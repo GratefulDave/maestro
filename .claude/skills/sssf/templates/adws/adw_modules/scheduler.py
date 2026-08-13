@@ -387,8 +387,24 @@ class Scheduler:
                 return
 
         baseline = wt.take_baseline(attempt)
+
+        def on_launch(pid: Optional[int] = None) -> None:
+            """The adapter reports launch, and that is what arms §7.6's first
+            two signals. It has to be a callback rather than a return value:
+            the runner does not return until the node is finished, and a
+            watchdog that learned of the launch then would have nothing left
+            to watch.
+            """
+            store.mark_launched(self.run_id, node.node_id, attempt_no, pid)
+
         execution = self.deps.run_node(attempt, node, record,
-                                       self._retry_prompts.get(node.node_id))
+                                       self._retry_prompts.get(node.node_id),
+                                       on_launch)
+        if execution.launched_pid is not None:
+            # A runner that reports its pid only on return still arms the
+            # signals, just late — recorded so the row is complete either way.
+            store.mark_launched(self.run_id, node.node_id, attempt_no,
+                                execution.launched_pid)
 
         after = wt.inventory(attempt.path)
         measured = wt.delta(baseline, after)

@@ -131,8 +131,10 @@ class SchedulerFixture(unittest.TestCase):
 
     # ── the injected adapter seams ──────────────────────────────────────────
 
-    def run_node(self, attempt, node, record, retry_prompt):
+    def run_node(self, attempt, node, record, retry_prompt, on_launch=None):
         self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+        if on_launch is not None:
+            on_launch(None)
         boom = self.raise_for.pop(node.node_id, None)
         if boom is not None:
             raise boom
@@ -210,10 +212,10 @@ class ReadySetTests(SchedulerFixture):
         order = []
         inner = self.run_node
 
-        def recording(attempt, node, record, retry_prompt):
+        def recording(attempt, node, record, retry_prompt, on_launch=None):
             order.append(("start", node.node_id,
                           dict(self.states())))
-            return inner(attempt, node, record, retry_prompt)
+            return inner(attempt, node, record, retry_prompt, on_launch)
 
         self.schedule([self.agent("a"), self.agent("b", depth=1, needs=("a",))],
                       deps=self.deps(run_node=recording)).run()
@@ -237,12 +239,12 @@ class ReadySetTests(SchedulerFixture):
         guard = threading.Lock()
         inner = self.run_node
 
-        def counting(attempt, node, record, retry_prompt):
+        def counting(attempt, node, record, retry_prompt, on_launch=None):
             with guard:
                 live.append(node.node_id)
                 peak.append(len(live))
             try:
-                return inner(attempt, node, record, retry_prompt)
+                return inner(attempt, node, record, retry_prompt, on_launch)
             finally:
                 with guard:
                     live.remove(node.node_id)
@@ -372,7 +374,8 @@ class SemanticRetryTests(SchedulerFixture):
         the same request repeated."""
         self.written = {"a": {"a.py": "A\n", "not-declared.py": "X\n"}}
 
-        def second_attempt_is_clean(attempt, node, record, retry_prompt):
+        def second_attempt_is_clean(attempt, node, record, retry_prompt,
+                                     on_launch=None):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
             files = ({"a.py": "A\n"} if record.attempt_no > 1
                      else {"a.py": "A\n", "not-declared.py": "X\n"})
@@ -634,10 +637,10 @@ class LivenessWiringTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         names = []
 
-        def observing(attempt, node, record, retry_prompt):
+        def observing(attempt, node, record, retry_prompt, on_launch=None):
             names.extend(t.name for t in threading.enumerate()
                          if t.name == "maestro-watchdog")
-            return self.run_node(attempt, node, record, retry_prompt)
+            return self.run_node(attempt, node, record, retry_prompt, on_launch)
 
         self.schedule([self.agent("a")],
                       deps=self.deps(run_node=observing)).run()
@@ -691,6 +694,39 @@ class LivenessWiringTests(SchedulerFixture):
         diagnostic = scheduler.status_diagnostic()
         self.assertIn("a: BLOCKED", diagnostic)
         self.assertIn("ancestor is blocked", diagnostic)
+
+    def test_the_launch_report_arms_the_first_two_signals(self):
+        """§7.6 — process-alive and turn-count arm when the adapter reports
+        launch, and nothing else arms them. The columns existed from the
+        start and nothing wrote them, which left the watchdog silently
+        running on its wall clock alone: an agent that died at once would
+        have been caught not immediately, as §7.6 requires, but only at the
+        node timeout."""
+        self.written = {"a": {"a.py": "A\n"}}
+        armed = {}
+
+        def reporting(attempt, node, record, retry_prompt, on_launch=None):
+            armed["before"] = self.store.get_attempt(
+                "run1", node.node_id, record.attempt_no).armed
+            on_launch(4321)
+            armed["after"] = self.store.get_attempt(
+                "run1", node.node_id, record.attempt_no).armed
+            return self.run_node(attempt, node, record, retry_prompt)
+
+        self.schedule([self.agent("a")],
+                      deps=self.deps(run_node=reporting)).run()
+        self.assertFalse(armed["before"], "armed before the adapter reported launch")
+        self.assertTrue(armed["after"])
+        self.assertEqual(self.store.get_attempt("run1", "a", 1).pid, 4321)
+
+    def test_an_attempt_is_unarmed_until_launch_is_reported(self):
+        """The pre-launch segment is signal-less by construction, not by
+        omission: no process and no transcript exist yet."""
+        scheduler = self.schedule([self.agent("a")])
+        scheduler.project()
+        attempt_no = self.store.start_attempt(
+            "run1", "a", _git(self.integration, "rev-parse", "HEAD"))
+        self.assertFalse(self.store.get_attempt("run1", "a", attempt_no).armed)
 
     def test_a_heartbeat_is_not_a_transition(self):
         """Writing a heartbeat as a transition would refresh

@@ -450,6 +450,34 @@ class LifecycleStore:
             for r in self.conn.execute(sql + " ORDER BY attempt_no", params).fetchall())
 
     @serialized
+    def mark_launched(self, run_id: str, node_id: str, attempt_no: int,
+                       pid: Optional[int], launched_at: Optional[float] = None) -> None:
+        """Record that the adapter reported the agent launched (§7.6).
+
+        This is what **arms** the process-alive and turn-count signals. Until
+        it is written, `AttemptRecord.launched_at` is None and the watchdog
+        correctly declines to evaluate either — the attempt window is open but
+        no process and no transcript exist yet, so both signals are undefined
+        by construction.
+
+        Without this writer the arming condition is never satisfied and the
+        watchdog silently degrades to its third signal alone: a node whose
+        agent dies immediately would then be detected not at once, as §7.6
+        requires, but only when the node wall-clock timeout expires. The
+        columns existed for this from the start; nothing wrote them, which is
+        the difference between a schema and a mechanism.
+
+        Deliberately not a transition. Launch is an observation about an
+        attempt already RUNNING, and writing it as one would refresh
+        `last_transition_at` — see `record_heartbeat` for why that matters.
+        """
+        self.conn.execute(
+            "UPDATE attempts SET launched_at=?, pid=?"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (launched_at if launched_at is not None else time.time(), pid,
+             run_id, node_id, attempt_no))
+
+    @serialized
     def record_heartbeat(self, attempt: st.AttemptRecord, turn_count: int,
                           observed_at: float) -> None:
         """Record a watchdog observation on the attempt row (§7.6).
