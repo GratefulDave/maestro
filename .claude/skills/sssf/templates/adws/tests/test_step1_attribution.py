@@ -275,22 +275,20 @@ class Step1QualityExplicitPhase(unittest.TestCase):
                 )
 
 
-class ReportedFinding(unittest.TestCase):
-    """Not a Step 1 property — a diagnostic that documents a real base defect
-    found while writing the tests above, for the report back to the lead.
+class TracerIsUsableAcrossThreads(unittest.TestCase):
+    """One Run builds one Tracer, and a DAG runs its nodes on a thread pool.
 
-    `sqlite3.connect(...)` in `Tracer.__init__` (tracer.py:108) does not pass
-    `check_same_thread=False`, so a `Tracer` (and therefore a `Run`, since
-    `Run.__init__` builds exactly one `Tracer`) cannot have its `.conn` used
-    from any thread but the one that constructed it. Two concurrent DAG
-    nodes sharing one `Run` — the architecture's own scenario for this
-    section — would hit `sqlite3.ProgrammingError: SQLite objects created in
-    a thread can only be used in that same thread` the moment the second
-    node's thread called `tracer.event(...)`. This test only demonstrates
-    the failure exists; fixing it is tracer.py, which this lane does not own.
+    This began as a tripwire asserting the defect: `Tracer.__init__` connected
+    without `check_same_thread=False`, so the second concurrent node raised
+    `sqlite3.ProgrammingError: SQLite objects created in a thread can only be
+    used in that same thread` on its first traced event — the architecture's
+    own scenario for this section (§7.2) could not record anything at all.
+    The connection is now shared deliberately and its writes serialised, so
+    the assertion is inverted to state the property that must hold rather than
+    the bug that used to.
     """
 
-    def test_a_second_thread_cannot_use_a_tracer_built_on_the_first_thread(self):
+    def test_a_second_thread_can_write_through_a_tracer_built_on_the_first(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             sys.path.insert(0, str(ADWS))
@@ -305,18 +303,20 @@ class ReportedFinding(unittest.TestCase):
                 try:
                     tracer.event(EventRecord(adw_id="threadconn", phase_id="p",
                                              type="log", name="x", payload={}))
-                except BaseException as error:  # noqa: BLE001 - capturing for the assertion below
+                except BaseException as error:  # noqa: BLE001 - reported, not raised, so join still runs
                     errors.append(error)
 
             t = threading.Thread(target=other_thread)
             t.start()
             t.join(timeout=10)
 
-            self.assertEqual(len(errors), 1,
-                             "expected the cross-thread sqlite3 use to raise — if this now "
-                             "passes, Tracer must have started passing check_same_thread=False "
-                             "and the finding below is stale")
-            self.assertIn("SQLite objects created in a thread", str(errors[0]))
+            self.assertEqual(errors, [],
+                             "a node running on another thread must be able to trace")
+            rows = tracer.conn.execute(
+                "SELECT phase_id FROM events WHERE adw_id='threadconn' AND name='x'"
+            ).fetchall()
+            self.assertEqual(rows, [("p",)],
+                             "the other thread's event must actually reach the database")
 
 
 if __name__ == "__main__":

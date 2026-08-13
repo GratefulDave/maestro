@@ -164,3 +164,7 @@ apps/inkwell/inkwell.db*
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Agent-harness state must never reach the installable tree
+.omc/
+.omp/

@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd .claude/skills/sssf/templates/adws/adw_modules && rtk grep -n \\\"phases\\\\[-1\\\\]\\\\|run\\\\.phases\\\\|max_phase_seq\\\\|self\\\\.phase_id\\\\|repo_root\\\\|cwd=\\\" *.py\",\"description\":\"Find shared-sta...",
-  "error": "Exit code 1\n(eval):cd:1: no such file or directory: .claude/skills/sssf/templates/adws/adw_modules",
-  "timestamp": "2026-08-13T20:24:51.742Z",
-  "retry_count": 1
-}

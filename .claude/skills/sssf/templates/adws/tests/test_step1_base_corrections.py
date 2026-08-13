@@ -53,13 +53,19 @@ class Step1PhaseIdentity(unittest.TestCase):
     """§12.2 Step 1 item 1 — phase_id must be derived from run, node, attempt."""
 
     def test_two_nodes_running_the_same_phase_name_get_two_phase_rows(self):
-        """Two concurrent DAG nodes share one run. Today they share one row.
+        """Two concurrent DAG nodes share one run. In the base they share one row.
 
         Both nodes read `max_phase_seq` before either writes, so both compute
         seq=1 and both build phase_id "<adw>_01_build". `phase_upsert`'s
         ON CONFLICT DO UPDATE then makes the second node overwrite the first
         node's row instead of adding its own: one node's entire phase record
         disappears from the trace, silently.
+
+        The nodes carry their scheduler-assigned ids here because that is the
+        whole repair — the base had nowhere to put the one fact that tells two
+        concurrent units of work apart, so no id built from what it did have
+        could distinguish them. Both nodes still race the same seq, which is
+        what keeps this a test of the collision rather than of the counter.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -70,8 +76,10 @@ class Step1PhaseIdentity(unittest.TestCase):
             tracer_b = Tracer(cfg.observability.db, tmp / "b.jsonl")
             tracer_a.session_start(adw_id, "test")
 
-            node_a = Run(cfg=cfg, adw_id=adw_id, tracer=tracer_a, engineer="test")
-            node_b = Run(cfg=cfg, adw_id=adw_id, tracer=tracer_b, engineer="test")
+            node_a = Run(cfg=cfg, adw_id=adw_id, tracer=tracer_a, engineer="test",
+                         node_id="build_api", dag_attempt_no=1)
+            node_b = Run(cfg=cfg, adw_id=adw_id, tracer=tracer_b, engineer="test",
+                         node_id="build_cli", dag_attempt_no=1)
 
             with node_a.phase(_params()):
                 with node_b.phase(_params()):
@@ -86,10 +94,12 @@ class Step1PhaseIdentity(unittest.TestCase):
             )
 
     def test_a_second_attempt_of_one_node_does_not_overwrite_the_first(self):
-        """§12.2 Step 1 item 5 — attempts must be distinguishable.
+        """§12.2 Step 1 item 1 — attempts must be distinguishable.
 
-        A retried node re-runs the same phase name. Without the attempt number
-        in the identity, attempt 2 overwrites attempt 1 and the evidence that
+        A retried node re-runs the same phase name at the same node id, in a
+        fresh Run built by the scheduler for the new attempt. Without the
+        attempt number in the identity the two Runs agree on everything the id
+        is made of, so attempt 2 updates attempt 1's row and the evidence that
         attempt 1 ever failed is destroyed.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -99,14 +109,17 @@ class Step1PhaseIdentity(unittest.TestCase):
 
             tracer = Tracer(cfg.observability.db, tmp / "e.jsonl")
             tracer.session_start(adw_id, "test")
-            run = Run(cfg=cfg, adw_id=adw_id, tracer=tracer, engineer="test")
 
+            first = Run(cfg=cfg, adw_id=adw_id, tracer=tracer, engineer="test",
+                        node_id="build_api", dag_attempt_no=1)
             try:
-                with run.phase(_params()):
+                with first.phase(_params()):
                     raise RuntimeError("attempt 1 fails")
             except RuntimeError:
                 pass
-            with run.phase(_params()):
+            second = Run(cfg=cfg, adw_id=adw_id, tracer=tracer, engineer="test",
+                         node_id="build_api", dag_attempt_no=2)
+            with second.phase(_params()):
                 pass
 
             statuses = [
@@ -160,12 +173,15 @@ class Step1AgentSessionIdentity(unittest.TestCase):
     """§12.2 Step 1 item 4 — agent sessions must key by agent, node, attempt."""
 
     def test_two_nodes_on_one_role_do_not_share_a_coding_agent_session(self):
-        """`agent_sessions` has PRIMARY KEY (adw_id, agent) — tracer.py:88.
+        """`agent_sessions` had PRIMARY KEY (adw_id, agent) — tracer.py:88.
 
         Two concurrent nodes assigned the same role write the same primary
         key, so the second node's session id overwrites the first's. Both
         nodes then resume the same coding-agent session: two live agents in
-        one context window.
+        one context window. The key now carries the node and the attempt, so
+        each node's session row is its own; the calls below pass the node ids
+        the scheduler assigned, because that fact is what the old key had no
+        column for.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -179,8 +195,10 @@ class Step1AgentSessionIdentity(unittest.TestCase):
                 prompt_engineering=PromptEngineering(system="s.md", user="u.md"),
             )
 
-            tracer.agent_session_row(adw_id, agent, "session_for_node_a")
-            tracer.agent_session_row(adw_id, agent, "session_for_node_b")
+            tracer.agent_session_row(adw_id, agent, "session_for_node_a",
+                                     node_id="build_api", dag_attempt_no=1)
+            tracer.agent_session_row(adw_id, agent, "session_for_node_b",
+                                     node_id="build_cli", dag_attempt_no=1)
 
             sessions = {
                 r[0] for r in tracer.conn.execute(
