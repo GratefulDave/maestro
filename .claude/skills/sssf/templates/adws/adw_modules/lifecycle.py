@@ -35,6 +35,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple)
@@ -180,6 +181,22 @@ def serialized(method):
         with self._lock:
             return method(self, *args, **kwargs)
     return guarded
+
+
+def _epoch_seconds(stamp: Optional[str]) -> float:
+    """An ISO transition stamp as epoch seconds, for the backstop's arithmetic.
+
+    Returns 0.0 for a missing or unparseable stamp, which fails *safe* in the
+    direction that matters: a zero makes elapsed time enormous, so the
+    backstop fires and declares STUCK rather than silently never firing on a
+    run whose timestamp it could not read.
+    """
+    if not stamp:
+        return 0.0
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _is_ancestor(repo_path, sha: str, ref: str = "HEAD") -> bool:
@@ -356,6 +373,119 @@ class LifecycleStore:
             extra=json.loads(extra_json))
 
     @serialized
+    def last_transition_at(self, run_id: str) -> float:
+        """The run row's `last_transition_at`, **as epoch seconds** — §11.2's
+        backstop input.
+
+        A lifecycle column, deliberately, and the obvious alternative is
+        forbidden: `SELECT MAX(ts) FROM transitions` reads the audit tier,
+        which §5.3 says is read at runtime never, and a scheduler mechanism
+        consulting it is the first arrow in that section's own list of ways
+        this design gets reimported.
+
+        The column is stored as an ISO timestamp because every other audit
+        row is, and the backstop measures an elapsed *duration* against `T`.
+        Handing it a string would either raise or, worse, compare
+        lexicographically and silently never fire. The conversion belongs
+        here, at the one reader, rather than in the backstop — which must
+        stay ignorant of how the column is spelled.
+        """
+        row = self.conn.execute(
+            "SELECT last_transition_at FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise LifecycleError(f"no run row for {run_id}")
+        return _epoch_seconds(row[0])
+
+    @serialized
+    def acceptance_started(self, run_id: str) -> None:
+        """Open §8.8's final-acceptance window (§11.2's silence rule).
+
+        Written when the scheduler observes the candidate-ACCEPTED quiescent
+        shape, before the ancestry sweep and before any spec or gate runs.
+        Nothing transitions between the last node's MERGED and the outcome
+        declaration, and that gap is as long as everything acceptance
+        executes — so without this refresh the backstop measures a healthy
+        final acceptance as silence and declares STUCK. Because resume
+        re-runs acceptance against the same quiescent shape, that misfire
+        would be a livelock rather than one lost run.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            now = now_iso()
+            self.conn.execute(
+                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id))
+            self.conn.execute(
+                "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+                " reason, actor, detail_json, created_at)"
+                " VALUES (?,NULL,'run',NULL,NULL,'acceptance-start','scheduler','{}',?)",
+                (run_id, now))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def attempts_for(self, run_id: str, node_id: Optional[str] = None
+                      ) -> Tuple[st.AttemptRecord, ...]:
+        """Attempt rows, for the counting the retry policy does over them.
+
+        The semantic ceiling is a `COUNT(*)` over rows that already exist
+        rather than a counter this store maintains, so what the policy needs
+        from here is the rows themselves and nothing more (§7.5).
+        """
+        sql = ("SELECT run_id, node_id, attempt_no, base_sha, state, started_at,"
+               " launched_at, pid, turn_count, retry_class, extra_json"
+               " FROM attempts WHERE run_id=?")
+        params: Tuple[Any, ...] = (run_id,)
+        if node_id is not None:
+            sql += " AND node_id=?"
+            params = (run_id, node_id)
+        return tuple(
+            st.AttemptRecord(
+                run_id=r[0], node_id=r[1], attempt_no=r[2], base_sha=r[3],
+                state=st.NodeState(r[4]), started_at=r[5] or 0.0,
+                launched_at=r[6], pid=r[7], turn_count=r[8] or 0,
+                retry_class=st.RetryClass(r[9]) if r[9] else None,
+                extra=json.loads(r[10]))
+            for r in self.conn.execute(sql + " ORDER BY attempt_no", params).fetchall())
+
+    @serialized
+    def record_heartbeat(self, attempt: st.AttemptRecord, turn_count: int,
+                          observed_at: float) -> None:
+        """Record a watchdog observation on the attempt row (§7.6).
+
+        Deliberately **not** a transition: a heartbeat is not a state change,
+        and writing one as a transition would refresh `last_transition_at` and
+        silently disarm §11.2's backstop — the run would never look silent
+        because a healthy watchdog was chattering into the column the backstop
+        measures. That is the failure mode the backstop exists to catch,
+        installed by the mechanism meant to help it.
+        """
+        self.conn.execute(
+            "UPDATE attempts SET turn_count=?, launched_at=COALESCE(launched_at, ?)"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (turn_count, attempt.launched_at, attempt.run_id, attempt.node_id,
+             attempt.attempt_no))
+
+    def attempts_spent(self, run_id: str, node_id: str,
+                        retry_class: st.RetryClass) -> int:
+        """How many attempts of this node already failed in this class.
+
+        Counts only rows already classified, which is what keeps §7.5's rule
+        that no infra fault produces a budget decrement true of the other
+        direction as well: an unclassified row contributes to nothing.
+        """
+        return sum(1 for a in self.attempts_for(run_id, node_id)
+                   if a.retry_class is retry_class)
+
+    def close(self) -> None:
+        """Close the shared connection. One connection outlives every thread
+        that touched it, so closing is the caller's explicit act rather than
+        a per-thread teardown."""
+        with self._lock:
+            self.conn.close()
+
+    @serialized
     def latest_outcome(self, run_id: str) -> Optional[st.RunOutcome]:
         row = self.conn.execute(
             "SELECT latest_outcome FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -491,17 +621,42 @@ class LifecycleStore:
             require_state=(st.NodeState.VERIFIED,))
 
     def mark_blocked(self, run_id: str, node_id: str, reason: st.BlockReason, *,
-                      detail: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
-        """RUNNING -> BLOCKED with a stored reason (§7.3). `UPSTREAM_BLOCKED` is
-        never a valid argument here — it is derived, never stored (§8.7)."""
+                      detail: Optional[Mapping[str, Any]] = None,
+                      retry_class: Optional[st.RetryClass] = None) -> st.NodeLifecycle:
+        """RUNNING or VERIFIED -> BLOCKED with a stored reason (§7.3).
+
+        `UPSTREAM_BLOCKED` is never a valid argument here — it is derived,
+        never stored (§8.7).
+
+        VERIFIED is a legal source, and leaving it out was a real gap: §8.7's
+        merge conflict blocks a node **at merge time**, and only a VERIFIED
+        node is ever eligible to merge, so a conflict could not be recorded at
+        all while RUNNING was the only permitted source. The node's work is
+        genuinely finished and genuinely unmergeable, which is exactly what
+        `MERGE_CONFLICT` says.
+
+        `retry_class` records what the *attempt* failed as, in the same
+        transaction, for the case where a node blocks because its budget is
+        exhausted. Without it the attempt row carries no reason at all — the
+        classification was computed, used to decide the block, and then
+        dropped — so `run status` could say the node blocked but not what its
+        last attempt actually did.
+        """
         def extra(lifecycle: st.NodeLifecycle):
-            return [(
+            writes = [(
                 "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND attempt_no=?",
                 (st.NodeState.BLOCKED.value, run_id, node_id, lifecycle.attempt_no))]
+            if retry_class is not None:
+                writes.append((
+                    "UPDATE attempts SET retry_class=? WHERE run_id=? AND node_id=?"
+                    " AND attempt_no=?",
+                    (retry_class.value, run_id, node_id, lifecycle.attempt_no)))
+            return writes
         return self._transition_node(
             run_id, node_id, st.NodeState.BLOCKED, actor="scheduler",
             reason=f"blocked:{reason.value}", block_reason=reason,
-            require_state=(st.NodeState.RUNNING,), detail=detail, extra_writes=extra)
+            require_state=(st.NodeState.RUNNING, st.NodeState.VERIFIED),
+            detail=detail, extra_writes=extra)
 
     def fail_attempt(self, run_id: str, node_id: str,
                       retry_class: st.RetryClass) -> st.NodeLifecycle:
