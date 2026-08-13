@@ -5,7 +5,7 @@ de31374. They are expected to FAIL before the Step 1 corrections land and to
 pass afterwards. Each test targets one numbered item from §12.2 Step 1 and
 asserts the behaviour concurrency requires, not the behaviour the base has.
 
-Run with:  python3 -m unittest discover -s tests -v
+Run with:  just test        (or: uv run adws/adw_test.py)
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-ADWS = REPO_ROOT / ".claude" / "skills" / "sssf" / "templates" / "adws"
+# This file ships inside adws/tests/, so the package root is its parent's parent.
+ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules.data_types import (  # noqa: E402
