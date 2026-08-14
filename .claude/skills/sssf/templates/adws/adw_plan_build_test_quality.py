@@ -55,7 +55,7 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
     for i in range(1, MAX_FIX_LOOPS + 1):
         with run.phase(PhaseParams(name=f"verify_{i}", kind="code", owner="quality",
                                    description="Lint, typecheck, and build before testing")) as ph:
-            quality_result = quality.run_quality(run)
+            quality_result = quality.run_quality(run, ph.phase)
             record(ph, quality_result)
 
         # run_quality() already includes the test block; a repo that wants tests

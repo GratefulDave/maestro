@@ -33,10 +33,28 @@ GITIGNORE_ENTRIES = [
 ]
 
 
+def is_junk(child: Path) -> bool:
+    """Whether a path under templates/ is tooling residue rather than factory.
+
+    Whatever sits in the template tree is what gets stamped, so anything a
+    tool leaves behind while the factory is being worked on is shipped to
+    every repository that installs it. That is not hypothetical: an agent
+    harness wrote its own state directory into templates/adws/ during
+    development and it reached a freshly stamped repo intact.
+
+    The rule is shaped rather than named — every dot-directory and every
+    compiled artefact — so a tool nobody has heard of yet is excluded on the
+    same terms as the ones that have already done this.
+    """
+    if child.is_dir():
+        return child.name.startswith(".") or child.name == "__pycache__"
+    return child.suffix in {".pyc", ".pyo"} or child.name == ".DS_Store"
+
+
 def stamp(src: Path, dest: Path, force: bool, stamped: list, skipped: list) -> None:
     if src.is_dir():
         for child in sorted(src.iterdir()):
-            if child.name == "__pycache__":
+            if is_junk(child):
                 continue
             stamp(child, dest / child.name, force, stamped, skipped)
         return

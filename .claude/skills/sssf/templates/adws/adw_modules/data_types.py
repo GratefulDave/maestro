@@ -303,8 +303,11 @@ class PromptEngineering(BaseModel):
 
 class AgentConfig(BaseModel):
     name: str
-    coding_agent: Literal["pi", "claude_code"] = "pi"
-    model: str = "google/gemini-3.6-flash"
+    # "omp" and "pi" both name the same runner: omp is what the binary is
+    # called now, and "pi" stays accepted so repos stamped before the rename
+    # keep validating.
+    coding_agent: Literal["omp", "pi", "claude_code"] = "omp"
+    model: str = "openai-codex/gpt-5.6-terra"
     thinking: str = "medium"        # off | minimal | low | medium | high | xhigh | max
     color: str = ""                 # hex swatch for this agent's lane in the UI
     purpose: str = ""
@@ -323,8 +326,11 @@ class AgentConfig(BaseModel):
 
 
 class ConfigDefaults(BaseModel):
-    coding_agent: Literal["pi", "claude_code"] = "pi"
-    model: str = "google/gemini-3.6-flash"
+    # "omp" and "pi" both name the same runner: omp is what the binary is
+    # called now, and "pi" stays accepted so repos stamped before the rename
+    # keep validating.
+    coding_agent: Literal["omp", "pi", "claude_code"] = "omp"
+    model: str = "openai-codex/gpt-5.6-terra"
     thinking: str = "medium"
     color: str = ""
     harness_engineering: list[str] = Field(default_factory=list)
@@ -445,3 +451,6 @@ class PiResult(BaseModel):
     # visualizer's context bar measures against `context_window`.
     context_tokens: int = 0
     context_window: int = 0         # 0 when the registry declares no ceiling
+    # The provider/model omp REPORTED running, which is not always the one it
+    # was asked for. Empty when no turn stated a model.
+    model_ran: str = ""

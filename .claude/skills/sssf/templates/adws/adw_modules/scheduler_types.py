@@ -1,0 +1,448 @@
+"""The scheduler's shared vocabulary — states, outcomes, classes, node model.
+
+Step 6 is three separately-implemented pieces — the lifecycle store, the retry
+policy, and the watchdog — plus the worker body that composes them. All four
+must agree on the names below *exactly*. Three private copies of one enum,
+reconciled by everyone having read the same section, is the RC1 shape (§4)
+this design convicts everywhere else; it would drift silently, because no
+piece's own tests can see another piece's copy.
+
+So the vocabulary is one module, imported by all of them, and the agreement is
+executed in `tests/test_scheduler_types.py` rather than assumed.
+
+What lives here is only what more than one piece needs, plus the two
+constructions that must refuse invalid input at the point it is written rather
+than at the point it is used:
+
+* `PlanNode`, because §7.4's scope rule and §7.3's code-node clauses are
+  structural facts about a node, and a node that violates either is a deadlock
+  or an unevaluatable state rather than a runtime error to be handled.
+* `SchedulerConfig`, because §11.2's liveness bound is preflight's refusal and
+  a scheduler constructed below the bound kills healthy runs.
+
+What deliberately does *not* live here: the outcome function (§7.3), the
+classifier (§7.5), and the watchdog's signals (§7.6). Each is behaviour owned
+by exactly one piece, and putting behaviour beside a shared vocabulary is how
+a vocabulary module becomes a second scheduler.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+from . import worktree as wt
+
+
+# ── §7.3 states, and the two kinds of terminal ──────────────────────────────
+
+class NodeState(str, Enum):
+    """The six. READY, MERGE_READY, and MERGING are deliberately absent: the
+    first is a derived predicate, the second a query, and the third a thing
+    recovery asks git about rather than reads off a marker."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    VERIFIED = "VERIFIED"
+    MERGED = "MERGED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+
+
+#: Nothing transitions out of these, ever (§7.3).
+ABSOLUTELY_TERMINAL: Tuple[NodeState, ...] = (NodeState.MERGED, NodeState.CANCELLED)
+
+#: No *automatic* transition leaves this, but the operator escapes can (§11.3).
+OPERATOR_TERMINAL: Tuple[NodeState, ...] = (NodeState.BLOCKED,)
+
+#: Ends a node without a merge, so the frontier skips it and its descendants
+#: become derived-unready (§8.5, §8.7). The merge protocol already owns this
+#: set; the tuple below is built *from* it rather than beside it, so the two
+#: cannot drift into two representations of one fact.
+TERMINAL_WITHOUT_MERGE: Tuple[NodeState, ...] = tuple(
+    NodeState(value) for value in wt.TERMINAL_WITHOUT_MERGE)
+
+
+class RunOutcome(str, Enum):
+    """Declared exactly once, at the point the run stops (§7.3)."""
+
+    ACCEPTED = "ACCEPTED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+    STUCK = "STUCK"
+
+
+#: The residual class, named rather than enumerated: a combination nobody
+#: anticipated lands here with a report, never outside the set (§7.3).
+RESIDUAL_OUTCOME = RunOutcome.BLOCKED
+
+
+# ── §7.5 retry classes ──────────────────────────────────────────────────────
+
+class RetryClass(str, Enum):
+    """Three, mutually exclusive, classified structurally and never lexically."""
+
+    SEMANTIC = "SEMANTIC"
+    ENVIRONMENTAL = "ENVIRONMENTAL"
+    LAUNCHER_TRANSIENT = "LAUNCHER_TRANSIENT"
+
+
+#: Fail-closed. Any exception reaching a worker's top-level handler without a
+#: classification is ENVIRONMENTAL, so an engine bug can never be recorded as
+#: a verdict about the code under test (§7.5 containment).
+DEFAULT_RETRY_CLASS = RetryClass.ENVIRONMENTAL
+
+
+def mutates_prompt(retry_class: RetryClass) -> bool:
+    """Only SEMANTIC rewrites the agent's instructions (§7.5).
+
+    An infra fault must never produce a code verdict, an ownership entry, or
+    a budget decrement, and mutating the prompt on one would be all three.
+    """
+    return retry_class is RetryClass.SEMANTIC
+
+
+class Escape(str, Enum):
+    """The operator's exits from a blocked node (§11.3)."""
+
+    RETRY = "retry"
+    RETRY_FORCE = "retry --force"
+    SKIP = "skip"
+    ABANDON = "abandon"
+
+
+class BlockReason(str, Enum):
+    """Every *stored* reason a node stopped.
+
+    `UPSTREAM_BLOCKED` is absent on purpose and its absence is load-bearing
+    (§8.7): stored, the cascade was irreversible, so a rescue that un-blocked
+    the origin left five descendants in a durable terminal state with no rule
+    anywhere to bring them back. Derived, the origin leaves the blocked set
+    and the predicate simply stops holding.
+    """
+
+    GATE_NOT_FALSIFIABLE = "GATE_NOT_FALSIFIABLE"
+    CODE_NODE_NO_EFFECT = "CODE_NODE_NO_EFFECT"
+    PERMISSION_SCOPE_VIOLATION = "PERMISSION_SCOPE_VIOLATION"
+    SEMANTIC_BUDGET_EXHAUSTED = "SEMANTIC_BUDGET_EXHAUSTED"
+    ENVIRONMENTAL_BUDGET_EXHAUSTED = "ENVIRONMENTAL_BUDGET_EXHAUSTED"
+    LAUNCHER_BUDGET_EXHAUSTED = "LAUNCHER_BUDGET_EXHAUSTED"
+    CREDENTIAL_REFUSED = "CREDENTIAL_REFUSED"
+    MERGE_CONFLICT = "MERGE_CONFLICT"
+
+
+#: The three failures that fit no retry class, because re-running a
+#: deterministic thing against an unchanged base cannot produce a different
+#: answer (§7.5). Without a dedicated reason each of these falls to the
+#: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
+#: then blocks with an infra-flavoured reason for what is a fact about content.
+NON_RETRYABLE: Tuple[BlockReason, ...] = (
+    BlockReason.GATE_NOT_FALSIFIABLE,
+    BlockReason.CODE_NODE_NO_EFFECT,
+    BlockReason.PERMISSION_SCOPE_VIOLATION,
+)
+
+
+def is_retryable(reason: BlockReason) -> bool:
+    """Whether another attempt could change this reason's answer."""
+    return reason not in NON_RETRYABLE
+
+
+#: §11.3's tested property, as a table rather than a sentence: every stored
+#: reason admits a legal transition out, and — the part that makes the
+#: property mean something — every one admits a *repair*, not only `abandon`.
+#: While `UPSTREAM_BLOCKED` was stored this was satisfiable vacuously, since
+#: abandon exits every blocked state and a cascaded descendant had no other.
+_EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
+    # Re-running an agent cannot make a gate falsifiable, and re-running a
+    # deterministic command cannot write different paths. The repair is the
+    # operator doing the work by hand and supplying the SHA.
+    BlockReason.GATE_NOT_FALSIFIABLE: (Escape.SKIP, Escape.ABANDON),
+    BlockReason.CODE_NODE_NO_EFFECT: (Escape.SKIP, Escape.ABANDON),
+    BlockReason.PERMISSION_SCOPE_VIOLATION: (Escape.SKIP, Escape.ABANDON),
+    # K is a ceiling on a spend, not a verdict, so the forced grant is the
+    # designed exit — one attempt per invocation, never a raised cap (§7.5).
+    BlockReason.SEMANTIC_BUDGET_EXHAUSTED: (
+        Escape.RETRY_FORCE, Escape.SKIP, Escape.ABANDON),
+    # Infra faults: a healthier machine genuinely can produce a different
+    # answer, so plain retry is the repair.
+    BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED: (
+        Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (
+        Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    BlockReason.CREDENTIAL_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    # §8.7 — resolution is human, because a conflict means two output sets
+    # overlapped in content though their declared globs did not, which is a
+    # planning defect that re-prompting papers over.
+    BlockReason.MERGE_CONFLICT: (Escape.SKIP, Escape.ABANDON),
+}
+
+
+def exits_for(reason: BlockReason) -> Tuple[Escape, ...]:
+    """The legal transitions out of a stored block reason (§11.3)."""
+    return _EXITS[reason]
+
+
+# ── §7.7 results ────────────────────────────────────────────────────────────
+
+class Adjudication(str, Enum):
+    """A result is adjudicated solely against the attempt row it names,
+    never against the node's current state (§7.7)."""
+
+    ACCEPTED = "ACCEPTED"
+    SUPERSEDED = "SUPERSEDED"
+    UNKNOWN_ATTEMPT = "UNKNOWN_ATTEMPT"
+    SHA_MISMATCH = "SHA_MISMATCH"
+
+
+@dataclass(frozen=True)
+class ResultRecord:
+    """One result, with its payload and its adjudication in one row (§7.7).
+
+    The payload is retained in all four outcomes and cannot be omitted: an
+    adjudication recorded without its payload is how a correct FAIL carrying
+    two real findings disappeared behind a byte-identical journal.
+    """
+
+    node_id: str
+    attempt_no: int
+    subject_sha: str
+    payload: Optional[Mapping[str, Any]]
+    adjudication: Optional[Adjudication] = None
+
+    def __post_init__(self) -> None:
+        if self.payload is None:
+            raise ValueError(
+                "a result row carries its payload and its adjudication together; "
+                "recording one without the other is what §7.7 exists to prevent")
+
+    @property
+    def key(self) -> Tuple[str, int, str]:
+        """`(node_id, attempt_no, subject_sha)` — what a result binds (§7.7)."""
+        return (self.node_id, self.attempt_no, self.subject_sha)
+
+
+# ── §7.1 the node the scheduler consumes directly ───────────────────────────
+
+class NodeKind(str, Enum):
+    """Two kinds, with two different VERIFIED predicates (§7.3)."""
+
+    AGENT = "agent"
+    CODE = "code"
+
+
+@dataclass(frozen=True)
+class PlanNode:
+    """A plan node, consumed directly — no second authored type, no converter.
+
+    The constructor refuses three shapes that are not runtime errors but
+    design violations, because each is a wedge rather than a failure:
+
+    * an agent node without its own gate selector, which is §7.4's measured
+      deadlock — an unscoped post-node gate is red for a sibling's absent
+      work, so no node verifies, nothing merges, and the run cannot progress;
+    * a code node carrying a gate, which is state nothing evaluates, since a
+      code node's acceptance is its exit code and clauses 1-3 do not apply;
+    * an agent node carrying `expects_changes`, which is a code-node clause
+      and on an agent node would be a field nothing reads (§12.3).
+    """
+
+    node_id: str
+    kind: NodeKind
+    depth: int
+    needs: Tuple[str, ...] = ()
+    outputs: Tuple[str, ...] = ()
+    specs: Tuple[str, ...] = ()
+    gate_command: Tuple[str, ...] = ()
+    gate_selector: Optional[str] = None
+    command: Tuple[str, ...] = ()
+    expects_changes: bool = False
+
+    def __post_init__(self) -> None:
+        if not str(self.node_id).strip():
+            raise ValueError("a node needs a non-empty id; identity is not optional")
+        if self.depth < 0:
+            raise ValueError(f"{self.node_id}: depth is a graph fact, never negative")
+        if self.node_id in self.needs:
+            raise ValueError(f"{self.node_id}: a node cannot depend on itself")
+
+        if self.kind is NodeKind.AGENT:
+            if not self.gate_command:
+                raise ValueError(
+                    f"{self.node_id}: an agent node's VERIFIED predicate is its own "
+                    "gate run twice (§7.4); without a command there is nothing to run")
+            if not (self.gate_selector or "").strip():
+                raise ValueError(
+                    f"{self.node_id}: an agent node needs its own gate selector "
+                    "(§7.4). A whole-suite post-node gate is red for a sibling's "
+                    "unmerged work, so no node could verify and nothing could merge")
+            if self.command:
+                raise ValueError(
+                    f"{self.node_id}: an agent node's work is the agent's, not a "
+                    "command; a command here would be a second execution path")
+            if self.expects_changes:
+                raise ValueError(
+                    f"{self.node_id}: expects_changes is a code-node clause (§7.3); "
+                    "on an agent node it is a field nothing reads")
+        else:
+            if not self.command:
+                raise ValueError(
+                    f"{self.node_id}: a code node's acceptance is its command's exit "
+                    "code (§6.2); without a command there is nothing to accept")
+            if self.gate_command or self.gate_selector:
+                raise ValueError(
+                    f"{self.node_id}: a code node has no gate and no min_cases "
+                    "(§7.3); a gate here is state nothing evaluates")
+
+    def to_record(self, state: NodeState) -> "wt.NodeRecord":
+        """Project onto the merge protocol's record (§7.1, §8.5).
+
+        A projection, not a conversion: every field is copied unchanged, so
+        re-projecting at the same digest and diffing the rows makes a bug in
+        this function observable rather than silent.
+        """
+        return wt.NodeRecord(node_id=self.node_id, depth=self.depth,
+                             needs=tuple(self.needs), state=NodeState(state).value,
+                             specs=tuple(self.specs))
+
+
+# ── §11.2 configuration, and the bound preflight enforces ───────────────────
+
+class LivenessBoundUnsatisfied(ValueError):
+    """`T` does not exceed the greatest run-window timeout (§9.5, §11.2).
+
+    Refused at construction rather than warned about, because a scheduler
+    below the bound does not degrade — below the node timeout it kills healthy
+    nodes inside their silent working gap, and below the final-acceptance
+    timeout it kills healthy acceptance, which resume then re-runs against the
+    same quiescent shape: `STUCK` at the same minute of every resume.
+    """
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    """Configuration, never plan content — the same reason retry budgets are.
+
+    The finalization timeout (§6.5) is deliberately not a field: no run exists
+    at plan time, so it takes no part in the bound below.
+    """
+
+    concurrency: int
+    node_timeout_s: float
+    turn_timeout_s: float
+    final_acceptance_timeout_s: float
+    backstop_t_s: float
+    semantic_ceiling: int
+    environmental_retries: int = 2
+    launcher_retries: int = 2
+    credential_retries: int = 0
+
+    def __post_init__(self) -> None:
+        if self.concurrency < 1:
+            raise ValueError("concurrency is also the pane limit (§7.2); it is ≥ 1")
+        if self.semantic_ceiling < 1:
+            raise ValueError(
+                "a semantic ceiling of zero blocks every agent node on its first "
+                "semantic failure, which is a different design, not a setting")
+        for name in ("node_timeout_s", "turn_timeout_s",
+                     "final_acceptance_timeout_s", "backstop_t_s"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} is a wall clock; it is positive")
+        for name in ("environmental_retries", "launcher_retries",
+                     "credential_retries"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} is a count; it is not negative")
+        if self.backstop_t_s <= self.greatest_run_window_s:
+            raise LivenessBoundUnsatisfied(
+                "LIVENESS_BOUND_UNSATISFIED: the run-level backstop must exceed "
+                "the greatest run-window timeout, or it fires inside a healthy "
+                f"window. T={self.backstop_t_s}, node_timeout={self.node_timeout_s}, "
+                f"final_acceptance_timeout={self.final_acceptance_timeout_s}")
+
+    @property
+    def greatest_run_window_s(self) -> float:
+        """The greater of the two run windows (§11.2). The finalization
+        window has no run row, so it is not one of them."""
+        return max(self.node_timeout_s, self.final_acceptance_timeout_s)
+
+    @property
+    def pane_limit(self) -> int:
+        """§7.2 — the concurrency limit is also the pane limit, because one
+        in-flight node holds at most one launch."""
+        return self.concurrency
+
+    def retry_budget(self, retry_class: RetryClass) -> int:
+        """The non-semantic budgets. SEMANTIC is absent deliberately: its
+        budget is scoped to `(node_id, base_sha)` with a cumulative ceiling
+        over `(run_id, node_id)`, which is a query over attempt rows rather
+        than a constant (§7.5)."""
+        if retry_class is RetryClass.ENVIRONMENTAL:
+            return self.environmental_retries
+        if retry_class is RetryClass.LAUNCHER_TRANSIENT:
+            return self.launcher_retries
+        raise ValueError(
+            "the semantic budget is a COUNT(*) over attempt rows scoped to "
+            "(node_id, base_sha) under a (run_id, node_id) ceiling, not a constant")
+
+
+# ── lifecycle rows the three pieces share ───────────────────────────────────
+
+@dataclass
+class NodeLifecycle:
+    """A node's authority-tier row — the only tier read at runtime (§5.3).
+
+    `granted_extra_attempts` is the one column §7.5's forced retry costs. It
+    exists because the grant must be readable by the scheduler's pre-launch
+    guard, and the escape's durable operator-attributed transition lives in
+    the audit tier, which §5.3 forbids reading at runtime. An earlier draft
+    claimed the ceiling introduced no new state; that was false the moment
+    `retry --force` existed.
+    """
+
+    node_id: str
+    state: NodeState = NodeState.PENDING
+    attempt_no: int = 0
+    block_reason: Optional[BlockReason] = None
+    output_sha: Optional[str] = None
+    granted_extra_attempts: int = 0
+
+    def __post_init__(self) -> None:
+        if (self.block_reason is not None) != (self.state is NodeState.BLOCKED):
+            raise ValueError(
+                f"{self.node_id}: a block reason and the BLOCKED state are one "
+                "fact; storing either without the other is a row that cannot be "
+                "reported and an exit that cannot be looked up (§11.3)")
+
+
+@dataclass
+class AttemptRecord:
+    """One attempt of one node. The window §7.6 watches opens with this row.
+
+    `launched_at` is `None` until the adapter reports the agent launched, and
+    that is what arms the process-alive and turn-count signals. Before it, the
+    two are undefined by construction rather than by omission: the attempt
+    window covers worktree creation, provision, the pre-gate, and the baseline
+    inventory, none of which have a process or a transcript yet.
+    """
+
+    run_id: str
+    node_id: str
+    attempt_no: int
+    base_sha: str
+    state: NodeState = NodeState.RUNNING
+    started_at: float = 0.0
+    launched_at: Optional[float] = None
+    pid: Optional[int] = None
+    turn_count: int = 0
+    retry_class: Optional[RetryClass] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def armed(self) -> bool:
+        """Whether §7.6's first two signals apply yet."""
+        return self.launched_at is not None
+
+    @property
+    def key(self) -> Tuple[str, str, int]:
+        return (self.run_id, self.node_id, self.attempt_no)

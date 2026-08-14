@@ -53,7 +53,7 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
         with run.phase(PhaseParams(name=f"test_{i}", kind="code", owner="quality",
                                    description="Run the suite — a known command, so code runs "
                                                "it and no agent has to rediscover it")) as ph:
-            test = quality.run_tests(run)
+            test = quality.run_tests(run, ph.phase)
             record(ph, test)
 
         if test.passed:

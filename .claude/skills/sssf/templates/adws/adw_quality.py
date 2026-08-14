@@ -30,7 +30,7 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
 
     with run.phase(PhaseParams(name="quality", kind="code", owner="quality",
                                description="Run the deterministic quality blocks")) as ph:
-        result = quality.run_quality(run)
+        result = quality.run_quality(run, ph.phase)
         passed = sum(1 for check in result.checks if check.passed)
         ph.log(passed=result.passed, checks=f"{passed}/{len(result.checks)}",
                artifacts=", ".join(result.artifacts))

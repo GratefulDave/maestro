@@ -8,6 +8,8 @@ so a CI log reads exactly like a terminal.
 
 from __future__ import annotations
 
+import threading
+
 from rich.console import Console as RichConsole
 from rich.markup import escape
 from rich.panel import Panel
@@ -30,11 +32,36 @@ class Console:
     def __init__(self, tracer, adw_id: str):
         self.tracer = tracer
         self.adw_id = adw_id
-        self.phase_id = ""          # current lane — log events attach to it
-        self.phase_name = ""
+        # One Console is shared by the whole run (runner.py), but the "current
+        # phase" slot is per-node, not per-run: two DAG nodes running
+        # concurrently each open a phase on this same Console, and a plain
+        # instance attribute would let the second node's phase_started()
+        # repoint the slot out from under the first. threading.local() gives
+        # each thread — each concurrently-running node — its own slot, so a
+        # note emitted by node A always attaches to node A's phase regardless
+        # of what node B does on another thread in between. A fresh thread's
+        # local storage starts empty, so `getattr(..., "")` below is also what
+        # keeps a brand-new thread from inheriting another thread's open phase.
+        self._phase_state = threading.local()
         self.results: list[str] = []            # phase statuses, for the summary
         self._finished = False                  # the summary panel prints once
         self._out = RichConsole(highlight=False, soft_wrap=True)
+
+    @property
+    def phase_id(self) -> str:
+        return getattr(self._phase_state, "phase_id", "")
+
+    @phase_id.setter
+    def phase_id(self, value: str) -> None:
+        self._phase_state.phase_id = value
+
+    @property
+    def phase_name(self) -> str:
+        return getattr(self._phase_state, "phase_name", "")
+
+    @phase_name.setter
+    def phase_name(self, value: str) -> None:
+        self._phase_state.phase_name = value
 
     # ── the one helper: print AND trace, always together ────────────────────
     def _emit(self, markup: str, level: str = "info", renderable=None) -> None:
