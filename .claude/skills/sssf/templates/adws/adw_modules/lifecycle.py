@@ -138,7 +138,51 @@ CREATE TABLE IF NOT EXISTS transitions (
   detail_json  TEXT NOT NULL DEFAULT '{}',
   created_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS results (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id        TEXT NOT NULL,
+  node_id       TEXT NOT NULL,
+  attempt_no    INTEGER NOT NULL,
+  subject_sha   TEXT NOT NULL,
+  payload_json  TEXT NOT NULL,     -- non-null by §7.7: the payload is the row
+  adjudication  TEXT,
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orphans (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      TEXT NOT NULL,
+  node_id     TEXT,
+  attempt_no  INTEGER,
+  pid         INTEGER,
+  handle      TEXT,
+  reason      TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_live_attempt_per_node
+  ON attempts(run_id, node_id) WHERE state='RUNNING';
+CREATE INDEX IF NOT EXISTS idx_ready_set
+  ON node_lifecycle(run_id, state);
 """
+
+#: §10.3's partial unique index — "at most one live attempt per node as a
+#: declarative constraint that releases automatically when status changes".
+#: Partial, so it constrains live rows only and never caps a node's history.
+LIVE_ATTEMPT_INDEX = "idx_one_live_attempt_per_node"
+
+#: §10.3's "one index on the ready-set query". The ready-set *predicate* — every
+#: dependency MERGED — is computed in Python over the projection rather than in
+#: SQL, so what an index can serve is the state-filtered lifecycle read that the
+#: ready-set computation, resume, and cancellation all issue.
+READY_SET_INDEX = "idx_ready_set"
+
+#: The state an attempt row takes when its attempt ends without a verdict about
+#: the work: an environmental retry, a cancellation, an abandon. Chosen from the
+#: existing vocabulary rather than adding a seventh state, and it matters that
+#: the row stops reading RUNNING for three separate reasons — the partial unique
+#: index above must release, §7.6's watchdog must stop polling a dead attempt,
+#: and §7.7 adjudicates a late arrival against `attempts.state`, so a row left
+#: RUNNING would ACCEPT a result from an attempt nobody is waiting for.
+CLOSED_ATTEMPT_STATE = st.NodeState.CANCELLED
 
 
 def _enable_wal(conn: sqlite3.Connection, attempts: int = 50) -> None:
@@ -197,6 +241,39 @@ def _epoch_seconds(stamp: Optional[str]) -> float:
         return datetime.fromisoformat(stamp).timestamp()
     except ValueError:
         return 0.0
+
+
+def _audit_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    """One audit row as a plain dict (§5.3, §10.5).
+
+    The three prohibitions this function exists to satisfy, none of which is
+    obvious from the call site:
+
+    * **Never a validating model.** The house style is pydantic, so
+      `Transition(**row)` is the natural thing to write and is exactly how
+      digest-revalidation-on-load returns. The return type is `dict`, always.
+    * **Unknown keys are ignored.** A column or blob key a later version wrote
+      arrives here and is carried through untouched; nothing enumerates the
+      expected set, so nothing can reject a row for carrying more than it knew.
+    * **A NULL column is absent, never defaulted.** `no default applied on read`
+      is a rule about silence: a defaulted `node_id` on a run-level transition
+      would read as a real node to any caller comparing it. An absent key makes
+      the caller supply its own default at the point of use, where the meaning
+      of the absence is known.
+
+    `*_json` columns are `json.loads`ed to plain dicts and lose the suffix, so
+    `detail_json` reads back as `detail`.
+    """
+    out: Dict[str, Any] = {}
+    for key in row.keys():
+        value = row[key]
+        if value is None:
+            continue
+        if key.endswith("_json"):
+            out[key[:-len("_json")]] = json.loads(value)
+        else:
+            out[key] = value
+    return out
 
 
 def _is_ancestor(repo_path, sha: str, ref: str = "HEAD") -> bool:
@@ -286,8 +363,14 @@ def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: s
 # ── the store ────────────────────────────────────────────────────────────────
 
 class LifecycleStore:
-    """SQLite-backed authority tier: `dag_nodes`, `node_lifecycle`, `attempts`,
-    `transitions`, and `runs` (§5.3). Safe to share across a thread pool."""
+    """SQLite-backed ledger for two of §5.3's three tiers.
+
+    Authority — `runs`, `dag_nodes`, `node_lifecycle`, `attempts` — is read at
+    runtime. Audit — `transitions`, `results`, `orphans` — is written here and
+    read only post-mortem, through the `audit_*` methods, which return plain
+    dicts precisely so nothing can start treating them as authority (§10.5).
+
+    Safe to share across a thread pool."""
 
     def __init__(self, db_path):
         ensure_dir(Path(db_path).parent)
@@ -548,6 +631,110 @@ class LifecycleStore:
         which already owns this computation."""
         return wt.upstream_blocked(self.node_records(run_id))
 
+    # ── the audit tier (§5.3, §7.7, §7.8, §10.5, §10.6) ─────────────────────
+
+    def _audit_query(self, sql: str, params: Tuple[Any, ...]) -> Tuple[Dict[str, Any], ...]:
+        """§10.6's one query path.
+
+        Every audit read — live or post-mortem, renderer or test — goes through
+        this one cursor pattern, so there is no dashboard-only schema and no
+        fixture-only truth to drift from what the run actually wrote. The row
+        factory is set on the **cursor**, never on the shared connection: the
+        authority-tier reads above index their rows by position, and flipping
+        the connection's factory under them would break every one of them.
+        """
+        cursor = self.conn.cursor()
+        cursor.row_factory = sqlite3.Row
+        try:
+            return tuple(_audit_dict(row) for row in cursor.execute(sql, params))
+        finally:
+            cursor.close()
+
+    @serialized
+    def audit_transitions(self, run_id: str,
+                           node_id: Optional[str] = None) -> Tuple[Dict[str, Any], ...]:
+        """The ordered transition history, oldest first (§5.3's audit tier).
+
+        Post-mortem only. Nothing in the scheduler may read this at runtime —
+        §11.2's backstop reads `runs.last_transition_at` for exactly that
+        reason, and `last_transition_at`'s docstring says why.
+        """
+        sql = "SELECT * FROM transitions WHERE run_id=?"
+        params: Tuple[Any, ...] = (run_id,)
+        if node_id is not None:
+            sql += " AND node_id=?"
+            params = (run_id, node_id)
+        return self._audit_query(sql + " ORDER BY id", params)
+
+    @serialized
+    def record_result(self, run_id: str, result: st.ResultRecord) -> None:
+        """Append one adjudicated result — payload and verdict in one row (§7.7).
+
+        `ResultRecord` refuses to exist without its payload and the column is
+        `NOT NULL`, so the failure this prevents is closed twice: an
+        adjudication stored without the payload it judged is how a correct FAIL
+        carrying two real findings vanished behind a byte-identical journal.
+
+        Its own `BEGIN IMMEDIATE` (§7.9) rather than a hitchhiker on a
+        transition's: a result arrives from a worker thread whenever the agent
+        finishes, which is not a lifecycle transition and must not refresh
+        `last_transition_at`.
+        """
+        payload = json.dumps(result.payload)  # outside the transaction on purpose
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT INTO results (run_id, node_id, attempt_no, subject_sha,"
+                " payload_json, adjudication, created_at) VALUES (?,?,?,?,?,?,?)",
+                (run_id, result.node_id, result.attempt_no, result.subject_sha,
+                 payload,
+                 result.adjudication.value if result.adjudication else None,
+                 now_iso()))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def audit_results(self, run_id: str,
+                       node_id: Optional[str] = None) -> Tuple[Dict[str, Any], ...]:
+        """Result rows with their payloads, oldest first (§7.7)."""
+        sql = "SELECT * FROM results WHERE run_id=?"
+        params: Tuple[Any, ...] = (run_id,)
+        if node_id is not None:
+            sql += " AND node_id=?"
+            params = (run_id, node_id)
+        return self._audit_query(sql + " ORDER BY id", params)
+
+    @serialized
+    def record_orphan(self, run_id: str, *, node_id: Optional[str] = None,
+                       attempt_no: Optional[int] = None, pid: Optional[int] = None,
+                       handle: Optional[str] = None, reason: str = "") -> None:
+        """Record a pane this process cannot reach (§7.8).
+
+        Audit, not authority: an orphan row changes no node's state and gates
+        nothing. It exists because resume's cost is stated rather than hidden —
+        one abandoned pane per in-flight node, visible and killed by hand — and
+        a cost nobody can enumerate is not visible.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT INTO orphans (run_id, node_id, attempt_no, pid, handle,"
+                " reason, created_at) VALUES (?,?,?,?,?,?,?)",
+                (run_id, node_id, attempt_no, pid, handle, reason or None, now_iso()))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def audit_orphans(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
+        """Every unreachable pane recorded for this run, oldest first (§7.8).
+        `run status` reports these so an operator can kill them by hand."""
+        return self._audit_query(
+            "SELECT * FROM orphans WHERE run_id=? ORDER BY id", (run_id,))
+
     # ── the generic guarded transition (§7.9) ───────────────────────────────
 
     @serialized
@@ -689,11 +876,22 @@ class LifecycleStore:
     def fail_attempt(self, run_id: str, node_id: str,
                       retry_class: st.RetryClass) -> st.NodeLifecycle:
         """RUNNING -> PENDING: an ENVIRONMENTAL/LAUNCHER_TRANSIENT failure that
-        earns another attempt automatically (§7.5) — not an operator escape."""
+        earns another attempt automatically (§7.5) — not an operator escape.
+
+        Closes the attempt row in the same transaction, and that write is not
+        bookkeeping. Leaving it RUNNING meant the node's *next* attempt row
+        collided with §10.3's partial unique index, §7.6's watchdog kept
+        polling an attempt nobody was running, and §7.7 adjudicated a late
+        arrival from the dead attempt as ACCEPTED rather than SUPERSEDED
+        because it reads `attempts.state`. The retry class is recorded
+        alongside, so the row still says what the attempt failed as.
+        """
         def extra(lifecycle: st.NodeLifecycle):
             return [(
-                "UPDATE attempts SET retry_class=? WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (retry_class.value, run_id, node_id, lifecycle.attempt_no))]
+                "UPDATE attempts SET retry_class=?, state=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (retry_class.value, CLOSED_ATTEMPT_STATE.value,
+                 run_id, node_id, lifecycle.attempt_no))]
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="scheduler",
             reason=f"retry:{retry_class.value}", require_state=(st.NodeState.RUNNING,),
@@ -725,6 +923,14 @@ class LifecycleStore:
                     " reason, actor, detail_json, created_at)"
                     " VALUES (?,?,'node',?,?, 'run-cancel','operator','{}',?)",
                     (run_id, node_id, current.value, st.NodeState.CANCELLED.value, now))
+                # §7.8's "its result is rejected because its attempt is no
+                # longer running" is only true if cancellation writes it. The
+                # scheduler never blocks on the kill, so the surviving pane may
+                # still report — and §7.7 reads this column to refuse it.
+                self.conn.execute(
+                    "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND state=?",
+                    (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
+                     st.NodeState.RUNNING.value))
                 cancelled.append(node_id)
             self.conn.execute(
                 "UPDATE runs SET last_transition_at=?, cancel_requested=1 WHERE run_id=?",
@@ -804,7 +1010,14 @@ class LifecycleStore:
         `last_transition_at` — BEFORE touching any inherited RUNNING attempt,
         so the backstop measures silence from the resume, not from the dead
         run's last act (§7.8, §11.2). Every inherited RUNNING attempt is
-        treated as ENVIRONMENTAL-failed and re-launched, never adopted."""
+        treated as ENVIRONMENTAL-failed and re-launched, never adopted.
+
+        Each one's pane is recorded in `orphans` before its attempt row is
+        closed — the pid lives on that row, so reading it afterwards would read
+        a row whose launch details are no longer the live ones. The resumed
+        process cannot reach those panes and does not try: §7.8's stated cost is
+        one abandoned pane per in-flight node, and these rows are what makes
+        `run status` able to name them for the operator to kill by hand."""
         outcome = self.latest_outcome(run_id)
         if outcome in (st.RunOutcome.ACCEPTED, st.RunOutcome.CANCELLED):
             raise ResumeRefused(
@@ -813,6 +1026,17 @@ class LifecycleStore:
         self._write_resume_transition(run_id)
         reclaimed = []
         for node_id in self._running_node_ids(run_id):
+            node = self.get_node(run_id, node_id)
+            try:
+                inherited = self.get_attempt(run_id, node_id, node.attempt_no)
+            except UnknownNode:
+                inherited = None
+            if inherited is not None:
+                self.record_orphan(
+                    run_id, node_id=node_id, attempt_no=inherited.attempt_no,
+                    pid=inherited.pid,
+                    handle=str(inherited.extra.get("pane")) if inherited.extra.get("pane") else None,
+                    reason="resume: inherited a RUNNING attempt this process does not own")
             self.fail_attempt(run_id, node_id, st.RetryClass.ENVIRONMENTAL)
             reclaimed.append(node_id)
         return tuple(reclaimed)
@@ -854,8 +1078,19 @@ class LifecycleStore:
     def abandon(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         """Any non-absolutely-terminal state -> CANCELLED (§7.3, §7.8, §11.3).
         Absolutely terminal from here on; descendants become derived-unready
-        (§8.7) with no state written for them at all."""
+        (§8.7) with no state written for them at all.
+
+        Closes the node's live attempt row in the same transaction, for the
+        same reason `cancel_run` does: `abandon` is the node-level form of
+        cancellation, and a result arriving from the abandoned attempt must
+        adjudicate as SUPERSEDED (§7.7)."""
         self._require_escape_legal(run_id)
+
+        def extra(lifecycle: st.NodeLifecycle):
+            return [(
+                "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND state=?",
+                (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
+                 st.NodeState.RUNNING.value))]
         return self._transition_node(
             run_id, node_id, st.NodeState.CANCELLED, actor="operator",
-            reason=st.Escape.ABANDON.value)
+            reason=st.Escape.ABANDON.value, extra_writes=extra)

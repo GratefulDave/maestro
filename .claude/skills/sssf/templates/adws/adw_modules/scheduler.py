@@ -321,6 +321,18 @@ class Scheduler:
                 if unmet:
                     why = f" (waiting on {', '.join(sorted(unmet))})"
             lines.append(f"  {record.node_id}: {record.state}{why}")
+        # §7.8 — panes a resumed process could not reach are recorded in
+        # `orphans` and reported here. The scheduler never adopts them and
+        # never kills them, so if this text does not name them the stated cost
+        # of resume ("visible and killed by hand") has no visible half.
+        orphans = store.audit_orphans(self.run_id)
+        if orphans:
+            lines.append(f"  {len(orphans)} orphaned pane(s) — kill by hand:")
+            for row in orphans:
+                where = row.get("handle") or (
+                    f"pid {row['pid']}" if row.get("pid") is not None else "no handle recorded")
+                lines.append(f"    orphan {row.get('node_id', '?')}"
+                             f"#{row.get('attempt_no', '?')}: {where}")
         return "\n".join(lines)
 
     # ── one attempt (§7.3, §7.4, §8.3, §8.4) ────────────────────────────────
