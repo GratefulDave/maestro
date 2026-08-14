@@ -21,12 +21,37 @@ which imports pydantic and rich at module scope.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import unittest
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parent
 TESTS = ADWS / "tests"
+
+
+def _refuse_cached_bytecode() -> None:
+    """Run the suite from source only, never from a .pyc.
+
+    Bytecode caching makes this suite lie in both directions. Python validates
+    a cache entry against the source's mtime and size, so an edit that keeps a
+    file the same size and lands in the same second as the cached entry is
+    indistinguishable from no edit at all: the previous build is imported, and
+    the run reports on code that is no longer on disk. That produces a false
+    red when the edit was a fix and a false green when the edit was the defect,
+    and both have been observed here.
+
+    Deleting `__pycache__` inside the repository does not help on this
+    interpreter, because `sys.pycache_prefix` redirects the cache to a mirror
+    tree outside it. So this closes all three paths: point the prefix back at
+    the source tree, remove the caches now sitting there, and stop writing new
+    ones. Every module the loader imports below is therefore compiled from the
+    bytes currently on disk.
+    """
+    sys.pycache_prefix = None
+    sys.dont_write_bytecode = True
+    for cache in ADWS.rglob("__pycache__"):
+        shutil.rmtree(cache, ignore_errors=True)
 
 
 def main() -> int:
@@ -41,6 +66,7 @@ def main() -> int:
         print(f"no test directory at {TESTS}", file=sys.stderr)
         return 1
 
+    _refuse_cached_bytecode()
     sys.path.insert(0, str(ADWS))
     loader = unittest.TestLoader()
     if args.match:
