@@ -1,9 +1,22 @@
-"""Pi coding agent interface — v1's only coding agent.
+"""omp coding agent interface — v1's only coding agent.
 
-Runs `pi -p --mode json` and tails its JSONL stdout line by line, forwarding
-each event to a callback WHILE the agent works (the streaming crack, solved
-by construction). `--session-id` creates-or-continues, so running and
-continuing an agent are the same call: same session id = same context window.
+Runs `omp -p --mode json` and tails its JSONL stdout line by line, forwarding
+each event to a callback WHILE the agent works (the streaming crack, solved by
+construction).
+
+Three things here are shaped by what omp 17.3.1 actually accepts, measured on
+2026-08-13 rather than read from documentation:
+
+* There is no `--list-models` flag. The catalog is the `omp models --json`
+  subcommand, which reports provider, id, and context window together.
+* There is no `--session-id`. A session is identified by the directory it
+  lives in, and `-c` continues the newest session there. Since each agent
+  already gets its own session directory, "same directory plus -c" is what
+  "same session id = same context window" means on this route.
+* The model omp reports back is not always the model it was asked for: a
+  request for `openai-codex/gpt-5.6-luna` runs `openai-codex/gpt-5.6-terra`.
+  So the reported binding is checked against the requested one and a
+  substitution raises rather than being recorded as the model that ran.
 """
 
 from __future__ import annotations
@@ -19,9 +32,19 @@ from typing import Callable, Optional
 from .data_types import PiRequest, PiResult
 from .utils import now_iso, operator_env
 
-PI_PATH = os.environ.get("PI_PATH", "pi")
-MODELS_JSON = os.environ.get("PI_MODELS_PATH",
-                             str(Path.home() / ".pi" / "agent" / "models.json"))
+
+class ModelBindingError(RuntimeError):
+    """omp ran a different model than the roster asked for.
+
+    Recording the requested model when another one answered would put a
+    number in the trace that no run produced, so this is fatal rather than a
+    warning.
+    """
+
+
+def omp_path() -> str:
+    """The omp binary, read at call time so a run can point at another one."""
+    return os.environ.get("OMP_PATH") or os.environ.get("PI_PATH") or "omp"
 
 RESULT_SNIPPET_CHARS = 20_000   # tool output rides along whole; clip only guards pathological cases
 ARG_VALUE_CHARS = 20_000        # args too — the UI scrolls, it must not be handed cut-off data
@@ -31,52 +54,50 @@ LABEL_CHARS = 80                # "bash: <command>" shown as the event name
 PRIMARY_ARGS = ("command", "path", "file_path", "pattern", "query", "url")
 
 
-def _count(value: str) -> int:
-    """Parse pi's compact model-list counts (`272K`, `1.0M`)."""
-    suffixes = {"K": 1_000, "M": 1_000_000}
-    suffix = value[-1:].upper()
-    if suffix in suffixes:
-        return int(float(value[:-1]) * suffixes[suffix])
-    return int(value)
-
-
 @lru_cache(maxsize=1)
-def _pi_catalog() -> list[tuple[str, str, int]]:
-    """Read pi's merged catalog, including built-in providers and custom models."""
+def catalog() -> tuple:
+    """omp's merged model catalog, as `(provider, model_id, context_window)`.
+
+    `omp models --json` reports the same merged view the picker shows —
+    built-in providers plus anything registered locally — and carries the
+    context window with each row, so this is the only place model facts are
+    read from.
+    """
     try:
         result = subprocess.run(
-            [PI_PATH, "--list-models"], capture_output=True, text=True,
+            [omp_path(), "models", "--json"], capture_output=True, text=True,
             timeout=30, env=operator_env(), check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return ()
     if result.returncode != 0:
-        return []
+        return ()
+    try:
+        listed = json.loads(result.stdout).get("models", [])
+    except (json.JSONDecodeError, AttributeError):
+        return ()
     rows = []
-    for line in result.stdout.splitlines()[1:]:
-        columns = line.split()
-        if len(columns) < 3:
+    for model in listed:
+        provider, model_id = model.get("provider"), model.get("id")
+        if not provider or not model_id:
             continue
-        try:
-            rows.append((columns[0], columns[1], _count(columns[2])))
-        except ValueError:
-            continue
-    return rows
+        rows.append((provider, model_id, int(model.get("contextWindow") or 0)))
+    return tuple(rows)
 
 
 def resolve_model(pattern: str) -> tuple[str, str]:
     """Resolve a model pattern to an explicit ``(provider, model_id)`` pair.
 
-    Pi's catalog merges built-in models with ``~/.pi/agent/models.json``. Using
-    that same merged view lets SSSF target direct providers such as
-    ``openai/gpt-5.6-terra`` without re-registering built-in models locally.
+    omp's catalog merges built-in models with whatever is registered locally.
+    Using that same merged view lets SSSF target direct providers such as
+    ``openai-codex/gpt-5.6-terra`` without re-registering built-in models.
     """
-    catalog = [(provider, model_id) for provider, model_id, _ in _pi_catalog()]
+    listed = [(provider, model_id) for provider, model_id, _ in catalog()]
     if "/" in pattern:
         provider, model_id = pattern.split("/", 1)
-        if (provider, model_id) in catalog:
+        if (provider, model_id) in listed:
             return provider, model_id
-    matches = [(provider, model_id) for provider, model_id in catalog
+    matches = [(provider, model_id) for provider, model_id in listed
                if pattern == model_id or pattern in model_id]
     exact = [match for match in matches
              if match[1] == pattern or match[1].endswith("/" + pattern)]
@@ -85,7 +106,7 @@ def resolve_model(pattern: str) -> tuple[str, str]:
     if len(matches) == 1:
         return matches[0]
     if not matches:
-        raise ValueError(f"model pattern {pattern!r} not found in pi --list-models — "
+        raise ValueError(f"model pattern {pattern!r} not found in `omp models` — "
                          "authenticate/register it or fix the config")
     raise ValueError(f"model pattern {pattern!r} is ambiguous: {matches}")
 
@@ -106,12 +127,8 @@ def _context_tokens(usage: dict) -> int:
 
 
 def context_window(provider: str, model_id: str) -> int:
-    """The model's context ceiling from pi's merged model catalog."""
-    registry = json.loads(Path(MODELS_JSON).read_text())
-    for model in registry.get("providers", {}).get(provider, {}).get("models", []):
-        if model.get("id") == model_id:
-            return int(model.get("contextWindow") or 0)
-    for listed_provider, listed_model, window in _pi_catalog():
+    """The model's context ceiling from omp's merged model catalog."""
+    for listed_provider, listed_model, window in catalog():
         if listed_provider == provider and listed_model == model_id:
             return window
     return 0
@@ -215,14 +232,21 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     to hunt for in `ps` while the run sits there.
     """
     provider, model_id = resolve_model(request.model)
+    sessions = Path(request.session_dir)
     cmd = [
-        PI_PATH, "-p", "--mode", "json",
+        omp_path(), "-p", "--mode", "json",
         "--provider", provider, "--model", model_id,
         "--thinking", request.thinking,
-        "--session-id", request.session_id,
-        "--session-dir", request.session_dir,
+        "--session-dir", str(sessions),
         "--system-prompt", request.system_prompt,
     ]
+    # omp has no --session-id, so rejoining a context window is "the same
+    # session directory, continued". Each agent already owns its directory
+    # (§12.2 step 1 item 4 keys it by agent, node, and attempt), so -c
+    # continues that agent's own session and nobody else's. The first run in a
+    # directory has nothing to continue and must not ask.
+    if sessions.is_dir() and any(sessions.glob("*.jsonl")):
+        cmd.append("-c")
     if request.tools:
         cmd += ["--tools", ",".join(request.tools)]
     for extension in request.extensions:
@@ -232,6 +256,8 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     raw_path = Path(request.raw_output_path)
     raw_path.parent.mkdir(parents=True, exist_ok=True)
 
+    requested = "{}/{}".format(provider, model_id)
+    ran = set()
     result = PiResult(session_id=request.session_id,
                       context_window=context_window(provider, model_id))
     # stdin is DEVNULL, deliberately. The prompt travels in argv, so the child
@@ -260,6 +286,12 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
                 continue
             if event.get("type") == "message_end":
                 message = event.get("message", {})
+                # The binding omp reports, turn by turn. A real run's first
+                # message_end is the user echo and names no model at all, so
+                # only a turn that states one is evidence of what ran.
+                if message.get("model"):
+                    ran.add("{}/{}".format(message.get("provider") or "",
+                                           message.get("model")))
                 if message.get("role") == "assistant":
                     text = _text_of(message)
                     if text:
@@ -282,5 +314,15 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     if on_exit:
         on_exit(process.pid)
     if result.returncode != 0 and not result.text:
-        raise RuntimeError(f"pi exited {result.returncode}: {stderr.strip()[-800:]}")
+        raise RuntimeError(f"omp exited {result.returncode}: {stderr.strip()[-800:]}")
+    # §9.5's binding verification, on the model rather than the binary. omp
+    # answers some requests with a different model than it was handed, and a
+    # run that records the request rather than the answer reports a model that
+    # never produced a token.
+    substituted = sorted(binding for binding in ran if binding != requested)
+    if substituted:
+        raise ModelBindingError(
+            "omp was asked for {} and ran {} — the roster's model is not what "
+            "answered".format(requested, ", ".join(substituted)))
+    result.model_ran = requested if ran else ""
     return result
