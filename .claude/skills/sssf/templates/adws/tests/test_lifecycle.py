@@ -32,6 +32,7 @@ sys.path.insert(0, str(ADWS))
 
 from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import watchdog as wd  # noqa: E402
 
 
 def make_node(node_id: str, depth: int, needs=()) -> st.PlanNode:
@@ -130,6 +131,21 @@ class TransitionTransactionTests(unittest.TestCase):
             # ISO-8601 strings sort lexicographically; >= tolerates two writes
             # landing in the same millisecond while still proving the refresh ran.
             self.assertGreaterEqual(after, before)
+
+    def test_mark_launched_preserves_transcript_metadata_across_rearming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            attempt_no = store.start_attempt("run1", "a", base_sha="deadbeef")
+            store.mark_launched(
+                "run1", "a", attempt_no, None,
+                extra={wd.SESSION_PATH_KEY: "/tmp/session.jsonl"})
+            store.mark_launched("run1", "a", attempt_no, None)
+
+            attempt = store.attempts_for("run1", "a")[0]
+            self.assertEqual(
+                attempt.extra[wd.SESSION_PATH_KEY], "/tmp/session.jsonl")
+            self.assertIsNotNone(attempt.launched_at)
 
     def test_a_refused_transition_writes_nothing(self):
         """The guard fires before any write — a failed transition leaves no residue."""
@@ -468,19 +484,76 @@ class EscapeTests(unittest.TestCase):
             store = new_store(Path(tmp))
             store.create_run("run1", "d", [make_node("a", 0), make_node("b", 0)])
 
-            store.start_attempt("run1", "a", base_sha="s1")
+            store.start_attempt("run1", "a", base_sha=good_sha)
             store.mark_blocked("run1", "a", st.BlockReason.GATE_NOT_FALSIFIABLE)
             store.declare_outcome("run1")
             store.skip("run1", "a", accept_sha=good_sha, repo_path=repo)
             self.assertEqual(store.get_node("run1", "a").state, st.NodeState.MERGED)
             self.assertEqual(store.get_node("run1", "a").output_sha, good_sha)
 
-            store.start_attempt("run1", "b", base_sha="s1")
+            store.start_attempt("run1", "b", base_sha=good_sha)
             store.mark_blocked("run1", "b", st.BlockReason.GATE_NOT_FALSIFIABLE)
             store.declare_outcome("run1")
             with self.assertRaises(lc.LifecycleError):
                 store.skip("run1", "b", accept_sha=bad_sha, repo_path=repo)
             self.assertEqual(store.get_node("run1", "b").state, st.NodeState.BLOCKED)
+
+    def test_skip_rejects_an_older_ancestor_of_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            parent = _init_git_repo(repo)
+            (repo / "f.txt").write_text("later")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "later"],
+                           check=True)
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha=parent)
+            store.mark_blocked("run1", "a", st.BlockReason.GATE_NOT_FALSIFIABLE)
+            store.declare_outcome("run1")
+            with self.assertRaises(lc.SkipAncestryRefused):
+                store.skip("run1", "a", accept_sha=parent, repo_path=repo)
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
+
+    def test_skip_rejects_head_before_the_attempt_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            parent = _init_git_repo(repo)
+            (repo / "f.txt").write_text("attempt base")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+                           check=True)
+            attempt_base = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(
+                ["git", "-C", str(repo), "reset", "--hard", parent],
+                check=True, capture_output=True)
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha=attempt_base)
+            store.mark_blocked("run1", "a", st.BlockReason.GATE_NOT_FALSIFIABLE)
+            store.declare_outcome("run1")
+            with self.assertRaises(lc.SkipAncestryRefused):
+                store.skip("run1", "a", accept_sha=parent, repo_path=repo)
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
+
+    def test_skip_rejects_a_dirty_current_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            head = _init_git_repo(repo)
+            (repo / "dirt.txt").write_text("uncommitted")
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha=head)
+            store.mark_blocked("run1", "a", st.BlockReason.GATE_NOT_FALSIFIABLE)
+            store.declare_outcome("run1")
+            with self.assertRaises(lc.SkipAncestryRefused):
+                store.skip("run1", "a", accept_sha=head, repo_path=repo)
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
 
     def test_every_stored_block_reason_admits_its_declared_escapes(self):
         """§11.3's tested property, executed rather than asserted from the table:
@@ -496,7 +569,7 @@ class EscapeTests(unittest.TestCase):
                     with tempfile.TemporaryDirectory() as run_tmp:
                         store = new_store(Path(run_tmp))
                         store.create_run("run1", "d", [make_node("a", 0)])
-                        store.start_attempt("run1", "a", base_sha="s1")
+                        store.start_attempt("run1", "a", base_sha=good_sha)
                         store.mark_blocked("run1", "a", reason)
                         store.declare_outcome("run1")
 

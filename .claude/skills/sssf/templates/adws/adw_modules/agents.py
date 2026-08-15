@@ -15,10 +15,10 @@ from typing import Optional
 
 import yaml
 
-from . import agent_pi, permissions, prompts
+from . import agent_cc, agent_pi, permissions, prompts
 from .data_types import (AgentCall, AgentConfig, EnvelopeBase, EventRecord,
-                         GateCheck, GateReport, Phase, PiRequest, SSSFConfig,
-                         UsageBreakdown)
+                         GateCheck, GateReport, Phase, PiRequest, PiResult,
+                         SSSFConfig, UsageBreakdown)
 from .utils import new_id
 
 JSON_FIX_ATTEMPTS = 2      # continue-with-correction attempts for malformed JSON
@@ -58,25 +58,33 @@ def validate(cfg: SSSFConfig, required: list[str]) -> None:
         except SystemExit as e:
             problems.append(str(e))
             continue
-        if agent.coding_agent not in ("omp", "pi"):
-            problems.append(f"agent {name!r}: coding_agent {agent.coding_agent!r} "
-                            f"is not implemented in v1 (omp only)")
+        if agent.coding_agent not in ("omp", "pi", "claude_code"):
+            problems.append(f"agent {name!r}: unsupported coding_agent "
+                            f"{agent.coding_agent!r}")
+        elif agent.coding_agent in ("omp", "pi"):
+            try:
+                agent_pi.resolve_model(agent.model)
+            except ValueError as e:
+                problems.append(f"agent {name!r}: {e}")
+        else:
+            try:
+                agent_cc.validate_capabilities(agent.tools, agent.harness_engineering)
+            except ValueError as e:
+                problems.append(f"agent {name!r}: {e}")
+        # Claude validates its reported identity at the process boundary.  It
+        # has no OMP catalog, so asking OMP to resolve this route's alias would
+        # incorrectly reject a valid direct-Claude roster before it can run.
         for label, ref in (("system", agent.prompt_engineering.system),
                            ("user", agent.prompt_engineering.user)):
             if not Path(ref).is_file():
                 problems.append(f"agent {name!r}: {label} prompt not found: {ref}")
-        try:
-            agent_pi.resolve_model(agent.model)
-        except ValueError as e:
-            problems.append(f"agent {name!r}: {e}")
     if problems:
         raise SystemExit("config validation failed:\n- " + "\n- ".join(problems))
 
 
 # ── execution ────────────────────────────────────────────────────────────────
-
 def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
-    """One agent call: render prompts -> pi run -> typed parse -> gates -> envelope."""
+    """One agent call: render prompts -> selected route -> typed parse -> gates."""
     agent = resolve(run.cfg, phase.params.owner)
     agent_dir = run.session_dir / agent.name
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -99,17 +107,18 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
                                           "session_id": session_id,
                                           "coding_agent": agent.coding_agent,
                                           "purpose": agent.purpose,
-                                          "tools": agent.tools,  # None = all tools
+                                          "tools": agent.tools,
                                           "harness_engineering": agent.harness_engineering}))
     run.console.agent_started(agent.name, agent.model, session_id)
 
-    # Parse retries and gate corrections re-enter the SAME pi session, so the
-    # last send is the one whose context occupancy is current — while spend is
-    # the opposite: every send costs, so usage accumulates across all of them.
-    latest: agent_pi.PiResult | None = None
+    # Parse retries and gate corrections re-enter the same route/session, so
+    # the last send is the one whose context occupancy is current — while spend
+    # is the opposite: every send costs, so usage accumulates across all of them.
+    latest: Optional[PiResult] = None
     spent = UsageBreakdown()
+    runner = agent_cc.run if agent.coding_agent == "claude_code" else agent_pi.run
 
-    def send(prompt_text: str) -> agent_pi.PiResult:
+    def send(prompt_text: str) -> PiResult:
         nonlocal latest
         request = PiRequest(
             prompt=prompt_text,
@@ -117,14 +126,14 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             model=agent.model,
             thinking=agent.thinking,
             session_id=session_id,
-            # absolute: these are read by the pi subprocess, which runs in repo_root
+            # Absolute: direct subprocesses run from repo_root.
             session_dir=str((agent_dir / "pi_sessions").resolve()),
             raw_output_path=str((agent_dir / "raw_output.jsonl").resolve()),
             tools=agent.tools,
             extensions=agent.harness_engineering,
             cwd=str(run.repo_root),
         )
-        result = agent_pi.run(
+        result = runner(
             request,
             on_event=_event_forwarder(run, phase, agent.name),
             on_spawn=lambda pid: run.tracer.process_start(
@@ -141,49 +150,56 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     # measured against this one baseline.
     tree_before = permissions.snapshot(run)
 
-    result = send(user_text)
-    envelope, attempt = _parse_with_retries(run, phase, call, result, send)
-
-    # claim gates — violations flow back into the SAME session as corrections
-    for gate_attempt in range(1, max(1, phase.params.retries + 1) + 1):
-        violations = []
-        for gate in call.gates:
-            report = _as_report(gate(envelope, run))
-            found = report.violations
-            run.tracer.gate_row(phase, gate.__name__, report, gate_attempt)
-            run.tracer.event(EventRecord(
-                adw_id=run.adw_id, phase_id=phase.phase_id,
-                type="gate_fail" if found else "gate_pass", name=gate.__name__,
-                payload={"attempt": gate_attempt, "violations": found,
-                         "checks": [c.model_dump() for c in report.checks]}))
-            run.console.gate_result(gate.__name__, report)
-            violations.extend(found)
-        if not violations:
-            break
-        if gate_attempt > phase.params.retries:
-            raise GateFailure(f"{agent.name} failed gates after {gate_attempt} attempt(s):\n- "
-                              + "\n- ".join(violations))
-        phase.attempt = gate_attempt
-        run.console.retry(agent.name, gate_attempt, phase.params.retries,
-                          f"{len(violations)} gate violation(s)")
-        correction = ("Your previous response failed validation:\n- "
-                      + "\n- ".join(violations)
-                      + "\n\nFix these problems, then re-emit ONLY your Report JSON.")
-        result = send(correction)
+    pending = None
+    touched = []
+    try:
+        result = send(user_text)
         envelope, attempt = _parse_with_retries(run, phase, call, result, send)
 
-    # Permission is checked after every send is done, and before the envelope is
-    # accepted: an agent does not get to report success on a phase in which it
-    # wrote somewhere it was not allowed to.
-    try:
-        touched = permissions.enforce(run, phase, agent, tree_before)
-    except permissions.PermissionBreach as breach:
-        run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
-                                     type="error", name="permission_breach",
-                                     payload={"agent": agent.name, "error": str(breach),
-                                              "writes": agent.writes,
-                                              "protected_files": run.cfg.defaults.protected_files}))
+        # claim gates — violations flow back into the SAME session as corrections
+        for gate_attempt in range(1, max(1, phase.params.retries + 1) + 1):
+            violations = []
+            for gate in call.gates:
+                report = _as_report(gate(envelope, run))
+                found = report.violations
+                run.tracer.gate_row(phase, gate.__name__, report, gate_attempt)
+                run.tracer.event(EventRecord(
+                    adw_id=run.adw_id, phase_id=phase.phase_id,
+                    type="gate_fail" if found else "gate_pass", name=gate.__name__,
+                    payload={"attempt": gate_attempt, "violations": found,
+                             "checks": [c.model_dump() for c in report.checks]}))
+                run.console.gate_result(gate.__name__, report)
+                violations.extend(found)
+            if not violations:
+                break
+            if gate_attempt > phase.params.retries:
+                raise GateFailure(f"{agent.name} failed gates after {gate_attempt} attempt(s):\n- "
+                                  + "\n- ".join(violations))
+            phase.attempt = gate_attempt
+            run.console.retry(agent.name, gate_attempt, phase.params.retries,
+                              f"{len(violations)} gate violation(s)")
+            correction = ("Your previous response failed validation:\n- "
+                          + "\n- ".join(violations)
+                          + "\n\nFix these problems, then re-emit ONLY your Report JSON.")
+            result = send(correction)
+            envelope, attempt = _parse_with_retries(run, phase, call, result, send)
+    except BaseException as exc:
+        pending = exc
         raise
+    finally:
+        try:
+            touched = permissions.enforce(run, phase, agent, tree_before)
+        except permissions.PermissionBreach as breach:
+            run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
+                                         type="error", name="permission_breach",
+                                         payload={"agent": agent.name, "error": str(breach),
+                                                  "writes": agent.writes,
+                                                  "protected_files": run.cfg.defaults.protected_files}))
+            if pending is None:
+                raise
+
+    if pending is not None:
+        raise pending
     if touched:
         run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                      type="log", name="paths_touched",
@@ -232,21 +248,69 @@ def _agent_session_id(run, agent: AgentConfig) -> str:
     return f"sssf-{run.adw_id}-{agent.name}-{new_id(4)}"
 
 
+def _tool_tracker_events(event: dict) -> tuple:
+    """Translate Claude's raw tool blocks into the established tracer protocol."""
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return (event,)
+
+    if event.get("type") == "assistant":
+        calls = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            calls.append({
+                "type": "toolCall",
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "arguments": block.get("input") if isinstance(block.get("input"), dict) else {},
+            })
+        if calls:
+            return ({"type": "message_end", "message": {"content": calls}},)
+
+    if event.get("type") == "user":
+        completions = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            call_id = block.get("tool_use_id")
+            if not call_id:
+                continue
+            result_content = block.get("content")
+            if isinstance(result_content, str):
+                result = {"content": [{"type": "text", "text": result_content}]}
+            elif isinstance(result_content, list):
+                result = {"content": result_content}
+            else:
+                result = {}
+            completions.append({
+                "type": "tool_execution_end",
+                "toolCallId": call_id,
+                "result": result,
+                "isError": bool(block.get("is_error")),
+            })
+        if completions:
+            return tuple(completions)
+    return (event,)
+
+
 def _event_forwarder(run, phase: Phase, agent_name: str):
     """One tool_call event per real tool call, with its exact args and result."""
     tracker = agent_pi.ToolCallTracker()
 
     def forward(event: dict) -> None:
-        record = tracker.observe(event)
-        if record is None:
-            return
-        # The call's span rides the columns; duration_ms stays in the payload as
-        # pi's own authoritative number.
-        run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
-                                     type="tool_call", name=record.pop("label"),
-                                     started_at=record.pop("started_at", None),
-                                     ended_at=record.pop("ended_at", None),
-                                     payload={**record, "agent": agent_name}))
+        for tracker_event in _tool_tracker_events(event):
+            record = tracker.observe(tracker_event)
+            if record is None:
+                continue
+            # The call's span rides the columns; duration_ms stays in the payload as
+            # pi's own authoritative number.
+            run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
+                                         type="tool_call", name=record.pop("label"),
+                                         started_at=record.pop("started_at", None),
+                                         ended_at=record.pop("ended_at", None),
+                                         payload={**record, "agent": agent_name}))
     return forward
 
 

@@ -18,7 +18,7 @@ The shape of an attempt, in the order the caller must execute it:
     permission_check(attempt, d, declared)   # §8.3's two conjuncts (§7.3 clause 4)
     sha = commit_measured_delta(attempt, d, after, msg)   # §8.4, before the gate
     check_post_commit(attempt, expected_inventory(baseline, d, after))
-    run_node_gate(attempt, cmd, selector)    # §7.3 clause 3, at the node's own scope
+    run_node_gate(attempt, cmd, selector, cancel_requested)  # §7.3 clause 3
     merge_verified_node(integration, node_id, sha)        # §8.5, §8.6
 
 Two things this module deliberately does not do, so that no caller can mistake
@@ -58,7 +58,13 @@ import re
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from .launcher import (
+    HarnessCancelled,
+    HarnessQuiescenceError,
+    run_harness_process,
+)
 
 # An inventory maps a worktree-relative path to its tuple: git's mode class and
 # git's blob object id for the bytes at that path (§8.3).
@@ -122,6 +128,11 @@ class StagingMismatch(WorktreeError):
     of passing a tautology. Also fails the attempt ENVIRONMENTAL.
     """
 
+class GateCancelled(WorktreeError):
+    """A gate stopped without a result after its owned process group quiesced."""
+
+
+
 
 # ── git plumbing ────────────────────────────────────────────────────────────
 
@@ -166,6 +177,47 @@ def integration_head(repo: Path, branch: str) -> str:
     if result.returncode != 0:
         raise WorktreeError(f"integration branch {branch!r} does not resolve in {repo}")
     return result.stdout.strip()
+
+_OBJECT_DIGEST = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def is_valid_output_commit(repo: Path, output_sha: str,
+                           expected_base: Optional[str] = None) -> bool:
+    """Whether a durable output identity names the recorded commit.
+
+    A lifecycle row is authority only after its SHA has the canonical object
+    shape, resolves as a commit in this repository, and — for a still
+    VERIFIED attempt — descends from that attempt's immutable execution base.
+    """
+    if not _OBJECT_DIGEST.fullmatch(output_sha):
+        return False
+    repo = Path(repo)
+    if _git(repo, "cat-file", "-e", f"{output_sha}^{{commit}}",
+            check=False).returncode != 0:
+        return False
+    return (expected_base is None
+            or _git(repo, "merge-base", "--is-ancestor", expected_base, output_sha,
+                    check=False).returncode == 0)
+
+
+def is_attempt_output_commit(repo: Path, output_sha: str, *, run_id: str,
+                             node_id: str, attempt_no: int,
+                             expected_base: str) -> bool:
+    """Whether SHA is the exact commit published by this durable attempt ref.
+
+    An ancestry predicate alone accepts a later descendant that a forged
+    lifecycle row can name.  The attempt branch is created from the recorded
+    base and advanced once by compare-and-swap when the private-index commit is
+    made, so its exact ref is the durable identity that binds the row to the
+    attempt that produced it.
+    """
+    if not is_valid_output_commit(repo, output_sha, expected_base=expected_base):
+        return False
+    ref = "refs/heads/{}".format(branch_name(run_id, node_id, attempt_no))
+    resolved = _git(
+        Path(repo), "rev-parse", "--verify", "--quiet", "{}^{{commit}}".format(ref),
+        check=False)
+    return resolved.returncode == 0 and resolved.stdout.strip() == output_sha
 
 
 # ── §8.2 identity ───────────────────────────────────────────────────────────
@@ -774,10 +826,17 @@ class GateResult:
     tail: Tuple[str, ...] = ()
 
 
-def _run_gate(worktree: Path, command: Sequence[str], scratch: Path, label: str,
-              scope: str, selector: Optional[str]) -> GateResult:
-    result = subprocess.run(list(command), cwd=str(worktree), capture_output=True,
-                            text=True, env=launch_env(scratch))
+def _run_gate(
+        worktree: Path, command: Sequence[str], scratch: Path, label: str,
+        scope: str, selector: Optional[str],
+        cancel_requested: Callable[[], bool],
+) -> GateResult:
+    try:
+        result = run_harness_process(
+            command, cwd=worktree, env=launch_env(scratch),
+            cancel_requested=cancel_requested)
+    except HarnessCancelled as exc:
+        raise GateCancelled("gate cancelled before a result was produced") from exc
     output = (result.stdout or "") + (result.stderr or "")
     counts = {("error" if key.startswith("error") else key): int(value)
               for value, key in _COUNT.findall(output)}
@@ -788,6 +847,7 @@ def _run_gate(worktree: Path, command: Sequence[str], scratch: Path, label: str,
 
 
 def run_node_gate(attempt: AttemptWorktree, command: Sequence[str], selector: str,
+                  cancel_requested: Callable[[], bool],
                   label: str = "node-gate") -> GateResult:
     """Run a gate scoped to the node's own declared selector (§7.4, §7.3).
 
@@ -807,19 +867,22 @@ def run_node_gate(attempt: AttemptWorktree, command: Sequence[str], selector: st
             "a node gate needs the node's own selector; whole-suite execution is "
             "run_integration_gate (§8.8), never an unscoped node gate")
     return _run_gate(attempt.path, list(command) + [selector], attempt.scratch,
-                     label, "node", selector)
+                     label, "node", selector, cancel_requested)
 
 
-def run_integration_gate(worktree: Path, command: Sequence[str], scratch: Path,
-                         label: str = "integration-gate") -> GateResult:
-    """The whole-suite gate, at the final head, named in the plan (§8.8).
+def run_integration_gate(
+        worktree: Path, command: Sequence[str], scratch: Path,
+        cancel_requested: Callable[[], bool],
+        label: str = "integration-gate",
+) -> GateResult:
+    """Run the final whole-suite gate under the caller's cancellation lease.
 
-    This is the only gate that is deliberately unscoped, because it is the only
-    one whose job is the *integrated* tree: a semantic conflict between two
-    individually-correct nodes is invisible to the union of their specs, since
-    the union is built from exactly the specs that did not name it.
+    This is the only gate deliberately unscoped: it judges the integrated tree,
+    where semantic conflicts between individually-correct nodes become visible.
     """
-    return _run_gate(Path(worktree), command, Path(scratch), label, "integration", None)
+    return _run_gate(
+        Path(worktree), command, Path(scratch), label, "integration", None,
+        cancel_requested)
 
 
 # ── §8.5 deterministic merge order ──────────────────────────────────────────

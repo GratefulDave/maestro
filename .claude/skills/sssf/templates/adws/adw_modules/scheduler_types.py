@@ -130,6 +130,8 @@ class BlockReason(str, Enum):
     LAUNCHER_BUDGET_EXHAUSTED = "LAUNCHER_BUDGET_EXHAUSTED"
     CREDENTIAL_REFUSED = "CREDENTIAL_REFUSED"
     MERGE_CONFLICT = "MERGE_CONFLICT"
+    QUIESCENCE_UNPROVEN = "QUIESCENCE_UNPROVEN"
+    OUTPUT_IDENTITY_INVALID = "OUTPUT_IDENTITY_INVALID"
 
 
 #: The three failures that fit no retry class, because re-running a
@@ -172,6 +174,11 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (
         Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     BlockReason.CREDENTIAL_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    # A process group whose absence cannot be proven must be repaired before
+    # retry; a retry would overlap an owned survivor with a new attempt.
+    BlockReason.QUIESCENCE_UNPROVEN: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    # A durable SHA that does not name the recorded commit cannot be merged.
+    BlockReason.OUTPUT_IDENTITY_INVALID: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     # §8.7 — resolution is human, because a conflict means two output sets
     # overlapped in content though their declared globs did not, which is a
     # planning defect that re-prompting papers over.

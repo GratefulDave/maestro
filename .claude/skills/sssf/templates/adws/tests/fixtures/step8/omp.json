@@ -1,0 +1,24 @@
+{
+  "schema": "maestro-route-receipt.v1",
+  "captured_at": "2026-08-14",
+  "route": "omp",
+  "binary_version": "17.3.4",
+  "requested_model": "openai-codex/gpt-5.6-terra",
+  "reported_model": "openai-codex/gpt-5.6-terra",
+  "first_turn": {
+    "event_type": "message_end",
+    "role": "assistant",
+    "text": "MAESTRO_OMP_RECEIPT_OK",
+    "stop_reason": "stop",
+    "exit_code": 0
+  },
+  "continuation_turn": {
+    "continued_with": "-c",
+    "question": "previous exact marker",
+    "text": "MAESTRO_OMP_RECEIPT_OK",
+    "exit_code": 0
+  },
+  "continuity_proven": true,
+  "visible_pane_cwd_verified": true,
+  "cancellation_clean": true
+}

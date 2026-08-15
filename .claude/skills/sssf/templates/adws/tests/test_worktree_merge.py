@@ -233,7 +233,9 @@ class CacheRedirection(WorktreeTestCase):
         attempt = _attempt(self.repo, self.root)
         script = ("import json, os; print(json.dumps({k: os.environ.get(k) for k in "
                   "('XDG_CACHE_HOME', 'TMPDIR', 'PYTHONPYCACHEPREFIX', 'PYTEST_ADDOPTS')}))")
-        gate = wt.run_node_gate(attempt, [sys.executable, "-c", script], selector="ignored")
+        gate = wt.run_node_gate(
+            attempt, [sys.executable, "-c", script], selector="ignored",
+            cancel_requested=lambda: False)
         observed = json.loads(gate.tail[-1])
         for key, value in observed.items():
             self.assertIsNotNone(value, key)
@@ -256,7 +258,9 @@ class CacheRedirection(WorktreeTestCase):
                   "pathlib.Path(os.environ['TMPDIR'], 'gate-temp').write_text('t')\n"
                   "pathlib.Path(os.environ['XDG_CACHE_HOME'], 'gate-cache').write_text('c')\n")
         baseline = wt.take_baseline(attempt)
-        gate = wt.run_node_gate(attempt, [sys.executable, "-c", script], selector="ignored")
+        gate = wt.run_node_gate(
+            attempt, [sys.executable, "-c", script], selector="ignored",
+            cancel_requested=lambda: False)
         self.assertEqual(gate.exit_code, 0, gate.tail)
         self.assertEqual(wt.delta(baseline, wt.inventory(attempt.path)), wt.InventoryDelta())
         self.assertTrue((attempt.scratch / "tmp" / "gate-temp").is_file())
@@ -268,7 +272,9 @@ class CacheRedirection(WorktreeTestCase):
         attempt = _attempt(self.repo, self.root)
         script = "import pathlib; pathlib.Path('tool-residue.txt').write_text('beside its work')"
         baseline = wt.take_baseline(attempt)
-        wt.run_node_gate(attempt, [sys.executable, "-c", script], selector="ignored")
+        wt.run_node_gate(
+            attempt, [sys.executable, "-c", script], selector="ignored",
+            cancel_requested=lambda: False)
         measured = wt.delta(baseline, wt.inventory(attempt.path))
         self.assertEqual(measured.added, ("tool-residue.txt",))
         verdict = wt.permission_check(attempt, measured, declared=["calc.py"])
@@ -534,7 +540,8 @@ class GateScope(WorktreeTestCase):
         an unscoped node gate is not a default anyone can fall into."""
         attempt = _attempt(self.repo, self.root)
         with self.assertRaises(ValueError):
-            wt.run_node_gate(attempt, NODE_GATE, selector="")
+            wt.run_node_gate(attempt, NODE_GATE, selector="",
+                             cancel_requested=lambda: False)
 
     def test_the_whole_suite_is_red_for_a_node_whose_sibling_has_not_merged(self):
         """Probe finding F3, executed. nodeA does its own work correctly; the
@@ -544,23 +551,45 @@ class GateScope(WorktreeTestCase):
         attempt = _attempt(self.repo, self.root)
         (attempt.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
 
-        whole = wt.run_integration_gate(attempt.path, INTEGRATION_GATE, attempt.scratch)
+        whole = wt.run_integration_gate(
+            attempt.path, INTEGRATION_GATE, attempt.scratch,
+            cancel_requested=lambda: False)
         self.assertFalse(whole.green)
         self.assertEqual(whole.scope, "integration")
 
-        scoped = wt.run_node_gate(attempt, NODE_GATE, selector="test_calc")
+        scoped = wt.run_node_gate(
+            attempt, NODE_GATE, selector="test_calc",
+            cancel_requested=lambda: False)
         self.assertTrue(scoped.green, scoped)
         self.assertEqual(scoped.scope, "node")
 
     def test_the_pre_gate_is_red_and_the_post_gate_is_green_at_the_same_selector(self):
         """§7.4 / §7.3 clauses 2 and 3, at the scope F3 requires."""
         attempt = _attempt(self.repo, self.root)
-        pre = wt.run_node_gate(attempt, NODE_GATE, selector="test_calc", label="pre-gate")
+        pre = wt.run_node_gate(
+            attempt, NODE_GATE, selector="test_calc",
+            cancel_requested=lambda: False, label="pre-gate")
         self.assertFalse(pre.green)
         (attempt.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
-        post = wt.run_node_gate(attempt, NODE_GATE, selector="test_calc", label="post-gate")
+        post = wt.run_node_gate(
+            attempt, NODE_GATE, selector="test_calc",
+            cancel_requested=lambda: False, label="post-gate")
         self.assertTrue(post.green)
 
+
+
+    def test_cancellation_at_any_gate_scope_is_a_typed_non_result(self):
+        attempt = _attempt(self.repo, self.root)
+        cancelled = lambda: True
+
+        with self.assertRaises(wt.GateCancelled):
+            wt.run_node_gate(
+                attempt, NODE_GATE, selector="test_calc",
+                cancel_requested=cancelled)
+        with self.assertRaises(wt.GateCancelled):
+            wt.run_integration_gate(
+                attempt.path, INTEGRATION_GATE, attempt.scratch,
+                cancel_requested=cancelled)
 
 # ── §8.5 deterministic merge order ──────────────────────────────────────────
 
@@ -653,8 +682,9 @@ class MergeAndAcceptance(WorktreeTestCase):
             self.assertTrue(result.ancestry_proven, result)
             self.assertEqual(result.conflicted_paths, ())
 
-        gate = wt.run_integration_gate(integration, INTEGRATION_GATE,
-                                       self.root / "scratch" / "integration")
+        gate = wt.run_integration_gate(
+            integration, INTEGRATION_GATE, self.root / "scratch" / "integration",
+            cancel_requested=lambda: False)
         self.assertTrue(gate.green, gate.tail)
 
     def test_the_merge_consumes_the_output_sha_and_never_the_branch(self):

@@ -329,9 +329,9 @@ class Plan(BaseModel):
     evidence: Tuple[Evidence, ...]
     nodes: Tuple[Node, ...]
     merge_policy: MergePolicy
-    #: The digest of the plan this one supersedes, or `None`. Lineage
-    #: resolves to an existing receipt (§6.4's eleventh obligation).
-    supersedes: Optional[str] = None
+    #: The canonical digest of the plan this one supersedes, or `None`.
+    #: Lineage resolves to an existing receipt (§6.4's eleventh obligation).
+    supersedes: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     # ── queries the obligations and the scheduler both need ──────────────
 

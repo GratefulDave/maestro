@@ -260,6 +260,20 @@ class ClosedParse(ValidationTestCase):
                                    pv.Obligation.CLOSED_PARSE)
         self.assertTrue(any("reviewed_by" in b.pointer for b in found))
 
+    def test_malformed_supersedes_blocks_at_schema_parse_before_receipt_access(self):
+        data = self.mapping()
+        data["supersedes"] = "A" * 64
+        stored = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+        class ReceiptsMustNotBeRead:
+            def has_receipt(_self, _digest):
+                self.fail("a malformed supersedes digest must not reach receipt access")
+
+        found = self.assertBlocked(
+            self.validate(stored=stored, receipts=ReceiptsMustNotBeRead()),
+            pv.Obligation.CLOSED_PARSE)
+        self.assertEqual([blocker.pointer for blocker in found], ["/supersedes"])
+
     def test_non_canonical_bytes_are_refused_not_rewritten(self):
         """§6.3 — two byte-different files with one meaning would be two
         identities for one plan."""
