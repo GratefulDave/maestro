@@ -135,6 +135,15 @@ class CountingRuleTests(unittest.TestCase):
                                counts={})
         self.assertFalse(vf.adjudicate_gate(result, min_cases=1).green)
 
+    def test_a_nonzero_exit_is_red_even_with_clean_counts(self):
+        result = wt.GateResult(label="node-gate", scope="node", selector="tests/",
+                               command=("pytest",), exit_code=1, green=False,
+                               counts={"passed": 12})
+        verdict = vf.adjudicate_gate(result, min_cases=1)
+        self.assertFalse(verdict.green)
+        self.assertFalse(verdict.unparseable)
+        self.assertEqual(verdict.counts.passed, 12)
+
 
 # ── §7.3 the agent-node conjunction ─────────────────────────────────────────
 

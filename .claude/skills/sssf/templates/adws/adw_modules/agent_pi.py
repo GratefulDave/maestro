@@ -311,6 +311,10 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
 
     stderr = process.stderr.read() if process.stderr else ""
     result.returncode = process.wait()
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
     if on_exit:
         on_exit(process.pid)
     if result.returncode != 0 and not result.text:

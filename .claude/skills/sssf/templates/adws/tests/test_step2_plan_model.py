@@ -169,6 +169,15 @@ class ModelShapeTests(unittest.TestCase):
             with self.assertRaises(pm.PlanParseError):
                 pm.parse_mapping(data)
 
+    def test_supersedes_must_be_a_canonical_receipt_digest_at_parse_time(self):
+        for supersedes in ("A" * 64, "a" * 63, "not-a-digest"):
+            with self.subTest(supersedes=supersedes):
+                data = plan_mapping()
+                data["supersedes"] = supersedes
+                with self.assertRaises(pm.PlanParseError) as caught:
+                    pm.parse_mapping(data)
+                self.assertEqual(caught.exception.pointers[0][0], "/supersedes")
+
 
 class NodeProjectionTests(unittest.TestCase):
     """§6.2 — nodes are consumed directly; there is no second authored type."""

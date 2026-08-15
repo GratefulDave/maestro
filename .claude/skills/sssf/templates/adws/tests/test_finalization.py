@@ -45,6 +45,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -169,7 +170,7 @@ def make_store(tmp: Path, *, seed=None, verify_keys=None, root=None):
     seed = rc.generate_seed() if seed is None else seed
     keys = [rc.seed_to_public_key(seed)] if verify_keys is None else verify_keys
     store_root = (tmp / "receipts") if root is None else root
-    store = fin.ReceiptStore(store_root, repo_path=repo, data_dir=data_dir,
+    store = fin.ReceiptStore(store_root, repo_paths=(repo,), data_dir=data_dir,
                              verify_keys=keys, signing_seed=seed)
     return store, repo, data_dir, seed
 
@@ -497,7 +498,7 @@ class ReceiptIntegrity(unittest.TestCase):
             store.write(self._receipt())
             new_seed = rc.generate_seed()
             rotated = fin.ReceiptStore(
-                store.root, repo_path=repo, data_dir=data,
+                store.root, repo_paths=(repo,), data_dir=data,
                 verify_keys=[rc.seed_to_public_key(new_seed),
                              rc.seed_to_public_key(old_seed)],
                 signing_seed=new_seed)
@@ -510,7 +511,7 @@ class ReceiptIntegrity(unittest.TestCase):
             store.write(self._receipt())
             stranger = rc.generate_seed()
             other = fin.ReceiptStore(
-                store.root, repo_path=repo, data_dir=data,
+                store.root, repo_paths=(repo,), data_dir=data,
                 verify_keys=[rc.seed_to_public_key(stranger)])
             with self.assertRaises(fin.SignatureInvalid):
                 other.load(DIGEST)
@@ -523,11 +524,45 @@ class ReceiptIntegrity(unittest.TestCase):
             store, repo, data, seed = make_store(tmp_path)
             store.write(self._receipt())
             keyless = fin.ReceiptStore(
-                store.root, repo_path=repo, data_dir=data,
+                store.root, repo_paths=(repo,), data_dir=data,
                 verify_keys=[rc.seed_to_public_key(seed)])
             self.assertEqual(keyless.load(DIGEST).verdict, fin.Verdict.PASS)
             with self.assertRaises(fin.SigningKeyUnavailable):
                 keyless.write(self._receipt(digest=OTHER_DIGEST))
+
+    def test_a_signing_key_must_be_among_the_store_verification_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            data = root / "data"
+            repo.mkdir()
+            data.mkdir()
+            signer = rc.generate_seed()
+            stranger = rc.generate_seed()
+            with self.assertRaises(fin.SigningKeyUnavailable):
+                fin.ReceiptStore(
+                    root / "receipts", repo_paths=(repo,), data_dir=data,
+                    verify_keys=(rc.seed_to_public_key(stranger),),
+                    signing_seed=signer)
+
+    def test_unsafe_receipt_timestamps_never_serialize_or_publish(self):
+        for timestamp in (True, "1", float("nan"), float("inf"), 10 ** 400):
+            with self.subTest(timestamp=repr(timestamp)[:40]):
+                receipt = self._receipt()
+                object.__setattr__(receipt, "created_at_epoch", timestamp)
+                with self.assertRaises(fin.ReceiptInvalid):
+                    receipt.to_bytes()
+                with tempfile.TemporaryDirectory() as tmp:
+                    store, _repo, _data, _seed = make_store(Path(tmp))
+                    with self.assertRaises(fin.ReceiptInvalid):
+                        store.write(receipt)
+                    self.assertFalse(store.has(DIGEST))
+
+    def test_receipt_parsing_maps_timestamp_overflow_to_receipt_invalid(self):
+        payload = json.loads(self._receipt().to_bytes())
+        payload["created_at_epoch"] = 10 ** 400
+        with self.assertRaises(fin.ReceiptInvalid):
+            fin.Receipt.from_bytes(json.dumps(payload).encode("utf-8"))
 
     def test_the_receipt_persists_the_full_matrix_on_pass_and_on_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -550,11 +585,100 @@ class ReceiptIntegrity(unittest.TestCase):
             self.assertEqual((reviewer.route, reviewer.model,
                               reviewer.session_id), ("omp", "opus", "sess-1"))
 
+    def test_read_only_store_does_not_create_a_missing_receipt_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            data = root / "data"
+            repo.mkdir()
+            data.mkdir()
+            missing_store = root / "missing-receipts"
+            store = fin.ReceiptStore(
+                missing_store, repo_paths=(repo,), data_dir=data,
+                verify_keys=(rc.seed_to_public_key(rc.generate_seed()),),
+                create=False)
+            self.assertFalse(missing_store.exists())
+            self.assertFalse(store.has(DIGEST))
+            with self.assertRaises(FileNotFoundError):
+                store.load(DIGEST)
+            self.assertFalse(missing_store.exists())
+
+    def test_load_refuses_a_verified_receipt_renamed_for_another_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            source = store.write(self._receipt())
+            source.rename(store.path_for(OTHER_DIGEST))
+            Path(str(source) + ".sig").rename(
+                store.signature_path_for(OTHER_DIGEST))
+            with self.assertRaises(fin.ReceiptInvalid):
+                store.load(OTHER_DIGEST)
+
+    def test_load_maps_malformed_signature_text_to_signature_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            path = store.write(self._receipt())
+            signature = Path(str(path) + ".sig")
+            for malformed in (b"\xff", b"not hexadecimal\n"):
+                with self.subTest(malformed=malformed):
+                    signature.write_bytes(malformed)
+                    with self.assertRaises(fin.SignatureInvalid):
+                        store.load(DIGEST)
+
+    def test_load_maps_signed_schema_failure_to_receipt_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, seed = make_store(Path(tmp))
+            data = b'{"not":"a receipt"}'
+            store.path_for(DIGEST).write_bytes(data)
+            store.signature_path_for(DIGEST).write_text(
+                rc.sign(seed, data).hex() + "\n", encoding="ascii")
+            with self.assertRaises(fin.ReceiptInvalid):
+                store.load(DIGEST)
+
+    def test_matching_orphaned_receipt_is_repaired_by_create_once_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, seed = make_store(Path(tmp))
+            receipt = self._receipt()
+            path = store.path_for(DIGEST)
+            data = receipt.to_bytes()
+            path.write_bytes(data)
+            self.assertFalse(store.signature_path_for(DIGEST).exists())
+
+            self.assertEqual(store.write(receipt), path)
+            self.assertTrue(rc.verify(
+                rc.seed_to_public_key(seed), path.read_bytes(),
+                bytes.fromhex(store.signature_path_for(DIGEST).read_text())))
+            self.assertEqual(store.load(DIGEST), receipt)
+
+    def test_concurrent_create_once_write_has_one_authoritative_creator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            receipt = self._receipt()
+            start = threading.Barrier(3)
+            outcomes = []
+
+            def write_once():
+                start.wait()
+                try:
+                    outcomes.append(store.write(receipt))
+                except fin.ReceiptExists:
+                    outcomes.append(None)
+
+            first = threading.Thread(target=write_once)
+            second = threading.Thread(target=write_once)
+            first.start()
+            second.start()
+            start.wait()
+            first.join()
+            second.join()
+
+            self.assertEqual(sum(item is not None for item in outcomes), 1)
+            self.assertEqual(store.load(DIGEST), receipt)
+
 
 class FinalizeOrchestration(unittest.TestCase):
 
     def _finalize(self, store, factory, *, blockers=(), occupancy=0.4,
-                  digest=DIGEST, calls=None):
+                  digest=DIGEST, calls=None, clock=lambda: 1_760_000_000.0):
         def validate():
             if calls is not None:
                 calls.append("validate")
@@ -574,7 +698,7 @@ class FinalizeOrchestration(unittest.TestCase):
             window_factory=window_factory,
             occupancy_reader=lambda session: occupancy,
             sleep=factory.sleep,
-            clock=lambda: 1_760_000_000.0)
+            clock=clock)
 
     def test_obligations_run_before_any_reviewer_is_launched(self):
         """§6.5's asserted, tested ordering invariant."""
@@ -587,6 +711,14 @@ class FinalizeOrchestration(unittest.TestCase):
             factory.calls = calls
             self._finalize(store, factory, calls=calls)
             self.assertEqual(calls, ["validate", "window", "launch", "record"])
+
+    def test_an_unsafe_finalization_clock_never_publishes_a_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            factory = WindowFactory(report=clean_report(matrix_for()))
+            with self.assertRaises(fin.ReceiptInvalid):
+                self._finalize(store, factory, clock=lambda: float("nan"))
+            self.assertFalse(store.has(DIGEST))
 
     def test_blockers_launch_no_reviewer_and_publish_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -635,6 +767,57 @@ class FinalizeOrchestration(unittest.TestCase):
             self.assertTrue(outcome.replayed)
             self.assertEqual(second.launches, 0)
             self.assertEqual(outcome.verdict, fin.Verdict.PASS)
+
+    def test_interrupted_detached_publication_recovers_as_a_verified_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            original_stage = store._stage
+
+            def interrupt_after_receipt_commit(destination, data):
+                original_stage(destination, data)
+                if destination == store.path_for(DIGEST):
+                    raise OSError("simulated crash after receipt commit")
+
+            store._stage = interrupt_after_receipt_commit
+            with self.assertRaises(OSError):
+                self._finalize(store, WindowFactory(report=clean_report(matrix_for())))
+            store._stage = original_stage
+
+            replay = WindowFactory(report=clean_report(matrix_for()))
+            outcome = self._finalize(store, replay)
+
+            self.assertTrue(outcome.replayed)
+            self.assertEqual(replay.launches, 0)
+            self.assertEqual(store.load(DIGEST).plan_digest, DIGEST)
+
+    def test_concurrent_finalizers_replay_the_one_verified_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            start = threading.Barrier(3)
+            outcomes = []
+            errors = []
+
+            def finalize_once():
+                try:
+                    start.wait()
+                    outcomes.append(self._finalize(
+                        store, WindowFactory(report=clean_report(matrix_for()))))
+                except Exception as exc:
+                    errors.append(exc)
+
+            first = threading.Thread(target=finalize_once)
+            second = threading.Thread(target=finalize_once)
+            first.start()
+            second.start()
+            start.wait()
+            first.join()
+            second.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(outcomes), 2)
+            self.assertEqual({outcome.receipt for outcome in outcomes},
+                             {store.load(DIGEST)})
+            self.assertEqual(sum(not outcome.replayed for outcome in outcomes), 1)
 
     def test_replay_is_keyed_on_the_digest_alone(self):
         """§6.5: keying on routes, policy, or delivery target would mean

@@ -121,6 +121,7 @@ class SchedulerFixture(unittest.TestCase):
         self.gate_script = {}      # (node_id, phase) -> [GateResult, ...]
         self.raise_for = {}        # node_id -> exception to raise, once
         self.exit_codes = {}       # node_id -> exit code for a code node
+        self.quiesce_calls = []    # (attempt identity, phase) -> []
 
     def config(self, **kw) -> st.SchedulerConfig:
         base = dict(concurrency=2, node_timeout_s=60.0, turn_timeout_s=30.0,
@@ -131,10 +132,10 @@ class SchedulerFixture(unittest.TestCase):
 
     # ── the injected adapter seams ──────────────────────────────────────────
 
-    def run_node(self, attempt, node, record, retry_prompt, on_launch=None):
+    def run_node(self, attempt, node, record, retry_prompt, on_launch,
+                 cancel_requested):
         self.prompts.setdefault(node.node_id, []).append(retry_prompt)
-        if on_launch is not None:
-            on_launch(None)
+        on_launch(None)
         boom = self.raise_for.pop(node.node_id, None)
         if boom is not None:
             raise boom
@@ -147,7 +148,7 @@ class SchedulerFixture(unittest.TestCase):
             exit_code=self.exit_codes.get(node.node_id, 0),
             launched_pid=None)
 
-    def run_gate(self, attempt, node, phase):
+    def run_gate(self, attempt, node, phase, cancel_requested):
         scripted = self.gate_script.get((node.node_id, phase))
         if scripted:
             return scripted.pop(0)
@@ -155,6 +156,10 @@ class SchedulerFixture(unittest.TestCase):
         # because the behaviour is absent, the post-gate green because the
         # agent supplied it. Falsifiability, in fixture form.
         return red() if phase == "pre" else green()
+
+    def quiesce_attempt(self, record, phase):
+        self.assertIsInstance(record, st.AttemptRecord)
+        self.quiesce_calls.append((record.key, phase))
 
     def deps(self, **kw):
         base = dict(store=self.store, repo=self.repo,
@@ -164,7 +169,8 @@ class SchedulerFixture(unittest.TestCase):
                     scratch_root=self.root / "scratch",
                     run_node=self.run_node,
                     run_gate=self.run_gate,
-                    run_integration_gate=lambda path, specs: green(3))
+                    run_integration_gate=lambda path, specs, cancel_requested: green(3),
+                    quiesce_attempt=self.quiesce_attempt)
         base.update(kw)
         return sch.SchedulerDeps(**base)
 
@@ -212,10 +218,12 @@ class ReadySetTests(SchedulerFixture):
         order = []
         inner = self.run_node
 
-        def recording(attempt, node, record, retry_prompt, on_launch=None):
+        def recording(attempt, node, record, retry_prompt, on_launch,
+                      cancel_requested):
             order.append(("start", node.node_id,
                           dict(self.states())))
-            return inner(attempt, node, record, retry_prompt, on_launch)
+            return inner(attempt, node, record, retry_prompt, on_launch,
+                         cancel_requested)
 
         self.schedule([self.agent("a"), self.agent("b", depth=1, needs=("a",))],
                       deps=self.deps(run_node=recording)).run()
@@ -239,12 +247,14 @@ class ReadySetTests(SchedulerFixture):
         guard = threading.Lock()
         inner = self.run_node
 
-        def counting(attempt, node, record, retry_prompt, on_launch=None):
+        def counting(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
             with guard:
                 live.append(node.node_id)
                 peak.append(len(live))
             try:
-                return inner(attempt, node, record, retry_prompt, on_launch)
+                return inner(attempt, node, record, retry_prompt, on_launch,
+                             cancel_requested)
             finally:
                 with guard:
                     live.remove(node.node_id)
@@ -306,10 +316,10 @@ class AttemptWindowTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         seen = {}
 
-        def observing(attempt, node, phase):
+        def observing(attempt, node, phase, cancel_requested):
             seen.setdefault("state_at_pre_gate",
                             self.store.get_node("run1", node.node_id).state)
-            return self.run_gate(attempt, node, phase)
+            return self.run_gate(attempt, node, phase, cancel_requested)
 
         self.schedule([self.agent("a")], deps=self.deps(run_gate=observing)).run()
         self.assertIs(seen["state_at_pre_gate"], st.NodeState.RUNNING)
@@ -375,8 +385,9 @@ class SemanticRetryTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n", "not-declared.py": "X\n"}}
 
         def second_attempt_is_clean(attempt, node, record, retry_prompt,
-                                     on_launch=None):
+                                     on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
             files = ({"a.py": "A\n"} if record.attempt_no > 1
                      else {"a.py": "A\n", "not-declared.py": "X\n"})
             for rel, content in files.items():
@@ -442,6 +453,163 @@ class ContainmentTests(SchedulerFixture):
         self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.MERGED)
         self.assertEqual(self.store.get_node("run1", "a").attempt_no, 2)
 
+
+
+class QuiescenceTests(SchedulerFixture):
+    """Every state transition follows a successful, identity-bound proof."""
+
+    def test_an_exception_from_run_node_is_quiesced_before_failure_classification(self):
+        phases = []
+
+        def quiesce(record, phase):
+            phases.append((record.key, phase,
+                           self.store.get_node("run1", record.node_id).state))
+
+        self.raise_for = {"a": RuntimeError("runner leaked")}
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(environmental_retries=0),
+            deps=self.deps(quiesce_attempt=quiesce)).run()
+
+        self.assertEqual([phase for _, phase, _ in phases],
+                         ["pre-baseline", "pre-inventory", "settle"])
+        self.assertTrue(all(state is st.NodeState.RUNNING
+                            for _, _, state in phases))
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.BLOCKED)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+    def test_a_missing_quiescence_dependency_is_refused_before_scheduling(self):
+        with self.assertRaises(sch.QuiescenceDependencyError):
+            self.deps(quiesce_attempt=None)
+
+    def test_unproven_quiescence_blocks_instead_of_releasing_a_retry(self):
+        def quiesce(record, phase):
+            if phase == "pre-baseline":
+                raise RuntimeError("process group still present")
+
+        report = self.schedule(
+            [self.agent("a")],
+            deps=self.deps(quiesce_attempt=quiesce)).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.state, st.NodeState.BLOCKED)
+        self.assertIs(node.block_reason, st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.assertEqual(node.attempt_no, 1)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+    def test_watchdog_kill_exception_blocks_that_generation_without_retry(self):
+        """A failed kill is unproven quiescence, not a swallowed watchdog error."""
+        kill_called = threading.Event()
+        watchdog_quiesced = threading.Event()
+
+        def provision(_path):
+            self.assertTrue(watchdog_quiesced.wait(timeout=3.0))
+
+        def kill_attempt(_record):
+            kill_called.set()
+            raise RuntimeError("launcher kill failed")
+
+        def quiesce(_record, phase):
+            if phase == "watchdog":
+                watchdog_quiesced.set()
+
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(node_timeout_s=0.01, turn_timeout_s=0.01,
+                               final_acceptance_timeout_s=1.0,
+                               backstop_t_s=5.0, environmental_retries=3),
+            deps=self.deps(provision=provision, kill_attempt=kill_attempt,
+                           quiesce_attempt=quiesce)).run()
+
+        node = self.store.get_node("run1", "a")
+        transitions = self.store.audit_transitions("run1", "a")
+        self.assertTrue(kill_called.is_set())
+        self.assertIs(node.state, st.NodeState.BLOCKED)
+        self.assertIs(node.block_reason, st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.assertEqual(node.attempt_no, 1)
+        self.assertEqual(transitions[-1]["detail"]["phase"], "watchdog-kill")
+        self.assertEqual(
+            transitions[-1]["detail"]["exception_type"], "RuntimeError")
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+
+    def test_node_gate_quiescence_error_blocks_instead_of_becoming_a_retry(self):
+        def gate(_attempt, _node, _phase, _cancel_requested):
+            raise wt.HarnessQuiescenceError(
+                "HARNESS_CONTEXT_QUIESCENCE_UNPROVEN")
+
+        report = self.schedule(
+            [self.agent("a")], deps=self.deps(run_gate=gate)).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.state, st.NodeState.BLOCKED)
+        self.assertIs(node.block_reason, st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.assertEqual(node.attempt_no, 1)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+class GenerationFenceTests(SchedulerFixture):
+
+    def test_a_stale_worker_cannot_commit_after_losing_running_ownership(self):
+        def runner(attempt, node, record, retry_prompt, on_launch,
+                   cancel_requested):
+            on_launch(None)
+            if record.attempt_no == 1:
+                (attempt.path / "stale.py").write_text("stale\n")
+                self.store.fail_attempt("run1", node.node_id,
+                                        st.RetryClass.ENVIRONMENTAL)
+            else:
+                (attempt.path / "fresh.py").write_text("fresh\n")
+            return sch.NodeExecution()
+
+        report = self.schedule(
+            [self.agent("a", outputs=("fresh.py",))],
+            deps=self.deps(run_node=runner)).run()
+
+        self.assertEqual(self.store.get_node("run1", "a").attempt_no, 2)
+        self.assertTrue((self.integration / "fresh.py").is_file())
+        self.assertFalse((self.integration / "stale.py").exists())
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_a_timed_out_provision_cannot_reach_a_gate_or_commit_before_retry(self):
+        watchdog_quiesced = threading.Event()
+        provision_calls = []
+        gate_attempts = []
+        runner_attempts = []
+
+        def provision(path):
+            provision_calls.append(path)
+            if len(provision_calls) == 1:
+                self.assertTrue(watchdog_quiesced.wait(timeout=3.0))
+
+        def quiesce(record, phase):
+            if phase == "watchdog":
+                watchdog_quiesced.set()
+
+        def gate(attempt, node, phase, cancel_requested):
+            gate_attempts.append(self.store.get_node("run1", node.node_id).attempt_no)
+            return self.run_gate(attempt, node, phase, cancel_requested)
+
+        def runner(attempt, node, record, retry_prompt, on_launch,
+                   cancel_requested):
+            runner_attempts.append(record.attempt_no)
+            return self.run_node(attempt, node, record, retry_prompt, on_launch,
+                                 cancel_requested)
+
+        self.written = {"a": {"a.py": "A\n"}}
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(node_timeout_s=0.01, turn_timeout_s=0.01,
+                               final_acceptance_timeout_s=1.0,
+                               backstop_t_s=5.0, environmental_retries=1),
+            deps=self.deps(provision=provision, quiesce_attempt=quiesce,
+                           run_gate=gate, run_node=runner)).run()
+
+        self.assertEqual(len(provision_calls), 2)
+        self.assertEqual(gate_attempts, [2, 2])
+        self.assertEqual(runner_attempts, [2])
+        self.assertIs(self.store.get_attempt("run1", "a", 1).retry_class,
+                      st.RetryClass.ENVIRONMENTAL)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
 # ── §7.3 code nodes under the scheduler ─────────────────────────────────────
 
@@ -527,6 +695,62 @@ class CancellationTests(SchedulerFixture):
         self.assertIs(report.outcome, st.RunOutcome.CANCELLED)
 
 
+
+    def test_cancellation_during_the_pre_node_gate_cannot_run_the_node(self):
+        holder = {}
+
+        def gate(attempt, node, phase, cancel_requested):
+            self.assertEqual(phase, "pre")
+            holder["scheduler"].cancel()
+            self.assertTrue(cancel_requested())
+            return red()
+
+        scheduler = self.schedule([self.agent("a")],
+                                  deps=self.deps(run_gate=gate))
+        holder["scheduler"] = scheduler
+        report = scheduler.run()
+
+        self.assertNotIn("a", self.prompts)
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.CANCELLED)
+        self.assertIs(report.outcome, st.RunOutcome.CANCELLED)
+
+    def test_cancellation_during_the_post_node_gate_cannot_verify_or_merge(self):
+        holder = {}
+        self.written = {"a": {"a.py": "A\n"}}
+
+        def gate(attempt, node, phase, cancel_requested):
+            if phase == "post":
+                holder["scheduler"].cancel()
+                self.assertTrue(cancel_requested())
+            return self.run_gate(attempt, node, phase, cancel_requested)
+
+        scheduler = self.schedule([self.agent("a")],
+                                  deps=self.deps(run_gate=gate))
+        holder["scheduler"] = scheduler
+        report = scheduler.run()
+
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.CANCELLED)
+        self.assertFalse((self.integration / "a.py").exists())
+        self.assertIs(report.outcome, st.RunOutcome.CANCELLED)
+
+    def test_cancellation_during_the_final_gate_cannot_declare_accepted(self):
+        holder = {}
+        self.written = {"a": {"a.py": "A\n"}}
+
+        def final_gate(path, specs, cancel_requested):
+            holder["scheduler"].cancel()
+            self.assertTrue(cancel_requested())
+            return green(3)
+
+        scheduler = self.schedule(
+            [self.agent("a")],
+            deps=self.deps(run_integration_gate=final_gate))
+        holder["scheduler"] = scheduler
+        report = scheduler.run()
+
+        self.assertIs(report.outcome, st.RunOutcome.CANCELLED)
+        self.assertIs(self.store.latest_outcome("run1"), st.RunOutcome.CANCELLED)
+
 class ResumeTests(SchedulerFixture):
 
     def test_an_inherited_running_attempt_is_failed_and_relaunched_never_adopted(self):
@@ -548,6 +772,79 @@ class ResumeTests(SchedulerFixture):
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
 
+
+    def test_crash_after_verification_rehydrates_the_verified_sha_and_merges_once(self):
+        node = self.agent("a")
+        crashed = self.schedule([node])
+        crashed.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo, "run1", "a", attempt_no, base, self.root / "wt",
+            self.root / "scratch")
+        baseline = wt.take_baseline(attempt)
+        (attempt.path / "a.py").write_text("A\n")
+        after = wt.inventory(attempt.path)
+        output_sha = wt.commit_measured_delta(
+            attempt, wt.delta(baseline, after), after, "a attempt 1")
+        self.store.mark_verified("run1", "a", output_sha)
+
+        restarted = self.schedule([node])
+        first_resume = restarted.run()
+        second_resume = self.schedule([node]).run()
+
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.MERGED)
+        self.assertEqual(self.store.get_node("run1", "a").output_sha, output_sha)
+        self.assertEqual(
+            _git(self.integration, "log", "--format=%s").splitlines().count("merge a"),
+            1)
+        self.assertIs(first_resume.outcome, st.RunOutcome.ACCEPTED)
+        self.assertIs(second_resume.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_unverifiable_durable_verified_sha_blocks_before_merge(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        self.store.start_attempt("run1", "a",
+                                 _git(self.integration, "rev-parse", "HEAD"))
+        self.store.mark_verified("run1", "a", "not-a-commit-digest")
+
+        report = self.schedule([node]).run()
+
+        stored = self.store.get_node("run1", "a")
+        self.assertIs(stored.state, st.NodeState.BLOCKED)
+        self.assertIs(stored.block_reason, st.BlockReason.OUTPUT_IDENTITY_INVALID)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+    def test_rehydration_refuses_a_descendant_not_owned_by_the_attempt(self):
+        """A forged row may name a real descendant, but not this attempt's ref."""
+        node = self.agent("a")
+        crashed = self.schedule([node])
+        crashed.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo, "run1", "a", attempt_no, base, self.root / "wt",
+            self.root / "scratch")
+        baseline = wt.take_baseline(attempt)
+        (attempt.path / "a.py").write_text("A\n")
+        after = wt.inventory(attempt.path)
+        output_sha = wt.commit_measured_delta(
+            attempt, wt.delta(baseline, after), after, "a attempt 1")
+        forged_descendant = _git(
+            self.repo, "commit-tree",
+            _git(self.repo, "rev-parse", "{}^{{tree}}".format(output_sha)),
+            "-p", output_sha, "-m", "forged descendant")
+        self.store.mark_verified("run1", "a", forged_descendant)
+
+        report = self.schedule([node]).run()
+
+        stored = self.store.get_node("run1", "a")
+        self.assertIs(stored.state, st.NodeState.BLOCKED)
+        self.assertIs(stored.block_reason, st.BlockReason.OUTPUT_IDENTITY_INVALID)
+        self.assertFalse((self.integration / "a.py").exists())
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
 # ── §8.8 final acceptance ───────────────────────────────────────────────────
 
 class FinalAcceptanceTests(SchedulerFixture):
@@ -556,7 +853,7 @@ class FinalAcceptanceTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}, "b": {"b.py": "B\n"}}
         seen = {}
 
-        def integration_gate(path, specs):
+        def integration_gate(path, specs, cancel_requested):
             seen["specs"] = specs
             return green(3)
 
@@ -574,7 +871,7 @@ class FinalAcceptanceTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule(
             [self.agent("a")],
-            deps=self.deps(run_integration_gate=lambda p, s: red())).run()
+            deps=self.deps(run_integration_gate=lambda p, s, c: red())).run()
         self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
         self.assertIsNotNone(report.acceptance)
         self.assertFalse(report.acceptance.green)
@@ -608,16 +905,16 @@ class FinalAcceptanceTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         stamps = []
 
-        def integration_gate(path, specs):
+        def integration_gate(path, specs, cancel_requested):
             stamps.append(self.store.last_transition_at("run1"))
             return green(3)
 
         merged_at = []
 
-        def gate(attempt, node, phase):
+        def gate(attempt, node, phase, cancel_requested):
             if phase == "post":
                 merged_at.append(self.store.last_transition_at("run1"))
-            return self.run_gate(attempt, node, phase)
+            return self.run_gate(attempt, node, phase, cancel_requested)
 
         self.schedule([self.agent("a")],
                       deps=self.deps(run_gate=gate,
@@ -637,10 +934,12 @@ class LivenessWiringTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         names = []
 
-        def observing(attempt, node, record, retry_prompt, on_launch=None):
+        def observing(attempt, node, record, retry_prompt, on_launch,
+                      cancel_requested):
             names.extend(t.name for t in threading.enumerate()
                          if t.name == "maestro-watchdog")
-            return self.run_node(attempt, node, record, retry_prompt, on_launch)
+            return self.run_node(attempt, node, record, retry_prompt, on_launch,
+                                 cancel_requested)
 
         self.schedule([self.agent("a")],
                       deps=self.deps(run_node=observing)).run()
@@ -705,13 +1004,15 @@ class LivenessWiringTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         armed = {}
 
-        def reporting(attempt, node, record, retry_prompt, on_launch=None):
+        def reporting(attempt, node, record, retry_prompt, on_launch,
+                      cancel_requested):
             armed["before"] = self.store.get_attempt(
                 "run1", node.node_id, record.attempt_no).armed
             on_launch(4321)
             armed["after"] = self.store.get_attempt(
                 "run1", node.node_id, record.attempt_no).armed
-            return self.run_node(attempt, node, record, retry_prompt)
+            return self.run_node(attempt, node, record, retry_prompt,
+                                 lambda pid: None, cancel_requested)
 
         self.schedule([self.agent("a")],
                       deps=self.deps(run_node=reporting)).run()

@@ -534,7 +534,8 @@ class LifecycleStore:
 
     @serialized
     def mark_launched(self, run_id: str, node_id: str, attempt_no: int,
-                       pid: Optional[int], launched_at: Optional[float] = None) -> None:
+                       pid: Optional[int], launched_at: Optional[float] = None,
+                       extra: Optional[Mapping[str, Any]] = None) -> None:
         """Record that the adapter reported the agent launched (§7.6).
 
         This is what **arms** the process-alive and turn-count signals. Until
@@ -554,11 +555,21 @@ class LifecycleStore:
         attempt already RUNNING, and writing it as one would refresh
         `last_transition_at` — see `record_heartbeat` for why that matters.
         """
+        row = self.conn.execute(
+            "SELECT extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise UnknownNode(
+                f"{run_id}/{node_id}#{attempt_no}: no attempt row to mark launched")
+        payload = json.loads(row[0] or "{}")
+        if extra:
+            payload.update(extra)
         self.conn.execute(
-            "UPDATE attempts SET launched_at=?, pid=?"
+            "UPDATE attempts SET launched_at=?, pid=?, extra_json=?"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
             (launched_at if launched_at is not None else time.time(), pid,
-             run_id, node_id, attempt_no))
+             json.dumps(payload), run_id, node_id, attempt_no))
 
     @serialized
     def record_heartbeat(self, attempt: st.AttemptRecord, turn_count: int,
@@ -1063,13 +1074,53 @@ class LifecycleStore:
 
     def skip(self, run_id: str, node_id: str, *, accept_sha: str, repo_path) -> st.NodeLifecycle:
         """BLOCKED -> MERGED: the operator supplied the work by hand. Verifies
-        `git merge-base --is-ancestor` before accepting — it does not bypass
-        the ancestry proof (§11.3)."""
+        `git merge-base --is-ancestor` and the four worktree checks against the
+        supplied SHA before accepting — it does not bypass those gates (§11.3).
+        """
         self._require_escape_legal(run_id)
+        repo = Path(repo_path)
+        latest_attempt = self.conn.execute(
+            "SELECT base_sha FROM attempts"
+            " WHERE run_id=? AND node_id=? ORDER BY attempt_no DESC LIMIT 1",
+            (run_id, node_id)).fetchone()
+        if latest_attempt is None:
+            raise SkipAncestryRefused(
+                f"{node_id}: no attempt base exists; skip cannot prove output identity")
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True, text=True)
+        if branch.returncode != 0:
+            raise SkipAncestryRefused(
+                f"{node_id}: {repo_path} has no checked-out branch; "
+                "skip does not bypass worktree identity (§11.3)")
+        if not wt.is_valid_output_commit(
+                repo, accept_sha, expected_base=str(latest_attempt[0])):
+            raise SkipAncestryRefused(
+                f"{node_id}: {accept_sha} is not a valid output commit descending "
+                f"from attempt base {latest_attempt[0]} in {repo_path}; "
+                "skip does not bypass identity (§11.3)")
         if not _is_ancestor(repo_path, accept_sha):
             raise SkipAncestryRefused(
                 f"{node_id}: {accept_sha} is not an ancestor of HEAD in {repo_path}; "
                 "skip does not bypass the ancestry proof (§11.3)")
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True)
+        resolved = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", accept_sha],
+            capture_output=True, text=True)
+        if head.returncode != 0 or resolved.returncode != 0 or (
+                resolved.stdout.strip() != head.stdout.strip()):
+            raise SkipAncestryRefused(
+                f"{node_id}: {accept_sha} is an older ancestor of HEAD in {repo_path}; "
+                "skip accepts only the current HEAD (§11.3)")
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            capture_output=True, text=True)
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            raise SkipAncestryRefused(
+                f"{node_id}: {repo_path} is not a clean worktree at {accept_sha}; "
+                "skip does not bypass cleanliness (§11.3)")
         return self._transition_node(
             run_id, node_id, st.NodeState.MERGED, actor="operator",
             reason=st.Escape.SKIP.value, require_state=(st.NodeState.BLOCKED,),

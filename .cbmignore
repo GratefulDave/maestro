@@ -1,0 +1,23 @@
+# cbm baseline excludes (seeded by cbm-ensure-index). gitignore syntax.
+# Edit freely; delete a line to let cbm index that dir. To scope cbm to only
+# certain dirs, replace this with an allowlist:  /*  then  !/src/  !/tests/ ...
+**/node_modules/
+**/.venv/
+**/venv/
+**/env/
+**/virtualenv/
+**/.env/
+**/__pycache__/
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.ipynb_checkpoints/
+**/.tox/
+**/dist/
+**/build/
+**/*.egg-info/
+**/.next/
+**/target/
+**/coverage/
+**/.gradle/
+**/vendor/

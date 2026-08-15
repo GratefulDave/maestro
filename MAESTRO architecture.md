@@ -1919,3 +1919,151 @@ Added by Step 1's own execution (§12.2 step 1.7–1.9), closing three concurren
 113. The tracer's `PRAGMA journal_mode=WAL` set-up reads the database's current journal mode before writing it, skips the write when it already reads WAL, and retries a busy answer rather than failing on the first one (§10.4, §12.2 step 1.8). Negative test: two processes opening one tracer database in the same instant must both succeed, neither failing with "database is locked".
 114. `Run.save_agent_map` re-reads `agent_map.json` under a lock immediately before merging the caller's update and replaces it atomically (§10.4, §12.2 step 1.9). Negative test: two concurrent nodes on one `Run` saving in close succession must both have their entries present in the final file, with neither dropped. The cross-process form of this race — two separate ADW processes writing one run's map — is not covered by this test and is registered open (§16.3 item 38).
 
+
+---
+
+## 18. Additive multi-repository coordination
+
+### 18.1 The single-repository factory remains the unit of execution
+
+Multi-repository coordination composes Maestro; it does not replace or weaken it. A writable repository participant is still one complete single-repository run:
+
+```text
+canonical Plan bytes
+  -> plan digest
+  -> signed PASS finalization receipt
+  -> dependency scheduler
+  -> isolated per-attempt worktrees
+  -> output-SHA verification and deterministic merge
+  -> repository final acceptance
+```
+
+The frozen `Plan` model, review matrix, receipt authority, node DAG, retry ceilings, permission bracket, and merge-by-SHA rules remain repository-local. `adw_modules/coordinator.py` never reaches inside that lifecycle to mark a plan node green, merge a node, or reinterpret a plan receipt. Its participant boundary is a process with the same authority and obligations as an independently invoked Maestro run.
+
+### 18.2 Workspace identity and authorization
+
+`adw_modules/workspace_model.py` defines the closed `maestro-workspace.v1` model. A workspace has a stable `workspace_id`, an ordered tuple of `RepositorySpec` declarations, ordered global integration gates, and one publication mode. Each repository declaration binds:
+
+- `repository_id`, unique within the workspace and safe for deterministic path/ref construction;
+- manifest-relative repository `path`;
+- exact forty-hex `base_commit`;
+- `mode`, either `write` or `read_only`;
+- for `write`, canonical child `plan_path`, exact `plan_digest`, `target_branch`, explicit participant `run_argv`, and ordered repository dependencies in `needs`;
+- for `read_only`, none of the writable execution fields.
+
+Repository dependencies form one acyclic graph. A dependency names a prior writable repository; malformed, duplicate, overlapping, or cyclic declarations refuse before execution.
+
+`workspace_canonical.canonicalize_workspace()` emits sorted compact UTF-8 JSON with one trailing newline. `workspace_digest.digest_of()` hashes those stored bytes with SHA-256; parsing and reserialization are not digest authority. A `WorkspaceReceipt` is Ed25519-signed outside every participant repository and binds that digest to the workspace-order authorization vector:
+
+```text
+(repository_id, mode, plan_digest | null,
+ base_commit, target_branch | null)
+```
+
+`workspace_receipt.finalize()` loads every writable child receipt by its declared `plan_digest` and accepts only a valid signed `PASS`. One missing, invalid, non-PASS, or mismatched child receipt prevents workspace authorization. Replay loads the existing signed workspace receipt; it neither re-finalizes children nor writes a second receipt.
+
+### 18.3 Participant process boundary
+
+`adw_modules/participant.py` launches one independent child process per ready writable repository. The coordinator supplies immutable environment bindings for workspace run id, repository id, child run id, canonical child plan, plan digest, candidate branch, candidate worktree, and the unique result path. The child owns all single-repository scheduling and final acceptance inside that candidate.
+
+The only completion protocol is an atomically replaced `maestro-participant-result.v1` JSON object:
+
+```text
+child_run_id
+outcome = accepted | blocked | cancelled
+accepted_sha = exact commit only for accepted
+reason
+```
+
+The parent accepts only a fresh, size-bounded, closed-schema result with the expected child identity. `accepted_sha` must equal the deterministic candidate branch and worktree head and descend from the declared base. A zero process exit without that result is not success. A malformed or stale result is not deleted and retried as if absent; it is durable blocking evidence.
+
+### 18.4 Repository DAG and deterministic candidates
+
+`CoordinatorStore` projects the authorized repository graph once. `WorkspaceCoordinator` claims ready repositories under immediate SQLite transactions and runs independent claims up to `max_workers`. A dependent repository becomes ready only after every declared prerequisite is durably `ACCEPTED`; a blocked prerequisite durably blocks all pending descendants. Read-only repositories launch no participant and become accepted only after their exact declared commit is proved locally.
+
+The first leased execution also binds the full canonical absolute repository-path vector in the store. Resume and publication must match that persisted vector exactly; moving or copying the manifest, retargeting a symlink, or substituting a same-SHA clone cannot replace a participant repository.
+
+Each writable claim has one identity:
+
+```text
+child run:       <workspace_run_id>:<repository_id>
+candidate ref:   maestro/workspace/<workspace_run_id>/<repository_id>/candidate
+candidate tree:  <state_root>/candidates/<workspace_run_id>/<repository_id>/candidate
+```
+
+The candidate starts from the exact declared base while the declared target branch still names that base. Existing refs or paths refuse a fresh claim. Recovery may reuse only the exact recorded ref, path, child id, and registered Git worktree; no suffix, regenerated id, guessed branch, or broad `git worktree prune` is legal.
+
+```text
+signed WorkspaceReceipt
+  -> durable graph projection and lease
+  -> ready writable repositories, bounded-concurrent
+      -> deterministic candidate worktree
+      -> independent single-repository Maestro participant
+      -> strict result + candidate-head/ancestry proof
+  -> dependency frontier advances
+  -> read-only acceptance composition
+  -> global gates
+  -> workspace outcome
+```
+
+### 18.5 Acceptance composition and outcomes
+
+After all repositories are accepted, `workspace_runtime.assemble_acceptance()` creates detached read-only worktrees under:
+
+```text
+<state_root>/acceptance/<workspace_run_id>/repositories/<repository_id>
+```
+
+Every checkout is pinned to the accepted candidate SHA or the read-only declared base. The canonical acceptance manifest records the complete repository-to-SHA map. Global gates run in declaration order, from acceptance-relative working directories, as `(gate.runner,) + gate.argv`; each requires exit zero and at least `min_cases`. Gate results become immutable store rows, so a resumed coordinator does not rerun an already recorded external check. Cleanup removes only the exact acceptance worktree registrations and paths; candidate worktrees remain recovery evidence.
+
+Repository outcomes are `ACCEPTED`, `BLOCKED`, or `CANCELLED`. The workspace outcome is the corresponding total terminal declaration:
+
+- `ACCEPTED`: every repository accepted and every global gate passed;
+- `BLOCKED`: a participant, binding, ancestry proof, acceptance composition, or global gate failed, with durable reasons and blocked descendants;
+- `CANCELLED`: cancellation was requested and no active or pending repository remains.
+
+Partial success is never renamed acceptance.
+
+### 18.6 Ledger, leases, and restart
+
+`adw_modules/coordinator_store.py` is the sole durable authority for workspace bytes/digest, repository declarations and state, child/candidate identities, accepted SHAs, global-gate results, cancellation, outcome, publication intent/steps, audit transitions, and coordinator lease. Production coordinator code performs no direct SQL and launches no repository command itself.
+
+One expiring lease excludes concurrent coordinators. The current owner heartbeats and may release only its own lease; another owner may take over only after expiry. Restart reloads the exact stored workspace rather than re-projecting current files. An inherited `RUNNING` row first adjudicates an existing strict result; otherwise it resumes the exact registered candidate and child identity. Accepted repositories and recorded gates are not relaunched. Acceptance worktrees are reconstructible transient state and are safely reclaimed before an exact rebuild. Audit rows are append-only observations, never execution authority.
+
+### 18.7 Publication is a persisted compare-and-swap protocol
+
+Publication begins only after workspace `ACCEPTED`. `CoordinatorStore.prepare_publication()` persists the complete ordered target vector, including each repository's expected base, target branch, accepted SHA, remote, and candidate branch, before any target mutation.
+
+For `local_refs`, all target refs are preflighted against their persisted expected bases. Each update uses `git update-ref <target> <accepted> <expected>` in vector order. A later failure rolls back every earlier update with the inverse compare-and-swap, but only while that ref still names the accepted SHA. A rollback race yields `MANUAL_RECOVERY_REQUIRED`; it is never overwritten.
+
+For `pull_requests`, preflight covers every writable repository before the durable intent: repository identity, target head, candidate remote state, remote configuration, and `gh auth status`. Publishing then pushes each exact candidate with force-with-lease semantics and creates its PR. Remote PR creation is not transactional. Once any external mutation succeeds, a later failure yields `PARTIALLY_PUBLISHED` and then `MANUAL_RECOVERY_REQUIRED`; Maestro does not claim remote rollback.
+
+There is no distributed Git transaction across unrelated repositories. Local compare-and-swap plus bounded rollback detects interference; it does not make independent repositories atomic.
+
+### 18.8 Public operator flow
+
+The executable surface is exactly:
+
+```text
+maestro workspace validate
+maestro workspace finalize
+maestro workspace start
+maestro workspace status
+maestro workspace cancel
+maestro workspace resume
+maestro workspace publish
+maestro workspace rollback
+```
+
+`validate` proves canonical bytes and the complete typed workspace. `finalize` verifies every child PASS receipt and writes or replays the signed workspace receipt. `start` verifies that receipt before graph projection; `resume` reopens the same durable run id and identities. `status` reports store authority, including repositories, gates, outcome, cancellation, and publication. `cancel` records intent before active participants are boundedly cancelled. `publish` consumes the accepted run's persisted publication vector. `rollback --db --manifest-dir --run-id --actor` resumes the persisted publication rollback using that same vector. Every invocation emits one machine-readable JSON object. `start` and `resume` return nonzero unless they reach `ACCEPTED`; the other verbs return nonzero on refusal.
+
+### 18.9 Negative guarantees
+
+- No repository head, working tree, current branch, or unsigned manifest is reconstructed as authority after projection.
+- No read-only repository executes a participant or receives a candidate branch.
+- No child process can authorize another repository, workspace, plan digest, or base commit.
+- No coordinator recovery invents a new attempt identity over an existing `RUNNING` row.
+- No global gate runs against mutable candidate worktrees or unaccepted SHAs.
+- No publication starts before all writable targets pass preflight.
+- No failed remote operation is reported as rolled back unless an exact local compare-and-swap proved that rollback.
+- No multi-repository feature changes the single-repository plan schema, receipt verdict, retry accounting, worktree bracket, or merge proof.

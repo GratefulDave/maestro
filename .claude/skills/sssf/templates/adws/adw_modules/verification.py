@@ -161,10 +161,15 @@ def adjudicate_counts(raw: Mapping[str, Any], min_cases: int) -> GateVerdict:
 def adjudicate_gate(result: "wt.GateResult", min_cases: int) -> GateVerdict:
     """Adjudicate a gate execution from the merge protocol.
 
-    The exit code is deliberately not consulted. It is the thing this rule
-    replaces: a suite that collected nothing, or skipped everything, exits
-    zero and has asserted nothing about the work.
+    A nonzero exit is always red. A zero exit is still insufficient: counts
+    must satisfy §10.2. Exit code is never a substitute for the counting rule.
     """
+    if result.exit_code != 0:
+        counts = GateCounts.parse(result.counts)
+        return GateVerdict(
+            green=False, unparseable=counts is None, counts=counts,
+            reason="gate exited {}".format(result.exit_code),
+            retry_class=st.RetryClass.ENVIRONMENTAL if counts is None else None)
     return adjudicate_counts(result.counts, min_cases)
 
 

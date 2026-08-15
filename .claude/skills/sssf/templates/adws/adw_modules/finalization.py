@@ -44,13 +44,19 @@ only through the window's injected recorders (`finalization_window`).
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import math
+import os
+import re
+import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
-                    Tuple, Type)
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Sequence, Tuple, Type, Union)
 
 from pydantic import BaseModel, ConfigDict
 
@@ -476,6 +482,17 @@ class ReviewerIdentity:
     session_id: str
 
 
+def _require_created_at_epoch(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ReceiptInvalid("created_at_epoch must be a finite number")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError as exc:
+        raise ReceiptInvalid("created_at_epoch must be a finite number") from exc
+    if not finite:
+        raise ReceiptInvalid("created_at_epoch must be a finite number")
+
+
 @dataclass(frozen=True)
 class Receipt:
     plan_digest: str
@@ -485,6 +502,7 @@ class Receipt:
     reviewer: ReviewerIdentity
     created_at_epoch: float
 
+
     def to_bytes(self) -> bytes:
         """The receipt's stored bytes — what the signature covers.
 
@@ -492,6 +510,7 @@ class Receipt:
         receipt always serialises identically and its signature can be
         re-derived rather than only checked.
         """
+        _require_created_at_epoch(self.created_at_epoch)
         payload = {
             "plan_digest": self.plan_digest,
             "rubric_version": self.rubric_version,
@@ -519,26 +538,80 @@ class Receipt:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Receipt":
-        payload = json.loads(data.decode("utf-8"))
-        return cls(
-            plan_digest=payload["plan_digest"],
-            rubric_version=payload["rubric_version"],
-            verdict=Verdict(payload["verdict"]),
-            cells=tuple(
-                DerivedCell(
+        if not isinstance(data, bytes):
+            raise ReceiptInvalid("receipt bytes must be bytes")
+
+        def object_without_duplicates(pairs):
+            payload = {}
+            for key, value in pairs:
+                if key in payload:
+                    raise ReceiptInvalid(
+                        "receipt JSON contains a duplicate object field")
+                payload[key] = value
+            return payload
+
+        try:
+            payload = json.loads(
+                data.decode("utf-8"), object_pairs_hook=object_without_duplicates)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReceiptInvalid("receipt bytes are not UTF-8 JSON") from exc
+        expected = {
+            "plan_digest", "rubric_version", "verdict", "created_at_epoch",
+            "reviewer", "cells",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
+        reviewer = payload["reviewer"]
+        if (not isinstance(reviewer, dict) or
+                set(reviewer) != {"route", "model", "session_id"} or
+                not all(isinstance(value, str) for value in reviewer.values())):
+            raise ReceiptInvalid("reviewer fields do not match the frozen receipt schema")
+        cells = payload["cells"]
+        if not isinstance(cells, list):
+            raise ReceiptInvalid("receipt cells must be an array")
+        try:
+            _require_plan_digest(payload["plan_digest"])
+            if not isinstance(payload["rubric_version"], str):
+                raise ReceiptInvalid("rubric_version must be a string")
+            created_at_epoch = payload["created_at_epoch"]
+            _require_created_at_epoch(created_at_epoch)
+            verdict = Verdict(payload["verdict"])
+            derived_cells = []
+            for cell in cells:
+                if (not isinstance(cell, dict) or set(cell) != {
+                        "check_id", "object_id", "status", "severity",
+                        "message", "canary"}):
+                    raise ReceiptInvalid(
+                        "receipt cell fields do not match the frozen receipt schema")
+                if not all(isinstance(cell[field], str)
+                           for field in ("check_id", "object_id", "message")):
+                    raise ReceiptInvalid("receipt cell text fields must be strings")
+                canary = cell["canary"]
+                if canary is not None and not isinstance(canary, str):
+                    raise ReceiptInvalid("receipt cell canary must be a string or null")
+                derived_cells.append(DerivedCell(
                     check_id=cell["check_id"],
                     object_id=cell["object_id"],
                     status=CellStatus(cell["status"]),
                     severity=Severity(cell["severity"]),
                     message=cell["message"],
-                    canary=(None if cell["canary"] is None
-                            else CanaryKind(cell["canary"])))
-                for cell in payload["cells"]),
+                    canary=None if canary is None else CanaryKind(canary)))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReceiptInvalid("receipt values do not match the frozen receipt schema") from exc
+        return cls(
+            plan_digest=payload["plan_digest"],
+            rubric_version=payload["rubric_version"],
+            verdict=verdict,
+            cells=tuple(derived_cells),
             reviewer=ReviewerIdentity(
-                route=payload["reviewer"]["route"],
-                model=payload["reviewer"]["model"],
-                session_id=payload["reviewer"]["session_id"]),
-            created_at_epoch=payload["created_at_epoch"])
+                route=reviewer["route"],
+                model=reviewer["model"],
+                session_id=reviewer["session_id"]),
+            created_at_epoch=created_at_epoch)
+
+
+_PLAN_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_SIGNATURE_HEX = re.compile(r"^[0-9a-fA-F]{128}$")
 
 
 class ReceiptStoreLocationError(RuntimeError):
@@ -550,6 +623,10 @@ class ReceiptStoreLocationError(RuntimeError):
 class ReceiptExists(RuntimeError):
     """Receipts are create-once. Rewriting one is how a verdict silently
     changes under a digest that has already been published."""
+
+
+class ReceiptInvalid(RuntimeError):
+    """Receipt bytes do not satisfy the frozen receipt schema."""
 
 
 class SignatureMissing(RuntimeError):
@@ -567,22 +644,28 @@ class SigningKeyUnavailable(RuntimeError):
     everywhere but the finalizer's own machine."""
 
 
-class ReceiptStore:
-    """The receipt store: create-once, signed, and located outside the
-    repository and the data directory (§6.6).
+def _require_plan_digest(plan_digest: str) -> None:
+    if not isinstance(plan_digest, str) or not _PLAN_DIGEST.fullmatch(plan_digest):
+        raise ReceiptInvalid("plan_digest must be a 64-character lowercase hex digest")
 
-    `verify_keys` is a list rather than a key: rotation appends a public
-    key, and old receipts verify forever under the key that signed them.
-    `signing_seed` is optional, which is what makes private-key loss
-    survivable — verification needs only public material.
+
+class ReceiptStore:
+    """Create-once detached receipts with verified read-only access.
+
+    Writers publish a signed pending record before making receipt bytes
+    visible.  A crash can therefore be recovered only when the pending
+    signature verifies the exact persisted bytes; raw orphan JSON is never
+    promoted to authority.
     """
 
-    def __init__(self, root, *, repo_path, data_dir,
-                 verify_keys: Sequence[bytes],
-                 signing_seed: Optional[bytes] = None) -> None:
+    def __init__(self, root, *, repo_paths: Sequence[Union[str, Path]],
+                 data_dir, verify_keys: Sequence[bytes],
+                 signing_seed: Optional[bytes] = None,
+                 create: bool = True) -> None:
         self.root = Path(root).resolve()
-        forbidden = (("repository", Path(repo_path).resolve()),
-                     ("SSSF data directory", Path(data_dir).resolve()))
+        forbidden = tuple(
+            ("repository", Path(path).resolve()) for path in repo_paths
+        ) + (("SSSF data directory", Path(data_dir).resolve()),)
         for label, boundary in forbidden:
             if self.root == boundary or _is_inside(self.root, boundary):
                 raise ReceiptStoreLocationError(
@@ -592,21 +675,126 @@ class ReceiptStore:
                     "authority over receipts")
         self._verify_keys = tuple(verify_keys)
         self._signing_seed = signing_seed
-        self.root.mkdir(parents=True, exist_ok=True)
+        if (signing_seed is not None and
+                rc.seed_to_public_key(signing_seed) not in self._verify_keys):
+            raise SigningKeyUnavailable(
+                "the signing key's public key is absent from this store's "
+                "verification keys")
+        self._create = create
+        self._replace = os.replace
+        if create:
+            self.root.mkdir(parents=True, exist_ok=True)
 
     # ── layout ──────────────────────────────────────────────────────────
 
+    def _confined_path(self, filename: str) -> Path:
+        candidate = self.root / filename
+        if candidate.is_symlink() or (
+                candidate.exists() and
+                not _is_inside(candidate.resolve(), self.root)):
+            raise ReceiptInvalid("receipt path resolves outside the receipt store")
+        return candidate
+
     def path_for(self, plan_digest: str) -> Path:
-        return self.root / f"{plan_digest}.json"
+        _require_plan_digest(plan_digest)
+        return self._confined_path(f"{plan_digest}.json")
 
     def signature_path_for(self, plan_digest: str) -> Path:
-        return Path(str(self.path_for(plan_digest)) + ".sig")
+        _require_plan_digest(plan_digest)
+        return self._confined_path(f"{plan_digest}.json.sig")
+
+    def _pending_path_for(self, plan_digest: str) -> Path:
+        _require_plan_digest(plan_digest)
+        return self._confined_path(f"{plan_digest}.pending")
+
+    @contextlib.contextmanager
+    def _locked(self, plan_digest: str) -> Iterator[None]:
+        lock_path = self._confined_path(f"{plan_digest}.lock")
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def has(self, plan_digest: str) -> bool:
-        """Whether a receipt exists for this digest. Deliberately does not
-        verify: an unverifiable receipt is still a receipt, and `load`
-        raises rather than letting it read as absent."""
+        """An orphan JSON remains visible as a hard verification error."""
         return self.path_for(plan_digest).is_file()
+
+    # ── atomic publication and recovery ─────────────────────────────────
+
+    def _stage(self, destination: Path, data: bytes) -> None:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".receipt-", dir=str(self.root))
+        temporary_path = Path(temporary)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            self._replace(str(temporary_path), str(destination))
+            self._fsync_root()
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    def _fsync_root(self) -> None:
+        descriptor = os.open(str(self.root), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _read_signature(self, path: Path, plan_digest: str) -> bytes:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeError as exc:
+            raise SignatureInvalid(
+                f"the receipt signature for {plan_digest} is not UTF-8") from exc
+        encoded = text[:-1] if text.endswith("\n") else text
+        if not _SIGNATURE_HEX.fullmatch(encoded):
+            raise SignatureInvalid(
+                f"the receipt signature for {plan_digest} is not hexadecimal")
+        return bytes.fromhex(encoded)
+
+    def _signature_verifies(self, data: bytes, signature: bytes) -> bool:
+        return any(rc.verify(key, data, signature) for key in self._verify_keys)
+
+    def _recover_locked(self, plan_digest: str) -> bool:
+        path = self.path_for(plan_digest)
+        signature_path = self.signature_path_for(plan_digest)
+        pending_path = self._pending_path_for(plan_digest)
+        if not pending_path.is_file():
+            return False
+        signature = self._read_signature(pending_path, plan_digest)
+        if not path.is_file():
+            pending_path.unlink()
+            self._fsync_root()
+            return False
+        data = path.read_bytes()
+        if not self._signature_verifies(data, signature):
+            raise SignatureInvalid(
+                f"the pending receipt for {plan_digest} verifies under none of "
+                f"this store's {len(self._verify_keys)} public key(s)")
+        expected = signature.hex().encode("ascii") + b"\n"
+        if signature_path.is_file():
+            existing = self._read_signature(signature_path, plan_digest)
+            if existing != signature:
+                raise ReceiptExists(
+                    f"a conflicting receipt signature exists for {plan_digest}")
+        else:
+            self._stage(signature_path, expected)
+        pending_path.unlink()
+        self._fsync_root()
+        return True
+
+    def recover(self, plan_digest: str) -> bool:
+        """Complete only an authenticated interrupted publication."""
+        _require_plan_digest(plan_digest)
+        if not self._create:
+            return False
+        with self._locked(plan_digest):
+            return self._recover_locked(plan_digest)
 
     # ── writing and reading ─────────────────────────────────────────────
 
@@ -615,20 +803,35 @@ class ReceiptStore:
             raise SigningKeyUnavailable(
                 "this store holds no signing key; the signing key is "
                 "finalizer-held (§6.6)")
+        if not self._create:
+            raise FileNotFoundError("receipt store is opened read-only")
+        _require_plan_digest(receipt.plan_digest)
+        _require_created_at_epoch(receipt.created_at_epoch)
         path = self.path_for(receipt.plan_digest)
-        if path.exists():
-            raise ReceiptExists(
-                f"a receipt already exists for {receipt.plan_digest}; receipts "
-                "are create-once")
+        signature_path = self.signature_path_for(receipt.plan_digest)
+        pending_path = self._pending_path_for(receipt.plan_digest)
         data = receipt.to_bytes()
         signature = rc.sign(self._signing_seed, data)
-        path.write_bytes(data)
-        self.signature_path_for(receipt.plan_digest).write_text(
-            signature.hex() + "\n", encoding="utf-8")
+        encoded_signature = signature.hex().encode("ascii") + b"\n"
+        with self._locked(receipt.plan_digest):
+            self._recover_locked(receipt.plan_digest)
+            if path.is_file():
+                if not signature_path.is_file() and path.read_bytes() == data:
+                    self._stage(signature_path, encoded_signature)
+                    return path
+                raise ReceiptExists(
+                    f"a receipt already exists for {receipt.plan_digest}; receipts "
+                    "are create-once")
+            self._stage(pending_path, encoded_signature)
+            self._stage(signature_path, encoded_signature)
+            self._stage(path, data)
+            pending_path.unlink()
+            self._fsync_root()
         return path
 
     def load(self, plan_digest: str) -> Receipt:
-        """Verify before trusting (§6.6)."""
+        """Verify before parsing or trusting receipt bytes."""
+        _require_plan_digest(plan_digest)
         path = self.path_for(plan_digest)
         if not path.is_file():
             raise FileNotFoundError(f"no receipt for {plan_digest}")
@@ -637,13 +840,16 @@ class ReceiptStore:
             raise SignatureMissing(
                 f"the receipt for {plan_digest} has no signature beside it")
         data = path.read_bytes()
-        signature = bytes.fromhex(signature_path.read_text().strip())
-        for key in self._verify_keys:
-            if rc.verify(key, data, signature):
-                return Receipt.from_bytes(data)
-        raise SignatureInvalid(
-            f"the receipt for {plan_digest} verifies under none of this "
-            f"store's {len(self._verify_keys)} public key(s)")
+        signature = self._read_signature(signature_path, plan_digest)
+        if not self._signature_verifies(data, signature):
+            raise SignatureInvalid(
+                f"the receipt for {plan_digest} verifies under none of this "
+                f"store's {len(self._verify_keys)} public key(s)")
+        receipt = Receipt.from_bytes(data)
+        if receipt.plan_digest != plan_digest:
+            raise ReceiptInvalid(
+                f"the receipt stored for {plan_digest} names {receipt.plan_digest}")
+        return receipt
 
 
 def _is_inside(candidate: Path, boundary: Path) -> bool:
@@ -745,6 +951,8 @@ def finalize(
     blockers = list(validate())
     if blockers:
         raise AuthoringBlocked(blockers)
+    store.recover(plan_digest)
+
 
     if store.has(plan_digest):
         receipt = store.load(plan_digest)
@@ -755,6 +963,9 @@ def finalize(
     window = window_factory(matrix)
     outcome: WindowOutcome = window.run(sleep=sleep)
     if not outcome.completed:
+        if outcome.signal is None:
+            raise RuntimeError(
+                "FINALIZATION_PROTOCOL_ERROR: incomplete window without signal")
         raise FinalizationStalled(outcome.session, outcome.signal,
                                   outcome.elapsed_s)
 
@@ -764,6 +975,8 @@ def finalize(
     verify_report(matrix, report)
 
     derived = derive_verdict(matrix, report, rubric)
+    created_at_epoch = clock()
+    _require_created_at_epoch(created_at_epoch)
     receipt = Receipt(
         plan_digest=plan_digest,
         rubric_version=rubric.version,
@@ -772,7 +985,12 @@ def finalize(
         reviewer=ReviewerIdentity(route=outcome.session.route,
                                   model=outcome.session.model,
                                   session_id=outcome.session.session_id),
-        created_at_epoch=clock())
-    store.write(receipt)
+        created_at_epoch=created_at_epoch)
+    try:
+        store.write(receipt)
+    except ReceiptExists:
+        existing = store.load(plan_digest)
+        return FinalizationOutcome(verdict=existing.verdict, receipt=existing,
+                                   replayed=True)
     return FinalizationOutcome(verdict=receipt.verdict, receipt=receipt,
                                replayed=False)

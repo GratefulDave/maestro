@@ -25,12 +25,12 @@ once, here, and every one of its steps is asserted by a test:
     RUNNING -> VERIFIED             # only if all four clauses hold
     merge by output SHA             # §8.5, §8.6 — in (depth, node_id) order
 
-Three seams are injected rather than implemented, because each belongs to
+Four seams are injected rather than implemented, because each belongs to
 step 7's launcher and would be a lie if faked here (§12.3 — a deferral is
-loud, never a stub): running a node, running a gate, and running the
-integration gate. They are injected behind the protocols the real adapters
-will implement, so the offline suite exercises this module's own logic
-rather than a mock of somebody else's.
+loud, never a stub): running a node, running a gate, running the integration
+gate, and proving an owned attempt's process groups absent. They are injected
+behind cancellable protocols the real adapters implement, so the offline suite
+exercises this module's own logic rather than a mock of somebody else's.
 
 Two decisions worth stating because they are not obvious from the spec, and
 both were forced by reading the code rather than the document:
@@ -81,17 +81,47 @@ class NodeExecution:
     launcher_failure: Optional[rp.LauncherFailure] = None
 
 
-#: `(attempt, node, attempt_record, retry_prompt) -> NodeExecution`. The
-#: retry prompt is `None` on a first attempt and non-None only for SEMANTIC
-#: retries, which are the only class that mutates it (§7.5).
-NodeRunner = Callable[..., NodeExecution]
+#: Runner boundaries receive the scheduler's cancellation lease explicitly.
+#: They MUST use it while waiting so no gate or owned execution can outlive
+#: the RUNNING generation that authorized it.
+CancelRequested = Callable[[], bool]
+NodeRunner = Callable[[
+    wt.AttemptWorktree, st.PlanNode, st.AttemptRecord, Optional[str],
+    Callable[[Optional[int]], None], CancelRequested,
+], NodeExecution]
+GateRunner = Callable[[
+    wt.AttemptWorktree, st.PlanNode, str, CancelRequested,
+], "wt.GateResult"]
+IntegrationGateRunner = Callable[[
+    Path, Sequence[str], CancelRequested,
+], "wt.GateResult"]
+QuiesceAttempt = Callable[[st.AttemptRecord, str], None]
 
-#: `(attempt, node, phase) -> wt.GateResult`, where phase is "pre" or "post".
-GateRunner = Callable[..., "wt.GateResult"]
 
-#: `(integration_path, specs) -> wt.GateResult` (§8.8).
-IntegrationGateRunner = Callable[..., "wt.GateResult"]
+class QuiescenceDependencyError(ValueError):
+    """A scheduler without process-absence proof is unsafe to construct."""
 
+
+class QuiescenceFailure(RuntimeError):
+    """The attempt's owned execution could not be proven absent."""
+
+    def __init__(self, phase: str, cause: BaseException) -> None:
+        super().__init__(f"{phase}: owned execution quiescence is unproven")
+        self.phase = phase
+        self.__cause__ = cause
+
+
+class AttemptOwnershipLost(RuntimeError):
+    """A worker observed that its RUNNING generation was superseded."""
+
+
+class AttemptCancelled(RuntimeError):
+    """Cancellation was requested while the attempt still held RUNNING."""
+
+
+
+class DurableOutputIdentityError(RuntimeError):
+    """A terminal durable row names no verifiable commit identity."""
 
 @dataclass
 class SchedulerDeps:
@@ -106,6 +136,7 @@ class SchedulerDeps:
     run_node: NodeRunner
     run_gate: GateRunner
     run_integration_gate: IntegrationGateRunner
+    quiesce_attempt: QuiesceAttempt
     min_cases: int = 1
     #: `(attempt) -> None`. The watchdog performs the kill the worker cannot,
     #: because the worker thread is blocked reading the agent (§7.6). Killing
@@ -114,6 +145,20 @@ class SchedulerDeps:
     #: detects and fails a stalled attempt; it simply cannot terminate it, and
     #: that is a stated limit rather than a silent one.
     kill_attempt: Optional[Callable[..., None]] = None
+    #: Provision runs after worktree creation and before pre-gate/baseline.
+    provision: Optional[Callable[[Path], None]] = None
+
+    def __post_init__(self) -> None:
+        if self.quiesce_attempt is None:
+            raise QuiescenceDependencyError(
+                "quiesce_attempt is required: a scheduler cannot classify or "
+                "retry while owned execution may still exist")
+
+
+@dataclass
+class _AttemptContext:
+    record: Optional[st.AttemptRecord] = None
+    settled: bool = False
 
 
 @dataclass
@@ -166,12 +211,16 @@ class Scheduler:
 
         self._cancelled = threading.Event()
         self._lock = threading.RLock()
+        # A watchdog timeout revokes a generation before quiescence can
+        # complete and release its retry. The durable row remains RUNNING
+        # during that proof, so its state alone cannot stop a provisioner
+        # unblocked by the watchdog from entering a gate or runner.
+        self._watchdog_fences: Dict[Tuple[str, str, int], None] = {}
         self._output_shas: Dict[str, str] = {}
         self._retry_prompts: Dict[str, Optional[str]] = {}
         self._pool: Optional[ThreadPoolExecutor] = None
         self._projected = False
         self._stuck = False
-
         _refuse_colliding_integration_branch(deps.integration_branch, run_id)
 
     # ── lifecycle of the scheduler itself ───────────────────────────────────
@@ -185,19 +234,117 @@ class Scheduler:
                                        list(self.nodes.values()))
         except lc.RunAlreadyExists:
             pass
+        # Both durable states carry authority only after their persisted SHA is
+        # revalidated. A crash after VERIFIED has no in-memory output map, so
+        # excluding it would strand a ready merge forever; trusting an
+        # unverified string would let a corrupt row choose the merge input.
+        for node_id in self.nodes:
+            row = self.deps.store.get_node(self.run_id, node_id)
+            if row.state not in (st.NodeState.VERIFIED, st.NodeState.MERGED):
+                continue
+            output_sha = row.output_sha
+            valid = output_sha is not None
+            if valid and row.state is st.NodeState.VERIFIED:
+                try:
+                    attempt = self.deps.store.get_attempt(
+                        self.run_id, node_id, row.attempt_no)
+                except lc.UnknownNode:
+                    valid = False
+                else:
+                    valid = (attempt.state is st.NodeState.VERIFIED
+                             and wt.is_attempt_output_commit(
+                                 Path(self.deps.repo), output_sha,
+                                 run_id=self.run_id, node_id=node_id,
+                                 attempt_no=row.attempt_no,
+                                 expected_base=attempt.base_sha))
+            elif valid:
+                valid = (
+                    wt.is_valid_output_commit(
+                        Path(self.deps.integration_path), output_sha)
+                    and wt.final_ancestry_sweep(
+                        Path(self.deps.integration_path),
+                        {node_id: output_sha}).get(node_id, False))
+            if not valid:
+                if row.state is st.NodeState.VERIFIED:
+                    self.deps.store.mark_blocked(
+                        self.run_id, node_id, st.BlockReason.OUTPUT_IDENTITY_INVALID)
+                    continue
+                raise DurableOutputIdentityError(
+                    f"{self.run_id}/{node_id}: MERGED output identity is invalid")
+            self._output_shas[node_id] = output_sha
         self._projected = True
 
     def cancel(self) -> None:
-        """§7.8 — the scheduler never blocks on a kill. Setting the flag is
-        the whole of cancellation's synchronous part; a surviving pane is a
-        leak, not a correctness hazard, because a cancelled node's worktree
-        is never merged and its result is rejected."""
-        self._cancelled.set()
+        """Latch cancellation; the run loop owns its quiescent completion."""
+        with self._lock:
+            self._cancelled.set()
 
     def shutdown(self) -> None:
         pool, self._pool = self._pool, None
         if pool is not None:
             pool.shutdown(wait=True)
+
+    def _owns_running(self, record: st.AttemptRecord) -> bool:
+        lifecycle = self.deps.store.get_node(self.run_id, record.node_id)
+        return (lifecycle.state is st.NodeState.RUNNING
+                and lifecycle.attempt_no == record.attempt_no)
+
+    def _fence_watchdog_generation(self, record: st.AttemptRecord) -> None:
+        """Revoke a timed-out generation before its quiescence proof blocks."""
+        with self._lock:
+            self._watchdog_fences[record.key] = None
+
+    def _require_running(self, record: st.AttemptRecord) -> None:
+        with self._lock:
+            if self._cancelled.is_set():
+                raise AttemptCancelled()
+            if record.key in self._watchdog_fences:
+                raise AttemptOwnershipLost(
+                    f"{record.node_id}#{record.attempt_no} was fenced by watchdog")
+            if not self._owns_running(record):
+                raise AttemptOwnershipLost(
+                    f"{record.node_id}#{record.attempt_no} no longer owns RUNNING")
+
+    def _quiesce(self, record: st.AttemptRecord, phase: str) -> None:
+        try:
+            self.deps.quiesce_attempt(record, phase)
+        except BaseException as exc:
+            raise QuiescenceFailure(phase, exc) from exc
+
+    def _settle_context(self, context: _AttemptContext) -> None:
+        if context.record is not None and not context.settled:
+            self._quiesce(context.record, "settle")
+            context.settled = True
+
+    def _block_quiescence(self, node: st.PlanNode,
+                          record: Optional[st.AttemptRecord],
+                          failure: QuiescenceFailure) -> None:
+        if record is None:
+            return
+        with self._lock:
+            if not self._owns_running(record):
+                return
+            cause = failure.__cause__
+            self.deps.store.mark_blocked(
+                self.run_id, node.node_id, st.BlockReason.QUIESCENCE_UNPROVEN,
+                detail={"phase": failure.phase,
+                        "exception_type": type(cause).__name__})
+
+    def _request_cancel(self, node_id: str) -> None:
+        lifecycle = self.deps.store.get_node(self.run_id, node_id)
+        if lifecycle.state is not st.NodeState.RUNNING:
+            return
+        try:
+            record = self.deps.store.get_attempt(
+                self.run_id, node_id, lifecycle.attempt_no)
+        except lc.UnknownNode:
+            return
+        try:
+            self._quiesce(record, "cancel")
+        except QuiescenceFailure as exc:
+            node = self.nodes.get(node_id)
+            if node is not None:
+                self._block_quiescence(node, record, exc)
 
     # ── the main loop ───────────────────────────────────────────────────────
 
@@ -215,12 +362,26 @@ class Scheduler:
 
         self._pool = ThreadPoolExecutor(max_workers=self.config.concurrency)
         in_flight: Dict[str, "Future"] = {}
+        cancellation_requested = set()
         watchdog, backstop = self._start_liveness()
+        watchdog.start()
         try:
             while True:
                 if self._cancelled.is_set():
-                    for future in list(in_flight.values()):
+                    # A Future cannot interrupt a running worker. Quiesce its
+                    # owned execution first, then wait for the worker to stop
+                    # observing its RUNNING lease before cancelling durable
+                    # state. Otherwise a late worker could commit into a retry.
+                    for node_id, future in list(in_flight.items()):
                         future.cancel()
+                        if node_id not in cancellation_requested:
+                            self._request_cancel(node_id)
+                            cancellation_requested.add(node_id)
+                    if in_flight:
+                        done, _ = _wait_any(list(in_flight.items()))
+                        for node_id in done:
+                            in_flight.pop(node_id, None)
+                        continue
                     self.deps.store.cancel_run(self.run_id)
                     break
 
@@ -235,11 +396,14 @@ class Scheduler:
                     break
 
                 self._merge_frontier()
+                if self._cancelled.is_set():
+                    continue
 
                 ready = [node_id for node_id in self.deps.store.ready_nodes(self.run_id)
                          if node_id not in in_flight]
                 for node_id in ready:
-                    if len(in_flight) >= self.config.concurrency:
+                    if (self._cancelled.is_set()
+                            or len(in_flight) >= self.config.concurrency):
                         break
                     in_flight[node_id] = self._pool.submit(self._attempt, node_id)
 
@@ -278,21 +442,49 @@ class Scheduler:
             return [a for a in store.attempts_for(self.run_id)
                     if a.state is st.NodeState.RUNNING]
 
+        def kill(attempt):
+            # `_stall` calls the killer before `fail_attempt`. Revoke the
+            # worker's authority here, rather than after the potentially
+            # blocking quiescence proof in `fail`, so no resumed provisioner
+            # can pass its next generation boundary in that interval.
+            self._fence_watchdog_generation(attempt)
+            if self.deps.kill_attempt is None:
+                return
+            try:
+                self.deps.kill_attempt(attempt)
+            except BaseException as exc:
+                node = self.nodes.get(attempt.node_id)
+                if node is not None:
+                    self._block_quiescence(
+                        node, attempt, QuiescenceFailure("watchdog-kill", exc))
+
         def fail(attempt, retry_class, reason):
-            # The watchdog returns the node to pending as ENVIRONMENTAL — an
-            # attempt that stalled is a fact about the machine, never a
-            # verdict about the work (§7.6).
+            # The watchdog's kill request is not proof: only the mandatory
+            # quiescer can establish group absence before this generation is
+            # released for retry. Fence again because this callback is also
+            # the authority boundary if a Watchdog implementation reaches it
+            # without calling `kill`.
+            self._fence_watchdog_generation(attempt)
             node = self.nodes.get(attempt.node_id)
-            if node is not None:
-                self._settle_failure(node, rp.Classification(retry_class=retry_class))
+            if node is None:
+                return
+            try:
+                self._quiesce(attempt, "watchdog")
+            except QuiescenceFailure as exc:
+                self._block_quiescence(node, attempt, exc)
+                return
+            if not self._cancelled.is_set():
+                self._settle_failure(
+                    node, rp.Classification(retry_class=retry_class), record=attempt,
+                    allow_watchdog_fence=True)
 
         watchdog = wd.Watchdog(
             config=self.config,
             attempts_provider=running_attempts,
             write_heartbeat=store.record_heartbeat,
-            kill=self.deps.kill_attempt or (lambda attempt: None),
-            fail_attempt=fail)
-        watchdog.start()
+            kill=kill,
+            fail_attempt=fail,
+            time_source=time.time)
 
         backstop = wd.RunBackstop(
             config=self.config,
@@ -338,36 +530,39 @@ class Scheduler:
     # ── one attempt (§7.3, §7.4, §8.3, §8.4) ────────────────────────────────
 
     def _attempt(self, node_id: str) -> None:
-        """One node's attempt, with the top-level handler §7.5 requires.
-
-        Every worker body carries this handler and **any exception reaching
-        it without a classification defaults to ENVIRONMENTAL** — fail-closed,
-        never SEMANTIC, so an engine bug can never be recorded as a verdict
-        about the code under test. A `ThreadPoolExecutor` otherwise swallows
-        an unhandled exception into a future where nobody looks.
-
-        A worker failure **writes only its own node's state**: one node's
-        collapse retries or blocks that node while its siblings and the run
-        continue (§13.3's negative test).
-        """
+        """Run one leased attempt and never classify a superseded generation."""
         node = self.nodes[node_id]
-        attempt = None
+        context = _AttemptContext()
         try:
-            self._attempt_body(node)
+            self._attempt_body(node, context)
+        except (AttemptCancelled, AttemptOwnershipLost):
+            # Even a superseded/cancelled worker must prove its latest boundary
+            # quiescent before returning control to the scheduler loop.
+            try:
+                self._settle_context(context)
+            except QuiescenceFailure as exc:
+                self._block_quiescence(node, context.record, exc)
+            return
+        except QuiescenceFailure as exc:
+            self._block_quiescence(node, context.record, exc)
+        except wt.HarnessQuiescenceError as exc:
+            self._block_quiescence(
+                node, context.record, QuiescenceFailure("harness-gate", exc))
         except BaseException as exc:  # noqa: BLE001 — containment is the point
             try:
-                signal = rp.FailureSignal(node_kind=node.kind,
-                                          exception_type=type(exc).__name__)
-                self._settle_failure(node, rp.classify(signal))
-            except Exception:
-                # Even the failure path cannot be allowed to escape into the
-                # future. There is nothing left to record it with, so the run
-                # loop sees the node still RUNNING and the watchdog owns it.
-                pass
-        finally:
-            del attempt
+                self._settle_context(context)
+            except QuiescenceFailure as quiescence:
+                self._block_quiescence(node, context.record, quiescence)
+                return
+            if (context.record is not None
+                    and not self._cancelled.is_set()
+                    and self._owns_running(context.record)):
+                signal = rp.FailureSignal(
+                    node_kind=node.kind, exception_type=type(exc).__name__)
+                self._settle_failure(
+                    node, rp.classify(signal), record=context.record)
 
-    def _attempt_body(self, node: st.PlanNode) -> None:
+    def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
         head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
 
@@ -375,50 +570,79 @@ class Scheduler:
         # `git worktree add` is inside it rather than outside.
         attempt_no = store.start_attempt(self.run_id, node.node_id, head)
         record = store.get_attempt(self.run_id, node.node_id, attempt_no)
+        context.record = record
+        self._require_running(record)
 
         attempt = wt.create_attempt_worktree(
             self.deps.repo, self.run_id, node.node_id, attempt_no, head,
             Path(self.deps.worktrees_root), Path(self.deps.scratch_root))
+        self._require_running(record)
 
         created = wt.check_at_create(attempt)
+        self._require_running(record)
         if not created.ok:
-            self._settle_failure(node, rp.Classification(
-                retry_class=st.RetryClass.ENVIRONMENTAL))
+            self._settle_context(context)
+            self._settle_failure(
+                node, rp.Classification(retry_class=st.RetryClass.ENVIRONMENTAL),
+                record=record)
             return
 
         pre_verdict = None
-        if node.kind is st.NodeKind.AGENT:
-            pre = self.deps.run_gate(attempt, node, "pre")
-            pre_verdict = vf.adjudicate_gate(pre, self.deps.min_cases)
-            if pre_verdict.green:
-                # §7.4 — terminal and non-retryable, and the agent never runs:
-                # a gate that cannot fail proves nothing about work that has
-                # not happened yet, so spending an agent on it is pure waste.
-                store.mark_blocked(self.run_id, node.node_id,
-                                   st.BlockReason.GATE_NOT_FALSIFIABLE)
-                return
+        try:
+            if self.deps.provision is not None:
+                self.deps.provision(attempt.path)
+            # A slow provision may finish after a watchdog revoked this
+            # generation. Its return is a fence: no stale worker reaches a
+            # gate, runner, inventory, or commit.
+            self._require_running(record)
+            if node.kind is st.NodeKind.AGENT:
+                self._require_running(record)
+                pre = self.deps.run_gate(
+                    attempt, node, "pre", self._cancelled.is_set)
+                pre_verdict = vf.adjudicate_gate(pre, self.deps.min_cases)
+        finally:
+            # Provision and the pre gate both execute before the measurement
+            # bracket; their process groups must be absent before its baseline.
+            self._quiesce(record, "pre-baseline")
+        self._require_running(record)
+
+        if pre_verdict is not None and pre_verdict.green:
+            self._settle_context(context)
+            self._settle_failure(
+                node, rp.Classification(
+                    block_reason=st.BlockReason.GATE_NOT_FALSIFIABLE),
+                record=record)
+            return
 
         baseline = wt.take_baseline(attempt)
+        self._require_running(record)
 
         def on_launch(pid: Optional[int] = None) -> None:
-            """The adapter reports launch, and that is what arms §7.6's first
-            two signals. It has to be a callback rather than a return value:
-            the runner does not return until the node is finished, and a
-            watchdog that learned of the launch then would have nothing left
-            to watch.
-            """
-            store.mark_launched(self.run_id, node.node_id, attempt_no, pid)
+            """Arm liveness only while this exact generation still owns RUNNING."""
+            with self._lock:
+                self._require_running(record)
+                store.mark_launched(self.run_id, node.node_id, attempt_no, pid)
 
-        execution = self.deps.run_node(attempt, node, record,
-                                       self._retry_prompts.get(node.node_id),
-                                       on_launch)
+        self._require_running(record)
+        try:
+            execution = self.deps.run_node(
+                attempt, node, record, self._retry_prompts.get(node.node_id),
+                on_launch, self._cancelled.is_set)
+        finally:
+            # This runs even if the runner raises; classification below cannot
+            # release or block the attempt until its owned group is absent.
+            self._quiesce(record, "pre-inventory")
+        self._require_running(record)
         if execution.launched_pid is not None:
             # A runner that reports its pid only on return still arms the
             # signals, just late — recorded so the row is complete either way.
-            store.mark_launched(self.run_id, node.node_id, attempt_no,
-                                execution.launched_pid)
+            with self._lock:
+                self._require_running(record)
+                store.mark_launched(self.run_id, node.node_id, attempt_no,
+                                    execution.launched_pid)
 
         after = wt.inventory(attempt.path)
+        self._require_running(record)
         measured = wt.delta(baseline, after)
         permission = wt.permission_check(attempt, measured, node.outputs)
 
@@ -438,37 +662,52 @@ class Scheduler:
                 permission=permission)
 
         if not verdict.verified and verdict.failed_clause != 3:
-            self._settle_verdict(node, verdict, execution)
+            self._settle_context(context)
+            self._settle_verdict(node, verdict, execution, record)
             return
 
-        output_sha = wt.commit_measured_delta(
-            attempt, measured, after,
-            f"{node.node_id} attempt {attempt_no}")
-        wt.check_post_commit(attempt, wt.expected_inventory(baseline, measured, after))
+        with self._lock:
+            self._require_running(record)
+            output_sha = wt.commit_measured_delta(
+                attempt, measured, after,
+                f"{node.node_id} attempt {attempt_no}")
+        self._require_running(record)
+        wt.check_post_commit(
+            attempt, wt.expected_inventory(baseline, measured, after))
+        self._require_running(record)
 
         if node.kind is st.NodeKind.AGENT:
-            post = self.deps.run_gate(attempt, node, "post")
+            self._require_running(record)
+            post = self.deps.run_gate(
+                attempt, node, "post", self._cancelled.is_set)
+            self._require_running(record)
             verdict = vf.verify_agent_node(
                 envelope_parsed=execution.envelope_parsed,
                 pre_gate=pre_verdict,
                 post_gate=vf.adjudicate_gate(post, self.deps.min_cases),
                 permission=permission)
             if not verdict.verified:
-                self._settle_verdict(node, verdict, execution)
+                self._settle_context(context)
+                self._settle_verdict(node, verdict, execution, record)
                 return
 
+        # The final proof covers post-gates as well as every failure path
+        # above. Only then may the scheduler make a durable state transition.
+        self._settle_context(context)
         with self._lock:
+            self._require_running(record)
             self._output_shas[node.node_id] = output_sha
-        store.mark_verified(self.run_id, node.node_id, output_sha)
+            store.mark_verified(self.run_id, node.node_id, output_sha)
 
     # ── settling a failed attempt ───────────────────────────────────────────
 
     def _settle_verdict(self, node: st.PlanNode, verdict: "vf.VerificationVerdict",
-                        execution: NodeExecution) -> None:
+                        execution: NodeExecution, record: st.AttemptRecord) -> None:
         """Turn a failed VERIFIED predicate into a classification (§7.5)."""
         if verdict.block_reason is not None:
-            self.deps.store.mark_blocked(self.run_id, node.node_id,
-                                         verdict.block_reason)
+            self._settle_failure(
+                node, rp.Classification(block_reason=verdict.block_reason),
+                record=record)
             return
 
         signal = rp.FailureSignal(
@@ -482,45 +721,52 @@ class Scheduler:
         classification = (rp.Classification(retry_class=verdict.retry_class)
                           if verdict.retry_class is not None
                           else rp.classify(signal))
-        self._settle_failure(node, classification, verdict)
+        self._settle_failure(node, classification, verdict, record)
 
     def _settle_failure(self, node: st.PlanNode, classification: rp.Classification,
-                        verdict: Optional["vf.VerificationVerdict"] = None) -> None:
-        """Block or release the node — decided here, while it is still RUNNING.
-
-        The store legally transitions to BLOCKED only from RUNNING, and that
-        is correct: a node blocks out of an attempt, not out of the queue. So
-        the budget question has to be answered now rather than at the next
-        pick-up, when the node would be PENDING and the transition refused.
-        """
-        store = self.deps.store
-        if classification.block_reason is not None:
-            store.mark_blocked(self.run_id, node.node_id, classification.block_reason)
+                        verdict: Optional["vf.VerificationVerdict"] = None,
+                        record: Optional[st.AttemptRecord] = None,
+                        allow_watchdog_fence: bool = False) -> None:
+        """Block or release only the generation that still owns RUNNING."""
+        if record is None:
             return
-
-        retry_class = classification.retry_class or st.DEFAULT_RETRY_CLASS
-        if retry_class is st.RetryClass.SEMANTIC:
-            lifecycle = store.get_node(self.run_id, node.node_id)
-            if self._semantic_ceiling_reached(node.node_id,
-                                              lifecycle.granted_extra_attempts):
-                store.mark_blocked(self.run_id, node.node_id,
-                                   st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
-                                   retry_class=retry_class)
+        store = self.deps.store
+        with self._lock:
+            if (self._cancelled.is_set()
+                    or not self._owns_running(record)
+                    or (record.key in self._watchdog_fences
+                        and not allow_watchdog_fence)):
                 return
-            # Only SEMANTIC mutates the prompt, and the offending paths are
-            # named in it — which is what makes the retry genuinely new
-            # instructions rather than the same request repeated (§7.5).
-            self._retry_prompts[node.node_id] = _retry_prompt(node, verdict)
-        else:
-            budget = self.config.retry_budget(retry_class)
-            spent = store.attempts_spent(self.run_id, node.node_id, retry_class)
-            if spent >= budget:
-                store.mark_blocked(self.run_id, node.node_id,
-                                   _budget_reason(retry_class),
-                                   retry_class=retry_class)
+            if classification.block_reason is not None:
+                store.mark_blocked(
+                    self.run_id, node.node_id, classification.block_reason)
                 return
 
-        store.fail_attempt(self.run_id, node.node_id, retry_class)
+            retry_class = classification.retry_class or st.DEFAULT_RETRY_CLASS
+            if retry_class is st.RetryClass.SEMANTIC:
+                lifecycle = store.get_node(self.run_id, node.node_id)
+                if self._semantic_ceiling_reached(
+                        node.node_id, lifecycle.granted_extra_attempts):
+                    store.mark_blocked(
+                        self.run_id, node.node_id,
+                        st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                        retry_class=retry_class)
+                    return
+                # Only SEMANTIC mutates the prompt, and the offending paths are
+                # named in it — which is what makes the retry genuinely new
+                # instructions rather than the same request repeated (§7.5).
+                self._retry_prompts[node.node_id] = _retry_prompt(node, verdict)
+            else:
+                budget = self.config.retry_budget(retry_class)
+                spent = store.attempts_spent(
+                    self.run_id, node.node_id, retry_class)
+                if spent >= budget:
+                    store.mark_blocked(
+                        self.run_id, node.node_id, _budget_reason(retry_class),
+                        retry_class=retry_class)
+                    return
+
+            store.fail_attempt(self.run_id, node.node_id, retry_class)
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """§7.5's ceiling, counting the attempt that is failing right now.
@@ -550,12 +796,14 @@ class Scheduler:
         worker happened to finish would make the sequence depend on timing —
         the property the frontier exists to remove.
         """
-        while True:
+        while not self._cancelled.is_set():
             records = self.deps.store.node_records(self.run_id)
             candidate = wt.merge_ready(records)
             if candidate is None:
                 return
             with self._lock:
+                if self._cancelled.is_set():
+                    return
                 output_sha = self._output_shas.get(candidate.node_id)
             if output_sha is None:
                 return
@@ -577,29 +825,46 @@ class Scheduler:
                     self.run_id, candidate.node_id, st.BlockReason.MERGE_CONFLICT,
                     detail={"reason": "ancestry not proven after merge"})
                 continue
+            if self._cancelled.is_set():
+                return
             self.deps.store.mark_merged(self.run_id, candidate.node_id)
 
     # ── §8.8 final acceptance, and §7.3's declaration ───────────────────────
 
     def _declare(self) -> RunReport:
         store = self.deps.store
+        # The Event is not authority. Persist it before either accepting a
+        # candidate or declaring the terminal outcome, including cancellation
+        # that arrived while final acceptance was running.
+        if self._cancelled.is_set():
+            store.cancel_run(self.run_id)
+
         records = store.node_records(self.run_id)
         states = {r.node_id: r.state for r in records}
         merged = tuple(sorted(n for n, s in states.items()
                               if s == st.NodeState.MERGED.value))
-        cancelled = tuple(sorted(n for n, s in states.items()
-                                 if s == st.NodeState.CANCELLED.value))
-        blocked = tuple(sorted(
-            (n, store.get_node(self.run_id, n).block_reason)
-            for n, s in states.items() if s == st.NodeState.BLOCKED.value))
 
         acceptance = None
-        if self._is_candidate_accepted(states):
+        if not self._cancelled.is_set() and self._is_candidate_accepted(states):
             acceptance = self._run_final_acceptance(records, merged)
-
-        declared = store.declare_outcome(
-            self.run_id, stuck=self._stuck,
-            acceptance_result=(acceptance.green if acceptance else None))
+        with self._lock:
+            if self._cancelled.is_set():
+                store.cancel_run(self.run_id)
+                records = store.node_records(self.run_id)
+                states = {r.node_id: r.state for r in records}
+                merged = tuple(sorted(n for n, s in states.items()
+                                      if s == st.NodeState.MERGED.value))
+            cancelled = tuple(sorted(n for n, s in states.items()
+                                     if s == st.NodeState.CANCELLED.value))
+            blocked = tuple(sorted(
+                (n, store.get_node(self.run_id, n).block_reason)
+                for n, s in states.items() if s == st.NodeState.BLOCKED.value))
+            # This closes the cancellation/ACCEPTED race: after the final gate
+            # returned, either cancellation is made durable here or acceptance
+            # is declared before a later cancellation request can take effect.
+            declared = store.declare_outcome(
+                self.run_id, stuck=self._stuck,
+                acceptance_result=(acceptance.green if acceptance else None))
 
         return RunReport(
             outcome=declared.outcome,
@@ -630,12 +895,19 @@ class Scheduler:
         run-level backstop measures that healthy gap as silence.
         """
         store = self.deps.store
+        if self._cancelled.is_set():
+            return AcceptanceResult(
+                green=False, specs=(), reason="cancellation requested before acceptance")
         store.acceptance_started(self.run_id)
         deadline = time.monotonic() + self.config.final_acceptance_timeout_s
 
         with self._lock:
             shas = {n: self._output_shas[n] for n in merged if n in self._output_shas}
         ancestry = wt.final_ancestry_sweep(Path(self.deps.integration_path), shas)
+        if self._cancelled.is_set():
+            return AcceptanceResult(
+                green=False, specs=(), ancestry=ancestry,
+                reason="cancellation requested during the final ancestry sweep")
         if not all(ancestry.values()) or len(ancestry) != len(merged):
             return AcceptanceResult(
                 green=False, specs=(), ancestry=ancestry,
@@ -645,7 +917,17 @@ class Scheduler:
                                     reason="final-acceptance timeout during the sweep")
 
         specs = wt.acceptance_specs(records)
-        gate = self.deps.run_integration_gate(Path(self.deps.integration_path), specs)
+        try:
+            gate = self.deps.run_integration_gate(
+                Path(self.deps.integration_path), specs, self._cancelled.is_set)
+        except wt.GateCancelled:
+            return AcceptanceResult(
+                green=False, specs=specs, ancestry=ancestry,
+                reason="cancellation requested during the final integration gate")
+        if self._cancelled.is_set():
+            return AcceptanceResult(
+                green=False, specs=specs, gate=gate, ancestry=ancestry,
+                reason="cancellation requested during the final integration gate")
         verdict = vf.adjudicate_gate(gate, self.deps.min_cases)
         if time.monotonic() > deadline:
             return AcceptanceResult(green=False, specs=specs, gate=gate,
