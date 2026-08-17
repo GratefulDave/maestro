@@ -26,6 +26,136 @@ from adw_modules import receipt_crypto
 from adw_modules import scheduler_types
 
 
+class RepositoryStateIdentityTest(unittest.TestCase):
+    """A linked worktree is the same factory as the repository it belongs to.
+
+    State used to be keyed by the checkout's directory name, so a worktree got
+    its own empty ledger, receipt store, and admitted routes. A plan finalized
+    in the main checkout then failed from a worktree with
+    `no receipt for <digest>`, which reads as a lost file rather than as a
+    second state directory nobody asked for.
+    """
+
+    def _installation(self, root, name):
+        repo = root / name
+        (repo / "adws").mkdir(parents=True)
+        (repo / "plans").mkdir(parents=True)
+        binaries = {}
+        for binary_name in ("herdr", "omp", "claude"):
+            binary = root / (name + "-" + binary_name)
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            binaries[binary_name] = str(binary)
+        config = {
+            "schema": "maestro-config.v1",
+            "plans_dir": "plans",
+            "state_root": "../maestro-state",
+            "keys": {
+                "verify_key_env": "MAESTRO_TEST_VERIFY_KEY",
+                "signing_seed_env": "MAESTRO_TEST_SIGNING_SEED",
+                "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
+            },
+            "executables": binaries,
+            "route_receipts": {"omp": "route-receipts/omp.json"},
+            "reviewer": {
+                "route": "omp", "model": "review-model", "effort": "high",
+                "finalization_timeout_s": 60, "turn_timeout_s": 20,
+                "poll_interval_s": 1,
+            },
+            "execution": {
+                "route": "omp", "model": "execution-model", "effort": "medium",
+                "concurrency": 2, "node_timeout_s": 120, "turn_timeout_s": 30,
+                "final_acceptance_timeout_s": 45, "backstop_t_s": 600,
+                "semantic_ceiling": 3,
+            },
+        }
+        config_path = repo / "adws" / "maestro.config.yaml"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        return repo, config_path
+
+    def test_a_worktree_shares_the_repositorys_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            main_repo, main_config = self._installation(root, "project")
+            (main_repo / ".git").mkdir()
+            worktree, worktree_config = self._installation(root, "project-wt")
+            (worktree / ".git").write_text(
+                "gitdir: " + str(main_repo / ".git" / "worktrees" / "wt") + "\n",
+                encoding="utf-8")
+
+            from_main = maestro._load_maestro_layout(main_repo, main_config)
+            from_worktree = maestro._load_maestro_layout(
+                worktree, worktree_config)
+
+            self.assertEqual(from_worktree["repository_state"],
+                             from_main["repository_state"])
+            self.assertEqual(from_worktree["database"], from_main["database"])
+            self.assertEqual(from_worktree["receipt_dir"],
+                             from_main["receipt_dir"])
+            self.assertEqual(from_worktree["route_paths"],
+                             from_main["route_paths"])
+            # The plan being run is still whatever *this* checkout has on disk.
+            self.assertEqual(from_worktree["plans_dir"], worktree / "plans")
+            self.assertEqual(from_main["plans_dir"], main_repo / "plans")
+
+    def test_each_installation_is_recorded_once_for_the_dashboard(self):
+        """Several factories run at once, so the registry holds several rows.
+
+        The dashboard cannot guess where a repository keeps its ledger, and
+        naming each one by environment variable caps it at what fits on a
+        command line. Maestro records what it already knows instead, and a
+        re-run replaces its own row rather than accumulating duplicates.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            registry = root / "registry.json"
+            first, first_config = self._installation(root, "alpha")
+            (first / ".git").mkdir()
+            second, second_config = self._installation(root, "beta")
+            (second / ".git").mkdir()
+            with mock.patch.dict(
+                    os.environ, {"MAESTRO_REGISTRY": str(registry)}):
+                for repo, config_path in ((first, first_config),
+                                          (second, second_config),
+                                          (first, first_config)):
+                    maestro._register_installation(
+                        maestro._load_maestro_layout(repo, config_path))
+                recorded = json.loads(registry.read_text(encoding="utf-8"))
+
+            rows = recorded["installations"]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["repository"], str(first))
+            self.assertEqual(rows[1]["repository"], str(second))
+            self.assertEqual(
+                rows[0]["database"],
+                str((root / "maestro-state" / "alpha"
+                     / "lifecycle.sqlite3").resolve()))
+            self.assertEqual(rows[0]["plans_dir"], str(first / "plans"))
+
+    def test_an_unwritable_registry_never_fails_a_run(self):
+        """Observability bookkeeping is not allowed to refuse a run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo, config_path = self._installation(root, "project")
+            (repo / ".git").mkdir()
+            layout = maestro._load_maestro_layout(repo, config_path)
+            blocker = root / "blocked"
+            blocker.write_text("not a directory\n", encoding="utf-8")
+            with mock.patch.dict(
+                    os.environ,
+                    {"MAESTRO_REGISTRY": str(blocker / "registry.json")}):
+                maestro._register_installation(layout)
+
+    def test_a_plain_checkout_still_names_itself(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo, config_path = self._installation(root, "project")
+            (repo / ".git").mkdir()
+            layout = maestro._load_maestro_layout(repo, config_path)
+            self.assertEqual(layout["repository_state"],
+                             (root / "maestro-state" / "project").resolve())
+
+
 class OperatorCliTest(unittest.TestCase):
     def test_all_public_verbs_exist_in_the_real_parser(self):
         parser = maestro.build_parser()

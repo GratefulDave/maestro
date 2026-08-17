@@ -190,6 +190,97 @@ def _path_is_within(path: Path, boundary: Path) -> bool:
     return True
 
 
+_REGISTRY_RELATIVE = Path(".maestro") / "registry.json"
+
+
+def _registry_path() -> Path:
+    override = os.environ.get("MAESTRO_REGISTRY")
+    if override:
+        return Path(override)
+    return Path.home() / _REGISTRY_RELATIVE
+
+
+def _register_installation(layout: Dict[str, Any]) -> None:
+    """Record this installation so the dashboard can find it without being told.
+
+    An operator runs several factories at once, each keeping its ledger beside
+    its own repository in a directory the dashboard cannot guess. Naming every
+    one of them by environment variable at start-up restates what Maestro
+    already knows, and caps the dashboard at what fits on a command line.
+
+    This is observability bookkeeping and nothing else: no lifecycle transition
+    reads it, and a failure to write it is not allowed to affect a run, so the
+    whole thing is best-effort by construction.
+    """
+    entry = {
+        "repository": str(layout["repo"]),
+        "database": str(layout["database"]),
+        "plans_dir": str(layout["plans_dir"]),
+        "state": str(layout["repository_state"]),
+    }
+    path = _registry_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        installations = []
+        if path.is_file():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(
+                    loaded.get("installations"), list):
+                installations = [
+                    item for item in loaded["installations"]
+                    if isinstance(item, dict)
+                    and item.get("database") != entry["database"]
+                ]
+        installations.insert(0, entry)
+        # Written beside the destination and renamed, so a dashboard reading
+        # concurrently sees either the old file or the new one, never a
+        # half-written one.
+        scratch = path.with_name(path.name + ".tmp")
+        scratch.write_text(
+            json.dumps({"installations": installations}, indent=2,
+                       sort_keys=True) + "\n",
+            encoding="utf-8")
+        scratch.replace(path)
+    except (OSError, UnicodeError, ValueError):
+        return
+
+
+def _repository_identity_root(repo: Path) -> Path:
+    """The main worktree of `repo`, which is what names the factory's state.
+
+    State was anchored to the checkout directory, so every linked worktree of
+    one repository became a *different* factory: its own ledger, its own
+    receipt store, its own admitted routes, and no memory of anything the
+    repository had already finalized. A plan finalized in the main checkout
+    then failed in a worktree with `no receipt for <digest>` — a refusal that
+    named a missing file when the truth was a second, empty state directory.
+
+    A linked worktree spells its `.git` as a file pointing into the main
+    repository's `.git/worktrees/<name>`; the main checkout spells it as a
+    directory. Reading that is enough to recover the identity, and it needs no
+    subprocess, so config loading stays a pure filesystem operation.
+    """
+    marker = repo / ".git"
+    try:
+        if not marker.is_file():
+            return repo
+        pointer = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return repo
+    if not pointer.startswith("gitdir:"):
+        return repo
+    git_dir = Path(pointer.split(":", 1)[1].strip())
+    if not git_dir.is_absolute():
+        git_dir = (repo / git_dir).resolve()
+    for parent in git_dir.parents:
+        # `<main>/.git/worktrees/<name>` -> `<main>`. Anything else (a bare or
+        # relocated git dir) has no main worktree to name, so the checkout
+        # keeps naming itself rather than guessing.
+        if parent.name == ".git":
+            return parent.parent.resolve()
+    return repo
+
+
 def _repository_path(repo: Path, value, label, *, inside: bool) -> Path:
     raw = Path(_config_string(value, label))
     if raw.is_absolute():
@@ -268,9 +359,17 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     plans_dir = _repository_path(repo, root["plans_dir"], "plans_dir", inside=True)
     if not plans_dir.is_dir():
         raise _MaestroConfigurationError("plans_dir is not a directory")
+    # Anchored to the repository, not the checkout: a worktree shares the
+    # ledger, receipts, and admitted routes of the repository it belongs to.
+    # `plans_dir` stays bound to `repo` above, because the plan being run is
+    # whatever this checkout has on disk.
+    identity = _repository_identity_root(repo)
     state_root = _repository_path(
-        repo, root["state_root"], "state_root", inside=False)
-    repository_state = (state_root / repo.name).resolve()
+        identity, root["state_root"], "state_root", inside=False)
+    if _path_is_within(state_root, repo):
+        raise _MaestroConfigurationError(
+            "state_root must resolve outside the repository")
+    repository_state = (state_root / identity.name).resolve()
     if not _path_is_within(repository_state, state_root):
         raise _MaestroConfigurationError(
             "repository state must remain below state_root")
@@ -599,6 +698,7 @@ def _apply_repository_config(
             args.command == "plan" and args.plan_command == "author"):
         layout = _load_maestro_layout(repo, config_path)
         _bind_layout_executables(args, layout)
+        _register_installation(layout)
         if args.command == "plan":
             args.plan_file = str(_named_plan_output(layout, args.plan_name))
         return
@@ -609,6 +709,7 @@ def _apply_repository_config(
         return
 
     config = _load_maestro_config(repo, config_path)
+    _register_installation(config)
     resumed_run_id = None
     if args.command == "run" and args.run_command == "resume":
         resumed_run_id, plan_file = _resolve_resume_target(args, config)
@@ -812,11 +913,21 @@ def _bootstrap(args: argparse.Namespace) -> int:
             reviewer_hmac_key_env=layout["key_env"].get(
                 "reviewer_hmac_key_env", _REVIEWER_HMAC_KEY_ENV),
         )
+        # A receipt is per route while several lanes may ride one route, so the
+        # capture spec comes from the first configured lane naming it. The
+        # order preserves the precedence the previous conditional expressed —
+        # execution before reviewer — and extends it to the authoring lane.
+        # `author` was omitted here while `_load_maestro_layout` already
+        # required `author.route` to have a receipt, so any config with an
+        # `author:` block refused bootstrap with ROUTE_MODEL_UNCONFIGURED and
+        # left the run unable to load the very receipt the config demanded.
+        lanes = [layout["execution"], layout["reviewer"]]
+        if layout.get("author") is not None:
+            lanes.append(layout["author"])
         specs = []
         for route, path in sorted(layout["route_paths"].items()):
-            section = (layout["execution"] if route == layout["execution"]["route"]
-                       else layout["reviewer"] if route == layout["reviewer"]["route"]
-                       else None)
+            section = next(
+                (lane for lane in lanes if lane["route"] == route), None)
             if section is None:
                 raise route_admission.AdmissionError(
                     "ROUTE_MODEL_UNCONFIGURED:{}".format(route))
