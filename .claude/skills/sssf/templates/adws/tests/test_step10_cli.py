@@ -270,6 +270,56 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(Path(args.claude).resolve(),
                          (fixture["repo"].parent / "claude").resolve())
 
+    def test_a_configured_verb_binds_from_below_the_repository_root(self):
+        """The repository owns the configuration; the shell's cwd does not.
+
+        Configuration was resolved as `Path.cwd() / adws/maestro.config.yaml`,
+        so the verb that bound the whole repository layout at the root bound
+        nothing one directory down: it read the plan *name* as a plan *path*
+        and failed naming a file the operator never typed. The command is the
+        same command wherever inside the checkout it was issued.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._named_plan_configuration(Path(tmp))
+            (fixture["repo"] / ".git").mkdir()
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(fixture["plan_file"].parent), \
+                    mock.patch.object(
+                        maestro, "_plan_validate", return_value=0) as validate:
+                self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
+        args = validate.call_args.args[0]
+        self.assertEqual(Path(args.plan_file).resolve(),
+                         fixture["plan_file"].resolve())
+        self.assertEqual(Path(args.repo).resolve(), fixture["repo"].resolve())
+        self.assertEqual(Path(args.data_dir).resolve(),
+                         (fixture["state"] / "data").resolve())
+        self.assertEqual(Path(args.receipt_dir).resolve(),
+                         (fixture["state"] / "receipts").resolve())
+
+    def test_a_nested_checkout_does_not_inherit_the_enclosing_repository(self):
+        """The search for an installation stops at the checkout it is in.
+
+        A repository that carries no configuration is unconfigured. Reading
+        the configuration of whatever directory happens to enclose it would
+        bind one repository's plans, state, and route receipts onto another's
+        checkout — the wrong-configuration half of the same defect.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._named_plan_configuration(Path(tmp))
+            (fixture["repo"] / ".git").mkdir()
+            nested = fixture["repo"] / "vendor" / "unrelated"
+            (nested / ".git").mkdir(parents=True)
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(nested), \
+                    mock.patch.object(
+                        maestro, "_plan_validate", return_value=0) as validate:
+                self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
+        args = validate.call_args.args[0]
+        self.assertEqual(args.plan_file, "named")
+        self.assertIsNone(getattr(args, "layout", None))
+
     def test_named_plan_finalize_derives_reviewer_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._named_plan_configuration(Path(tmp))
