@@ -77,6 +77,44 @@ Run these in the repository the plan will change.
 5. `maestro plan finalize <plan-name>` — required before the plan can run, and before it can
    participate in a workspace.
 
+## Choosing a verifier command
+
+Every lane declares one verifier — the command that proves the lane's work happened. Maestro does
+not merely run it; it counts how many test cases actually executed and checks that count against
+the lane's `min_cases` floor. Counting is why the runner set is closed: Maestro has to parse the
+runner's report, so `Gate.runner` is `Literal["pytest", "vitest"]` and nothing else projects.
+
+| Verifying | Command shape |
+| --- | --- |
+| Python | `pytest <targets>` or `python3 -m pytest <targets>` |
+| JavaScript / TypeScript, including React and Next.js | `npx vitest run <targets>` or `vitest <targets>` |
+
+A shell script, a Makefile target, a migration applied with `psql`, or a `curl` health check proves
+nothing countable and is refused with `maestro.command`. That is not a gap to work around — it is
+the reason the gate means something. Work of that kind is verified by asserting its *effect* from a
+test the runner can count:
+
+```python
+# tests/test_mdl_schema.py — verifier command: pytest tests/test_mdl_schema.py
+def test_mdl_cases_carries_a_docket_number():
+    assert "docket_number" in columns_of("mdl_cases")
+```
+
+### Practical rules
+
+- **Pass the real argv, never a script alias.** `npm test` and `make test` are refused even when
+  they ultimately invoke vitest, because Maestro has to see the selector to know what the gate
+  actually covers. Write `npx vitest run src/ingest.test.ts`.
+- **Choose vitest over Jest when setting up a new JavaScript or TypeScript repository.** Adding
+  tests to such a repository is ordinary project work — `npm i -D vitest @testing-library/react
+  jsdom` — and needs no change to Maestro. Choosing Jest does: `Gate.runner` would have to accept
+  it and the executor would have to parse its report.
+- **Playwright and Cypress cannot currently be gates** for the same reason. End-to-end coverage
+  either waits on that change or is asserted through a countable test.
+- **One verifier per lane.** The projection gives each node exactly one gate, so a lane binding
+  zero or several verifiers is refused with `maestro.lane_gate`. When a lane genuinely needs two
+  independent checks, either widen one command's selector to cover both or split the lane.
+
 ## Several repositories
 
 There is no multi-repository Plan IR. Each repository runs the whole single-repository sequence to
