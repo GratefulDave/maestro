@@ -76,7 +76,7 @@ const showTabs = computed(() => sources.value.length > 1)
           <rect x="8" y="13.5" width="20" height="5" rx="2.5" fill="#c89bff" />
           <rect x="4" y="21" width="13" height="5" rx="2.5" fill="#5ad2dd" />
         </svg>
-        <span class="brand">Super Simple Software Factory</span>
+        <span class="brand">Maestro</span>
         <template v-if="activeSource">
           <span class="sep">›</span>
           <a
@@ -133,7 +133,13 @@ const showTabs = computed(() => sources.value.length > 1)
         />
         <MaestroRunsList v-else :key="activeSource.id" :source-id="activeSource.id" />
       </template>
-      <div v-else-if="route.sourceId && sourcesLoaded" class="unknown-source">
+      <!-- Which view is right depends entirely on `/api/sources`, so nothing
+           renders before that answer arrives. Falling through to the session
+           list while `sources` was still empty made a Maestro-only server
+           answer `/api/sessions` with `no sssf database is loaded`, once per
+           poll, and the operator saw an empty page over a stream of 404s. -->
+      <div v-else-if="!sourcesLoaded" class="loading">loading sources…</div>
+      <div v-else-if="route.sourceId" class="unknown-source">
         no source “{{ route.sourceId }}” is loaded — this server is serving
         {{ sources.map((s) => s.id).join(', ') || 'nothing' }}
       </div>
@@ -280,7 +286,8 @@ const showTabs = computed(() => sources.value.length > 1)
   color: var(--faint);
 }
 
-.unknown-source {
+.unknown-source,
+.loading {
   padding: 40px 24px;
   color: var(--dim);
 }

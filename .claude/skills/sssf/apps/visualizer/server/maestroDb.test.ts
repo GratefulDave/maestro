@@ -457,6 +457,45 @@ describe("source discovery", () => {
     for (const source of sources) source.close();
   });
 
+  test("every factory Maestro has run is served with no arguments", () => {
+    const first = ledger("factory-one", (seed) => insertRun(seed, "run-one"));
+    const second = ledger("factory-two", (seed) => insertRun(seed, "run-two"));
+    const registry = join(root, "registry.json");
+    writeFileSync(
+      registry,
+      JSON.stringify({
+        installations: [
+          { repository: join(root, "one"), database: first, plans_dir: null },
+          { repository: join(root, "two"), database: second, plans_dir: null },
+        ],
+      }),
+    );
+    const previous = process.env.MAESTRO_REGISTRY;
+    process.env.MAESTRO_REGISTRY = registry;
+    try {
+      // No --db, no MAESTRO_DB, and a cwd that is not a factory at all.
+      const sources = resolveSources([], join(root, "elsewhere"));
+      expect(sources.map((s) => s.path)).toEqual([first, second]);
+      for (const source of sources) source.close();
+    } finally {
+      if (previous === undefined) delete process.env.MAESTRO_REGISTRY;
+      else process.env.MAESTRO_REGISTRY = previous;
+    }
+  });
+
+  test("a corrupt registry costs discovery, not the server", () => {
+    const registry = join(root, "corrupt-registry.json");
+    writeFileSync(registry, "{ not json");
+    const previous = process.env.MAESTRO_REGISTRY;
+    process.env.MAESTRO_REGISTRY = registry;
+    try {
+      expect(resolveSources([], join(root, "elsewhere"))).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.MAESTRO_REGISTRY;
+      else process.env.MAESTRO_REGISTRY = previous;
+    }
+  });
+
   test("an unreadable database is skipped, never fatal", () => {
     const good = ledger("survivor", (seed) => insertRun(seed, "run-ok"));
     const junk = join(root, "survivor", "junk.db");

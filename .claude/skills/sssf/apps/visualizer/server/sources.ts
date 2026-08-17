@@ -17,13 +17,57 @@
  * SssfDb's `setArchived`, which is review triage on a tracer row.
  */
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
 import { SssfDb } from "./db.ts";
 import { MAESTRO_TABLES, MaestroDb, discoverMaestroLedger, openLedgerReadonly } from "./maestroDb.ts";
 import type { SourceInfo, SourceKind } from "../shared/types.ts";
 
 const DEFAULT_SSSF_RELATIVE = "adws/adw_data/sssf.db";
+
+/**
+ * Where Maestro records the installations it has run.
+ *
+ * The dashboard is one process watching several factories at once, and each
+ * factory keeps its ledger beside its own repository, in a directory the
+ * dashboard has no way to guess. Requiring `MAESTRO_DB` per factory made the
+ * operator restate, every session, something Maestro already knew — and it
+ * caps the dashboard at whatever fits on one command line.
+ *
+ * So Maestro writes it down. Each configured run records its ledger here, and
+ * the dashboard opens every entry. Five factories become five tabs with no
+ * arguments at all.
+ */
+const REGISTRY_RELATIVE = ".maestro/registry.json";
+
+type RegistryEntry = { db: string; plansDir: string | null };
+
+/** Installations Maestro has recorded, newest first, unreadable ones dropped. */
+export function registeredInstallations(
+  home = process.env.MAESTRO_REGISTRY ?? null,
+): RegistryEntry[] {
+  const path =
+    home ?? resolve(process.env.HOME ?? process.env.USERPROFILE ?? ".", REGISTRY_RELATIVE);
+  if (!existsSync(path)) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    // A half-written registry costs the operator nothing but auto-discovery.
+    console.warn(`[sssf] ignoring ${path}: ${(error as Error).message}`);
+    return [];
+  }
+  const raw = (parsed as { installations?: unknown })?.installations;
+  if (!Array.isArray(raw)) return [];
+  const entries: RegistryEntry[] = [];
+  for (const item of raw) {
+    const db = (item as { database?: unknown })?.database;
+    if (typeof db !== "string" || !db) continue;
+    const plans = (item as { plans_dir?: unknown })?.plans_dir;
+    entries.push({ db, plansDir: typeof plans === "string" && plans ? plans : null });
+  }
+  return entries;
+}
 
 /** The tables that identify each schema. First full match wins. */
 const PROBES: { kind: SourceKind; tables: string[] }[] = [
@@ -158,6 +202,9 @@ export function resolveSources(argv: string[] = Bun.argv, cwd = process.cwd()): 
     add(DEFAULT_SSSF_RELATIVE);
     const discovered = discoverMaestroLedger(cwd);
     if (discovered) add(discovered.db, discovered.plansDir);
+    // The repo we are standing in comes first so it stays the landing view;
+    // every other factory Maestro has run is added behind it as a tab.
+    for (const entry of registeredInstallations()) add(entry.db, entry.plansDir);
   } else {
     // An explicitly-named Maestro ledger still gets its plan names when the
     // repo it belongs to is the one we are standing in.
