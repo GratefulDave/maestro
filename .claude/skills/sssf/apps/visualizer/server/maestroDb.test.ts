@@ -158,10 +158,21 @@ function insertTransition(
   ).run(runId, nodeId, nodeId === null ? "run" : "node", reason, JSON.stringify(detail));
 }
 
+let previousRegistry: string | undefined;
+
 beforeAll(() => {
   root = mkdtempSync(join(tmpdir(), "maestro-viz-"));
+  // Auto-discovery reads the operator's own registry by default, so without
+  // this every source-discovery case would return whatever factories this
+  // machine happens to have run — passing on a clean checkout and failing
+  // the moment someone starts a run. Cases that exercise the registry point
+  // it at a file of their own.
+  previousRegistry = process.env.MAESTRO_REGISTRY;
+  process.env.MAESTRO_REGISTRY = join(root, "absent-registry.json");
 });
 afterAll(() => {
+  if (previousRegistry === undefined) delete process.env.MAESTRO_REGISTRY;
+  else process.env.MAESTRO_REGISTRY = previousRegistry;
   rmSync(root, { recursive: true, force: true });
 });
 
