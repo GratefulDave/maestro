@@ -68,12 +68,22 @@ from .finalization_window import (FinalizationSignal, ReviewerSession,
 
 
 class ObjectKind(str, Enum):
-    """What a reviewable object is. §6.2's model, from the reviewer's side."""
+    """What a reviewable object is. §6.2's model, from the reviewer's side.
+
+    The first four are plan-finalization's objects. `DIFF` and `CHANGED_FILE`
+    are code review's (`code_review.py`), and they live here rather than in a
+    parallel enum so that `compute_matrix`, `verify_report`, `derive_verdict`,
+    `Receipt`, and `ReceiptStore` serve both reviews unchanged. A rubric only
+    ever emits cells for the kinds its own checks declare, so the two review
+    families never produce each other's cells.
+    """
 
     PLAN = "plan"
     NODE = "node"
     GATE = "gate"
     EVIDENCE = "evidence"
+    DIFF = "diff"
+    CHANGED_FILE = "changed_file"
 
 
 class CellStatus(str, Enum):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 from contextlib import redirect_stdout as _redirect_stdout
@@ -16,14 +17,17 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
 from adw_modules import agent_pi
+from adw_modules import code_review
 from adw_modules import coordinator as coordinator
 from adw_modules import coordinator_store
+from adw_modules import deliver as deliver_module
 from adw_modules import finalization
 from adw_modules import finalization_window
 from adw_modules import launcher
@@ -65,6 +69,15 @@ class _PlanReceiptVerificationError(RuntimeError):
 
 class _RunPathConfigurationError(ValueError):
     """Run authority storage is located in a participant-writable boundary."""
+
+class _RunSelectionError(ValueError):
+    """Nothing in the ledger matches the run the operator named.
+
+    Deliberately not a configuration error: the installation is fine, the
+    question simply has no answer, and an operator told `MAESTRO_CONFIGURATION_
+    INVALID` goes looking for a broken config file instead of a run id.
+    """
+
 
 class _MaestroConfigurationError(ValueError):
     """The repository-local Maestro configuration is absent or unsafe."""
@@ -246,7 +259,8 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     root = _config_mapping(
         raw, "maestro configuration",
         ("schema", "plans_dir", "state_root", "keys", "executables",
-         "route_receipts", "reviewer", "execution"), ("plan_contract",))
+         "route_receipts", "reviewer", "execution"),
+        ("plan_contract", "author"))
     if root["schema"] != _MAESTRO_SCHEMA:
         raise _MaestroConfigurationError(
             "schema must be " + _MAESTRO_SCHEMA)
@@ -308,7 +322,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         root["execution"], "execution",
         ("route", "model", "effort", "concurrency", "node_timeout_s",
          "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
-         "semantic_ceiling"), ("profile",))
+         "semantic_ceiling"), ("profile", "vendor", "review_ceiling"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -347,11 +361,59 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             execution_raw["backstop_t_s"], "execution.backstop_t_s"),
         "semantic_ceiling": _config_positive_integer(
             execution_raw["semantic_ceiling"], "execution.semantic_ceiling"),
+        "vendor": (_config_string(execution_raw["vendor"], "execution.vendor")
+                   if "vendor" in execution_raw else None),
+        # Separate from the semantic ceiling by construction. Defaulted rather
+        # than required so an existing config keeps working, but the default is
+        # a real bound, not "unlimited".
+        "review_ceiling": (
+            _config_positive_integer(execution_raw["review_ceiling"],
+                                     "execution.review_ceiling")
+            if "review_ceiling" in execution_raw else 3),
     }
-    for label, section in (("reviewer", reviewer), ("execution", execution)):
+    # `author` is optional so an installation that never runs `maestro deliver`
+    # keeps working unchanged; `deliver` refuses when it is absent rather than
+    # inventing a lane nobody configured.
+    author = None
+    if "author" in root:
+        author_raw = _config_mapping(
+            root["author"], "author",
+            ("route", "model", "effort", "author_timeout_s", "turn_timeout_s",
+             "poll_interval_s"), ("profile",))
+        author = {
+            "route": _config_string(author_raw["route"], "author.route"),
+            "model": _config_string(author_raw["model"], "author.model"),
+            "effort": _config_string(author_raw["effort"], "author.effort"),
+            "profile": (_config_string(author_raw["profile"], "author.profile")
+                        if "profile" in author_raw else None),
+            "author_timeout_s": _config_positive_number(
+                author_raw["author_timeout_s"], "author.author_timeout_s"),
+            "turn_timeout_s": _config_positive_number(
+                author_raw["turn_timeout_s"], "author.turn_timeout_s"),
+            "poll_interval_s": _config_positive_number(
+                author_raw["poll_interval_s"], "author.poll_interval_s"),
+        }
+
+    sections = [("reviewer", reviewer), ("execution", execution)]
+    if author is not None:
+        sections.append(("author", author))
+    for label, section in sections:
         if section["route"] not in route_paths:
             raise _MaestroConfigurationError(
                 label + ".route has no route receipt")
+
+    # B12's *equality* half applies to every verb that loads a config: two
+    # blocks naming the same vendor is a misconfiguration whenever it is
+    # written, not only when a run reads it. The *absence* half is enforced at
+    # the run branch instead, because a config with no vendors is legal for
+    # `plan validate`, `bootstrap`, and the workspace verbs — none of them
+    # launches a reviewer, so none of them can be self-judging.
+    if (execution.get("vendor") and reviewer.get("vendor")):
+        try:
+            code_review.require_distinct_vendor(
+                execution["vendor"], reviewer["vendor"])
+        except code_review.SelfJudgeRefused as exc:
+            raise _MaestroConfigurationError(str(exc)) from exc
 
     data_dir = repository_state / "data"
     receipt_dir = repository_state / "receipts"
@@ -383,6 +445,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "route_paths": route_paths,
         "reviewer": reviewer,
         "execution": execution,
+        "author": author,
     }
 
 
@@ -413,9 +476,20 @@ def _load_maestro_config(repo: Path, config_path: Path) -> Dict[str, Any]:
     return _bind_maestro_keys(_load_maestro_layout(repo, config_path))
 
 
+def _is_plan_name(name: Any) -> bool:
+    """The one-path-component rule, asked as a question rather than raised.
+
+    Mode selection needs the same predicate `_named_plan_name` enforces, so it
+    lives here once: a second spelling of "what counts as a plan name" is how
+    the resolver and the mode selector come to disagree about the same string.
+    """
+    return (isinstance(name, str) and bool(name) and name not in (".", "..")
+            and "/" not in name and "\\" not in name
+            and Path(name).name == name)
+
+
 def _named_plan_name(name: str) -> str:
-    if (not isinstance(name, str) or not name or name in (".", "..")
-            or "/" in name or "\\" in name or Path(name).name != name):
+    if not _is_plan_name(name):
         raise _MaestroConfigurationError("plan name must be one path component")
     return name
 
@@ -436,11 +510,48 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
     return path
 
 
+#: Run verbs served by the repository layout alone. None of them verifies a
+#: receipt or launches anything, so none of them needs key material — asking
+#: `run status` for a signing seed is how a read verb becomes unusable on a
+#: machine that merely wants to watch a run.
+_RUN_LEDGER_COMMANDS = ("status", "list", "cancel")
+
+#: Flags that select *which* run to read and how to print it. They are the only
+#: flags a configured run verb accepts, because they override no derived path;
+#: any other flag means the operator is driving every path by hand.
+_RUN_SELECTION_OPTIONS = frozenset({"--run-id", "--json"})
+
+#: Plan verbs whose positional argument is overloaded — a plan *name* the
+#: installed configuration resolves, or a filesystem path to the plan bytes.
+#: `author` is excluded because it also binds executables and *writes* the
+#: named plan, and `run` because its positional selects a run, not a file.
+_PLAN_FILE_VERBS = ("validate", "finalize")
+
+
+def _spells_its_own_plan_file(args: argparse.Namespace) -> bool:
+    """Whether the operator typed a plan *path* instead of an installed name.
+
+    A plan name is one path component; anything carrying a separator is a path,
+    and a path is a configuration the operator wrote out by hand. Binding the
+    repository's configuration over it answers a different question than the
+    one asked. It also refuses the wrong thing: because a configured named-plan
+    verb accepts no runtime flags, a manual `plan validate <path> --receipt-dir
+    … --verify-key …` issued from inside any installed repository never reached
+    `_plan_validate` at all, and a forged or wrong-key receipt was reported as
+    `MAESTRO_CONFIGURATION_INVALID` rather than `RECEIPT_VERIFICATION_FAILED`
+    — a refusal whose exit code was right and whose vocabulary named the wrong
+    cause. Selecting the manual mode here is what lets the receipt gate speak.
+    """
+    return (args.command == "plan"
+            and args.plan_command in _PLAN_FILE_VERBS
+            and not _is_plan_name(getattr(args, "plan_name", None)))
+
+
 def _configured_command(args: argparse.Namespace) -> bool:
     return (args.command == "bootstrap"
             or (args.command == "plan"
                 and args.plan_command in ("validate", "finalize", "author"))
-            or (args.command == "run" and args.run_command == "start"))
+            or args.command == "run")
 
 
 def _bind_layout_executables(args: argparse.Namespace, layout: Dict[str, Any]) -> None:
@@ -462,16 +573,24 @@ def _apply_repository_config(
     if not _configured_command(args):
         return
     config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
-    if not os.path.lexists(str(config_path)):
+    if not os.path.lexists(str(config_path)) or _spells_its_own_plan_file(args):
         if args.command == "plan":
             args.plan_file = args.plan_name
-        elif args.command == "run":
+        elif args.command == "run" and args.run_command == "start":
             args.digest = args.plan_name
         return
     if not config_path.is_file():
         raise _MaestroConfigurationError(
             str(_MAESTRO_CONFIG_FILE) + " is not a regular file")
-    if any(item.startswith("-") for item in argv):
+    options = tuple(item.split("=", 1)[0] for item in argv
+                    if item.startswith("-"))
+    if args.command == "run" and args.run_command != "start":
+        if any(option not in _RUN_SELECTION_OPTIONS for option in options):
+            # A fully manual invocation. Every path it works on came from a
+            # flag, and binding the other half from configuration is exactly
+            # how the two halves come to disagree about which run this is.
+            return
+    elif options:
         raise _MaestroConfigurationError(
             "configured named-plan commands do not accept runtime flags")
 
@@ -484,8 +603,17 @@ def _apply_repository_config(
             args.plan_file = str(_named_plan_output(layout, args.plan_name))
         return
 
+    if args.command == "run" and args.run_command in _RUN_LEDGER_COMMANDS:
+        _bind_run_ledger_configuration(
+            args, _load_maestro_layout(repo, config_path))
+        return
+
     config = _load_maestro_config(repo, config_path)
-    plan_file = _named_plan_file(config, args.plan_name)
+    resumed_run_id = None
+    if args.command == "run" and args.run_command == "resume":
+        resumed_run_id, plan_file = _resolve_resume_target(args, config)
+    else:
+        plan_file = _named_plan_file(config, args.plan_name)
     args.repo = str(config["repo"])
     args.plan_file = str(plan_file)
     args.receipt_dir = str(config["receipt_dir"])
@@ -517,7 +645,10 @@ def _apply_repository_config(
         args.reviewer_poll_interval_s = reviewer["poll_interval_s"]
     elif args.command == "run":
         execution = config["execution"]
-        run_id = "run-" + uuid.uuid4().hex
+        # `start` mints; `resume` re-enters the run it just resolved. Minting
+        # for `resume` would hand the scheduler an empty ledger, a fresh
+        # integration worktree, and no memory of what already merged.
+        run_id = resumed_run_id or ("run-" + uuid.uuid4().hex)
         run_root = config["repository_state"] / "runs" / run_id
         args.digest = plan_digest.digest_of(plan_file.read_bytes())
         args.db = str(config["database"])
@@ -532,10 +663,131 @@ def _apply_repository_config(
             "final_acceptance_timeout_s"]
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
+        args.review_ceiling = execution["review_ceiling"]
         args.agent_route = execution["route"]
         args.agent_model = execution["model"]
         args.agent_effort = execution["effort"]
         args.agent_profile = execution["profile"]
+
+        # The reviewer bindings, which until now existed only in the `plan
+        # finalize` branch above. That asymmetry was the whole defect: the run
+        # path had a fully configured `reviewer:` block in
+        # `maestro.config.yaml` and never read one field of it, so every lane
+        # merged on gate results alone and no model ever read a diff.
+        reviewer = config["reviewer"]
+        review_root = run_root / "review"
+        args.reviewer_route = reviewer["route"]
+        args.reviewer_model = reviewer["model"]
+        args.reviewer_effort = reviewer["effort"]
+        args.reviewer_profile = reviewer["profile"]
+        args.reviewer_vendor = reviewer["vendor"]
+        args.execution_vendor = execution["vendor"]
+        # Per-attempt subdirectories are minted under this root by the runner;
+        # each review gets a fresh session directory, because §6.5's structural
+        # half of "independent review is recorded" refuses a reused one.
+        args.review_root = str(review_root)
+        args.review_receipt_dir = str(review_root / "receipts")
+        args.review_timeout_s = reviewer["finalization_timeout_s"]
+        args.reviewer_turn_timeout_s = reviewer["turn_timeout_s"]
+        args.reviewer_poll_interval_s = reviewer["poll_interval_s"]
+
+
+def _named_plan_digests(layout: Dict[str, Any]) -> Dict[str, str]:
+    """Every installed plan name against the digest of the bytes on disk now.
+
+    The ledger stores a plan *digest* and nothing else — it has never heard of
+    a plan name — so this mapping is the whole bridge between what an operator
+    types and what `runs.plan_digest` holds, in both directions. Rebuilt on
+    every call rather than cached because the plan file is what an author
+    edits between runs, and a stale digest here silently resolves to the wrong
+    run.
+    """
+    digests: Dict[str, str] = {}
+    for candidate in sorted(layout["plans_dir"].iterdir()):
+        stored = candidate / "maestro-plan.v1"
+        if stored.is_file():
+            digests[candidate.name] = plan_digest.digest_of(stored.read_bytes())
+    return digests
+
+
+def _bind_run_ledger_configuration(
+        args: argparse.Namespace, layout: Dict[str, Any]) -> None:
+    """Point a read verb at the configured ledger, and nothing more."""
+    args.repo = str(layout["repo"])
+    args.db = str(layout["database"])
+    args.repository_state = str(layout["repository_state"])
+    args.plan_digests = _named_plan_digests(layout)
+
+
+def _select_run(reader: "lc.LifecycleReader",
+                args: argparse.Namespace) -> "lc.RunRecord":
+    """The single rule that turns what an operator typed into one run.
+
+    Three accepted shapes, in falling order of explicitness: `--run-id`, a run
+    id typed positionally, and a plan name — which resolves to that plan's
+    *most recent* run, because the run an operator means while a run is going
+    is the one that is going. Every other run for the plan stays reachable
+    through `run list` and `--run-id`, so defaulting to the newest loses
+    nothing.
+    """
+    requested = getattr(args, "run_id", None)
+    if requested:
+        record = reader.run(requested)
+        if record is None:
+            raise _RunSelectionError("no run in the ledger has id " + requested)
+        return record
+    selector = getattr(args, "selector", None)
+    if not selector:
+        raise _RunSelectionError(
+            "name a plan or a run id, or pass --run-id")
+    record = reader.run(selector)
+    if record is not None:
+        return record
+    digest = (getattr(args, "plan_digests", None) or {}).get(selector)
+    if digest is None:
+        raise _RunSelectionError(
+            selector + " is neither a run id in the ledger nor an installed "
+            "plan name")
+    records = reader.runs(digest)
+    if not records:
+        raise _RunSelectionError(
+            "no run has been started for plan " + selector
+            + " at its current contents (digest " + digest[:12] + ")")
+    return records[0]
+
+
+def _resolve_resume_target(
+        args: argparse.Namespace,
+        config: Dict[str, Any]) -> Tuple[str, Path]:
+    """The existing run `resume` re-enters, and the plan bytes it ran on.
+
+    Resume is the verb that most needs *not* to invent an identity: a fresh
+    run id would give the scheduler an empty ledger and a new integration
+    worktree, discarding every node the original run already merged. The plan
+    file is chosen by the resolved run's own `plan_digest` rather than by the
+    name typed at the prompt, so resuming a run whose plan has since been
+    edited refuses at validation instead of resuming a different plan.
+    """
+    args.plan_digests = _named_plan_digests(config)
+    reader = _open_reader(config["database"])
+    try:
+        record = _select_run(reader, args)
+    finally:
+        reader.close()
+    for name, digest in args.plan_digests.items():
+        if digest == record.plan_digest:
+            return record.run_id, _named_plan_file(config, name)
+    raise _RunSelectionError(
+        "run " + record.run_id + " ran plan digest " + record.plan_digest[:12]
+        + ", which no installed plan currently matches; the plan file has "
+        "changed since the run started")
+
+
+def _open_reader(database) -> "lc.LifecycleReader":
+    try:
+        return lc.LifecycleReader.open(database)
+    except lc.LedgerUnavailable as exc:
+        raise _RunSelectionError(str(exc)) from exc
 
 
 def _refusal(outcome: str, detail: str) -> int:
@@ -791,6 +1043,151 @@ def _reviewer_window_factory(args: argparse.Namespace):
     return factory
 
 
+def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLauncher"):
+    """Build the scheduler's review stage: one reviewer per verified attempt.
+
+    Shares the launcher with the node runner deliberately — a second
+    `HerdrLauncher` would own a second pane registry, and the pane accounting
+    that `cancel` depends on would then be split across two objects that cannot
+    see each other's handles.
+    """
+    # B12's absence half, enforced where a reviewer is actually about to run.
+    # Fail closed: a vendor nobody declared cannot be shown to differ from the
+    # builder's, and "probably a different model" is not a property.
+    try:
+        code_review.require_distinct_vendor(
+            getattr(args, "execution_vendor", "") or "",
+            getattr(args, "reviewer_vendor", "") or "")
+    except code_review.SelfJudgeRefused as exc:
+        raise _PlanReceiptConfigurationError(str(exc)) from exc
+
+    review_root = Path(args.review_root)
+    store = finalization.ReceiptStore(
+        Path(args.review_receipt_dir), repo_paths=(args.repo,),
+        data_dir=args.data_dir,
+        verify_keys=tuple(bytes.fromhex(k) for k in args.verify_key),
+        signing_seed=bytes.fromhex(args.signing_seed))
+
+    def review(attempt, node, record, base_sha: str, output_sha: str):
+        digest = code_review.review_digest(
+            run_id=args.run_id, node_id=node.node_id, base_sha=base_sha,
+            output_sha=output_sha, rubric_version=code_review.CODE_RUBRIC.version)
+        # Keyed by the subject digest, not the attempt number, so a rebuilt but
+        # byte-identical output lands on the same directory and the same
+        # receipt — B10's replay rather than a second opinion.
+        subject_root = review_root / digest
+        report_path = subject_root / "report.json"
+        prompt_path = subject_root / "prompt.md"
+        session_dir = subject_root / "session"
+
+        diff, changed = code_review.read_diff(
+            Path(args.repo), base_sha, output_sha)
+        objects = code_review.review_objects(changed, output_sha)
+        matrix = finalization.compute_matrix(
+            code_review.CODE_RUBRIC, digest, objects)
+        handoff = code_review.build_handoff(
+            subject_digest=digest, run_id=args.run_id, node=node,
+            base_sha=base_sha, output_sha=output_sha, diff=diff,
+            matrix=matrix, rubric=code_review.CODE_RUBRIC,
+            report_path=report_path)
+
+        # B13 — measured against the reviewer's real window before a pane is
+        # allocated, so an oversized handoff is a refusal rather than a
+        # confident verdict about something else.
+        provider, _, model_name = str(args.reviewer_model).partition("/")
+        window = agent_pi.context_window(provider, model_name)
+        text = handoff.render()
+        code_review.preflight_handoff(text, window)
+
+        handle_box: Dict[str, Any] = {"handle": None}
+
+        def window_factory(_matrix):
+            subject_root.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(text, encoding="utf-8")
+
+            def launch_reviewer():
+                handle = runner.launch(launcher.LaunchSpec(
+                    correlation_token="review-" + digest[:16],
+                    worktree=Path(args.repo), prompt_path=prompt_path,
+                    envelope_path=report_path, route=args.reviewer_route,
+                    model=args.reviewer_model, effort=args.reviewer_effort,
+                    profile=args.reviewer_profile, session_dir=session_dir))
+                handle_box["handle"] = handle
+                return finalization_window.ReviewerSession(
+                    route=args.reviewer_route, model=args.reviewer_model,
+                    session_id=handle.pane_id, session_dir=str(session_dir),
+                    harness_owned_group=handle.process_group is not None,
+                    pid=handle.process_group)
+
+            def poll_report():
+                if not report_path.is_file():
+                    return None
+                try:
+                    return json.loads(report_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, UnicodeError):
+                    # A half-written report is not a report. Returning None
+                    # keeps the window open for the next poll rather than
+                    # crashing the whole review on a partial flush.
+                    return None
+
+            def read_status(_session):
+                handle = handle_box["handle"]
+                return runner.agent_status(handle) if handle is not None else None
+
+            def kill_reviewer(_session):
+                _close_reviewer_pane(runner, handle_box)
+
+            return finalization_window.FinalizationWindow(
+                config=finalization_window.FinalizationConfig(
+                    finalization_timeout_s=args.review_timeout_s,
+                    turn_timeout_s=args.reviewer_turn_timeout_s,
+                    poll_interval_s=args.reviewer_poll_interval_s),
+                launch=launch_reviewer, poll_report=poll_report,
+                record_reviewer_session=lambda _s: None,
+                record_stall=lambda _s, _sig, _e: None,
+                kill=kill_reviewer,
+                actor_status=read_status)
+
+        try:
+            return code_review.review_attempt(
+                subject_digest=digest, handoff=handoff, objects=objects,
+                rubric=code_review.CODE_RUBRIC, store=store,
+                window_factory=window_factory,
+                occupancy_reader=_reviewer_occupancy)
+        finally:
+            # Unconditional. The pane is closed on the success path too, not
+            # only when the window stalls and calls `kill` — a completed review
+            # that leaves its pane alive is the leak that accumulates one
+            # orphaned pane per node for the length of a run.
+            _close_reviewer_pane(runner, handle_box)
+
+    return review
+
+
+def _close_reviewer_pane(runner: "launcher.HerdrLauncher",
+                         handle_box: Dict[str, Any]) -> None:
+    """Close the reviewer's pane and forget the handle, at most once.
+
+    `cancel` proves quiescence and raises when it cannot. Here that exception
+    is swallowed on purpose: this runs in a `finally` around a review whose
+    verdict is already decided, and letting a pane-close failure replace a real
+    PASS or FAIL with a quiescence error would turn a cosmetic leak into a lost
+    review. The pane id stays in the log either way.
+    """
+    handle = handle_box.get("handle")
+    if handle is None:
+        return
+    handle_box["handle"] = None
+    try:
+        runner.cancel(handle, finalization_window.time.monotonic() + 5.0)
+    except BaseException as exc:  # noqa: BLE001 — see docstring
+        print(json.dumps({
+            "event": "reviewer_pane_close_failed",
+            "pane_id": handle.pane_id,
+            "detail": str(exc)[:200],
+        }, sort_keys=True), file=sys.stderr)
+
+
 def _agent_node_prompt(node: Any, envelope: Path,
                        retry_prompt: Optional[str]) -> str:
     """The instruction, plus every term the attempt is actually judged on.
@@ -854,6 +1251,46 @@ def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
         elif line.startswith("branch ") and line[len("branch "):].strip() == wanted:
             return path
     return None
+
+
+def _release_run_integration_worktree(repo: Path, path: Optional[Path]) -> None:
+    """Give up a run's own integration checkout, keeping its branch.
+
+    Only the checkout this invocation added is ever passed here. The
+    INTEGRATION_BRANCH_CHECKED_OUT refusal returns while somebody else's
+    worktree -- possibly the operator's own -- holds the branch, and releasing
+    that one would delete work this process never created.
+
+    `--force`, because the integration gate executes inside this checkout and
+    leaves untracked artifacts behind (§8.8); an unforced removal fails in the
+    ordinary case, which would leave in place the leak this exists to close.
+    Nothing merged is lost: `worktree remove` takes the checkout and never the
+    branch, so every merged commit stays reachable for the operator to
+    publish, and Maestro still performs no remote git operation at all (§8.8).
+    Attempt worktrees -- including the blocked ones retained for post-mortem
+    -- are not this function's business and are never named here.
+
+    Never raises. It runs in the run's `finally`, where an exception would
+    replace the outcome the run actually reached.
+    """
+    if path is None:
+        return
+    try:
+        released = subprocess.run(
+            ("git", "-C", str(repo), "worktree", "remove", "--force",
+             str(path)),
+            capture_output=True, text=True, check=False)
+    except OSError as exc:
+        detail = str(exc)
+    else:
+        if released.returncode == 0:
+            return
+        detail = (released.stderr or released.stdout or "").strip()
+    # stdout carries the run's report, so a failed release is reported beside
+    # it rather than inside it: the operator learns there is a worktree left to
+    # clean up, and the run still says exactly what it did.
+    print("integration worktree release failed: {}: {}".format(path, detail),
+          file=sys.stderr)
 
 
 def _reviewer_occupancy(
@@ -1080,7 +1517,8 @@ def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerCon
         concurrency=args.concurrency, node_timeout_s=args.node_timeout_s,
         turn_timeout_s=args.turn_timeout_s,
         final_acceptance_timeout_s=args.final_acceptance_timeout_s,
-        backstop_t_s=args.backstop_t_s, semantic_ceiling=args.semantic_ceiling)
+        backstop_t_s=args.backstop_t_s, semantic_ceiling=args.semantic_ceiling,
+        review_ceiling=getattr(args, "review_ceiling", None) or 3)
 
 
 def _paths_share_inode(left: Path, right: Path) -> bool:
@@ -1187,10 +1625,17 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     handles = {}
     proven_absent = set()
     handles_lock = RLock()
+    # The integration checkout this invocation added, and nothing else. The
+    # refusal below returns while another worktree still holds the branch, and
+    # a release that did not distinguish the two would delete that worktree --
+    # which may be the operator's own. `None` until `worktree add` succeeds.
+    created_integration_path: Optional[Path] = None
     try:
         if resuming:
             store.resume_run(args.run_id)
-        elif not Path(args.integration_path).exists():
+        # Not `elif`: a resumed run whose predecessor released the checkout has
+        # to take the branch back, because every attempt is based on its head.
+        if not Path(args.integration_path).exists():
             branch = plan.merge_policy.integration_branch
             occupant = _worktree_holding_branch(Path(args.repo), branch)
             if occupant is not None:
@@ -1206,6 +1651,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 ("git", "-C", str(args.repo), "worktree", "add",
                  str(args.integration_path), branch),
                 check=True, capture_output=True, text=True)
+            created_integration_path = Path(args.integration_path)
 
         def run_node(attempt, node, record, retry_prompt, on_launch,
                      cancel_requested):
@@ -1307,6 +1753,10 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 proven_absent.add(key)
 
         run_gate, run_integration_gate = _scheduler_gate_deps(plan)
+        review_attempt = (
+            _code_review_runner(args, route_runner)
+            if route_runner is not None and getattr(args, "review_root", None)
+            else None)
         deps = scheduler.SchedulerDeps(
             store=store, repo=Path(args.repo),
             integration_path=Path(args.integration_path),
@@ -1315,18 +1765,35 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             scratch_root=Path(args.scratch_root), run_node=run_node,
             run_gate=run_gate, run_integration_gate=run_integration_gate,
             quiesce_attempt=quiesce_attempt,
-            kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"))
+            kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
+            review_attempt=review_attempt)
         report = scheduler.Scheduler(
             args.run_id, plan.to_plan_nodes(), config, deps,
             plan_digest=args.digest).run()
     finally:
-        store.close()
+        # Nested so that a failing close still releases the checkout, and a
+        # failing release still leaves the store closed. Neither may become the
+        # reason the run's own outcome goes unreported.
+        try:
+            store.close()
+        finally:
+            _release_run_integration_worktree(
+                Path(args.repo), created_integration_path)
     print(json.dumps({"outcome": report.outcome.value,
                       "run_id": args.run_id,
                       "merged": list(report.merged),
                       "blocked": [
                           {"node_id": node, "reason": reason.value}
-                          for node, reason in report.blocked]}, sort_keys=True))
+                          for node, reason in report.blocked],
+                      # The findings that exhausted a node's review budget. A
+                      # bare REVIEW_BUDGET_EXHAUSTED names the rule that fired
+                      # and nothing an operator can act on. Read defensively:
+                      # the scheduler is a seam tests substitute, and a run's
+                      # exit status must not depend on a stand-in carrying
+                      # every field of the real report.
+                      "review_findings": dict(
+                          getattr(report, "review_findings", {}) or {})},
+                     sort_keys=True))
     return 0
 
 
@@ -1348,36 +1815,374 @@ def _scheduler_gate_deps(plan: plan_model.Plan):
     return run_gate, run_integration_gate
 
 
-def _run_status(args: argparse.Namespace) -> int:
-    store = _store(args)
-    if store is None:
-        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+def _epoch(stamp: Optional[str]) -> Optional[float]:
+    """An ISO ledger stamp as epoch seconds, or None when it cannot be read.
+
+    None rather than 0.0, unlike the scheduler's backstop: this is a display
+    path, and a zero here would render as "elapsed 57 years" instead of
+    admitting the timestamp is unreadable.
+    """
+    if not stamp:
+        return None
     try:
-        rows = [store.get_node(args.run_id, row.node_id)
-                for row in store.node_records(args.run_id)]
-        print(json.dumps([
-            {"node_id": row.node_id, "state": row.state.value,
-             "block_reason": row.block_reason.value if row.block_reason else None}
-            for row in rows
-        ], sort_keys=True))
-        return 0
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _since(stamp: Optional[str], now: float) -> Optional[float]:
+    moment = _epoch(stamp)
+    return None if moment is None else max(0.0, now - moment)
+
+
+def _duration(seconds: Optional[float]) -> str:
+    """A wall-clock gap an operator can read at a glance."""
+    if seconds is None:
+        return "-"
+    total = int(seconds)
+    if total < 60:
+        return "{}s".format(total)
+    if total < 3600:
+        return "{}m{:02d}s".format(total // 60, total % 60)
+    if total < 86400:
+        return "{}h{:02d}m".format(total // 3600, (total % 3600) // 60)
+    return "{}d{:02d}h".format(total // 86400, (total % 86400) // 3600)
+
+
+def _integration_head(path: Path) -> Optional[Dict[str, Any]]:
+    """The integration worktree's branch and head, as git reports them.
+
+    The run's whole output accumulates on this branch, so "which commit is the
+    integration worktree on" is the single most load-bearing fact `run status`
+    can print that the ledger does not store.
+    """
+    if not path.is_dir():
+        return None
+    read = {"branch": ("rev-parse", "--abbrev-ref", "HEAD"),
+            "head": ("rev-parse", "HEAD"),
+            "subject": ("log", "-1", "--format=%s")}
+    found: Dict[str, Any] = {"path": str(path)}
+    for key, command in read.items():
+        completed = subprocess.run(
+            ("git", "-C", str(path)) + command,
+            capture_output=True, text=True)
+        found[key] = (completed.stdout.strip()
+                      if completed.returncode == 0 else None)
+    return found
+
+
+def _attempt_history(transitions: Sequence[Dict[str, Any]]
+                     ) -> Dict[Tuple[str, int], List[Dict[str, Any]]]:
+    """Every node transition filed under the attempt it happened to.
+
+    The ledger numbers attempts in `attempts` and narrates them in
+    `transitions`, and nothing joins the two — `transitions` carries no
+    attempt number. The join is positional and reliable for one reason: the
+    scheduler writes exactly one `attempt-start` per attempt, in order, so the
+    nth `attempt-start` for a node opens attempt n. Anything before the first
+    one belongs to no attempt and is dropped rather than guessed at.
+    """
+    open_attempt: Dict[str, int] = {}
+    history: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for row in transitions:
+        node_id = row.get("node_id")
+        if node_id is None:
+            continue
+        if row.get("reason") == "attempt-start":
+            open_attempt[node_id] = open_attempt.get(node_id, 0) + 1
+            continue
+        attempt_no = open_attempt.get(node_id)
+        if attempt_no is None:
+            continue
+        history.setdefault((node_id, attempt_no), []).append({
+            "reason": row.get("reason"),
+            "from_state": row.get("from_state"),
+            "to_state": row.get("to_state"),
+            "actor": row.get("actor"),
+            "at": row.get("created_at"),
+            "detail": row.get("detail", {}),
+        })
+    return history
+
+
+def _attempt_verdict(entries: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The sentence that explains why an attempt ended, when there is one."""
+    for entry in entries:
+        detail = entry.get("detail") or {}
+        verdict = detail.get("verdict")
+        if verdict:
+            return str(verdict)
+    return None
+
+
+def _live_state(record: "lc.RunRecord",
+                nodes: Sequence["lc.NodeRow"]) -> str:
+    """What the run is doing now, which is not what it last *declared*.
+
+    `runs.latest_outcome` is the last quiescence a scheduler declared, and it
+    survives a resume — so a run that blocked, was rescued, and is now working
+    still reads BLOCKED there. An operator watching a run needs the live
+    shape, so the declared outcome is reported beside this rather than as it.
+    """
+    if record.cancel_requested:
+        return "CANCELLING"
+    states = [node.state for node in nodes]
+    if any(state is scheduler_types.NodeState.RUNNING for state in states):
+        return "RUNNING"
+    if not states:
+        return "EMPTY"
+    if all(state is scheduler_types.NodeState.MERGED for state in states):
+        return "MERGED"
+    if any(state is scheduler_types.NodeState.BLOCKED for state in states):
+        return "BLOCKED"
+    if any(state is scheduler_types.NodeState.PENDING for state in states):
+        return "PENDING"
+    return "QUIESCENT"
+
+
+def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
+                  args: argparse.Namespace) -> Dict[str, Any]:
+    """Everything `run status` knows about one run, as one document."""
+    now = time.time()
+    nodes = reader.nodes(record.run_id)
+    attempts = reader.attempts(record.run_id)
+    history = _attempt_history(reader.transitions(record.run_id))
+    results = reader.results(record.run_id)
+    names = {digest: name for name, digest
+             in (getattr(args, "plan_digests", None) or {}).items()}
+
+    by_node: Dict[str, List[Dict[str, Any]]] = {}
+    in_flight: List[Dict[str, Any]] = []
+    for attempt in attempts:
+        entries = history.get((attempt.node_id, attempt.attempt_no), [])
+        started = attempt.launched_at or attempt.started_at or None
+        running = attempt.state is scheduler_types.NodeState.RUNNING
+        projected = {
+            "attempt_no": attempt.attempt_no,
+            "state": attempt.state.value,
+            "base_sha": attempt.base_sha,
+            "turn_count": attempt.turn_count,
+            "retry_class": (attempt.retry_class.value
+                            if attempt.retry_class else None),
+            "pid": attempt.pid,
+            "started_at": attempt.started_at or None,
+            "launched_at": attempt.launched_at,
+            "running": running,
+            "elapsed_s": (max(0.0, now - started)
+                          if running and started else None),
+            "session_path": attempt.extra.get(watchdog.SESSION_PATH_KEY),
+            "verdict": _attempt_verdict(entries),
+            "transitions": entries,
+        }
+        by_node.setdefault(attempt.node_id, []).append(projected)
+        if running:
+            in_flight.append({"node_id": attempt.node_id,
+                              "attempt_no": attempt.attempt_no,
+                              "turn_count": attempt.turn_count,
+                              "elapsed_s": projected["elapsed_s"]})
+
+    projected_nodes = []
+    for node in nodes:
+        node_attempts = by_node.get(node.node_id, [])
+        projected_nodes.append({
+            "node_id": node.node_id,
+            "kind": node.kind,
+            "depth": node.depth,
+            "needs": list(node.needs),
+            "state": node.state.value,
+            "block_reason": (node.block_reason.value
+                             if node.block_reason else None),
+            "attempt_no": node.attempt_no,
+            "attempts_recorded": len(node_attempts),
+            "granted_extra_attempts": node.granted_extra_attempts,
+            "output_sha": node.output_sha,
+            "updated_at": node.updated_at,
+            "idle_s": _since(node.updated_at, now),
+            "attempts": node_attempts,
+        })
+
+    integration = None
+    state_root = getattr(args, "repository_state", None)
+    if state_root:
+        integration = _integration_head(
+            Path(state_root) / "runs" / record.run_id / "integration")
+    return {
+        "run_id": record.run_id,
+        "plan_name": names.get(record.plan_digest),
+        "plan_digest": record.plan_digest,
+        "state": _live_state(record, nodes),
+        "declared_outcome": (record.latest_outcome.value
+                             if record.latest_outcome else None),
+        "declared_outcome_at": record.latest_outcome_at,
+        "cancel_requested": record.cancel_requested,
+        "created_at": record.created_at,
+        "last_transition_at": record.last_transition_at,
+        "elapsed_s": _since(record.created_at, now),
+        "idle_s": _since(record.last_transition_at, now),
+        "integration": integration,
+        "in_flight": in_flight,
+        "nodes": projected_nodes,
+        "results": [
+            {"node_id": row.get("node_id"), "attempt_no": row.get("attempt_no"),
+             "adjudication": row.get("adjudication"),
+             "subject_sha": row.get("subject_sha"), "at": row.get("created_at"),
+             "payload": row.get("payload")}
+            for row in results],
+    }
+
+
+def _render_progress(progress: Dict[str, Any]) -> str:
+    """The default human view. One run, top to bottom, newest fact last."""
+    lines = ["{}  {}".format(progress["run_id"],
+                             progress["plan_name"] or "(plan not installed)")]
+    declared = progress["declared_outcome"]
+    lines.append("  state        {}{}".format(
+        progress["state"],
+        "" if declared is None
+        else "   (last declared outcome {} at {})".format(
+            declared, progress["declared_outcome_at"])))
+    lines.append("  plan digest  {}".format(progress["plan_digest"]))
+    lines.append("  started      {}   ({} ago)".format(
+        progress["created_at"], _duration(progress["elapsed_s"])))
+    lines.append("  last change  {}   ({} ago)".format(
+        progress["last_transition_at"], _duration(progress["idle_s"])))
+    if progress["cancel_requested"]:
+        lines.append("  cancel       requested")
+    integration = progress["integration"]
+    if integration is None:
+        lines.append("  integration  (no worktree found)")
+    else:
+        lines.append("  integration  {} @ {}".format(
+            integration.get("branch") or "?",
+            (integration.get("head") or "?")[:12]))
+        lines.append("               {}".format(integration["path"]))
+        if integration.get("subject"):
+            lines.append("               head: {}".format(
+                integration["subject"]))
+
+    lines.append("")
+    lines.append("  {:<44} {:<10} {:>8}  {}".format(
+        "NODE", "STATE", "ATTEMPT", "DETAIL"))
+    for node in progress["nodes"]:
+        detail = node["block_reason"] or ""
+        live = [item for item in node["attempts"] if item["running"]]
+        if live:
+            detail = "in flight {}, {} turns".format(
+                _duration(live[0]["elapsed_s"]), live[0]["turn_count"])
+        elif node["output_sha"]:
+            detail = "output {}".format(node["output_sha"][:12])
+        lines.append("  {:<44} {:<10} {:>8}  {}".format(
+            node["node_id"][:44], node["state"], node["attempt_no"], detail))
+
+    for node in progress["nodes"]:
+        if not node["attempts"]:
+            continue
+        lines.append("")
+        lines.append("  {} — attempts".format(node["node_id"]))
+        for attempt in node["attempts"]:
+            outcome = attempt["retry_class"] or attempt["state"]
+            lines.append("    a{:<3} {:<10} {:<22} {:>4} turns  {}".format(
+                attempt["attempt_no"], attempt["state"], outcome,
+                attempt["turn_count"],
+                _duration(attempt["elapsed_s"]) if attempt["running"] else ""))
+            if attempt["verdict"]:
+                lines.append("         why: {}".format(attempt["verdict"]))
+            if attempt["session_path"]:
+                lines.append("         session: {}".format(
+                    attempt["session_path"]))
+        if node["block_reason"]:
+            lines.append("    BLOCKED: {}".format(node["block_reason"]))
+
+    for row in progress["results"]:
+        lines.append("")
+        lines.append("  result {}#{} {}".format(
+            row["node_id"], row["attempt_no"], row["adjudication"] or ""))
+        lines.append("    {}".format(json.dumps(row["payload"], sort_keys=True)))
+    return "\n".join(lines)
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        progress = _run_progress(reader, _select_run(reader, args), args)
     finally:
-        store.close()
+        reader.close()
+    if getattr(args, "as_json", False):
+        print(json.dumps(progress, sort_keys=True))
+    else:
+        print(_render_progress(progress))
+    return 0
+
+
+def _run_list(args: argparse.Namespace) -> int:
+    """Every run in the ledger, newest first — the index into `--run-id`."""
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    digests = getattr(args, "plan_digests", None) or {}
+    names = {digest: name for name, digest in digests.items()}
+    selector = getattr(args, "selector", None)
+    wanted = None
+    if selector:
+        wanted = digests.get(selector)
+        if wanted is None:
+            raise _RunSelectionError(selector + " is not an installed plan name")
+    reader = _open_reader(args.db)
+    try:
+        records = reader.runs(wanted)
+        rows = [{"run_id": record.run_id,
+                 "plan_name": names.get(record.plan_digest),
+                 "plan_digest": record.plan_digest,
+                 "created_at": record.created_at,
+                 "last_transition_at": record.last_transition_at,
+                 "declared_outcome": (record.latest_outcome.value
+                                      if record.latest_outcome else None),
+                 "cancel_requested": record.cancel_requested,
+                 "state": _live_state(record, reader.nodes(record.run_id))}
+                for record in records]
+    finally:
+        reader.close()
+    if getattr(args, "as_json", False):
+        print(json.dumps(rows, sort_keys=True))
+        return 0
+    if not rows:
+        print("no runs")
+        return 0
+    print("{:<40} {:<28} {:<11} {:<11} {}".format(
+        "RUN", "PLAN", "STATE", "DECLARED", "STARTED"))
+    for row in rows:
+        print("{:<40} {:<28} {:<11} {:<11} {}".format(
+            row["run_id"], (row["plan_name"] or row["plan_digest"][:12])[:28],
+            row["state"], row["declared_outcome"] or "-", row["created_at"]))
+    return 0
 
 
 def _run_cancel(args: argparse.Namespace) -> int:
-    store = _store(args)
-    if store is None:
+    if not getattr(args, "db", None):
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
     try:
-        store.cancel_run(args.run_id)
-        print(json.dumps({"outcome": "CANCELLED", "run_id": args.run_id}))
+        run_id = _select_run(reader, args).run_id
+    finally:
+        reader.close()
+    store = lc.LifecycleStore(args.db)
+    try:
+        store.cancel_run(run_id)
+        print(json.dumps({"outcome": "CANCELLED", "run_id": run_id}))
         return 0
     finally:
         store.close()
 
 
 def _run_resume(args: argparse.Namespace) -> int:
+    # A manual, unconfigured resume still names its run positionally; the
+    # configured path has already resolved one into `run_id` by here.
+    if not getattr(args, "run_id", None) and getattr(args, "selector", None):
+        args.run_id = args.selector
     try:
         return _execute_run(args, resuming=True)
     except _PlanReceiptConfigurationError as exc:
@@ -1965,6 +2770,383 @@ def _plan_ship(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── `maestro deliver` ───────────────────────────────────────────────────────
+# One verb for the sequence `docs/plan-authoring.md` documents: a source
+# document becomes an architecture anchor, the anchor becomes N brownfield work
+# packages, each package is gated, reviewed, and shipped, and each shipped
+# package is then RUN -- sequentially, in dependency order, halting at the
+# first run that is not ACCEPTED. `--no-run` stops after shipping and reports
+# the commands instead.
+
+
+def _deliver_config() -> Dict[str, Any]:
+    """The plan-contract layout with route keys bound, which the lane needs."""
+    config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
+    if not config_path.is_file():
+        raise _MaestroConfigurationError(
+            "maestro deliver requires an installed " + str(_MAESTRO_CONFIG_FILE))
+    return _load_maestro_config(config_path.parent.parent.resolve(), config_path)
+
+
+def _deliver_author_lane(config: Dict[str, Any]) -> deliver_module.AuthorLane:
+    configured = config.get("author")
+    if not configured:
+        raise _MaestroConfigurationError(
+            "maestro deliver requires an author: block in "
+            + str(_MAESTRO_CONFIG_FILE) + " naming the route, model, effort, "
+            "and timeouts of the authoring lane")
+    return deliver_module.AuthorLane(**configured)
+
+
+def _deliver_runner(config: Dict[str, Any]) -> launcher.HerdrLauncher:
+    """The authoring lane rides the same admitted-route launcher as every
+    other agent turn. No new trust material is minted for it."""
+    route_keys = (bytes.fromhex(config["route_verify_key"]),)
+    admitted = route_receipts.load_admitted_routes(
+        dict(config["route_paths"]), verify_keys=route_keys)
+    return launcher.HerdrLauncher(
+        herdr_path=Path(config["executables"]["herdr"]),
+        omp_path=Path(config["executables"]["omp"]),
+        claude_path=Path(config["executables"]["claude"]),
+        admitted_routes=admitted)
+
+
+def _deliver_close_pane(config: Dict[str, Any], pane_id: Optional[str]) -> None:
+    """Close the pane whatever the launcher's proof said.
+
+    `cancel` already closes and proves absence, but a quiescence failure
+    raises before the close is retried, and a pane left open is the one
+    failure an operator sees every single time. This runs after it,
+    unconditionally and best-effort.
+    """
+    if not pane_id:
+        return
+    try:
+        subprocess.run(
+            [config["executables"]["herdr"], "pane", "close", pane_id],
+            capture_output=True, text=True, check=False, timeout=30.0)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _deliver_author_turn(config: Dict[str, Any],
+                         lane: deliver_module.AuthorLane,
+                         runner: launcher.HerdrLauncher,
+                         session_root: Path):
+    """One opus authoring turn, ending when the lane writes its envelope."""
+
+    def turn(kind: str, prompt: str, envelope: Path) -> Dict[str, Any]:
+        token = "deliver-" + kind + "-" + uuid.uuid4().hex[:8]
+        session_dir = session_root / token
+        prompt_path = session_root / (token + ".prompt.md")
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        envelope.parent.mkdir(parents=True, exist_ok=True)
+        # `poll` ends the turn on the envelope's presence, so a stale envelope
+        # from a previous attempt would end this one before it began.
+        if envelope.exists():
+            envelope.unlink()
+        handle = runner.launch(launcher.LaunchSpec(
+            correlation_token=token, worktree=Path(config["repo"]),
+            prompt_path=prompt_path, envelope_path=envelope,
+            route=lane.route, model=lane.model, effort=lane.effort,
+            profile=lane.profile, session_dir=session_dir))
+        deadline = time.monotonic() + lane.author_timeout_s
+        state = None
+        try:
+            while time.monotonic() < deadline:
+                state = runner.poll(handle)
+                if state.state in (launcher.PollState.EXITED,
+                                   launcher.PollState.GONE):
+                    break
+                time.sleep(lane.poll_interval_s)
+        finally:
+            try:
+                runner.cancel(handle, time.monotonic() + 5.0)
+            except (launcher.HarnessQuiescenceError, RuntimeError, OSError):
+                pass
+            _deliver_close_pane(config, handle.pane_id)
+        if not envelope.is_file():
+            raise deliver_module.DeliverError(
+                "AUTHOR_LANE_NO_ENVELOPE:{}:{}".format(
+                    kind, state.detail if state is not None else "TIMEOUT"))
+        try:
+            payload = json.loads(envelope.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise deliver_module.DeliverError(
+                "AUTHOR_LANE_ENVELOPE_UNPARSED:{}".format(kind)) from exc
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            detail = ""
+            if isinstance(payload, dict):
+                detail = str(payload.get("summary") or "")
+            raise deliver_module.DeliverError(
+                "AUTHOR_LANE_FAILED:{}:{}".format(kind, detail))
+        return payload
+
+    return turn
+
+
+def _deliver_json_lines(text: str):
+    payloads = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payloads.append(parsed)
+    return payloads
+
+
+def _deliver_plan_step(verb: str, name: str):
+    """`maestro plan <verb> <name>` in process, tee'd and parsed.
+
+    The operator sees each step's output exactly as if they had typed it; the
+    parsed payloads are what the repair loop reads its findings out of.
+    """
+    handlers = {"gate": _plan_gate, "review": _plan_review, "ship": _plan_ship}
+    stream = io.StringIO()
+    with _redirect_stdout(stream):
+        status = int(handlers[verb](_configured_plan_step(verb, name)))
+    text = stream.getvalue()
+    sys.stdout.write(text)
+    return status, _deliver_json_lines(text)
+
+
+def _deliver_run_start(name: str):
+    """`maestro run start <name>`, resolved exactly as an operator's would be.
+
+    The run id, worktree roots, and execution bounds all come from
+    `_apply_repository_config`, untouched: `deliver` starting a run must be
+    indistinguishable from an operator starting the same one.
+    """
+    argv = ("run", "start", name)
+    args = build_parser().parse_args(list(argv))
+    _apply_repository_config(args, argv)
+    stream = io.StringIO()
+    with _redirect_stdout(stream):
+        status = int(_run_start(args))
+    text = stream.getvalue()
+    sys.stdout.write(text)
+    return status, _deliver_json_lines(text)
+
+
+def _deliver_plan_bytes(config: Dict[str, Any], name: str) -> Optional[bytes]:
+    plan_file = config["plans_dir"] / _named_plan_name(name) / "maestro-plan.v1"
+    if not plan_file.is_file():
+        return None
+    return plan_file.read_bytes()
+
+
+def _deliver_shipped(config: Dict[str, Any], name: str) -> bool:
+    """True when this package's CURRENT bytes already carry a PASS receipt.
+
+    Keyed on the digest of the bytes on disk, so a re-authored package is
+    never mistaken for the approved one it replaced.
+    """
+    stored = _deliver_plan_bytes(config, name)
+    if stored is None:
+        return False
+    try:
+        store = finalization.ReceiptStore(
+            str(config["receipt_dir"]), repo_paths=(config["repo"],),
+            data_dir=str(config["data_dir"]),
+            verify_keys=(bytes.fromhex(config["verify_key"]),),
+            create=False)
+        receipt = store.load(plan_digest.digest_of(stored))
+    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
+            finalization.SignatureInvalid,
+            finalization.ReceiptStoreLocationError,
+            receipt_crypto.KeyMaterialError, KeyError, OSError, ValueError):
+        return False
+    return receipt.verdict is finalization.Verdict.PASS
+
+
+def _deliver_accepted_run(config: Dict[str, Any], name: str) -> Optional[str]:
+    """An ACCEPTED run for these exact plan bytes, if one already happened.
+
+    This is what makes a resumed `deliver` cheap: package 3 of 5 halting must
+    not re-run packages 1 and 2, and the lifecycle store already records, per
+    plan digest, that their runs reached ACCEPTED.
+    """
+    stored = _deliver_plan_bytes(config, name)
+    database = config["database"]
+    if stored is None or not Path(database).is_file():
+        return None
+    try:
+        connection = sqlite3.connect(
+            "file:{}?mode=ro".format(database), uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT run_id FROM runs WHERE plan_digest=? AND latest_outcome=?"
+            " ORDER BY latest_outcome_at DESC LIMIT 1",
+            (plan_digest.digest_of(stored),
+             scheduler_types.RunOutcome.ACCEPTED.value)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    return str(row[0]) if row else None
+
+
+def _deliver_blocked_lanes(config: Dict[str, Any], run_id: str):
+    """Every lane that did not merge: which lane, which attempt, and why.
+
+    Attempt and reason both come from the lifecycle store rather than the run
+    report, because the report names the node and the reason but not the
+    attempt the ceiling was reached on, and "on which attempt" is half of what
+    a halted operator needs.
+    """
+    database = config["database"]
+    if not Path(database).is_file():
+        return ()
+    store = lc.LifecycleStore(str(database))
+    try:
+        rows = []
+        for record in store.node_records(run_id):
+            node = store.get_node(run_id, record.node_id)
+            if node.state is scheduler_types.NodeState.MERGED:
+                continue
+            rows.append({
+                "lane": record.node_id,
+                "state": node.state.value,
+                "attempt": node.attempt_no,
+                "reason": (node.block_reason.value
+                           if node.block_reason else None),
+            })
+        return tuple(rows)
+    except (lc.LifecycleError, sqlite3.Error, KeyError):
+        return ()
+    finally:
+        store.close()
+
+
+def _deliver_release_run(config: Dict[str, Any], name: str):
+    """Free the integration branch a previous run's worktree still holds.
+
+    Deliberately narrow. `_execute_run` now releases the checkout it added on
+    every path out of the run, so a fresh leak is no longer produced. What
+    remains is the backlog: worktrees stranded by runs that predate that
+    release, or by a release that failed and said so on stderr. Either one
+    refuses the next run with INTEGRATION_BRANCH_CHECKED_OUT until something
+    hands the branch back, and this verb is that something.
+
+    Only a worktree inside this repository's own run root is ever removed. An
+    operator's checkout of the same branch is left exactly where it is, so
+    `run start` still refuses with its own message and explains itself; a verb
+    that deleted an operator's worktree to get its own work started would be a
+    far worse bug than the one it is working around.
+    """
+    stored = _deliver_plan_bytes(config, name)
+    if stored is None:
+        return ()
+    try:
+        branch = plan_model.parse_bytes(stored).merge_policy.integration_branch
+    except (ValueError, KeyError):
+        return ()
+    repo = Path(config["repo"])
+    occupant = _worktree_holding_branch(repo, branch)
+    runs_root = (config["repository_state"] / "runs").resolve()
+    released = []
+    if occupant is not None and _path_is_within(occupant.resolve(), runs_root):
+        result = subprocess.run(
+            ("git", "-C", str(repo), "worktree", "remove", "--force",
+             str(occupant)), capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            released.append(str(occupant))
+    subprocess.run(("git", "-C", str(repo), "worktree", "prune"),
+                   capture_output=True, text=True, check=False)
+    return tuple(released)
+
+
+def _deliver_reviewer_report(config: Dict[str, Any], name: str):
+    """The report behind a finalization verdict, so a FAIL yields its cells."""
+    plan_file = (config["plans_dir"] / name / "maestro-plan.v1")
+    if not plan_file.is_file():
+        return None
+    digest = plan_digest.digest_of(plan_file.read_bytes())
+    report = (config["repository_state"] / "finalization" / digest
+              / "report.json")
+    if not report.is_file():
+        return None
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _deliver_remove_plan(config: Dict[str, Any], name: str) -> None:
+    """`plan author` is create-once, so a re-ship starts from no plan.
+
+    Bounded to `plans_dir` by the same check every other derived path uses: a
+    verb that deletes directories may not be talked into deleting one outside
+    the tree it owns.
+    """
+    directory = (config["plans_dir"] / _named_plan_name(name)).resolve()
+    if not _path_is_within(directory, config["plans_dir"]):
+        raise _MaestroConfigurationError(
+            "plan directory resolves outside plans_dir: " + name)
+    if directory.is_dir():
+        shutil.rmtree(directory)
+
+
+def _deliver(args: argparse.Namespace) -> int:
+    config = _deliver_config()
+    lane = _deliver_author_lane(config)
+    spec = Path(args.spec)
+    resolved_spec = (spec if spec.is_absolute()
+                     else (Path(config["repo"]) / spec)).resolve()
+    if not resolved_spec.is_file():
+        return _refusal("DELIVER_SPEC_MISSING",
+                        "no source document at " + str(resolved_spec))
+    if not _path_is_within(resolved_spec, config["repo"]):
+        return _refusal(
+            "DELIVER_SPEC_OUTSIDE_REPOSITORY",
+            "a source document is pinned by repository-relative path, and "
+            + str(resolved_spec) + " is outside " + str(config["repo"]))
+    relative = str(resolved_spec.relative_to(Path(config["repo"]).resolve()))
+
+    session_root = config["repository_state"] / "deliver"
+    runner = _deliver_runner(config)
+    delivery = deliver_module.Delivery(
+        spec=relative,
+        repo=Path(config["repo"]),
+        # The same derivation `plan gate`, `plan review`, and `plan ship` use.
+        # An IR written anywhere else is an IR those verbs never see.
+        plans_dir=config["plans_dir"],
+        envelope_dir=session_root,
+        author_turn=_deliver_author_turn(config, lane, runner, session_root),
+        plan_step=_deliver_plan_step,
+        reviewer_report=lambda name: _deliver_reviewer_report(config, name),
+        request=args.request or "",
+        max_attempts=args.max_attempts,
+        remove_plan_dir=lambda name: _deliver_remove_plan(config, name),
+        run_start=None if args.no_run else _deliver_run_start,
+        accepted_run=lambda name: _deliver_accepted_run(config, name),
+        blocked_lanes=lambda run_id: _deliver_blocked_lanes(config, run_id),
+        release_run=lambda name: _deliver_release_run(config, name),
+        shipped=lambda name: _deliver_shipped(config, name),
+        ledger_path=session_root / (_deliver_ledger_name(relative)))
+    try:
+        payload = delivery.run()
+    except deliver_module.DeliverError as exc:
+        return _refusal("DELIVER_FAILED", str(exc))
+    print(json.dumps(payload, sort_keys=True))
+    # DELIVERED_NOT_RUN is `--no-run` doing exactly what it was asked to do.
+    return 0 if payload["outcome"] in ("DELIVERED", "DELIVERED_NOT_RUN") else 2
+
+
+def _deliver_ledger_name(spec: str) -> str:
+    """One ledger per source document, named from it and never by it."""
+    return "packages-" + plan_digest.digest_of(spec.encode("utf-8"))[:16] + ".json"
+
+
 class _WorkspaceNotCanonical(RuntimeError):
     """The manifest parses but is not the immutable byte representation."""
 
@@ -2358,6 +3540,7 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--final-acceptance-timeout-s", type=float)
     parser.add_argument("--backstop-t-s", type=float)
     parser.add_argument("--semantic-ceiling", type=int)
+    parser.add_argument("--review-ceiling", type=int)
     parser.add_argument("--herdr")
     parser.add_argument("--omp")
     parser.add_argument("--claude")
@@ -2367,6 +3550,13 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-profile")
     parser.add_argument("--route-receipt", action="append")
     parser.add_argument("--route-verify-key", action="append")
+
+
+def _add_run_selection(parser: argparse.ArgumentParser) -> None:
+    """Which run to read, and how to print it — the only two choices a read
+    verb offers, because everything else it needs is configured."""
+    parser.add_argument("--run-id")
+    parser.add_argument("--json", action="store_true", dest="as_json")
 
 
 def _add_db(parser: argparse.ArgumentParser) -> None:
@@ -2462,6 +3652,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_plan_receipt_access(listing)
     listing.set_defaults(handler=_plan_list)
 
+    # One verb from a source document to shipped, runnable plans. It prints the
+    # `run start` commands and stops; it never starts one.
+    deliver = root.add_parser("deliver")
+    deliver.add_argument("spec")
+    deliver.add_argument("--request", default="")
+    deliver.add_argument("--max-attempts", type=int,
+                         default=deliver_module.MAX_ATTEMPTS)
+    deliver.add_argument("--no-run", action="store_true")
+    deliver.set_defaults(handler=_deliver)
+
     run = root.add_parser("run")
     run_sub = run.add_subparsers(dest="run_command", required=True)
     start = run_sub.add_parser("start")
@@ -2469,15 +3669,22 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("plan_name")
     start.set_defaults(handler=_run_start)
     status = run_sub.add_parser("status")
-    status.add_argument("run_id")
+    status.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    _add_run_selection(status)
     _add_db(status)
     status.set_defaults(handler=_run_status)
+    run_listing = run_sub.add_parser("list")
+    run_listing.add_argument("selector", nargs="?", metavar="PLAN")
+    run_listing.add_argument("--json", action="store_true", dest="as_json")
+    _add_db(run_listing)
+    run_listing.set_defaults(handler=_run_list)
     cancel = run_sub.add_parser("cancel")
-    cancel.add_argument("run_id")
+    cancel.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    cancel.add_argument("--run-id")
     _add_db(cancel)
     cancel.set_defaults(handler=_run_cancel)
     resume = run_sub.add_parser("resume")
-    resume.add_argument("run_id")
+    resume.add_argument("selector", metavar="PLAN_OR_RUN_ID")
     resume.add_argument("--digest")
     _add_run_execution_options(resume)
     resume.set_defaults(handler=_run_resume)
@@ -2592,8 +3799,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _refusal("MAESTRO_ENVIRONMENT_REQUIRED", str(exc))
     except _MaestroConfigurationError as exc:
         return _refusal("MAESTRO_CONFIGURATION_INVALID", str(exc))
+    except _RunSelectionError as exc:
+        return _refusal("RUN_NOT_FOUND", str(exc))
     except route_admission.AdmissionError as exc:
         return _refusal("ROUTE_ADMISSION_FAILED", str(exc))
+    except deliver_module.DeliverError as exc:
+        return _refusal("DELIVER_FAILED", str(exc))
     except plan_author.AuthoringError as exc:
         return _refusal("PLAN_AUTHORING_FAILED", str(exc))
     except _WORKSPACE_TYPED_ERRORS as exc:

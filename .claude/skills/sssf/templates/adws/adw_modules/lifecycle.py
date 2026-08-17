@@ -78,6 +78,16 @@ class SkipAncestryRefused(LifecycleError):
     Skip does not bypass the ancestry proof."""
 
 
+class LedgerUnavailable(LifecycleError):
+    """A read verb was pointed at a lifecycle database that does not exist.
+
+    Distinct from every other error here because it is the *expected* answer
+    to `run status` before a first run: an operator asking to read a ledger
+    that was never written must be told so, and must not have one created for
+    them as a side effect of asking.
+    """
+
+
 # ── schema ───────────────────────────────────────────────────────────────────
 
 SCHEMA = """
@@ -848,7 +858,8 @@ class LifecycleStore:
 
     def mark_blocked(self, run_id: str, node_id: str, reason: st.BlockReason, *,
                       detail: Optional[Mapping[str, Any]] = None,
-                      retry_class: Optional[st.RetryClass] = None) -> st.NodeLifecycle:
+                      retry_class: Optional[st.RetryClass] = None,
+                      attempt_extra: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
         """RUNNING or VERIFIED -> BLOCKED with a stored reason (§7.3).
 
         `UPSTREAM_BLOCKED` is never a valid argument here — it is derived,
@@ -877,6 +888,26 @@ class LifecycleStore:
                     "UPDATE attempts SET retry_class=? WHERE run_id=? AND node_id=?"
                     " AND attempt_no=?",
                     (retry_class.value, run_id, node_id, lifecycle.attempt_no)))
+            if attempt_extra:
+                # The blocking attempt's marker matters as much as a retrying
+                # one's: without it the budget-exhausting attempt leaves no
+                # stored evidence, and after `retry --force` the count restarts
+                # one short — which turns a granted single attempt into an
+                # unbounded loop for as long as the operator keeps forcing.
+                row = self.conn.execute(
+                    "SELECT extra_json FROM attempts"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (run_id, node_id, lifecycle.attempt_no)).fetchone()
+                try:
+                    merged = dict(json.loads(row[0]) if row and row[0] else {})
+                except (TypeError, ValueError):
+                    merged = {}
+                merged.update(dict(attempt_extra))
+                writes.append((
+                    "UPDATE attempts SET extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (json.dumps(merged, sort_keys=True),
+                     run_id, node_id, lifecycle.attempt_no)))
             return writes
         return self._transition_node(
             run_id, node_id, st.NodeState.BLOCKED, actor="scheduler",
@@ -886,7 +917,8 @@ class LifecycleStore:
 
     def fail_attempt(self, run_id: str, node_id: str,
                       retry_class: st.RetryClass,
-                      detail: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
+                      detail: Optional[Mapping[str, Any]] = None,
+                      attempt_extra: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
         """RUNNING -> PENDING: an ENVIRONMENTAL/LAUNCHER_TRANSIENT failure that
         earns another attempt automatically (§7.5) — not an operator escape.
 
@@ -897,13 +929,39 @@ class LifecycleStore:
         arrival from the dead attempt as ACCEPTED rather than SUPERSEDED
         because it reads `attempts.state`. The retry class is recorded
         alongside, so the row still says what the attempt failed as.
+
+        `attempt_extra` merges into the attempt row's `extra_json` in the same
+        transaction. It exists so a budget can be counted over a dimension the
+        three retry classes do not name — code review is one: a rejected diff
+        is a SEMANTIC failure by §7.5's own rule, but it must not share the
+        semantic ceiling, and adding a fourth `RetryClass` would break §7.5's
+        stated "three, mutually exclusive" and every guard written against it.
+        A marker in the row the count already ranges over is the smaller
+        change, and it keeps the count a `COUNT(*)` over stored facts rather
+        than a counter this store maintains.
         """
         def extra(lifecycle: st.NodeLifecycle):
-            return [(
+            writes = [(
                 "UPDATE attempts SET retry_class=?, state=?"
                 " WHERE run_id=? AND node_id=? AND attempt_no=?",
                 (retry_class.value, CLOSED_ATTEMPT_STATE.value,
                  run_id, node_id, lifecycle.attempt_no))]
+            if attempt_extra:
+                row = self.conn.execute(
+                    "SELECT extra_json FROM attempts"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (run_id, node_id, lifecycle.attempt_no)).fetchone()
+                try:
+                    merged = dict(json.loads(row[0]) if row and row[0] else {})
+                except (TypeError, ValueError):
+                    merged = {}
+                merged.update(dict(attempt_extra))
+                writes.append((
+                    "UPDATE attempts SET extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (json.dumps(merged, sort_keys=True),
+                     run_id, node_id, lifecycle.attempt_no)))
+            return writes
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="scheduler",
             reason=f"retry:{retry_class.value}", require_state=(st.NodeState.RUNNING,),
@@ -1146,3 +1204,167 @@ class LifecycleStore:
         return self._transition_node(
             run_id, node_id, st.NodeState.CANCELLED, actor="operator",
             reason=st.Escape.ABANDON.value, extra_writes=extra)
+
+
+# ── the read-only projection the operator's read verbs use (§11.1) ───────────
+
+@dataclass(frozen=True)
+class RunRecord:
+    """One `runs` row, as the operator reads it.
+
+    `latest_outcome` is `None` while no scheduler has ever declared quiescence
+    for this run — which is exactly the shape of a run that is still going, and
+    the reason the column is nullable rather than defaulted to a fifth outcome.
+    """
+
+    run_id: str
+    plan_digest: str
+    created_at: str
+    last_transition_at: str
+    latest_outcome: Optional[st.RunOutcome]
+    latest_outcome_at: Optional[str]
+    cancel_requested: bool
+
+
+@dataclass(frozen=True)
+class NodeRow:
+    """One node's plan shape joined to its lifecycle row, for display only."""
+
+    node_id: str
+    kind: str
+    depth: int
+    needs: Tuple[str, ...]
+    state: st.NodeState
+    attempt_no: int
+    block_reason: Optional[st.BlockReason]
+    output_sha: Optional[str]
+    granted_extra_attempts: int
+    updated_at: str
+
+
+class LifecycleReader:
+    """Every read the operator's read verbs make, and no write at all.
+
+    `LifecycleStore.__init__` runs `ensure_dir`, switches journal mode, and
+    executes `SCHEMA` — three writes — because it is the *scheduler's* handle.
+    Reusing it for `run status` would make asking about a run that never
+    happened create the ledger it asked about, and would take a write lock on
+    the database a live scheduler is transacting against. So the read verbs
+    get their own handle, opened `mode=ro`, and the queries still live in this
+    module rather than in the CLI (§10.6's one-query-path rule).
+
+    Read-only WAL access needs the `-shm` file, which SQLite deletes on the
+    last clean close. When it is gone there is provably no live writer, so the
+    fallback to `immutable=1` cannot read behind one — it is the only way to
+    read a finished run's ledger at all.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    @classmethod
+    def open(cls, db_path) -> "LifecycleReader":
+        path = Path(db_path)
+        if not path.is_file():
+            raise LedgerUnavailable(f"no lifecycle database at {path}")
+        located = path.resolve().as_uri()[len("file://"):]
+        try:
+            conn = cls._probed("file:{}?mode=ro".format(located))
+        except sqlite3.OperationalError:
+            conn = cls._probed("file:{}?mode=ro&immutable=1".format(located))
+        conn.row_factory = sqlite3.Row
+        return cls(conn)
+
+    @staticmethod
+    def _probed(uri: str) -> sqlite3.Connection:
+        """Connect and force the open, so a `-shm` refusal surfaces here.
+
+        `sqlite3.connect` is lazy about some failures; the probe makes the two
+        read-only modes distinguishable at the one place that chooses between
+        them instead of at an arbitrary later query.
+        """
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def _rows(self, sql: str, params: Tuple[Any, ...]) -> Tuple[sqlite3.Row, ...]:
+        return tuple(self.conn.execute(sql, params).fetchall())
+
+    def runs(self, plan_digest: Optional[str] = None) -> Tuple[RunRecord, ...]:
+        """Run rows, newest first — the index `run list` renders and `run
+        status` resolves a plan name through."""
+        sql = ("SELECT run_id, plan_digest, created_at, last_transition_at,"
+               " latest_outcome, latest_outcome_at, cancel_requested FROM runs")
+        params: Tuple[Any, ...] = ()
+        if plan_digest is not None:
+            sql += " WHERE plan_digest=?"
+            params = (plan_digest,)
+        return tuple(
+            RunRecord(
+                run_id=row["run_id"], plan_digest=row["plan_digest"],
+                created_at=row["created_at"],
+                last_transition_at=row["last_transition_at"],
+                latest_outcome=(st.RunOutcome(row["latest_outcome"])
+                                if row["latest_outcome"] else None),
+                latest_outcome_at=row["latest_outcome_at"],
+                cancel_requested=bool(row["cancel_requested"]))
+            for row in self._rows(sql + " ORDER BY created_at DESC, run_id DESC",
+                                  params))
+
+    def run(self, run_id: str) -> Optional[RunRecord]:
+        found = [record for record in self.runs() if record.run_id == run_id]
+        return found[0] if found else None
+
+    def nodes(self, run_id: str) -> Tuple[NodeRow, ...]:
+        rows = self._rows(
+            "SELECT d.node_id, d.kind, d.depth, d.needs_json, l.state,"
+            " l.attempt_no, l.block_reason, l.output_sha,"
+            " l.granted_extra_attempts, l.updated_at"
+            " FROM dag_nodes d JOIN node_lifecycle l"
+            " ON l.run_id = d.run_id AND l.node_id = d.node_id"
+            " WHERE d.run_id=? ORDER BY d.depth, d.node_id", (run_id,))
+        return tuple(
+            NodeRow(
+                node_id=row["node_id"], kind=row["kind"], depth=row["depth"],
+                needs=tuple(json.loads(row["needs_json"])),
+                state=st.NodeState(row["state"]), attempt_no=row["attempt_no"],
+                block_reason=(st.BlockReason(row["block_reason"])
+                              if row["block_reason"] else None),
+                output_sha=row["output_sha"],
+                granted_extra_attempts=row["granted_extra_attempts"],
+                updated_at=row["updated_at"])
+            for row in rows)
+
+    def attempts(self, run_id: str) -> Tuple[st.AttemptRecord, ...]:
+        rows = self._rows(
+            "SELECT node_id, attempt_no, base_sha, state, started_at,"
+            " launched_at, pid, turn_count, retry_class, extra_json"
+            " FROM attempts WHERE run_id=? ORDER BY node_id, attempt_no",
+            (run_id,))
+        return tuple(
+            st.AttemptRecord(
+                run_id=run_id, node_id=row["node_id"],
+                attempt_no=row["attempt_no"], base_sha=row["base_sha"],
+                state=st.NodeState(row["state"]),
+                started_at=row["started_at"] or 0.0,
+                launched_at=row["launched_at"], pid=row["pid"],
+                turn_count=row["turn_count"] or 0,
+                retry_class=(st.RetryClass(row["retry_class"])
+                             if row["retry_class"] else None),
+                extra=json.loads(row["extra_json"]))
+            for row in rows)
+
+    def transitions(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
+        return tuple(_audit_dict(row) for row in self._rows(
+            "SELECT * FROM transitions WHERE run_id=? ORDER BY id", (run_id,)))
+
+    def results(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
+        return tuple(_audit_dict(row) for row in self._rows(
+            "SELECT * FROM results WHERE run_id=? ORDER BY id", (run_id,)))

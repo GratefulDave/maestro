@@ -12,6 +12,16 @@ executables:
 route_receipts:
   omp: route-receipts/omp.json
   claude: route-receipts/claude.json
+# The plan-authoring lane `maestro deliver` drives. It rides the already
+# admitted `claude` route; `profile` is omitted because only the omp route's
+# argv carries one.
+author:
+  route: claude
+  model: opus
+  effort: high
+  author_timeout_s: 3600
+  turn_timeout_s: 300
+  poll_interval_s: 2
 reviewer:
   route: claude
   model: opus
@@ -26,9 +36,17 @@ execution:
   model: grok-4.6
   effort: high
   profile: grok
+  # Compared against reviewer.vendor at preflight so no actor reviews its own
+  # output (B12). Config-derived, not receipt-proven: route receipts are keyed
+  # by route, and both profiles ride the same admitted `omp` receipt.
+  vendor: xai
   concurrency: 6
   node_timeout_s: 1800
   turn_timeout_s: 300
   final_acceptance_timeout_s: 900
   backstop_t_s: 7200
   semantic_ceiling: 3
+  # Attempts a node may spend on code-review rejections, counted separately
+  # from semantic_ceiling. Three total: reject, reject, reject -> the lane
+  # blocks REVIEW_BUDGET_EXHAUSTED with the findings reported.
+  review_ceiling: 3

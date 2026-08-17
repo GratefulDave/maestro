@@ -567,7 +567,9 @@ class TheRealCollector(ValidationTestCase):
 
     def test_collection_never_executes_the_suite(self):
         argv = pv.SubprocessCollector().argv_for(self.gate(["tests"]))
-        self.assertEqual(argv, ("pytest", "--collect-only", "-q", "tests"))
+        self.assertEqual(
+            argv,
+            ("pytest", "--collect-only", "-q", "-o", "addopts=", "tests"))
 
     def test_the_vitest_argv_lists_rather_than_watches(self):
         gate = pm.Gate(runner="vitest", cwd="web", argv=("src/a.test.ts",),

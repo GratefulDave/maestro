@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import maestro
 from adw_modules import receipt_crypto
+from adw_modules import route_admission
 
 
 FAKE_PLANCTL = '''#!/usr/bin/env python3
@@ -741,6 +742,91 @@ class VisiblePaneTest(PlanContractVerbFixture):
         self.assertEqual(after, [plan_ir.name])
         self.assertFalse(state.exists(),
                          "a refused verb must not leave a step log behind")
+
+
+class BootstrapReviewerKeyTest(unittest.TestCase):
+    """`maestro bootstrap` mints the reviewer key, so nobody ever types one.
+
+    The key is needed before `maestro plan review` exists: /arch-review drives
+    `planctl review` through the skill directly and only needs the env file
+    bootstrap already writes.
+    """
+
+    def test_bootstrap_writes_the_reviewer_key_into_the_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys = route_admission.provision_keys(Path(tmp) / "keys")
+            env_file = route_admission.write_env_file(
+                keys, verify_key_env="MAESTRO_VERIFY_KEY",
+                signing_seed_env="MAESTRO_SIGNING_SEED",
+                route_verify_key_env="MAESTRO_ROUTE_VERIFY_KEY")
+            body = env_file.read_text(encoding="ascii")
+            bindings = dict(
+                line.split("=", 1) for line in body.splitlines() if line.strip())
+            mode = stat.S_IMODE(env_file.stat().st_mode)
+        self.assertIn("PLANCTL_REVIEWER_HMAC_KEY", bindings)
+        for name in ("MAESTRO_VERIFY_KEY", "MAESTRO_SIGNING_SEED",
+                     "MAESTRO_ROUTE_VERIFY_KEY"):
+            self.assertIn(name, bindings)
+        self.assertEqual(bindings["PLANCTL_REVIEWER_HMAC_KEY"],
+                         keys.reviewer_hmac.hex())
+        self.assertEqual(mode, 0o600)
+
+    def test_the_minted_key_clears_planctl_s_minimum_length(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys = route_admission.provision_keys(Path(tmp) / "keys")
+        self.assertGreaterEqual(
+            len(keys.reviewer_hmac.hex().encode("utf-8")),
+            maestro._REVIEWER_HMAC_KEY_MINIMUM_BYTES)
+
+    def test_bootstrapping_twice_never_changes_the_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys_dir = Path(tmp) / "keys"
+            first = route_admission.provision_keys(keys_dir)
+            second = route_admission.provision_keys(keys_dir)
+            key_file = keys_dir / route_admission.REVIEWER_HMAC_KEY_FILE
+            stored = key_file.read_text(encoding="ascii").strip()
+            mode = stat.S_IMODE(key_file.stat().st_mode)
+        self.assertEqual(first.reviewer_hmac, second.reviewer_hmac)
+        self.assertEqual(second.created, ())
+        self.assertEqual(stored, first.reviewer_hmac.hex())
+        self.assertEqual(mode, 0o600)
+
+    def test_the_reviewer_key_is_minted_on_the_first_bootstrap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = route_admission.provision_keys(Path(tmp) / "keys")
+        self.assertIn(route_admission.REVIEWER_HMAC_KEY_FILE, first.created)
+
+
+class BootstrapAndReviewShareOneKeyTest(PlanContractVerbFixture):
+    def test_plan_review_uses_exactly_the_key_bootstrap_wrote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(Path(tmp))
+            # Bootstrap runs first, as it does in a real repository.
+            keys = route_admission.provision_keys(fixture["state"] / "keys")
+            bootstrapped = keys.reviewer_hmac.hex()
+            self._write_plan_ir(fixture)
+            (fixture["plans_dir"] / "demo.html").write_text(
+                "<html/>", encoding="utf-8")
+            status, payloads, raw = self._run(
+                fixture, ["plan", "review", "demo"],
+                environment={"PLANCTL_REVIEWER_HMAC_KEY": None})
+            keys_used = {row["key"] for row in self._invocations(fixture)
+                         if "--help" not in row["argv"]}
+        self.assertEqual(status, 0, payloads)
+        self.assertEqual(keys_used, {bootstrapped})
+        self.assertNotIn(bootstrapped, raw)
+
+    def test_plan_review_mints_the_same_key_when_bootstrap_has_not_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(Path(tmp))
+            with self._repository_cwd(fixture["repo"]), \
+                    mock.patch.dict(os.environ, fixture["environment"]):
+                os.environ.pop("PLANCTL_REVIEWER_HMAC_KEY", None)
+                layout = maestro._plan_contract_layout()
+                minted = maestro._reviewer_hmac_key(layout)
+            # A later bootstrap must adopt it rather than replace it.
+            keys = route_admission.provision_keys(fixture["state"] / "keys")
+        self.assertEqual(keys.reviewer_hmac.hex(), minted)
 
 
 class PlanShipTest(PlanContractVerbFixture):

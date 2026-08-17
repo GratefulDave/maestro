@@ -1,0 +1,463 @@
+"""`run status`, `run list`, `run cancel`, `run resume` resolve a real run (§11.1).
+
+Every case here is built from the real schema through the real store, so the
+projection is exercised against rows a scheduler would actually have written —
+including the one shape that broke the verb in the field: a named plan with a
+configured repository and no flags at all.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import maestro
+from adw_modules import lifecycle as lc
+from adw_modules import receipt_crypto
+from adw_modules import scheduler_types as st
+
+
+AGENT_NODE = st.PlanNode(
+    node_id="lane-one", kind=st.NodeKind.AGENT, depth=0,
+    gate_command=("pytest",), gate_selector="tests/test_one.py")
+SECOND_NODE = st.PlanNode(
+    node_id="lane-two", kind=st.NodeKind.AGENT, depth=0,
+    gate_command=("pytest",), gate_selector="tests/test_two.py")
+
+
+class RunStatusFixture(unittest.TestCase):
+    """A configured repository, an installed plan, and a real ledger."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.repo = self.root / "repo"
+        self.state = (self.root / "maestro-state" / "repo").resolve()
+        self.stored = b'{"plan":"stored bytes"}\n'
+        self.digest = maestro.plan_digest.digest_of(self.stored)
+        self._install_repository()
+
+    def _install_repository(self):
+        plan_file = self.repo / "plans" / "named" / "maestro-plan.v1"
+        plan_file.parent.mkdir(parents=True)
+        plan_file.write_bytes(self.stored)
+        other = self.repo / "plans" / "other" / "maestro-plan.v1"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b'{"plan":"other bytes"}\n')
+        self.other_digest = maestro.plan_digest.digest_of(other.read_bytes())
+        (self.repo / "adws").mkdir()
+        binaries = {}
+        for name in ("herdr", "omp", "claude"):
+            binary = self.root / name
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            binaries[name] = str(binary)
+        route_dir = self.state / "route-receipts"
+        route_dir.mkdir(parents=True)
+        for route in ("omp", "claude"):
+            (route_dir / (route + ".json")).write_text("{}", encoding="utf-8")
+        seed = receipt_crypto.generate_seed()
+        route_seed = receipt_crypto.generate_seed()
+        self.environment = {
+            "MAESTRO_TEST_VERIFY_KEY":
+                receipt_crypto.seed_to_public_key(seed).hex(),
+            "MAESTRO_TEST_SIGNING_SEED": seed.hex(),
+            "MAESTRO_TEST_ROUTE_VERIFY_KEY":
+                receipt_crypto.seed_to_public_key(route_seed).hex(),
+        }
+        config = {
+            "schema": "maestro-config.v1",
+            "plans_dir": "plans",
+            "state_root": "../maestro-state",
+            "keys": {
+                "verify_key_env": "MAESTRO_TEST_VERIFY_KEY",
+                "signing_seed_env": "MAESTRO_TEST_SIGNING_SEED",
+                "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
+            },
+            "executables": binaries,
+            "route_receipts": {"omp": "route-receipts/omp.json",
+                               "claude": "route-receipts/claude.json"},
+            "reviewer": {"route": "claude", "model": "review-model",
+                         "effort": "high", "finalization_timeout_s": 60,
+                         "turn_timeout_s": 20, "poll_interval_s": 1},
+            "execution": {"route": "omp", "model": "execution-model",
+                          "effort": "medium", "concurrency": 2,
+                          "node_timeout_s": 120, "turn_timeout_s": 30,
+                          "final_acceptance_timeout_s": 45,
+                          "backstop_t_s": 600, "semantic_ceiling": 3},
+        }
+        (self.repo / "adws" / "maestro.config.yaml").write_text(
+            json.dumps(config), encoding="utf-8")
+
+    @property
+    def database(self) -> Path:
+        return self.state / "lifecycle.sqlite3"
+
+    @contextlib.contextmanager
+    def _store(self):
+        store = lc.LifecycleStore(self.database)
+        try:
+            yield store
+        finally:
+            store.close()
+
+    def _run(self, argv):
+        """Invoke the CLI exactly as an operator does — from the repository."""
+        output = io.StringIO()
+        previous = Path.cwd()
+        os.chdir(self.repo)
+        try:
+            with mock.patch.dict(os.environ, self.environment, clear=False), \
+                    contextlib.redirect_stdout(output):
+                code = maestro.main(argv)
+        finally:
+            os.chdir(previous)
+        return code, output.getvalue()
+
+    # ── ledger builders ──────────────────────────────────────────────────────
+
+    def _live_run(self, run_id="run-live", digest=None):
+        """Two attempts retried away and a third still in flight."""
+        with self._store() as store:
+            store.create_run(run_id, digest or self.digest, [AGENT_NODE])
+            store.start_attempt(run_id, "lane-one", "a" * 40)
+            store.fail_attempt(run_id, "lane-one", st.RetryClass.ENVIRONMENTAL)
+            store.start_attempt(run_id, "lane-one", "a" * 40)
+            store.fail_attempt(
+                run_id, "lane-one", st.RetryClass.SEMANTIC,
+                detail={"clause": 4, "verdict": "the gate stayed red"})
+            attempt_no = store.start_attempt(run_id, "lane-one", "a" * 40)
+            store.mark_launched(run_id, "lane-one", attempt_no, 4321,
+                                extra={"session_path": "/tmp/session.jsonl"})
+        return run_id
+
+    def _accepted_run(self, run_id="run-done", digest=None):
+        with self._store() as store:
+            store.create_run(run_id, digest or self.digest, [AGENT_NODE])
+            store.start_attempt(run_id, "lane-one", "b" * 40)
+            store.mark_verified(run_id, "lane-one", "c" * 40)
+            store.mark_merged(run_id, "lane-one")
+            store.declare_outcome(run_id, acceptance_result=True)
+        return run_id
+
+    def _blocked_run(self, run_id="run-bad", digest=None):
+        with self._store() as store:
+            store.create_run(run_id, digest or self.digest,
+                             [AGENT_NODE, SECOND_NODE])
+            store.start_attempt(run_id, "lane-one", "d" * 40)
+            store.mark_blocked(
+                run_id, "lane-one", st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                detail={"verdict": "three attempts, still red"},
+                retry_class=st.RetryClass.SEMANTIC)
+            store.declare_outcome(run_id)
+        return run_id
+
+
+class RunStatusTest(RunStatusFixture):
+    def test_named_plan_status_needs_no_flags_at_all(self):
+        """The field failure: a plan name alone refused with '--db is required'."""
+        self._live_run()
+        code, output = self._run(["run", "status", "named"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("run-live", output)
+        self.assertIn("RUNNING", output)
+
+    def test_status_reports_no_ledger_rather_than_creating_one(self):
+        code, output = self._run(["run", "status", "named"])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output)["outcome"], "RUN_NOT_FOUND")
+        self.assertFalse(self.database.exists())
+
+    def test_status_reports_a_plan_with_no_runs(self):
+        self._accepted_run(digest=self.other_digest)
+        code, output = self._run(["run", "status", "named"])
+        self.assertEqual(code, 3)
+        payload = json.loads(output)
+        self.assertEqual(payload["outcome"], "RUN_NOT_FOUND")
+        self.assertIn("named", payload["detail"])
+
+    def test_live_run_reports_the_attempt_in_flight_and_why_earlier_ones_died(self):
+        self._live_run()
+        code, output = self._run(["run", "status", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        progress = json.loads(output)
+        self.assertEqual(progress["run_id"], "run-live")
+        self.assertEqual(progress["plan_name"], "named")
+        self.assertEqual(progress["state"], "RUNNING")
+        self.assertIsNone(progress["declared_outcome"])
+        self.assertEqual([item["attempt_no"] for item in progress["in_flight"]],
+                         [3])
+        node = progress["nodes"][0]
+        self.assertEqual(node["state"], "RUNNING")
+        self.assertEqual(node["attempt_no"], 3)
+        self.assertEqual([item["retry_class"] for item in node["attempts"]],
+                         ["ENVIRONMENTAL", "SEMANTIC", None])
+        self.assertEqual(node["attempts"][1]["verdict"], "the gate stayed red")
+        self.assertEqual(node["attempts"][2]["session_path"],
+                         "/tmp/session.jsonl")
+        self.assertTrue(node["attempts"][2]["running"])
+        self.assertIsNotNone(node["attempts"][2]["elapsed_s"])
+        self.assertIsNotNone(progress["elapsed_s"])
+
+    def test_live_run_text_view_names_the_failure_reasons(self):
+        self._live_run()
+        code, output = self._run(["run", "status", "named"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("why: the gate stayed red", output)
+        self.assertIn("in flight", output)
+        self.assertIn("ENVIRONMENTAL", output)
+        self.assertIn("session: /tmp/session.jsonl", output)
+
+    def test_finished_run_reports_its_declared_outcome_and_output(self):
+        self._accepted_run()
+        code, output = self._run(["run", "status", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        progress = json.loads(output)
+        self.assertEqual(progress["state"], "MERGED")
+        self.assertEqual(progress["declared_outcome"], "ACCEPTED")
+        self.assertEqual(progress["nodes"][0]["output_sha"], "c" * 40)
+        self.assertEqual(progress["in_flight"], [])
+
+    def test_failed_run_reports_the_block_reason_on_the_node(self):
+        self._blocked_run()
+        code, output = self._run(["run", "status", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        progress = json.loads(output)
+        self.assertEqual(progress["declared_outcome"], "BLOCKED")
+        blocked = {node["node_id"]: node for node in progress["nodes"]}
+        self.assertEqual(blocked["lane-one"]["block_reason"],
+                         "SEMANTIC_BUDGET_EXHAUSTED")
+        self.assertEqual(blocked["lane-one"]["attempts"][0]["verdict"],
+                         "three attempts, still red")
+        self.assertEqual(blocked["lane-two"]["state"], "PENDING")
+        code, text = self._run(["run", "status", "named"])
+        self.assertEqual(code, 0, text)
+        self.assertIn("BLOCKED: SEMANTIC_BUDGET_EXHAUSTED", text)
+
+    def test_live_state_is_reported_beside_a_stale_declared_outcome(self):
+        """A rescued run is RUNNING even though `runs` still says BLOCKED."""
+        run_id = self._blocked_run()
+        with self._store() as store:
+            store.retry(run_id, "lane-one", force=True)
+            store.start_attempt(run_id, "lane-one", "e" * 40)
+        code, output = self._run(["run", "status", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        progress = json.loads(output)
+        self.assertEqual(progress["state"], "RUNNING")
+        self.assertEqual(progress["declared_outcome"], "BLOCKED")
+
+    def test_cancel_requested_shows_before_the_nodes_react(self):
+        run_id = self._live_run()
+        with self._store() as store:
+            store.conn.execute(
+                "UPDATE runs SET cancel_requested=1 WHERE run_id=?", (run_id,))
+        code, output = self._run(["run", "status", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["state"], "CANCELLING")
+
+
+class RunSelectionTest(RunStatusFixture):
+    def test_several_runs_default_to_the_newest_and_stay_reachable(self):
+        self._accepted_run("run-first")
+        self._blocked_run("run-second")
+        newest = self._live_run("run-third")
+
+        code, output = self._run(["run", "status", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["run_id"], newest)
+
+        code, output = self._run(
+            ["run", "status", "named", "--run-id", "run-first", "--json"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["run_id"], "run-first")
+
+    def test_a_run_id_is_accepted_positionally(self):
+        self._accepted_run("run-first")
+        self._live_run("run-third")
+        code, output = self._run(["run", "status", "run-first", "--json"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["run_id"], "run-first")
+
+    def test_an_unknown_run_id_is_a_typed_refusal(self):
+        self._live_run()
+        code, output = self._run(
+            ["run", "status", "named", "--run-id", "run-nope"])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output)["outcome"], "RUN_NOT_FOUND")
+
+    def test_an_unknown_name_is_a_typed_refusal(self):
+        self._live_run()
+        code, output = self._run(["run", "status", "no-such-plan"])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output)["outcome"], "RUN_NOT_FOUND")
+
+    def test_run_list_indexes_every_run_and_filters_by_plan(self):
+        self._accepted_run("run-first")
+        self._live_run("run-third")
+        self._accepted_run("run-other", digest=self.other_digest)
+
+        code, output = self._run(["run", "list", "--json"])
+        self.assertEqual(code, 0, output)
+        rows = json.loads(output)
+        self.assertEqual([row["run_id"] for row in rows],
+                         ["run-other", "run-third", "run-first"])
+        self.assertEqual({row["plan_name"] for row in rows},
+                         {"named", "other"})
+
+        code, output = self._run(["run", "list", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual([row["run_id"] for row in json.loads(output)],
+                         ["run-third", "run-first"])
+
+    def test_run_list_text_view_survives_an_empty_ledger(self):
+        self._accepted_run("run-first")
+        with self._store() as store:
+            store.conn.execute("DELETE FROM runs")
+        code, output = self._run(["run", "list"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.strip(), "no runs")
+
+
+class RunMutationSelectionTest(RunStatusFixture):
+    def test_cancel_resolves_the_named_plans_newest_run(self):
+        self._accepted_run("run-first")
+        newest = self._live_run("run-third")
+        code, output = self._run(["run", "cancel", "named"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["run_id"], newest)
+        with self._store() as store:
+            self.assertEqual(store.get_node(newest, "lane-one").state,
+                             st.NodeState.CANCELLED)
+            self.assertEqual(store.get_node("run-first", "lane-one").state,
+                             st.NodeState.MERGED)
+
+    def test_cancel_reaches_an_older_run_by_id(self):
+        older = self._live_run("run-first")
+        self._live_run("run-third")
+        code, output = self._run(["run", "cancel", "named", "--run-id", older])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["run_id"], older)
+        with self._store() as store:
+            self.assertEqual(store.get_node("run-third", "lane-one").state,
+                             st.NodeState.RUNNING)
+
+    def test_resume_re_enters_the_existing_run_instead_of_minting_one(self):
+        run_id = self._blocked_run("run-second")
+        with mock.patch.object(maestro, "_run_resume", return_value=0) as resume:
+            code, output = self._run(["run", "resume", "named"])
+        self.assertEqual(code, 0, output)
+        args = resume.call_args.args[0]
+        self.assertEqual(args.run_id, run_id)
+        self.assertEqual(args.db, str(self.database))
+        self.assertEqual(args.digest, self.digest)
+        run_root = self.state / "runs" / run_id
+        self.assertEqual(args.integration_path, str(run_root / "integration"))
+        self.assertEqual(args.worktrees_root, str(run_root / "worktrees"))
+        self.assertEqual(args.scratch_root, str(run_root / "scratch"))
+
+    def test_resume_reaches_an_older_run_by_id(self):
+        older = self._blocked_run("run-first")
+        self._live_run("run-third")
+        with mock.patch.object(maestro, "_run_resume", return_value=0) as resume:
+            code, output = self._run(
+                ["run", "resume", "named", "--run-id", older])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(resume.call_args.args[0].run_id, older)
+
+    def test_resume_refuses_a_plan_that_has_never_run(self):
+        self._accepted_run(digest=self.other_digest)
+        code, output = self._run(["run", "resume", "named"])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output)["outcome"], "RUN_NOT_FOUND")
+
+    def test_start_still_mints_a_fresh_run_id(self):
+        self._live_run("run-third")
+        with mock.patch.object(maestro, "_run_start", return_value=0) as start:
+            code, output = self._run(["run", "start", "named"])
+        self.assertEqual(code, 0, output)
+        minted = start.call_args.args[0].run_id
+        self.assertTrue(minted.startswith("run-"))
+        self.assertNotEqual(minted, "run-third")
+        self.assertEqual(len(minted), len("run-") + 32)
+
+
+class RunReaderTest(RunStatusFixture):
+    def test_the_reader_never_creates_or_writes_the_ledger(self):
+        with self.assertRaises(lc.LedgerUnavailable):
+            lc.LifecycleReader.open(self.database)
+        self.assertFalse(self.database.exists())
+
+        self._accepted_run()
+        before = self.database.stat().st_mtime_ns
+        reader = lc.LifecycleReader.open(self.database)
+        try:
+            self.assertEqual([record.run_id for record in reader.runs()],
+                             ["run-done"])
+            with self.assertRaises(Exception):
+                reader.conn.execute("DELETE FROM runs")
+        finally:
+            reader.close()
+        self.assertEqual(self.database.stat().st_mtime_ns, before)
+
+    def test_a_finished_ledger_reads_after_its_sidecars_are_gone(self):
+        """A cleanly closed WAL database has no -shm, which plain mode=ro refuses."""
+        self._accepted_run()
+        for sidecar in ("-wal", "-shm"):
+            candidate = Path(str(self.database) + sidecar)
+            if candidate.exists():
+                candidate.unlink()
+        reader = lc.LifecycleReader.open(self.database)
+        try:
+            self.assertEqual(len(reader.runs()), 1)
+            self.assertEqual(len(reader.nodes("run-done")), 1)
+        finally:
+            reader.close()
+
+
+class RunManualInvocationTest(RunStatusFixture):
+    def test_an_explicit_db_still_drives_the_verb_by_hand(self):
+        self._live_run()
+        code, output = self._run(
+            ["run", "status", "run-live", "--db", str(self.database),
+             "--json"])
+        self.assertEqual(code, 0, output)
+        progress = json.loads(output)
+        self.assertEqual(progress["run_id"], "run-live")
+        # No configuration was bound, so the digest has no name to map to.
+        self.assertIsNone(progress["plan_name"])
+
+    def test_status_without_a_database_is_a_typed_refusal(self):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as elsewhere:
+            previous = Path.cwd()
+            os.chdir(elsewhere)
+            try:
+                with contextlib.redirect_stdout(output):
+                    code = maestro.main(["run", "status", "run-live"])
+            finally:
+                os.chdir(previous)
+        self.assertEqual(code, 3)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["outcome"], "RUN_CONFIGURATION_REQUIRED")
+
+    def test_start_still_refuses_runtime_flags_under_configuration(self):
+        code, output = self._run(
+            ["run", "start", "named", "--db", str(self.database)])
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(output)["outcome"],
+                         "MAESTRO_CONFIGURATION_INVALID")
+
+
+if __name__ == "__main__":
+    unittest.main()

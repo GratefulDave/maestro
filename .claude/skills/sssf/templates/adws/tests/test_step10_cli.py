@@ -769,8 +769,10 @@ class OperatorCliTest(unittest.TestCase):
 
     def test_unconfigured_run_is_typed_refusal_not_success_stub(self):
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            code = maestro.main(["run", "start", "a" * 64])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._repository_cwd(Path(tmp)):
+                with contextlib.redirect_stdout(output):
+                    code = maestro.main(["run", "start", "a" * 64])
         self.assertEqual(code, 3)
         self.assertEqual(
             output.getvalue().splitlines(),
