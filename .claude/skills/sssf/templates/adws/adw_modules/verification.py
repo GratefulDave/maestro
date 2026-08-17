@@ -158,6 +158,31 @@ def adjudicate_counts(raw: Mapping[str, Any], min_cases: int) -> GateVerdict:
     return GateVerdict(green=False, unparseable=False, counts=counts, reason=reason)
 
 
+def adjudicate_pre_gate(result: "wt.GateResult", min_cases: int,
+                        selector_unbuilt: bool = False) -> GateVerdict:
+    """Adjudicate the pre-node gate, where an absent selector is the red.
+
+    A node that creates its own test file has no test file at its base, so its
+    pre-gate selector names a path that does not exist and the runner refuses
+    to collect -- pytest exits 4, emitting no counts at all. Read through the
+    ordinary rule that is an unparseable gate, hence ENVIRONMENTAL, and the
+    attempt is retried until the budget is gone; every retry starts from the
+    same base and fails identically.
+
+    An absent selector is not a broken environment. It is the strongest form
+    of the red that clause 2 requires: the behaviour cannot be present,
+    because the file asserting it has not been written yet. `selector_unbuilt`
+    is passed by the caller, which is the only layer that knows the selector
+    names a path this node is declared to produce.
+    """
+    if selector_unbuilt and result.exit_code != 0:
+        return GateVerdict(
+            green=False, unparseable=False, counts=GateCounts.parse(result.counts),
+            reason=("gate exited {} with its selector absent at base, which is "
+                    "this node's declared output".format(result.exit_code)))
+    return adjudicate_gate(result, min_cases)
+
+
 def adjudicate_gate(result: "wt.GateResult", min_cases: int) -> GateVerdict:
     """Adjudicate a gate execution from the merge protocol.
 
@@ -311,6 +336,79 @@ def verify_code_node(exit_code: int,
                     "diff; re-running a deterministic command against an "
                     "unchanged base cannot produce a different answer"),
             block_reason=st.BlockReason.CODE_NODE_NO_EFFECT)
+
+    return VerificationVerdict(verified=True)
+
+
+def verify_review_node(report_parsed: bool,
+                       matrix_verified: bool,
+                       occupancy_measured: bool,
+                       receipt_verdict: Optional[str],
+                       receipt_signed: bool) -> VerificationVerdict:
+    """§7.3's **review-node** predicate — its own clauses, sharing none.
+
+    A review node has no gate, no `min_cases`, no declared outputs, and no
+    permission check: it writes one report file into a fresh session directory
+    and touches the repository not at all. Reusing an agent node's four clauses
+    for it would be the unscoped-VERIFIED defect §7.3 exists to prevent, one
+    kind further along — clause 2 (pre-gate red) and clause 3 (post-gate green)
+    are not merely unsatisfiable here, they are meaningless.
+
+    Five clauses, and every one of them is a fact about *code's* observation of
+    the review, never about what the reviewer said:
+
+    1. The report parsed against the frozen schema, in which `verdict` and
+       `severity` are unrepresentable.
+    2. The report survived the matrix: digest echo, pair count, exact cell set,
+       and both canaries. A reviewer that cannot echo what it was given did not
+       read what it was given.
+    3. The reviewer's context-window occupancy was **measured** and under
+       threshold. NULL convicts, per §6.5 — an unmeasured window is not a
+       passing one, and B13 is what an overflowing reviewer does instead of
+       erroring.
+    4. Code derived PASS from the rubric's severities.
+    5. A create-once receipt exists and its Ed25519 signature verifies. This is
+       the clause that makes the merge lawful under §1.2: the transition is
+       caused by a signed artifact, not by pane text, prompt text, a free-text
+       field, or an agent's claim about its own work.
+
+    Clause 4 is the only one that can be false without something being broken —
+    a FAIL is a working review — so it alone carries a retry class. The others
+    are protocol failures of the review itself, and re-running the *builder* on
+    them would spend a node's budget on a reviewer's malfunction.
+    """
+    if not report_parsed:
+        return VerificationVerdict(
+            verified=False, failed_clause=1,
+            reason="the reviewer wrote no parseable report")
+
+    if not matrix_verified:
+        return VerificationVerdict(
+            verified=False, failed_clause=2,
+            reason=("the report did not survive the matrix: echo, pair count, "
+                    "cell set, or a canary"))
+
+    if not occupancy_measured:
+        return VerificationVerdict(
+            verified=False, failed_clause=3,
+            reason=("no context-window occupancy was recorded for the reviewer "
+                    "session; a NULL row convicts (§6.5)"))
+
+    if not receipt_signed:
+        return VerificationVerdict(
+            verified=False, failed_clause=5,
+            reason="no signed receipt exists for this review subject")
+
+    if receipt_verdict != "PASS":
+        return VerificationVerdict(
+            verified=False, failed_clause=4,
+            reason=f"code derived {receipt_verdict} from the reviewer's cells",
+            # The one clause that is a verdict about the code under review, so
+            # the one that earns the builder another attempt against a mutated
+            # prompt. The scheduler counts it under its own ceiling, never the
+            # semantic one — a red gate and a rejected diff are different
+            # failures and share no budget.
+            retry_class=st.RetryClass.SEMANTIC)
 
     return VerificationVerdict(verified=True)
 

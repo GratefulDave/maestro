@@ -152,8 +152,16 @@ class GateCollector(Protocol):
 
 
 #: How each runner is asked to enumerate without executing.
+#:
+#: pytest reads ``addopts`` from the repository's own ini file and prepends it,
+#: so a repository carrying ``-v`` there cancels the ``-q`` here: verbosity nets
+#: to the default and ``--collect-only`` prints its tree form (``<Function x>``)
+#: instead of flat ``path::case`` identifiers. ``_count`` reads identifiers, so
+#: that renders every gate in such a repository as zero collected cases.
+#: ``-o addopts=`` clears the inherited options, making collection output depend
+#: on this argv alone.
 COLLECT_ARGV: Dict[str, Tuple[str, ...]] = {
-    "pytest": ("pytest", "--collect-only", "-q"),
+    "pytest": ("pytest", "--collect-only", "-q", "-o", "addopts="),
     "vitest": ("vitest", "list", "--run"),
 }
 

@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
                     Tuple)
 
+from . import code_review as cr
 from . import lifecycle as lc
 from . import retry_policy as rp
 from . import scheduler_types as st
@@ -96,6 +97,13 @@ IntegrationGateRunner = Callable[[
     Path, Sequence[str], CancelRequested,
 ], "wt.GateResult"]
 QuiesceAttempt = Callable[[st.AttemptRecord, str], None]
+#: `(attempt, node, record, base_sha, output_sha) -> code_review.ReviewOutcome`.
+#: Raises `code_review.ReviewStalled` when the reviewer never reported, which
+#: the scheduler classifies ENVIRONMENTAL — a wedged reviewer is a fact about
+#: the machine, and must not spend a node's review budget.
+ReviewRunner = Callable[[
+    wt.AttemptWorktree, st.PlanNode, st.AttemptRecord, str, str,
+], Any]
 
 
 class QuiescenceDependencyError(ValueError):
@@ -147,6 +155,17 @@ class SchedulerDeps:
     kill_attempt: Optional[Callable[..., None]] = None
     #: Provision runs after worktree creation and before pre-gate/baseline.
     provision: Optional[Callable[[Path], None]] = None
+    #: The code-review stage (§7.3's review-node predicate). Runs after an
+    #: attempt's own verification passes and before `mark_verified`, so a diff
+    #: no model has read cannot reach the merge frontier.
+    #:
+    #: Optional, and its default is the honest one: left `None` the scheduler
+    #: merges on gates alone, exactly as it did before this stage existed. That
+    #: is a stated limit rather than a silent one — `maestro run start` always
+    #: supplies it, and the golden offline scenario supplies a fake, so the
+    #: unreviewed path is reachable only by a caller that constructs
+    #: `SchedulerDeps` itself and omits it.
+    review_attempt: Optional[ReviewRunner] = None
 
     def __post_init__(self) -> None:
         if self.quiesce_attempt is None:
@@ -183,6 +202,12 @@ class RunReport:
     upstream_blocked: Tuple[str, ...] = ()
     acceptance: Optional[AcceptanceResult] = None
     ancestry: Dict[str, bool] = field(default_factory=dict)
+    #: `node_id -> findings` for every node blocked `REVIEW_BUDGET_EXHAUSTED`.
+    #: Reported beside the blocked set for the same reason the acceptance
+    #: result is: a block reason names the rule that fired, never the thing to
+    #: fix, and a lane that spent three attempts on review deserves to say what
+    #: the reviewer objected to without the operator re-running it.
+    review_findings: Dict[str, str] = field(default_factory=dict)
 
     @property
     def integration_untested(self) -> bool:
@@ -218,6 +243,9 @@ class Scheduler:
         self._watchdog_fences: Dict[Tuple[str, str, int], None] = {}
         self._output_shas: Dict[str, str] = {}
         self._retry_prompts: Dict[str, Optional[str]] = {}
+        #: Findings from the review that exhausted a node's budget, kept so the
+        #: run report can surface *why* rather than only that a count ran out.
+        self._review_findings: Dict[str, str] = {}
         self._pool: Optional[ThreadPoolExecutor] = None
         self._projected = False
         self._stuck = False
@@ -325,10 +353,24 @@ class Scheduler:
             if not self._owns_running(record):
                 return
             cause = failure.__cause__
+            # The type alone names the guard that fired, never the condition it
+            # fired on, and the chain below it is where the actual failure is:
+            # a quiescence error raised from another quiescence error reports
+            # only its own name at every level. Record the messages so a blocked
+            # node can be diagnosed from the row instead of by re-running.
+            chain = []
+            seen = set()
+            current: Optional[BaseException] = cause
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                chain.append("{0}: {1}".format(
+                    type(current).__name__, current))
+                current = current.__cause__ or current.__context__
             self.deps.store.mark_blocked(
                 self.run_id, node.node_id, st.BlockReason.QUIESCENCE_UNPROVEN,
                 detail={"phase": failure.phase,
-                        "exception_type": type(cause).__name__})
+                        "exception_type": type(cause).__name__,
+                        "causes": chain[:6]})
 
     def _request_cancel(self, node_id: str) -> None:
         lifecycle = self.deps.store.get_node(self.run_id, node_id)
@@ -599,7 +641,14 @@ class Scheduler:
                 self._require_running(record)
                 pre = self.deps.run_gate(
                     attempt, node, "pre", self._cancelled.is_set)
-                pre_verdict = vf.adjudicate_gate(pre, self.deps.min_cases)
+                # A selector this node is declared to produce, absent at its
+                # base, is the red clause 2 asks for -- not a broken runner.
+                selector = (node.gate_selector or "").strip()
+                unbuilt = bool(
+                    selector and selector in node.outputs
+                    and not (attempt.path / selector).exists())
+                pre_verdict = vf.adjudicate_pre_gate(
+                    pre, self.deps.min_cases, selector_unbuilt=unbuilt)
         finally:
             # Provision and the pre gate both execute before the measurement
             # bracket; their process groups must be absent before its baseline.
@@ -694,6 +743,39 @@ class Scheduler:
         # The final proof covers post-gates as well as every failure path
         # above. Only then may the scheduler make a durable state transition.
         self._settle_context(context)
+
+        # ── the review gate (§7.3's review-node predicate) ──────────────────
+        #
+        # Here, and not one line earlier or later. After `_settle_context`,
+        # because that is the proof this attempt's owned process group is
+        # absent, and the reviewer opens a pane of its own — starting it while
+        # the builder might still be alive would put two owned groups inside
+        # one attempt's quiescence obligation. Before `mark_verified`, because
+        # VERIFIED is what `_merge_frontier` reads: a node that reaches it has
+        # already won the right to merge, and a gate after that point would be
+        # judging code the scheduler had already committed to.
+        if self.deps.review_attempt is not None:
+            self._require_running(record)
+            try:
+                review = self.deps.review_attempt(
+                    attempt, node, record, head, output_sha)
+            except cr.ReviewStalled:
+                # A reviewer that never reported says nothing about the code.
+                # ENVIRONMENTAL, so it spends an infra retry rather than a
+                # review attempt, and mutates no prompt — telling a builder to
+                # fix findings that were never produced would be the refund
+                # loop §7.5 convicts.
+                self._settle_failure(
+                    node, rp.Classification(
+                        retry_class=st.RetryClass.ENVIRONMENTAL,
+                        reason="the code reviewer stalled without reporting"),
+                    record=record)
+                return
+            self._require_running(record)
+            if not review.passed:
+                self._settle_review_rejection(node, review, record)
+                return
+
         with self._lock:
             self._require_running(record)
             self._output_shas[node.node_id] = output_sha
@@ -766,7 +848,81 @@ class Scheduler:
                         retry_class=retry_class)
                     return
 
-            store.fail_attempt(self.run_id, node.node_id, retry_class)
+            # Why the attempt failed, recorded where the attempt is recorded.
+            # A bare `retry:ENVIRONMENTAL` row says a retry was spent and
+            # nothing about what to fix, so a node that exhausts its budget
+            # leaves no evidence at all.
+            detail = {"reason": classification.reason} if getattr(
+                classification, "reason", None) else {}
+            if verdict is not None:
+                detail["clause"] = verdict.failed_clause
+                if verdict.reason:
+                    detail["verdict"] = verdict.reason
+            store.fail_attempt(self.run_id, node.node_id, retry_class,
+                               detail=detail or None)
+
+    def _settle_review_rejection(self, node: st.PlanNode, review: Any,
+                                 record: st.AttemptRecord) -> None:
+        """Recycle the attempt with the reviewer's findings, or block on budget.
+
+        The same shape as `_settle_failure`'s SEMANTIC arm, and deliberately so
+        — a rejected diff earns another attempt against *new instructions*,
+        never a repeat of the same request. What differs is the budget: this
+        counts against `review_ceiling` through a marker on the attempt row,
+        and the semantic ceiling is untouched. A node whose gate went red twice
+        still gets its full review allowance, and vice versa.
+        """
+        store = self.deps.store
+        findings = review.findings_text()
+        with self._lock:
+            if (self._cancelled.is_set()
+                    or not self._owns_running(record)
+                    or record.key in self._watchdog_fences):
+                return
+
+            marker = {rp.REVIEW_REJECTED_KEY: True,
+                      "review_subject_digest": review.subject_digest}
+            detail = {
+                "reason": "code review rejected the diff",
+                "subject_digest": review.subject_digest,
+                "replayed": bool(review.replayed),
+                # The check ids only. The messages are the builder's retry
+                # guidance and live in the prompt; duplicating their prose into
+                # a durable audit row would be the second representation §4
+                # convicts, and §10.1 forbids any guard reading it back.
+                "blocking_checks": [c.check_id for c in review.findings],
+            }
+
+            lifecycle = store.get_node(self.run_id, node.node_id)
+            if self._review_ceiling_reached(
+                    node.node_id, lifecycle.granted_extra_attempts):
+                store.mark_blocked(
+                    self.run_id, node.node_id,
+                    st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                    detail=detail, attempt_extra=marker)
+                # Surfaced where the operator will actually read it: the block
+                # reason alone says a budget ran out and nothing about what the
+                # reviewer objected to, which is the evidence gap that makes a
+                # blocked node undiagnosable without re-running it.
+                self._review_findings[node.node_id] = findings
+                return
+
+            self._retry_prompts[node.node_id] = _review_retry_prompt(node, review)
+            store.fail_attempt(self.run_id, node.node_id,
+                               st.RetryClass.SEMANTIC,
+                               detail=detail, attempt_extra=marker)
+
+    def _review_ceiling_reached(self, node_id: str, granted: int) -> bool:
+        """The review ceiling, counting the attempt that is failing right now.
+
+        The same off-by-one `_semantic_ceiling_reached` documents: the policy
+        counts marker rows that already exist, and this attempt's marker is
+        written by the call this decision gates. Without the increment K would
+        admit K+1 attempts.
+        """
+        attempts = self.deps.store.attempts_for(self.run_id, node_id)
+        already = rp.review_attempts_total(attempts, node_id)
+        return already + 1 >= self.config.review_ceiling + granted
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """§7.5's ceiling, counting the attempt that is failing right now.
@@ -873,7 +1029,11 @@ class Scheduler:
             abandoned=cancelled,
             upstream_blocked=store.upstream_blocked(self.run_id),
             acceptance=acceptance,
-            ancestry=dict(acceptance.ancestry) if acceptance else {})
+            ancestry=dict(acceptance.ancestry) if acceptance else {},
+            review_findings={
+                node_id: findings
+                for node_id, findings in self._review_findings.items()
+                if any(n == node_id for n, _ in blocked)})
 
     def _is_candidate_accepted(self, states: Mapping[str, str]) -> bool:
         """§8.8 — at least one node MERGED and every other MERGED or
@@ -1008,6 +1168,35 @@ def _retry_prompt(node: st.PlanNode,
             lines.append("Paths written outside this node's declared outputs: "
                          + ", ".join(verdict.offending_paths))
     lines.append("Declared outputs: " + (", ".join(node.outputs) or "(none)"))
+    return "\n".join(lines)
+
+
+def _review_retry_prompt(node: st.PlanNode, review: Any) -> str:
+    """The mutated prompt for a review rejection, carrying the findings.
+
+    The findings are the entire justification for recycling the attempt instead
+    of blocking it. A retry that repeats the original instruction would send
+    the builder back to produce the same diff, spend an attempt, and be
+    rejected for the same reason — §7.5's refund loop with a reviewer attached.
+    So the builder is told which cell failed, on which object, and why.
+
+    The reviewer's messages are quoted into the prompt and nowhere else. That
+    is the one place free text is allowed to travel, because a prompt is not a
+    guard: §10.1 forbids a *lifecycle transition* caused by free text, and the
+    transition here was caused by the derived verdict and its signed receipt
+    before this string was ever built.
+    """
+    lines = [
+        f"Attempt for node {node.node_id} passed its gate but was rejected by "
+        "code review.",
+        "",
+        "The gate going green is not the bar. A reviewer read the diff and "
+        "found the problems below. Fix them and keep the gate green.",
+        "",
+        review.findings_text(),
+        "",
+        "Declared outputs: " + (", ".join(node.outputs) or "(none)"),
+    ]
     return "\n".join(lines)
 
 

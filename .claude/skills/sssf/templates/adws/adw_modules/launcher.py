@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import (Callable, Dict, List, Mapping, Optional, Protocol,
+                    Sequence, Tuple)
 
 from .route_receipts import AdmittedRouteSet
 
@@ -65,6 +66,7 @@ class LaunchHandle:
     agent_name: str
     launched_cwd: Path
     transcript_path: Optional[Path] = None
+    envelope_path: Optional[Path] = None
     process_group: Optional[int] = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
@@ -148,6 +150,21 @@ class TranscriptTailer:
         if envelopes[-1].get("success") is True:
             return 0, "ENVELOPE_SUCCESS"
         return 1, "ENVELOPE_FAILURE"
+
+    def terminal_envelope(self) -> Optional[Tuple[int, str]]:
+        """The turn's own verdict, or `None` if the turn has not declared.
+
+        Distinguished from `synthesized_exit` because that method answers
+        "what exit code should this attempt get" and folds *absence* into
+        failure — it returns `NO_ENVELOPE` as exit 1 whether the agent failed
+        or has simply not finished. A caller deciding whether the turn is over
+        at all must not read that 1 as an answer, which is exactly the
+        conflation that scored a completed successful turn as a failure.
+        """
+        if not any(row.get("type") == "maestro_envelope"
+                   for row in self._records):
+            return None
+        return self.synthesized_exit()
 
 
 def quiesce_process_group(process_group: int, deadline: float) -> None:
@@ -303,6 +320,44 @@ def _is_text_read(args: Sequence[str]) -> bool:
     return len(args) >= 2 and args[0] in ("agent", "pane") and args[1] == "read"
 
 
+def _agent_transcript_path(agent: object) -> Optional[Path]:
+    """Where herdr says this agent's transcript lives.
+
+    `agent start` and `agent get` report it as `agent_session`, a tagged value
+    whose `kind` says how to read `value` -- `path` for the routes that write a
+    JSONL transcript. Reading only a flat `transcript_path` key, which herdr
+    does not send, left every launch without a session path and failed the node
+    with SESSION_PATH_MISSING before its first turn.
+    """
+    if not isinstance(agent, dict):
+        return None
+    direct = agent.get("transcript_path")
+    if direct:
+        return Path(str(direct))
+    session = agent.get("agent_session")
+    if isinstance(session, dict) and session.get("kind") == "path":
+        value = session.get("value")
+        if value:
+            return Path(str(value))
+    return None
+
+
+class PromptNotSubmitted(RuntimeError):
+    """The composer holds the prompt text and will not submit it.
+
+    Raised only after every recovery attempt has been spent, so it means the
+    pane is genuinely wedged rather than merely slow.
+    """
+
+
+#: How many times to press Enter on an unsubmitted composer before giving up.
+#: More than one because a single fallback is what failed in the recorded
+#: incident: the Enter went in while the composer was still not accepting
+#: input, the one verification wait then blocked for the whole remaining
+#: budget, and the 600s window expired around a prompt that was never sent.
+SUBMIT_ATTEMPTS = 4
+
+
 def submit_agent_prompt(
         herdr_call: Callable[..., dict],
         pane_id: str,
@@ -311,6 +366,8 @@ def submit_agent_prompt(
         *,
         timeout_s: float = 30.0,
         until: Sequence[str] = ("idle",),
+        attempts: int = SUBMIT_ATTEMPTS,
+        sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Submit one atomic prompt and prove the agent actually accepted it.
 
@@ -325,33 +382,63 @@ def submit_agent_prompt(
     otherwise. Without it a prompt delivered to a composer that is not accepting
     input yet reports success while the text simply sits on screen unsubmitted,
     which is indistinguishable from a delivered prompt until the turn times out.
-    A caller timeout of five seconds or less downgrades that to a plain timeout,
-    so the wait budget is always kept above it.
+
+    **Why this is a loop and not a fallback.** Against omp the stall happens
+    roughly half the time: the composer takes the `@<path>` text and never
+    submits it. A single Enter afterwards is not enough — if it lands while the
+    composer still is not accepting input it is swallowed, and the one
+    verification wait that follows then consumes the whole budget waiting on a
+    prompt that was never sent. So each Enter is followed by a *short* verify,
+    and a failed verify presses again. The budget buys several observations
+    instead of one.
+
+    The recovery presses Enter on what is already on screen and never re-issues
+    `agent prompt`: a second prompt would append its text to the unsubmitted
+    line and send both as one garbled turn.
     """
     target = agent_name or pane_id
-    wait_s = max(5.1, max(0.001, timeout_s))
-    timeout_ms = str(int(wait_s * 1000))
-    until_argv = []
+    total_s = max(5.1, max(0.001, timeout_s))
+    until_argv: List[str] = []
     for status in until:
         until_argv.extend(["--until", status])
-    argv = ["agent", "prompt", target, text, "--wait"]
-    argv.extend(until_argv)
-    argv.extend(["--timeout", timeout_ms])
+
+    def wait_for(budget_s: float) -> bool:
+        argv = ["agent", "wait", target, *until_argv,
+                "--timeout", str(int(budget_s * 1000))]
+        try:
+            herdr_call(*argv, timeout=budget_s + 5.0)
+            return True
+        except Exception:
+            return False
+
+    argv = ["agent", "prompt", target, text, "--wait", *until_argv,
+            "--timeout", str(int(total_s * 1000))]
     try:
-        herdr_call(*argv, timeout=wait_s + 5.0)
+        herdr_call(*argv, timeout=total_s + 5.0)
         return
     except Exception as exc:
         if "agent_prompt_stalled" not in str(exc):
             raise
-    # The composer took the text but never submitted it, so the prompt is
-    # sitting on screen. Press Enter on what is already there instead of
-    # prompting again -- a second `agent prompt` would append its text to the
-    # unsubmitted line and send both as one garbled turn.
-    herdr_call("agent", "send-keys", target, "enter", timeout=30.0)
-    argv = ["agent", "wait", target]
-    argv.extend(until_argv)
-    argv.extend(["--timeout", timeout_ms])
-    herdr_call(*argv, timeout=wait_s + 5.0)
+
+    rounds = max(1, attempts)
+    # Kept above herdr's own five-second lifecycle-observation floor, or the
+    # verify degrades into a plain timeout that proves nothing.
+    per_round = max(5.1, total_s / rounds)
+    for round_no in range(rounds):
+        try:
+            herdr_call("agent", "send-keys", target, "enter", timeout=30.0)
+        except Exception:
+            # A send-keys that fails on one round is not fatal: the pane may be
+            # mid-repaint. Fall through to the verify, which is the thing that
+            # actually decides.
+            pass
+        if wait_for(per_round):
+            return
+        if round_no + 1 < rounds:
+            sleep(0.5)
+    raise PromptNotSubmitted(
+        "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(
+            target, rounds))
 
 def wait_for_interactive_agent(
         herdr_call: Callable[..., dict], name: str, timeout_s: float = 180.0,
@@ -496,11 +583,11 @@ class HerdrLauncher:
                         time.monotonic() + 1.0)
             raise RuntimeError("BINDING_MISMATCH:{}!={}".format(actual, worktree))
         agent = _extract(started, "agent")
-        transcript = None
-        if isinstance(agent, dict) and agent.get("transcript_path"):
-            transcript = Path(str(agent["transcript_path"]))
+        transcript = _agent_transcript_path(agent)
         handle = LaunchHandle(spec.correlation_token, pane_id, name, worktree,
-                              transcript_path=transcript, environment=environment)
+                              transcript_path=transcript,
+                              envelope_path=spec.envelope_path,
+                              environment=environment)
         with self._handles_lock:
             self._handles[spec.correlation_token] = handle
             self._proven_absent.pop(spec.correlation_token, None)
@@ -520,24 +607,106 @@ class HerdrLauncher:
             timeout_s=60.0, until=("working", "idle"))
         return handle
 
+    def agent_status(self, handle: LaunchHandle) -> Optional[str]:
+        """The route's raw per-pane status, uncollapsed — B14's seam.
+
+        `poll` cannot serve this. For a build node it must read `idle` as "the
+        turn ended", collapsing the very distinction B14 needs: *not yet
+        started*, *working*, and *stopped without declaring* all arrive as
+        `idle` there. So the raw string is exposed separately, and
+        `FinalizationWindow` does the arming (idle only counts once the agent
+        has been seen working).
+
+        `None` on any read failure or a vanished agent, never a guess — an
+        unreadable status is a missing observation, and the window treats it as
+        such rather than as a stall.
+        """
+        try:
+            payload = self._herdr("agent", "get", handle.agent_name,
+                                  env=handle.environment)
+        except RuntimeError:
+            return None
+        agent = _extract(payload, "agent")
+        if not isinstance(agent, dict):
+            return None
+        raw = agent.get("agent_status") or agent.get("status")
+        return str(raw) if raw else None
+
     def poll(self, handle: LaunchHandle) -> PollResult:
-        payload = self._herdr("agent", "get", handle.agent_name,
-                              env=handle.environment)
+        try:
+            payload = self._herdr("agent", "get", handle.agent_name,
+                                  env=handle.environment)
+        except RuntimeError as exc:
+            # An agent whose pane is closed is not reported as an agent with no
+            # record: herdr exits nonzero with `agent_not_found`. Reading that
+            # as an error rather than as GONE makes `cancel` treat a successful
+            # close as unproven quiescence, which blocks every agent node.
+            if "agent_not_found" not in str(exc):
+                raise
+            return PollResult(PollState.GONE, detail="AGENT_GONE")
         agent = _extract(payload, "agent")
         if not isinstance(agent, dict):
             return PollResult(PollState.GONE, detail="AGENT_GONE")
         status = str(agent.get("status") or agent.get("agent_status") or "unknown")
         with self._handles_lock:
             tailer = self._tailers.get(handle.correlation_token)
-        progressed = False
+        turns = 0
         if tailer:
             tailer.read_new()
-            progressed = bool(tailer._records)
-        if progressed:
-            code, detail = tailer.synthesized_exit()
-            return PollResult(PollState.EXITED, code, detail)
+            turns = len(tailer._records)
+
+        # The attempt ends when the agent writes its terminal envelope. The
+        # envelope is a file the agent is told to write, not a record in the
+        # route's transcript: an interactive route writes its own event schema
+        # and has no reason to emit one of ours, so reading the transcript for
+        # a terminal record ended every attempt on the agent's first message
+        # and cancelled the work mid-flight.
+        # ── precedence: what the agent WROTE beats what the pane REPORTS ────
+        #
+        # `agent_status` is a lagging observation of a pane; a written envelope
+        # is the turn's own declaration. Two real failures came from letting
+        # the status win. A completed turn behind a stale `working` status held
+        # the poll in RUNNING until a wall clock expired and charged the
+        # attempt ENVIRONMENTAL; and a successful turn observed at `idle` fell
+        # through to the no-envelope branch and scored a passing attempt as
+        # exit 1, burning a third of a three-attempt budget on a lie.
+        #
+        # This is the same rule `FinalizationWindow.poll` follows when it
+        # checks for the report before consulting any signal, and it does not
+        # contradict B14's arming rule. B14 says an `idle` that has never been
+        # seen working is *not yet started* and must not be read as dead. This
+        # says a status of any kind is stale once the turn has declared. One is
+        # about absence of output before liveness, the other about presence of
+        # output after it; both resolve the same way — the artifact wins.
+        envelope = handle.envelope_path
+        if envelope is not None and envelope.is_file():
+            try:
+                payload = json.loads(envelope.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                return PollResult(PollState.EXITED, 1, "ENVELOPE_UNPARSED")
+            success = isinstance(payload, dict) and payload.get("success") is True
+            return PollResult(PollState.EXITED, 0 if success else 1,
+                              "ENVELOPE_SUCCESS" if success else "ENVELOPE_FAILURE")
+
+        # The transcript's own terminal record, for routes that declare there
+        # rather than by writing the envelope file. Read before the status
+        # branches for the reason above, and `terminal_envelope` returns None
+        # rather than a failing exit when the turn has not declared, so an
+        # unfinished turn cannot be mistaken for a failed one.
+        if tailer is not None:
+            declared = tailer.terminal_envelope()
+            if declared is not None:
+                exit_code, detail = declared
+                return PollResult(PollState.EXITED, exit_code, detail)
+
         if status in ("starting", "unknown"):
             return PollResult(PollState.STARTING)
+        # Idle after at least one turn and still no envelope: the agent
+        # finished its turn without writing one. That is a failed attempt, not
+        # a running one -- waiting would hold the node until its timeout with
+        # nothing left to observe.
+        if status == "idle" and turns:
+            return PollResult(PollState.EXITED, 1, "NO_ENVELOPE")
         return PollResult(PollState.RUNNING)
 
     def cancel(self, handle: LaunchHandle, deadline: float) -> None:
@@ -555,11 +724,18 @@ class HerdrLauncher:
                 raise HarnessQuiescenceError(
                     "HERDR_QUIESCENCE_UNPROVEN:{}".format(token))
         try:
-            closed = _extract(
-                self._herdr("pane", "close", handle.pane_id,
-                            env=handle.environment),
-                "closed")
-            if closed is not True:
+            # herdr confirms a close as `{"result": {"type": "ok"}}`; there is
+            # no `closed` flag. Demanding one turned every successful close
+            # into PANE_CLOSE_UNCONFIRMED, which is raised inside the block
+            # that proves quiescence, so the proof could never succeed.
+            response = self._herdr("pane", "close", handle.pane_id,
+                                   env=handle.environment)
+            result = response.get("result")
+            closed = _extract(response, "closed")
+            confirmed = (closed is True
+                         or (isinstance(result, dict)
+                             and result.get("type") == "ok"))
+            if not confirmed:
                 raise RuntimeError("PANE_CLOSE_UNCONFIRMED:{}".format(
                     handle.pane_id))
             state = self.poll(handle)
@@ -594,6 +770,7 @@ class FakeLauncher:
     def __init__(self) -> None:
         self._handles: Dict[str, LaunchHandle] = {}
         self._states: Dict[str, PollResult] = {}
+        self._statuses: Dict[str, Optional[str]] = {}
 
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         handle = LaunchHandle(spec.correlation_token, "fake:" + spec.correlation_token,
@@ -605,6 +782,12 @@ class FakeLauncher:
     def complete(self, token: str, exit_code: int = 0,
                  detail: str = "ENVELOPE_SUCCESS") -> None:
         self._states[token] = PollResult(PollState.EXITED, exit_code, detail)
+
+    def set_agent_status(self, token: str, status: Optional[str]) -> None:
+        self._statuses[token] = status
+
+    def agent_status(self, handle: LaunchHandle) -> Optional[str]:
+        return self._statuses.get(handle.correlation_token)
 
     def poll(self, handle: LaunchHandle) -> PollResult:
         return self._states.get(handle.correlation_token,

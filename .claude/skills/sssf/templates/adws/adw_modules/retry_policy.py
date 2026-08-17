@@ -203,7 +203,8 @@ def semantic_attempts_at_base(attempts: Iterable[AttemptRecord], node_id: str,
     """
     return sum(1 for a in attempts
               if a.node_id == node_id and a.base_sha == base_sha
-              and a.retry_class is RetryClass.SEMANTIC)
+              and a.retry_class is RetryClass.SEMANTIC
+              and not (a.extra or {}).get(REVIEW_REJECTED_KEY))
 
 
 def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
@@ -213,9 +214,20 @@ def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> 
     SEMANTIC are counted, so an ENVIRONMENTAL or LAUNCHER_TRANSIENT failure
     can never produce a budget decrement (§7.5). Callers pass rows already
     scoped to one run.
+
+    **Review rejections are excluded**, and the exclusion is what keeps the two
+    ceilings genuinely separate. A rejected diff is written `SEMANTIC` because
+    that is what it is by §7.5's rule — it earns a prompt-mutating retry, and
+    the other two classes would be lies about a content verdict. But it is
+    counted under `review_ceiling`, so leaving it in this sum would spend both
+    budgets for one failure: a node rejected twice by review would arrive at
+    its third gate failure already out of semantic attempts, which is the
+    merged counter the two ceilings exist to avoid. The row says what the
+    attempt *was*; the marker says which budget it *spent*.
     """
     return sum(1 for a in attempts
-              if a.node_id == node_id and a.retry_class is RetryClass.SEMANTIC)
+              if a.node_id == node_id and a.retry_class is RetryClass.SEMANTIC
+              and not (a.extra or {}).get(REVIEW_REJECTED_KEY))
 
 
 def semantic_budget_exhausted(cfg: SchedulerConfig, node_id: str,
@@ -235,6 +247,51 @@ def semantic_budget_exhausted(cfg: SchedulerConfig, node_id: str,
     total = semantic_attempts_total(attempts, node_id)
     allowance = cfg.semantic_ceiling + granted_extra_attempts
     return total >= allowance
+
+
+# ── the review budget, counted the same way and kept separate ───────────────
+
+#: The marker `fail_attempt`/`mark_blocked` write into `attempts.extra_json`
+#: when an attempt was recycled because a reviewer rejected its diff. A key in
+#: a row the count already ranges over, rather than a fourth `RetryClass`,
+#: because §7.5 states three mutually exclusive classes and every guard in the
+#: system is written against exactly those three.
+REVIEW_REJECTED_KEY = "review_rejected"
+
+
+def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
+    """`COUNT(*)` over this node's review-rejected attempt rows.
+
+    Scoped to `(run_id, node_id)` across every base, exactly as
+    `semantic_attempts_total` is, and for the same reason: without the
+    cumulative scope every unrelated merge mints a new base and re-arms a
+    per-base counter, so total spend would scale with the number of merges
+    rather than with the node.
+
+    Deliberately disjoint from the semantic count. A red gate and a rejected
+    diff are different failures — one says the stated behaviour is absent, the
+    other says the code that produces it should not merge — and a shared budget
+    would let a node that burned two attempts on gate failures merge unreviewed
+    on its third because the reviewer had no attempts left to spend.
+    """
+    return sum(1 for a in attempts
+               if a.node_id == node_id
+               and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
+
+
+def review_budget_exhausted(cfg: SchedulerConfig, node_id: str,
+                            attempts: Iterable[AttemptRecord],
+                            granted_extra_attempts: int = 0) -> bool:
+    """At most `review_ceiling + granted` review-rejected attempts per node.
+
+    `granted_extra_attempts` is the same `retry --force` grant the semantic
+    ceiling honours, and here it is also B10's missing operator escape: a review
+    that FAILed for a flaky or environmental reason would otherwise strand the
+    producer, because a byte-identical resubmission replays the stored FAIL
+    rather than being re-reviewed into a different answer.
+    """
+    total = review_attempts_total(attempts, node_id)
+    return total >= cfg.review_ceiling + granted_extra_attempts
 
 
 # ── §7.5 launcher budgets — credential is the zero-retry exception ──────────

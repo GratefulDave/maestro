@@ -43,7 +43,7 @@ OBLIGATION_LEDGER = (
 REQUIRED_VERBS = (
     "bootstrap", "plan author",
     "plan validate", "plan finalize", "plan show", "plan list",
-    "run start", "run status", "run cancel", "run resume",
+    "run start", "run status", "run list", "run cancel", "run resume",
     "retry", "skip", "abandon",
 )
 

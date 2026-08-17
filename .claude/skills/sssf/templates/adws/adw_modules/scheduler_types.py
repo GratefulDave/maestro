@@ -126,6 +126,7 @@ class BlockReason(str, Enum):
     CODE_NODE_NO_EFFECT = "CODE_NODE_NO_EFFECT"
     PERMISSION_SCOPE_VIOLATION = "PERMISSION_SCOPE_VIOLATION"
     SEMANTIC_BUDGET_EXHAUSTED = "SEMANTIC_BUDGET_EXHAUSTED"
+    REVIEW_BUDGET_EXHAUSTED = "REVIEW_BUDGET_EXHAUSTED"
     ENVIRONMENTAL_BUDGET_EXHAUSTED = "ENVIRONMENTAL_BUDGET_EXHAUSTED"
     LAUNCHER_BUDGET_EXHAUSTED = "LAUNCHER_BUDGET_EXHAUSTED"
     CREDENTIAL_REFUSED = "CREDENTIAL_REFUSED"
@@ -166,6 +167,14 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     # K is a ceiling on a spend, not a verdict, so the forced grant is the
     # designed exit — one attempt per invocation, never a raised cap (§7.5).
     BlockReason.SEMANTIC_BUDGET_EXHAUSTED: (
+        Escape.RETRY_FORCE, Escape.SKIP, Escape.ABANDON),
+    # Same shape as the semantic ceiling, and the same exit: the reviewer's
+    # findings are a verdict about content, so a plain retry against unchanged
+    # bytes replays the stored FAIL (B10). `retry --force` grants the one extra
+    # attempt, which is also B10's missing operator escape — Strav's
+    # `EMPTY_RESUBMISSION_GUARD_V1` shipped with no override at all, so a flaky
+    # or environmental FAIL stranded the producer until it minted a new SHA.
+    BlockReason.REVIEW_BUDGET_EXHAUSTED: (
         Escape.RETRY_FORCE, Escape.SKIP, Escape.ABANDON),
     # Infra faults: a healthier machine genuinely can produce a different
     # answer, so plain retry is the repair.
@@ -233,10 +242,30 @@ class ResultRecord:
 # ── §7.1 the node the scheduler consumes directly ───────────────────────────
 
 class NodeKind(str, Enum):
-    """Two kinds, with two different VERIFIED predicates (§7.3)."""
+    """Three kinds, each with its own VERIFIED predicate (§7.3).
+
+    `REVIEW` is a kind at the type level and never an authored one. B11's
+    lesson is that reviewing and producing must be separated in the *type*
+    system from day one — Strav made `Role.verifier` mean both "independent
+    Verdict-only reviewer" and "artifact-producing task", and PR #74's attempt
+    to split them found 33 workflows depending on the hybrid and was closed
+    rather than merged. A review node therefore has its own kind, its own
+    predicate (`verification.verify_review_node`), and its own evidence chain,
+    and shares none of an agent node's clauses.
+
+    But it is **derived by the scheduler, one per build-node attempt**, not
+    written by a plan author. An authored review node cannot deliver what this
+    gate exists for: "no build lane merges unreviewed" is a property of every
+    run, and a property that depends on an author remembering to declare it is
+    a property the system does not have. The edge also runs backwards through
+    the graph — the build node must be VERIFIED before its review can start,
+    and a review FAIL sends the build node back to PENDING — which is a
+    scheduler loop, not a dependency. `PlanNode` refuses this kind outright.
+    """
 
     AGENT = "agent"
     CODE = "code"
+    REVIEW = "review"
 
 
 @dataclass(frozen=True)
@@ -273,6 +302,13 @@ class PlanNode:
             raise ValueError(f"{self.node_id}: depth is a graph fact, never negative")
         if self.node_id in self.needs:
             raise ValueError(f"{self.node_id}: a node cannot depend on itself")
+
+        if self.kind is NodeKind.REVIEW:
+            raise ValueError(
+                f"{self.node_id}: a review node is derived by the scheduler from a "
+                "build node's verified attempt, never authored in a plan (§7.3). An "
+                "authored one would make 'every merged lane was reviewed' depend on "
+                "the author remembering to write it")
 
         if self.kind is NodeKind.AGENT:
             if not self.gate_command:
@@ -341,6 +377,13 @@ class SchedulerConfig:
     final_acceptance_timeout_s: float
     backstop_t_s: float
     semantic_ceiling: int
+    #: §7.5's ceiling applied to code review, counted separately and never
+    #: merged with `semantic_ceiling`. They bound different things: the
+    #: semantic ceiling bounds attempts whose *gate* went red, this one bounds
+    #: attempts whose gate went green and whose *diff* a reviewer rejected. One
+    #: counter would let a node with two gate failures merge unreviewed on its
+    #: third try because the shared budget was already spent.
+    review_ceiling: int = 3
     environmental_retries: int = 2
     launcher_retries: int = 2
     credential_retries: int = 0
@@ -352,6 +395,10 @@ class SchedulerConfig:
             raise ValueError(
                 "a semantic ceiling of zero blocks every agent node on its first "
                 "semantic failure, which is a different design, not a setting")
+        if self.review_ceiling < 1:
+            raise ValueError(
+                "a review ceiling of zero blocks every node on its first review "
+                "rejection, which is a different design, not a setting")
         for name in ("node_timeout_s", "turn_timeout_s",
                      "final_acceptance_timeout_s", "backstop_t_s"):
             if getattr(self, name) <= 0:

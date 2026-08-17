@@ -147,8 +147,11 @@ class WorkspaceCliContract(unittest.TestCase):
     def test_parser_preserves_existing_verbs_and_orders_workspace_verbs(self):
         self.assertEqual(maestro.parser_verbs(maestro.build_parser()), (
             "bootstrap", "plan author",
-            "plan validate", "plan finalize", "plan show", "plan list",
-            "run start", "run status", "run cancel", "run resume",
+            "plan validate", "plan finalize",
+            "plan gate", "plan review", "plan ship",
+            "plan show", "plan list",
+            "deliver",
+            "run start", "run status", "run list", "run cancel", "run resume",
             "retry", "skip", "abandon",
             "workspace author", "workspace validate", "workspace finalize",
             "workspace start",

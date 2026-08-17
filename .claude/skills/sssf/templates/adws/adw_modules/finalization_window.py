@@ -84,6 +84,22 @@ class FinalizationSignal(str, Enum):
     PROCESS_DEAD = wd.StallReason.PROCESS_DEAD.value
     TURN_TIMEOUT = wd.StallReason.TURN_TIMEOUT.value
     WINDOW_TIMEOUT = "WINDOW_TIMEOUT"
+    #: B14: the reviewer went live and then stopped without declaring. Not a
+    #: wall clock — it fires the moment the route reports the agent back at its
+    #: composer with no report written, however long or short the review was.
+    ACTOR_ABANDONED = "ACTOR_ABANDONED"
+
+
+#: Herdr statuses that mean the agent is alive and doing something. `idle` is
+#: deliberately absent: it is a *live* status, and `launch()` returns while an
+#: agent still sits at a fresh prompt having done nothing, so treating idle as
+#: liveness is what made B14 undetectable. Quiescence detection arms only after
+#: one of these has been observed at least once.
+LIVE_WORKING_STATUSES = frozenset({"working", "blocked"})
+
+#: The status that means "back at the composer, not doing anything". After the
+#: reviewer has been observed working, this means it stopped without declaring.
+QUIESCENT_STATUS = "idle"
 
 
 @dataclass(frozen=True)
@@ -188,6 +204,21 @@ class ReviewerKiller(Protocol):
     def __call__(self, session: ReviewerSession) -> None: ...
 
 
+class ActorStatusReader(Protocol):
+    """The route's raw per-pane agent status, uncollapsed.
+
+    B14's fix depends on the *raw* status. An adapter that collapses idle into
+    RUNNING — as `HerdrLauncher.poll` must, because for a build node idle means
+    "turn finished" — cannot express "went live, then stopped without
+    declaring", which is the only shape that distinguishes a stalled reviewer
+    from a slow one. Returns `None` when the status cannot be read, which is
+    never treated as a stall: an unreadable status is a missing observation,
+    and convicting on it would kill healthy reviewers whenever herdr hiccups.
+    """
+
+    def __call__(self, session: ReviewerSession) -> Optional[str]: ...
+
+
 def _default_record_count(session: ReviewerSession) -> int:
     path = session.extra.get(SESSION_PATH_KEY)
     if not path:
@@ -248,6 +279,7 @@ class FinalizationWindow:
         process_alive: Callable[[int], bool] = DEFAULT_PROCESS_ALIVE,
         transcript_record_count: Callable[[ReviewerSession], int] = (
             _default_record_count),
+        actor_status: Optional[ActorStatusReader] = None,
         time_source: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -259,6 +291,7 @@ class FinalizationWindow:
         self._kill = kill
         self._process_alive = process_alive
         self._transcript_record_count = transcript_record_count
+        self._actor_status = actor_status
         self._time_source = time_source
         self._wall_clock = wall_clock
 
@@ -269,6 +302,11 @@ class FinalizationWindow:
         # advanced. Written only by `poll`, as §7.6's heartbeat cache is.
         self._turn_observed_count = 0
         self._turn_observed_at: Optional[float] = None
+        # B14's arming latch. False until the route has reported the reviewer
+        # actually working at least once, because until then `idle` means "at a
+        # fresh prompt, not started", which is the normal post-launch state and
+        # not a stall.
+        self._actor_was_working = False
 
     # ── the span ────────────────────────────────────────────────────────
 
@@ -341,6 +379,22 @@ class FinalizationWindow:
 
         if session.pid is not None and not self._process_alive(session.pid):
             return self._stall(FinalizationSignal.PROCESS_DEAD, elapsed)
+
+        # (c) B14 — quiescence after liveness, checked before either clock so a
+        # reviewer that stopped without declaring is reported as what it is
+        # rather than waiting out a timeout that would name the wrong cause.
+        #
+        # The order matters and is the whole point: the report check at the top
+        # of this method already ran, so reaching here with the actor idle means
+        # it is idle *and* has written nothing. B14's fix is not a shorter
+        # timeout — a legitimate large review takes a long time and any wall
+        # clock bounds honest work. It is noticing that the thing stopped.
+        if self._actor_status is not None:
+            status = (self._actor_status(session) or "").strip().casefold()
+            if status in LIVE_WORKING_STATUSES:
+                self._actor_was_working = True
+            elif status == QUIESCENT_STATUS and self._actor_was_working:
+                return self._stall(FinalizationSignal.ACTOR_ABANDONED, elapsed)
 
         record_count = self._transcript_record_count(session)
         if self._turn_observed_at is None:

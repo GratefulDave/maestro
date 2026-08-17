@@ -529,6 +529,85 @@ class BootstrapCliTest(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("AUTHORING_BLOCKED", output.getvalue())
 
+    def test_the_authoring_lane_route_is_admitted_not_refused(self):
+        """A route only the `author:` block names still gets a receipt.
+
+        `_load_maestro_layout` requires every configured lane's route to have a
+        receipt path, but bootstrap's capture specs were built from the
+        execution and reviewer lanes alone. A deployment whose reviewer and
+        execution share one route while the authoring lane rides another —
+        which is the shape `maestro deliver` asks for — therefore refused
+        `ROUTE_MODEL_UNCONFIGURED` for a route its own configuration demanded,
+        and could never mint the receipt `run start` then insists on loading.
+        """
+        from test_step10_cli import OperatorCliTest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = OperatorCliTest()
+            fixture = helper._named_plan_configuration(Path(tmp))
+            config_path = fixture["repo"] / "adws" / "maestro.config.yaml"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["reviewer"]["route"] = "omp"
+            config["reviewer"]["profile"] = "reviewer-profile"
+            config["author"] = {
+                "route": "claude",
+                "model": "author-model",
+                "effort": "high",
+                "author_timeout_s": 600,
+                "turn_timeout_s": 25,
+                "poll_interval_s": 1,
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            for route in ("omp", "claude"):
+                (fixture["state"] / "route-receipts" / (route + ".json")).unlink()
+            (Path(tmp) / "herdr").write_text(FAKE_HERDR, encoding="utf-8")
+            (Path(tmp) / "herdr").chmod(0o755)
+            (Path(tmp) / "omp").write_text(
+                "#!/bin/sh\necho 17.3.4\n", encoding="utf-8")
+            (Path(tmp) / "claude").write_text(
+                "#!/bin/sh\necho 2.1.232\n", encoding="utf-8")
+            (Path(tmp) / "omp").chmod(0o755)
+            (Path(tmp) / "claude").chmod(0o755)
+            output = io.StringIO()
+            with helper._repository_cwd(fixture["repo"]), mock_env({
+                    "FAKE_ADMIT_ROOT": tmp,
+                    "FAKE_HERDR_CWD": str(fixture["repo"])}), \
+                    contextlib.redirect_stdout(output):
+                code = maestro.main(["bootstrap"])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["outcome"], "ROUTES_ADMITTED")
+            self.assertEqual(sorted(payload["routes"]), ["claude", "omp"])
+            keys = ra.provision_keys(fixture["state"] / "keys")
+            admitted = load_admitted_routes(
+                {route: Path(path)
+                 for route, path in payload["receipts"].items()},
+                verify_keys=(keys.route_public,))
+            self.assertTrue(admitted.admits("claude"))
+            self.assertTrue(admitted.admits("omp"))
+
+    def test_a_route_no_lane_names_is_still_refused(self):
+        """The refusal survives; only the authoring lane stops triggering it."""
+        from test_step10_cli import OperatorCliTest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = OperatorCliTest()
+            fixture = helper._named_plan_configuration(Path(tmp))
+            config_path = fixture["repo"] / "adws" / "maestro.config.yaml"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["reviewer"]["route"] = "omp"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            for route in ("omp", "claude"):
+                (fixture["state"] / "route-receipts" / (route + ".json")).unlink()
+            output = io.StringIO()
+            with helper._repository_cwd(fixture["repo"]), \
+                    contextlib.redirect_stdout(output):
+                code = maestro.main(["bootstrap"])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(code, 3)
+            self.assertEqual(payload["outcome"], "ROUTE_ADMISSION_FAILED")
+            self.assertEqual(payload["detail"], "ROUTE_MODEL_UNCONFIGURED:claude")
+
 
 @contextlib.contextmanager
 def mock_env(values):
