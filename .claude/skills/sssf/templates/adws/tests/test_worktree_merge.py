@@ -36,6 +36,7 @@ from pathlib import Path
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
+from adw_modules import launcher  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
 
 
@@ -225,6 +226,19 @@ class CacheRedirection(WorktreeTestCase):
         for key in ("XDG_CACHE_HOME", "TMPDIR", "PYTHONPYCACHEPREFIX", "PYTEST_ADDOPTS"):
             self.assertIn(key, env)
             self.assertIn(str(attempt.scratch), env[key])
+
+    def test_every_redirected_variable_is_forwarded_across_the_pane_boundary(self):
+        """§8.3: the same environment goes to all three bracket contexts.
+
+        Two of them are subprocesses of this harness and inherit the mapping.
+        The pane is not: it is forked by the herdr server, and reaches it only
+        through `launcher.SCRATCH_ENV_KEYS`. A variable added here and not
+        there is honoured by the gates and ignored by the agent — the
+        asymmetry that convicted a node on 2026-08-17 — so the two sets are
+        the same set, checked rather than reviewed."""
+        attempt = _attempt(self.repo, self.root)
+        self.assertEqual(set(wt.scratch_env(attempt.scratch)),
+                         set(launcher.SCRATCH_ENV_KEYS))
 
     def test_the_gate_invocation_itself_carries_the_redirection(self):
         """§8.3 item 3: the environment is applied to the gate invocation, not

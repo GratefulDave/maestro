@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .launcher import (
+    SCRATCH_ENV_KEYS,
     HarnessCancelled,
     HarnessQuiescenceError,
     run_harness_process,
@@ -477,9 +478,17 @@ def scratch_env(scratch: Path) -> Dict[str, str]:
     the adapter's own gate invocation, and a code node's command (§7.3) — which
     is why this returns the mapping instead of applying it: only the caller
     knows which process it is about to start.
+
+    Two of those three contexts are ordinary subprocesses of this harness and
+    receive the mapping by inheritance. The pane is not: it is forked by the
+    herdr server, and reaches it only through the `--env` flags
+    `launcher.pane_env_flags` builds from `launcher.SCRATCH_ENV_KEYS`. A
+    variable added here and not there is redirected for the gates and ignored
+    by the agent — the asymmetry that convicted a node on 2026-08-17 — so the
+    two sets are asserted equal on every call rather than left to review.
     """
     scratch = Path(scratch)
-    return {
+    values = {
         "XDG_CACHE_HOME": str(scratch / "xdg"),
         "TMPDIR": str(scratch / "tmp"),
         "PYTHONPYCACHEPREFIX": str(scratch / "pycache"),
@@ -488,6 +497,15 @@ def scratch_env(scratch: Path) -> Dict[str, str]:
         "RUFF_CACHE_DIR": str(scratch / "ruff"),
         "npm_config_cache": str(scratch / "npm"),
     }
+    unforwarded = sorted(set(values) - set(SCRATCH_ENV_KEYS))
+    if unforwarded:
+        raise WorktreeError(
+            "SCRATCH_ENV_NOT_FORWARDED_TO_PANE:{}".format(",".join(unforwarded)))
+    unbuilt = sorted(set(SCRATCH_ENV_KEYS) - set(values))
+    if unbuilt:
+        raise WorktreeError(
+            "SCRATCH_ENV_NOT_BUILT:{}".format(",".join(unbuilt)))
+    return values
 
 
 def launch_env(scratch: Path, base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
