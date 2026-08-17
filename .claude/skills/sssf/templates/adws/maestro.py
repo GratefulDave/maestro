@@ -281,6 +281,38 @@ def _repository_identity_root(repo: Path) -> Path:
     return repo
 
 
+def _installed_config_path() -> Path:
+    """The configuration of the repository this command was issued inside.
+
+    Configuration was resolved as `Path.cwd() / adws/maestro.config.yaml`, so
+    every configured verb silently required the operator to be standing in the
+    repository root. One directory down — in `adws/` itself, in `plans/`, in
+    any source tree — the identical command found no configuration at all and
+    fell back to reading the plan *name* as a plan *path*, which fails with a
+    message about a missing file rather than about where the operator stood.
+    It is the same defect as state keyed to the checkout directory: behaviour
+    depending on where somebody happened to be, rather than on the repository.
+
+    The repository owns the configuration, so the repository is what answers.
+    The checkout is discovered by walking up from the invocation directory to
+    the nearest ancestor that carries an installation, stopping at the first
+    `.git` marker because a repository without a configuration is unconfigured
+    and does not inherit whatever encloses its directory. Reading the marker
+    rather than asking git keeps this a pure filesystem operation, the same
+    property `_repository_identity_root` preserves resolving identity in the
+    other direction. Finding nothing returns the invocation-relative path, so
+    an unconfigured tree refuses exactly as it did before, naming that path.
+    """
+    origin = Path.cwd().resolve()
+    for directory in (origin, *origin.parents):
+        candidate = directory / _MAESTRO_CONFIG_FILE
+        if os.path.lexists(str(candidate)):
+            return candidate
+        if os.path.lexists(str(directory / ".git")):
+            break
+    return origin / _MAESTRO_CONFIG_FILE
+
+
 def _repository_path(repo: Path, value, label, *, inside: bool) -> Path:
     raw = Path(_config_string(value, label))
     if raw.is_absolute():
@@ -671,7 +703,7 @@ def _apply_repository_config(
     """Bind named-plan and bootstrap entrypoints to installed repository state."""
     if not _configured_command(args):
         return
-    config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
+    config_path = _installed_config_path()
     if not os.path.lexists(str(config_path)) or _spells_its_own_plan_file(args):
         if args.command == "plan":
             args.plan_file = args.plan_name
@@ -2330,7 +2362,7 @@ def _escape(args: argparse.Namespace) -> int:
 
 def _plan_contract_layout() -> Dict[str, Any]:
     """The repository layout the plan-contract pipeline derives every path from."""
-    config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
+    config_path = _installed_config_path()
     if not config_path.is_file():
         raise _MaestroConfigurationError(
             "the plan pipeline requires an installed "
@@ -2892,7 +2924,7 @@ def _plan_ship(args: argparse.Namespace) -> int:
 
 def _deliver_config() -> Dict[str, Any]:
     """The plan-contract layout with route keys bound, which the lane needs."""
-    config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
+    config_path = _installed_config_path()
     if not config_path.is_file():
         raise _MaestroConfigurationError(
             "maestro deliver requires an installed " + str(_MAESTRO_CONFIG_FILE))
