@@ -5,11 +5,11 @@
 """/install — stamp the SSSF factory from the skill into the cwd. Idempotent.
 
 Usage:
-    uv run <skill>/scripts/install.py [--force]
+    uv run <skill>/scripts/install.py [--force] [--adws-only]
 
 Stamps: adws/ (modules + starter ADWs), adws/adw_data/prompt_engineering/
 (4 starter agents), adws/adw_sssf_config/sssf.config.yaml, .env.sample,
-.gitignore entries.
+.gitignore entries. `--adws-only` limits the install to `adws/`.
 Existing files are skipped unless --force.
 """
 
@@ -79,6 +79,11 @@ def ensure_gitignore(root: Path, stamped: list) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="overwrite existing files")
+    parser.add_argument(
+        "--adws-only",
+        action="store_true",
+        help="stamp only adws/; leave root files and .gitignore untouched",
+    )
     args = parser.parse_args()
 
     root = Path.cwd()
@@ -92,12 +97,13 @@ def main() -> int:
     stamp(TEMPLATES / "sssf.config.yaml",
           root / "adws" / "adw_sssf_config" / "sssf.config.yaml",
           args.force, stamped, skipped)
-    stamp(TEMPLATES / "env.sample", root / ".env.sample", args.force, stamped, skipped)
-    # The recipes are part of the operating experience, and several cookbooks
-    # plus the run banner tell you to use them, so a stamped repo has to have
-    # them. Skipped like any other file if the repo already has a justfile.
-    stamp(TEMPLATES / "justfile", root / "justfile", args.force, stamped, skipped)
-    ensure_gitignore(root, stamped)
+    if not args.adws_only:
+        stamp(TEMPLATES / "env.sample", root / ".env.sample", args.force, stamped, skipped)
+        # The recipes are part of the operating experience, and several cookbooks
+        # plus the run banner tell you to use them, so a stamped repo has to have
+        # them. Skipped like any other file if the repo already has a justfile.
+        stamp(TEMPLATES / "justfile", root / "justfile", args.force, stamped, skipped)
+        ensure_gitignore(root, stamped)
 
     print(f"sssf installed into {root}")
     print(f"  stamped: {len(stamped)} file(s)")
@@ -105,13 +111,16 @@ def main() -> int:
         print(f"    + {s}")
     if skipped:
         print(f"  skipped (already exist, use --force to overwrite): {len(skipped)}")
-    print("\nnext steps:")
-    print("  1. cp .env.sample .env   # then set the key(s) your roster needs")
-    print("  2. just demo             # two cheap read-only runs, end to end")
-    print("  3. just sessions         # what just happened")
-    print("  4. just obs              # the trace UI, needs bun")
-    print("\n  no just? the raw form of step 2 is:")
-    print("     uv run adws/adw_prompt.py \"say hello\" --agent scout")
+    print("\nnext step:")
+    if args.adws_only:
+        print("  uv run adws/maestro.py workspace --help  # verify Maestro")
+    else:
+        print("  1. cp .env.sample .env   # then set the key(s) your roster needs")
+        print("  2. just demo             # two cheap read-only runs, end to end")
+        print("  3. just sessions         # what just happened")
+        print("  4. just obs              # the trace UI, needs bun")
+        print("\n  no just? the raw form of step 2 is:")
+        print("     uv run adws/adw_prompt.py \"say hello\" --agent scout")
     return 0
 
 

@@ -12,7 +12,7 @@ The ADW is the worker. Your job is to launch it, watch the trace, and tell the e
 
 ## Launch
 
-Which chain to launch is decided in `how_to_prompt_for_the_eng.md`, and the short version is: **the ADW the engineer named, or else the most complete composed chain the work justifies — never a single-agent one.** Read `ls adws/adw_*.py` and the `Phases:` line in each docstring to see what this repo has; the names below are shape, not a menu.
+Which chain to launch is decided in `how_to_prompt_for_the_eng.md`; use `just --list` to see the stamped entrypoints. The named ADW is authoritative. The examples below are concrete starter chains, not a substitute for its declared phase contract.
 
 ```bash
 uv run adws/<end-to-end-chain>.py "add a /health endpoint"
@@ -23,48 +23,20 @@ uv run adws/<recon-chain>.py "where is auth handled" --config path/to/other.conf
 
 The prompt is inline text or a file path. Launch in the background so you can poll while it works; the `adw_id` is printed on startup — capture it, everything else keys off it.
 
-### Listen for the roster
+### Choose the roster deliberately
 
-The chain says *what runs*; the config says *who runs it*. **If the engineer references a roster, a config, or a model tier, pass it — do not fall through to the default.**
-
-```bash
-just rosters                            # every roster on disk, and the model each agent runs
-```
-
-That prints the path to pass and who is in it, in one read:
-
-```
-adws/adw_sssf_config/sssf.config.yaml
-    planner     fireworks/accounts/fireworks/models/kimi-k3
-    builder     google/gemini-3.6-flash (inherited)
-adws/adw_sssf_config/sssf.frontier.config.yaml
-    planner     anthropic/claude-opus-5
-```
-
-Read those from disk every time. Rosters are the engineer's to add, rename, and retune, so a name you remember from a doc is a guess.
-
-They will rarely say `--config`. Treat any of these as naming a roster, then resolve it to a file:
-
-| What they say | What it means |
-|---|---|
-| "run it on the frontier config", "use the frontier roster" | the roster file whose name matches |
-| "run this with the big models", "use the sota roster" | the non-default roster — confirm which if there is more than one. Each config's header comment lists the names it answers to, so `head -3` on the file settles it |
-| "have opus plan this one" | a roster whose planner is that model; if none exists, say so rather than editing the config mid-request |
-| nothing about models at all | the default, `adws/adw_sssf_config/sssf.config.yaml` |
-
-`--config` takes the path directly; the justfile recipes read `SSSF_CONFIG` instead:
+The chain says *what runs*; the config says *who runs it*. The default is `adws/adw_sssf_config/sssf.config.yaml`. If the engineer names a roster, a model tier, an OMP profile, or a Claude route, identify the requested YAML and pass `--config` explicitly — never silently substitute a different roster.
 
 ```bash
-uv run adws/<chain>.py "<prompt>" --config adws/adw_sssf_config/sssf.frontier.config.yaml
-SSSF_CONFIG=adws/adw_sssf_config/sssf.frontier.config.yaml just <recipe> "<prompt>"
+uv run adws/adw_plan.py "add a /health endpoint" \
+  --config adws/adw_sssf_config/sssf.config.yaml
+SSSF_CONFIG=adws/adw_sssf_config/sssf.config.yaml \
+  just plan "add a /health endpoint"
 ```
 
-Two things that bite:
+Read the selected YAML before launch. Its OMP agents either use an explicit `provider/model-id` or a `pm_profile`; direct Claude Code agents carry their own model, effort, and explicit tool allowlist. A different roster changes cost, model binding, tool authority, and potentially the result.
 
-- **Never swap rosters on your own.** A different roster is a different cost and a different result. If the default's model looks wrong for the work, say so and let the engineer choose.
-- **Switching rosters mid-session breaks resumption.** `agent_map.json` records the model each coding-agent session was created with, so a joined run (`--adw-id`) whose config now names a different model starts that agent **fresh** instead of resuming its context window. That is deliberate — a bad resume is worse — but it means "plan on the frontier roster, then build on the default" costs the builder its accumulated context. Say so when you report it.
-
-`--adw-id` is optional on **every** ADW. Given one, the run joins that session if it exists or creates it pinned to exactly that id: same `sessions/{adw_id}/` dirs, same `context_handoff/`, envelopes appended, and each agent resumes its existing coding-agent context window via `agent_map.json`. That is how you chain ADWs — plan under one id, then build under the same id.
+`--adw-id` is optional on **every** ADW. Given one, the run joins that session if it exists or creates it at that id: the same `sessions/{adw_id}/` directories, `context_handoff/`, and envelopes are reused. Continuity is route-specific: direct Claude Code resumes only a saved matching request; OMP resumes the state OMP keeps in that per-agent session directory. A changed model or profile is **not** a context reset—use a new `--adw-id` when isolation is required.
 
 ## Observe
 
@@ -107,13 +79,12 @@ A hung coding agent produces no events at all, so the trace goes quiet rather th
 
 ```bash
 just phases <adw_id>     # which phase is still `running`
-just procs <adw_id>      # what that phase is actually running, with pids
-just kill <adw_id>       # stop it — children first, then the workflow
+just procs <adw_id>      # recorded live child processes, including PIDs
 ```
 
-`processes` rows with `ended_at IS NULL` are the live ones. If `procs` shows a pi child but the phase has produced no `tool_call` events and its `raw_output.jsonl` is empty, the agent never got started properly — check the model resolves and that nothing is blocking the subprocess, rather than waiting it out. `just kill` verifies each pid still matches the command that was recorded before signalling, because pids get recycled.
+`processes` rows with `ended_at IS NULL` are the live ones. If a recorded coding-agent child has produced no `tool_call` events and its `raw_output.jsonl` is empty, launch likely failed before the first tool call: check the selected roster's route and authentication before waiting longer. To stop a stuck run, terminate the recorded child process deliberately, then record the outcome; the stamped justfile provides inspection recipes, not a `just kill` command.
 
-A killed run marks itself `fail` and closes its process rows, so the trace never claims work is in flight that is already dead.
+After termination, inspect the run's terminal status before reporting it. Never leave an unverified process row represented as active work.
 
 ## Report
 

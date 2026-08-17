@@ -2,7 +2,7 @@
 
 `canonicalize(plan) -> bytes` and `digest_of(bytes) -> sha256` are **two
 disjoint functions with disjoint call sites**. This module holds the first
-and is imported by exactly two places: authoring, which writes the file, and
+and is imported by authoring (`plan_author.py`), which writes the file, and
 validation, which checks the stored file is already in canonical form.
 
 Nothing on the runtime path may import this module. `plan_digest` is what

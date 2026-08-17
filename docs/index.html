@@ -285,9 +285,12 @@
               <tr><td>reclaim(token)</td><td>Recover exact correlation matches only; never infer ownership from nearby panes.</td></tr>
               <tr><td>classify(error)</td><td>Map launch faults into fixed configuration, authentication, transient, protocol, or execution classes.</td></tr>
               <tr><td>provision(worktree)</td><td>Run ecosystem setup after worktree creation and before baseline or pre-gate measurement.</td></tr>
+              <tr><td>wait_for_interactive_agent(name)</td><td>Block on <code>herdr agent wait &lt;name&gt; --until idle --timeout</code>, the documented readiness gate for coding agents. No undocumented status field is polled and no per-agent startup banner is scraped from the pane.</td></tr>
+              <tr><td>submit_agent_prompt(target, text)</td><td>Deliver one turn with <code>herdr agent prompt &lt;target&gt; &lt;text&gt; --wait --until &lt;status&gt; --timeout</code>, which submits the text and its Enter atomically and proves the composer accepted them. On <code>agent_prompt_stalled</code> the recovery is a single <code>agent send-keys &lt;target&gt; enter</code> followed by <code>agent wait</code>, never a second prompt.</td></tr>
             </tbody>
           </table>
         </div>
+        <div class="callout"><strong>Command boundary.</strong> Coding agents are driven only through the <code>agent</code> commands. The <code>pane</code> commands address ordinary terminals, servers, and shells, so <code>pane run</code> against a pane hosting a coding agent types the prompt as a shell command instead of handing it to the composer. A prompt submitted without <code>--wait</code> reports success even when the text is left sitting unsubmitted, which is indistinguishable from a delivered turn until the turn times out.</div>
       </section>
 
       <section id="workspace">
@@ -314,7 +317,10 @@
           <span class="section-no">07 / 08</span>
           <div><h2>Operator CLI</h2><p class="section-copy">The public surface exposes validation, publication, execution, inspection, recovery, and deliberate escapes.</p></div>
         </div>
-        <pre aria-label="Maestro command examples"><span class="comment"># authoring</span>
+        <pre aria-label="Maestro command examples"><span class="comment"># route admission</span>
+<span class="prompt">$</span> ./maestro.py bootstrap
+
+<span class="comment"># authoring</span>
 <span class="prompt">$</span> ./maestro.py plan validate plan.json
 <span class="prompt">$</span> ./maestro.py plan finalize plan.json
 <span class="prompt">$</span> ./maestro.py plan show &lt;digest&gt;
@@ -340,6 +346,7 @@
 <span class="prompt">$</span> ./maestro.py workspace resume --manifest-file &lt;workspace.json&gt; --workspace-receipt-dir &lt;dir&gt; --data-dir &lt;dir&gt; --verify-key &lt;hex&gt; --db &lt;db&gt; --state-root &lt;dir&gt; --run-id &lt;id&gt; --max-workers &lt;n&gt; --lease-owner &lt;id&gt; --lease-stale-after-s &lt;seconds&gt; --participant-timeout-s &lt;seconds&gt; --cancellation-timeout-s &lt;seconds&gt; --poll-interval-s &lt;seconds&gt;
 <span class="prompt">$</span> ./maestro.py workspace publish --manifest-dir &lt;dir&gt; --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;
 <span class="prompt">$</span> ./maestro.py workspace rollback --manifest-dir &lt;dir&gt; --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;</pre>
+        <div class="callout"><strong>Bootstrap.</strong> <code>bootstrap</code> provisions key material and admits every configured route before any run may use it. Admission is a real capture, not a version probe: each route answers a marker prompt in a visible pane, answers it again from a resumed session to prove continuity, and is then cancelled to prove the pane closes. Only then is a signed route receipt written. A route whose receipt already verifies is reported as reused.</div>
       </section>
 
       <section id="guarantees">
@@ -350,7 +357,7 @@
         <div class="metric-grid">
           <div class="metric"><b>Scoped</b><span>offline contract suite</span></div>
           <div class="metric"><b>2</b><span>real route receipt types</span></div>
-          <div class="metric"><b>6</b><span>launcher operations</span></div>
+          <div class="metric"><b>8</b><span>launcher operations</span></div>
           <div class="metric"><b>8</b><span>workspace operator verbs</span></div>
         </div>
         <div class="callout"><strong>Golden scenarios.</strong> Run A proves concurrent isolated work, deterministic merges, and an <code>ACCEPTED</code> outcome. Run B proves a conflict reaches <code>BLOCKED</code>, then exercises recovery without inventing ancestry.</div>

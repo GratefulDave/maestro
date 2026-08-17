@@ -357,9 +357,12 @@ class DirectClaudeRouteContract(unittest.TestCase):
 
         unrestricted = self.request()
         unrestricted.tools = None
-        with self.assertRaises(ValueError):
-            agent_cc.run(unrestricted)
-        self.assertFalse((self.root / "argv.jsonl").exists())
+        agent_cc.run(unrestricted)
+        argv = self.argv()
+        self.assertNotIn("--tools", argv)
+        self.assertNotIn("--allowedTools", argv)
+        self.assertNotIn("--disallowedTools", argv)
+        (self.root / "argv.jsonl").unlink()
 
         with self.assertRaises(ValueError):
             agent_cc.run(self.request(tools=["mcp__server__tool"]))
@@ -481,6 +484,9 @@ class DirectClaudeDispatchContract(unittest.TestCase):
             adw_id = "adw-1"
             tracer = _Tracer()
             console = _Console()
+            def agent_map_entry(self, name):
+                return self.agent_map.get(name)
+
 
             def add_usage(self, *_args):
                 pass

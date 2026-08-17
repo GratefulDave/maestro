@@ -34,7 +34,8 @@ def load_config(path: str = "adws/adw_sssf_config/sssf.config.yaml") -> SSSFConf
     raw = yaml.safe_load(Path(path).read_text()) or {}
     defaults = raw.get("defaults", {}) or {}
     for agent in raw.get("agents", []) or []:
-        for key in ("coding_agent", "model", "thinking", "color", "tools", "writes"):
+        for key in ("coding_agent", "model", "thinking", "color", "tools", "writes",
+                    "dangerously_skip_permissions"):
             if key in defaults:
                 agent.setdefault(key, defaults[key])
         agent.setdefault("harness_engineering", defaults.get("harness_engineering", []))
@@ -62,10 +63,11 @@ def validate(cfg: SSSFConfig, required: list[str]) -> None:
             problems.append(f"agent {name!r}: unsupported coding_agent "
                             f"{agent.coding_agent!r}")
         elif agent.coding_agent in ("omp", "pi"):
-            try:
-                agent_pi.resolve_model(agent.model)
-            except ValueError as e:
-                problems.append(f"agent {name!r}: {e}")
+            if not agent.pm_profile:
+                try:
+                    agent_pi.resolve_model(agent.model)
+                except ValueError as e:
+                    problems.append(f"agent {name!r}: {e}")
         else:
             try:
                 agent_cc.validate_capabilities(agent.tools, agent.harness_engineering)
@@ -124,9 +126,10 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
             prompt=prompt_text,
             system_prompt=system_text,
             model=agent.model,
+            pm_profile=agent.pm_profile,
+            dangerously_skip_permissions=agent.dangerously_skip_permissions,
             thinking=agent.thinking,
             session_id=session_id,
-            # Absolute: direct subprocesses run from repo_root.
             session_dir=str((agent_dir / "pi_sessions").resolve()),
             raw_output_path=str((agent_dir / "raw_output.jsonl").resolve()),
             tools=agent.tools,
@@ -242,7 +245,7 @@ def _as_report(result) -> GateReport:
 
 
 def _agent_session_id(run, agent: AgentConfig) -> str:
-    entry = run.agent_map.get(agent.name)
+    entry = run.agent_map_entry(agent.name)
     if entry and entry.get("model") == agent.model:
         return entry["session_id"]           # rejoin the existing context window
     return f"sssf-{run.adw_id}-{agent.name}-{new_id(4)}"

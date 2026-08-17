@@ -47,7 +47,8 @@ WORKSPACE_SOURCE_FIXTURES = {
 }
 
 WORKSPACE_VERBS = (
-    "workspace validate", "workspace finalize", "workspace start",
+    "workspace author", "workspace validate", "workspace finalize",
+    "workspace start",
     "workspace status", "workspace cancel", "workspace resume",
     "workspace publish", "workspace rollback",
 )

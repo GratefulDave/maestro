@@ -303,25 +303,16 @@ class PromptEngineering(BaseModel):
 
 class AgentConfig(BaseModel):
     name: str
-    # "omp" and "pi" both name the same runner: omp is what the binary is
-    # called now, and "pi" stays accepted so repos stamped before the rename
-    # keep validating.
     coding_agent: Literal["omp", "pi", "claude_code"] = "omp"
-    model: str = "openai-codex/gpt-5.6-terra"
-    thinking: str = "medium"        # off | minimal | low | medium | high | xhigh | max
-    color: str = ""                 # hex swatch for this agent's lane in the UI
+    model: Optional[str] = "openai-codex/gpt-5.6-terra"
+    pm_profile: Optional[str] = None
+    dangerously_skip_permissions: bool = False
+    thinking: str = "medium"
+    color: str = ""
     purpose: str = ""
     prompt_engineering: PromptEngineering
     harness_engineering: list[str] = Field(default_factory=list)
-    tools: Optional[list[str]] = None    # allowlist; None = all tools usable
-    # What this agent may MODIFY in the repo, enforced in code after every call
-    # (see adw_modules/permissions.py). `tools` cannot express this: `bash` runs
-    # anything and `write` reaches any path, so an agent's capability list is a
-    # statement of intent that nothing checks.
-    #   None  -> unrestricted, except the roster-wide `protected_files` paths
-    #   []    -> read-only: may modify nothing tracked
-    #   [...] -> only these. A trailing "/" means a directory prefix; a "*"
-    #            makes it a glob; anything else is an exact path.
+    tools: Optional[list[str]] = None
     writes: Optional[list[str]] = None
 
 
@@ -377,18 +368,20 @@ class EventRecord(BaseModel):
 # ── Pi coding agent interface ────────────────────────────────────────────────
 
 class PiRequest(BaseModel):
-    """Everything one non-interactive pi run needs."""
+    """Everything one non-interactive coding-agent run needs."""
 
     prompt: str
     system_prompt: str
-    model: str                      # registry pattern, resolved to provider + id
+    model: Optional[str] = None
+    pm_profile: Optional[str] = None
+    dangerously_skip_permissions: bool = False
     thinking: str = "medium"
-    session_id: str                 # pi --session-id: creates or continues
+    session_id: str
     session_dir: str
-    raw_output_path: str            # JSONL stream lands here
+    raw_output_path: str
     tools: Optional[list[str]] = None
     extensions: list[str] = Field(default_factory=list)
-    cwd: str = "."                  # set from run.repo_root — the codebase root agents work in
+    cwd: str = "."
 
 
 class UsageBreakdown(BaseModel):

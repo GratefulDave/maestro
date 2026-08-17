@@ -157,11 +157,8 @@ def validate_capabilities(tools: Optional[list[str]], extensions: list[str]) -> 
         raise ValueError(
             "Claude direct route does not support PiRequest.extensions; refusing "
             "to spawn with unmapped capabilities")
-    if tools is None:
-        raise ValueError(
-            "Claude direct route requires an explicit PiRequest.tools allowlist; "
-            "refusing the CLI default tool set")
-    _builtin_tools(tools)
+    if tools is not None:
+        _builtin_tools(tools)
 
 
 def _argv(request: PiRequest, resume: str) -> list:
@@ -172,15 +169,16 @@ def _argv(request: PiRequest, resume: str) -> list:
         "--model", request.model, "--effort", request.thinking,
         "--system-prompt", request.system_prompt,
     ]
-    builtins = _builtin_tools(request.tools)
-    if builtins:
-        command += ["--tools", *builtins, "--allowedTools", *request.tools]
-    else:
-        # Claude documents an empty --tools value as the no-tools mode.
-        command += ["--tools", ""]
-    # Direct Claude runs do not map MCP extensions, and preconfigured MCP
-    # servers must not become capabilities merely because the CLI is present.
-    command += ["--disallowedTools", "mcp__*"]
+    if request.dangerously_skip_permissions:
+        command.append("--dangerously-skip-permissions")
+    if request.tools is not None:
+        builtins = _builtin_tools(request.tools)
+        if builtins:
+            command += ["--tools", *builtins, "--allowedTools", *request.tools]
+        else:
+            # Claude documents an empty --tools value as the no-tools mode.
+            command += ["--tools", ""]
+        command += ["--disallowedTools", "mcp__*"]
     if resume:
         command += ["--resume", resume]
     else:

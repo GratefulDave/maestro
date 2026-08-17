@@ -78,6 +78,13 @@ class ClaudeRouteTest(unittest.TestCase):
         self.assertEqual(result.model_ran, "claude/claude-opus-5")
         self.assertEqual(result.cost, 0.02)
 
+    def test_permission_bypass_is_explicitly_opt_in(self):
+        request = self.request()
+        request.dangerously_skip_permissions = True
+        agent_cc.run(request)
+        argv = json.loads((self.root / "argv.json").read_text())
+        self.assertIn("--dangerously-skip-permissions", argv)
+
     def test_rejects_a_substituted_stream_reported_model(self):
         os.environ["FAKE_CLAUDE_MODEL"] = "sonnet"
         spawned = []

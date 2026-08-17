@@ -18,39 +18,39 @@ Writes `adws/adw_sssf_config/sssf.config.yaml` — creating the directory if nee
 
 ```yaml
 defaults:
-  coding_agent: pi                 # v1: pi only (claude_code is specced, stubbed until v2)
-  model: google/gemini-3.6-flash   # ALWAYS provider/model-id — a bare id is ambiguous
-  thinking: medium                 # off | minimal | low | medium | high | xhigh | max
-  harness_engineering: []          # pi extension names
-  data_dir: adws/adw_data          # runtime home: {data_dir}/sessions/{adw_id}/{agent_name}/
+  coding_agent: omp
+  model: openai-codex/gpt-5.6-terra  # OMP: explicit provider/model-id
+  thinking: medium
+  harness_engineering: []            # OMP extension paths
+  data_dir: adws/adw_data
 
 observability:
-  db: adws/adw_data/sssf.db        # tracer writes here; the UI polls it
-  poll_ms: 500                     # visualizer live-poll cadence
+  db: adws/adw_data/sssf.db
+  poll_ms: 500
 
 agents:
-  - name: planner                  # ADW scripts name agents, never models
-    coding_agent: pi
-    model: google/gemini-3.6-flash
+  - name: planner                    # ADW scripts name agents, never models
+    coding_agent: claude_code
+    model: opus
     thinking: high
-    color: "#a78bfa"               # optional hex — this agent's lane color in the visualizer
+    dangerously_skip_permissions: true
+    color: "#a78bfa"
     purpose: Turn a request into a plan the builder can implement without asking questions.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/planner/system.md
       user: adws/adw_data/prompt_engineering/planner/user.md
+    tools: [Read, Grep, Glob, Bash, Write]
 
-  - name: scout
-    thinking: high                 # unset keys fall through to defaults
-    purpose: Find and report where things live; change nothing.
+  - name: builder
+    pm_profile: grok                 # OMP profile mode; model falls back only when no profile exists
+    purpose: Implement the plan exactly; report every changed file in the envelope.
     prompt_engineering:
-      system: adws/adw_data/prompt_engineering/scout/system.md
-      user: adws/adw_data/prompt_engineering/scout/user.md
-    tools:                         # optional allowlist — omit the key entirely for all tools
-      - read
-      - bash
+      system: adws/adw_data/prompt_engineering/builder/system.md
+      user: adws/adw_data/prompt_engineering/builder/user.md
+    tools: [read, grep, glob, bash, write]
 ```
 
-Every agent entry merges over `defaults`, so an entry only states what differs. Pi's builtin tools are `read`, `bash`, `edit`, `write` — a read-only recon agent gets `[read, bash]`; a builder omits `tools` altogether.
+Every agent entry merges over `defaults`, so an entry only states what differs. OMP tool names are lower-case; Claude's direct route uses its documented builtin names. An explicit `tools` list is required for `claude_code`; a missing OMP list inherits defaults, and `pm_profile` selects OMP's profile route instead of an explicit provider/model invocation.
 
 ## After generating
 

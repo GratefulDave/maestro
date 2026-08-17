@@ -1,0 +1,32 @@
+schema: maestro-config.v1
+plans_dir: specs
+state_root: ../.maestro-state
+keys:
+  verify_key_env: MAESTRO_VERIFY_KEY
+  signing_seed_env: MAESTRO_SIGNING_SEED
+  route_verify_key_env: MAESTRO_ROUTE_VERIFY_KEY
+executables:
+  herdr: herdr
+  omp: omp
+  claude: claude
+route_receipts:
+  omp: route-receipts/omp.json
+  claude: route-receipts/claude.json
+reviewer:
+  route: claude
+  model: opus
+  effort: high
+  finalization_timeout_s: 600
+  turn_timeout_s: 120
+  poll_interval_s: 1
+execution:
+  route: omp
+  model: grok-4.6
+  effort: high
+  profile: grok
+  concurrency: 2
+  node_timeout_s: 1800
+  turn_timeout_s: 300
+  final_acceptance_timeout_s: 900
+  backstop_t_s: 7200
+  semantic_ceiling: 3

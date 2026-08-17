@@ -93,9 +93,7 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
     if not spec.profile:
         raise ValueError("OMP_PROFILE_REQUIRED")
     argv = [
-        str(binary), "--profile", spec.profile,
-        "--model", spec.model,
-        "--thinking", spec.effort,
+        str(binary), "--pm-profile", spec.profile,
         "--session-dir", str(spec.session_dir),
     ]
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
@@ -262,6 +260,168 @@ def _extract(payload: dict, key: str) -> object:
     return None
 
 
+def _optional_int(value: object) -> Optional[int]:
+    if type(value) is int:
+        return value
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _available_shell(payload: Mapping[str, object]) -> bool:
+    info = _extract(payload, "process_info")
+    if not isinstance(info, dict):
+        return False
+    procs = info.get("foreground_processes")
+    if not isinstance(procs, list) or len(procs) != 1:
+        return False
+    proc = procs[0]
+    if not isinstance(proc, dict):
+        return False
+    shell_pid = _optional_int(info.get("shell_pid"))
+    pgid = _optional_int(info.get("foreground_process_group_id"))
+    proc_pid = _optional_int(proc.get("pid"))
+    if None not in (shell_pid, pgid, proc_pid) and not (
+            shell_pid == pgid == proc_pid):
+        return False
+    token = str(proc.get("name") or proc.get("argv0") or "")
+    argv = proc.get("argv")
+    if isinstance(argv, list) and argv:
+        token = token or str(argv[0] or "")
+    base = token.rsplit("/", 1)[-1].lstrip("-").lower()
+    return base in ("zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh")
+
+
+def _payload_text(payload: Mapping[str, object]) -> str:
+    stack = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key in ("text", "output", "content"):
+                value = current.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            lines = current.get("lines")
+            if isinstance(lines, list):
+                joined = "\n".join(
+                    str(line) for line in lines if line is not None)
+                if joined.strip():
+                    return joined
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return ""
+
+
+def _is_text_read(args: Sequence[str]) -> bool:
+    """`herdr agent read` / `herdr pane read` print the snapshot as raw text.
+
+    They have no JSON output mode (`--format` accepts only `text` and `ansi`),
+    so a JSON decode failure on those commands is the normal case, not a
+    protocol violation.
+    """
+    return len(args) >= 2 and args[0] in ("agent", "pane") and args[1] == "read"
+
+
+def submit_agent_prompt(
+        herdr_call: Callable[..., dict],
+        pane_id: str,
+        text: str,
+        agent_name: Optional[str] = None,
+        *,
+        timeout_s: float = 30.0,
+        until: Sequence[str] = ("idle",),
+) -> None:
+    """Submit one atomic prompt and prove the agent actually accepted it.
+
+    `herdr agent prompt` is the documented path for coding agents: it honours
+    live bracketed-paste mode and submits the text plus an encoded Enter
+    atomically. `pane run` is documented for ordinary terminals, servers, and
+    shells, so pointing it at a pane hosting a coding agent types the prompt as
+    a shell command instead of handing it to the agent composer.
+
+    `--wait` is what makes the submission provable. Herdr requires an observed
+    lifecycle change within five seconds and returns `agent_prompt_stalled`
+    otherwise. Without it a prompt delivered to a composer that is not accepting
+    input yet reports success while the text simply sits on screen unsubmitted,
+    which is indistinguishable from a delivered prompt until the turn times out.
+    A caller timeout of five seconds or less downgrades that to a plain timeout,
+    so the wait budget is always kept above it.
+    """
+    target = agent_name or pane_id
+    wait_s = max(5.1, max(0.001, timeout_s))
+    timeout_ms = str(int(wait_s * 1000))
+    until_argv = []
+    for status in until:
+        until_argv.extend(["--until", status])
+    argv = ["agent", "prompt", target, text, "--wait"]
+    argv.extend(until_argv)
+    argv.extend(["--timeout", timeout_ms])
+    try:
+        herdr_call(*argv, timeout=wait_s + 5.0)
+        return
+    except Exception as exc:
+        if "agent_prompt_stalled" not in str(exc):
+            raise
+    # The composer took the text but never submitted it, so the prompt is
+    # sitting on screen. Press Enter on what is already there instead of
+    # prompting again -- a second `agent prompt` would append its text to the
+    # unsubmitted line and send both as one garbled turn.
+    herdr_call("agent", "send-keys", target, "enter", timeout=30.0)
+    argv = ["agent", "wait", target]
+    argv.extend(until_argv)
+    argv.extend(["--timeout", timeout_ms])
+    herdr_call(*argv, timeout=wait_s + 5.0)
+
+def wait_for_interactive_agent(
+        herdr_call: Callable[..., dict], name: str, timeout_s: float = 180.0,
+) -> None:
+    """Block until Herdr reports the coding agent idle at its composer.
+
+    `herdr agent wait` is the documented readiness gate for coding agents. It
+    replaces polling `agent get` for an undocumented `interactive_ready` field
+    and scraping the visible pane for a per-agent banner string.
+    """
+    timeout_ms = max(1, int(max(0.001, timeout_s) * 1000))
+    try:
+        herdr_call(
+            "agent", "wait", name, "--until", "idle",
+            "--timeout", str(timeout_ms),
+            timeout=timeout_s + 5.0)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
+
+def _wait_for_available_shell(
+        herdr_call: Callable[..., dict], pane_id: str, timeout_s: float = 30.0,
+        settle_polls: int = 5,
+) -> None:
+    """Wait until the pane is a settled interactive shell.
+
+    A single ready snapshot is not enough: a freshly split pane can look like a
+    lone zsh in the gap before login hooks (direnv, keychain lookups) spawn
+    their own foreground processes. Starting an agent in that gap makes Herdr
+    report `agent_pane_busy`. Require several consecutive ready snapshots so the
+    pane has demonstrably stopped changing before we start the agent.
+    """
+    deadline = time.monotonic() + timeout_s
+    ready = 0
+    while True:
+        try:
+            payload = herdr_call("pane", "process-info", "--pane", pane_id)
+        except RuntimeError:
+            payload = {}
+        ready = ready + 1 if _available_shell(payload) else 0
+        if ready >= settle_polls:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError("LAUNCH_REFUSED:SHELL_NOT_READY")
+        time.sleep(0.1)
+
+
+
+
 class HerdrLauncher:
     def __init__(self, *, herdr_path: Path, omp_path: Path, claude_path: Path,
                  admitted_routes: AdmittedRouteSet,
@@ -278,14 +438,15 @@ class HerdrLauncher:
         self._tailers: Dict[str, TranscriptTailer] = {}
         self._proven_absent: Dict[str, LaunchHandle] = {}
 
-    def _herdr(self, *args: str, env: Optional[Mapping[str, str]] = None) -> dict:
+    def _herdr(self, *args: str, env: Optional[Mapping[str, str]] = None,
+               timeout: float = 30.0) -> dict:
         merged = dict(os.environ)
         if env:
             merged.update(env)
         try:
             result = subprocess.run(
                 [str(self.herdr_path), *args], capture_output=True, text=True,
-                env=merged, timeout=30, check=False,
+                env=merged, timeout=timeout, check=False,
             )
         except (OSError, ValueError) as exc:
             raise RuntimeError("LAUNCH_REFUSED:{}".format(exc)) from exc
@@ -294,8 +455,12 @@ class HerdrLauncher:
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
+            if _is_text_read(args):
+                return {"result": {"text": result.stdout or ""}}
             raise RuntimeError("PROTOCOL_INVALID_JSON") from exc
         if not isinstance(payload, dict):
+            if _is_text_read(args):
+                return {"result": {"text": result.stdout or ""}}
             raise RuntimeError("PROTOCOL_INVALID_RESPONSE")
         return payload
 
@@ -326,23 +491,21 @@ class HerdrLauncher:
             except BaseException:
                 pass
             raise RuntimeError("BINDING_MISMATCH:{}!={}".format(actual, worktree))
-        ready_deadline = time.monotonic() + 5.0
-        while True:
+        try:
+            _wait_for_available_shell(
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                pane_id)
+            started = self._herdr(
+                "agent", "start", name, "--kind", spec.route,
+                "--pane", pane_id, "--timeout", "180000",
+                "--", *route_argv[1:],
+                env=environment, timeout=185.0)
+        except BaseException:
             try:
-                started = self._herdr(
-                    "agent", "start", name, "--kind", spec.route,
-                    "--pane", pane_id, "--", *route_argv[1:],
-                    env=environment)
-                break
-            except RuntimeError as exc:
-                if ("agent_pane_busy" not in str(exc)
-                        or time.monotonic() >= ready_deadline):
-                    try:
-                        self._herdr("pane", "close", pane_id, env=environment)
-                    except BaseException:
-                        pass
-                    raise
-                time.sleep(0.05)
+                self._herdr("pane", "close", pane_id, env=environment)
+            except BaseException:
+                pass
+            raise
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
         actual = (Path(str(bound.get("cwd"))).resolve()
@@ -364,9 +527,18 @@ class HerdrLauncher:
             self._proven_absent.pop(spec.correlation_token, None)
             if transcript:
                 self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
-        bootstrap = "Read and follow the instructions in {0}.".format(
-            spec.prompt_path.resolve())
-        self._herdr("agent", "prompt", name, bootstrap, env=environment)
+        wait_for_interactive_agent(
+            lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+            name)
+        bootstrap = "@{0}".format(spec.prompt_path.resolve())
+        # Settle for either working or idle: the harness turn runs for as long
+        # as the task takes, so waiting for idle here would hold the launch open
+        # for the whole run, while a short task can be back at idle before the
+        # working state is ever sampled.
+        submit_agent_prompt(
+            lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+            pane_id, bootstrap, name,
+            timeout_s=60.0, until=("working", "idle"))
         return handle
 
     def poll(self, handle: LaunchHandle) -> PollResult:

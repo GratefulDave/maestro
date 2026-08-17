@@ -45,13 +45,15 @@ def _run(root: Path, agent: AgentConfig):
     cfg = SSSFConfig(agents=[agent])
     tracer = mock.Mock()
     console = mock.Mock()
+    agent_map = {}
     return SimpleNamespace(
         cfg=cfg,
         adw_id="adw1",
         repo_root=root,
         session_dir=root / "session",
         context_handoff_dir=root / "handoff",
-        agent_map={},
+        agent_map=agent_map,
+        agent_map_entry=agent_map.get,
         tracer=tracer,
         console=console,
         add_usage=mock.Mock(),

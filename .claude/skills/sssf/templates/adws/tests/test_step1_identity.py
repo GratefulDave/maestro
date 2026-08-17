@@ -43,6 +43,7 @@ from adw_modules.data_types import (  # noqa: E402
 )
 from adw_modules.runner import Run  # noqa: E402
 from adw_modules.tracer import Tracer  # noqa: E402
+from adw_modules.agents import _agent_session_id  # noqa: E402
 
 
 def _config(tmp: Path) -> SSSFConfig:
@@ -328,6 +329,17 @@ class AgentMapScoping(unittest.TestCase):
             self.assertEqual(node_b.agent_map_entry("builder"), {"session_id": "b"})
             self.assertEqual(reread.agent_map_entry("builder"), {"session_id": "a"},
                              "a node re-reading the file must find its own session")
+
+    def test_a_node_reuses_its_scoped_matching_model_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            agent = _agent()
+            first = self._run(tmp, "runmapresume", node_id="build_api", dag_attempt_no=1)
+            first.save_agent_map("builder",
+                                 {"session_id": "resumed", "model": agent.model})
+            resumed = self._run(tmp, "runmapresume", node_id="build_api", dag_attempt_no=1)
+
+            self.assertEqual(_agent_session_id(resumed, agent), "resumed")
 
     def test_a_second_attempt_does_not_resume_the_first_attempts_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:

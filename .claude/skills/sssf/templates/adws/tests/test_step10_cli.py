@@ -31,6 +31,221 @@ class OperatorCliTest(unittest.TestCase):
         parser = maestro.build_parser()
         enforcement.assert_verbs(maestro.parser_verbs(parser))
 
+    @contextlib.contextmanager
+    def _repository_cwd(self, repo):
+        previous = Path.cwd()
+        os.chdir(repo)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
+    def _named_plan_configuration(self, root, *, state_root="../maestro-state"):
+        repo = root / "repo"
+        plan_file = repo / "plans" / "named" / "maestro-plan.v1"
+        plan_file.parent.mkdir(parents=True)
+        stored = b'{"plan":"stored bytes"}\n'
+        plan_file.write_bytes(stored)
+        (repo / "adws").mkdir()
+        binaries = {}
+        for name in ("herdr", "omp", "claude"):
+            binary = root / name
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            binaries[name] = str(binary)
+        state = (repo / state_root).resolve()
+        route_dir = state / repo.name / "route-receipts"
+        route_dir.mkdir(parents=True)
+        for route in ("omp", "claude"):
+            (route_dir / (route + ".json")).write_text("{}", encoding="utf-8")
+        signing_seed = receipt_crypto.generate_seed()
+        route_seed = receipt_crypto.generate_seed()
+        environment = {
+            "MAESTRO_TEST_VERIFY_KEY": receipt_crypto.seed_to_public_key(
+                signing_seed).hex(),
+            "MAESTRO_TEST_SIGNING_SEED": signing_seed.hex(),
+            "MAESTRO_TEST_ROUTE_VERIFY_KEY": receipt_crypto.seed_to_public_key(
+                route_seed).hex(),
+        }
+        config = {
+            "schema": "maestro-config.v1",
+            "plans_dir": "plans",
+            "state_root": state_root,
+            "keys": {
+                "verify_key_env": "MAESTRO_TEST_VERIFY_KEY",
+                "signing_seed_env": "MAESTRO_TEST_SIGNING_SEED",
+                "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
+            },
+            "executables": binaries,
+            "route_receipts": {
+                "omp": "route-receipts/omp.json",
+                "claude": "route-receipts/claude.json",
+            },
+            "reviewer": {
+                "route": "claude",
+                "model": "review-model",
+                "effort": "high",
+                "finalization_timeout_s": 60,
+                "turn_timeout_s": 20,
+                "poll_interval_s": 1,
+            },
+            "execution": {
+                "route": "omp",
+                "model": "execution-model",
+                "effort": "medium",
+                "profile": "test",
+                "concurrency": 2,
+                "node_timeout_s": 120,
+                "turn_timeout_s": 30,
+                "final_acceptance_timeout_s": 45,
+                "backstop_t_s": 600,
+                "semantic_ceiling": 3,
+            },
+        }
+        (repo / "adws" / "maestro.config.yaml").write_text(
+            json.dumps(config), encoding="utf-8")
+        return {
+            "environment": environment,
+            "plan_file": plan_file,
+            "repo": repo,
+            "state": state / repo.name,
+            "stored": stored,
+        }
+
+    def test_named_plan_validate_binds_repository_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._named_plan_configuration(Path(tmp))
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(fixture["repo"]), \
+                    mock.patch.object(
+                        maestro, "_plan_validate", return_value=0) as validate:
+                self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
+        args = validate.call_args.args[0]
+        self.assertEqual(Path(args.plan_file).resolve(),
+                         fixture["plan_file"].resolve())
+        self.assertEqual(Path(args.repo).resolve(), fixture["repo"].resolve())
+        self.assertEqual(Path(args.data_dir).resolve(),
+                         (fixture["state"] / "data").resolve())
+        self.assertEqual(Path(args.receipt_dir).resolve(),
+                         (fixture["state"] / "receipts").resolve())
+        self.assertEqual(args.verify_key, [fixture["environment"][
+            "MAESTRO_TEST_VERIFY_KEY"]])
+        self.assertEqual(args.signing_seed, fixture["environment"][
+            "MAESTRO_TEST_SIGNING_SEED"])
+        self.assertEqual(Path(args.herdr).resolve(),
+                         (fixture["repo"].parent / "herdr").resolve())
+        self.assertEqual(Path(args.omp).resolve(),
+                         (fixture["repo"].parent / "omp").resolve())
+        self.assertEqual(Path(args.claude).resolve(),
+                         (fixture["repo"].parent / "claude").resolve())
+
+    def test_named_plan_finalize_derives_reviewer_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._named_plan_configuration(Path(tmp))
+            digest = maestro.plan_digest.digest_of(fixture["stored"])
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(fixture["repo"]), \
+                    mock.patch.object(
+                        maestro, "_plan_finalize", return_value=0) as finalize:
+                self.assertEqual(maestro.main(["plan", "finalize", "named"]), 0)
+        args = finalize.call_args.args[0]
+        root = fixture["state"] / "finalization" / digest
+        self.assertEqual(Path(args.plan_file).resolve(),
+                         fixture["plan_file"].resolve())
+        self.assertEqual(args.reviewer_route, "claude")
+        self.assertEqual(args.reviewer_model, "review-model")
+        self.assertEqual(args.reviewer_effort, "high")
+        self.assertIsNone(args.reviewer_profile)
+        self.assertEqual(args.reviewer_session_dir, str(root / "session"))
+        self.assertEqual(args.reviewer_report_file, str(root / "report.json"))
+        self.assertEqual(args.finalization_timeout_s, 60.0)
+
+    def test_named_run_start_derives_digest_and_external_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._named_plan_configuration(Path(tmp))
+            run_uuid = SimpleNamespace(hex="0123456789abcdef")
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(fixture["repo"]), \
+                    mock.patch.object(maestro.uuid, "uuid4",
+                                      return_value=run_uuid), \
+                    mock.patch.object(
+                        maestro, "_run_start", return_value=0) as start:
+                self.assertEqual(maestro.main(["run", "start", "named"]), 0)
+        args = start.call_args.args[0]
+        run_root = fixture["state"] / "runs" / ("run-" + run_uuid.hex)
+        self.assertEqual(Path(args.plan_file).resolve(),
+                         fixture["plan_file"].resolve())
+        self.assertEqual(args.digest, maestro.plan_digest.digest_of(
+            fixture["stored"]))
+        self.assertEqual(args.run_id, "run-" + run_uuid.hex)
+        self.assertEqual(args.db, str(fixture["state"] / "lifecycle.sqlite3"))
+        self.assertEqual(args.integration_path, str(run_root / "integration"))
+        self.assertEqual(args.worktrees_root, str(run_root / "worktrees"))
+        self.assertEqual(args.scratch_root, str(run_root / "scratch"))
+        self.assertEqual(args.agent_route, "omp")
+        self.assertEqual(args.agent_profile, "test")
+        for path in (args.db, args.data_dir, args.receipt_dir):
+            self.assertFalse(maestro._path_is_within(
+                Path(path), fixture["repo"]))
+            self.assertFalse(maestro._path_is_within(
+                Path(path), Path(args.integration_path)))
+
+    def test_named_plan_configuration_fails_closed_for_bad_env_and_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._named_plan_configuration(root)
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    self._repository_cwd(fixture["repo"]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = maestro.main(["plan", "validate", "named"])
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output.getvalue())["outcome"],
+                             "MAESTRO_ENVIRONMENT_REQUIRED")
+
+            malformed_repo = root / "malformed-config"
+            (malformed_repo / "adws").mkdir(parents=True)
+            (malformed_repo / "adws" / "maestro.config.yaml").write_text(
+                "[", encoding="utf-8")
+            with self._repository_cwd(malformed_repo), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = maestro.main(["plan", "validate", "named"])
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output.getvalue())["outcome"],
+                             "MAESTRO_CONFIGURATION_INVALID")
+
+            invalid = self._named_plan_configuration(
+                root / "invalid", state_root=".maestro-state")
+            with mock.patch.dict(
+                    os.environ, invalid["environment"], clear=False), \
+                    self._repository_cwd(invalid["repo"]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = maestro.main(["plan", "validate", "named"])
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output.getvalue())["outcome"],
+                             "MAESTRO_CONFIGURATION_INVALID")
+
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(fixture["repo"]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = maestro.main(["plan", "validate", "missing"])
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output.getvalue())["outcome"],
+                             "MAESTRO_CONFIGURATION_INVALID")
+
+            with mock.patch.dict(
+                    os.environ, fixture["environment"], clear=False), \
+                    self._repository_cwd(fixture["repo"]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                code = maestro.main([
+                    "plan", "validate", "named", "--repo", "override"])
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output.getvalue())["outcome"],
+                             "MAESTRO_CONFIGURATION_INVALID")
+
     def test_plan_validate_malformed_bytes_is_authoring_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = Path(tmp) / "plan.json"

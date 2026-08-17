@@ -75,7 +75,7 @@ The user prompt asks for the shape; the type enforces it. They always travel as 
 
 **Parse failure is not a restart.** If the response doesn't parse or doesn't validate, the harness re-prompts the **same session** with a correction naming the required fields — bounded by `JSON_FIX_ATTEMPTS` in `agents.py` (2). Gate violations use the identical mechanism, bounded instead by the phase's `retries`. A cold restart would throw away the context that produced the near-miss.
 
-In v1 there is no separate continue call to make: `agent_pi.run()` passes `--session-id`, which pi treats as create-or-continue, so running an agent and continuing it are the same call with the same id. Before parsing, the harness also tolerates a fenced `json` code block or prose wrapped around the object — but the prompt still asks for bare JSON, and every failed attempt is persisted as an invalid envelope row.
+There is no separate continuation action. OMP continues a prior per-agent session directory with `-c`; direct Claude Code resumes the stored session id. Before parsing, the harness also tolerates a fenced `json` code block or prose wrapped around the object — but the prompt still asks for bare JSON, and every failed attempt is persisted as an invalid envelope row.
 
 ## Injecting the previous envelope
 
@@ -136,7 +136,7 @@ adws/adw_data/sessions/{adw_id}/
 ├── context_handoff/        the ONE place agents write files for the agents that follow
 └── {agent_name}/
     ├── prompts/            exact prompts sent (system.md + user.md), saved before execution
-    ├── pi_sessions/        pi's own session state for this agent
+    ├── pi_sessions/        legacy directory name; persisted per-agent session state for either route
     ├── raw_output.jsonl    full JSONL stream from the coding agent, appended live
     └── envelope.json       the final valid-JSON response — captured, validated, persisted by code
 ```
@@ -148,14 +148,14 @@ adws/adw_data/sessions/{adw_id}/
 ```json
 {
   "planner": {"session_id": "sssf-a1b2c3d4-planner-9f2e",
-              "model": "google/gemini-3.6-flash", "coding_agent": "pi"},
+              "model": "opus", "coding_agent": "claude_code"},
   "builder": {"session_id": "sssf-a1b2c3d4-builder-71ac",
-              "model": "google/gemini-3.6-flash", "coding_agent": "pi"}
+              "model": "openai-codex/gpt-5.6-terra", "coding_agent": "omp"}
 }
 ```
 
-This map is the key that lets a later ADW rejoin each agent's **existing context window**. Run `adw_build.py --adw-id a1b2c3d4` after `adw_plan.py` and the builder resumes its own session rather than starting cold.
+This map records each agent's logical session identity and selected route. A later ADW joins the same run directories and hands off `context_handoff/`; launcher continuity is route-specific. Direct Claude Code resumes only a saved matching request, while OMP resumes the state it keeps in the per-agent session directory.
 
-The map records the model each session was created with. If config drift changes an agent's model, that agent starts a **fresh** session and the map is updated — never a bad resume. `agent_sessions` in `sssf.db` is the queryable mirror of this file.
+Changing a model or profile does **not** guarantee a fresh context. `agent_sessions` in `sssf.db` is the queryable mirror of this file; use a new `--adw-id` for a guaranteed isolated run.
 
 **Files are the raw record; the db is the queryable mirror.** Losing `sssf.db` loses nothing that can't be rebuilt from `raw_output.jsonl`, `envelope.json`, and `agent_map.json`.

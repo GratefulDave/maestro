@@ -179,6 +179,21 @@ class OmpRouteTest(unittest.TestCase):
                      "--system-prompt"):
             self.assertIn(flag, argv)
 
+    def test_model_route_keeps_json_as_the_mode_value(self):
+        _, argv = self._run_capturing_argv(self._request(self.root / "sessions"))
+        self.assertEqual(argv[argv.index("--mode") + 1], "json")
+
+    def test_profile_route_omits_model_selection_and_records_reported_model(self):
+        request = self._request(self.root / "sessions")
+        request.pm_profile = "grok"
+        result, argv = self._run_capturing_argv(request)
+
+        self.assertEqual(argv[argv.index("--pm-profile") + 1], "grok")
+        self.assertNotIn("--provider", argv)
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("--thinking", argv)
+        self.assertEqual(result.model_ran, "openai-codex/gpt-5.6-luna")
+
     # ── binding verification (§9.5) ─────────────────────────────────────────
 
     def test_a_substituted_model_is_refused(self):
