@@ -1,26 +1,12 @@
 # sssf.config.yaml — the factory's agent roster. One agent, one prompt, one purpose.
-# v1 runs the omp coding agent only; coding_agent: claude_code arrives in v2.
+# OMP and direct Claude Code routes are both supported; each agent selects its route.
 defaults:
   coding_agent: omp
   model: openai-codex/gpt-5.6-terra  # provider/id — a bare pattern is ambiguous across providers
   thinking: medium                 # off | minimal | low | medium | high | xhigh | max
   harness_engineering: []          # omp extensions loaded into the harness (-e)
-  # Roster-wide allowlist; any agent may override with its own list.
-  # NOTE: --tools filters extension and custom tools too, not just builtins. An agent
-  # whose harness_engineering extension registers a tool MUST name that tool in its own
-  # tools list — otherwise the extension loads and its tool is silently filtered out.
-  #
-  # These are omp's names, and omp rejects the whole run over one it does not
-  # know rather than ignoring it. It has no partial-edit tool: `write` creates
-  # or overwrites a whole file, so an agent that changes one line rewrites the
-  # file around it. `glob` is what pi called `find`, and directory listing is
-  # bash's job.
-  tools:
-    - read                         # read file contents
-    - bash                         # execute bash commands, including directory listing
-    - write                        # create/overwrite whole files — omp has no partial edit
-    - grep                         # search file contents
-    - glob                         # find files by glob
+  # Omit `tools` to retain every default tool provided by each agent runtime.
+  # Per-agent `tools` is only for deliberate restriction.
   # Off-limits to every agent that does not name them in its own `writes`.
   # `tools` alone cannot protect these: bash runs `git checkout`, and write
   # reaches any path. An agent must not be able to edit the machinery that
@@ -42,45 +28,32 @@ observability:
 
 agents:
   - name: planner
-    model: openrouter/moonshotai/kimi-k3
+    model: opus
     thinking: high
-    color: "#a78bfa"                 # optional hex — the agent's lane color in the visualizer
+    coding_agent: claude_code
+    dangerously_skip_permissions: true
+    color: "#a78bfa"
     purpose: Turn a request into a plan the builder can implement without asking questions.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/planner/system.md
       user: adws/adw_data/prompt_engineering/planner/user.md
-    harness_engineering:
-      - adws/adw_data/harness_engineering/subagents.ts    # registers the four subagent_* tools below
-    writes:                        # the plan is the only thing it may leave in the repo
+    writes:
       - specs/
-    tools:                         # full recon + write for plan.md; `writes` is what keeps it out of the repo
-      - read
-      - grep
-      - glob
-      - bash
-      - write
-      - subagent_create            # extension tools MUST be named here or they are filtered out
-      - subagent_continue
-      - subagent_list
-      - subagent_remove
+    # Omit tools: direct Claude Code receives its complete default tool set.
 
   - name: builder
     color: "#22d3ee"
+    pm_profile: grok
     purpose: Implement the plan exactly; report every changed file in the envelope.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/builder/system.md
       user: adws/adw_data/prompt_engineering/builder/user.md
     # No `writes` key: unrestricted, and the only agent that is. It still cannot
     # touch defaults.protected_files — the builder does not get to edit its own grader.
-    tools:                         # the only agent that mutates the repo — everything omp has
-      - read
-      - grep
-      - glob
-      - bash
-      - write
-
+    # Omit tools: OMP receives its complete default tool set.
   - name: scout
     color: "#fbbf24"
+    pm_profile: openai-mechanical
     purpose: Find and report where things live; change nothing.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/scout/system.md
@@ -89,22 +62,14 @@ agents:
       - adws/adw_data/harness_engineering/subagents.ts    # registers the four subagent_* tools below
     writes: []                     # read-only, and now actually read-only: its findings
                                    # go to context_handoff/, which is runtime, not the repo
-    tools:                         # search-heavy recon; write only so scout_findings.md lands without a bash heredoc
-      - read
-      - grep
-      - glob
-      - bash
-      - write
-      - subagent_create            # extension tools MUST be named here or they are filtered out
-      - subagent_continue
-      - subagent_list
-      - subagent_remove
+    # Omit tools: OMP receives its complete default and extension tool sets.
 
   # No tester agent: running the suite is a known command, so it is a kind="code"
   # phase over adw_modules/quality.py. See SKILL.md hard rule 8.
 
   - name: reviewer
     model: openai-codex/gpt-5.6-terra
+    pm_profile: openai-performance
     thinking: high
     color: "#fb7185"
     purpose: Confirm that what was built is what was asked for; change nothing.
@@ -113,12 +78,7 @@ agents:
       user: adws/adw_data/prompt_engineering/reviewer/user.md
     writes: []                     # a reviewer that cannot fix cannot quietly fix — the
                                    # claim the tool list only implied, now enforced
-    tools:                         # full read surface; write only for review.md
-      - read
-      - grep
-      - glob
-      - bash
-      - write
+    # Omit tools: OMP receives its complete default tool set.
 
   - name: documenter
     # gpt-5.6-luna is deliberately NOT named here: omp 17.3.1 answers a
@@ -126,6 +86,7 @@ agents:
     # unbound model rather than recording a model that never ran.
     model: openai-codex/gpt-5.6-terra
     color: "#e879f9"
+    pm_profile: openai-mechanical
     purpose: Write up the change that was just made, from the diff; document only.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/documenter/system.md
@@ -135,9 +96,4 @@ agents:
       - docs/                      # Markdown anywhere, because docs live next to the
       - "**/*.md"                  # code they describe as often as in a docs folder.
       - "*.md"
-    tools:                         # reads the diff and the code; writes documentation only
-      - read
-      - grep
-      - glob
-      - bash
-      - write
+    # Omit tools: OMP receives its complete default tool set.

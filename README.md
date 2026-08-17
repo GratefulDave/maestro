@@ -58,47 +58,40 @@ Copy `.claude/skills/sssf/` into the target repo and type `/sssf install` inside
 
 ### Manual Install
 
-**Prereqs:** [`uv`](https://docs.astral.sh/uv/), [`pi`](https://github.com/mariozechner/pi-coding-agent), `sqlite3`, and an API key for whichever providers your roster names (see below). [`bun`](https://bun.sh) only if you want the visualizer.
+**Prereqs:** [`uv`](https://docs.astral.sh/uv/), `omp`, `sqlite3`, and authentication for every route selected by your roster. An agent with `coding_agent: claude_code` also needs an authenticated `claude` CLI. [`bun`](https://bun.sh) is only needed for the visualizer.
 
 ```bash
 # 1. get the skill into the target repo
 mkdir -p .claude/skills
-cp -r /path/to/super-simple-software-factory/.claude/skills/sssf .claude/skills/
+cp -r /path/to/maestro/.claude/skills/sssf .claude/skills/
 
-# 2. stamp the factory (run from the target repo ROOT, the cwd is where everything lands)
+# 2. stamp the factory (run from target repo root; cwd is where everything lands)
 uv run .claude/skills/sssf/scripts/install.py
-cp .env.sample .env                              # then set OPENROUTER_API_KEY
-pi --version                                     # confirm pi is on PATH, or set PI_PATH in .env
-git init && git commit --allow-empty -m init     # chains that end in a commit phase need a repo
+cp .env.sample .env
+omp --version
+claude --version       # only when the selected roster uses claude_code
+git init && git commit --allow-empty -m init     # commit-ending chains need a repo
 
-# 3. smoke test: two cheap read-only runs, end to end
+# 3. installation smoke: no agents or credentials required
+uv run adws/maestro.py workspace --help
+
+# 4. after credentials and roster selection: two read-only runs, end to end
 just demo
-just sessions              # what just happened
-just obs                   # the trace UI, needs bun
-
-# no just? every recipe is one line. the raw form of `just demo` is:
-uv run adws/adw_prompt.py "reply with a one-line summary of this repo" --agent scout
+just sessions
+just obs               # trace UI; needs bun
 ```
 
-Re-running `install.py` is safe. It skips every file that already exists and reports what it skipped, so a second run doubles as a drift check. `--force` refreshes stamped code to the skill's current version, but it overwrites **all** stamped files including your `sssf.config.yaml` and your prompts, so commit first.
+Re-running `install.py` is safe. It skips every file that already exists and reports what it skipped, so a second run doubles as a drift check. `--force` refreshes stamped code to the skill's current version, but it overwrites **all** stamped files including `sssf.config.yaml` and prompts; commit first.
 
-Green on the smoke test means the whole path works: config validated, session minted, Pi ran, envelope parsed, events landed in `adws/adw_data/sssf.db`. Fix it there before composing anything larger, because every multi-agent chain rides this exact path.
+The Maestro help command proves the installed control-plane surface exists. A green `just demo` proves the selected roster validated, sessions were minted, agents ran, envelopes parsed, and events landed in `adws/adw_data/sssf.db`.
 
-### Which API keys you actually need
+### Which credentials you actually need
 
-That depends on your roster, not on this repo. Every `model:` in `sssf.config.yaml` is written `provider/model-id`, and the provider half decides the key. Which key pi reads for a given provider comes from `~/.pi/agent/models.json`.
+The roster decides. An OMP agent either uses a named `pm_profile` or, without one, an explicit `provider/model-id` resolved through `omp models`. A direct Claude Code agent uses its configured model through the authenticated Claude CLI. `.env.sample` names only the environment-key option used by its sample route; it cannot validate provider or CLI authentication for you.
 
-The starter roster deliberately mixes providers to show the point, so out of the box it wants three:
+The stamped starter roster mixes direct Claude planning with OMP execution profiles. Read its YAML before changing models or assuming a credential requirement; choosing one provider/model and removing profile-specific overrides is the simplest way to make a uniform roster.
 
-| Model in the starter roster | Provider | Key |
-|---|---|---|
-| `google/gemini-3.6-flash` (default, builder, scout) | served via openrouter | `OPENROUTER_API_KEY` |
-| `fireworks/accounts/fireworks/models/kimi-k3` (planner) | fireworks | `FIREWORKS_API_KEY` |
-| `openai/gpt-5.6-terra`, `openai/gpt-5.6-luna` (reviewer, documenter) | openai | `OPENAI_API_KEY` |
-
-**Want one key instead of three?** Delete the per-agent `model:` lines and let every agent inherit `defaults.model`. The whole roster then runs on one provider. Cheapest way to get a first green run.
-
-One sharp edge worth knowing: `agents.validate()` checks that a model is *written* as `provider/id`, not that the provider is reachable or that its key is set. A missing key does not fail at startup. It fails when that agent runs, partway into a chain.
+`agents.validate()` resolves explicit OMP model bindings and checks prompt references before launch. It does not prove credentials, profile availability, or downstream provider reachability; those failures occur when that agent starts.
 
 
 ---
@@ -128,13 +121,14 @@ Everything lives in `.claude/skills/sssf/`. `SKILL.md` carries the hard rules an
 | What lands in your repo | Where it comes from | Tracked |
 |---|---|---|
 | `adws/adw_sssf_config/sssf.config.yaml` | `templates/sssf.config.yaml` | yes, it is your agent roster |
-| `adws/adw_*.py` | `templates/adws/` | yes, twelve starter workflows |
+| `adws/maestro.py`, `adws/maestro.config.yaml` | `templates/adws/` | yes, Maestro repository/workspace orchestration |
+| `adws/adw_*.py` | `templates/adws/` | yes, starter workflows |
 | `adws/adw_modules/` | `templates/adws/adw_modules/` | yes, all low-level logic |
 | `adws/adw_data/prompt_engineering/` | `templates/prompt_engineering/` | yes, **your prompts live here** |
-| `adws/adw_data/harness_engineering/` | `templates/harness_engineering/` | yes, pi extensions |
+| `adws/adw_data/harness_engineering/` | `templates/harness_engineering/` | yes, OMP extensions |
 | `.env.sample` | `templates/env.sample` | yes |
 | `justfile` | `templates/justfile` | yes, starter recipes to run and watch |
-| `adws/adw_data/sessions/`, `sssf.db` | created at runtime | no, gitignored |
+| `adws/adw_data/sessions/`, `adws/adw_data/sssf.db` | created at runtime | no, gitignored |
 
 The prompts are yours the moment they land. Edit them in `adws/adw_data/prompt_engineering/{agent}/`, never back inside the skill.
 
@@ -148,10 +142,10 @@ There is no DSL here. No framework to learn. It is Python, YAML, agents, and a s
 
 ```yaml
 defaults:
-  coding_agent: pi                 # v1 runs pi only, claude_code is schema-valid and stubbed
-  model: google/gemini-3.6-flash   # provider/model-id, a bare id can match several providers
-  thinking: medium                 # off | minimal | low | medium | high | xhigh | max
-  protected_files:                 # no agent may edit the machinery that grades it
+  coding_agent: omp
+  model: openai-codex/gpt-5.6-terra # explicit OMP binding if no profile is set
+  thinking: medium
+  protected_files:
     - adws/adw_modules/
     - adws/adw_sssf_config/
     - adws/adw_*.py
@@ -159,17 +153,18 @@ defaults:
 
 agents:
   - name: planner
-    model: fireworks/accounts/fireworks/models/kimi-k3
-    thinking: high                 # per-agent overrides win over defaults
-    color: "#a78bfa"               # this agent's lane swatch in the trace
+    coding_agent: claude_code
+    model: opus
+    thinking: high
     purpose: Turn a request into a plan the builder can implement without asking questions.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/planner/system.md
       user: adws/adw_data/prompt_engineering/planner/user.md
-    harness_engineering:
-      - adws/adw_data/harness_engineering/subagents.ts   # this agent can spawn subagents
-    writes:                        # the plan is all it may leave in the repo
-      - specs/
+    tools: [Read, Grep, Glob, Bash, Write]
+
+  - name: builder
+    pm_profile: grok
+    purpose: Implement the plan exactly; report every changed file in the envelope.
 ```
 
 Five starter agents ship in the box: `planner`, `builder`, `scout` (read-only recon), `reviewer`, and `documenter`. There is no tester, because running a suite is a known command and therefore code.
@@ -242,7 +237,7 @@ Determinism is wired into every step. Agents must return a specific structure, e
 
 Gates verify claims, never predictions. Nobody knows which files an agent will touch before it finishes, so gates run **after** the fact against the envelope's own declarations: `artifacts_exist`, `files_non_empty`, `json_parses`, `diff_matches_claims`, `tests_pass(...)`. A gate is a callable with the signature `gate(envelope, run) -> GateReport`, one `check(item, ok, note)` per thing it examined, so a green gate tells you *what* it verified.
 
-When JSON does not parse or a gate returns violations, **nothing restarts**. The harness re-prompts the same session with a correction naming exactly what was wrong, and the context window stays intact. Pi treats `--session-id` as create-or-continue, so running an agent and continuing it are the same call. A cold restart throws away everything the agent learned. A correction costs one message.
+When JSON does not parse or a gate returns violations, **nothing restarts**. The harness re-prompts the same route session with a correction naming exactly what was wrong, and context stays intact. OMP continues its prior agent directory with `-c`; direct Claude Code resumes its stored session id. A cold restart throws away everything the agent learned. A correction costs one message.
 
 The output contract lives in three places and they are one thing: the type in `data_types.py`, the JSON example in that agent's `user.md` `## Report` section, and `output_type=` at the call site. **Change one, change all three in the same edit.**
 
@@ -254,11 +249,11 @@ The output contract lives in three places and they are one thing: the type in `d
   <img src="images/06_trace_path.svg" alt="Running agents to tracer.py to a WAL SQLite db with seven tables, read by a cursor poll query, with no websocket and no ingest endpoint" width="780">
 </p>
 
-One data path, no exceptions: **agents write to SQLite, readers poll SQLite.** `agent_pi.py` tails the coding agent's JSONL stdout line by line and the tracer inserts each event while the agent is still working, so tool calls are visible mid-run instead of batched at the end.
+One data path, no exceptions: **agents write to SQLite, readers poll SQLite.** The selected coding-agent route is drained line by line and the tracer inserts each event while the agent is still working, so tool calls are visible mid-run instead of batched at the end.
 
 Ten event types land across seven tables: `sessions`, `phases`, `events`, `envelopes`, `gate_results`, `agent_sessions`, and `processes` (adw_id to pid, so a stuck run can be found and stopped). Every event logs against both its `adw_id` and its `phase_id`, and `parent_id` nests spans, so an agent phase expands into its own tool calls.
 
-Pi announces a tool call across three raw events, so the interface folds them into exactly **one** `tool_call` row per real call. Each row is named the way you would read it aloud (`bash: ls -la src`) and carries `{tool, tool_call_id, args, result_snippet, ok, duration_ms, agent}`.
+The routes emit different raw event shapes; the adapters normalize each completed call into exactly **one** `tool_call` row. Each row carries `{tool, tool_call_id, args, result_snippet, ok, duration_ms, agent}`.
 
 ```sql
 select * from events where adw_id = ? and rowid > ? order by rowid limit 500;
@@ -293,7 +288,7 @@ super-simple-software-factory/          # the deployable factory, and nothing el
     └── templates/                      # EXACTLY what install.py stamps
         ├── sssf.config.yaml            # the starter roster
         ├── prompt_engineering/{agent}/ # system.md + user.md per agent
-        ├── harness_engineering/        # pi extensions
+        ├── harness_engineering/        # OMP extensions
         └── adws/
             ├── adw_*.py                # the twelve starter workflows
             └── adw_modules/            # ALL low-level logic, ADW scripts stay thin
@@ -354,15 +349,15 @@ Honest edges, because knowing them is cheaper than discovering them.
 | Failure | What actually happens | What to do |
 |---|---|---|
 | The test phase reports green on a fresh install | `quality.py` ships placeholder commands that exit 0. Three ADWs run them as their test phase | Wire your real commands into `quality.py` before trusting `adw_build_test`, `adw_plan_build_test`, or `adw_simple_sdlc`. This is the first thing to customize |
-| A bare model pattern | The same model sits under several providers, so `gemini-3.6-flash` matches three catalog entries and `agents.validate()` refuses to spawn | Always write `provider/model-id` |
+| A bare OMP model pattern | The same model can sit under several providers, so an ambiguous pattern makes `agents.validate()` refuse to spawn | Write `provider/model-id`, or choose a `pm_profile` deliberately |
 | `just` is not installed | The stamped `justfile` is a convenience wrapper, nothing depends on it | Every recipe is a one-line `uv run` or `sqlite3` command. Open the justfile and run the line yourself |
-| A coding agent hangs silently | No events, no tokens, an empty `raw_output.jsonl`. The trace goes quiet rather than red | Query `processes` for what is alive and kill it children-first. A killed run finalizes its own trace to `fail` |
+| A coding agent hangs silently | No events, no tokens, an empty `raw_output.jsonl`. The trace goes quiet rather than red | Query `processes`, verify the recorded PID and command before manual termination, then inspect terminal status |
 | The synced triad drifts | Type, `## Report` example, and `output_type=` disagree, so every call burns correction rounds | Grep the type name and fix all three in one edit |
 | Gates pass, output is bad | Gates check what a predicate can check, not plan quality or code taste | Run the `reviewer`, or read it yourself |
 | An agent edits something it should not | Detected and rolled back after the call, and the phase fails | Expected. Widen that agent's `writes` if the change was legitimate |
 | Commit phase has nothing to commit | `commit_all` raises if the cwd is not a git repo or nothing changed | `git init` with one commit first. A no-op build fails the phase rather than committing nothing |
 | `install.py --force` | Overwrites **all** stamped files, config and prompts included | Commit before you force |
-| `coding_agent: claude_code` | Schema-valid, but `agent_cc.py` raises | v1 is Pi only |
+| `coding_agent: claude_code` | Direct Claude Code requires an authenticated CLI plus an explicit builtin tool allowlist; extensions are rejected | Set the required `tools`, configure CLI authentication, and remove unsupported `harness_engineering` entries |
 
 Also missing on purpose, so you know what to add: this runs on your current branch. For real work you want a branch per run, a sandbox around the agent, and a merge step at the end.
 
@@ -385,7 +380,7 @@ Where to start, roughly in the order that pays off fastest:
 | Your roster | `adws/adw_sssf_config/sssf.config.yaml` | Models, thinking levels, tools, and what each agent is allowed to write |
 | Your chains | `adws/adw_*.py` | Copy the closest workflow and edit the phase list. They are 40 to 180 lines on purpose |
 | Your definition of done | `adws/adw_modules/gates.py` | A gate is one function. Whatever "done" means where you work, write it here |
-| Your agent capabilities | `adws/adw_data/harness_engineering/` | Pi extensions, a different set per agent if that is what the job needs |
+| Your agent capabilities | `adws/adw_data/harness_engineering/` | OMP extensions, scoped per agent when that is what the job needs |
 
 And what it deliberately does not do. It runs on your current branch. There is no sandbox, no branch per run, no merge step, no cloud, and no human-in-the-loop approval phase. Those are the obvious next things to build. They are left out so the core stays small enough to read in one sitting, which is the only reason you would trust it enough to change it.
 

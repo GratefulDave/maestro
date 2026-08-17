@@ -41,13 +41,15 @@ OBLIGATION_LEDGER = (
 )
 
 REQUIRED_VERBS = (
+    "bootstrap", "plan author",
     "plan validate", "plan finalize", "plan show", "plan list",
     "run start", "run status", "run cancel", "run resume",
     "retry", "skip", "abandon",
 )
 
 WORKSPACE_REQUIRED_VERBS = (
-    "workspace validate", "workspace finalize", "workspace start",
+    "workspace author", "workspace validate", "workspace finalize",
+    "workspace start",
     "workspace status", "workspace cancel", "workspace resume",
     "workspace publish", "workspace rollback",
 )

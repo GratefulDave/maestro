@@ -7,16 +7,16 @@ Add or retune agents in `sssf.config.yaml`.
 Edit the agent's entry in place:
 
 ```yaml
-  - name: builder
-    model: google/gemini-3.6-flash   # ALWAYS provider/model-id
-    thinking: high                   # was medium
+  - name: reviewer
+    model: openai-codex/gpt-5.6-terra  # OMP without pm_profile: provider/model-id
+    thinking: high
 ```
 
-Write the model as `provider/model-id`, never a bare id. The same model is usually carried by several providers, and an ambiguous pattern raises in `agents.validate()` — grounding every agent that inherits it. See `references/config.md`.
+OMP agents without `pm_profile` require `provider/model-id`; direct Claude Code receives its configured model name unchanged. Do not substitute routes or model identifiers by guess: `agents.validate()` resolves explicit OMP bindings before an agent starts.
 
-Thinking levels are Pi's reasoning effort: `off | minimal | low | medium | high | xhigh | max`. It only bites when the model is registered with `reasoning: true` in `~/.pi/agent/models.json`.
+Thinking values are `off | minimal | low | medium | high | xhigh | max`. OMP passes the value as `--thinking` only outside profile mode; direct Claude Code passes it as `--effort`.
 
-**A model change means a fresh session.** `agent_map.json` records the model each coding-agent session was created with. When a joined run (`--adw-id`) finds the config's model no longer matches the recorded one, that agent starts a **new** session rather than resuming — the map is updated, never a bad resume. Thinking changes do not invalidate a session; model changes do. Expect the agent to lose its accumulated context window on the first run after the change.
+**A model or profile change is not a context reset.** `agent_map.json` records each coding agent's model and logical session identity. Direct Claude Code scopes its persisted session to the matching request; OMP resumes the state it keeps under the per-agent session directory. Use a new `--adw-id` for a guaranteed isolated run.
 
 ## Recolor an agent's lane
 
@@ -29,60 +29,55 @@ Purely cosmetic and safe to change mid-project: the color rides the `agent_start
 
 ## Retune tools
 
-Pi's seven builtins: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. The last three are **off in bare Pi**, so an agent that doesn't name them will shell out through `bash` to search and list.
+`tools` is a route-specific allowlist. The starter OMP default is `read`, `bash`, `write`, `grep`, and `glob`; OMP has no partial-edit tool, and directory listing belongs in `bash`. Direct Claude Code requires its own explicit builtin allowlist, such as `Read`, `Grep`, `Glob`, `Bash`, and `Write`.
 
-Set the roster-wide floor in `defaults`, then narrow per agent:
+Set the roster-wide OMP default, then narrow per agent:
 
 ```yaml
 defaults:
-  tools: [read, bash, edit, write, grep, find, ls]
+  tools: [read, bash, write, grep, glob]
 
 agents:
   - name: reviewer
-    tools:                # explicit list wins over defaults
+    tools:
       - read
       - grep
-      - find
-      - ls
+      - glob
       - bash
       - write
 ```
 
-**Resolution:** the agent's own list wins → else it inherits `defaults.tools` → else `None`, meaning all tools. An empty list is not "all tools"; it is a tool-less agent, and it will stall.
+An agent's own list wins; otherwise it inherits `defaults.tools`. For direct Claude Code, an explicit list is required. An empty list deliberately starts a no-tools Claude run.
 
 Narrow by role, not by reflex:
 
-- Any agent that must produce a `context_handoff/` artifact needs **`write`** — without it, it falls back to a `bash` heredoc to create the file the gate checks for.
-- Withhold `edit`/`write` only where the restriction *is* the guarantee. The reviewer's contract is "change nothing", so withholding `edit` makes that structural instead of merely prompted.
-- Recon agents should get the full read surface (`read`, `grep`, `find`, `ls`) — cheaper and more legible in the trace than the equivalent `bash` calls.
+- Any agent that must produce a `context_handoff/` artifact needs **`write`**, or it must use a shell heredoc.
+- Withhold `write` only where the restriction is the guarantee. The reviewer's contract is "change nothing"; enforce that with `writes: []`, not a prompt.
+- Recon agents need only their actual search surface; the starter scout also receives the stamped subagent extension tools.
 
-**Extension tools count against the allowlist.** `--tools` filters built-in, extension, and custom tools alike. Once an agent has a `tools` list — its own, or inherited from `defaults` — a tool registered by one of its `harness_engineering` extensions is dropped unless it is named there. Nothing errors: the extension loads, the run passes, the tool is just never offered. Any agent with a tool-registering extension must list that tool by name.
+**OMP extension tools count against the allowlist.** `omp --tools` filters builtin, extension, and custom tools alike. Once an OMP agent has a `tools` list — its own or inherited — a `harness_engineering` tool is absent unless it is named there.
 
 ## Add harness extensions
 
-```yaml
-    harness_engineering:
-      - .pi/extensions/json_guard.ts    # a pi extension FILE PATH
-```
-
-Entries are pi extension **file paths**, passed through as `pi -e <path>`, applied to that agent only. Reach for an output-tightening extension when an agent keeps wrapping its envelope in prose and burning correction retries. The starter roster ships with none — this is an escape hatch, not a default.
-
-**Adding a tool-registering extension is a two-part edit.** The extension path goes in `harness_engineering`, *and* the tool name it registers goes in that agent's `tools` list:
+`harness_engineering` is OMP-only. Each entry is an extension file path passed as `omp -e <path>`:
 
 ```yaml
-  - name: reviewer
+  - name: scout
     harness_engineering:
-      - .pi/extensions/ast_query.ts     # registers tool: ast_query
+      - adws/adw_data/harness_engineering/subagents.ts
     tools:
       - read
       - grep
-      - find
-      - ls
+      - glob
       - bash
-      - ast_query                       # REQUIRED — or the extension loads and its tool is filtered out
+      - write
+      - subagent_create
+      - subagent_continue
+      - subagent_list
+      - subagent_remove
 ```
 
-Skip the second half and it fails silently: extension loaded, run green, tool never available to the model. Extensions that only shape output or register flags — no new tool — need no `tools` change.
+Adding a tool-registering extension is a two-part edit: its path goes in `harness_engineering`, then every registered tool goes in `tools`. Direct Claude Code rejects extensions rather than silently accepting unmapped capability.
 
 ## Add a new agent
 

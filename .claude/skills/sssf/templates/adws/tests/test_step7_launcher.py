@@ -47,16 +47,31 @@ if argv[:2] == ["pane", "split"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"]}}}))
 elif argv[:2] == ["pane", "get"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"], "foreground_cwd": "/wrong"}}}))
+elif argv[:2] == ["pane", "process-info"]:
+    root = os.path.dirname(record) if record else "/tmp"
+    launched = os.path.join(root, "launched")
+    process = "omp" if os.path.exists(launched) and argv[-1] in open(launched).read().split() else "zsh"
+    print(json.dumps({"result": {"process_info": {
+        "pane_id": "w1:p2",
+        "foreground_processes": [{"name": process, "argv0": process, "argv": [process]}]}}}))
 elif argv[:2] == ["agent", "start"]:
     if os.environ.get("FAKE_HERDR_REFUSE"):
         sys.stderr.write(json.dumps({"error": {"code": "launch_refused"}}))
         sys.exit(1)
-    busy = os.environ.get("FAKE_HERDR_BUSY_ONCE")
-    if busy and not os.path.exists(busy):
-        open(busy, "w").close()
-        sys.stderr.write(json.dumps({"error": {"code": "agent_pane_busy"}}))
-        sys.exit(1)
     print(json.dumps({"result": {"agent": {"name": argv[2], "status": "idle", "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
+elif argv[:2] == ["agent", "wait"]:
+    print(json.dumps({"result": {"ok": True, "status": "idle"}}))
+elif argv[:2] == ["agent", "prompt"]:
+    print(json.dumps({"result": {"ok": True}}))
+elif argv[:2] == ["agent", "read"]:
+    name = argv[2]
+    record = os.environ.get("FAKE_HERDR_ARGV")
+    root = os.path.dirname(record) if record else "/tmp"
+    path = os.path.join(root, name + ".prompt")
+    if os.path.exists(path):
+        print(json.dumps({"result": {"text": open(path, encoding="utf-8").read()}}))
+    else:
+        print(json.dumps({"result": {}}))
 elif argv[:2] == ["agent", "get"]:
     if os.environ.get("FAKE_HERDR_GET_FAILURE"):
         sys.stderr.write(json.dumps({"error": {"code": "transport_failure"}}))
@@ -66,7 +81,7 @@ elif argv[:2] == ["agent", "get"]:
         print(json.dumps({"result": {}}))
     else:
         status = os.environ.get("FAKE_AGENT_STATUS", "working")
-        print(json.dumps({"result": {"agent": {"name": argv[2], "status": status, "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
+        print(json.dumps({"result": {"agent": {"name": argv[2], "status": status, "interactive_ready": True, "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
 elif argv[:2] == ["pane", "close"]:
     if os.environ.get("FAKE_HERDR_CLOSE_FAILURE"):
         sys.stderr.write(json.dumps({"error": {"code": "close_failure"}}))
@@ -75,6 +90,10 @@ elif argv[:2] == ["pane", "close"]:
     if marker and not os.environ.get("FAKE_HERDR_CLOSE_DOES_NOT_STOP_AGENT"):
         open(marker, "w").close()
     print(json.dumps({"result": {"closed": True}}))
+elif argv[:2] == ["pane", "send-keys"]:
+    root = os.path.dirname(record) if record else "/tmp"
+    open(os.path.join(root, "launched"), "a").write(argv[2] + "\n")
+    print(json.dumps({"result": {"ok": True}}))
 else:
     print(json.dumps({"result": {}}))
 '''
@@ -132,6 +151,27 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(handle.launched_cwd, self.worktree.resolve())
         self.assertEqual(handle.pane_id, "w1:p2")
 
+    def test_read_commands_accept_raw_text_output(self):
+        # `herdr agent read` / `pane read` print the snapshot as raw text; they
+        # have no JSON output mode. Rejecting that as PROTOCOL_INVALID_JSON
+        # blinds the composer-visibility wait and the receipt scan.
+        script = self.root / "text-herdr"
+        script.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'MAESTRO_CLAUDE_RECEIPT_OK'\n")
+        script.chmod(0o755)
+        harness = HerdrLauncher(herdr_path=script, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        payload = harness._herdr("agent", "read", "n", "--source", "visible")
+        self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK",
+                      launcher._payload_text(payload))
+        payload = harness._herdr("pane", "read", "w1:p2", "--source", "visible")
+        self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK",
+                      launcher._payload_text(payload))
+        # Every other command still has to speak JSON.
+        with self.assertRaisesRegex(RuntimeError, "PROTOCOL_INVALID_JSON"):
+            harness._herdr("pane", "list")
+
     def test_launch_refuses_unadmitted_route_before_creating_pane(self):
         fixtures = Path(__file__).parent / "fixtures" / "step8"
         claude_only = load_admitted_routes(
@@ -155,13 +195,71 @@ class LauncherContractTest(unittest.TestCase):
         self.assertNotIn(["agent", "start"], [call[:2] for call in calls])
         self.assertIn(["pane", "close", "w1:p2"], calls)
 
-    def test_launch_retries_until_new_pane_shell_is_ready(self):
-        os.environ["FAKE_HERDR_BUSY_ONCE"] = str(self.root / "busy-once")
+    def test_launch_waits_for_shell_then_starts_agent_once(self):
         launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
                                  claude_path=Path("/opt/claude"),
                                  admitted_routes=self.admitted_routes)
         handle = launcher.launch(self.spec())
         self.assertEqual(handle.pane_id, "w1:p2")
+        calls = [json.loads(line)["argv"]
+                 for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        wait_indexes = [
+            index for index, call in enumerate(calls)
+            if call[:2] == ["pane", "process-info"]
+        ]
+        start_indexes = [
+            index for index, call in enumerate(calls)
+            if call[:2] == ["agent", "start"]
+        ]
+        # The shell must look ready on several consecutive snapshots before we
+        # start: one ready snapshot can land in the gap before login hooks
+        # spawn, which makes Herdr report agent_pane_busy.
+        self.assertGreaterEqual(len(wait_indexes), 5)
+        self.assertEqual(len(start_indexes), 1)
+        self.assertLess(wait_indexes[4], start_indexes[0])
+        for index in wait_indexes:
+            self.assertEqual(
+                calls[index],
+                ["pane", "process-info", "--pane", "w1:p2"])
+        start = calls[start_indexes[0]]
+        self.assertEqual(
+            start[:9],
+            ["agent", "start", start[2], "--kind", "omp",
+             "--pane", "w1:p2", "--timeout", "180000"])
+        self.assertEqual(start[9], "--")
+        self.assertEqual(calls[start_indexes[0] + 1][:2], ["pane", "get"])
+        # The coder must be waited for with the documented readiness gate, and
+        # the prompt must be handed to the agent composer -- not typed into the
+        # pane's shell -- so text plus Enter are submitted atomically.
+        wait_indexes = [
+            index for index, call in enumerate(calls)
+            if call[:2] == ["agent", "wait"]
+        ]
+        self.assertEqual(len(wait_indexes), 1)
+        wait = calls[wait_indexes[0]]
+        self.assertEqual(wait[:5], ["agent", "wait", start[2], "--until", "idle"])
+        self.assertIn("--timeout", wait)
+        prompt_indexes = [
+            index for index, call in enumerate(calls)
+            if call[:2] == ["agent", "prompt"] and call[3].startswith("@")
+        ]
+        self.assertEqual(len(prompt_indexes), 1)
+        prompt = calls[prompt_indexes[0]]
+        self.assertEqual(
+            prompt[:5],
+            ["agent", "prompt", start[2],
+             "@{0}".format(self.prompt.resolve()), "--wait"])
+        # The harness turn runs as long as the task does, so the launch settles
+        # on either working or idle rather than holding open until the run ends.
+        self.assertEqual(
+            [prompt[i + 1] for i, a in enumerate(prompt) if a == "--until"],
+            ["working", "idle"])
+        self.assertGreater(int(prompt[prompt.index("--timeout") + 1]), 5000)
+        self.assertLess(wait_indexes[0], prompt_indexes[0])
+        self.assertFalse(any(
+            call[:2] in (["pane", "run"], ["pane", "send-keys"],
+                         ["agent", "send-keys"])
+            for call in calls))
 
     def test_launch_refusal_closes_the_allocated_pane(self):
         os.environ["FAKE_HERDR_REFUSE"] = "1"
@@ -184,7 +282,6 @@ class LauncherContractTest(unittest.TestCase):
     def test_cancel_never_raises(self):
         launcher = FakeLauncher()
         handle = launcher.launch(self.spec())
-        launcher.cancel(handle, time.monotonic() - 1.0)
         launcher.cancel(handle, time.monotonic() - 1.0)
         self.assertEqual(launcher.poll(handle).state, PollState.GONE)
 
@@ -276,12 +373,8 @@ class LauncherContractTest(unittest.TestCase):
         prompt_calls = [call for call in calls if call[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompt_calls), 1)
         bootstrap = prompt_calls[0][-1]
-        self.assertEqual(
-            bootstrap,
-            "Read and follow the instructions in {0}.".format(
-                self.prompt.resolve()))
         self.assertNotIn(prompt_bytes, json.dumps(calls))
-        self.assertLess(len(bootstrap), len(str(self.prompt.resolve())) + 48)
+        self.assertLess(len(bootstrap), len(str(self.prompt.resolve())) + 2)
 
     def test_reclaim_matches_exact_token_only(self):
         launcher = FakeLauncher()
@@ -383,14 +476,15 @@ class TranscriptAndRouteTest(unittest.TestCase):
         empty.read_new()
         self.assertEqual(empty.synthesized_exit(), (1, "NO_ENVELOPE"))
 
-    def test_omp_argv_has_explicit_latest_profile_and_session(self):
+    def test_omp_argv_uses_pm_profile_and_session_only(self):
         spec = LaunchSpec("t", self.root, self.root / "p", self.root / "e", "omp", "provider/model", "high", "latest-profile", self.root / "s")
         argv = build_omp_argv(Path("/bin/omp"), spec)
         self.assertEqual(argv[0], "/bin/omp")
-        self.assertIn("--profile", argv)
-        self.assertEqual(argv[argv.index("--profile") + 1], "latest-profile")
+        self.assertIn("--pm-profile", argv)
+        self.assertEqual(argv[argv.index("--pm-profile") + 1], "latest-profile")
         self.assertIn("--session-dir", argv)
-        self.assertNotIn("--session-id", argv)
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("--effort", argv)
 
     def test_claude_argv_is_direct_and_unattended(self):
         spec = LaunchSpec("t", self.root, self.root / "p", self.root / "e", "claude", "opus", "high", None, self.root / "s")

@@ -6,11 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import sqlite3
 import subprocess
+import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
+
+import yaml
 
 from adw_modules import coordinator as coordinator
 from adw_modules import coordinator_store
@@ -19,16 +25,21 @@ from adw_modules import finalization_window
 from adw_modules import launcher
 from adw_modules import lifecycle as lc
 from adw_modules import participant
+from adw_modules import plan_author
+from adw_modules import plan_contract_ingress
 from adw_modules import plan_finalization
+from adw_modules import plan_digest
 from adw_modules import plan_model
 from adw_modules import plan_validate as pv
 from adw_modules import publication
 from adw_modules import receipt_crypto
+from adw_modules import route_admission
 from adw_modules import route_receipts
 from adw_modules import scheduler
 from adw_modules import scheduler_types
 from adw_modules import watchdog
 from adw_modules import worktree
+from adw_modules import workspace_author
 from adw_modules import workspace_canonical
 from adw_modules import workspace_digest
 from adw_modules import workspace_model
@@ -51,10 +62,519 @@ class _PlanReceiptVerificationError(RuntimeError):
 class _RunPathConfigurationError(ValueError):
     """Run authority storage is located in a participant-writable boundary."""
 
+class _MaestroConfigurationError(ValueError):
+    """The repository-local Maestro configuration is absent or unsafe."""
+
+
+class _MaestroEnvironmentError(_MaestroConfigurationError):
+    """A configuration-directed environment variable is unavailable."""
+
+
+_MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
+_MAESTRO_SCHEMA = "maestro-config.v1"
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class _StrictYamlLoader(yaml.SafeLoader):
+    """Safe YAML plus duplicate-key refusal for operator configuration."""
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, str):
+            raise yaml.constructor.ConstructorError(
+                None, None, "configuration mapping keys must be strings",
+                key_node.start_mark)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                None, None, "duplicate configuration key: " + key,
+                key_node.start_mark)
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictYamlLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
+def _config_mapping(value, label, required, optional=()):
+    if not isinstance(value, dict):
+        raise _MaestroConfigurationError(label + " must be a mapping")
+    allowed = set(required) | set(optional)
+    missing = set(required) - set(value)
+    unknown = set(value) - allowed
+    if missing or unknown:
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(sorted(missing)))
+        if unknown:
+            detail.append("unknown " + ", ".join(sorted(unknown)))
+        raise _MaestroConfigurationError(
+            label + " has " + "; ".join(detail) + " keys")
+    return value
+
+
+def _config_string(value, label):
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or "\x00" in value):
+        raise _MaestroConfigurationError(label + " must be a non-empty string")
+    return value
+
+
+def _config_positive_number(value, label):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or value <= 0):
+        raise _MaestroConfigurationError(label + " must be positive")
+    return float(value)
+
+
+def _config_positive_integer(value, label):
+    if (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+        raise _MaestroConfigurationError(label + " must be a positive integer")
+    return value
+
+
+def _path_is_within(path: Path, boundary: Path) -> bool:
+    try:
+        path.relative_to(boundary)
+    except ValueError:
+        return False
+    return True
+
+
+def _repository_path(repo: Path, value, label, *, inside: bool) -> Path:
+    raw = Path(_config_string(value, label))
+    if raw.is_absolute():
+        raise _MaestroConfigurationError(label + " must be repository-relative")
+    resolved = (repo / raw).resolve()
+    within_repo = _path_is_within(resolved, repo)
+    if inside and not within_repo:
+        raise _MaestroConfigurationError(label + " must resolve inside the repository")
+    if not inside and within_repo:
+        raise _MaestroConfigurationError(label + " must resolve outside the repository")
+    return resolved
+
+
+def _config_relative_path(value, label) -> Path:
+    path = Path(_config_string(value, label))
+    if path.is_absolute():
+        raise _MaestroConfigurationError(label + " must be relative")
+    return path
+
+
+def _resolve_binary(value, label) -> str:
+    binary = _config_string(value, label)
+    resolved = shutil.which(binary)
+    if resolved is None:
+        raise _MaestroConfigurationError(label + " is not an executable on PATH")
+    path = Path(resolved).resolve()
+    if not path.is_file() or not os.access(str(path), os.X_OK):
+        raise _MaestroConfigurationError(label + " is not an executable file")
+    return str(path)
+
+
+def _resolve_key_environment(
+        name, label, expected_size: int, *, fallback: Optional[Path] = None,
+) -> str:
+    environment_name = _config_string(name, label)
+    if _ENVIRONMENT_NAME.fullmatch(environment_name) is None:
+        raise _MaestroConfigurationError(label + " must name an environment variable")
+    value = os.environ.get(environment_name)
+    if not value and fallback is not None and fallback.is_file():
+        try:
+            value = fallback.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError) as exc:
+            raise _MaestroEnvironmentError(
+                "key material file is unreadable: " + str(fallback)) from exc
+    if not value:
+        raise _MaestroEnvironmentError(
+            "required environment variable is unset: " + environment_name)
+    try:
+        material = bytes.fromhex(value)
+    except ValueError as exc:
+        raise _MaestroEnvironmentError(
+            "environment variable is not hexadecimal: " + environment_name) from exc
+    if len(material) != expected_size:
+        raise _MaestroEnvironmentError(
+            "environment variable has invalid key length: " + environment_name)
+    return value
+
+
+def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
+    """Repository layout, binaries, and route destinations. No key material."""
+    try:
+        with config_path.open(encoding="utf-8") as handle:
+            raw = yaml.load(handle, Loader=_StrictYamlLoader)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise _MaestroConfigurationError(
+            "cannot load " + str(_MAESTRO_CONFIG_FILE)) from exc
+    root = _config_mapping(
+        raw, "maestro configuration",
+        ("schema", "plans_dir", "state_root", "keys", "executables",
+         "route_receipts", "reviewer", "execution"))
+    if root["schema"] != _MAESTRO_SCHEMA:
+        raise _MaestroConfigurationError(
+            "schema must be " + _MAESTRO_SCHEMA)
+
+    plans_dir = _repository_path(repo, root["plans_dir"], "plans_dir", inside=True)
+    if not plans_dir.is_dir():
+        raise _MaestroConfigurationError("plans_dir is not a directory")
+    state_root = _repository_path(
+        repo, root["state_root"], "state_root", inside=False)
+    repository_state = (state_root / repo.name).resolve()
+    if not _path_is_within(repository_state, state_root):
+        raise _MaestroConfigurationError(
+            "repository state must remain below state_root")
+
+    keys = _config_mapping(
+        root["keys"], "keys",
+        ("verify_key_env", "signing_seed_env", "route_verify_key_env"))
+
+    executable_values = _config_mapping(
+        root["executables"], "executables", ("herdr", "omp", "claude"))
+    executables = {
+        name: _resolve_binary(executable_values[name], "executables." + name)
+        for name in ("herdr", "omp", "claude")
+    }
+
+    receipts = root["route_receipts"]
+    if not isinstance(receipts, dict) or not receipts:
+        raise _MaestroConfigurationError("route_receipts must be a non-empty mapping")
+    route_paths = {}
+    runs_root = repository_state / "runs"
+    for route, value in receipts.items():
+        route_name = _config_string(route, "route_receipts route")
+        if "=" in route_name:
+            raise _MaestroConfigurationError(
+                "route_receipts route must not contain '='")
+        relative = _config_relative_path(
+            value, "route_receipts." + route_name)
+        path = (repository_state / relative).resolve()
+        if not _path_is_within(path, repository_state):
+            raise _MaestroConfigurationError(
+                "route receipt must remain below repository state")
+        if _path_is_within(path, runs_root):
+            raise _MaestroConfigurationError(
+                "route receipt must not be in a participant run boundary")
+        route_paths[route_name] = path
+
+    reviewer_raw = _config_mapping(
+        root["reviewer"], "reviewer",
+        ("route", "model", "effort", "finalization_timeout_s",
+         "turn_timeout_s", "poll_interval_s"), ("profile",))
+    execution_raw = _config_mapping(
+        root["execution"], "execution",
+        ("route", "model", "effort", "concurrency", "node_timeout_s",
+         "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
+         "semantic_ceiling"), ("profile",))
+
+    reviewer = {
+        "route": _config_string(reviewer_raw["route"], "reviewer.route"),
+        "model": _config_string(reviewer_raw["model"], "reviewer.model"),
+        "effort": _config_string(reviewer_raw["effort"], "reviewer.effort"),
+        "profile": (_config_string(reviewer_raw["profile"], "reviewer.profile")
+                    if "profile" in reviewer_raw else None),
+        "finalization_timeout_s": _config_positive_number(
+            reviewer_raw["finalization_timeout_s"],
+            "reviewer.finalization_timeout_s"),
+        "turn_timeout_s": _config_positive_number(
+            reviewer_raw["turn_timeout_s"], "reviewer.turn_timeout_s"),
+        "poll_interval_s": _config_positive_number(
+            reviewer_raw["poll_interval_s"], "reviewer.poll_interval_s"),
+    }
+    execution = {
+        "route": _config_string(execution_raw["route"], "execution.route"),
+        "model": _config_string(execution_raw["model"], "execution.model"),
+        "effort": _config_string(execution_raw["effort"], "execution.effort"),
+        "profile": (_config_string(execution_raw["profile"], "execution.profile")
+                    if "profile" in execution_raw else None),
+        "concurrency": _config_positive_integer(
+            execution_raw["concurrency"], "execution.concurrency"),
+        "node_timeout_s": _config_positive_number(
+            execution_raw["node_timeout_s"], "execution.node_timeout_s"),
+        "turn_timeout_s": _config_positive_number(
+            execution_raw["turn_timeout_s"], "execution.turn_timeout_s"),
+        "final_acceptance_timeout_s": _config_positive_number(
+            execution_raw["final_acceptance_timeout_s"],
+            "execution.final_acceptance_timeout_s"),
+        "backstop_t_s": _config_positive_number(
+            execution_raw["backstop_t_s"], "execution.backstop_t_s"),
+        "semantic_ceiling": _config_positive_integer(
+            execution_raw["semantic_ceiling"], "execution.semantic_ceiling"),
+    }
+    for label, section in (("reviewer", reviewer), ("execution", execution)):
+        if section["route"] not in route_paths:
+            raise _MaestroConfigurationError(
+                label + ".route has no route receipt")
+
+    data_dir = repository_state / "data"
+    receipt_dir = repository_state / "receipts"
+    database = repository_state / "lifecycle.sqlite3"
+    for label, path in (("data directory", data_dir),
+                        ("receipt store", receipt_dir),
+                        ("lifecycle database", database)):
+        if _path_is_within(path, repo) or _path_is_within(path, runs_root):
+            raise _MaestroConfigurationError(
+                label + " is inside a repository or participant boundary")
+    if _path_is_within(receipt_dir, data_dir) or _path_is_within(data_dir, receipt_dir):
+        raise _MaestroConfigurationError(
+            "receipt store and data directory must be separate")
+    return {
+        "repo": repo,
+        "plans_dir": plans_dir,
+        "repository_state": repository_state,
+        "receipt_dir": receipt_dir,
+        "data_dir": data_dir,
+        "database": database,
+        "key_env": keys,
+        "executables": executables,
+        "route_paths": route_paths,
+        "reviewer": reviewer,
+        "execution": execution,
+    }
+
+
+def _bind_maestro_keys(layout: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve signing and route keys from env, then bootstrapped state files."""
+    keys = layout["key_env"]
+    key_dir = layout["repository_state"] / "keys"
+    verify_key = _resolve_key_environment(
+        keys["verify_key_env"], "keys.verify_key_env",
+        receipt_crypto.PUBLIC_KEY_SIZE,
+        fallback=key_dir / "signing.pub")
+    signing_seed = _resolve_key_environment(
+        keys["signing_seed_env"], "keys.signing_seed_env",
+        receipt_crypto.SEED_SIZE,
+        fallback=key_dir / "signing.seed")
+    route_verify_key = _resolve_key_environment(
+        keys["route_verify_key_env"], "keys.route_verify_key_env",
+        receipt_crypto.PUBLIC_KEY_SIZE,
+        fallback=key_dir / "route.pub")
+    bound = dict(layout)
+    bound["verify_key"] = verify_key
+    bound["signing_seed"] = signing_seed
+    bound["route_verify_key"] = route_verify_key
+    return bound
+
+
+def _load_maestro_config(repo: Path, config_path: Path) -> Dict[str, Any]:
+    return _bind_maestro_keys(_load_maestro_layout(repo, config_path))
+
+
+def _named_plan_name(name: str) -> str:
+    if (not isinstance(name, str) or not name or name in (".", "..")
+            or "/" in name or "\\" in name or Path(name).name != name):
+        raise _MaestroConfigurationError("plan name must be one path component")
+    return name
+
+
+def _named_plan_file(config: Dict[str, Any], name: str) -> Path:
+    path = (config["plans_dir"] / _named_plan_name(name) / "maestro-plan.v1").resolve()
+    if not _path_is_within(path, config["plans_dir"]):
+        raise _MaestroConfigurationError("named plan resolves outside plans_dir")
+    if not path.is_file():
+        raise _MaestroConfigurationError("named plan does not exist: " + name)
+    return path
+
+
+def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
+    path = (config["plans_dir"] / _named_plan_name(name) / "maestro-plan.v1").resolve()
+    if not _path_is_within(path, config["plans_dir"]):
+        raise _MaestroConfigurationError("named plan resolves outside plans_dir")
+    return path
+
+
+def _configured_command(args: argparse.Namespace) -> bool:
+    return (args.command == "bootstrap"
+            or (args.command == "plan"
+                and args.plan_command in ("validate", "finalize", "author"))
+            or (args.command == "run" and args.run_command == "start"))
+
+
+def _bind_layout_executables(args: argparse.Namespace, layout: Dict[str, Any]) -> None:
+    args.repo = str(layout["repo"])
+    args.herdr = layout["executables"]["herdr"]
+    args.omp = layout["executables"]["omp"]
+    args.claude = layout["executables"]["claude"]
+    args.route_receipt = [
+        route + "=" + str(path)
+        for route, path in sorted(layout["route_paths"].items())
+    ]
+    args.repository_state = str(layout["repository_state"])
+    args.layout = layout
+
+
+def _apply_repository_config(
+        args: argparse.Namespace, argv: Sequence[str]) -> None:
+    """Bind named-plan and bootstrap entrypoints to installed repository state."""
+    if not _configured_command(args):
+        return
+    config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
+    if not os.path.lexists(str(config_path)):
+        if args.command == "plan":
+            args.plan_file = args.plan_name
+        elif args.command == "run":
+            args.digest = args.plan_name
+        return
+    if not config_path.is_file():
+        raise _MaestroConfigurationError(
+            str(_MAESTRO_CONFIG_FILE) + " is not a regular file")
+    if any(item.startswith("-") for item in argv):
+        raise _MaestroConfigurationError(
+            "configured named-plan commands do not accept runtime flags")
+
+    repo = config_path.parent.parent.resolve()
+    if args.command == "bootstrap" or (
+            args.command == "plan" and args.plan_command == "author"):
+        layout = _load_maestro_layout(repo, config_path)
+        _bind_layout_executables(args, layout)
+        if args.command == "plan":
+            args.plan_file = str(_named_plan_output(layout, args.plan_name))
+        return
+
+    config = _load_maestro_config(repo, config_path)
+    plan_file = _named_plan_file(config, args.plan_name)
+    args.repo = str(config["repo"])
+    args.plan_file = str(plan_file)
+    args.receipt_dir = str(config["receipt_dir"])
+    args.data_dir = str(config["data_dir"])
+    args.verify_key = [config["verify_key"]]
+    args.signing_seed = config["signing_seed"]
+    args.route_verify_key = [config["route_verify_key"]]
+    args.route_receipt = [
+        route + "=" + str(path)
+        for route, path in sorted(config["route_paths"].items())
+    ]
+    args.herdr = config["executables"]["herdr"]
+    args.omp = config["executables"]["omp"]
+    args.claude = config["executables"]["claude"]
+
+    if args.command == "plan" and args.plan_command == "finalize":
+        digest = plan_digest.digest_of(plan_file.read_bytes())
+        reviewer = config["reviewer"]
+        finalization_root = (
+            config["repository_state"] / "finalization" / digest)
+        args.reviewer_route = reviewer["route"]
+        args.reviewer_model = reviewer["model"]
+        args.reviewer_effort = reviewer["effort"]
+        args.reviewer_profile = reviewer["profile"]
+        args.reviewer_session_dir = str(finalization_root / "session")
+        args.reviewer_report_file = str(finalization_root / "report.json")
+        args.finalization_timeout_s = reviewer["finalization_timeout_s"]
+        args.reviewer_turn_timeout_s = reviewer["turn_timeout_s"]
+        args.reviewer_poll_interval_s = reviewer["poll_interval_s"]
+    elif args.command == "run":
+        execution = config["execution"]
+        run_id = "run-" + uuid.uuid4().hex
+        run_root = config["repository_state"] / "runs" / run_id
+        args.digest = plan_digest.digest_of(plan_file.read_bytes())
+        args.db = str(config["database"])
+        args.run_id = run_id
+        args.integration_path = str(run_root / "integration")
+        args.worktrees_root = str(run_root / "worktrees")
+        args.scratch_root = str(run_root / "scratch")
+        args.concurrency = execution["concurrency"]
+        args.node_timeout_s = execution["node_timeout_s"]
+        args.turn_timeout_s = execution["turn_timeout_s"]
+        args.final_acceptance_timeout_s = execution[
+            "final_acceptance_timeout_s"]
+        args.backstop_t_s = execution["backstop_t_s"]
+        args.semantic_ceiling = execution["semantic_ceiling"]
+        args.agent_route = execution["route"]
+        args.agent_model = execution["model"]
+        args.agent_effort = execution["effort"]
+        args.agent_profile = execution["profile"]
+
 
 def _refusal(outcome: str, detail: str) -> int:
     print(json.dumps({"detail": detail, "outcome": outcome}, sort_keys=True))
     return 3
+
+
+def _bootstrap(args: argparse.Namespace) -> int:
+    layout = getattr(args, "layout", None)
+    if layout is None:
+        return _refusal(
+            "MAESTRO_CONFIGURATION_INVALID",
+            "bootstrap requires an installed " + str(_MAESTRO_CONFIG_FILE))
+    keys_dir = Path(layout["repository_state"]) / "keys"
+    try:
+        keys = route_admission.provision_keys(keys_dir)
+        env_file = route_admission.write_env_file(
+            keys,
+            verify_key_env=layout["key_env"]["verify_key_env"],
+            signing_seed_env=layout["key_env"]["signing_seed_env"],
+            route_verify_key_env=layout["key_env"]["route_verify_key_env"],
+        )
+        specs = []
+        for route, path in sorted(layout["route_paths"].items()):
+            section = (layout["execution"] if route == layout["execution"]["route"]
+                       else layout["reviewer"] if route == layout["reviewer"]["route"]
+                       else None)
+            if section is None:
+                raise route_admission.AdmissionError(
+                    "ROUTE_MODEL_UNCONFIGURED:{}".format(route))
+            timeout = section.get("turn_timeout_s") or 180.0
+            specs.append(route_admission.RouteCaptureSpec(
+                route=route,
+                cwd=Path(layout["repo"]),
+                herdr=Path(layout["executables"]["herdr"]),
+                binary=Path(layout["executables"][route]),
+                model=section["model"],
+                effort=section["effort"],
+                profile=section.get("profile"),
+                session_dir=(Path(layout["repository_state"])
+                             / "admission" / route),
+                timeout_s=float(timeout),
+            ))
+        written = route_admission.admit_routes(
+            specs, layout["route_paths"], route_seed=keys.route_seed)
+    except route_admission.AdmissionError as exc:
+        return _refusal("ROUTE_ADMISSION_FAILED", str(exc))
+    payload = {
+        "outcome": "ROUTES_ADMITTED",
+        "env_file": str(env_file),
+        "keys_dir": str(keys.keys_dir),
+        "receipts": {item.route: str(item.path) for item in written},
+        "reused": [item.route for item in written if item.reused],
+        "routes": [item.route for item in written],
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+def _plan_author(args: argparse.Namespace) -> int:
+    destination = Path(args.plan_file)
+    draft = getattr(args, "from_file", None)
+    contract = getattr(args, "from_plan_contract", None)
+    repo = Path(getattr(args, "repo", None) or ".")
+    try:
+        if contract:
+            receipt = getattr(args, "plan_contract_receipt", None)
+            if not receipt:
+                return _refusal("PLAN_AUTHORING_FAILED", "RECEIPT_REQUIRED")
+            rendered = getattr(args, "plan_contract_rendered", None)
+            stored, _trace = plan_contract_ingress.author_from_plan_contract(
+                Path(contract), Path(receipt), destination, repo,
+                Path(rendered) if rendered else None)
+            draft_path = Path(contract)
+        else:
+            if draft:
+                draft_path = Path(draft)
+            else:
+                draft_path = plan_author.find_draft(destination.parent)
+            stored = plan_author.author_from_draft(draft_path, destination, repo)
+    except (plan_author.AuthoringError, plan_contract_ingress.IngressError) as exc:
+        return _refusal("PLAN_AUTHORING_FAILED", str(exc))
+    payload = {
+        "outcome": "PLAN_AUTHORED",
+        "digest": plan_digest.digest_of(stored),
+        "draft": str(draft_path),
+        "plan": str(destination),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0
 
 
 class _VerifiedReceipts:
@@ -831,8 +1351,6 @@ def _publication_projection(intent, steps) -> Dict[str, Any]:
             "remote_repository": target.remote_repository,
             "remote_url": target.remote_url,
             "repository_id": target.repository_id,
-            "state": target.state.value,
-            "target_branch": target.target_branch,
         } for target in intent.targets],
         "steps": [{
             "detail": dict(step.detail),
@@ -843,6 +1361,19 @@ def _publication_projection(intent, steps) -> Dict[str, Any]:
         } for step in steps],
     }
 
+
+def _workspace_author(args: argparse.Namespace) -> int:
+    try:
+        stored = workspace_author.author_from_draft(
+            Path(args.from_file), Path(args.out), Path(args.root))
+    except workspace_author.WorkspaceAuthoringError as exc:
+        return _workspace_refusal("WORKSPACE_AUTHORING_FAILED", str(exc))
+    _workspace_emit({
+        "digest": workspace_digest.digest_of(stored),
+        "outcome": "WORKSPACE_AUTHORED",
+        "workspace": str(Path(args.out)),
+    })
+    return 0
 
 def _workspace_validate(args: argparse.Namespace) -> int:
     _manifest_dir, plan, digest = _load_workspace_manifest(args)
@@ -1133,14 +1664,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="maestro")
     root = parser.add_subparsers(dest="command", required=True)
 
+    bootstrap = root.add_parser("bootstrap")
+    bootstrap.set_defaults(handler=_bootstrap)
+
     plan = root.add_parser("plan")
     plan_sub = plan.add_subparsers(dest="plan_command", required=True)
+    author = plan_sub.add_parser("author")
+    author.add_argument("plan_name")
+    author.add_argument("--from", dest="from_file")
+    author.add_argument("--from-plan-contract")
+    author.add_argument("--plan-contract-receipt")
+    author.add_argument("--plan-contract-rendered")
+    author.add_argument("--repo", default=".")
+    author.set_defaults(handler=_plan_author)
     validate = plan_sub.add_parser("validate")
-    validate.add_argument("plan_file")
+    validate.add_argument("plan_name")
     _add_plan_receipt_access(validate)
     validate.set_defaults(handler=_plan_validate)
     finalize = plan_sub.add_parser("finalize")
-    finalize.add_argument("plan_file")
+    finalize.add_argument("plan_name")
     finalize.add_argument("--repo", default=".")
     finalize.add_argument("--receipt-dir")
     finalize.add_argument("--data-dir")
@@ -1173,7 +1715,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_sub = run.add_subparsers(dest="run_command", required=True)
     start = run_sub.add_parser("start")
     _add_run_execution_options(start)
-    start.add_argument("digest")
+    start.add_argument("plan_name")
     start.set_defaults(handler=_run_start)
     status = run_sub.add_parser("status")
     status.add_argument("run_id")
@@ -1211,6 +1753,12 @@ def build_parser() -> argparse.ArgumentParser:
     workspace = root.add_parser("workspace")
     workspace_sub = workspace.add_subparsers(
         dest="workspace_command", required=True)
+
+    workspace_author_cmd = workspace_sub.add_parser("author")
+    workspace_author_cmd.add_argument("--from", dest="from_file", required=True)
+    workspace_author_cmd.add_argument("--out", required=True)
+    workspace_author_cmd.add_argument("--root", default=".")
+    workspace_author_cmd.set_defaults(handler=_workspace_author)
 
     workspace_validate = workspace_sub.add_parser("validate")
     _add_workspace_manifest_file(workspace_validate)
@@ -1282,9 +1830,19 @@ def parser_verbs(parser: argparse.ArgumentParser) -> Tuple[str, ...]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = tuple(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
     try:
+        _apply_repository_config(args, raw_argv)
         return int(args.handler(args))
+    except _MaestroEnvironmentError as exc:
+        return _refusal("MAESTRO_ENVIRONMENT_REQUIRED", str(exc))
+    except _MaestroConfigurationError as exc:
+        return _refusal("MAESTRO_CONFIGURATION_INVALID", str(exc))
+    except route_admission.AdmissionError as exc:
+        return _refusal("ROUTE_ADMISSION_FAILED", str(exc))
+    except plan_author.AuthoringError as exc:
+        return _refusal("PLAN_AUTHORING_FAILED", str(exc))
     except _WORKSPACE_TYPED_ERRORS as exc:
         if args.command == "workspace":
             return _workspace_refusal(_workspace_error_code(exc), str(exc))

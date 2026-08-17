@@ -165,8 +165,7 @@ Verified baseline limitations:
 
 - SSSF is a sequential source-order phase list, not a dependency DAG.
 - `events.parent_id` is trace nesting, not a dependency edge.
-- Pi is the only implemented launcher; Claude Code is a stub.
-- provider/model strings are not launcher contracts.
+- OMP and direct Claude Code launchers are implemented. `coding_agent` selects the route; explicit `provider/model-id` binds OMP only when no `pm_profile` is selected.
 - SSSF runs on the current branch.
 - no worktree-per-node, sandbox, merge, deterministic integration, or approval/finalization exists.
 - fresh quality commands are placeholders that exit zero.

@@ -8,11 +8,11 @@ It lives at **`adws/adw_sssf_config/sssf.config.yaml`** — the default path eve
 
 ```yaml
 defaults:
-  coding_agent: pi
-  model: google/gemini-3.6-flash        # ALWAYS provider/model-id
+  coding_agent: omp
+  model: openai-codex/gpt-5.6-terra
   thinking: medium
   harness_engineering: []
-  tools: [read, bash, edit, write, grep, find, ls]
+  tools: [read, bash, write, grep, glob]
   data_dir: adws/adw_data
 
 observability:
@@ -21,19 +21,21 @@ observability:
 
 agents:
   - name: planner
-    coding_agent: pi
-    model: google/gemini-3.6-flash        # ALWAYS provider/model-id
+    coding_agent: claude_code
+    model: opus
     thinking: high
-    color: "#a78bfa"
     purpose: Turn a request into a plan the builder can implement without asking questions.
     prompt_engineering:
       system: adws/adw_data/prompt_engineering/planner/system.md
       user: adws/adw_data/prompt_engineering/planner/user.md
-    harness_engineering:
-      - json-enforcer
-    tools:
-      - read
-      - bash
+    tools: [Read, Grep, Glob, Bash, Write]
+
+  - name: builder
+    pm_profile: grok
+    purpose: Implement the plan exactly; report every changed file in the envelope.
+    prompt_engineering:
+      system: adws/adw_data/prompt_engineering/builder/system.md
+      user: adws/adw_data/prompt_engineering/builder/user.md
 ```
 
 ## Fields
@@ -42,12 +44,12 @@ agents:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `coding_agent` | `pi` \| `claude_code` | Which interface runs the agent. **v1 implements `pi` only**; `claude_code` is specced and stubbed in `agent_cc.py`, landing in v2. |
-| `model` | string | Model id. For Pi, any id registered in `~/.pi/agent/models.json`. Default `gemini-3.6-flash`. |
+| `coding_agent` | `omp` \| `claude_code` | Which implemented interface runs the agent. |
+| `model` | string | OMP model binding when no `pm_profile` is set; direct Claude Code model name otherwise. The starter OMP default is `openai-codex/gpt-5.6-terra`. |
 | `thinking` | enum | Reasoning effort — see below. Default `medium`. |
 | `color` | hex string | Lane color for every agent that does not set its own. Default empty — the visualizer falls back to its own palette. |
-| `harness_engineering` | list[string] | Coding-agent extensions. Pi: extension names. Claude Code: reserved (MCP, hooks). |
-| `tools` | list[string] | Roster-wide tool allowlist. Every agent that omits its own `tools` inherits this. Unset = all tools usable. |
+| `harness_engineering` | list[string] | OMP extension paths. Direct Claude Code rejects extensions because it cannot enforce their capabilities. |
+| `tools` | list[string] | Roster-wide tool allowlist. Every `claude_code` agent must provide one; OMP may inherit this default. |
 | `protected_files` | list[string] | Paths **no** agent may modify unless it names them in its own `writes`. Default: `adws/adw_modules/`, `adws/adw_sssf_config/`, `adws/adw_*.py` — an agent must not be able to edit the machinery that decides whether its work passed. |
 | `data_dir` | path | Runtime home. Sessions land at `{data_dir}/sessions/{adw_id}/{agent_name}/`. Default `adws/adw_data`. |
 
@@ -67,8 +69,9 @@ agents:
 | `prompt_engineering.system` | yes | Path to the system prompt — who the agent is, its single purpose, its output contract. |
 | `prompt_engineering.user` | yes | Path to the default user prompt — the task template with `{{prompt}}`, `{{previous_envelope}}`, `{{context_handoff_dir}}`. |
 | `color` | no | Hex swatch (`"#a78bfa"`) for this agent's lane in the visualizer. Travels config → `agent_sessions.color` → `/api/sessions/:adw_id`, and rides the `agent_start` event so a lane is colored while the agent is still running. Unset = the UI's fallback palette. |
-| `coding_agent`, `model`, `thinking`, `color`, `harness_engineering` | no | Override the corresponding `defaults` key. |
-| `tools` | no | Allowlist. **Omitting the key means all tools usable.** A capability list, not a boundary — see `writes`. |
+| `coding_agent`, `model`, `thinking`, `harness_engineering` | no | Override the corresponding `defaults` key. |
+| `pm_profile` | no | OMP profile name. When present, OMP runs profile mode instead of explicit provider/model/thinking flags. |
+| `tools` | no | Allowlist. Direct Claude Code requires it; OMP inherits defaults when omitted. A capability list, not a boundary — see `writes`. |
 | `writes` | no | What this agent may modify **in the repo**, enforced after every call. Omitted = unrestricted (still barred from `protected_files`). `[]` = no repo writes at all. A list = only those paths: a trailing `/` is a directory prefix, `*` matches within one path segment, `**` crosses segments, anything else is an exact path. Naming a `protected_files` path here is what unlocks it. **The session runtime under `data_dir` is always writable** — `writes: []` means read-only with respect to the repo, not unable to write its own report. |
 
 Output types are deliberately absent: config defines who an agent *is*; the ADW call site defines how it's *used*. One agent serves many calls — same system prompt, different user prompt + output type per call.
@@ -79,49 +82,23 @@ Output types are deliberately absent: config defines who an agent *is*; the ADW 
 
 ## Thinking levels
 
-Pi's reasoning-effort ladder, lowest to highest:
-
-```
+```text
 off | minimal | low | medium | high | xhigh | max
 ```
 
-Mapped to Pi's reasoning effort control and honored when the model is registered with `reasoning: true` in `~/.pi/agent/models.json`. On a non-reasoning model the setting is inert — no error, no effect. Rough guidance: `high`/`xhigh` for planners and reviewers, `medium` for builders, `low` for mechanical read-and-report agents. (For Claude Code in v2, the same field maps to the thinking budget.)
+For OMP without `pm_profile`, the value is passed as `--thinking`. In profile mode, the selected OMP profile owns route-specific behavior. Direct Claude Code receives the same value as `--effort`.
 
 ## Model resolution
 
-**Always write `model` as `provider/model-id`.** `agents.py` hands the string to the Pi interface, which resolves it against pi's merged catalog — `~/.pi/agent/models.json` plus pi's built-in providers. The same model is usually carried by more than one provider (`gemini-3.6-flash` lives under `google` *and* under `openrouter` as `google/gemini-3.6-flash`), and a bare id that matches several **raises at resolution**:
+For OMP without `pm_profile`, write `model` as an explicit `provider/model-id` listed by `omp models`; ambiguous or unknown bindings fail before launch. Profile mode deliberately omits provider/model/thinking flags and records the model OMP reports as having run. Direct Claude Code receives the configured model name unchanged and records the model returned by its stream.
 
-```
-agent 'scout': model pattern 'gemini-3.6-flash' is ambiguous:
-  [('google', 'gemini-3.6-flash'), ('openrouter', 'google/gemini-3.6-flash'), ...]
-```
-
-That is `agents.validate()` doing its job — it fails before anything spawns rather than silently billing the wrong provider — but it means every agent in the roster inheriting that default is grounded until the pattern is qualified. Qualifying is the whole fix: `google/gemini-3.6-flash`, `openai/gpt-5.6-terra`, `fireworks/accounts/fireworks/models/kimi-k3`. The leading segment is matched against the provider list first, so the rest of the string can contain slashes.
-
-Other consequences worth knowing:
-
-- A model must be in the catalog before any agent can name it. An unknown id fails at resolution, before spawn. `pi --list-models` is the catalog the resolver actually reads.
-- **Ambiguity can appear without you touching the config.** Registering a new provider that carries a model you already use turns a formerly-fine bare pattern ambiguous. If a roster stops validating and nobody edited it, that is why.
-- Provider credentials come from the environment, not the config — the key that matches the provider you named (`GEMINI_API_KEY` for `google/...`, `OPENROUTER_API_KEY` for `openrouter/...`).
-- The resolved model is recorded per session in `agent_map.json` and mirrored into the `agent_sessions` table. **Changing an agent's model invalidates its session**: a joined run starts that agent fresh instead of resuming a context window built by a different model.
+Provider credentials belong to the selected OMP provider or Claude CLI login, never this YAML. Changing a model or profile does **not** guarantee a fresh context: direct Claude Code scopes persistence to its matching request, while OMP resumes state from its per-agent session directory. Use a new `--adw-id` when a clean context is required.
 
 ## Tools
 
-`tools` maps to `pi --tools`. Pi's seven builtin tool names:
+`tools` is passed to the selected runtime. The starter OMP roster uses lower-case OMP names such as `read`, `grep`, `glob`, `bash`, and `write`; extension-provided OMP tools must also appear in that list. Direct Claude Code requires an explicit allowlist of its builtin capabilities and refuses MCP capabilities or extensions. An empty allowlist deliberately yields a no-tools Claude run.
 
-| Tool | Purpose | Pi's own default |
-|---|---|---|
-| `read` | read file contents | on |
-| `bash` | execute bash commands | on |
-| `edit` | find/replace edits | on |
-| `write` | create/overwrite files | on |
-| `grep` | search file contents | **off** |
-| `find` | find files by glob | **off** |
-| `ls` | list directory contents | **off** |
-
-`grep`, `find`, and `ls` are off in bare Pi, so an agent that does not name them will shell out through `bash` to do the same work. The starter roster therefore sets `defaults.tools` to all seven and lets each agent narrow from there.
-
-**Resolution order:** an agent's own `tools` list wins; an agent that omits the key inherits `defaults.tools`; if neither is set, `tools` stays `None` and all tools are usable. An empty list is not "all tools" — it is a tool-less agent, and it will stall.
+Tool allowlists are not repository-write boundaries. Use `writes` and `protected_files` for that boundary.
 
 ## Write permissions — `writes` and `protected_files`
 
@@ -176,27 +153,28 @@ Narrow by role, not by reflex. Anything that must produce a `context_handoff/` a
 
 ### Extension tools must be named explicitly
 
-`pi --tools` is an allowlist over **built-in, extension, and custom tools alike** — not just builtins. So the moment an agent has a `tools` list at all (its own, or one inherited from `defaults`), any tool registered by its `harness_engineering` extensions is **excluded unless it appears in that list by name**.
+`omp --tools` is an allowlist over **builtin, extension, and custom tools alike**. The moment an OMP agent has a `tools` list — its own or inherited from `defaults` — any tool registered by `harness_engineering` is excluded unless it appears by name.
 
-This fails quietly. The extension still loads, the run still succeeds, and the tool the extension exists to provide is simply never offered to the model — you find out by noticing the agent never called it.
+The extension still loads and the run may still succeed, but the model never receives its omitted tool.
 
 ```yaml
-  - name: reviewer
+  - name: scout
     harness_engineering:
-      - .pi/extensions/ast_query.ts     # registers tool: ast_query
+      - adws/adw_data/harness_engineering/subagents.ts
     tools:
       - read
       - grep
-      - find
-      - ls
+      - glob
       - bash
-      - ast_query                       # REQUIRED — the extension's tool, named or lost
+      - write
+      - subagent_create
+      - subagent_continue
+      - subagent_list
+      - subagent_remove
 ```
 
-Rule: **every entry in `harness_engineering` that registers a tool must have that tool name added to the agent's `tools` list.** Adding an extension is therefore a two-line change, never one. The alternative is dropping the `tools` key *and* leaving `defaults.tools` unset so the agent resolves to `None` (all tools) — but with a roster-wide `defaults.tools` in place, that escape hatch is closed; naming the tool is the only path.
+Rule: **every OMP extension tool must also be named in that agent's `tools` list.** Direct Claude Code rejects `harness_engineering`; it has no corresponding extension path.
 
 ## Harness engineering
 
-`harness_engineering` entries are pi extension **file paths**, passed through as `pi -e <path>`, one flag per entry, scoped to that agent only. This is where per-agent harness changes live — e.g. an output-tightening extension for an agent that keeps wrapping its envelope in prose. The starter roster ships with none. On Claude Code the field is reserved for MCP config and hooks in v2.
-
-**If the extension registers a tool, name that tool in the agent's `tools` list too** — `--tools` filters extension tools exactly like builtins, so an unnamed extension tool is silently unavailable no matter that the extension loaded fine. See [Extension tools must be named explicitly](#extension-tools-must-be-named-explicitly) above. Extensions that only shape output or add flags (no tool registration) need no `tools` change.
+OMP `harness_engineering` entries are extension file paths, passed as `omp -e <path>`, one flag per entry and scoped to that agent. Use them for a harness capability such as the stamped `subagents.ts` extension. Every tool it registers must be explicitly added to `tools`.

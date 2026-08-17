@@ -231,15 +231,23 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     can record it as killable — a hung coding agent is otherwise a pid you have
     to hunt for in `ps` while the run sits there.
     """
-    provider, model_id = resolve_model(request.model)
     sessions = Path(request.session_dir)
     cmd = [
         omp_path(), "-p", "--mode", "json",
-        "--provider", provider, "--model", model_id,
-        "--thinking", request.thinking,
         "--session-dir", str(sessions),
         "--system-prompt", request.system_prompt,
     ]
+    if request.pm_profile:
+        cmd += ["--pm-profile", request.pm_profile]
+        requested = ""
+        result = PiResult(session_id=request.session_id, context_window=0)
+    else:
+        provider, model_id = resolve_model(request.model)
+        requested = "{}/{}".format(provider, model_id)
+        cmd[4:4] = ["--provider", provider, "--model", model_id,
+                    "--thinking", request.thinking]
+        result = PiResult(session_id=request.session_id,
+                          context_window=context_window(provider, model_id))
     # omp has no --session-id, so rejoining a context window is "the same
     # session directory, continued". Each agent already owns its directory
     # (§12.2 step 1 item 4 keys it by agent, node, and attempt), so -c
@@ -256,10 +264,7 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     raw_path = Path(request.raw_output_path)
     raw_path.parent.mkdir(parents=True, exist_ok=True)
 
-    requested = "{}/{}".format(provider, model_id)
     ran = set()
-    result = PiResult(session_id=request.session_id,
-                      context_window=context_window(provider, model_id))
     # stdin is DEVNULL, deliberately. The prompt travels in argv, so the child
     # never needs stdin — but inheriting the parent's means pi sees a non-TTY
     # and can sit forever waiting for piped input that will never arrive or
@@ -323,6 +328,9 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
     # answers some requests with a different model than it was handed, and a
     # run that records the request rather than the answer reports a model that
     # never produced a token.
+    if request.pm_profile:
+        result.model_ran = sorted(ran)[-1] if ran else ""
+        return result
     substituted = sorted(binding for binding in ran if binding != requested)
     if substituted:
         raise ModelBindingError(

@@ -6,32 +6,13 @@ argument-hint: "[install | create adw | run adw | update config | ...]"
 
 # Super Simple Software Factory (SSSF)
 
-Reusable combination of **agents plus code**: deterministic Python ADW scripts own sequencing, retries, and acceptance; coding agents (Pi in v1) work inside bounded phases; typed JSON envelopes carry context between them; everything streams into SQLite for the polled visualizer. Agent proposes, code disposes.
+Reusable combination of **agents plus code**: deterministic Python ADW and Maestro scripts own sequencing, retries, and acceptance; OMP and Claude Code agents work inside bounded phases; typed JSON envelopes carry context between them; everything streams into SQLite for the polled visualizer. Agent proposes, code disposes.
 
 ## Startup
 
-Three steps. Then stop.
+Do not inventory the repository, scan ADW files, read runtime state, or print a dashboard at startup.
 
-1. Read [cookbooks/sssf_overview.md](cookbooks/sssf_overview.md) — the system map.
-2. `ls adws/adw_*.py` and read each file's `Phases:` docstring line.
-3. Print the ADWs as a table — name, the chain, one line on when to reach for it — and **wait for the engineer's request.**
-
-```
-| ADW | Chain | Use when |
-|---|---|---|
-| adw_scout | engineer → scout | read-only recon; nothing changes |
-| adw_simple_sdlc | plan → build → test → review → document, 3 commits | the work is real and its shape is not obvious |
-```
-
-**Nothing else.** No trace-db queries, no reading the config or the ADW scripts' bodies, no repo inventory, no last-runs summary, no diagnosing an old failure, no "current state" dashboard. None of it was asked for, and it is not free:
-
-- **Volunteered state is guessed state.** An orchestrator that improvised a status board queried a `runs` table and a `payload` column — neither exists (`sessions`, `payload_json`). The spec that would have said so is `references/observability.md`, one lazy read away. Probing to look prepared is how you end up confidently wrong in your first message.
-- **It spends the context the real task needs**, before you know what the task is.
-- **It is stale on arrival.** State printed before the request describes a system that the very next run changes.
-
-Everything else — the db schema, the roster, the handoff contract — is lazy-loaded through the routing table below, when a request actually calls for it. Reading it early defeats the mechanism.
-
-Two exceptions, both narrow: if the engineer's first message already contains a request, skip the waiting and route it; and if the factory is plainly not installed (no `adws/`, no config), say that in one line instead of the table.
+If the factory is installed, it exposes ordinary ADW entrypoints and may expose `adws/maestro.py` for repository and workspace orchestration. Route only the engineer's explicit request through the table below. If a request requires the factory but `adws/` is absent, say that it is not installed and point to the install cookbook.
 
 ## Orchestrator rules
 
@@ -71,6 +52,8 @@ Deep specs, when needed: [references/config.md](references/config.md) · [refere
 9. **`tools:` is a capability list, `writes:` is the boundary** — `bash` runs anything (including `git checkout`) and `write` reaches any path, so a tool list can never make "this agent changes nothing" true. `writes:` per agent and `protected_files` in defaults are enforced in `adw_modules/permissions.py` after every agent call: unauthorized changes are rolled back and the phase dies. The session runtime under `data_dir` is always writable — a read-only agent is read-only with respect to the REPO, never mute.
 10. **Every ADW ends in `run.finish()`** — phases passing is not the same as the run being accepted. A test phase that ran a red suite succeeded at its job. Pass `accepted=` so the exit code, the session status, and the banner are decided together and cannot disagree.
 
-## v1 scope
+## Runtime routes
 
-Pi coding agent only (`coding_agent: pi`), default model `gemini-3.6-flash` via openrouter, thinking `medium`. `claude_code` is schema-valid but stubbed until v2. The visualizer app ships in a later pass — observe via sqlite queries until then.
+`coding_agent: omp` runs non-interactive `omp -p --mode json`; an optional `pm_profile` selects OMP profile mode, otherwise the configured provider/model and thinking level are passed explicitly. `coding_agent: claude_code` runs direct non-interactive Claude Code with an explicit model, effort, and tool allowlist. Both are implemented and validated before launch.
+
+Maestro is a separate stamped CLI: invoke it from the control-root as `uv run adws/maestro.py ...`; it is not a shell executable named `maestro`.

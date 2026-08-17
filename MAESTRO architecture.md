@@ -1,8 +1,10 @@
 # MAESTRO — Architecture and Implementation Plan
 
-**Baseline:** Maestro at `de31374882e7a4e3e5b7bb9bd09e69dc2f779356`, byte-identical to upstream `disler/super-simple-software-factory`. The Strav repository is read-only evidence throughout; no code is ported from it.
+**Historical baseline:** Maestro began at `de31374882e7a4e3e5b7bb9bd09e69dc2f779356`, byte-identical to upstream `disler/super-simple-software-factory`. The Strav repository was read-only evidence; no code was ported from it.
 
-**Mode:** architecture only. This document is the sole repository file produced by this session.
+**Current implementation authority:** runtime behavior lives in `.claude/skills/sssf/templates/adws/`, its focused tests, `README.md`, and `.claude/skills/sssf/` cookbooks/references. In particular, OMP and direct Claude Code routes are implemented; `agent_pi.py` and `PiRequest` remain legacy compatibility names, not a claim that a Pi CLI executes.
+
+**Document status:** this is the chronological architecture/design and audit record that preceded implementation. Historical baseline, stub, unproven, and line-count claims below are not current-runtime assertions; where they conflict with the authority above, the authority wins.
 
 **Scope:** Slice 1 is one canonical plan finalized once; a DAG whose independent ready nodes execute concurrently; each node attempt isolated in its own git worktree; **each agent node launched in a visible Herdr pane via omp or Claude**; deterministic merge with ancestry proof; and typed envelopes, gates, and a SQLite lifecycle store. Additional routes are decided later by measurement.
 
@@ -1345,6 +1347,16 @@ Live and historical reads use the same tables and the same cursor pattern the ex
 The CLI is the only operator surface. Every verb below is covered by a verb-existence test (§13.4), so a command named here, in an error message, or in a console hint must exist in the parser — the direct repair of shipped documentation referencing dead CLI verbs.
 
 ### 11.1 Authoring and finalization
+
+```
+maestro bootstrap
+```
+The provision verb. It mints or reuses key material under the repository state root, then captures each configured route in a **visible Herdr pane**: first turn, continuation (`-c` / `--resume`), pane-cwd proof, and clean cancellation. It writes a detached-signature `maestro-route-receipt.v1` only after that capture verifies. Copying a fixture or hand-writing a signature is not admission. A junk or unsigned file already at the destination is refused rather than overwritten. Idempotent on an already-admitted signed pair.
+
+```
+maestro plan author <plan-name>
+```
+The only production writer of `maestro-plan.v1`. In a configured repository it reads `plans_dir/<name>/draft.json` (or `.yaml`) and writes `plans_dir/<name>/maestro-plan.v1`. It fills observed / produced-base / prompt-asset hashes from git at the declared base commit (or `HEAD`), then writes `canonicalize(plan)` create-once. It does not launch a reviewer and does not publish a receipt.
 
 ```
 maestro plan validate <plan-file>

@@ -334,8 +334,10 @@ class ImportBoundaryTests(unittest.TestCase):
     model even by accident.
     """
 
-    #: The only two call sites §6.3 permits.
-    CANONICAL_IMPORTERS = {"plan_canonical.py", "plan_validate.py"}
+    #: The only call sites §6.3 permits: the writer and the validator.
+    CANONICAL_IMPORTERS = {
+        "plan_canonical.py", "plan_validate.py", "plan_author.py",
+    }
 
     def modules(self):
         return sorted((ADWS / "adw_modules").glob("*.py"))
