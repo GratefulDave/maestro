@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `docs/plan-authoring.md`: the path from a source document to an executable
+  plan. Records that source documents are never converted — they are pinned as
+  `source_artifacts` inside a `plan-contract.v1` Plan IR — and that the IR must
+  carry `extensions.maestro` before review, because the review receipt is bound
+  to the IR bytes. Covers the single-repository sequence and the
+  finalize-then-compose rule for `maestro-workspace.v1`.
+
 - `maestro bootstrap`: visible Herdr route admission. Captures first turn,
   continuation, pane cwd, and clean cancellation per configured route; mints
   or reuses Ed25519 key material under the repository state root; writes a
