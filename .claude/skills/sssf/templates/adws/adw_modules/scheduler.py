@@ -325,10 +325,24 @@ class Scheduler:
             if not self._owns_running(record):
                 return
             cause = failure.__cause__
+            # The type alone names the guard that fired, never the condition it
+            # fired on, and the chain below it is where the actual failure is:
+            # a quiescence error raised from another quiescence error reports
+            # only its own name at every level. Record the messages so a blocked
+            # node can be diagnosed from the row instead of by re-running.
+            chain = []
+            seen = set()
+            current: Optional[BaseException] = cause
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                chain.append("{0}: {1}".format(
+                    type(current).__name__, current))
+                current = current.__cause__ or current.__context__
             self.deps.store.mark_blocked(
                 self.run_id, node.node_id, st.BlockReason.QUIESCENCE_UNPROVEN,
                 detail={"phase": failure.phase,
-                        "exception_type": type(cause).__name__})
+                        "exception_type": type(cause).__name__,
+                        "causes": chain[:6]})
 
     def _request_cancel(self, node_id: str) -> None:
         lifecycle = self.deps.store.get_node(self.run_id, node_id)
@@ -599,7 +613,14 @@ class Scheduler:
                 self._require_running(record)
                 pre = self.deps.run_gate(
                     attempt, node, "pre", self._cancelled.is_set)
-                pre_verdict = vf.adjudicate_gate(pre, self.deps.min_cases)
+                # A selector this node is declared to produce, absent at its
+                # base, is the red clause 2 asks for -- not a broken runner.
+                selector = (node.gate_selector or "").strip()
+                unbuilt = bool(
+                    selector and selector in node.outputs
+                    and not (attempt.path / selector).exists())
+                pre_verdict = vf.adjudicate_pre_gate(
+                    pre, self.deps.min_cases, selector_unbuilt=unbuilt)
         finally:
             # Provision and the pre gate both execute before the measurement
             # bracket; their process groups must be absent before its baseline.
@@ -766,7 +787,18 @@ class Scheduler:
                         retry_class=retry_class)
                     return
 
-            store.fail_attempt(self.run_id, node.node_id, retry_class)
+            # Why the attempt failed, recorded where the attempt is recorded.
+            # A bare `retry:ENVIRONMENTAL` row says a retry was spent and
+            # nothing about what to fix, so a node that exhausts its budget
+            # leaves no evidence at all.
+            detail = {"reason": classification.reason} if getattr(
+                classification, "reason", None) else {}
+            if verdict is not None:
+                detail["clause"] = verdict.failed_clause
+                if verdict.reason:
+                    detail["verdict"] = verdict.reason
+            store.fail_attempt(self.run_id, node.node_id, retry_class,
+                               detail=detail or None)
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """§7.5's ceiling, counting the attempt that is failing right now.

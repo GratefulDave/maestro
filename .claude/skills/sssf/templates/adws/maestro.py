@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from contextlib import redirect_stdout as _redirect_stdout
 import re
+import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -18,6 +21,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import yaml
 
+from adw_modules import agent_pi
 from adw_modules import coordinator as coordinator
 from adw_modules import coordinator_store
 from adw_modules import finalization
@@ -73,6 +77,35 @@ class _MaestroEnvironmentError(_MaestroConfigurationError):
 _MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
 _MAESTRO_SCHEMA = "maestro-config.v1"
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# The plan-contract pipeline. Every path below is derived from the plan name and
+# the configured plans_dir so an operator never types one.
+_PLAN_CONTRACT_IR_SUFFIX = ".plan.json"
+_PLAN_CONTRACT_RENDERED_SUFFIX = ".html"
+_PLAN_CONTRACT_RECEIPT_SUFFIX = ".plan-review.json"
+_PLAN_CONTRACT_SCRIPT = Path("scripts") / "planctl.py"
+_PLAN_CONTRACT_REPOSITORY_SKILL = (
+    Path(".claude") / "skills" / "plan-contract" / _PLAN_CONTRACT_SCRIPT)
+_PLAN_CONTRACT_SKILL_ENV = "PLAN_CONTRACT_SKILL_PATH"
+_PLAN_CONTRACT_AUTHOR_OPTION = "--from-plan-contract"
+_PLAN_CONTRACT_RECEIPT_OPTION = "--plan-contract-receipt"
+_PLAN_CONTRACT_RENDERED_OPTION = "--plan-contract-rendered"
+
+# planctl reads the reviewer key from exactly this variable. Maestro owns the
+# key's whole lifecycle and injects it per subprocess; an operator shell never
+# holds it.
+_REVIEWER_HMAC_KEY_ENV = route_admission.REVIEWER_HMAC_KEY_ENV
+_REVIEWER_HMAC_KEY_FILE = route_admission.REVIEWER_HMAC_KEY_FILE
+_REVIEWER_HMAC_KEY_MINIMUM_BYTES = 32
+_REVIEWER_HMAC_KEY_MINTED_BYTES = 32
+
+# Every step streams into a log a visible Herdr pane tails, so an operator can
+# watch work that would otherwise happen behind captured pipes. The log path
+# travels in the environment; only it, never a key, is ever expanded here.
+_PLAN_STEP_LOG_ENV = "MAESTRO_PLAN_STEP_LOG"
+_PLAN_STEP_SHELL = (
+    "/bin/sh", "-c",
+    'exec >>"$' + _PLAN_STEP_LOG_ENV + '" 2>&1; exec "$0" "$@"')
 
 
 class _StrictYamlLoader(yaml.SafeLoader):
@@ -213,7 +246,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     root = _config_mapping(
         raw, "maestro configuration",
         ("schema", "plans_dir", "state_root", "keys", "executables",
-         "route_receipts", "reviewer", "execution"))
+         "route_receipts", "reviewer", "execution"), ("plan_contract",))
     if root["schema"] != _MAESTRO_SCHEMA:
         raise _MaestroConfigurationError(
             "schema must be " + _MAESTRO_SCHEMA)
@@ -230,7 +263,14 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
 
     keys = _config_mapping(
         root["keys"], "keys",
-        ("verify_key_env", "signing_seed_env", "route_verify_key_env"))
+        ("verify_key_env", "signing_seed_env", "route_verify_key_env"),
+        ("reviewer_hmac_key_env",))
+    if "reviewer_hmac_key_env" in keys:
+        reviewer_key_env = _config_string(
+            keys["reviewer_hmac_key_env"], "keys.reviewer_hmac_key_env")
+        if _ENVIRONMENT_NAME.fullmatch(reviewer_key_env) is None:
+            raise _MaestroConfigurationError(
+                "keys.reviewer_hmac_key_env must name an environment variable")
 
     executable_values = _config_mapping(
         root["executables"], "executables", ("herdr", "omp", "claude"))
@@ -263,7 +303,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     reviewer_raw = _config_mapping(
         root["reviewer"], "reviewer",
         ("route", "model", "effort", "finalization_timeout_s",
-         "turn_timeout_s", "poll_interval_s"), ("profile",))
+         "turn_timeout_s", "poll_interval_s"), ("profile", "id", "vendor"))
     execution_raw = _config_mapping(
         root["execution"], "execution",
         ("route", "model", "effort", "concurrency", "node_timeout_s",
@@ -276,6 +316,10 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "effort": _config_string(reviewer_raw["effort"], "reviewer.effort"),
         "profile": (_config_string(reviewer_raw["profile"], "reviewer.profile")
                     if "profile" in reviewer_raw else None),
+        "id": (_config_string(reviewer_raw["id"], "reviewer.id")
+               if "id" in reviewer_raw else None),
+        "vendor": (_config_string(reviewer_raw["vendor"], "reviewer.vendor")
+                   if "vendor" in reviewer_raw else None),
         "finalization_timeout_s": _config_positive_number(
             reviewer_raw["finalization_timeout_s"],
             "reviewer.finalization_timeout_s"),
@@ -321,8 +365,14 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     if _path_is_within(receipt_dir, data_dir) or _path_is_within(data_dir, receipt_dir):
         raise _MaestroConfigurationError(
             "receipt store and data directory must be separate")
+    plan_contract = None
+    if "plan_contract" in root:
+        raw_contract = Path(_config_string(root["plan_contract"], "plan_contract"))
+        plan_contract = (raw_contract if raw_contract.is_absolute()
+                         else repo / raw_contract).resolve()
     return {
         "repo": repo,
+        "plan_contract": plan_contract,
         "plans_dir": plans_dir,
         "repository_state": repository_state,
         "receipt_dir": receipt_dir,
@@ -507,6 +557,8 @@ def _bootstrap(args: argparse.Namespace) -> int:
             verify_key_env=layout["key_env"]["verify_key_env"],
             signing_seed_env=layout["key_env"]["signing_seed_env"],
             route_verify_key_env=layout["key_env"]["route_verify_key_env"],
+            reviewer_hmac_key_env=layout["key_env"].get(
+                "reviewer_hmac_key_env", _REVIEWER_HMAC_KEY_ENV),
         )
         specs = []
         for route, path in sorted(layout["route_paths"].items()):
@@ -739,6 +791,132 @@ def _reviewer_window_factory(args: argparse.Namespace):
     return factory
 
 
+def _agent_node_prompt(node: Any, envelope: Path,
+                       retry_prompt: Optional[str]) -> str:
+    """The instruction, plus every term the attempt is actually judged on.
+
+    Verification asks four questions of an agent node -- did it write a typed
+    envelope, was its gate red before and green after, and did it write only
+    what it declared. An agent sent the instruction alone is told none of that,
+    so it cannot satisfy terms it was never given: it works, stops, writes no
+    envelope, and the attempt fails clause 1 with the work discarded.
+    """
+    lines = [node.instruction, ""]
+    outputs = list(getattr(node, "outputs", ()) or ())
+    if outputs:
+        lines.append(
+            "Write only these paths, relative to the repository root. A change "
+            "to anything else fails the attempt:")
+        lines.extend("  " + path for path in outputs)
+        lines.append("")
+    gate = getattr(node, "gate", None)
+    if gate is not None:
+        lines.append(
+            "Your work is judged by this command, run from {0!r}. It fails now "
+            "and must pass, collecting at least {1} case(s), when you are "
+            "done:".format(gate.cwd, gate.min_cases))
+        lines.append("  " + " ".join([gate.runner, *gate.argv]))
+        lines.append("")
+    if retry_prompt:
+        lines.extend(["Retry guidance:", retry_prompt, ""])
+    lines.extend([
+        "When you have finished, write this file and then stop:",
+        "  " + str(envelope),
+        '  {"success": true, "summary": "<what you did>"}',
+        "",
+        "Use \"success\": false if you could not finish, with the reason in "
+        "the summary. The attempt is not verified without this file, and "
+        "nothing else ends it.",
+    ])
+    return "\n".join(lines)
+
+
+def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
+    """The worktree that already has `branch` checked out, if any.
+
+    Read from `git worktree list --porcelain` rather than inferred from a
+    failed `worktree add`, so the refusal can name the checkout standing in
+    the way instead of echoing git's exit status.
+    """
+    try:
+        listed = subprocess.run(
+            ("git", "-C", str(repo), "worktree", "list", "--porcelain"),
+            capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    if listed.returncode != 0:
+        return None
+    wanted = "refs/heads/" + branch
+    path: Optional[Path] = None
+    for line in (listed.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):].strip())
+        elif line.startswith("branch ") and line[len("branch "):].strip() == wanted:
+            return path
+    return None
+
+
+def _reviewer_occupancy(
+        session: finalization_window.ReviewerSession) -> Optional[float]:
+    """How full the reviewer's context window was after its last valid turn.
+
+    The reading comes from the transcript the route wrote, not from the report
+    the reviewer returned: the report is the thing being judged, so it cannot
+    also be the evidence that the reviewer had room to judge it. Anything that
+    cannot be read stays `None`, because `finalization.check_occupancy`
+    convicts on a NULL row -- an unmeasured window is not a passing one.
+
+    Occupancy is the last VALID assistant turn's window usage, exactly as
+    `agent_pi` records it live: an aborted or errored turn reports usage that
+    cannot be trusted and must not overwrite a good reading.
+    """
+    directory = session.session_dir
+    if not directory:
+        return None
+    tokens = 0
+    provider = ""
+    model = ""
+    for transcript in sorted(Path(directory).glob("*.jsonl")):
+        try:
+            lines = transcript.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict):
+                message = event
+            if message.get("role") != "assistant":
+                continue
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            turn = agent_pi._context_tokens(usage)
+            if turn and message.get("stopReason") not in ("aborted", "error"):
+                tokens = turn
+                provider = str(message.get("provider") or provider)
+                model = str(message.get("model") or model)
+    if not tokens:
+        return None
+    if not provider or not model:
+        # The configured binding is `provider/model`; it is the fallback only,
+        # because what actually ran is what the window belongs to.
+        provider, _, model = str(session.model).partition("/")
+    window = agent_pi.context_window(provider, model) if provider and model else 0
+    if not window:
+        return None
+    return tokens / window
+
+
 def _plan_finalize(args: argparse.Namespace) -> int:
     try:
         stored = Path(args.plan_file).read_bytes()
@@ -764,7 +942,7 @@ def _plan_finalize(args: argparse.Namespace) -> int:
             store=_finalization_store(args),
             validate=lambda: (),
             window_factory=lambda matrix: _reviewer_window_factory(args)(matrix),
-            occupancy_reader=lambda _session: None)
+            occupancy_reader=_reviewer_occupancy)
     except _PlanReceiptConfigurationError as exc:
         return _refusal("FINALIZATION_CONFIGURATION_REQUIRED", str(exc))
     except (_PlanReceiptVerificationError, finalization.SignatureMissing,
@@ -1013,9 +1191,20 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         if resuming:
             store.resume_run(args.run_id)
         elif not Path(args.integration_path).exists():
+            branch = plan.merge_policy.integration_branch
+            occupant = _worktree_holding_branch(Path(args.repo), branch)
+            if occupant is not None:
+                return _refusal(
+                    "INTEGRATION_BRANCH_CHECKED_OUT",
+                    "the integration branch " + branch + " is checked out at "
+                    + str(occupant) + ", and git gives a branch to one worktree "
+                    "at a time. The run's integration worktree must hold it, "
+                    "because every attempt is based on that branch's head and a "
+                    "detached copy would never advance it. Move that checkout "
+                    "to another branch and start the run again")
             subprocess.run(
                 ("git", "-C", str(args.repo), "worktree", "add",
-                 str(args.integration_path), plan.merge_policy.integration_branch),
+                 str(args.integration_path), branch),
                 check=True, capture_output=True, text=True)
 
         def run_node(attempt, node, record, retry_prompt, on_launch,
@@ -1042,8 +1231,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             prompt = attempt.scratch / "agent-prompt.txt"
             envelope = attempt.scratch / "agent-envelope.json"
             prompt.write_text(
-                plan.node_by_id()[node.node_id].instruction +
-                ("\n\nRetry guidance:\n" + retry_prompt if retry_prompt else ""),
+                _agent_node_prompt(plan.node_by_id()[node.node_id], envelope,
+                                   retry_prompt),
                 encoding="utf-8")
             handle = route_runner.launch(launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
@@ -1221,6 +1410,559 @@ def _escape(args: argparse.Namespace) -> int:
         return 0
     finally:
         store.close()
+
+
+def _plan_contract_layout() -> Dict[str, Any]:
+    """The repository layout the plan-contract pipeline derives every path from."""
+    config_path = Path.cwd() / _MAESTRO_CONFIG_FILE
+    if not config_path.is_file():
+        raise _MaestroConfigurationError(
+            "the plan pipeline requires an installed "
+            + str(_MAESTRO_CONFIG_FILE))
+    return _load_maestro_layout(config_path.parent.parent.resolve(), config_path)
+
+
+def _plan_contract_path(layout: Dict[str, Any], name: str, suffix: str) -> Path:
+    """<plans_dir>/<name><suffix>. An operator names the plan and nothing else."""
+    path = (layout["plans_dir"] / (_named_plan_name(name) + suffix)).resolve()
+    if not _path_is_within(path, layout["plans_dir"]):
+        raise _MaestroConfigurationError(
+            "plan contract artifact resolves outside plans_dir")
+    return path
+
+
+def _plan_contract_artifacts(layout: Dict[str, Any], name: str) -> Dict[str, Path]:
+    return {
+        "plan_ir": _plan_contract_path(layout, name, _PLAN_CONTRACT_IR_SUFFIX),
+        "rendered": _plan_contract_path(
+            layout, name, _PLAN_CONTRACT_RENDERED_SUFFIX),
+        "receipt": _plan_contract_path(
+            layout, name, _PLAN_CONTRACT_RECEIPT_SUFFIX),
+    }
+
+
+def _planctl_script(candidate: Path) -> Path:
+    """Accept either the planctl script itself or the skill directory holding it."""
+    return candidate / _PLAN_CONTRACT_SCRIPT if candidate.is_dir() else candidate
+
+
+def _resolve_planctl(layout: Dict[str, Any]) -> Path:
+    """planctl's location, in search order. None of it is ever typed."""
+    searched = []
+    configured = layout.get("plan_contract")
+    if configured is not None:
+        searched.append(Path(configured))
+    searched.append(layout["repo"] / _PLAN_CONTRACT_REPOSITORY_SKILL)
+    environment = os.environ.get(_PLAN_CONTRACT_SKILL_ENV)
+    if environment:
+        searched.append(Path(environment))
+    for candidate in searched:
+        script = _planctl_script(candidate)
+        if script.is_file():
+            return script.resolve()
+    raise _MaestroConfigurationError(
+        "planctl is unavailable: set plan_contract in "
+        + str(_MAESTRO_CONFIG_FILE) + ", install the plan-contract skill at "
+        + str(_PLAN_CONTRACT_REPOSITORY_SKILL) + ", or export "
+        + _PLAN_CONTRACT_SKILL_ENV + "; searched "
+        + ", ".join(str(_planctl_script(item)) for item in searched))
+
+
+def _planctl_supports_repo_root(script: Path) -> bool:
+    """Ask the installed planctl: the flag is pending upstream, so never assume."""
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), "validate", "--help"],
+            capture_output=True, text=True, check=False, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--repo-root" in (completed.stdout or "") + (completed.stderr or "")
+
+
+def _planctl_repo_root(layout: Dict[str, Any], script: Path) -> Optional[Path]:
+    """The --repo-root argument, or None when the installed planctl lacks it."""
+    repo = layout["repo"]
+    if _planctl_supports_repo_root(script):
+        return repo
+    if layout["plans_dir"] != repo:
+        raise _MaestroConfigurationError(
+            "the installed planctl has no --repo-root, so a Plan IR must sit at "
+            "the repository root, but plans_dir is " + str(layout["plans_dir"])
+            + "; install a planctl that supports --repo-root or set plans_dir "
+            "to the repository root")
+    return None
+
+
+def _reviewer_key_environment_names(layout: Dict[str, Any]) -> Tuple[str, ...]:
+    """Every variable that could carry the reviewer key into this process."""
+    configured = layout["key_env"].get("reviewer_hmac_key_env")
+    names = [_REVIEWER_HMAC_KEY_ENV]
+    if configured and configured not in names:
+        names.append(configured)
+    return tuple(names)
+
+
+def _reviewer_keys_in_environment(layout: Dict[str, Any]) -> Tuple[str, ...]:
+    return tuple(name for name in _reviewer_key_environment_names(layout)
+                 if os.environ.get(name))
+
+
+def _reviewer_hmac_key_file(layout: Dict[str, Any]) -> Path:
+    return Path(layout["repository_state"]) / "keys" / _REVIEWER_HMAC_KEY_FILE
+
+
+def _existing_reviewer_hmac_key(path: Path) -> str:
+    try:
+        existing = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise _MaestroConfigurationError(
+            "the reviewer key at " + str(path) + " is unreadable; it is not "
+            "replaced, because that would invalidate every receipt already "
+            "signed with it") from exc
+    if len(existing.encode("utf-8")) < _REVIEWER_HMAC_KEY_MINIMUM_BYTES:
+        raise _MaestroConfigurationError(
+            "the reviewer key at " + str(path) + " is shorter than "
+            + str(_REVIEWER_HMAC_KEY_MINIMUM_BYTES) + " bytes; it is not "
+            "regenerated, because that would invalidate every receipt already "
+            "signed with it")
+    return existing
+
+
+def _minted_reviewer_hmac_key(layout: Dict[str, Any]) -> str:
+    """Reuse the key `maestro bootstrap` wrote; mint it here only if absent.
+
+    Bootstrap is the primary minter, because the key is needed before these
+    verbs are -- `/arch-review` drives `planctl review` through the skill
+    directly, sourcing the env file bootstrap writes. Both paths produce the
+    same 64-character hex in the same 0600 file, so whichever runs first wins
+    and the other reuses it. Regenerating would silently invalidate every
+    receipt already signed with the old key, so a present-but-unusable file is
+    a refusal, never a fresh mint.
+    """
+    path = _reviewer_hmac_key_file(layout)
+    if _path_is_within(path, layout["repo"]):
+        raise _MaestroConfigurationError(
+            "the reviewer key would be stored inside the repository at "
+            + str(path) + "; state_root must resolve outside the repository")
+    for ancestor in (path.parent, *path.parent.parents):
+        if (ancestor / ".git").exists():
+            raise _MaestroConfigurationError(
+                "the reviewer key would be stored inside the git work tree at "
+                + str(ancestor) + "; point state_root outside every repository")
+    if path.exists():
+        return _existing_reviewer_hmac_key(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(path.parent), stat.S_IRWXU)
+    minted = secrets.token_hex(_REVIEWER_HMAC_KEY_MINTED_BYTES)
+    try:
+        descriptor = os.open(
+            str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR)
+    except FileExistsError:
+        return _existing_reviewer_hmac_key(path)
+    except OSError as exc:
+        raise _MaestroConfigurationError(
+            "cannot create the reviewer key at " + str(path)) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(minted + "\n")
+    except OSError as exc:
+        raise _MaestroConfigurationError(
+            "cannot write the reviewer key at " + str(path)) from exc
+    return minted
+
+
+def _reviewer_hmac_key(layout: Dict[str, Any]) -> str:
+    """Operator-supplied environment wins; the key Maestro minted is the default."""
+    for name in _reviewer_key_environment_names(layout):
+        supplied = os.environ.get(name)
+        if supplied:
+            if len(supplied.encode("utf-8")) < _REVIEWER_HMAC_KEY_MINIMUM_BYTES:
+                raise _MaestroEnvironmentError(
+                    name + " must carry at least "
+                    + str(_REVIEWER_HMAC_KEY_MINIMUM_BYTES) + " bytes")
+            return supplied
+    return _minted_reviewer_hmac_key(layout)
+
+
+def _redacted(text: Optional[str], secret: Optional[str]) -> str:
+    """No emitted byte may carry the reviewer key, whatever planctl printed."""
+    value = text or ""
+    if secret:
+        value = value.replace(secret, "[redacted]")
+    return value
+
+
+class _PlanPaneUnavailable(RuntimeError):
+    """No visible Herdr pane, so the verb refuses rather than working unseen."""
+
+
+class _PlanPane:
+    """A visible Herdr pane tailing one step log, so no work happens unseen.
+
+    planctl is deterministic local computation, not an agent turn, so this uses
+    Herdr's pane path only. No route receipt is minted, no admission is claimed,
+    and no agent readiness is polled -- a signed receipt here would attest to
+    nothing. The command bound to the pane only ever tails a log file, so the
+    reviewer key can never reach the pane's argv, text, or scrollback; it is
+    handed to planctl through the subprocess environment alone.
+
+    There is no inline fallback. A pane that cannot be opened is a refusal
+    raised before any step runs, because an escape hatch is how invisible
+    execution comes back.
+    """
+
+    def __init__(self, layout: Dict[str, Any], log: Path) -> None:
+        self._herdr = layout["executables"]["herdr"]
+        self._cwd = layout["repo"]
+        self._log = log
+        self.log = log
+        self.pane_id: Optional[str] = None
+        self._reported_pane: Optional[str] = None
+
+    def _call(self, *args: str) -> Dict[str, Any]:
+        result = subprocess.run(
+            [self._herdr, *args], capture_output=True, text=True,
+            check=False, timeout=30.0)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout or "herdr failed").strip()[-200:])
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def open(self) -> None:
+        """Prove the pane exists before a single artifact is written."""
+        try:
+            payload = self._call(
+                "pane", "split", "--current", "--direction", "right",
+                "--cwd", str(self._cwd), "--no-focus")
+            container = payload.get("result", payload)
+            pane = container.get("pane") if isinstance(container, dict) else None
+            if not isinstance(pane, dict) or not pane.get("pane_id"):
+                raise RuntimeError("herdr opened no pane")
+            pane_id = str(pane["pane_id"])
+        except (OSError, RuntimeError, ValueError,
+                subprocess.SubprocessError) as exc:
+            raise _PlanPaneUnavailable(
+                "no visible Herdr pane (" + (str(exc) or type(exc).__name__)
+                + "); start Herdr and rerun, or fix executables.herdr in "
+                + str(_MAESTRO_CONFIG_FILE)
+                + ". Nothing was rendered, reviewed, or authored.") from exc
+        try:
+            self._log.parent.mkdir(parents=True, exist_ok=True)
+            self._log.write_text("", encoding="utf-8")
+            self._call("pane", "run", pane_id, "tail", "-n", "+1", "-f",
+                       str(self._log))
+        except (OSError, RuntimeError, ValueError,
+                subprocess.SubprocessError) as exc:
+            self.pane_id = pane_id
+            self.close()
+            raise _PlanPaneUnavailable(
+                "the Herdr pane could not stream this step ("
+                + (str(exc) or type(exc).__name__)
+                + "). Nothing was rendered, reviewed, or authored.") from exc
+        self.pane_id = pane_id
+        self._reported_pane = pane_id
+
+    def close(self) -> None:
+        if self.pane_id is None:
+            return
+        try:
+            self._call("pane", "close", self.pane_id)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
+        self.pane_id = None
+
+    def note(self, text: str) -> None:
+        """Append a line an operator watching the pane needs to see."""
+        try:
+            with self._log.open("a", encoding="utf-8") as handle:
+                handle.write(text.rstrip("\n") + "\n")
+        except OSError:
+            pass
+
+    def report(self) -> Dict[str, Any]:
+        return {"pane": self._reported_pane, "log": str(self._log)}
+
+
+def _plan_step_log(layout: Dict[str, Any], name: str, verb: str) -> Path:
+    return (Path(layout["repository_state"]) / "plan-contract" / name
+            / (verb + ".log"))
+
+
+def _planctl_run(
+        script: Path, layout: Dict[str, Any], repo_root: Optional[Path],
+        verb: str, plan_ir: Path, arguments: Sequence[str], *,
+        log: Path, reviewer_key: Optional[str] = None
+) -> subprocess.CompletedProcess:
+    """One planctl step, streamed into the pane's log, key in the environment only."""
+    command = [sys.executable, str(script), verb, str(plan_ir)]
+    command.extend(arguments)
+    if repo_root is not None:
+        command.extend(["--repo-root", str(repo_root)])
+    command.append("--json")
+    # The key reaches planctl through this mapping and nowhere else. An empty
+    # value clears anything inherited, so a gate step can never sign anything.
+    environment = {
+        _PLAN_STEP_LOG_ENV: str(log),
+        _REVIEWER_HMAC_KEY_ENV: reviewer_key if reviewer_key is not None else "",
+    }
+    argv = list(_PLAN_STEP_SHELL) + command
+    before = log.stat().st_size if log.is_file() else 0
+    try:
+        completed = launcher.run_harness_process(
+            argv, cwd=layout["repo"], env=environment)
+    except (launcher.HarnessCancelled, launcher.HarnessQuiescenceError,
+            TimeoutError, OSError) as exc:
+        return subprocess.CompletedProcess(argv, 1, "", str(exc))
+    return subprocess.CompletedProcess(
+        argv, completed.returncode, _log_tail(log, before), completed.stderr or "")
+
+
+def _log_tail(log: Path, offset: int) -> str:
+    try:
+        with log.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def _plan_contract_step_failure(
+        outcome: str, step: str, completed: subprocess.CompletedProcess,
+        pane: Dict[str, Any], secret: Optional[str] = None) -> int:
+    """Name the step that failed and hand back planctl's diagnostics verbatim."""
+    payload = {
+        "outcome": outcome,
+        "step": step,
+        "status": completed.returncode,
+        "stdout": _redacted(completed.stdout, secret),
+        "stderr": _redacted(completed.stderr, secret),
+    }
+    payload.update(pane)
+    print(json.dumps(payload, sort_keys=True))
+    return 2
+
+
+def _run_plan_contract(
+        args: argparse.Namespace, verb: str,
+        steps: Sequence[Tuple[str, Sequence[str]]], *, outcome: str,
+        failure: str, plan_ir: Path, layout: Dict[str, Any],
+        reviewer_key: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None) -> int:
+    """Run planctl steps in order in a visible pane, stopping at the first failure."""
+    # Fail closed before any step runs: no pane, no work, no artifacts left over.
+    pane = _PlanPane(layout, _plan_step_log(layout, args.plan_name, verb))
+    pane.open()
+    try:
+        script = _resolve_planctl(layout)
+        repo_root = _planctl_repo_root(layout, script)
+        for step, arguments in steps:
+            pane.note("$ planctl " + step + " " + plan_ir.name)
+            completed = _planctl_run(
+                script, layout, repo_root, step, plan_ir, arguments,
+                log=pane.log, reviewer_key=reviewer_key)
+            if completed.returncode != 0:
+                return _plan_contract_step_failure(
+                    failure, step, completed, pane.report(), reviewer_key)
+    finally:
+        pane.close()
+    payload = {
+        "outcome": outcome,
+        "plan": args.plan_name,
+        "plan_ir": str(plan_ir),
+        "planctl": str(script),
+        "steps": [step for step, _arguments in steps],
+    }
+    payload.update(extra or {})
+    payload.update(pane.report())
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def _plan_gate(args: argparse.Namespace) -> int:
+    """render + validate + mutate, on the author side, without the reviewer key."""
+    layout = _plan_contract_layout()
+    held = _reviewer_keys_in_environment(layout)
+    if held:
+        return _refusal(
+            "REVIEWER_KEY_PRESENT",
+            "plan gate refuses to run while the reviewer key is in its "
+            "environment (" + ", ".join(held) + " is set); the author side must "
+            "not hold the key that authorizes its own plan")
+    artifacts = _plan_contract_artifacts(layout, args.plan_name)
+    plan_ir = artifacts["plan_ir"]
+    if not plan_ir.is_file():
+        return _refusal(
+            "PLAN_CONTRACT_IR_MISSING", "no Plan IR at " + str(plan_ir))
+    rendered = artifacts["rendered"]
+    return _run_plan_contract(
+        args, "gate", (
+            ("render", ("--out", str(rendered))),
+            ("validate", ("--rendered", str(rendered))),
+            ("mutate", ("--rendered", str(rendered))),
+        ), outcome="PLAN_GATED", failure="PLAN_GATE_FAILED",
+        plan_ir=plan_ir, layout=layout, extra={"rendered": str(rendered)})
+
+
+def _plan_review(args: argparse.Namespace) -> int:
+    """review + validate --require-approved, holding the key Maestro owns."""
+    layout = _plan_contract_layout()
+    artifacts = _plan_contract_artifacts(layout, args.plan_name)
+    plan_ir = artifacts["plan_ir"]
+    if not plan_ir.is_file():
+        return _refusal(
+            "PLAN_CONTRACT_IR_MISSING", "no Plan IR at " + str(plan_ir))
+    rendered = artifacts["rendered"]
+    if not rendered.is_file():
+        return _refusal(
+            "PLAN_CONTRACT_RENDER_MISSING",
+            "no rendered plan at " + str(rendered)
+            + "; run: maestro plan gate " + args.plan_name)
+    reviewer = layout["reviewer"]
+    missing = [key for key in ("id", "vendor") if not reviewer.get(key)]
+    if missing:
+        return _refusal(
+            "REVIEWER_IDENTITY_UNCONFIGURED",
+            "reviewer." + " and reviewer.".join(missing) + " must be set in "
+            + str(_MAESTRO_CONFIG_FILE))
+    receipt = artifacts["receipt"]
+    return _run_plan_contract(
+        args, "review", (
+            ("review", ("--rendered", str(rendered), "--receipt-out",
+                        str(receipt), "--reviewer", reviewer["id"],
+                        "--reviewer-vendor", reviewer["vendor"])),
+            ("validate", ("--rendered", str(rendered), "--receipt",
+                          str(receipt), "--require-approved")),
+        ), outcome="PLAN_REVIEWED", failure="PLAN_REVIEW_FAILED",
+        plan_ir=plan_ir, layout=layout,
+        reviewer_key=_reviewer_hmac_key(layout),
+        extra={"rendered": str(rendered), "receipt": str(receipt),
+               "reviewer": reviewer["id"],
+               "reviewer_vendor": reviewer["vendor"]})
+
+
+def _plan_author_options() -> Dict[str, str]:
+    """The author verb's options, so a pending flag is detected and never assumed."""
+    parser = build_parser()
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        plan_parser = action.choices.get("plan")
+        if plan_parser is None:
+            continue
+        for plan_action in plan_parser._actions:
+            if not isinstance(plan_action, argparse._SubParsersAction):
+                continue
+            author = plan_action.choices.get("author")
+            if author is None:
+                continue
+            return {option: item.dest
+                    for item in author._actions
+                    for option in item.option_strings}
+    return {}
+
+
+def _configured_plan_step(plan_command: str, name: str) -> argparse.Namespace:
+    """Exactly what `maestro plan <command> <name>` binds, resolved in process."""
+    argv = ("plan", plan_command, name)
+    args = build_parser().parse_args(list(argv))
+    _apply_repository_config(args, argv)
+    return args
+
+
+class _PaneTee:
+    """Stream a step's stdout to the operator's terminal and the pane log at once."""
+
+    def __init__(self, stream, log: Path) -> None:
+        self._stream = stream
+        self._log = log
+
+    def write(self, text: str) -> int:
+        try:
+            with self._log.open("a", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError:
+            pass
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+
+def _plan_ship_step_failure(step: str, status: int,
+                            pane: Dict[str, Any]) -> int:
+    payload = {"outcome": "PLAN_SHIP_FAILED", "step": step, "status": status}
+    payload.update(pane)
+    print(json.dumps(payload, sort_keys=True))
+    return status
+
+
+def _plan_ship(args: argparse.Namespace) -> int:
+    """plan author --from-plan-contract + plan validate + plan finalize.
+
+    The finalize step is the only agent work here: it drives the independent
+    reviewer through the existing Herdr launcher and admitted route receipts,
+    untouched. Author and validate are local computation, shown in the pane.
+    """
+    layout = _plan_contract_layout()
+    artifacts = _plan_contract_artifacts(layout, args.plan_name)
+    for label, outcome, remedy in (
+            ("plan_ir", "PLAN_CONTRACT_IR_MISSING", ""),
+            ("rendered", "PLAN_CONTRACT_RENDER_MISSING",
+             "; run: maestro plan gate " + args.plan_name),
+            ("receipt", "PLAN_CONTRACT_RECEIPT_MISSING",
+             "; run: maestro plan review " + args.plan_name)):
+        if not artifacts[label].is_file():
+            return _refusal(
+                outcome, "no " + label.replace("_", " ") + " at "
+                + str(artifacts[label]) + remedy)
+    options = _plan_author_options()
+    required = (_PLAN_CONTRACT_AUTHOR_OPTION, _PLAN_CONTRACT_RECEIPT_OPTION,
+                _PLAN_CONTRACT_RENDERED_OPTION)
+    if any(option not in options for option in required):
+        return _refusal(
+            "PLAN_CONTRACT_INGRESS_UNAVAILABLE",
+            "the installed plan author verb has no "
+            + _PLAN_CONTRACT_AUTHOR_OPTION
+            + ", so an approved Plan IR cannot be projected onto a Maestro plan")
+    # Fail closed before authoring anything: no pane, no work, no leftovers.
+    pane = _PlanPane(layout, _plan_step_log(layout, args.plan_name, "ship"))
+    pane.open()
+    try:
+        author_args = _configured_plan_step("author", args.plan_name)
+        setattr(author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION],
+                str(artifacts["plan_ir"]))
+        setattr(author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION],
+                str(artifacts["receipt"]))
+        setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
+                str(artifacts["rendered"]))
+        steps = (("author", _plan_author, author_args),
+                 ("validate", _plan_validate, None),
+                 ("finalize", _plan_finalize, None))
+        for step, handler, prepared in steps:
+            pane.note("$ maestro plan " + step + " " + args.plan_name)
+            with _redirect_stdout(_PaneTee(sys.stdout, pane.log)):
+                status = int(handler(
+                    prepared if prepared is not None
+                    else _configured_plan_step(step, args.plan_name)))
+            if status != 0:
+                return _plan_ship_step_failure(step, status, pane.report())
+    finally:
+        pane.close()
+    payload = {
+        "outcome": "PLAN_SHIPPED",
+        "plan": args.plan_name,
+        "plan_ir": str(artifacts["plan_ir"]),
+        "receipt": str(artifacts["receipt"]),
+        "steps": ["author", "validate", "finalize"],
+    }
+    payload.update(pane.report())
+    print(json.dumps(payload, sort_keys=True))
+    return 0
 
 
 class _WorkspaceNotCanonical(RuntimeError):
@@ -1703,6 +2445,15 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--reviewer-turn-timeout-s", type=float, default=120.0)
     finalize.add_argument("--reviewer-poll-interval-s", type=float, default=1.0)
     finalize.set_defaults(handler=_plan_finalize)
+    gate = plan_sub.add_parser("gate")
+    gate.add_argument("plan_name")
+    gate.set_defaults(handler=_plan_gate)
+    review = plan_sub.add_parser("review")
+    review.add_argument("plan_name")
+    review.set_defaults(handler=_plan_review)
+    ship = plan_sub.add_parser("ship")
+    ship.add_argument("plan_name")
+    ship.set_defaults(handler=_plan_ship)
     show = plan_sub.add_parser("show")
     show.add_argument("digest")
     _add_plan_receipt_access(show)
@@ -1835,6 +2586,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         _apply_repository_config(args, raw_argv)
         return int(args.handler(args))
+    except _PlanPaneUnavailable as exc:
+        return _refusal("HERDR_PANE_UNAVAILABLE", str(exc))
     except _MaestroEnvironmentError as exc:
         return _refusal("MAESTRO_ENVIRONMENT_REQUIRED", str(exc))
     except _MaestroConfigurationError as exc:

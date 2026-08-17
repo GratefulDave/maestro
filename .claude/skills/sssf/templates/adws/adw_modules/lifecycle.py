@@ -885,7 +885,8 @@ class LifecycleStore:
             detail=detail, extra_writes=extra)
 
     def fail_attempt(self, run_id: str, node_id: str,
-                      retry_class: st.RetryClass) -> st.NodeLifecycle:
+                      retry_class: st.RetryClass,
+                      detail: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
         """RUNNING -> PENDING: an ENVIRONMENTAL/LAUNCHER_TRANSIENT failure that
         earns another attempt automatically (§7.5) — not an operator escape.
 
@@ -906,7 +907,7 @@ class LifecycleStore:
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="scheduler",
             reason=f"retry:{retry_class.value}", require_state=(st.NodeState.RUNNING,),
-            extra_writes=extra)
+            detail=detail, extra_writes=extra)
 
     # ── run-level: cancellation, outcome, resume ────────────────────────────
 

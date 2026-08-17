@@ -39,11 +39,18 @@ CONTINUATION_PROMPT = (
     "Reply with the previous exact marker and nothing else."
 )
 
+# The plan-contract reviewer key lives with the rest of the state root's key
+# material so an operator never generates or types one. planctl requires at
+# least 32 UTF-8 bytes; a 32-byte seed rendered as hex is 64 characters.
+REVIEWER_HMAC_KEY_FILE = "reviewer-hmac.key"
+REVIEWER_HMAC_KEY_ENV = "PLANCTL_REVIEWER_HMAC_KEY"
+
 _KEY_FILES = {
     "signing_seed": "signing.seed",
     "signing_pub": "signing.pub",
     "route_seed": "route.seed",
     "route_pub": "route.pub",
+    "reviewer_hmac": REVIEWER_HMAC_KEY_FILE,
 }
 
 
@@ -53,6 +60,7 @@ class KeyMaterial:
     signing_public: bytes
     route_seed: bytes
     route_public: bytes
+    reviewer_hmac: bytes
     keys_dir: Path
     env_file: Path
     created: Tuple[str, ...]
@@ -106,6 +114,10 @@ def provision_keys(keys_dir: Path) -> KeyMaterial:
         _KEY_FILES["signing_seed"], crypto.SEED_SIZE, crypto.generate_seed)
     route_seed = load_or_mint(
         _KEY_FILES["route_seed"], crypto.SEED_SIZE, crypto.generate_seed)
+    # Minted once and never regenerated: a new reviewer key would silently
+    # invalidate every approval receipt already signed with the old one.
+    reviewer_hmac = load_or_mint(
+        _KEY_FILES["reviewer_hmac"], crypto.SEED_SIZE, crypto.generate_seed)
     signing_public = crypto.seed_to_public_key(signing_seed)
     route_public = crypto.seed_to_public_key(route_seed)
     for name, public in (
@@ -120,6 +132,7 @@ def provision_keys(keys_dir: Path) -> KeyMaterial:
         signing_public=signing_public,
         route_seed=route_seed,
         route_public=route_public,
+        reviewer_hmac=reviewer_hmac,
         keys_dir=directory,
         env_file=directory / "maestro.env",
         created=tuple(created),
@@ -130,12 +143,19 @@ def write_env_file(
         keys: KeyMaterial, *,
         verify_key_env: str, signing_seed_env: str,
         route_verify_key_env: str,
+        reviewer_hmac_key_env: str = REVIEWER_HMAC_KEY_ENV,
 ) -> Path:
-    """Write the three operator environment bindings (0600)."""
+    """Write the operator environment bindings (0600).
+
+    The reviewer binding is here so the plan-contract skill can be driven
+    directly -- `planctl review` outside Maestro -- by sourcing one file the
+    operator never had to write.
+    """
     body = (
         "{verify}={verify_hex}\n"
         "{seed}={seed_hex}\n"
         "{route}={route_hex}\n"
+        "{reviewer}={reviewer_hex}\n"
     ).format(
         verify=verify_key_env,
         verify_hex=keys.signing_public.hex(),
@@ -143,6 +163,8 @@ def write_env_file(
         seed_hex=keys.signing_seed.hex(),
         route=route_verify_key_env,
         route_hex=keys.route_public.hex(),
+        reviewer=reviewer_hmac_key_env,
+        reviewer_hex=keys.reviewer_hmac.hex(),
     )
     _write_secret(keys.env_file, body)
     return keys.env_file
@@ -317,8 +339,11 @@ def _start_visible_agent(
         call: Callable[..., dict], spec: RouteCaptureSpec, cwd: Path,
         *, continuing: bool, session_id: Optional[str] = None,
 ) -> Dict[str, str]:
+    # Split downward rather than sideways: successive right-splits divide the
+    # width until each agent pane is too narrow to read, while a down-split
+    # keeps full width and costs only rows.
     split = call(
-        "pane", "split", "--current", "--direction", "right",
+        "pane", "split", "--current", "--direction", "down",
         "--cwd", str(cwd), "--no-focus")
     pane = _extract(split, "pane")
     if not isinstance(pane, dict) or not pane.get("pane_id"):

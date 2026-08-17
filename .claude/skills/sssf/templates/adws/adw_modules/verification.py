@@ -158,6 +158,31 @@ def adjudicate_counts(raw: Mapping[str, Any], min_cases: int) -> GateVerdict:
     return GateVerdict(green=False, unparseable=False, counts=counts, reason=reason)
 
 
+def adjudicate_pre_gate(result: "wt.GateResult", min_cases: int,
+                        selector_unbuilt: bool = False) -> GateVerdict:
+    """Adjudicate the pre-node gate, where an absent selector is the red.
+
+    A node that creates its own test file has no test file at its base, so its
+    pre-gate selector names a path that does not exist and the runner refuses
+    to collect -- pytest exits 4, emitting no counts at all. Read through the
+    ordinary rule that is an unparseable gate, hence ENVIRONMENTAL, and the
+    attempt is retried until the budget is gone; every retry starts from the
+    same base and fails identically.
+
+    An absent selector is not a broken environment. It is the strongest form
+    of the red that clause 2 requires: the behaviour cannot be present,
+    because the file asserting it has not been written yet. `selector_unbuilt`
+    is passed by the caller, which is the only layer that knows the selector
+    names a path this node is declared to produce.
+    """
+    if selector_unbuilt and result.exit_code != 0:
+        return GateVerdict(
+            green=False, unparseable=False, counts=GateCounts.parse(result.counts),
+            reason=("gate exited {} with its selector absent at base, which is "
+                    "this node's declared output".format(result.exit_code)))
+    return adjudicate_gate(result, min_cases)
+
+
 def adjudicate_gate(result: "wt.GateResult", min_cases: int) -> GateVerdict:
     """Adjudicate a gate execution from the merge protocol.
 

@@ -1,5 +1,5 @@
 schema: maestro-config.v1
-plans_dir: specs
+plans_dir: .maestro/plans
 state_root: ../.maestro-state
 keys:
   verify_key_env: MAESTRO_VERIFY_KEY
@@ -16,6 +16,8 @@ reviewer:
   route: claude
   model: opus
   effort: high
+  id: maestro-independent-reviewer
+  vendor: anthropic
   finalization_timeout_s: 600
   turn_timeout_s: 120
   poll_interval_s: 1

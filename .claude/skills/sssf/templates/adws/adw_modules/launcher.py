@@ -65,6 +65,7 @@ class LaunchHandle:
     agent_name: str
     launched_cwd: Path
     transcript_path: Optional[Path] = None
+    envelope_path: Optional[Path] = None
     process_group: Optional[int] = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
@@ -303,6 +304,28 @@ def _is_text_read(args: Sequence[str]) -> bool:
     return len(args) >= 2 and args[0] in ("agent", "pane") and args[1] == "read"
 
 
+def _agent_transcript_path(agent: object) -> Optional[Path]:
+    """Where herdr says this agent's transcript lives.
+
+    `agent start` and `agent get` report it as `agent_session`, a tagged value
+    whose `kind` says how to read `value` -- `path` for the routes that write a
+    JSONL transcript. Reading only a flat `transcript_path` key, which herdr
+    does not send, left every launch without a session path and failed the node
+    with SESSION_PATH_MISSING before its first turn.
+    """
+    if not isinstance(agent, dict):
+        return None
+    direct = agent.get("transcript_path")
+    if direct:
+        return Path(str(direct))
+    session = agent.get("agent_session")
+    if isinstance(session, dict) and session.get("kind") == "path":
+        value = session.get("value")
+        if value:
+            return Path(str(value))
+    return None
+
+
 def submit_agent_prompt(
         herdr_call: Callable[..., dict],
         pane_id: str,
@@ -496,11 +519,11 @@ class HerdrLauncher:
                         time.monotonic() + 1.0)
             raise RuntimeError("BINDING_MISMATCH:{}!={}".format(actual, worktree))
         agent = _extract(started, "agent")
-        transcript = None
-        if isinstance(agent, dict) and agent.get("transcript_path"):
-            transcript = Path(str(agent["transcript_path"]))
+        transcript = _agent_transcript_path(agent)
         handle = LaunchHandle(spec.correlation_token, pane_id, name, worktree,
-                              transcript_path=transcript, environment=environment)
+                              transcript_path=transcript,
+                              envelope_path=spec.envelope_path,
+                              environment=environment)
         with self._handles_lock:
             self._handles[spec.correlation_token] = handle
             self._proven_absent.pop(spec.correlation_token, None)
@@ -521,23 +544,51 @@ class HerdrLauncher:
         return handle
 
     def poll(self, handle: LaunchHandle) -> PollResult:
-        payload = self._herdr("agent", "get", handle.agent_name,
-                              env=handle.environment)
+        try:
+            payload = self._herdr("agent", "get", handle.agent_name,
+                                  env=handle.environment)
+        except RuntimeError as exc:
+            # An agent whose pane is closed is not reported as an agent with no
+            # record: herdr exits nonzero with `agent_not_found`. Reading that
+            # as an error rather than as GONE makes `cancel` treat a successful
+            # close as unproven quiescence, which blocks every agent node.
+            if "agent_not_found" not in str(exc):
+                raise
+            return PollResult(PollState.GONE, detail="AGENT_GONE")
         agent = _extract(payload, "agent")
         if not isinstance(agent, dict):
             return PollResult(PollState.GONE, detail="AGENT_GONE")
         status = str(agent.get("status") or agent.get("agent_status") or "unknown")
         with self._handles_lock:
             tailer = self._tailers.get(handle.correlation_token)
-        progressed = False
+        turns = 0
         if tailer:
             tailer.read_new()
-            progressed = bool(tailer._records)
-        if progressed:
-            code, detail = tailer.synthesized_exit()
-            return PollResult(PollState.EXITED, code, detail)
+            turns = len(tailer._records)
+
+        # The attempt ends when the agent writes its terminal envelope. The
+        # envelope is a file the agent is told to write, not a record in the
+        # route's transcript: an interactive route writes its own event schema
+        # and has no reason to emit one of ours, so reading the transcript for
+        # a terminal record ended every attempt on the agent's first message
+        # and cancelled the work mid-flight.
+        envelope = handle.envelope_path
+        if envelope is not None and envelope.is_file():
+            try:
+                payload = json.loads(envelope.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                return PollResult(PollState.EXITED, 1, "ENVELOPE_UNPARSED")
+            success = isinstance(payload, dict) and payload.get("success") is True
+            return PollResult(PollState.EXITED, 0 if success else 1,
+                              "ENVELOPE_SUCCESS" if success else "ENVELOPE_FAILURE")
         if status in ("starting", "unknown"):
             return PollResult(PollState.STARTING)
+        # Idle after at least one turn and still no envelope: the agent
+        # finished its turn without writing one. That is a failed attempt, not
+        # a running one -- waiting would hold the node until its timeout with
+        # nothing left to observe.
+        if status == "idle" and turns:
+            return PollResult(PollState.EXITED, 1, "NO_ENVELOPE")
         return PollResult(PollState.RUNNING)
 
     def cancel(self, handle: LaunchHandle, deadline: float) -> None:
@@ -555,11 +606,18 @@ class HerdrLauncher:
                 raise HarnessQuiescenceError(
                     "HERDR_QUIESCENCE_UNPROVEN:{}".format(token))
         try:
-            closed = _extract(
-                self._herdr("pane", "close", handle.pane_id,
-                            env=handle.environment),
-                "closed")
-            if closed is not True:
+            # herdr confirms a close as `{"result": {"type": "ok"}}`; there is
+            # no `closed` flag. Demanding one turned every successful close
+            # into PANE_CLOSE_UNCONFIRMED, which is raised inside the block
+            # that proves quiescence, so the proof could never succeed.
+            response = self._herdr("pane", "close", handle.pane_id,
+                                   env=handle.environment)
+            result = response.get("result")
+            closed = _extract(response, "closed")
+            confirmed = (closed is True
+                         or (isinstance(result, dict)
+                             and result.get("type") == "ok"))
+            if not confirmed:
                 raise RuntimeError("PANE_CLOSE_UNCONFIRMED:{}".format(
                     handle.pane_id))
             state = self.poll(handle)
