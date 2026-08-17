@@ -56,26 +56,64 @@ Run these in the repository the plan will change.
    review receipt under `.maestro/` — `.maestro/<name>.plan.json`, `.maestro/<name>.html`,
    `.maestro/<name>.plan-review.json` — alongside `.maestro/plans/`, where Maestro projects the
    finished plan.
-3. `planctl render` → `planctl validate` → `planctl mutate`, then an independent reviewer runs
-   `planctl review` and `planctl validate --require-approved`, all with `--repo-root .` so source
-   paths in `source_artifacts` resolve from the repository root rather than from `.maestro/`, the
-   IR's own directory. Without `--repo-root`, a source cited as `docs/AUDIT.md` would have to be
-   written `../docs/AUDIT.md` to reach it from inside `.maestro/`, and Maestro refuses any path
-   that escapes with `..` — the two tools would only agree on paths at the repository root.
-   `--repo-root .` removes that constraint, which is what lets the IR live in `.maestro/` at all.
-   `validate` reproduces every ingress refusal, so a plan that passes here projects.
-4. Project and check:
+3. `maestro plan gate <plan-name>` — the author renders, validates, and mutates the IR.
+4. `maestro plan review <plan-name>` — a second person, holding the reviewer's key rather than the
+   author's, reviews the mutated IR and re-validates it against the approved-receipt requirement.
+5. `maestro plan ship <plan-name>` — projects the reviewed IR into a `maestro-plan.v1` plan,
+   validates the projection, and finalizes it. Finalizing is required before the plan can run, and
+   before it can participate in a workspace.
 
-   ```bash
-   maestro plan author <plan-name> \
-     --from-plan-contract .maestro/<name>.plan.json \
-     --plan-contract-receipt .maestro/<name>.plan-review.json \
-     --plan-contract-rendered .maestro/<name>.html
-   maestro plan validate <plan-name>
-   ```
+> **Not built yet.** `gate`, `review`, and `ship` are the intended surface for Maestro's plan CLI —
+> one verb, one argument, everything else resolved from `maestro.config.yaml`. The companion change
+> that adds them is in progress in the lexgenius repository and has not merged. Until it lands, run
+> the calls each verb wraps directly; see "What each verb runs" below.
 
-5. `maestro plan finalize <plan-name>` — required before the plan can run, and before it can
-   participate in a workspace.
+`gate` and `review` are two separate commands, on purpose, because of who is allowed to hold what.
+A review receipt only proves that someone other than the author looked at the plan if the author
+is structurally incapable of producing one, which means the HMAC key that signs receipts must never
+sit in the author's environment. Maestro owns that key itself rather than handing it to whoever
+types the command: `maestro bootstrap` mints it once into the repository's state root, next to the
+Ed25519 signing material it already manages, and `maestro plan review <plan-name>` — which takes
+the plan name and nothing else — injects the key into the `planctl review` subprocess directly. No
+shell ever holds it, no export line exists, and there is no reviewer identity to pass. (An
+environment-variable override remains, for a reviewer who deliberately supplies their own key, the
+same way the Ed25519 signing key already supports one; the ordinary path never touches it.) `gate`
+enforces the same boundary from the other side: it refuses outright if that key is present in its
+own environment, because a gate command able to see the reviewer's key would no longer prove that
+gating and reviewing happen on two sides of a line neither side can cross. Nobody has to remember to
+keep the key separate — Maestro checks for it before either command does anything else.
+
+### What each verb runs
+
+```bash
+# maestro plan gate <plan-name>
+planctl render <name>.plan.json --repo-root .
+planctl validate <name>.plan.json --repo-root .
+planctl mutate <name>.plan.json --repo-root .
+
+# maestro plan review <plan-name>  — runs with the reviewer's key, never the author's
+planctl review <name>.plan.json --repo-root .
+planctl validate <name>.plan.json --repo-root . --require-approved
+
+# maestro plan ship <plan-name>
+maestro plan author <plan-name> \
+  --from-plan-contract .maestro/<name>.plan.json \
+  --plan-contract-receipt .maestro/<name>.plan-review.json \
+  --plan-contract-rendered .maestro/<name>.html
+maestro plan validate <plan-name>
+maestro plan finalize <plan-name>
+```
+
+Every `planctl` call carries `--repo-root .` because the IR lives in `.maestro/` while the
+`source_artifacts` paths it cites are repo-relative (`docs/AUDIT.md`, not `.maestro/docs/AUDIT.md`).
+Without `--repo-root`, planctl resolves those paths relative to the IR's own directory, so that same
+source would have to be written `../docs/AUDIT.md` to be reached from inside `.maestro/` — and
+Maestro refuses any path that escapes with `..`. `--repo-root .` is what lets the IR live in
+`.maestro/` at all; `gate` and `review` pass it on every call so `planctl` and Maestro agree on
+where "repo-relative" starts.
+
+`validate` reproduces every ingress refusal a later step would hit, so a plan that passes it inside
+`gate` is a plan that projects inside `ship`.
 
 ## Choosing a verifier command
 

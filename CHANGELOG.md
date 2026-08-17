@@ -8,13 +8,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- `docs/plan-authoring.md`: the single-repository sequence now places the Plan IR, its bound HTML
-  view, and its PASS review receipt under `.maestro/` (`.maestro/<name>.plan.json`,
-  `.maestro/<name>.html`, `.maestro/<name>.plan-review.json`) instead of at the repository root,
-  and instructs `planctl render`/`validate`/`review` to run with `--repo-root .` so
+- `docs/plan-authoring.md`: the single-repository step-by-step is rewritten around three
+  intended plan-CLI verbs — `maestro plan gate`, `plan review`, `plan ship` — each taking only
+  the plan name, everything else (including the `.maestro/` artifact layout and `--repo-root .`)
+  resolved underneath. The Plan IR, its bound HTML view, and its PASS review receipt live under
+  `.maestro/` (`.maestro/<name>.plan.json`, `.maestro/<name>.html`,
+  `.maestro/<name>.plan-review.json`) instead of at the repository root, alongside
+  `.maestro/plans/<name>/maestro-plan.v1` where Maestro projects the finished plan; the
+  `planctl render`/`validate`/`mutate`/`review` calls each verb wraps carry `--repo-root .` so
   `source_artifacts` paths resolve from the repository root instead of `..`-relative to the IR's
-  own directory. `.maestro/` is now the one directory everything plan-related is read from,
-  alongside `.maestro/plans/<name>/maestro-plan.v1` where Maestro projects the finished plan.
+  own directory inside `.maestro/`. Those `planctl`/`maestro plan` calls are now presented as a
+  clearly marked "What each verb runs" subsection, not as the reader's typed instructions.
+  Explains why `gate` and `review` are separate commands: the reviewer's HMAC key is minted and
+  held by Maestro itself (`maestro bootstrap`, alongside the existing Ed25519 signing material)
+  and injected only into `plan review`'s subprocess, never into the author's shell; `gate`
+  refuses outright if that key is present in its own environment. Notes plainly that these verbs
+  are not yet built — they depend on an in-progress, unmerged companion change in lexgenius.
 
 ### Added
 
