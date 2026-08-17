@@ -49,21 +49,28 @@ brownfield plan pins, not something that runs.
 Run these in the repository the plan will change.
 
 1. `/arch-review <master-spec>` — author or refresh the approved architecture IR. It produces
-   `<stem>.plan.json`, `<stem>.html`, and `<stem>.plan-review.json`. Skip only when an approved
-   architecture IR already exists.
+   `.maestro/<stem>.plan.json`, `.maestro/<stem>.html`, and `.maestro/<stem>.plan-review.json`.
+   Skip only when an approved architecture IR already exists.
 2. `/plan-brownfield "<what to build>" <master-spec>` — author one executable work package per
-   reviewable unit, each carrying `extensions.maestro`. Place the IR at the repository root so its
-   source paths are repo-relative; Maestro refuses a path that escapes with `..`.
+   reviewable unit, each carrying `extensions.maestro`. Place the IR, its bound HTML view, and its
+   review receipt under `.maestro/` — `.maestro/<name>.plan.json`, `.maestro/<name>.html`,
+   `.maestro/<name>.plan-review.json` — alongside `.maestro/plans/`, where Maestro projects the
+   finished plan.
 3. `planctl render` → `planctl validate` → `planctl mutate`, then an independent reviewer runs
-   `planctl review` and `planctl validate --require-approved`. `validate` reproduces every ingress
-   refusal, so a plan that passes here projects.
+   `planctl review` and `planctl validate --require-approved`, all with `--repo-root .` so source
+   paths in `source_artifacts` resolve from the repository root rather than from `.maestro/`, the
+   IR's own directory. Without `--repo-root`, a source cited as `docs/AUDIT.md` would have to be
+   written `../docs/AUDIT.md` to reach it from inside `.maestro/`, and Maestro refuses any path
+   that escapes with `..` — the two tools would only agree on paths at the repository root.
+   `--repo-root .` removes that constraint, which is what lets the IR live in `.maestro/` at all.
+   `validate` reproduces every ingress refusal, so a plan that passes here projects.
 4. Project and check:
 
    ```bash
    maestro plan author <plan-name> \
-     --from-plan-contract <name>.plan.json \
-     --plan-contract-receipt <name>.plan-review.json \
-     --plan-contract-rendered <name>.html
+     --from-plan-contract .maestro/<name>.plan.json \
+     --plan-contract-receipt .maestro/<name>.plan-review.json \
+     --plan-contract-rendered .maestro/<name>.html
    maestro plan validate <plan-name>
    ```
 

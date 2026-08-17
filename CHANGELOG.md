@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `docs/plan-authoring.md`: the single-repository sequence now places the Plan IR, its bound HTML
+  view, and its PASS review receipt under `.maestro/` (`.maestro/<name>.plan.json`,
+  `.maestro/<name>.html`, `.maestro/<name>.plan-review.json`) instead of at the repository root,
+  and instructs `planctl render`/`validate`/`review` to run with `--repo-root .` so
+  `source_artifacts` paths resolve from the repository root instead of `..`-relative to the IR's
+  own directory. `.maestro/` is now the one directory everything plan-related is read from,
+  alongside `.maestro/plans/<name>/maestro-plan.v1` where Maestro projects the finished plan.
+
 ### Added
 
 - `docs/plan-authoring.md`: the path from a source document to an executable
