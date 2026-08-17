@@ -163,11 +163,9 @@ class LauncherContractTest(unittest.TestCase):
                                 claude_path=Path("/opt/claude"),
                                 admitted_routes=self.admitted_routes)
         payload = harness._herdr("agent", "read", "n", "--source", "visible")
-        self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK",
-                      launcher._payload_text(payload))
+        self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK", payload["result"]["text"])
         payload = harness._herdr("pane", "read", "w1:p2", "--source", "visible")
-        self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK",
-                      launcher._payload_text(payload))
+        self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK", payload["result"]["text"])
         # Every other command still has to speak JSON.
         with self.assertRaisesRegex(RuntimeError, "PROTOCOL_INVALID_JSON"):
             harness._herdr("pane", "list")

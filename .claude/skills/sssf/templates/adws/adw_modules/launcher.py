@@ -293,27 +293,6 @@ def _available_shell(payload: Mapping[str, object]) -> bool:
     return base in ("zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh")
 
 
-def _payload_text(payload: Mapping[str, object]) -> str:
-    stack = [payload]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, dict):
-            for key in ("text", "output", "content"):
-                value = current.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-            lines = current.get("lines")
-            if isinstance(lines, list):
-                joined = "\n".join(
-                    str(line) for line in lines if line is not None)
-                if joined.strip():
-                    return joined
-            stack.extend(current.values())
-        elif isinstance(current, list):
-            stack.extend(current)
-    return ""
-
-
 def _is_text_read(args: Sequence[str]) -> bool:
     """`herdr agent read` / `herdr pane read` print the snapshot as raw text.
 
