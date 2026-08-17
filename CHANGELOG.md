@@ -48,6 +48,56 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Byproduct redirection now reaches the agent's own pane. `scratch_env()`'s seven
+  variables were passed as `env=` to the `herdr` CLI subprocess, but a pane's shell is
+  forked by the herdr server, so the redirect configured the client and died there. The
+  harness pre-gate honoured it and the agent's own test run did not, which meant an agent
+  that merely ran pytest was convicted under §8.3 clause 4 for the bytecode cache its test
+  run wrote. The variables are now forwarded as `--env KEY=VALUE` on `herdr pane split`,
+  the one surface that crosses the server boundary, and a launch refuses with
+  `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:<keys>` before any pane exists if one is
+  missing. `scratch_env()` raises if its key set diverges from the forwarded set, so
+  adding a variable for the gates but not for the pane is no longer possible. §8.3's
+  permission check is untouched and no ignore list was introduced; this is a fix at the
+  redirect tier, which is the order §8.3 requires.
+
+- Blocked transitions record why they blocked. Three arms in the scheduler called
+  `mark_blocked` without `detail=`, so a terminal block wrote `{}` and its reason survived
+  only as prompt text rendered into the next attempt — prose, which §1.2 forbids as a
+  basis for anything. Four of the seven blocked transitions in the live ledger carried an
+  empty detail. All three arms now pass a shared typed record carrying the classifier
+  reason, the failed clause, the verdict, and the offending paths; the quiescence arm
+  already did, so the precedent existed and the budget arms simply never used it.
+
+- Retry guidance accumulates per acceptance surface instead of being overwritten. A single
+  string slot held the most recent failure, and the verification arm and the review arm each
+  overwrote it, so a node alternating between the §8.3 permission check and the reviewer
+  received only the last surface's constraint and dropped the other. Observed in production:
+  a node fixed the cache flag, then the clock, then the cache flag again, satisfying each
+  constraint individually and never both at once, until its attempt ceiling ended the run.
+  Guidance is now a typed ledger keyed by acceptance surface, one entry per surface,
+  replaced rather than appended, with every occupied surface rendered into every retry
+  prompt. A constraint retires only when its own surface re-evaluates a newer diff — never
+  on a pass, which is what caused the regression. Rendering is bounded by a 12,000-character
+  budget split evenly across occupied surfaces, elided from each section's tail, with every
+  surface keeping its header and an explicit truncation marker.
+
+- A stalled reviewer's reason survives into the ledger. The `ReviewStalled` arm constructed
+  a `Classification` with a `reason` the dataclass did not define. The resulting `TypeError`
+  was swallowed by the surrounding `except BaseException` and reclassified as a generic
+  environmental retry, so the symptom was not a crash but an unexplained retry row with no
+  reason recorded. `Classification` now carries an optional `reason`, left outside the
+  exactly-one-of pairing `__post_init__` enforces, and the stall reason reaches the durable
+  transition row.
+
+- Configuration is resolved from the repository root rather than the process working
+  directory. `Path.cwd() / "adws/maestro.config.yaml"` at three resolution sites meant every
+  configured command silently required being run from the repository root. Resolution now
+  walks up from the invocation directory to the nearest ancestor holding the config file and
+  stops at the first `.git` marker, so a nested checkout cannot inherit the enclosing
+  repository's plans, state, and route receipts. `plans_dir` still binds to the current
+  checkout; only which checkout is selected has changed.
+
 - Plan finalize and run start still refuse when no signed route receipt
   exists. There is no fixture-copy or hand-signed bypass.
 - Herdr admission/launch no longer treat the typed composer prompt as a
