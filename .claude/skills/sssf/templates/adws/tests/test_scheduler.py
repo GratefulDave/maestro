@@ -86,6 +86,14 @@ def red(passed: int = 1, failed: int = 1) -> wt.GateResult:
                          counts={"passed": passed, "failed": failed})
 
 
+def unparseable() -> wt.GateResult:
+    """A gate that exited nonzero and reported no countable result — §10.2's
+    ENVIRONMENTAL case, which is neither a red gate nor a green one."""
+    return wt.GateResult(label="gate", scope="node", selector="sel",
+                         command=("gate",), exit_code=1, green=False,
+                         counts={})
+
+
 class Recorder:
     """A callable that remembers how it was called, for order assertions."""
 
@@ -419,6 +427,63 @@ class SemanticRetryTests(SchedulerFixture):
                                config=self.config(semantic_ceiling=1)).run()
         self.assertEqual(dict(report.blocked)["a"],
                          st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
+
+    def _blocked_transition(self, node_id: str = "a"):
+        """The one BLOCKED transition row for a node, from the audit tier."""
+        rows = [row for row in self.store.audit_transitions("run1", node_id)
+                if row.get("to_state") == st.NodeState.BLOCKED.value]
+        self.assertEqual(len(rows), 1, rows)
+        return rows[0]
+
+    def test_the_blocking_transition_records_which_clause_failed(self):
+        """§1.1 item 4 — a block is terminal, so its transition row is the
+        ledger's last chance to say what the attempt failed on.
+
+        An observed run wrote `blocked:SEMANTIC_BUDGET_EXHAUSTED` with
+        `detail_json == {}`, and the reason its last attempt failed existed
+        nowhere in the store — it was recoverable only from the worktree's git
+        history. The earlier attempts' reasons survived only because they had
+        been rendered into the next attempt's prompt, which makes prose the
+        carrier of the evidence (§1.2).
+        """
+        self.written = {"a": {"a.py": "A\n"}}
+        self.gate_script[("a", "post")] = [red()] * 10
+        self.schedule([self.agent("a")],
+                      config=self.config(semantic_ceiling=1)).run()
+
+        detail = self._blocked_transition().get("detail", {})
+        self.assertEqual(detail.get("clause"), 3,
+                         "the red post-node gate is clause 3")
+        self.assertNotEqual(detail, {})
+
+    def test_the_blocking_transition_names_the_offending_paths(self):
+        """§1.1 item 4 / §7.5 — the paths that justified calling a permission
+        failure SEMANTIC are recorded where the block is recorded, not only in
+        the retry prompt that the blocking attempt never gets."""
+        self.written = {"a": {"a.py": "A\n", "not-declared.py": "X\n"}}
+        self.schedule([self.agent("a")],
+                      config=self.config(semantic_ceiling=1)).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.state, st.NodeState.BLOCKED)
+        detail = self._blocked_transition().get("detail", {})
+        self.assertEqual(detail.get("clause"), 4)
+        self.assertIn("not-declared.py", detail.get("offending_paths", []))
+
+    def test_an_exhausted_environmental_budget_records_its_reason(self):
+        """The same evidence on the non-SEMANTIC arm: a node blocked on its
+        environmental budget records what its last attempt failed as."""
+        self.written = {"a": {"a.py": "A\n"}}
+        self.gate_script[("a", "pre")] = [unparseable()] * 10
+        self.schedule([self.agent("a")],
+                      config=self.config(environmental_retries=0)).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.block_reason,
+                      st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED)
+        detail = self._blocked_transition().get("detail", {})
+        self.assertEqual(detail.get("clause"), 2)
+        self.assertNotEqual(detail, {})
 
 
 class ContainmentTests(SchedulerFixture):
