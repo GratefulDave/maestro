@@ -9,7 +9,7 @@ Maestro is a dependency-DAG software factory. Repository materials define the fa
 | File | Description |
 |------|-------------|
 | `README.md` | Project overview and usage guidance |
-| `MAESTRO architecture.md` | Architecture and design reference |
+| `MAESTRO_architecture.md` | Architecture and design reference |
 | `maestro_prompt.md` | Primary Maestro prompt/specification |
 | `FABLE prompt.md` | Related prompt and operating contract |
 | `LICENSE` | Repository license |
@@ -24,7 +24,7 @@ Maestro is a dependency-DAG software factory. Repository materials define the fa
 ## For AI Agents
 
 ### Working In This Directory
-- Treat `MAESTRO architecture.md`, prompts, and README as contract-bearing docs; keep implementation and docs aligned.
+- Treat `MAESTRO_architecture.md`, prompts, and README as contract-bearing docs; keep implementation and docs aligned.
 - Keep generated/runtime state directories out of source changes.
 - Prefer existing SSSF patterns under `.claude/skills/sssf/` before introducing new structure.
 
