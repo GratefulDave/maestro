@@ -26,7 +26,7 @@ execution:
   model: grok-4.6
   effort: high
   profile: grok
-  concurrency: 2
+  concurrency: 6
   node_timeout_s: 1800
   turn_timeout_s: 300
   final_acceptance_timeout_s: 900

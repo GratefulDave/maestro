@@ -25,11 +25,27 @@ you were given contradicts them, the documents win — say so rather than follow
 
 ## Where the implementation lives
 
-Current implementation authority is `.claude/skills/sssf/templates/adws/` **in this repo**.
+The ADW runtime exists in three copies:
 
-Deployed copies exist elsewhere — notably `lexgenius/adws/` — and **there is no sync
-mechanism between them: no script, no test**. Every fix must be applied by hand to each copy.
-Land changes here first, mirror deliberately, and state which copies were touched.
+| Copy | Role |
+| --- | --- |
+| `.claude/skills/sssf/templates/adws/` (this repo) | The template. Where the factory ships from. |
+| `lexgenius/adws/` | A deployed instance, and in practice where fixes have landed first. |
+| `the-library/skills/sssf/templates/adws/` | The install source for `skills/sssf`. |
+
+**There is no sync mechanism between them: no script, no test.** They drift silently, and the
+drift is only discovered when something breaks. On 2026-08-17 the template copy was found to be
+~750 lines behind in `maestro.py` alone, missing every plan verb in daily use, and a revert in a
+consuming repo silently deleted 6009 lines of runtime from another copy. All three were
+reconciled that day and are byte-identical as of `041f74a`.
+
+Treat this repo's template as authoritative for what the factory *ships*, but **verify before
+assuming any copy is current** — `diff -rq` the copies rather than trusting this file, which can
+itself go stale. When landing a change, say explicitly which copies you touched, and mirror
+deliberately rather than assuming a mirror already happened.
+
+The visualizer (`.claude/skills/sssf/apps/visualizer/`) exists only in this repo — no copies,
+no ambiguity.
 
 ## Reviewer design — settled, do not re-derive
 
