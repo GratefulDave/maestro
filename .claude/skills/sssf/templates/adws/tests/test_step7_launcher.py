@@ -31,6 +31,7 @@ from adw_modules.launcher import (
     run_harness_process,
 )
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
+from adw_modules import worktree as worktree_module
 
 
 FAKE_HERDR = r'''#!/usr/bin/env python3
@@ -105,6 +106,8 @@ class LauncherContractTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.worktree = self.root / "worktree"
         self.worktree.mkdir()
+        self.scratch = self.root / "scratch"
+        self.scratch.mkdir()
         self.prompt = self.root / "prompt.txt"
         self.prompt.write_text("do the work")
         self.envelope = self.root / "envelope.json"
@@ -141,7 +144,37 @@ class LauncherContractTest(unittest.TestCase):
             effort="high",
             profile="openai-performance" if route == "omp" else None,
             session_dir=self.root / "session",
+            environment=worktree_module.launch_env(self.scratch),
         )
+
+    @staticmethod
+    def split_call(calls):
+        """The one `pane split` argv, which is the pane's whole launch surface."""
+        splits = [call for call in calls if call[:2] == ["pane", "split"]]
+        if len(splits) != 1:
+            raise AssertionError("expected exactly one pane split, got {}".format(
+                len(splits)))
+        return splits[0]
+
+    @staticmethod
+    def pane_environment(split):
+        """What the pane's shell will actually be forked with.
+
+        Only `--env KEY=VALUE` counts. The environment this process hands the
+        `herdr` CLI reaches the client and stops there, because the server
+        forks the pane; asserting on the CLI subprocess's own environment is
+        the assertion that let the 2026-08-17 defect through.
+        """
+        pane_env = {}
+        for index, token in enumerate(split):
+            if token == "--env":
+                key, _, value = split[index + 1].partition("=")
+                pane_env[key] = value
+        return pane_env
+
+    def recorded_calls(self):
+        return [json.loads(line)["argv"]
+                for line in (self.root / "argv.jsonl").read_text().splitlines()]
 
     def test_launch_verifies_pane_cwd_not_foreground_cwd(self):
         launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
@@ -180,6 +213,59 @@ class LauncherContractTest(unittest.TestCase):
                                  admitted_routes=claude_only)
         with self.assertRaisesRegex(RuntimeError, "ROUTE_NOT_ADMITTED:omp"):
             launcher.launch(self.spec("omp"))
+        self.assertFalse((self.root / "argv.jsonl").exists())
+
+    def test_launch_carries_scratch_redirection_into_the_pane_itself(self):
+        # §8.3: byproducts are redirected out of the worktree, and the pane
+        # environment at allocation is one of the three contexts that must
+        # carry the redirection. The pane's shell is forked by the herdr
+        # server, so `--env` on `pane split` is the only thing that reaches it
+        # -- the CLI subprocess's own environment does not. On 2026-08-17 an
+        # agent whose pane never received these wrote 226 `.pyc` files and a
+        # `.pytest_cache` into its worktree running its own tests, and was
+        # convicted under the permission check for the harness's omission.
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        harness.launch(self.spec())
+        split = self.split_call(self.recorded_calls())
+        pane_env = self.pane_environment(split)
+        self.assertEqual(set(pane_env), set(launcher.SCRATCH_ENV_KEYS))
+        expected = worktree_module.scratch_env(self.scratch)
+        self.assertEqual(pane_env, expected)
+        # Every redirected path must land in the attempt's scratch, outside the
+        # worktree, or the redirect is decorative.
+        self.assertEqual(pane_env["PYTHONPYCACHEPREFIX"],
+                         str(self.scratch / "pycache"))
+        self.assertIn("cache_dir={}".format(self.scratch / "pytest_cache"),
+                      pane_env["PYTEST_ADDOPTS"])
+        for key, value in pane_env.items():
+            path = value.split("cache_dir=", 1)[-1] if key == "PYTEST_ADDOPTS" else value
+            self.assertTrue(Path(path).is_relative_to(self.scratch), key)
+            self.assertFalse(Path(path).is_relative_to(self.worktree), key)
+
+    def test_pane_env_flags_survive_values_carrying_equals_and_spaces(self):
+        # `PYTEST_ADDOPTS="-o cache_dir=<path>"` carries both a space and a
+        # second `=`. Measured against herdr 0.8.0 on 2026-08-17: `--env`
+        # splits on the first `=` only, so the value arrives whole.
+        flags = launcher.pane_env_flags(worktree_module.scratch_env(self.scratch))
+        pane_env = self.pane_environment(("pane", "split") + flags)
+        self.assertEqual(pane_env["PYTEST_ADDOPTS"],
+                         "-o cache_dir={}".format(self.scratch / "pytest_cache"))
+
+    def test_launch_refuses_before_creating_a_pane_when_redirection_is_missing(self):
+        # A redirect that silently fails to arrive convicts the agent for a
+        # harness defect, so an incomplete environment is refused before any
+        # untrusted code runs rather than degraded into a conviction (§8.3).
+        environment = worktree_module.launch_env(self.scratch)
+        del environment["PYTHONPYCACHEPREFIX"]
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"):
+            harness.launch(replace(self.spec(), environment=environment))
         self.assertFalse((self.root / "argv.jsonl").exists())
 
     def test_launch_refuses_wrong_pane_cwd_before_starting_agent(self):
@@ -284,7 +370,8 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(launcher.poll(handle).state, PollState.GONE)
 
     def test_lifecycle_uses_immutable_launch_environment(self):
-        environment = {"FAKE_LAUNCH_ENV": "bound-context"}
+        environment = dict(worktree_module.launch_env(self.scratch),
+                           FAKE_LAUNCH_ENV="bound-context")
         launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
                                  claude_path=Path("/opt/claude"),
                                  admitted_routes=self.admitted_routes)

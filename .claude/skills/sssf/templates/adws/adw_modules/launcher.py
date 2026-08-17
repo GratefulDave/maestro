@@ -45,6 +45,60 @@ class HarnessCancelled(RuntimeError):
 class HarnessQuiescenceError(RuntimeError):
     """A harness-owned process group could not be proven absent."""
 
+#: §8.3's cache-redirection variables, named here rather than only beside
+#: `worktree.scratch_env`, because this module is where they cross the herdr
+#: boundary. A variable absent from this tuple never reaches the agent's shell
+#: however carefully it was computed.
+SCRATCH_ENV_KEYS: Tuple[str, ...] = (
+    "XDG_CACHE_HOME",
+    "TMPDIR",
+    "PYTHONPYCACHEPREFIX",
+    "PYTEST_ADDOPTS",
+    "COVERAGE_FILE",
+    "RUFF_CACHE_DIR",
+    "npm_config_cache",
+)
+
+
+def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
+    """`--env KEY=VALUE` flags carrying §8.3's redirection into the pane shell.
+
+    The environment this process passes to the `herdr` CLI does not reach the
+    pane. `herdr` is a client: it hands the split over a socket to the herdr
+    server, and the server forks the pane's shell from *its own* environment,
+    so `env=` on the CLI subprocess stops at the client. Measured 2026-08-17
+    against herdr 0.8.0: a variable exported into the CLI subprocess is absent
+    from the pane's shell, while the same variable passed as `--env` to `pane
+    split` is present in it. `herdr agent start` has no environment option of
+    its own and needs none — it starts the agent at the pane's own shell
+    prompt, so the agent inherits whatever the split established.
+
+    The incident this closes: an agent node whose pane never received
+    `PYTHONPYCACHEPREFIX` or `PYTEST_ADDOPTS` ran its own tests, wrote 226
+    `.pyc` files and a `.pytest_cache` into its worktree, and was convicted
+    under §8.3's permission check for the harness's own omission. The
+    harness's pre-gate, started as an ordinary subprocess with the same
+    mapping, honoured the redirect in the same attempt — which is exactly the
+    asymmetry that identifies the boundary.
+
+    Only the redirection variables are forwarded. The rest of the launch
+    environment is the harness's own, and the pane already has the operator's.
+
+    Missing variables are refused rather than skipped. §8.3's preference order
+    is redirect, then suppress, then the write convicts, and a redirect that
+    silently fails to arrive convicts an agent for a harness defect. A refusal
+    here happens before any untrusted code runs and names the variable.
+    """
+    missing = [key for key in SCRATCH_ENV_KEYS if not environment.get(key)]
+    if missing:
+        raise RuntimeError(
+            "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:{}".format(",".join(missing)))
+    flags: List[str] = []
+    for key in SCRATCH_ENV_KEYS:
+        flags.extend(("--env", "{}={}".format(key, environment[key])))
+    return tuple(flags)
+
+
 @dataclass(frozen=True)
 class LaunchSpec:
     correlation_token: str
@@ -535,8 +589,12 @@ class HerdrLauncher:
             raise RuntimeError("ROUTE_NOT_ADMITTED:{}".format(spec.route))
         worktree = spec.worktree.resolve()
         environment = MappingProxyType(dict(spec.environment))
+        # The pane shell is forked by the herdr server, not by the CLI process
+        # below, so `env=` alone leaves the bracket's redirection outside the
+        # pane entirely (§8.3). `--env` is the only surface that crosses.
         split = self._herdr("pane", "split", "--current", "--direction", "right",
-                            "--cwd", str(worktree), "--no-focus", env=environment)
+                            "--cwd", str(worktree), "--no-focus",
+                            *pane_env_flags(environment), env=environment)
         pane = _extract(split, "pane")
         if not isinstance(pane, dict) or not pane.get("pane_id"):
             raise RuntimeError("LAUNCH_REFUSED:NO_PANE")
