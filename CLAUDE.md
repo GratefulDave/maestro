@@ -33,16 +33,31 @@ The ADW runtime exists in three copies:
 | `lexgenius/adws/` | A deployed instance, and in practice where fixes have landed first. |
 | `the-library/skills/sssf/templates/adws/` | The install source for `skills/sssf`. |
 
-**There is no sync mechanism between them: no script, no test.** They drift silently, and the
-drift is only discovered when something breaks. On 2026-08-17 the template copy was found to be
-~750 lines behind in `maestro.py` alone, missing every plan verb in daily use, and a revert in a
-consuming repo silently deleted 6009 lines of runtime from another copy. All three were
-reconciled that day and are byte-identical as of `041f74a`.
+**There is still no script that copies one to another.** They drift silently, and until
+2026-08-17 the drift was only discovered when something broke. That day the template copy was
+found to be ~750 lines behind in `maestro.py` alone, missing every plan verb in daily use, and a
+revert in a consuming repo silently deleted 6009 lines of runtime from another copy.
 
+The two **template** copies are now held together by a test rather than by discipline:
+`.claude/skills/sssf/templates/adws/tests/test_template_parity.py` compares this repo's template
+against the-library's file by file and fails naming the files that differ and in which direction.
+It is mirrored into the-library along with the runtime, and re-exported into that repo's own
+suite by `the-library/tests/test_sssf_adws_copy_parity.py`, so both repositories check the
+invariant from their own side. A file present in one copy and not the other fails, which is the
+6009-line loss mode. It skips only when the peer repository is not checked out at all; a peer that
+is checked out with its runtime directory missing fails.
+
+`lexgenius/adws/` is **not** covered by that test. A deployed instance carries its own
+`maestro.config.yaml` and legitimately runs ahead of the template, so it is reconciled by hand.
 Treat this repo's template as authoritative for what the factory *ships*, but **verify before
-assuming any copy is current** — `diff -rq` the copies rather than trusting this file, which can
-itself go stale. When landing a change, say explicitly which copies you touched, and mirror
-deliberately rather than assuming a mirror already happened.
+assuming it is current against a deployment** — `diff -rq` against the instance rather than
+trusting this file, which can itself go stale. When landing a change, say explicitly which copies
+you touched, and mirror deliberately rather than assuming a mirror already happened.
+
+`maestro.config.yaml` is deliberately *not* copied from a deployment. It is deployment-specific:
+its lane vendors, models, and concurrency name a particular installation. The template's copy
+carries the same schema keys as the deployments, with template-shaped values, and the parity test
+does compare it between the two template copies.
 
 The visualizer (`.claude/skills/sssf/apps/visualizer/`) exists only in this repo — no copies,
 no ambiguity.
