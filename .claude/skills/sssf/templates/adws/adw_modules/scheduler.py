@@ -242,7 +242,14 @@ class Scheduler:
         # unblocked by the watchdog from entering a gate or runner.
         self._watchdog_fences: Dict[Tuple[str, str, int], None] = {}
         self._output_shas: Dict[str, str] = {}
-        self._retry_prompts: Dict[str, Optional[str]] = {}
+        # Latest typed guidance per acceptance surface, per node. Replaced a
+        # plain last-failure string: verification and review took turns
+        # overwriting one slot, and each attempt fixed exactly what the last
+        # prompt named while regressing the constraint the prompt no longer
+        # mentioned (run-32b19abadf4a4d6b801ae0f4456976c7 BLOCKED after five
+        # such attempts). Rendered into the retry prompt at dispatch and read
+        # nowhere else — nothing transitions on it (§10.1/§1.2).
+        self._guidance: Dict[str, rp.GuidanceLedger] = {}
         #: Findings from the review that exhausted a node's budget, kept so the
         #: run report can surface *why* rather than only that a count ran out.
         self._review_findings: Dict[str, str] = {}
@@ -675,7 +682,8 @@ class Scheduler:
         self._require_running(record)
         try:
             execution = self.deps.run_node(
-                attempt, node, record, self._retry_prompts.get(node.node_id),
+                attempt, node, record,
+                rp.render_guidance(node, self._guidance.get(node.node_id)),
                 on_launch, self._cancelled.is_set)
         finally:
             # This runs even if the runner raises; classification below cannot
@@ -819,9 +827,16 @@ class Scheduler:
                     or (record.key in self._watchdog_fences
                         and not allow_watchdog_fence)):
                 return
+            # Why the attempt failed, computed once and written wherever this
+            # failure is recorded — the retry row below and, above all, the
+            # block rows here. A block is terminal, so its transition is the
+            # last chance the ledger has to say what failed.
+            detail = _failure_detail(classification, verdict)
+
             if classification.block_reason is not None:
                 store.mark_blocked(
-                    self.run_id, node.node_id, classification.block_reason)
+                    self.run_id, node.node_id, classification.block_reason,
+                    detail=detail or None)
                 return
 
             retry_class = classification.retry_class or st.DEFAULT_RETRY_CLASS
@@ -832,12 +847,18 @@ class Scheduler:
                     store.mark_blocked(
                         self.run_id, node.node_id,
                         st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
-                        retry_class=retry_class)
+                        detail=detail or None, retry_class=retry_class)
                     return
                 # Only SEMANTIC mutates the prompt, and the offending paths are
                 # named in it — which is what makes the retry genuinely new
                 # instructions rather than the same request repeated (§7.5).
-                self._retry_prompts[node.node_id] = _retry_prompt(node, verdict)
+                # The entry consumes the same typed `detail` record the store
+                # rows get — one representation of the failure, not two — and
+                # replaces only this surface's slot: the reviewer's standing
+                # findings, if any, survive into the next prompt.
+                self._guidance[node.node_id] = self._guidance.get(
+                    node.node_id, rp.GuidanceLedger()).with_verification(
+                        rp.verification_guidance(detail))
             else:
                 budget = self.config.retry_budget(retry_class)
                 spent = store.attempts_spent(
@@ -845,19 +866,9 @@ class Scheduler:
                 if spent >= budget:
                     store.mark_blocked(
                         self.run_id, node.node_id, _budget_reason(retry_class),
-                        retry_class=retry_class)
+                        detail=detail or None, retry_class=retry_class)
                     return
 
-            # Why the attempt failed, recorded where the attempt is recorded.
-            # A bare `retry:ENVIRONMENTAL` row says a retry was spent and
-            # nothing about what to fix, so a node that exhausts its budget
-            # leaves no evidence at all.
-            detail = {"reason": classification.reason} if getattr(
-                classification, "reason", None) else {}
-            if verdict is not None:
-                detail["clause"] = verdict.failed_clause
-                if verdict.reason:
-                    detail["verdict"] = verdict.reason
             store.fail_attempt(self.run_id, node.node_id, retry_class,
                                detail=detail or None)
 
@@ -907,7 +918,12 @@ class Scheduler:
                 self._review_findings[node.node_id] = findings
                 return
 
-            self._retry_prompts[node.node_id] = _review_retry_prompt(node, review)
+            # Replaces only the REVIEW slot: a rejection must not erase what
+            # verification said, or the node oscillates between the two
+            # surfaces fixing one constraint while regressing the other.
+            self._guidance[node.node_id] = self._guidance.get(
+                node.node_id, rp.GuidanceLedger()).with_review(
+                    rp.review_guidance(review))
             store.fail_attempt(self.run_id, node.node_id,
                                st.RetryClass.SEMANTIC,
                                detail=detail, attempt_extra=marker)
@@ -1151,53 +1167,40 @@ def _budget_reason(retry_class: st.RetryClass) -> st.BlockReason:
     return st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
 
 
-def _retry_prompt(node: st.PlanNode,
-                  verdict: Optional["vf.VerificationVerdict"]) -> str:
-    """The mutated prompt for a SEMANTIC retry, naming what went wrong.
+def _failure_detail(classification: rp.Classification,
+                    verdict: Optional["vf.VerificationVerdict"]
+                    ) -> Dict[str, Any]:
+    """Why one attempt failed, as a typed record (§1.1 item 4).
 
-    Naming the offending paths is the whole justification for classifying an
-    agent's permission failure as SEMANTIC rather than blocking it: a retry
-    that repeats the same request is not new instructions, and spending an
-    attempt on it would be the refund loop §7.5 convicts.
+    A bare `retry:ENVIRONMENTAL` row says a retry was spent and nothing about
+    what to fix. The same gap is worse on a block, because a block is
+    terminal: an observed run blocked a node with `blocked:SEMANTIC_BUDGET_
+    EXHAUSTED` and `detail_json == {}`, and the reason its last attempt failed
+    existed nowhere in the ledger — it was recoverable only from the worktree's
+    git history. The earlier attempts' reasons survived only because they had
+    been rendered into the *next* attempt's prompt, which makes prose the
+    carrier of the evidence and is exactly what §1.2 refuses.
+
+    So this is computed once per failure and written to every row that records
+    it. Typed fields only — the failed clause, the paths the attempt wrote
+    outside its declared outputs, and the classifier's own reason. No guard
+    reads any of them back; nothing here causes a transition (§10.1).
     """
-    lines = [f"Attempt for node {node.node_id} did not verify."]
+    detail: Dict[str, Any] = {}
+    reason = getattr(classification, "reason", None)
+    if reason:
+        detail["reason"] = reason
     if verdict is not None:
+        detail["clause"] = verdict.failed_clause
         if verdict.reason:
-            lines.append(verdict.reason)
+            detail["verdict"] = verdict.reason
         if verdict.offending_paths:
-            lines.append("Paths written outside this node's declared outputs: "
-                         + ", ".join(verdict.offending_paths))
-    lines.append("Declared outputs: " + (", ".join(node.outputs) or "(none)"))
-    return "\n".join(lines)
-
-
-def _review_retry_prompt(node: st.PlanNode, review: Any) -> str:
-    """The mutated prompt for a review rejection, carrying the findings.
-
-    The findings are the entire justification for recycling the attempt instead
-    of blocking it. A retry that repeats the original instruction would send
-    the builder back to produce the same diff, spend an attempt, and be
-    rejected for the same reason — §7.5's refund loop with a reviewer attached.
-    So the builder is told which cell failed, on which object, and why.
-
-    The reviewer's messages are quoted into the prompt and nowhere else. That
-    is the one place free text is allowed to travel, because a prompt is not a
-    guard: §10.1 forbids a *lifecycle transition* caused by free text, and the
-    transition here was caused by the derived verdict and its signed receipt
-    before this string was ever built.
-    """
-    lines = [
-        f"Attempt for node {node.node_id} passed its gate but was rejected by "
-        "code review.",
-        "",
-        "The gate going green is not the bar. A reviewer read the diff and "
-        "found the problems below. Fix them and keep the gate green.",
-        "",
-        review.findings_text(),
-        "",
-        "Declared outputs: " + (", ".join(node.outputs) or "(none)"),
-    ]
-    return "\n".join(lines)
+            # The paths §7.5 says justify calling a permission failure
+            # SEMANTIC. They were named in the retry prompt and nowhere
+            # durable, so a node that exhausted its semantic budget blocked
+            # without ever recording which paths it wrote.
+            detail["offending_paths"] = list(verdict.offending_paths)
+    return detail
 
 
 def _wait_any(items: Sequence[Tuple[str, "Future"]],

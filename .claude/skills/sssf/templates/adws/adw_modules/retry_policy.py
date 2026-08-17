@@ -111,10 +111,18 @@ class FailureSignal:
 @dataclass(frozen=True)
 class Classification:
     """Exactly one of the two is set — the same pairing `NodeLifecycle`
-    enforces between `block_reason` and the BLOCKED state."""
+    enforces between `block_reason` and the BLOCKED state.
+
+    `reason` is the classifier's own account of the failure, carried into the
+    durable failure detail and the retry guidance. It existed as a call-site
+    keyword (the reviewer-stall arm) before it existed as a field, which made
+    that arm a TypeError waiting for its first stall; the field closes that
+    and never participates in the exactly-one-of pairing.
+    """
 
     retry_class: Optional[RetryClass] = None
     block_reason: Optional[BlockReason] = None
+    reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         if (self.retry_class is None) == (self.block_reason is None):
@@ -301,6 +309,246 @@ def launcher_retry_budget(cfg: SchedulerConfig, failure: Optional[LauncherFailur
     if failure is LauncherFailure.CREDENTIAL:
         return cfg.credential_retries
     return cfg.launcher_retries
+
+
+# ── retry guidance ledger — one slot per acceptance surface ─────────────────
+#
+# A node is judged by more than one independent acceptance surface: the §8.3
+# verification predicate (clause 4's permission check runs before the commit
+# even exists) and the cross-vendor reviewer's located findings. A retry
+# prompt that carries only the most recent failure lets the surfaces take
+# turns rejecting the node: run-32b19abadf4a4d6b801ae0f4456976c7 oscillated
+# for five attempts because each attempt fixed exactly what the last prompt
+# named and silently regressed the constraint the prompt no longer mentioned.
+# Each individual fix was correct; the two constraints were never held
+# simultaneously.
+#
+# The ledger holds the latest typed evidence from *each* surface and renders
+# all of it into every retry prompt. Three properties are deliberate:
+#
+# * **Typed, not concatenated prose.** The state is dataclasses keyed by
+#   surface, never an accumulated string. §10.1/§1.2 still hold by
+#   construction — nothing transitions on this state; it is rendered into the
+#   prompt and read nowhere else. The prompt is the one place free text is
+#   allowed to travel, because a prompt is not a guard: §10.1 forbids a
+#   *lifecycle transition* caused by free text, and every transition here was
+#   caused by the derived verdict or signed receipt before any of this
+#   rendering existed.
+# * **Latest-per-surface replacement is the retirement rule.** A finding
+#   retires when its own surface re-evaluates a newer attempt and no longer
+#   reports it — the new entry replaces the old, and a fixed defect simply
+#   does not reappear in the new evidence. A constraint never retires because
+#   the *other* surface failed, and never because one attempt satisfied it:
+#   the run above BLOCKED precisely because a satisfied constraint vanished
+#   from the prompt and the next attempt regressed it. Standing constraints
+#   are cheap to restate; a dropped one costs an attempt.
+# * **Bounded (A9/B13).** At most one entry per surface, each replaced rather
+#   than appended, so ledger size is bounded by the newest verdict plus the
+#   newest review, and rendering truncates deterministically to a character
+#   budget without ever dropping a surface. Attempt counts stay bounded by the
+#   untouched semantic and review ceilings; the ledger adds no loop.
+#
+# A new acceptance surface later means a new enum member and a new slot on the
+# ledger — the same scoping rule §1.1 item 4 applies to evidence chains, so a
+# new surface extends the structure rather than borrowing another's slot.
+
+class AcceptanceSurface(str, Enum):
+    """The independent predicates that can reject an attempt and recycle it.
+
+    One member per surface that mutates the retry prompt. `VERIFICATION` is
+    the §8.3 predicate (clauses 1–4, including the pre-commit permission
+    check); `REVIEW` is the cross-vendor reviewer. Launcher and environmental
+    failures never mutate the prompt (§7.5), so they have no member here.
+    """
+
+    VERIFICATION = "verification"
+    REVIEW = "review"
+
+
+@dataclass(frozen=True)
+class VerificationGuidance:
+    """The latest verification failure, in the fields §8.3 already produces."""
+
+    reason: str = ""
+    offending_paths: Tuple[str, ...] = ()
+    failed_clause: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    """One located finding, copied from the derived verdict's graded cell."""
+
+    check_id: str
+    object_id: str
+    message: str
+    blocking: bool
+
+
+@dataclass(frozen=True)
+class ReviewGuidance:
+    """The latest review rejection: which cells failed, where, and why."""
+
+    subject_digest: str
+    findings: Tuple[ReviewFinding, ...] = ()
+
+
+@dataclass(frozen=True)
+class GuidanceLedger:
+    """Latest typed evidence per acceptance surface, for one node.
+
+    Immutable; `with_*` returns a new ledger with that surface's slot
+    replaced and every other slot carried forward — which is the entire fix:
+    a review rejection can no longer erase what verification said, and vice
+    versa.
+    """
+
+    verification: Optional[VerificationGuidance] = None
+    review: Optional[ReviewGuidance] = None
+
+    def with_verification(self, guidance: VerificationGuidance) -> "GuidanceLedger":
+        return GuidanceLedger(verification=guidance, review=self.review)
+
+    def with_review(self, guidance: ReviewGuidance) -> "GuidanceLedger":
+        return GuidanceLedger(verification=self.verification, review=guidance)
+
+    @property
+    def empty(self) -> bool:
+        return self.verification is None and self.review is None
+
+
+def verification_guidance(detail: Optional[dict]) -> VerificationGuidance:
+    """Build the VERIFICATION entry from the scheduler's typed failure detail.
+
+    `detail` is the `_failure_detail` record the scheduler already computes
+    once per failed attempt and writes to every row that records the failure
+    — `reason` (the classifier's), `clause`, `verdict` (the predicate's own
+    reason), `offending_paths` — with empty keys omitted. Consuming that one
+    record here, rather than re-deriving the same facts from the verdict,
+    keeps a single representation of the failure instead of two that can
+    drift (§4's conviction, applied to this module's own inputs).
+    """
+    detail = detail or {}
+    reason = detail.get("verdict") or detail.get("reason") or ""
+    return VerificationGuidance(
+        reason=str(reason),
+        offending_paths=tuple(detail.get("offending_paths") or ()),
+        failed_clause=detail.get("clause"))
+
+
+def review_guidance(review: object) -> ReviewGuidance:
+    """Copy the located findings out of a review verdict's graded cells.
+
+    Blocking findings first, advisories after, each carrying the same three
+    facts `findings_text` renders: which cell, on which object, and why. The
+    prose message rides along as data — it is rendered into the prompt and
+    read nowhere else.
+    """
+    findings: List[ReviewFinding] = []
+    for cell in getattr(review, "findings", ()) or ():
+        findings.append(ReviewFinding(
+            check_id=cell.check_id, object_id=cell.object_id,
+            message=cell.message.strip(), blocking=True))
+    for cell in getattr(review, "advisories", ()) or ():
+        findings.append(ReviewFinding(
+            check_id=cell.check_id, object_id=cell.object_id,
+            message=cell.message.strip(), blocking=False))
+    return ReviewGuidance(
+        subject_digest=getattr(review, "subject_digest", ""),
+        findings=tuple(findings))
+
+
+#: Rendering budget for the whole guidance block, in characters. B13's lesson
+#: applies to the builder as much as the reviewer: a prompt that outgrows the
+#: agent's context produces an attempt about a different task. The budget is
+#: enforced by deterministic truncation that keeps every surface's header and
+#: check ids and elides message prose first, with an explicit marker — a
+#: silently dropped surface is the oscillation bug again.
+GUIDANCE_CHAR_BUDGET = 12_000
+
+_TRUNCATION_MARKER = (
+    "  [guidance truncated to fit the prompt budget; every constraint named "
+    "above still binds in full]")
+
+
+def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
+    lines = ["Verification (§8.3):",
+             "A prior attempt for this node did not verify."
+             if g.failed_clause is None else
+             "A prior attempt for this node did not verify "
+             f"(clause {g.failed_clause})."]
+    if g.reason:
+        lines.append(g.reason)
+    if g.offending_paths:
+        lines.append("Paths written outside this node's declared outputs: "
+                     + ", ".join(g.offending_paths))
+    lines.append("Declared outputs: "
+                 + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)"))
+    return lines
+
+
+def _review_lines(g: ReviewGuidance) -> List[str]:
+    lines = ["Code review:",
+             "A prior attempt for this node passed its gate but was rejected "
+             "by code review. The gate going green is not the bar; the "
+             "findings below must be resolved and the gate kept green."]
+    blocking = [f for f in g.findings if f.blocking]
+    advisory = [f for f in g.findings if not f.blocking]
+    if blocking:
+        lines.append("Blocking findings — each must be resolved:")
+        for f in blocking:
+            lines.append(f"  [{f.object_id}] {f.check_id}")
+            lines.append(f"    {f.message}")
+    if advisory:
+        lines.append("Advisory findings — address if you agree:")
+        for f in advisory:
+            lines.append(f"  [{f.object_id}] {f.check_id}")
+            lines.append(f"    {f.message}")
+    return lines
+
+
+def _fit(lines: List[str], share: int) -> List[str]:
+    """Deterministically truncate one surface's section to its share.
+
+    Drops lines from the end until the section plus the marker fits; the
+    first line (the surface header) always survives, so a surface is never
+    silently absent from the prompt.
+    """
+    def size(ls: List[str]) -> int:
+        return sum(len(l) + 1 for l in ls)
+
+    if size(lines) <= share:
+        return lines
+    kept = list(lines)
+    while len(kept) > 1 and size(kept) + len(_TRUNCATION_MARKER) + 1 > share:
+        kept.pop()
+    return kept + [_TRUNCATION_MARKER]
+
+
+def render_guidance(node: object, ledger: Optional[GuidanceLedger],
+                    char_budget: int = GUIDANCE_CHAR_BUDGET) -> Optional[str]:
+    """Every surface's standing constraints, rendered for the retry prompt.
+
+    This string is the one place the ledger is ever read. It mutates the
+    prompt — which is what makes a SEMANTIC retry genuinely new instructions
+    (§7.5) — and nothing transitions on it (§10.1/§1.2)."""
+    if ledger is None or ledger.empty:
+        return None
+    sections: List[List[str]] = []
+    if ledger.verification is not None:
+        sections.append(_verification_lines(node, ledger.verification))
+    if ledger.review is not None:
+        sections.append(_review_lines(ledger.review))
+    preamble = [
+        "Every constraint below is binding at the same time. Earlier attempts "
+        "were rejected for fixing one surface while regressing another; a "
+        "constraint a prior attempt already satisfied still binds."]
+    share = max(0, (char_budget - sum(len(l) + 1 for l in preamble))
+                ) // len(sections)
+    rendered: List[str] = list(preamble)
+    for section in sections:
+        rendered.append("")
+        rendered.extend(_fit(section, share))
+    return "\n".join(rendered)
 
 
 # ── §7.5 git results: only the documented not-found exit code is a fact ─────
