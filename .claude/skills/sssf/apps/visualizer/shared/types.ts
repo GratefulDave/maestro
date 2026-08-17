@@ -293,12 +293,166 @@ export type EnvelopesResponse = Envelope[];
 /** GET /api/sessions/:adw_id/gates */
 export type GatesResponse = GateResult[];
 
+// ── sources: one dashboard over several factory runtimes ─────────────────────
+// The SSSF tracer and Maestro's DAG runtime write different schemas, so the
+// server reads whichever it was pointed at and tells the UI which view to draw.
+// A new ADW adds a kind here and a view keyed on it; it never has to write a
+// second schema to be visible.
+
+export type SourceKind = "sssf" | "maestro";
+
+export interface SourceInfo {
+  /** Stable, URL-safe, and recognisable: "maestro:lexgenius". */
+  id: string;
+  kind: SourceKind;
+  path: string;
+  /** The database's directory name — what an operator calls this factory. */
+  label: string;
+  journal_mode: string;
+  /** Sessions for an sssf source, runs for a maestro one. */
+  count: number;
+}
+
+/** GET /api/sources */
+export type SourcesResponse = SourceInfo[];
+
+// ── maestro lifecycle schema ─────────────────────────────────────────────────
+// Mirrors `<state_root>/<repo>/lifecycle.sqlite3`: runs / dag_nodes /
+// node_lifecycle / attempts, plus the transitions and results audit tables.
+// States are carried as strings rather than unions of today's values, because
+// the ledger is written by a runtime that may add one and a client that
+// crashes on an unknown state is worse than one that prints it.
+
+/** node_lifecycle.state — PENDING · RUNNING · VERIFIED · MERGED · BLOCKED · CANCELLED. */
+export type MaestroNodeState = string;
+
+/** runs.latest_outcome — ACCEPTED · BLOCKED · CANCELLED · STUCK, or null while running. */
+export type MaestroRunOutcome = string;
+
+/**
+ * What the run is doing now, derived from its node states — never stored.
+ * RUNNING · CANCELLING · BLOCKED · PENDING · MERGED · QUIESCENT · EMPTY.
+ */
+export type MaestroLiveState = string;
+
+/** One transition row, with its `detail_json` already parsed. */
+export interface MaestroTransition {
+  node_id: string | null;
+  from_state: string | null;
+  to_state: string | null;
+  /** "attempt-start", "retry:SEMANTIC", "blocked:MERGE_CONFLICT", an escape… */
+  reason: string | null;
+  /** "scheduler" or "operator" — an escape is visibly a human's doing. */
+  actor: string | null;
+  created_at: string | null;
+  detail: Record<string, unknown>;
+}
+
+export interface MaestroAttempt {
+  node_id: string;
+  attempt_no: number;
+  /** attempts.state — RUNNING while in flight, else how it was closed. */
+  state: MaestroNodeState;
+  base_sha: string | null;
+  turn_count: number;
+  /** Why this attempt earned a retry: SEMANTIC · ENVIRONMENTAL · LAUNCHER_TRANSIENT. */
+  retry_class: string | null;
+  pid: number | null;
+  /** Epoch milliseconds; the ledger stores seconds and the server converts. */
+  started_at_ms: number | null;
+  launched_at_ms: number | null;
+  running: boolean;
+  /** The agent's transcript on disk, once the launcher has reported it. */
+  session_path: string | null;
+  /** The structured verdict recorded against this attempt's failure, if any. */
+  verdict: string | null;
+  transitions: MaestroTransition[];
+}
+
+export interface MaestroNode {
+  node_id: string;
+  /** dag_nodes.kind — "agent" or "code". */
+  kind: string | null;
+  depth: number;
+  /** The node's dependencies — the DAG's edges. */
+  needs: string[];
+  outputs: string[];
+  state: MaestroNodeState;
+  attempt_no: number;
+  /** Why the node stopped, when it stopped: SEMANTIC_BUDGET_EXHAUSTED, … */
+  block_reason: string | null;
+  output_sha: string | null;
+  granted_extra_attempts: number;
+  updated_at: string | null;
+  attempts: MaestroAttempt[];
+}
+
+export interface MaestroIntegration {
+  path: string;
+  branch: string | null;
+  head: string | null;
+  subject: string | null;
+}
+
+export interface MaestroResult {
+  node_id: string | null;
+  attempt_no: number | null;
+  subject_sha: string | null;
+  adjudication: string | null;
+  created_at: string | null;
+  payload: unknown;
+}
+
+/** GET /api/sources/:id/runs — the index, one row per run. */
+export interface MaestroRunSummary {
+  run_id: string;
+  /** Resolved by hashing the installed plan files; null when none matches. */
+  plan_name: string | null;
+  plan_digest: string;
+  state: MaestroLiveState;
+  declared_outcome: MaestroRunOutcome | null;
+  declared_outcome_at: string | null;
+  cancel_requested: boolean;
+  created_at: string | null;
+  last_transition_at: string | null;
+  node_count: number;
+  /** Enough for a progress strip without a request per card. */
+  node_states: { node_id: string; state: MaestroNodeState }[];
+}
+
+/** GET /api/sources/:id/runs/:run_id */
+export interface MaestroRunDetail {
+  run_id: string;
+  plan_name: string | null;
+  plan_digest: string;
+  state: MaestroLiveState;
+  declared_outcome: MaestroRunOutcome | null;
+  declared_outcome_at: string | null;
+  cancel_requested: boolean;
+  created_at: string | null;
+  last_transition_at: string | null;
+  /**
+   * The server's clock at the moment it answered. Attempt timestamps come from
+   * the scheduler's host, so elapsed time is measured against this rather than
+   * the browser's clock, which may differ.
+   */
+  server_now_ms: number;
+  integration: MaestroIntegration | null;
+  nodes: MaestroNode[];
+  results: MaestroResult[];
+  /** Run-level transitions: outcome declarations, resumes, acceptance starts. */
+  run_transitions: MaestroTransition[];
+}
+
 /** GET /api/health */
 export interface HealthResponse {
   ok: boolean;
+  /** The first source's path — kept for the single-source case. */
   db: string;
   journal_mode: string;
   sessions: number;
+  /** Every database this process is serving. */
+  sources: SourceInfo[];
 }
 
 export interface ApiError {

@@ -4,9 +4,12 @@ import type {
   EventsPage,
   GateResult,
   HealthResponse,
+  MaestroRunDetail,
+  MaestroRunSummary,
   PromptsResponse,
   SessionDetail,
   SessionSummary,
+  SourceInfo,
 } from './types'
 
 async function getJson(url: string): Promise<unknown> {
@@ -53,6 +56,27 @@ export async function archiveSession(adwId: string, archived = true): Promise<vo
 
 export function fetchHealth(): Promise<HealthResponse> {
   return getJson('/api/health') as Promise<HealthResponse>
+}
+
+// ── sources ──────────────────────────────────────────────────────────────────
+// Which run databases the server is serving, and which schema each one holds.
+// The UI picks a view from `kind`, so a new factory runtime becomes visible by
+// adding a kind and a view — no change to the ones already here.
+
+export function fetchSources(): Promise<SourceInfo[]> {
+  return getJson('/api/sources') as Promise<SourceInfo[]>
+}
+
+export function fetchRuns(sourceId: string): Promise<MaestroRunSummary[]> {
+  return getJson(`/api/sources/${encodeURIComponent(sourceId)}/runs`) as Promise<
+    MaestroRunSummary[]
+  >
+}
+
+export function fetchRun(sourceId: string, runId: string): Promise<MaestroRunDetail> {
+  return getJson(
+    `/api/sources/${encodeURIComponent(sourceId)}/runs/${encodeURIComponent(runId)}`,
+  ) as Promise<MaestroRunDetail>
 }
 
 // PhaseDetail imports the prompts type from here alongside fetchPrompts.

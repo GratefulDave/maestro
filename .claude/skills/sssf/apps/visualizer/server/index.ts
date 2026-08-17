@@ -1,31 +1,56 @@
 /**
- * SSSF visualizer server — JSON API over a target repo's sssf.db, plus the
- * built UI when ./dist exists. Reads are read-only; the single write is
- * POST /api/sessions/:adw_id/archive, which sets one review flag on a row.
+ * Factory visualizer server — JSON API over whichever run databases it is
+ * pointed at, plus the built UI when ./dist exists. Reads are read-only; the
+ * single write is POST /api/sessions/:adw_id/archive, which sets one review
+ * flag on a tracer row.
+ *
+ * Two schemas are served, because two runtimes write two different ledgers:
+ * the SSSF tracer's sessions/phases/events, and Maestro's DAG lifecycle store
+ * (runs/dag_nodes/node_lifecycle/attempts). Each database is probed for the
+ * tables it actually has, so neither runtime has to write the other's schema
+ * to be visible here. See server/sources.ts for how a third one is added.
  *
  * There is no ingest endpoint and no websocket. The data path is
  * agents → sqlite → web ui, and the UI gets there by polling.
  *
- *   bun run server/index.ts
- *   bun run server/index.ts --db /path/to/repo/adws/adw_data/sssf.db
- *   SSSF_DB=/path/to/sssf.db PORT=4600 bun run server/index.ts
+ *   bun run server/index.ts                       # discover both under cwd
+ *   bun run server/index.ts --db /path/sssf.db --db /path/lifecycle.sqlite3
+ *   MAESTRO_DB=/path/lifecycle.sqlite3 PORT=4600 bun run server/index.ts
  */
 import { existsSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { SssfDb, resolveDbPath } from "./db.ts";
+import type { SssfDb } from "./db.ts";
+import { resolveSources, type Source } from "./sources.ts";
 import type { AgentPrompts, ApiError, HealthResponse } from "../shared/types.ts";
 
 const PORT = Number(process.env.PORT ?? 4600);
 const DIST_DIR = resolve(import.meta.dir, "..", "dist");
 
-const dbPath = resolveDbPath();
-let db: SssfDb;
+let sources: Source[];
 try {
-  db = new SssfDb(dbPath);
+  sources = resolveSources();
 } catch (error) {
   console.error(`[sssf] ${(error as Error).message}`);
   process.exit(1);
 }
+if (sources.length === 0) {
+  console.error(
+    "[sssf] no run database found.\n" +
+      "Point the visualizer at one: --db <path> (repeatable), SSSF_DB=<path>, " +
+      "MAESTRO_DB=<path>, or run it from a repo containing adws/adw_data/sssf.db " +
+      "or adws/maestro.config.yaml",
+  );
+  process.exit(1);
+}
+
+/**
+ * The tracer source the legacy /api/sessions routes speak to.
+ *
+ * Those routes predate the source registry and are addressed without a source
+ * id, so they bind to the first sssf database. A process serving only Maestro
+ * has none, and they 404 rather than throwing.
+ */
+const db: SssfDb | undefined = sources.find((source) => source.kind === "sssf")?.sssf;
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -110,6 +135,16 @@ async function serveStatic(req: Request): Promise<Response> {
   return notFound("not found");
 }
 
+/** The tracer routes are only meaningful when a tracer database is loaded. */
+function withSssf(handler: (sssf: SssfDb, req: Request) => Response): (req: Request) => Response {
+  return (req) => (db ? handler(db, req) : notFound("no sssf database is loaded"));
+}
+
+/** Look up a registered source by the id the UI carries in its route. */
+function sourceFor(req: Request): Source | undefined {
+  return sources.find((source) => source.id === param(req, "source_id"));
+}
+
 const server = Bun.serve({
   port: PORT,
   routes: {
@@ -117,23 +152,47 @@ const server = Bun.serve({
       () =>
         json({
           ok: true,
-          db: db.path,
-          journal_mode: db.journalMode,
-          sessions: db.sessionCount(),
+          db: sources[0]!.path,
+          journal_mode: sources[0]!.info().journal_mode,
+          sessions: db?.sessionCount() ?? 0,
+          sources: sources.map((source) => source.info()),
         } satisfies HealthResponse),
     ),
 
-    "/api/sessions": safely((req) => json(db.sessions(intQuery(req, "limit", 200)))),
+    /** Every database this process serves, and which view each one needs. */
+    "/api/sources": safely(() => json(sources.map((source) => source.info()))),
 
-    "/api/sessions/:adw_id": safely((req) => {
-      const detail = db.sessionDetail(param(req, "adw_id"));
-      return detail ? json(detail) : notFound(`no session ${param(req, "adw_id")}`);
+    /** Maestro: the run index for one lifecycle ledger, newest run first. */
+    "/api/sources/:source_id/runs": safely((req) => {
+      const source = sourceFor(req);
+      if (!source?.maestro) return notFound(`no maestro source ${param(req, "source_id")}`);
+      return json(source.maestro.runs());
     }),
+
+    /** Maestro: one run whole — DAG shape, node lifecycle, attempts, verdicts. */
+    "/api/sources/:source_id/runs/:run_id": safely((req) => {
+      const source = sourceFor(req);
+      if (!source?.maestro) return notFound(`no maestro source ${param(req, "source_id")}`);
+      const detail = source.maestro.run(param(req, "run_id"));
+      return detail ? json(detail) : notFound(`no run ${param(req, "run_id")}`);
+    }),
+
+    "/api/sessions": safely(
+      withSssf((sssf, req) => json(sssf.sessions(intQuery(req, "limit", 200)))),
+    ),
+
+    "/api/sessions/:adw_id": safely(
+      withSssf((sssf, req) => {
+        const detail = sssf.sessionDetail(param(req, "adw_id"));
+        return detail ? json(detail) : notFound(`no session ${param(req, "adw_id")}`);
+      }),
+    ),
 
     // The one write. Archiving is review triage — it belongs to the reader, not
     // to the run — so it never touches anything a tracer wrote.
     "/api/sessions/:adw_id/archive": {
       POST: safely(async (req) => {
+        if (!db) return notFound("no sssf database is loaded");
         const adwId = param(req, "adw_id");
         if (!isSafeSegment(adwId)) {
           return json({ error: "invalid adw_id" } satisfies ApiError, 400);
@@ -146,25 +205,30 @@ const server = Bun.serve({
       }),
     },
 
-    "/api/sessions/:adw_id/events": safely((req) =>
-      json(
-        db.events(
-          param(req, "adw_id"),
-          intQuery(req, "after", 0),
-          intQuery(req, "limit", 500),
+    "/api/sessions/:adw_id/events": safely(
+      withSssf((sssf, req) =>
+        json(
+          sssf.events(
+            param(req, "adw_id"),
+            intQuery(req, "after", 0),
+            intQuery(req, "limit", 500),
+          ),
         ),
       ),
     ),
 
-    "/api/sessions/:adw_id/envelopes": safely((req) =>
-      json(db.envelopes(param(req, "adw_id"))),
+    "/api/sessions/:adw_id/envelopes": safely(
+      withSssf((sssf, req) => json(sssf.envelopes(param(req, "adw_id")))),
     ),
 
-    "/api/sessions/:adw_id/gates": safely((req) => json(db.gates(param(req, "adw_id")))),
+    "/api/sessions/:adw_id/gates": safely(
+      withSssf((sssf, req) => json(sssf.gates(param(req, "adw_id")))),
+    ),
 
     // The exact prompts an agent was sent, read from the session dir. Files are
     // the raw record; the db has no copy of them.
     "/api/sessions/:adw_id/agents/:agent/prompts": safely(async (req) => {
+      if (!db) return notFound("no sssf database is loaded");
       const adwId = param(req, "adw_id");
       const agent = param(req, "agent");
       if (!isSafeSegment(adwId) || !isSafeSegment(agent)) {
@@ -199,7 +263,15 @@ const server = Bun.serve({
 });
 
 console.log(`[sssf] visualizer api  http://localhost:${server.port}`);
-console.log(`[sssf] db              ${db.path}  [journal_mode=${db.journalMode}]`);
+for (const source of sources) {
+  const info = source.info();
+  console.log(
+    `[sssf] ${info.kind.padEnd(7)} ${info.path}  ` +
+      `[journal_mode=${info.journal_mode}, ${info.count} ${
+        info.kind === "maestro" ? "runs" : "sessions"
+      }]`,
+  );
+}
 console.log(
   existsSync(DIST_DIR)
     ? `[sssf] serving ui from  ${DIST_DIR}`
@@ -207,6 +279,6 @@ console.log(
 );
 
 process.on("SIGINT", () => {
-  db.close();
+  for (const source of sources) source.close();
   process.exit(0);
 });

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Read-only observability UI for the Super Simple Software Factory — polls sssf.db in a target repo.",
+  "description": "Read-only observability UI for the Super Simple Software Factory — polls a target repo's sssf.db and/or Maestro lifecycle ledger.",
   "scripts": {
     "dev": "vite",
     "server": "bun run server/index.ts",
@@ -11,6 +11,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "bun run server/index.ts",
     "typecheck": "vue-tsc --noEmit",
+    "test": "bun test server",
     "lint": "oxlint ."
   },
   "dependencies": {
