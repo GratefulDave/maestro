@@ -10,10 +10,12 @@ visible Herdr pane every verb refuses to work without.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +32,7 @@ from adw_modules import route_admission
 
 FAKE_PLANCTL = '''#!/usr/bin/env python3
 """A planctl stand-in that records how Maestro drove it."""
+import hashlib
 import json
 import os
 import pathlib
@@ -56,8 +59,22 @@ if verb == "render" and "--out" in sys.argv:
     pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).write_text(
         "<html>rendered</html>", encoding="utf-8")
 if verb == "review" and "--receipt-out" in sys.argv:
+    # A plan-contract-review.v1 receipt, bound to the bytes it was shown.
+    # `{"approved": true}` was accepted here for as long as nothing read the
+    # file; `plan ship` reads it now, and a receipt that cannot verify is not
+    # a review a downstream verb may act on.
+    payload = {"schema_version": "plan-contract-review.v1", "verdict": "PASS"}
+    ir = next((item for item in sys.argv if item.endswith(".plan.json")), None)
+    if ir:
+        payload["ir_sha256"] = hashlib.sha256(
+            pathlib.Path(ir).read_bytes()).hexdigest()
+    if "--rendered" in sys.argv:
+        payload["rendered_sha256"] = hashlib.sha256(
+            pathlib.Path(
+                sys.argv[sys.argv.index("--rendered") + 1]).read_bytes()
+        ).hexdigest()
     pathlib.Path(sys.argv[sys.argv.index("--receipt-out") + 1]).write_text(
-        '{"approved": true}', encoding="utf-8")
+        json.dumps(payload), encoding="utf-8")
 
 status = int(control.get("fail", {}).get(verb, 0))
 if status:
@@ -94,6 +111,15 @@ raise SystemExit(0)
 '''
 
 
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                            text=True)
+    if result.returncode != 0:
+        raise AssertionError("git {0} -> {1}: {2}".format(
+            " ".join(args), result.returncode, result.stderr))
+    return result.stdout.strip()
+
+
 class PlanContractVerbFixture(unittest.TestCase):
     """A repository whose plan pipeline is fully configured and fully derived."""
 
@@ -113,7 +139,14 @@ class PlanContractVerbFixture(unittest.TestCase):
         repo = root / "repo"
         (repo / "adws").mkdir(parents=True)
         (repo / plans_dir).mkdir(parents=True, exist_ok=True)
-        (repo / ".git").mkdir()
+        # A real repository, not a bare `.git` directory. `plan ship` projects
+        # the canonical plan before it authors anything, and that projection
+        # pins every declared source artifact against `git hash-object`, so a
+        # fixture with no objects can only ever exercise the refusal arm.
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "harness@example.invalid")
+        _git(repo, "config", "user.name", "Harness")
+        _git(repo, "config", "core.hooksPath", str(root / "no-such-hooks"))
 
         binaries = {}
         for name in ("herdr", "omp", "claude"):
@@ -206,6 +239,92 @@ class PlanContractVerbFixture(unittest.TestCase):
             "root": root,
             "state": state,
         }
+
+    def _approved(self, fixture, name="demo"):
+        """An IR that really projects, and a receipt that really verifies.
+
+        `{"approved": true}` beside a one-key IR served for as long as nothing
+        read either file. `plan ship` now projects the canonical plan before it
+        authors anything -- that is what makes a half-finished ship resumable
+        -- so the placeholder pair stopped standing for an approved plan and
+        started standing for `RECEIPT_SCHEMA`. The receipt is built from the
+        digests of the bytes actually written, never pasted, because a pasted
+        digest is the same hole one edit later.
+        """
+        repo = fixture["repo"]
+        readme = "# fixture repository\n"
+        (repo / "README.md").write_text(readme, encoding="utf-8")
+        tests_dir = repo / "tests"
+        tests_dir.mkdir(exist_ok=True)
+        (tests_dir / "test_existing.py").write_text(
+            "def test_one():\n    assert True\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "fixture base")
+
+        ir_bytes = json.dumps({
+            "schema_version": "plan-contract.v1",
+            "plan_id": name,
+            "title": "Ship " + name,
+            "plan_kind": "brownfield",
+            "source_artifacts": [{
+                "source_id": "src-readme",
+                "path": "README.md",
+                "sha256": hashlib.sha256(readme.encode("utf-8")).hexdigest(),
+                "required": True,
+            }],
+            "lanes": [{
+                "lane_id": "lane-ship",
+                "title": "Ship it",
+                "execution_context": ".",
+                "depends_on": [],
+                "verifier_ids": ["verify-ship"],
+            }],
+            "verifiers": [{
+                "verifier_id": "verify-ship",
+                "lane_ids": ["lane-ship"],
+                "source_ids": ["src-readme"],
+                "command": "python3 -m pytest tests/test_existing.py",
+                "min_executed": 1,
+            }],
+            "extensions": {
+                "maestro": {
+                    "repo": "example",
+                    "outputs": {"lane-ship": ["src/shipped.py"]},
+                    "integration_branch": "main",
+                    "integration_gate": {
+                        "runner": "pytest",
+                        "argv": ["tests"],
+                        "cwd": ".",
+                        "min_cases": 1,
+                    },
+                },
+            },
+        }).encode("utf-8")
+        (fixture["plans_dir"] / (name + ".plan.json")).write_bytes(ir_bytes)
+        rendered_bytes = b"<html/>"
+        (fixture["plans_dir"] / (name + ".html")).write_bytes(rendered_bytes)
+        (fixture["plans_dir"] / (name + ".plan-review.json")).write_text(
+            json.dumps({
+                "schema_version": "plan-contract-review.v1",
+                "verdict": "PASS",
+                "ir_sha256": hashlib.sha256(ir_bytes).hexdigest(),
+                "rendered_sha256": hashlib.sha256(rendered_bytes).hexdigest(),
+            }), encoding="utf-8")
+
+    def _authors(self):
+        """What a real `plan author` leaves behind, since it is mocked here.
+
+        `plan validate` and `plan finalize` bind to the named plan on disk, so
+        an author step that returns 0 without writing one leaves the next step
+        refusing `MAESTRO_CONFIGURATION_INVALID`. Returning the status alone
+        modelled half of what the step does.
+        """
+        def author(args):
+            destination = Path(args.plan_file)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b'{"plan":"stored"}\n')
+            return 0
+        return author
 
     def _write_plan_ir(self, fixture, name="demo"):
         path = fixture["plans_dir"] / (name + ".plan.json")
@@ -649,10 +768,7 @@ class VisiblePaneTest(PlanContractVerbFixture):
     def test_review_and_ship_open_a_visible_pane_too(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._fixture(Path(tmp))
-            self._write_plan_ir(fixture)
-            named = fixture["plans_dir"] / "demo" / "maestro-plan.v1"
-            named.parent.mkdir(parents=True)
-            named.write_bytes(b'{"plan":"stored"}\n')
+            self._approved(fixture)
             self._run(fixture, ["plan", "gate", "demo"])
             status, payloads, _raw = self._run(fixture, ["plan", "review", "demo"])
             self.assertEqual(status, 0, payloads)
@@ -663,7 +779,8 @@ class VisiblePaneTest(PlanContractVerbFixture):
                         "--from-plan-contract": "from_plan_contract",
                         "--plan-contract-receipt": "plan_contract_receipt",
                         "--plan-contract-rendered": "plan_contract_rendered"}), \
-                    mock.patch.object(maestro, "_plan_author", return_value=0), \
+                    mock.patch.object(maestro, "_plan_author",
+                                      side_effect=self._authors()), \
                     mock.patch.object(maestro, "_plan_validate", return_value=0), \
                     mock.patch.object(maestro, "_plan_finalize", return_value=0):
                 ship_status, ship_payloads, _raw = self._run(
@@ -830,17 +947,6 @@ class BootstrapAndReviewShareOneKeyTest(PlanContractVerbFixture):
 
 
 class PlanShipTest(PlanContractVerbFixture):
-    def _approved(self, fixture, name="demo"):
-        self._write_plan_ir(fixture, name)
-        (fixture["plans_dir"] / (name + ".html")).write_text(
-            "<html/>", encoding="utf-8")
-        (fixture["plans_dir"] / (name + ".plan-review.json")).write_text(
-            '{"approved": true}', encoding="utf-8")
-        # `plan validate` and `plan finalize` bind to the named plan itself.
-        named = fixture["plans_dir"] / name / "maestro-plan.v1"
-        named.parent.mkdir(parents=True, exist_ok=True)
-        named.write_bytes(b'{"plan":"stored"}\n')
-
     def test_ship_refuses_without_a_review_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._fixture(Path(tmp))
@@ -887,7 +993,7 @@ class PlanShipTest(PlanContractVerbFixture):
             with mock.patch.object(maestro, "_plan_author_options",
                                    return_value=self._ingest_options()), \
                     mock.patch.object(maestro, "_plan_author",
-                                      return_value=0) as author, \
+                                      side_effect=self._authors()) as author, \
                     mock.patch.object(maestro, "_plan_validate",
                                       return_value=0), \
                     mock.patch.object(maestro, "_plan_finalize",
@@ -932,7 +1038,7 @@ class PlanShipTest(PlanContractVerbFixture):
             with mock.patch.object(maestro, "_plan_author_options",
                                    return_value=self._ingest_options()), \
                     mock.patch.object(maestro, "_plan_author",
-                                      return_value=0), \
+                                      side_effect=self._authors()), \
                     mock.patch.object(maestro, "_plan_validate",
                                       return_value=2), \
                     mock.patch.object(maestro, "_plan_finalize",

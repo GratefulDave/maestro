@@ -646,16 +646,38 @@ def classify_git_exit(exit_code: int, not_found_exit_code: int) -> GitResult:
 
 # ── §7.5 AST detector #1: no comparison against process output text ─────────
 
-_STDIO_NAME_MARKERS = ("stderr", "stdout", "output", "text", "tail")
+#: Identifiers that denote a process's own output bytes, matched **exactly**.
+#: `text` was a member and is deliberately not: it is the most generic string
+#: name in Python and denoted process output only by local convention, so it
+#: convicted newline normalisation (`text.endswith("\n")`) in three modules
+#: and a markdown-fence check in a fourth, while the four names below are
+#: unambiguous. The cost of dropping it is stated rather than hidden — see
+#: `find_output_content_comparisons`.
+_STDIO_NAME_MARKERS = ("stderr", "stdout", "output", "tail")
 _STDIO_COMPARISON_OPS = (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
 _STDIO_COMPARISON_METHODS = ("startswith", "endswith", "find", "lower", "upper")
 
 
 def _looks_like_output(node: ast.AST) -> bool:
+    """Whether this operand denotes a process's own output bytes.
+
+    **Exact identifier match, never a substring.** The substring form this
+    replaces convicted `node.outputs` — a plan node's *declared output paths*,
+    which are harness-computed state and exactly what §7.5 permits a
+    classifier to read — because "outputs" contains "output". Nine such hits
+    across the tree, every one a false positive on an ordinary membership test
+    like `selector in node.outputs`, and they are why this rule could only
+    ever be pointed at its own module.
+
+    Narrowing the input rather than exempting the callers is the whole point:
+    a rule that needs an allowlist to widen has stopped describing what it is
+    about. `outputs` is not `output`; the plural is a different concept, not a
+    special case of the singular.
+    """
     if isinstance(node, ast.Name):
-        return any(marker in node.id.lower() for marker in _STDIO_NAME_MARKERS)
+        return node.id.lower() in _STDIO_NAME_MARKERS
     if isinstance(node, ast.Attribute):
-        return any(marker in node.attr.lower() for marker in _STDIO_NAME_MARKERS)
+        return node.attr.lower() in _STDIO_NAME_MARKERS
     return False
 
 
@@ -688,11 +710,28 @@ class _OutputComparisonVisitor(ast.NodeVisitor):
 
 
 def find_output_content_comparisons(source: str) -> List[Tuple[int, str]]:
-    """Parse `source` and return every place it compares against, or
-    pattern-matches, a value that looks derived from process output. Run
-    against this file's own source as a test, and against
-    `PLANTED_OUTPUT_COMPARISON_FIXTURE` to prove the detector actually goes
-    red on a real violation.
+    """Every place `source` compares against or pattern-matches process output.
+
+    §7.5: `_classify` "may **not** read stderr or stdout content; an AST test
+    forbids string comparison against process output, because a regex over
+    stderr is how ecosystem specifics leak into a general engine."
+
+    **Runs over the whole tree, not one module.** It was scoped to
+    `retry_policy.py` alone, which is the narrowest possible reading of a rule
+    about the engine's behaviour, and the same single-module shape that let a
+    live violation sit unseen in `plan_validate.py` under a detector written
+    for exactly that bug. Widening needed no allowlist — only an input
+    narrowed to what the rule is actually about (`_looks_like_output`).
+
+    **A stated limit, because the widening bought it at a price.** The rule
+    matches operands *named* like process output. Output bound to a generic
+    local first — `text = str(error).lower()`, then `"locked" not in text` —
+    is invisible to it, and that construct exists at
+    `coordinator_store.py:288`, where a sqlite failure is classified by
+    matching its message rather than its error code. That is an instance of
+    this rule's own shape which this rule does not catch; it is reported
+    rather than papered over with a marker so generic it convicted three
+    modules' newline handling. Closing it needs dataflow, not another name.
     """
     tree = ast.parse(source)
     visitor = _OutputComparisonVisitor()

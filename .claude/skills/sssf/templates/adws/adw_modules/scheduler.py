@@ -104,6 +104,22 @@ class NodeExecution:
     launched_pid: Optional[int] = None
     launcher_failure: Optional[rp.LauncherFailure] = None
     launch_detail: str = ""
+    #: The agent's terminal envelope, parsed — §7.7's result payload.
+    #:
+    #: The ruling item 43 held open, taken the same way item 42's was: by what
+    #: may read it. This is DATA, recorded in the `results` row beside its
+    #: adjudication and read back by nothing that decides anything. It is not
+    #: `launch_detail`'s prose and it is not a classifier input; §7.7 requires
+    #: the payload to be retained in all four adjudications, so it has to
+    #: travel, and the only component that possesses it is the adapter that
+    #: read the envelope file.
+    #:
+    #: `_poll_agent_execution` already parsed exactly this object and threw it
+    #: away, keeping only `envelope_parsed`. That discard is why the `results`
+    #: table had a live reader in `run status` and no writer at all: not a
+    #: missing mechanism, a dropped value — §7.6's lesson about a typed reason
+    #: computed and never recorded, in its second instance.
+    envelope_payload: Optional[Mapping[str, Any]] = None
 
 
 #: Runner boundaries receive the scheduler's cancellation lease explicitly.
@@ -475,6 +491,18 @@ class Scheduler:
         except BaseException as exc:
             raise QuiescenceFailure(phase, exc) from exc
 
+    def _settling(self) -> bool:
+        """Whether any node's durable row still says RUNNING.
+
+        Called only when no future is in flight, so a RUNNING row here has no
+        worker behind it: the worker returned and the verdict that will move
+        the node — the watchdog's, or its own settle — has not committed yet.
+        That is a node mid-transition, not a quiescent one, and §7.3 defines
+        quiescence as "nothing in flight and no node can progress".
+        """
+        return any(record.state == st.NodeState.RUNNING.value
+                   for record in self.deps.store.node_records(self.run_id))
+
     def _settle_context(self, context: _AttemptContext) -> None:
         if context.record is not None and not context.settled:
             self._quiesce(context.record, "settle")
@@ -590,9 +618,29 @@ class Scheduler:
                     # start either, no node can progress and the run is
                     # quiescent.
                     self._merge_frontier()
-                    if not self.deps.store.ready_nodes(self.run_id):
-                        break
-                    continue
+                    if self.deps.store.ready_nodes(self.run_id):
+                        continue
+                    if self._settling():
+                        # Not quiescent — mid-verdict. `ready_nodes` returns
+                        # only PENDING nodes, so a node whose durable row still
+                        # says RUNNING while no worker holds it is invisible to
+                        # the readiness check AND to the blocked set. The loop
+                        # therefore declared the residual BLOCKED naming
+                        # nothing: `{"blocked": [], "merged": [], "outcome":
+                        # "BLOCKED"}`, with the node still PENDING at attempt 2
+                        # and no block_reason — a run that stops with work left
+                        # to do and reports it as a mystery. Reproduced 8 times
+                        # in 40 whenever a worker returned before the
+                        # watchdog's verdict committed.
+                        #
+                        # Waiting is bounded rather than open-ended: if no
+                        # verdict ever lands, §11.2's backstop declares STUCK,
+                        # which is the truthful answer for a run that stopped
+                        # with something in flight. The wait is on the
+                        # cancellation event so a cancel stays responsive.
+                        self._cancelled.wait(_SETTLING_POLL_S)
+                        continue
+                    break
 
                 done, _ = _wait_any(list(in_flight.items()))
                 for node_id in done:
@@ -931,6 +979,7 @@ class Scheduler:
             # Classification cannot release or block the attempt until its
             # owned group is absent.
             self._quiesce(record, "pre-inventory")
+        self._record_result(node, record, execution)
         self._require_running(record)
         if execution.launched_pid is not None:
             # A runner that reports its pid only on return still arms the
@@ -1069,6 +1118,41 @@ class Scheduler:
             store.mark_verified(self.run_id, node.node_id, output_sha)
 
     # ── settling a failed attempt ───────────────────────────────────────────
+
+    def _record_result(self, node: st.PlanNode, record: st.AttemptRecord,
+                       execution: NodeExecution) -> None:
+        """§7.7 — land the agent's declared result in one adjudicated row.
+
+        **Placed here, before `_require_running`, and that ordering is the
+        mechanism rather than an accident.** §7.7 exists for "a reclaimed
+        attempt's late result", and the only way one is produced is an attempt
+        whose envelope arrives after its generation stopped being the live
+        one. Recording after the ownership check would drop exactly the
+        payload the section was written to preserve — the correct FAIL
+        carrying two real findings that vanished behind a byte-identical
+        journal — and would leave `SUPERSEDED` unreachable, so three of the
+        four adjudications would be decoration.
+
+        The adjudication is **not** made here. `verification.adjudicate_result`
+        owns it and judges the result solely against the attempt row it names,
+        never against the node's current state (§7.7); this supplies the row
+        and stores what it returns. The write is unconditional on the verdict
+        because the payload is retained in all four outcomes.
+
+        Silent on absence rather than refusing: a code node has no envelope
+        and an agent whose envelope did not parse has no payload, and neither
+        is a result that failed to land — there was none. `ResultRecord`
+        refuses to exist without a payload, so the guard is a precondition of
+        constructing one, not a policy choice made here.
+        """
+        payload = execution.envelope_payload
+        if payload is None:
+            return
+        adjudged = vf.adjudicate_result(
+            st.ResultRecord(node_id=node.node_id, attempt_no=record.attempt_no,
+                            subject_sha=record.base_sha, payload=payload),
+            self.deps.store.attempts_for(self.run_id, node.node_id))
+        self.deps.store.record_result(self.run_id, adjudged)
 
     def _settle_verdict(self, node: st.PlanNode, verdict: "vf.VerificationVerdict",
                         execution: NodeExecution, record: st.AttemptRecord) -> None:
@@ -1572,6 +1656,11 @@ def _budget_reason(retry_class: st.RetryClass,
             return st.BlockReason.LAUNCH_REFUSED
         return st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED
     return st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+
+
+#: How long the loop pauses while a node is mid-verdict. Short enough that a
+#: settled verdict is picked up promptly, long enough not to spin a core.
+_SETTLING_POLL_S = 0.05
 
 
 def _launch_left_nothing_to_reap(exc: BaseException) -> bool:

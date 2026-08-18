@@ -47,10 +47,32 @@ if record:
             "argv": argv,
             "environment": os.environ.get("FAKE_LAUNCH_ENV"),
         }) + "\n")
+ROOT = os.path.dirname(record) if record else "/tmp"
+# The monotonic per-pane counter real herdr publishes on `pane get`. It is the
+# only signal `launcher.submit_agent_prompt` accepts as proof that a composer
+# actually took a prompt, so a fake that omits it models a pane that can never
+# accept anything -- which is what silently blinded this suite to the launcher
+# path that killed two production runs on 2026-08-18.
+REV = os.path.join(ROOT, "pane_revision")
+
+def revision():
+    return int(open(REV).read()) if os.path.exists(REV) else 4096
+
+def bump():
+    nxt = revision() + 1
+    open(REV, "w").write(str(nxt))
+
 if argv[:2] == ["pane", "split"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"]}}}))
 elif argv[:2] == ["pane", "get"]:
-    print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"], "foreground_cwd": "/wrong"}}}))
+    if os.environ.get("FAKE_PANE_GET_FAILURE"):
+        sys.stderr.write(json.dumps({"error": {"code": "transport_failure"}}))
+        sys.exit(1)
+    pane = {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"],
+            "foreground_cwd": "/wrong"}
+    if not os.environ.get("FAKE_PANE_WITHOUT_REVISION"):
+        pane["revision"] = revision()
+    print(json.dumps({"result": {"pane": pane}}))
 elif argv[:2] == ["pane", "process-info"]:
     root = os.path.dirname(record) if record else "/tmp"
     launched = os.path.join(root, "launched")
@@ -69,6 +91,18 @@ elif argv[:2] == ["agent", "start"]:
 elif argv[:2] == ["agent", "wait"]:
     print(json.dumps({"result": {"ok": True, "status": "idle"}}))
 elif argv[:2] == ["agent", "prompt"]:
+    stalls = os.path.join(ROOT, "stalls")
+    seen = int(open(stalls).read()) if os.path.exists(stalls) else 0
+    if seen < int(os.environ.get("FAKE_PROMPT_STALLS", "0")):
+        # The composer took the text and never submitted it: no lifecycle
+        # change, and -- the part that matters -- no revision movement.
+        open(stalls, "w").write(str(seen + 1))
+        sys.stderr.write(json.dumps({"error": {"code": "agent_prompt_stalled"}}))
+        sys.exit(1)
+    bump()
+    print(json.dumps({"result": {"ok": True}}))
+elif argv[:2] == ["agent", "send-keys"]:
+    bump()
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["agent", "read"]:
     name = argv[2]
@@ -347,9 +381,13 @@ class LauncherContractTest(unittest.TestCase):
              "--pane", "w1:p2", "--timeout", "180000"])
         self.assertEqual(start[9], "--")
         self.assertEqual(calls[start_indexes[0] + 1][:2], ["pane", "get"])
-        # The coder must be waited for with the documented readiness gate, and
-        # the prompt must be handed to the agent composer -- not typed into the
-        # pane's shell -- so text plus Enter are submitted atomically.
+        # The coder must still be waited for with the documented readiness
+        # gate. What changed on 2026-08-18 (`7f03ee2`) is where the prompt
+        # travels: omp documents a `MESSAGES` positional that accepts
+        # `@<file>`, so the process that starts the agent carries the prompt
+        # and there is no composer in the path at all. Typing it stalled
+        # against omp roughly half the time -- run-d7c242809fe74e74b7368393fa4de6de
+        # blocked both depth-0 lanes at 0 turns on exactly that.
         wait_indexes = [
             index for index, call in enumerate(calls)
             if call[:2] == ["agent", "wait"]
@@ -358,23 +396,10 @@ class LauncherContractTest(unittest.TestCase):
         wait = calls[wait_indexes[0]]
         self.assertEqual(wait[:5], ["agent", "wait", start[2], "--until", "idle"])
         self.assertIn("--timeout", wait)
-        prompt_indexes = [
-            index for index, call in enumerate(calls)
-            if call[:2] == ["agent", "prompt"] and call[3].startswith("@")
-        ]
-        self.assertEqual(len(prompt_indexes), 1)
-        prompt = calls[prompt_indexes[0]]
+        route_argv = start[start.index("--") + 1:]
+        self.assertEqual(route_argv[-1], "@{0}".format(self.prompt.resolve()))
         self.assertEqual(
-            prompt[:5],
-            ["agent", "prompt", start[2],
-             "@{0}".format(self.prompt.resolve()), "--wait"])
-        # The harness turn runs as long as the task does, so the launch settles
-        # on either working or idle rather than holding open until the run ends.
-        self.assertEqual(
-            [prompt[i + 1] for i, a in enumerate(prompt) if a == "--until"],
-            ["working", "idle"])
-        self.assertGreater(int(prompt[prompt.index("--timeout") + 1]), 5000)
-        self.assertLess(wait_indexes[0], prompt_indexes[0])
+            [call for call in calls if call[:2] == ["agent", "prompt"]], [])
         self.assertFalse(any(
             call[:2] in (["pane", "run"], ["pane", "send-keys"],
                          ["agent", "send-keys"])
@@ -561,6 +586,44 @@ class LauncherContractTest(unittest.TestCase):
         bootstrap = prompt_calls[0][-1]
         self.assertNotIn(prompt_bytes, json.dumps(calls))
         self.assertLess(len(bootstrap), len(str(self.prompt.resolve())) + 2)
+
+    def test_a_claude_composer_that_stalls_is_recovered_with_enter(self):
+        """The composer route still exists, so its stall must still be caught.
+
+        Only omp carries its prompt in argv; the claude route hands `@<path>`
+        to a composer, and a composer that swallows the text reports `idle`
+        exactly like one that took it. The pane's monotonic `revision` is the
+        only thing that separates them, so this drives the real recovery loop
+        in `submit_agent_prompt` through `launch` rather than in isolation.
+        """
+        os.environ["FAKE_PROMPT_STALLS"] = "1"
+        runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        runtime.launch(self.spec("claude"))
+        calls = self.recorded_calls()
+        self.assertEqual(
+            len([call for call in calls if call[:2] == ["agent", "prompt"]]), 1)
+        # Enter was pressed on what the composer was already holding, and the
+        # prompt was never re-issued -- a second `agent prompt` would append to
+        # the unsubmitted line and send both as one garbled turn.
+        send_keys = [call for call in calls if call[:2] == ["agent", "send-keys"]]
+        self.assertEqual(len(send_keys), 1)
+        self.assertEqual(send_keys[0][3], "enter")
+
+    def test_a_pane_that_never_advances_its_revision_refuses_the_launch(self):
+        """The blindness this suite carried until 2026-08-18.
+
+        With no `revision` key at all the launcher can never prove submission,
+        so the launch must refuse rather than hand back a handle for an agent
+        that was never given any work.
+        """
+        os.environ["FAKE_PANE_WITHOUT_REVISION"] = "1"
+        runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        with self.assertRaises(launcher.PromptSubmissionUnobservable):
+            runtime.launch(self.spec("claude"))
 
     def test_reclaim_matches_exact_token_only(self):
         launcher = FakeLauncher()

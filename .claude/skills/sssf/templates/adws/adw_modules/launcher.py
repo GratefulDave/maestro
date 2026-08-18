@@ -598,8 +598,27 @@ def _agent_transcript_path(agent: object) -> Optional[Path]:
 class PromptNotSubmitted(RuntimeError):
     """The composer holds the prompt text and will not submit it.
 
-    Raised only after every recovery attempt has been spent, so it means the
-    pane is genuinely wedged rather than merely slow.
+    Raised only after every recovery attempt has been spent *and* the pane's
+    revision counter was legible throughout, so it means the pane is genuinely
+    wedged rather than merely slow or merely unreadable.
+    """
+
+
+class PromptSubmissionUnobservable(RuntimeError):
+    """The pane's revision counter could not be read, so nothing was proven.
+
+    D9. "The meter did not move" and "I could not read the meter" are
+    different facts and must not collapse to the same terminal outcome. Both
+    fail closed -- neither ever reports a prompt as submitted -- but only the
+    first is a statement about the prompt. The second is a statement about
+    herdr: a `pane get` that timed out, a server mid-restart, a pane record not
+    yet published. A single transient read failure at baseline capture used to
+    guarantee `AGENT_PROMPT_UNSUBMITTED` even when the prompt had landed
+    perfectly, which spends the attempt and then the node's whole retry budget
+    on a launcher that was never broken.
+
+    `classify_error` maps this to the existing `TRANSIENT` class -- no new
+    retry class -- so the scheduler retries the launch instead of burning it.
     """
 
 
@@ -677,6 +696,10 @@ def submit_agent_prompt(
     # What the pane had consumed before the prompt was offered. Everything
     # below compares against this rather than against a status word.
     baseline = pane_revision(herdr_call, pane_id)
+    # Every legible reading taken *after* the prompt was offered. Emptiness is
+    # the structural fact D9 turns on: it says the meter was never readable,
+    # which is not the same claim as "the meter did not move".
+    readings: List[int] = []
 
     def consumed() -> bool:
         """Whether the pane has taken anything since the prompt was offered.
@@ -688,14 +711,18 @@ def submit_agent_prompt(
         cannot be satisfied that way -- an unsubmitted composer does not
         advance it.
 
-        Unreadable on either side means unproven, and unproven is not
+        Unreadable on either side means unproven, and unproven is never
         submitted: the caller's next move is to press Enter again, which is
-        harmless against a prompt that did go through.
+        harmless against a prompt that did go through. What the unreadable case
+        does *not* do any more is decide the terminal outcome -- see
+        `PromptSubmissionUnobservable`.
         """
-        if baseline is None:
-            return False
         current = pane_revision(herdr_call, pane_id)
-        return current is not None and current > baseline
+        if current is not None:
+            readings.append(current)
+        if baseline is None or current is None:
+            return False
+        return current > baseline
 
     def wait_for(budget_s: float) -> bool:
         argv = ["agent", "wait", target, *until_argv,
@@ -732,6 +759,14 @@ def submit_agent_prompt(
             return
         if round_no + 1 < rounds:
             sleep(0.5)
+    if baseline is None or not readings:
+        # Never a legible before/after pair, so there is no fact about the
+        # prompt here at all -- only a fact about herdr. Transient by
+        # construction, and the pane is left for the caller to reap exactly as
+        # the wedged case is.
+        raise PromptSubmissionUnobservable(
+            "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts".format(
+                target, rounds))
     raise PromptNotSubmitted(
         "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(
             target, rounds))
@@ -1370,6 +1405,12 @@ def _herdr_error_code_of(exc: BaseException) -> str:
 
 def classify_error(exc: BaseException) -> ErrorClass:
     if _herdr_error_code_of(exc) in TRANSIENT_HERDR_ERROR_CODES:
+        return ErrorClass.TRANSIENT
+    if isinstance(exc, PromptSubmissionUnobservable):
+        # An unreadable revision counter is a missing observation about herdr,
+        # not a wedged composer (D9). `PromptNotSubmitted` deliberately does
+        # not land here: a legible counter that never moved is a real refusal
+        # and stays EXECUTION.
         return ErrorClass.TRANSIENT
     if isinstance(exc, FileNotFoundError):
         return ErrorClass.CONFIGURATION

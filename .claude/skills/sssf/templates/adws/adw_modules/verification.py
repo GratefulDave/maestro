@@ -365,36 +365,108 @@ def verify_code_node(exit_code: int,
 
 # ── §10.1 no guard reads free text ──────────────────────────────────────────
 
+def _free_text_names(node: ast.AST) -> List[str]:
+    """Every §10.1 free-text field read anywhere inside `node`.
+
+    Both access shapes, because catching only the attribute form would leave
+    the mapping form silently permitted. Parsed rather than grepped: a field
+    name inside a docstring or a string constant is not a read, and a detector
+    that convicted one would be the lexical matching this design forbids.
+    """
+    found: List[str] = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in FREE_TEXT_FIELDS:
+            found.append(sub.attr)
+        elif isinstance(sub, ast.Subscript):
+            index = sub.slice
+            # Python 3.9 still wraps a constant subscript in ast.Index on some
+            # parse paths, so unwrap before testing rather than assuming 3.10.
+            if isinstance(index, ast.Index):  # pragma: no cover - version dependent
+                index = index.value  # type: ignore[attr-defined]
+            if isinstance(index, ast.Constant) and index.value in FREE_TEXT_FIELDS:
+                found.append(index.value)
+    return found
+
+
 class _FreeTextVisitor(ast.NodeVisitor):
+    """Free-text reads that reach a **decision**, not every read.
+
+    §1.2 forbids a *lifecycle transition* caused by free text. It does not
+    forbid reading free text — §7.6's own ledger records it, an error message
+    quotes it, and the console prints it, all of which the rule permits and
+    all of which the previous form convicted. That is why this guard could
+    only ever be pointed at `verification.py`: run tree-wide it reported three
+    hits, every one a tracer payload, an f-string in a `raise`, or a console
+    line, and the only way to widen a rule that convicts permitted code is an
+    allowlist — which is how a guard dies.
+
+    So the rule now asks the question §1.2 actually asks: does this value
+    **decide** anything? A free-text read convicts when it sits inside a
+    branch test, a comparison, a boolean operator, an assertion, or a
+    comprehension filter — the places a value changes what happens next. It
+    acquits when the value only flows into a call argument or a formatted
+    string, which is recording and display.
+
+    **A stated limit.** This is a syntactic reach, not dataflow: free text
+    assigned to a local and branched on later escapes it. Closing that needs
+    reaching-definitions analysis, and the honest move is to name the gap
+    rather than to widen the shape until it convicts the innocent again.
+    """
 
     def __init__(self) -> None:
         self.found: List[str] = []
 
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr in FREE_TEXT_FIELDS:
-            self.found.append(node.attr)
+    def _decide(self, node: Optional[ast.AST]) -> None:
+        if node is not None:
+            self.found.extend(_free_text_names(node))
+
+    def visit_If(self, node: ast.If) -> None:
+        self._decide(node.test)
         self.generic_visit(node)
 
-    def visit_Subscript(self, node: ast.Subscript) -> None:
-        index = node.slice
-        # Python 3.9 still wraps a constant subscript in ast.Index on some
-        # parse paths, so unwrap before testing rather than assuming 3.10.
-        if isinstance(index, ast.Index):  # pragma: no cover - version dependent
-            index = index.value  # type: ignore[attr-defined]
-        if isinstance(index, ast.Constant) and index.value in FREE_TEXT_FIELDS:
-            self.found.append(index.value)
+    def visit_While(self, node: ast.While) -> None:
+        self._decide(node.test)
+        self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self._decide(node.test)
+        self.generic_visit(node)
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self._decide(node.test)
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        for operand in (node.left, *node.comparators):
+            self._decide(operand)
+        self.generic_visit(node)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        for value in node.values:
+            self._decide(value)
+        self.generic_visit(node)
+
+    def visit_comprehension(self, node: ast.comprehension) -> None:
+        for condition in node.ifs:
+            self._decide(condition)
+        self.generic_visit(node)
+
+    def visit_Match(self, node: "ast.Match") -> None:  # pragma: no cover
+        self._decide(node.subject)
         self.generic_visit(node)
 
 
 def free_text_reads(source: str) -> Tuple[str, ...]:
-    """Every read of a §10.1 free-text field in `source`, by AST.
+    """Every §10.1 free-text field that **decides** something in `source`.
 
-    Parsed rather than grepped, and the distinction is the same one §7.5
-    makes about stderr: a field name inside a docstring or a string constant
-    is not a read, and a detector that convicted one would be the lexical
-    matching this design forbids. Both access shapes are covered, because
-    catching only the attribute form would leave the mapping form silently
-    permitted.
+    §1.2's rule has the widest scope in the specification — a run fails if ANY
+    lifecycle transition is caused by pane text, prompt text, a free-text
+    envelope field, or an agent's claim — and lifecycle transitions happen in
+    `scheduler.py`, not here. Checking the widest rule in the narrowest place
+    is what this now stops doing: it runs over the whole tree.
+
+    See `_FreeTextVisitor` for what separates a read from a decision, and for
+    the dataflow case this deliberately does not reach.
     """
     visitor = _FreeTextVisitor()
     visitor.visit(ast.parse(source))

@@ -298,12 +298,58 @@ class CodeNodeVerificationTests(unittest.TestCase):
 FREE_TEXT_FIELDS = ("notes_for_next_agent", "summary")
 
 
+def _tree_sources():
+    """Every production module, plus the CLI. The guards below are about the
+    runtime's behaviour, so their scope is the runtime, not one file."""
+    return sorted((ADWS / "adw_modules").glob("*.py")) + [ADWS / "maestro.py"]
+
+
 class FreeTextDetectorTests(unittest.TestCase):
     """Prose is permitted as input to work; never as a guarantee about work."""
 
-    def test_verification_reads_no_free_text_field(self):
-        source = (ADWS / "adw_modules" / "verification.py").read_text()
-        self.assertEqual(vf.free_text_reads(source), ())
+    def test_no_module_in_the_tree_decides_on_free_text(self):
+        """§1.2 governs the WHOLE runtime, so the guard runs over all of it.
+
+        Scoped to `verification.py` alone this checked the widest rule in the
+        specification in the narrowest place in the codebase — and lifecycle
+        transitions happen in `scheduler.py`, not here. The single-module
+        shape is the one that let a live violation sit unseen in
+        `plan_validate.py` under a detector written for exactly that bug.
+        """
+        offenders = {}
+        for source_file in _tree_sources():
+            found = vf.free_text_reads(source_file.read_text())
+            if found:
+                offenders[source_file.name] = found
+        self.assertEqual(
+            offenders, {},
+            "a free-text field decides control flow — §1.2 forbids a "
+            f"lifecycle transition caused by prose: {offenders}")
+
+    def test_recording_and_displaying_free_text_is_permitted(self):
+        """The acquittal that makes the widening possible without exemptions.
+
+        §1.2 forbids *transitioning* on free text, not reading it. The tracer
+        payload at `agents.py`, the `raise` that quotes a summary, and the
+        console line that prints one are all permitted — and all three were
+        convicted by the previous form, which is why it could never widen.
+        Listing them as exceptions would have been the allowlist that kills a
+        guard; teaching the rule the difference is not.
+        """
+        permitted = (
+            "def record(envelope, tracer, log):\n"
+            "    tracer.event(payload={'summary': envelope.summary})\n"
+            "    log.info('%s', envelope.notes_for_next_agent)\n"
+            "    raise RuntimeError(f'failed: {envelope.summary}')\n")
+        self.assertEqual(vf.free_text_reads(permitted), ())
+
+    def test_a_transition_decided_by_free_text_is_convicted(self):
+        """The direction that matters: prose reaching a branch."""
+        planted = (
+            "def settle(envelope, store):\n"
+            "    if 'failed' in envelope.summary:\n"
+            "        store.mark_blocked('n')\n")
+        self.assertIn("summary", vf.free_text_reads(planted))
 
     def test_the_detector_catches_a_planted_violation(self):
         """A detector never proven red on a real violation is not a
@@ -313,7 +359,9 @@ class FreeTextDetectorTests(unittest.TestCase):
             "def guard(envelope):\n"
             "    if envelope.notes_for_next_agent:\n"
             "        return True\n"
-            "    return envelope['summary'] == 'ok'\n")
+            "    if envelope['summary'] == 'ok':\n"
+            "        return False\n"
+            "    return None\n")
         found = vf.free_text_reads(planted)
         self.assertIn("notes_for_next_agent", found)
         self.assertIn("summary", found)

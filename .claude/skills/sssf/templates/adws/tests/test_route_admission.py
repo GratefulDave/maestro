@@ -40,6 +40,33 @@ def write(name, payload):
     with open(os.path.join(root, name), "a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload) + "\n")
 write("argv.jsonl", {"argv": argv})
+
+# The monotonic per-pane counter real herdr publishes on `pane get` (observed
+# 12169 on a live pane). `launcher.submit_agent_prompt` accepts nothing else as
+# proof that a composer took a prompt: a pane holding an unsubmitted `@<path>`
+# reports `idle` exactly like one that consumed it, and only the revision tells
+# them apart. A fake without the key models a pane that can never accept
+# anything, which is how this suite went blind to the launcher path that
+# blocked two production runs at 0 turns on 2026-08-18.
+def rev_path(pane):
+    return os.path.join(root, "rev_" + pane.replace(":", "_"))
+
+def revision(pane):
+    path = rev_path(pane)
+    return int(open(path).read()) if os.path.exists(path) else 12169
+
+def bump(pane):
+    nxt = revision(pane) + 1
+    open(rev_path(pane), "w").write(str(nxt))
+
+def pane_of(name):
+    starts_path = os.path.join(root, "starts.jsonl")
+    if os.path.exists(starts_path):
+        for line in reversed(open(starts_path, encoding="utf-8").read().splitlines()):
+            start = json.loads(line)["argv"]
+            if start[2] == name and "--pane" in start:
+                return start[start.index("--pane") + 1]
+    return "w1:p2"
 if argv[:2] == ["pane", "current"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p1", "cwd": cwd}}}))
 elif argv[:2] == ["pane", "split"]:
@@ -59,7 +86,10 @@ elif argv[:2] == ["pane", "get"]:
         sys.stderr.write("pane_not_found\n")
         sys.exit(1)
     claimed = os.environ.get("FAKE_PANE_CWD", cwd)
-    print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": claimed}}}))
+    pane = {"pane_id": "w1:p2", "cwd": claimed}
+    if not os.environ.get("FAKE_PANE_WITHOUT_REVISION"):
+        pane["revision"] = revision(argv[2])
+    print(json.dumps({"result": {"pane": pane}}))
 elif argv[:2] == ["pane", "process-info"]:
     process = "zsh"
     launched_path = os.path.join(root, "launched")
@@ -111,6 +141,10 @@ elif argv[:2] in (["agent", "prompt"], ["agent", "send-keys"]):
             sys.stderr.write(json.dumps({"error": {"code": "agent_prompt_stalled"}}))
             sys.exit(1)
     open(os.path.join(root, name + ".entered"), "w").close()
+    # The pane consumed something: either the atomic `agent prompt` submission
+    # or the Enter that rescued a composer holding the text. A stalled prompt
+    # exits above without ever reaching here, so it never advances the counter.
+    bump(pane_of(name))
     if os.environ.get("FAKE_OMIT_MARKER") or os.environ.get("FAKE_DELAY_MARKER"):
         print(json.dumps({"result": {"ok": True}}))
         raise SystemExit(0)

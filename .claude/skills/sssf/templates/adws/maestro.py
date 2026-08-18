@@ -2250,15 +2250,26 @@ def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
         state = _typed_launch(adapter, adapter.poll, handle)
         if state.state is launcher.PollState.EXITED:
             parsed = False
+            payload = None
             try:
-                json.loads(envelope_path.read_text(encoding="utf-8"))
+                declared = json.loads(envelope_path.read_text(encoding="utf-8"))
                 parsed = True
+                # §7.7's result payload. This object was already being parsed
+                # here and thrown away, which is the whole of why the
+                # `results` table had a live reader in `run status` and no
+                # writer anywhere: not a missing mechanism, a dropped value.
+                # Only a mapping is carried — `ResultRecord` stores a payload,
+                # and a bare list or scalar is a parseable envelope that
+                # declares nothing this row can hold.
+                if isinstance(declared, dict):
+                    payload = declared
             except (OSError, ValueError, UnicodeError):
                 pass
             return scheduler.NodeExecution(
                 envelope_parsed=parsed, exit_code=state.exit_code or 1,
                 launched_pid=handle.process_group,
-                launch_detail=state.detail)
+                launch_detail=state.detail,
+                envelope_payload=payload)
         if state.state is launcher.PollState.GONE:
             # TRANSPORT rather than STARTUP: the agent launched and then its
             # record vanished, so what was lost is the channel to it, not its
@@ -3518,32 +3529,38 @@ def _plan_ship(args: argparse.Namespace) -> int:
     setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
             str(artifacts["rendered"]))
 
-    # What the author step would write, computed before anything is written, so
-    # a re-run can tell "already authored" from "the IR moved" -- see
-    # `_plan_ship_authoring`. Projection failures are the author step's own
-    # refusals and are reported as that step failing, not as a ship that never
-    # started.
     destination = Path(author_args.plan_file)
-    try:
-        projected, _draft, _ir = plan_contract_ingress.project_canonical_plan(
-            artifacts["plan_ir"], artifacts["receipt"], Path(author_args.repo),
-            artifacts["rendered"])
-    except (plan_author.AuthoringError,
-            plan_contract_ingress.IngressError) as exc:
-        return _refusal("PLAN_AUTHORING_FAILED", str(exc))
-    try:
-        superseded = _plan_ship_authoring(
-            destination, projected, _plan_ship_approved(args))
-    except _ShipSupersedeRefused as exc:
-        return _refusal("PLAN_SUPERSEDE_REFUSED", str(exc))
-    except OSError as exc:
-        return _refusal("PLAN_SUPERSEDE_FAILED", str(exc))
-    authored_already = destination.exists()
 
     # Fail closed before authoring anything: no pane, no work, no leftovers.
+    # The projection and the supersede both live *inside* the pane, not before
+    # it. `_plan_ship_authoring` archives and unlinks the plan on disk, and a
+    # command that moves a plan's bytes while no pane exists is precisely the
+    # invisible work `VisiblePaneTest` forbids -- it was hoisted above the pane
+    # when ship was made resumable and has to come back down.
     pane = _PlanPane(layout, _plan_step_log(layout, args.plan_name, "ship"))
     pane.open()
     try:
+        # What the author step would write, computed before anything is
+        # written, so a re-run can tell "already authored" from "the IR moved"
+        # -- see `_plan_ship_authoring`. Projection failures are the author
+        # step's own refusals and are reported as that step failing, not as a
+        # ship that never started.
+        try:
+            projected, _draft, _ir = (
+                plan_contract_ingress.project_canonical_plan(
+                    artifacts["plan_ir"], artifacts["receipt"],
+                    Path(author_args.repo), artifacts["rendered"]))
+        except (plan_author.AuthoringError,
+                plan_contract_ingress.IngressError) as exc:
+            return _refusal("PLAN_AUTHORING_FAILED", str(exc))
+        try:
+            superseded = _plan_ship_authoring(
+                destination, projected, _plan_ship_approved(args))
+        except _ShipSupersedeRefused as exc:
+            return _refusal("PLAN_SUPERSEDE_REFUSED", str(exc))
+        except OSError as exc:
+            return _refusal("PLAN_SUPERSEDE_FAILED", str(exc))
+        authored_already = destination.exists()
         steps = (("validate", _plan_validate, None),
                  ("finalize", _plan_finalize, None))
         if not authored_already:

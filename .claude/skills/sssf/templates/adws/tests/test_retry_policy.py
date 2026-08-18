@@ -49,6 +49,11 @@ def make_attempt(node_id, base_sha, attempt_no, retry_class, run_id="r1"):
                             base_sha=base_sha, retry_class=retry_class)
 
 
+def _tree_sources():
+    """Every production module, plus the CLI."""
+    return sorted((ADWS / "adw_modules").glob("*.py")) + [ADWS / "maestro.py"]
+
+
 class CeilingProbe:
     """A `Scheduler` reduced to what `_semantic_ceiling_reached` reads.
 
@@ -371,11 +376,37 @@ class OutputComparisonDetectorTests(unittest.TestCase):
     engine (§7.5). This detector parses retry_policy.py's own source and
     fails if the classifier compares against stdout/stderr/output content."""
 
-    def test_the_real_module_is_clean(self):
-        source = Path(rp.__file__).read_text()
-        violations = rp.find_output_content_comparisons(source)
-        self.assertEqual(violations, [],
-                         f"retry_policy.py compares against process output text: {violations}")
+    def test_no_module_in_the_tree_compares_against_process_output(self):
+        """§7.5's rule is about the engine, so the guard covers the engine.
+
+        Scoped to `retry_policy.py` alone it reported clean over instances
+        living anywhere else — the same single-module shape that hid a live
+        violation in `plan_validate.py` from a detector written for that very
+        bug. Widening needed no exemptions, only an input narrowed to what the
+        rule is about: the substring form convicted `node.outputs`, a plan
+        node's declared output paths, which §7.5 explicitly permits a
+        classifier to read.
+        """
+        offenders = {}
+        for source_file in _tree_sources():
+            violations = rp.find_output_content_comparisons(source_file.read_text())
+            if violations:
+                offenders[source_file.name] = violations
+        self.assertEqual(
+            offenders, {},
+            "a classifier compares against process output text, which §7.5 "
+            f"forbids: {offenders}")
+
+    def test_declared_output_paths_are_not_process_output(self):
+        """The acquittal the widening depends on. `node.outputs` is
+        harness-computed state, not a process's bytes, and reading it is
+        exactly what §7.5's clause-4 trigger requires."""
+        permitted = (
+            "def check(selector, node, delta):\n"
+            "    if selector in node.outputs:\n"
+            "        return True\n"
+            "    return delta.paths == node.outputs\n")
+        self.assertEqual(rp.find_output_content_comparisons(permitted), [])
 
     def test_detector_catches_a_planted_violation(self):
         """A detector never proven to go red on a real violation is not a

@@ -118,10 +118,87 @@ class SubmissionProof(unittest.TestCase):
                                 until=("idle",), sleep=lambda _s: None)
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
-    def test_an_unreadable_revision_counts_as_unsubmitted(self):
-        herdr = FakeHerdr(revision=None)
-        with self.assertRaises(lch.PromptNotSubmitted):
+    def test_a_legible_counter_that_never_moves_is_a_genuine_refusal(self):
+        """The meter was readable the whole time and did not move.
+
+        That is a fact about the composer, so it stays terminal and stays
+        classified as EXECUTION.
+        """
+        herdr = FakeHerdr(stalls=99, revision=41)
+        with self.assertRaises(lch.PromptNotSubmitted) as caught:
             lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
+                                    until=("working", "idle"),
+                                    sleep=lambda _s: None)
+        self.assertIn("AGENT_PROMPT_UNSUBMITTED", str(caught.exception))
+        self.assertEqual(lch.classify_error(caught.exception),
+                         lch.ErrorClass.EXECUTION)
+
+    def test_an_unreadable_revision_is_unproven_rather_than_unsubmitted(self):
+        """D9. "I could not read the meter" is not "the meter did not move".
+
+        Both fail closed -- nothing here ever reports the prompt as submitted,
+        and Enter is still pressed every round -- but a herdr that cannot be
+        read is an environmental condition the next attempt survives, not a
+        wedged composer that has earned the node's terminal verdict.
+        """
+        herdr = FakeHerdr(revision=None)
+        with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
+            lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
+                                    until=("working", "idle"),
+                                    sleep=lambda _s: None)
+        self.assertIn("AGENT_PROMPT_UNOBSERVED", str(caught.exception))
+        self.assertNotIsInstance(caught.exception, lch.PromptNotSubmitted)
+        # Reuses the existing transient class; no new retry class exists.
+        self.assertEqual(lch.classify_error(caught.exception),
+                         lch.ErrorClass.TRANSIENT)
+        # Fails closed all the same: recovery was attempted every round.
+        self.assertEqual(herdr.count("agent", "send-keys"), lch.SUBMIT_ATTEMPTS)
+
+    def test_a_baseline_read_that_fails_outright_is_also_unproven(self):
+        """The recorded co-cause shape: one transient `pane get` at baseline.
+
+        The prompt may well have landed; the launcher simply never saw it. A
+        counter that is legible again afterwards does not retroactively supply
+        the missing baseline, so this is still unproven -- but transiently so.
+        """
+        class BlindBaseline(FakeHerdr):
+            def __init__(self) -> None:
+                super().__init__(revision=5)
+                self.reads = 0
+
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("pane", "get"):
+                    self.reads += 1
+                    if self.reads == 1:
+                        raise RuntimeError("herdr timeout")
+                return super().__call__(*argv, **kwargs)
+
+        herdr = BlindBaseline()
+        with self.assertRaises(lch.PromptSubmissionUnobservable):
+            lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
+                                    until=("working", "idle"),
+                                    sleep=lambda _s: None)
+
+    def test_a_counter_that_becomes_unreadable_after_a_good_baseline_is_unproven(self):
+        """The mirror case: baseline legible, every later read fails.
+
+        There is still no before/after pair, so there is still no fact about
+        the prompt -- only one about herdr.
+        """
+        class GoesBlind(FakeHerdr):
+            def __init__(self) -> None:
+                super().__init__(stalls=99, revision=5)
+                self.reads = 0
+
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("pane", "get"):
+                    self.reads += 1
+                    if self.reads > 1:
+                        raise RuntimeError("herdr timeout")
+                return super().__call__(*argv, **kwargs)
+
+        with self.assertRaises(lch.PromptSubmissionUnobservable):
+            lch.submit_agent_prompt(GoesBlind(), "w1:p1", "@prompt", "agent",
                                     until=("working", "idle"),
                                     sleep=lambda _s: None)
 
