@@ -118,10 +118,6 @@ ALLOWED: Dict[str, str] = {
     # travels on `PlanNode.gate_min_cases`, the one integration gate's on
     # `SchedulerDeps.integration_min_cases`, and the per-run scalar this
     # registry named was deleted rather than wired.)
-    "SchedulerDeps.provision": "DEFERRED D10: §8.3's provision step never runs; "
-                               "LauncherAdapter.provision exists but nothing "
-                               "connects it. Baseline is measured against an "
-                               "unprovisioned tree.",
 
     # D3 / D4 / D5. retry_policy.py, under investigation; do not delete.
     "retry_policy.semantic_budget_exhausted": "DEFERRED D3: §7.5's ceiling, "
@@ -190,13 +186,6 @@ ALLOWED: Dict[str, str] = {
     # production value in every run. Not broken branches — constants wearing a
     # config key's clothes — but recorded so that "configurable" is not
     # mistaken for "configured".
-    "SchedulerConfig.environmental_retries": "default is the production value; "
-                                             "nothing writes it outside tests",
-    "SchedulerConfig.launcher_retries": "DEFERRED: lives or dies with the "
-                                        "launcher-classification lane's "
-                                        "launcher_retry_budget",
-    "SchedulerConfig.credential_retries": "DEFERRED: same — the zero-budget "
-                                          "credential rule's only reader",
     "ValidationConfig.review_payload_budget_bytes": "default is the production "
                                                     "value; tests vary it to "
                                                     "exercise the budget",
