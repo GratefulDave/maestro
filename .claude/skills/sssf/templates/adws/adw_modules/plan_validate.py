@@ -44,7 +44,7 @@ from __future__ import annotations
 import hashlib
 import posixpath
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import (Any, Dict, List, Mapping, Optional, Sequence, Set,
@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover - Python < 3.8
 from . import plan_canonical as pc
 from . import plan_digest as pd
 from . import plan_model as pm
+from . import runner_resolution as rr
 
 
 class Obligation(str, Enum):
@@ -152,19 +153,16 @@ class GateCollector(Protocol):
         ...
 
 
-#: How each runner is asked to enumerate without executing.
+#: The collection flags, without a binary — the table used to carry one.
 #:
-#: pytest reads ``addopts`` from the repository's own ini file and prepends it,
-#: so a repository carrying ``-v`` there cancels the ``-q`` here: verbosity nets
-#: to the default and ``--collect-only`` prints its tree form (``<Function x>``)
-#: instead of flat ``path::case`` identifiers. ``_count`` reads identifiers, so
-#: that renders every gate in such a repository as zero collected cases.
-#: ``-o addopts=`` clears the inherited options, making collection output depend
-#: on this argv alone.
-COLLECT_ARGV: Dict[str, Tuple[str, ...]] = {
-    "pytest": ("pytest", "--collect-only", "-q", "-o", "addopts="),
-    "vitest": ("vitest", "list", "--run"),
-}
+#: `COLLECT_ARGV["pytest"]` began `("pytest", …)`, so the interpreter that
+#: enumerated a gate was whatever `PATH` exposed to the shell that started the
+#: verb. On the machine this was measured on that was pytest 8.4.0 from
+#: homebrew, which cannot import the target repository's `conftest.py` and
+#: reports every gate as zero collected cases. The binary now comes from
+#: `runner_resolution.ResolvedRunner`, and this module re-exports the flags
+#: from there so there is exactly one table rather than two that can disagree.
+COLLECT_ARGS = rr.COLLECT_ARGS
 
 
 @dataclass(frozen=True)
@@ -174,12 +172,41 @@ class SubprocessCollector:
     It is a seam rather than a hard dependency because collection is the one
     obligation that must touch the environment, and §6.4 puts environment
     facts outside eligibility. A missing runner raises rather than blocks.
+
+    The runner is **resolved**, never inherited. `resolver` is the single
+    producer `runner_resolution.resolve`, memoised per `(runner, cwd)` so the
+    twelve obligations pay the capability probe once for a plan rather than
+    once per gate. A resolution that refuses becomes `CollectorUnavailable` —
+    which is a reuse, not a new type: this module's own docstring already
+    states that a collector which cannot run is "an operational refusal with
+    no identity consequence, rather than being recorded as a blocker that
+    would make a missing binary look like a defect in the authored bytes",
+    and a runner that cannot import the repository is exactly that.
     """
 
     timeout_s: float = 120.0
+    #: Declared `runners:` values by runner literal, from `maestro.config.yaml`.
+    #: Empty means nothing is declared and discovery proposes.
+    declared: Mapping[str, str] = field(default_factory=dict)
+    env: Optional[Mapping[str, str]] = None
+    resolver: Any = staticmethod(rr.resolve)
+    _cache: Dict[Tuple[str, str], "rr.ResolvedRunner"] = field(
+        default_factory=dict, repr=False, compare=False)
 
-    def argv_for(self, gate: "pm.Gate") -> Tuple[str, ...]:
-        return COLLECT_ARGV[gate.runner] + tuple(gate.argv)
+    def runner_for(self, gate: "pm.Gate", tree: Path) -> "rr.ResolvedRunner":
+        key = (gate.runner, str(gate.cwd))
+        if key not in self._cache:
+            try:
+                self._cache[key] = self.resolver(
+                    gate.runner, Path(tree), gate.cwd,
+                    declared=self.declared.get(gate.runner), env=self.env)
+            except rr.RunnerUnusable as exc:
+                raise CollectorUnavailable(
+                    "{0}:{1}".format(rr.RUNNER_UNUSABLE, exc.detail)) from exc
+        return self._cache[key]
+
+    def argv_for(self, gate: "pm.Gate", tree: Path) -> Tuple[str, ...]:
+        return self.runner_for(gate, tree).collect_argv(gate)
 
     def collect(self, gate: "pm.Gate", tree: Path) -> int:
         cwd = Path(tree) / gate.cwd
@@ -187,7 +214,10 @@ class SubprocessCollector:
             raise CollectorUnavailable(
                 "the gate's working directory does not exist: {0}".format(cwd))
         try:
-            result = subprocess.run(list(self.argv_for(gate)), cwd=str(cwd),
+            result = subprocess.run(list(self.argv_for(gate, tree)),
+                                    cwd=str(cwd),
+                                    env=dict(self.env) if self.env is not None
+                                    else None,
                                     capture_output=True, text=True,
                                     timeout=self.timeout_s)
         except FileNotFoundError as exc:

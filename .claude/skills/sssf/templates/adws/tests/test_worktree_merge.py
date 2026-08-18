@@ -37,6 +37,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import launcher  # noqa: E402
+from adw_modules import runner_resolution as rr
 from adw_modules import worktree as wt  # noqa: E402
 
 
@@ -60,9 +61,25 @@ class T(unittest.TestCase):
         self.assertEqual(shout("hi"), "HI!")
 """
 
-NODE_GATE = [sys.executable, "-m", "unittest", "-q"]
-INTEGRATION_GATE = [sys.executable, "-m", "unittest", "discover", "-q", "-s", ".",
-                    "-p", "test_*.py"]
+def _runner(*prefix: str) -> "rr.ResolvedRunner":
+    """A resolved runner for an arbitrary command.
+
+    `run_node_gate` and `run_integration_gate` take a `ResolvedRunner` rather
+    than a command, because the binary that adjudicates a node must come from
+    `runner_resolution.resolve` and not from whatever `PATH` exposed. These
+    gates run `unittest` rather than a real runner, so the invocation is named
+    here explicitly; that is the signature working, not a workaround for it.
+    """
+    return rr.ResolvedRunner(
+        runner="pytest", executable=prefix[0], launcher_args=tuple(prefix[1:]),
+        origin="declared", probe_exit=5, version="unittest-stub")
+
+
+NODE_RUNNER = _runner(sys.executable, "-m", "unittest", "-q")
+NODE_ARGV: tuple = ()
+INTEGRATION_RUNNER = _runner(sys.executable, "-m", "unittest", "discover", "-q",
+                             "-s", ".", "-p", "test_*.py")
+INTEGRATION_ARGV: tuple = ()
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
@@ -248,7 +265,7 @@ class CacheRedirection(WorktreeTestCase):
         script = ("import json, os; print(json.dumps({k: os.environ.get(k) for k in "
                   "('XDG_CACHE_HOME', 'TMPDIR', 'PYTHONPYCACHEPREFIX', 'PYTEST_ADDOPTS')}))")
         gate = wt.run_node_gate(
-            attempt, [sys.executable, "-c", script], selector="ignored",
+            attempt, _runner(sys.executable), ("-c", script), selector="ignored",
             cancel_requested=lambda: False)
         observed = json.loads(gate.tail[-1])
         for key, value in observed.items():
@@ -273,7 +290,7 @@ class CacheRedirection(WorktreeTestCase):
                   "pathlib.Path(os.environ['XDG_CACHE_HOME'], 'gate-cache').write_text('c')\n")
         baseline = wt.take_baseline(attempt)
         gate = wt.run_node_gate(
-            attempt, [sys.executable, "-c", script], selector="ignored",
+            attempt, _runner(sys.executable), ("-c", script), selector="ignored",
             cancel_requested=lambda: False)
         self.assertEqual(gate.exit_code, 0, gate.tail)
         self.assertEqual(wt.delta(baseline, wt.inventory(attempt.path)), wt.InventoryDelta())
@@ -287,7 +304,7 @@ class CacheRedirection(WorktreeTestCase):
         script = "import pathlib; pathlib.Path('tool-residue.txt').write_text('beside its work')"
         baseline = wt.take_baseline(attempt)
         wt.run_node_gate(
-            attempt, [sys.executable, "-c", script], selector="ignored",
+            attempt, _runner(sys.executable), ("-c", script), selector="ignored",
             cancel_requested=lambda: False)
         measured = wt.delta(baseline, wt.inventory(attempt.path))
         self.assertEqual(measured.added, ("tool-residue.txt",))
@@ -554,7 +571,7 @@ class GateScope(WorktreeTestCase):
         an unscoped node gate is not a default anyone can fall into."""
         attempt = _attempt(self.repo, self.root)
         with self.assertRaises(ValueError):
-            wt.run_node_gate(attempt, NODE_GATE, selector="",
+            wt.run_node_gate(attempt, NODE_RUNNER, NODE_ARGV, selector="",
                              cancel_requested=lambda: False)
 
     def test_the_whole_suite_is_red_for_a_node_whose_sibling_has_not_merged(self):
@@ -566,13 +583,13 @@ class GateScope(WorktreeTestCase):
         (attempt.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
 
         whole = wt.run_integration_gate(
-            attempt.path, INTEGRATION_GATE, attempt.scratch,
+            attempt.path, INTEGRATION_RUNNER, INTEGRATION_ARGV, attempt.scratch,
             cancel_requested=lambda: False)
         self.assertFalse(whole.green)
         self.assertEqual(whole.scope, "integration")
 
         scoped = wt.run_node_gate(
-            attempt, NODE_GATE, selector="test_calc",
+            attempt, NODE_RUNNER, NODE_ARGV, selector="test_calc",
             cancel_requested=lambda: False)
         self.assertTrue(scoped.green, scoped)
         self.assertEqual(scoped.scope, "node")
@@ -581,12 +598,12 @@ class GateScope(WorktreeTestCase):
         """§7.4 / §7.3 clauses 2 and 3, at the scope F3 requires."""
         attempt = _attempt(self.repo, self.root)
         pre = wt.run_node_gate(
-            attempt, NODE_GATE, selector="test_calc",
+            attempt, NODE_RUNNER, NODE_ARGV, selector="test_calc",
             cancel_requested=lambda: False, label="pre-gate")
         self.assertFalse(pre.green)
         (attempt.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
         post = wt.run_node_gate(
-            attempt, NODE_GATE, selector="test_calc",
+            attempt, NODE_RUNNER, NODE_ARGV, selector="test_calc",
             cancel_requested=lambda: False, label="post-gate")
         self.assertTrue(post.green)
 
@@ -598,11 +615,11 @@ class GateScope(WorktreeTestCase):
 
         with self.assertRaises(wt.GateCancelled):
             wt.run_node_gate(
-                attempt, NODE_GATE, selector="test_calc",
+                attempt, NODE_RUNNER, NODE_ARGV, selector="test_calc",
                 cancel_requested=cancelled)
         with self.assertRaises(wt.GateCancelled):
             wt.run_integration_gate(
-                attempt.path, INTEGRATION_GATE, attempt.scratch,
+                attempt.path, INTEGRATION_RUNNER, INTEGRATION_ARGV, attempt.scratch,
                 cancel_requested=cancelled)
 
 # ── §8.5 deterministic merge order ──────────────────────────────────────────
@@ -697,7 +714,8 @@ class MergeAndAcceptance(WorktreeTestCase):
             self.assertEqual(result.conflicted_paths, ())
 
         gate = wt.run_integration_gate(
-            integration, INTEGRATION_GATE, self.root / "scratch" / "integration",
+            integration, INTEGRATION_RUNNER, INTEGRATION_ARGV,
+            self.root / "scratch" / "integration",
             cancel_requested=lambda: False)
         self.assertTrue(gate.green, gate.tail)
 

@@ -36,6 +36,7 @@ from adw_modules import lifecycle as lc
 from adw_modules import participant
 from adw_modules import plan_author
 from adw_modules import plan_contract_ingress
+from adw_modules import runner_resolution
 from adw_modules import plan_finalization
 from adw_modules import plan_digest
 from adw_modules import plan_model
@@ -429,7 +430,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         raw, "maestro configuration",
         ("schema", "plans_dir", "state_root", "keys", "executables",
          "route_receipts", "reviewer", "execution"),
-        ("plan_contract", "author"))
+        ("plan_contract", "author", "runners"))
     if root["schema"] != _MAESTRO_SCHEMA:
         raise _MaestroConfigurationError(
             "schema must be " + _MAESTRO_SCHEMA)
@@ -469,6 +470,22 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         name: _resolve_binary(executable_values[name], "executables." + name)
         for name in ("herdr", "omp", "claude")
     }
+
+    # The gate runner, declared the same way every other external binary
+    # Maestro shells out to already is. Optional, so an existing configuration
+    # keeps loading; when a runner is named here the declaration is binding and
+    # discovery never runs. Deliberately *not* resolved with `_resolve_binary`:
+    # a runner is legitimately spelled as a repository-relative path
+    # (`.venv/bin/pytest`), which is not on PATH, and its usability is decided
+    # by the capability probe in `runner_resolution`, not by `shutil.which`.
+    runners: Dict[str, str] = {}
+    if "runners" in root:
+        runner_values = _config_mapping(
+            root["runners"], "runners", (), tuple(plan_model.RUNNERS))
+        for name in plan_model.RUNNERS:
+            if name in runner_values:
+                runners[name] = _config_string(
+                    runner_values[name], "runners." + name)
 
     receipts = root["route_receipts"]
     if not isinstance(receipts, dict) or not receipts:
@@ -660,6 +677,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "database": database,
         "key_env": keys,
         "executables": executables,
+        "runners": runners,
         "route_paths": route_paths,
         "reviewer": reviewer,
         "execution": execution,
@@ -782,6 +800,7 @@ def _bind_layout_executables(args: argparse.Namespace, layout: Dict[str, Any]) -
         for route, path in sorted(layout["route_paths"].items())
     ]
     args.repository_state = str(layout["repository_state"])
+    args.runners = dict(layout.get("runners") or {})
     args.layout = layout
 
 
@@ -1025,6 +1044,22 @@ def _refusal(outcome: str, detail: str) -> int:
     return 3
 
 
+def _typed_refusal(payload: Dict[str, Any], detail: str) -> int:
+    """A refusal whose discriminating facts travel as typed fields.
+
+    `_refusal` carries an outcome and a sentence, which is enough while the
+    outcome is the whole answer. `RUNNER_UNUSABLE` is not: an operator needs to
+    know *which* of unresolved, incapable, or ambiguous fired, what was tried,
+    and what the probe returned, and a caller needs to branch on that without
+    parsing prose (§1.2). So the payload carries them as fields and the
+    sentence stays a sentence.
+    """
+    body = dict(payload)
+    body["detail"] = detail
+    print(json.dumps(body, sort_keys=True))
+    return 3
+
+
 def _bootstrap(args: argparse.Namespace) -> int:
     layout = getattr(args, "layout", None)
     if layout is None:
@@ -1153,12 +1188,32 @@ class _VerifiedReceipts:
         return True
 
 
+def _plan_collector(args: argparse.Namespace) -> "pv.SubprocessCollector":
+    """The collector every plan verb uses, carrying the declared runners.
+
+    The gate runner used to be `argv[0]` taken from the `Gate.runner` literal
+    and executed against an inherited `PATH`, so `plan validate` enumerated a
+    plan's gates with whatever interpreter the operator's shell exposed. On a
+    machine whose `PATH` pytest cannot import the repository's `conftest.py`,
+    every gate collected zero cases and the plan was blocked as if its authored
+    bytes were wrong. Handing the collector the declared `runners:` block is
+    what lets `runner_resolution` decide the binary instead.
+    """
+    # `resolver` is passed rather than defaulted so the seam has a production
+    # writer: `tests/test_no_dead_seams.py` convicts a field production reads
+    # and only tests write, and a resolver that only ever arrived from a test
+    # would be exactly that.
+    return pv.SubprocessCollector(
+        declared=dict(getattr(args, "runners", {}) or {}),
+        resolver=runner_resolution.resolve)
+
+
 def _plan_validate(args: argparse.Namespace) -> int:
     try:
         result = pv.validate_plan(
             Path(args.plan_file).read_bytes(), args.repo,
             receipts=_VerifiedReceipts(args),
-            collector=pv.SubprocessCollector())
+            collector=_plan_collector(args))
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
     except _PlanReceiptVerificationError as exc:
@@ -1685,7 +1740,7 @@ def _plan_finalize(args: argparse.Namespace) -> int:
         stored = Path(args.plan_file).read_bytes()
         validation = pv.validate_plan(
             stored, args.repo, receipts=_VerifiedReceipts(args),
-            collector=pv.SubprocessCollector())
+            collector=_plan_collector(args))
         if not validation.eligible:
             print(json.dumps({
                 "outcome": validation.outcome.value,
@@ -1952,7 +2007,7 @@ def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
     stored = Path(args.plan_file).read_bytes()
     receipts = _VerifiedReceipts(args)
     validation = pv.validate_plan(
-        stored, args.repo, receipts=receipts, collector=pv.SubprocessCollector())
+        stored, args.repo, receipts=receipts, collector=_plan_collector(args))
     if not validation.eligible or validation.digest != args.digest:
         raise ValueError("RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE")
     receipt = receipts._receipt_store().load(args.digest)
@@ -2318,12 +2373,61 @@ def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
         sleep(0.05)
 
 
+def _resolve_run_runners(
+        args: argparse.Namespace,
+        plan: plan_model.Plan) -> Dict[str, "runner_resolution.ResolvedRunner"]:
+    """Resolve every gate runner this run will execute, before it starts.
+
+    Keyed by the runner literal alone rather than by `(runner, cwd)`, and that
+    is a fact about where gates run rather than a simplification: the
+    projection deliberately drops `Gate.cwd` (`plan_model._GATE_PROJECTION`
+    maps it to `None`, because a node's command runs in that attempt's own
+    worktree), and `run_integration_gate` is handed the integration checkout.
+    Every gate on this path therefore executes at its tree root, so the
+    repository root is the directory capability must be established in.
+
+    The probe runs under the same environment builder the gate will run under.
+    Proving capability under an environment the gate will not have proves
+    nothing, and the two paths could already disagree: `worktree.launch_env`
+    sets `PYTEST_ADDOPTS`, and the collector on the validate path did not.
+    """
+    declared = dict(getattr(args, "runners", {}) or {})
+    scratch = Path(args.scratch_root) / "runner-probe"
+    env = worktree.launch_env(scratch)
+    wanted = {node.gate.runner for node in plan.agent_nodes}
+    wanted.add(plan.merge_policy.integration_gate.runner)
+    return {
+        runner: runner_resolution.resolve(
+            runner, Path(args.repo), ".", declared=declared.get(runner),
+            env=env)
+        for runner in sorted(wanted)
+    }
+
+
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     from threading import RLock
 
     config = _run_configuration(args)
     plan = _load_runnable_plan(args)
     _validate_run_paths(args, plan)
+    # A run precondition, in the same family as the integration branch already
+    # being checked out: decided before the scheduler exists, so an unusable
+    # runner launches no pane, writes no attempt row, and reaches no retry
+    # classifier. Discovering it at attempt time instead is what made a
+    # permanently wrong interpreter look like a transient environmental fault
+    # and burn a node's whole environmental budget on identical re-runs.
+    try:
+        resolved_runners = _resolve_run_runners(args, plan)
+    except runner_resolution.RunnerUnusable as exc:
+        return _typed_refusal(exc.payload(), exc.detail)
+    runner_resolution.write_record(
+        Path(args.integration_path).parent / "runner-resolution.json",
+        resolved_runners.values())
+    notice = runner_resolution.adoption_notice(resolved_runners.values())
+    if notice:
+        # stderr, because this verb's stdout is one JSON document and an
+        # operator hint is not part of it.
+        print(notice, file=sys.stderr)
     route_runner = _runtime_launcher(args) if plan.agent_nodes else None
     store = lc.LifecycleStore(args.db)
     handles = {}
@@ -2461,7 +2565,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 handles.pop(key)
                 proven_absent.add(key)
 
-        run_gate, run_integration_gate = _scheduler_gate_deps(plan)
+        run_gate, run_integration_gate = _scheduler_gate_deps(
+            plan, resolved_runners)
         review_attempt = (
             _code_review_runner(args, route_runner)
             if route_runner is not None and getattr(args, "review_root", None)
@@ -2517,19 +2622,29 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     return 0
 
 
-def _scheduler_gate_deps(plan: plan_model.Plan):
-    """Adapt the frozen plan gates without dropping cancellation ownership."""
+def _scheduler_gate_deps(plan: plan_model.Plan, runners):
+    """Adapt the frozen plan gates without dropping cancellation ownership.
+
+    `node.gate_command` stays the abstract `(runner,) + argv` it has always
+    been — it is inside the plan's canonical bytes and `plan_model` asserts
+    exactly that shape, so a resolved interpreter must never be baked into it
+    or the resolved binary becomes part of the approved identity and a plan
+    stops being portable between machines. The binary is supplied here, at
+    execution, from the `ResolvedRunner` the run's preflight probed.
+    """
     integration_gate = plan.merge_policy.integration_gate
 
     def run_gate(attempt, node, phase, cancel_requested):
+        command = tuple(node.gate_command)
         return worktree.run_node_gate(
-            attempt, node.gate_command, node.gate_selector, cancel_requested,
-            label="{}-{}".format(node.node_id, phase))
+            attempt, runners[command[0]], command[1:], node.gate_selector,
+            cancel_requested, label="{}-{}".format(node.node_id, phase))
 
     def run_integration_gate(integration_path, specs, cancel_requested):
-        command = (integration_gate.runner,) + tuple(integration_gate.argv)
         return worktree.run_integration_gate(
-            integration_path, command, Path(integration_path).parent / ".maestro",
+            integration_path, runners[integration_gate.runner],
+            tuple(integration_gate.argv),
+            Path(integration_path).parent / ".maestro",
             cancel_requested, label="integration-gate")
 
     return run_gate, run_integration_gate

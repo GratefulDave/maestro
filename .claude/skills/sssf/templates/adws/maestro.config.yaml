@@ -9,6 +9,18 @@ executables:
   herdr: herdr
   omp: omp
   claude: claude
+# The interpreter each gate runner is executed as. Optional, and binding when
+# present: a declared runner is probed for its ability to collect in this
+# repository and refuses `RUNNER_UNUSABLE` if it cannot, rather than falling
+# back to a guess. Omit the block and Maestro discovers one — repository
+# environment first, then `uv run`, then `poetry run`, then PATH — probes it,
+# records the choice in the run's `runner-resolution.json`, and prints the
+# block to adopt. Declaring it is what removes the dependence on whatever PATH
+# the shell that started the scheduler happened to carry.
+#
+# runners:
+#   pytest: .venv/bin/pytest
+#   vitest: node_modules/.bin/vitest
 route_receipts:
   omp: route-receipts/omp.json
   claude: route-receipts/claude.json

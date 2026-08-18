@@ -732,6 +732,10 @@ class OperatorCliTest(unittest.TestCase):
             args = mock.Mock(
                 plan_file=str(plan_file), repo=str(root),
                 receipt_dir=str(root / "receipts"), data_dir=str(root / "data"),
+                # Bound by installed configuration, so it is named here: a
+                # `Mock` invents every attribute it is asked for, and the
+                # declared-runners block has to be a mapping.
+                runners={},
                 verify_key=[receipt_crypto.seed_to_public_key(
                     receipt_crypto.generate_seed()).hex()],
                 signing_seed=receipt_crypto.generate_seed().hex())
@@ -855,6 +859,12 @@ class OperatorCliTest(unittest.TestCase):
             ), mock.patch.object(
                     maestro, "_load_runnable_plan", return_value=plan
             ), mock.patch.object(
+                    # Runner resolution probes a real interpreter. This plan is
+                    # a stub whose gate never executes, so resolution joins the
+                    # seams already substituted here rather than making every
+                    # CLI test depend on the machine's PATH.
+                    maestro, "_resolve_run_runners", return_value={}
+            ), mock.patch.object(
                     maestro, "_runtime_launcher", return_value=route
             ), mock.patch.object(
                     maestro.lc, "LifecycleStore"
@@ -920,6 +930,12 @@ class OperatorCliTest(unittest.TestCase):
                     maestro, "_run_configuration", return_value=mock.Mock()
             ), mock.patch.object(
                     maestro, "_load_runnable_plan", return_value=plan
+            ), mock.patch.object(
+                    # Runner resolution probes a real interpreter. This plan is
+                    # a stub whose gate never executes, so resolution joins the
+                    # seams already substituted here rather than making every
+                    # CLI test depend on the machine's PATH.
+                    maestro, "_resolve_run_runners", return_value={}
             ), mock.patch.object(
                     maestro.lc, "LifecycleStore"
             ), mock.patch.object(
@@ -1021,6 +1037,8 @@ class OperatorCliTest(unittest.TestCase):
                             integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                         to_plan_nodes=lambda: ())
             ), mock.patch.object(
+                    maestro, "_resolve_run_runners", return_value={}
+            ), mock.patch.object(
                     maestro, "_validate_run_paths"
             ), mock.patch.object(
                     maestro.lc, "LifecycleStore"
@@ -1094,6 +1112,12 @@ class OperatorCliTest(unittest.TestCase):
                     maestro, "_run_configuration", return_value=config
             ), mock.patch.object(
                     maestro, "_load_runnable_plan", return_value=plan
+            ), mock.patch.object(
+                    # Runner resolution probes a real interpreter. This plan is
+                    # a stub whose gate never executes, so resolution joins the
+                    # seams already substituted here rather than making every
+                    # CLI test depend on the machine's PATH.
+                    maestro, "_resolve_run_runners", return_value={}
             ), mock.patch.object(
                     maestro, "_validate_run_paths"
             ), mock.patch.object(
@@ -1196,6 +1220,12 @@ class OperatorCliTest(unittest.TestCase):
             ), mock.patch.object(
                     maestro, "_load_runnable_plan", return_value=plan
             ), mock.patch.object(
+                    # Runner resolution probes a real interpreter. This plan is
+                    # a stub whose gate never executes, so resolution joins the
+                    # seams already substituted here rather than making every
+                    # CLI test depend on the machine's PATH.
+                    maestro, "_resolve_run_runners", return_value={}
+            ), mock.patch.object(
                     maestro, "_runtime_launcher", return_value=route
             ), mock.patch.object(
                     maestro.lc, "LifecycleStore", return_value=store
@@ -1283,6 +1313,12 @@ class OperatorCliTest(unittest.TestCase):
                     maestro, "_run_configuration", return_value=mock.Mock()
             ), mock.patch.object(
                     maestro, "_load_runnable_plan", return_value=plan
+            ), mock.patch.object(
+                    # Runner resolution probes a real interpreter. This plan is
+                    # a stub whose gate never executes, so resolution joins the
+                    # seams already substituted here rather than making every
+                    # CLI test depend on the machine's PATH.
+                    maestro, "_resolve_run_runners", return_value={}
             ), mock.patch.object(
                     maestro, "_runtime_launcher", return_value=NoTranscriptRoute()
             ), mock.patch.object(

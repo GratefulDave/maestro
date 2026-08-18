@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 from . import coordinator_store as cs
 from . import plan_digest
 from . import plan_model as pm
+from . import runner_resolution as rr
 from . import workspace_model as wm
 from . import worktree as wt
 
@@ -798,6 +799,7 @@ def run_global_gates(
         acceptance: AcceptanceWorkspace,
         gates: Sequence[pm.Gate],
         cancel_requested: Callable[[], bool],
+        declared_runners: Optional[Mapping[str, str]] = None,
 ) -> Tuple[wt.GateResult, ...]:
     """Run declared global gates in order with an explicit cancellation source."""
     if not isinstance(acceptance, AcceptanceWorkspace):
@@ -805,13 +807,26 @@ def run_global_gates(
     if not callable(cancel_requested):
         raise GateConfigurationError("global gates require a cancellation callback")
     _validate_acceptance_checkouts(acceptance)
+    declared_runners = dict(declared_runners or {})
     results = []
     for index, gate in enumerate(gates):
         if cancel_requested():
             raise wt.GateCancelled("global gate execution was cancelled")
         cwd = _acceptance_cwd(acceptance, gate.cwd)
+        # The runner is resolved here rather than inherited from whatever
+        # shell started this process. A global gate runs against a checkout of
+        # a participating repository, so the resolution is anchored at that
+        # checkout and probed there; an unusable runner raises before the gate
+        # is executed rather than producing an unparseable report that reads
+        # as an environmental fault.
+        try:
+            resolved = rr.resolve(gate.runner, cwd, ".",
+                                  declared=declared_runners.get(gate.runner))
+        except rr.RunnerUnusable as exc:
+            raise GateConfigurationError(
+                "{0}:{1}".format(rr.RUNNER_UNUSABLE, exc.detail)) from exc
         result = wt.run_integration_gate(
-            cwd, (gate.runner,) + tuple(gate.argv),
+            cwd, resolved, tuple(gate.argv),
             acceptance.root / ".maestro-gate-scratch" / str(index),
             cancel_requested, label="global-gate-{0}".format(index))
         if not result.green or result.counts.get("passed", 0) < gate.min_cases:

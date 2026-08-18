@@ -18,7 +18,8 @@ The shape of an attempt, in the order the caller must execute it:
     permission_check(attempt, d, declared)   # §8.3's two conjuncts (§7.3 clause 4)
     sha = commit_measured_delta(attempt, d, after, msg)   # §8.4, before the gate
     check_post_commit(attempt, expected_inventory(baseline, d, after))
-    run_node_gate(attempt, cmd, selector, cancel_requested)  # §7.3 clause 3
+    run_node_gate(attempt, resolved_runner, argv, selector,
+                  cancel_requested)                    # §7.3 clause 3
     merge_verified_node(integration, node_id, sha)        # §8.5, §8.6
 
 Two things this module deliberately does not do, so that no caller can mistake
@@ -66,6 +67,7 @@ from .launcher import (
     HarnessQuiescenceError,
     run_harness_process,
 )
+from . import runner_resolution as rr
 
 # An inventory maps a worktree-relative path to its tuple: git's mode class and
 # git's blob object id for the bytes at that path (§8.3).
@@ -863,10 +865,28 @@ class GateResult:
 
 
 def _run_gate(
-        worktree: Path, command: Sequence[str], scratch: Path, label: str,
-        scope: str, selector: Optional[str],
+        worktree: Path, runner: "rr.ResolvedRunner", argv: Sequence[str],
+        scratch: Path, label: str, scope: str, selector: Optional[str],
         cancel_requested: Callable[[], bool],
 ) -> GateResult:
+    """Run one gate through a resolved runner.
+
+    `runner` is a `ResolvedRunner` and not a command, and that is the whole
+    repair: this function used to take `Sequence[str]` whose `argv[0]` was the
+    bare `Gate.runner` literal, executed with an inherited `PATH`. A wrong
+    interpreter then produced no summary line, `counts` came back empty,
+    `GateCounts.parse` returned `None`, `adjudicate_gate` stamped
+    `ENVIRONMENTAL`, and the node re-ran the same broken binary until its
+    environmental budget was gone. Taking a resolved runner means a caller has
+    nothing to build an invocation from except something `runner_resolution.
+    resolve` produced and probed, so the wrong-interpreter case is refused at
+    run start instead of misclassified at attempt time (§1.2).
+    """
+    if not isinstance(runner, rr.ResolvedRunner):
+        raise TypeError(
+            "a gate runs through a resolved runner, never a bare command; "
+            "obtain one from runner_resolution.resolve")
+    command = runner.execute_argv(argv)
     try:
         result = run_harness_process(
             command, cwd=worktree, env=launch_env(scratch),
@@ -882,7 +902,8 @@ def _run_gate(
                       tail=tuple(output.strip().splitlines()[-5:]))
 
 
-def run_node_gate(attempt: AttemptWorktree, command: Sequence[str], selector: str,
+def run_node_gate(attempt: AttemptWorktree, runner: "rr.ResolvedRunner",
+                  argv: Sequence[str], selector: str,
                   cancel_requested: Callable[[], bool],
                   label: str = "node-gate") -> GateResult:
     """Run a gate scoped to the node's own declared selector (§7.4, §7.3).
@@ -902,13 +923,14 @@ def run_node_gate(attempt: AttemptWorktree, command: Sequence[str], selector: st
         raise ValueError(
             "a node gate needs the node's own selector; whole-suite execution is "
             "run_integration_gate (§8.8), never an unscoped node gate")
-    return _run_gate(attempt.path, list(command) + [selector], attempt.scratch,
-                     label, "node", selector, cancel_requested)
+    return _run_gate(attempt.path, runner, list(argv) + [selector],
+                     attempt.scratch, label, "node", selector,
+                     cancel_requested)
 
 
 def run_integration_gate(
-        worktree: Path, command: Sequence[str], scratch: Path,
-        cancel_requested: Callable[[], bool],
+        worktree: Path, runner: "rr.ResolvedRunner", argv: Sequence[str],
+        scratch: Path, cancel_requested: Callable[[], bool],
         label: str = "integration-gate",
 ) -> GateResult:
     """Run the final whole-suite gate under the caller's cancellation lease.
@@ -917,8 +939,8 @@ def run_integration_gate(
     where semantic conflicts between individually-correct nodes become visible.
     """
     return _run_gate(
-        Path(worktree), command, Path(scratch), label, "integration", None,
-        cancel_requested)
+        Path(worktree), runner, argv, Path(scratch), label, "integration",
+        None, cancel_requested)
 
 
 # ── §8.5 deterministic merge order ──────────────────────────────────────────
