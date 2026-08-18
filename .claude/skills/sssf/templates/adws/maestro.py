@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
 import os
@@ -181,6 +182,36 @@ def _config_positive_integer(value, label):
     if (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
         raise _MaestroConfigurationError(label + " must be a positive integer")
     return value
+
+
+def _config_nonnegative_integer(value, label):
+    """A count that is allowed to be zero.
+
+    Separate from `_config_positive_integer` because zero is the *point* of
+    one of these: §7.5 gives `LauncherFailure.CREDENTIAL` a budget of zero, and
+    a validator that refuses zero would make the one row of the retry table
+    whose whole purpose is not to retry unexpressible in configuration.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _MaestroConfigurationError(
+            label + " must be a non-negative integer")
+    return value
+
+
+def _config_argv(value, label) -> Tuple[str, ...]:
+    """A command as a real argv list, never a shell string.
+
+    The same rule the plan's gates already live under (`docs/plan-authoring.md`,
+    "Pass the real argv, never a script alias"): a string would have to be
+    split by something, and whatever split it would be a shell this process
+    does not run.
+    """
+    if not isinstance(value, list) or not value:
+        raise _MaestroConfigurationError(
+            label + " must be a non-empty list of argv strings")
+    return tuple(
+        _config_string(item, label + "[{}]".format(index))
+        for index, item in enumerate(value))
 
 
 def _path_is_within(path: Path, boundary: Path) -> bool:
@@ -372,6 +403,20 @@ def _resolve_key_environment(
     return value
 
 
+#: Every `SchedulerConfig` field that declares a default, and that default.
+#:
+#: Read off the dataclass rather than restated, so there is exactly one of each
+#: number. `_run_configuration` uses it for the settings an operator may leave
+#: unspecified, and looking up a field that has no default raises `KeyError`
+#: rather than inventing one — a required field with no argument is the
+#: `missing run configuration` refusal's job, not a fallback's.
+_SCHEDULER_CONFIG_DEFAULTS: Dict[str, Any] = {
+    field.name: field.default
+    for field in dataclasses.fields(scheduler_types.SchedulerConfig)
+    if field.default is not dataclasses.MISSING
+}
+
+
 def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     """Repository layout, binaries, and route destinations. No key material."""
     try:
@@ -454,7 +499,9 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         root["execution"], "execution",
         ("route", "model", "effort", "concurrency", "node_timeout_s",
          "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
-         "semantic_ceiling"), ("profile", "vendor", "review_ceiling"))
+         "semantic_ceiling"),
+        ("profile", "vendor", "review_ceiling", "provision",
+         "environmental_retries", "launcher_retries", "credential_retries"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -502,6 +549,45 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             _config_positive_integer(execution_raw["review_ceiling"],
                                      "execution.review_ceiling")
             if "review_ceiling" in execution_raw else 3),
+        # §8.3/§9.3's provision step: the ecosystem's setup, run in every
+        # attempt's fresh worktree after `git worktree add` and before the
+        # pre-node gate and the baseline inventory. `npm ci` for a JavaScript
+        # repository; absent for a pytest one, which is §9.3's stated no-op
+        # default. Deployment-specific for the same reason `execution.model`
+        # is — it names the ecosystem this installation builds — so it lives
+        # here rather than being inferred from a runner.
+        #
+        # Without it §7.4's falsifiable gate claims nothing in any repository
+        # with an install step: a pre-node gate red because `node_modules` is
+        # absent is not red for the intended reason, and its post-node partner
+        # can never go green, so every agent node blocks on a fact about the
+        # tree rather than about the work.
+        "provision": (_config_argv(execution_raw["provision"],
+                                   "execution.provision")
+                      if "provision" in execution_raw else ()),
+        # §7.5's two non-semantic budgets and CREDENTIAL's zero. The defaults
+        # are read off `SchedulerConfig` rather than restated here: a literal
+        # in this file would be a second representation of a number the
+        # dataclass already declares, which is RC1's shape and the reason
+        # these three keys were unreachable in the first place.
+        "environmental_retries": (
+            _config_nonnegative_integer(
+                execution_raw["environmental_retries"],
+                "execution.environmental_retries")
+            if "environmental_retries" in execution_raw
+            else _SCHEDULER_CONFIG_DEFAULTS["environmental_retries"]),
+        "launcher_retries": (
+            _config_nonnegative_integer(
+                execution_raw["launcher_retries"],
+                "execution.launcher_retries")
+            if "launcher_retries" in execution_raw
+            else _SCHEDULER_CONFIG_DEFAULTS["launcher_retries"]),
+        "credential_retries": (
+            _config_nonnegative_integer(
+                execution_raw["credential_retries"],
+                "execution.credential_retries")
+            if "credential_retries" in execution_raw
+            else _SCHEDULER_CONFIG_DEFAULTS["credential_retries"]),
     }
     # `author` is optional so an installation that never runs `maestro deliver`
     # keeps working unchanged; `deliver` refuses when it is absent rather than
@@ -798,6 +884,16 @@ def _apply_repository_config(
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
         args.review_ceiling = execution["review_ceiling"]
+        # §7.5's non-semantic budgets. Present in `SchedulerConfig` and in
+        # `maestro.config.yaml` for as long as both existed, and connected by
+        # nothing: a deployment that set them changed no run, because the
+        # projection onto `SchedulerConfig` never named them and every budget
+        # stayed at its dataclass default.
+        args.environmental_retries = execution["environmental_retries"]
+        args.launcher_retries = execution["launcher_retries"]
+        args.credential_retries = execution["credential_retries"]
+        # §8.3's provision argv, consumed by `_run_provisioner`.
+        args.provision_argv = list(execution["provision"])
         args.agent_route = execution["route"]
         args.agent_model = execution["model"]
         args.agent_effort = execution["effort"]
@@ -1399,14 +1495,24 @@ def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
     failed `worktree add`, so the refusal can name the checkout standing in
     the way instead of echoing git's exit status.
     """
+    # §7.5: a git failure is a fact about the machine, never about the
+    # repository. `return None` here reads to every caller as "no worktree
+    # holds this branch" — a repository fact — so a git that failed for any
+    # reason silently authorised the run to take a branch that may well be
+    # checked out, and the operator got a raw `worktree add` error instead of
+    # the refusal this function exists to phrase. `_execute_run` turns the
+    # raised error into a typed refusal.
     try:
         listed = subprocess.run(
             ("git", "-C", str(repo), "worktree", "list", "--porcelain"),
             capture_output=True, text=True, check=False)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise RuntimeError(
+            "GIT_READ_FAILED:worktree list in {}".format(repo)) from exc
     if listed.returncode != 0:
-        return None
+        raise RuntimeError(
+            "GIT_READ_FAILED:worktree list in {} exited {}".format(
+                repo, listed.returncode))
     wanted = "refs/heads/" + branch
     path: Optional[Path] = None
     for line in (listed.stdout or "").splitlines():
@@ -1735,12 +1841,43 @@ def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerCon
     if missing:
         raise _PlanReceiptConfigurationError(
             "missing run configuration: {}".format(", ".join(missing)))
+    # Every field of `SchedulerConfig` is named here, and
+    # `test_every_scheduler_config_field_is_projected` fails if one is not.
+    # This is the projection §7.4 describes: the one that copied a gate's
+    # runner, argv and selector and dropped its threshold, because a
+    # field-by-field copy has no way to notice the field it did not copy.
     return scheduler_types.SchedulerConfig(
         concurrency=args.concurrency, node_timeout_s=args.node_timeout_s,
         turn_timeout_s=args.turn_timeout_s,
         final_acceptance_timeout_s=args.final_acceptance_timeout_s,
         backstop_t_s=args.backstop_t_s, semantic_ceiling=args.semantic_ceiling,
-        review_ceiling=getattr(args, "review_ceiling", None) or 3)
+        review_ceiling=_scheduler_setting(args, "review_ceiling"),
+        environmental_retries=_scheduler_setting(
+            args, "environmental_retries"),
+        launcher_retries=_scheduler_setting(args, "launcher_retries"),
+        credential_retries=_scheduler_setting(args, "credential_retries"))
+
+
+def _scheduler_setting(args: argparse.Namespace, name: str) -> Any:
+    """One optional `SchedulerConfig` setting, from the run's arguments.
+
+    Not `getattr(args, name, 2)`. A literal here would be a second
+    representation of a number `SchedulerConfig` already declares, and the two
+    would drift the first time either changed — the shape RC1 names. The
+    fallback is the dataclass's own default, so there is exactly one of it, and
+    a field with no default raises `KeyError` rather than acquiring an invented
+    one.
+
+    A configured run never reaches the fallback: `_apply_repository_config`
+    writes all four of these from `maestro.config.yaml`, which resolves its own
+    absent keys against the same table. The fallback exists for the manual
+    `maestro run start --concurrency ...` invocation, where every one of these
+    is an unsupplied `argparse` option.
+    """
+    value = getattr(args, name, None)
+    if value is None:
+        return _SCHEDULER_CONFIG_DEFAULTS[name]
+    return value
 
 
 def _paths_share_inode(left: Path, right: Path) -> bool:
@@ -1833,7 +1970,47 @@ def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
         {route: Path(path) for route, path in paths.items()}, verify_keys=keys)
     return launcher.HerdrLauncher(
         herdr_path=Path(args.herdr), omp_path=Path(args.omp),
-        claude_path=Path(args.claude), admitted_routes=admitted)
+        claude_path=Path(args.claude), admitted_routes=admitted,
+        # §9.3's sixth operation. The adapter has implemented it since it was
+        # written; nothing had ever handed it the argv to run, so it returned
+        # immediately for every attempt of every run.
+        provision_argv=tuple(getattr(args, "provision_argv", None) or ()))
+
+
+class _ConfiguredProvisioner:
+    """§9.3's `provision(worktree)` for a run that launches no agent.
+
+    Provision is a runner-adapter operation, and a plan of code nodes alone has
+    no runner adapter: the scheduler starts those commands itself (§8.3). The
+    tree they run in still needs provisioning — §8.3's baseline is the
+    provisioned tree for a code node exactly as it is for an agent node, and a
+    code node's command in an unprovisioned JavaScript checkout fails on the
+    absent install, not on the work.
+
+    `HerdrLauncher.provision` is reused rather than restated. A second copy of
+    "run the configured argv in the worktree, refuse on a nonzero exit" is one
+    behaviour with two representations, and the two would answer differently
+    the first time either changed.
+    """
+
+    provision = launcher.HerdrLauncher.provision
+
+    def __init__(self, provision_argv: Sequence[str]) -> None:
+        self.provision_argv = tuple(provision_argv)
+
+
+def _run_provisioner(args: argparse.Namespace, route_runner):
+    """§8.3's provision step, for whichever kind of run this is.
+
+    Returns `None` only when nothing is configured to run, which is §9.3's
+    stated default of a no-op and is what a pytest repository wants.
+    """
+    if route_runner is not None:
+        return route_runner.provision
+    argv = tuple(getattr(args, "provision_argv", None) or ())
+    if not argv:
+        return None
+    return _ConfiguredProvisioner(argv).provision
 
 
 # ── §7.5's launcher triggers, from the adapter's own typed error class ───────
@@ -2155,6 +2332,12 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             # acceptance counting to 1 while the plan asked for 70.
             integration_min_cases=(
                 plan.merge_policy.integration_gate.min_cases),
+            # §8.3's provision step, which the scheduler has always called and
+            # nothing had ever supplied. Omitting it measured every baseline
+            # against an unprovisioned tree and left §7.4's pre-gate red for
+            # the ecosystem's missing install rather than for the node's
+            # missing work.
+            provision=_run_provisioner(args, route_runner),
             kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
             review_attempt=review_attempt)
         report = scheduler.Scheduler(
@@ -2255,12 +2438,24 @@ def _integration_head(path: Path) -> Optional[Dict[str, Any]]:
             "head": ("rev-parse", "HEAD"),
             "subject": ("log", "-1", "--format=%s")}
     found: Dict[str, Any] = {"path": str(path)}
+    # A key is present when git answered and absent when it did not. The
+    # ternary this replaces wrote `None` on every nonzero exit, which reads as
+    # "the repository has no head" rather than "this process could not read
+    # one" — §7.5's conflation, in the diagnostics rather than in an
+    # obligation. The renderer already prints `?` for a key it does not find,
+    # so an unread field looks unread, and `unreadable` says so outright
+    # rather than leaving an operator to infer it from a null.
+    unreadable = []
     for key, command in read.items():
         completed = subprocess.run(
             ("git", "-C", str(path)) + command,
             capture_output=True, text=True)
-        found[key] = (completed.stdout.strip()
-                      if completed.returncode == 0 else None)
+        if completed.returncode == 0:
+            found[key] = completed.stdout.strip()
+        else:
+            unreadable.append(key)
+    if unreadable:
+        found["unreadable"] = sorted(unreadable)
     return found
 
 
@@ -3937,6 +4132,12 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backstop-t-s", type=float)
     parser.add_argument("--semantic-ceiling", type=int)
     parser.add_argument("--review-ceiling", type=int)
+    parser.add_argument("--environmental-retries", type=int)
+    parser.add_argument("--launcher-retries", type=int)
+    parser.add_argument("--credential-retries", type=int)
+    # One argv word per flag, in order: `--provision npm --provision ci`. The
+    # same reason a gate takes real argv rather than a shell string.
+    parser.add_argument("--provision", action="append", dest="provision_argv")
     parser.add_argument("--herdr")
     parser.add_argument("--omp")
     parser.add_argument("--claude")

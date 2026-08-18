@@ -322,20 +322,33 @@ def find_forbidden_report_fields(model: Type[BaseModel]) -> List[str]:
     this convicts it, per §13.4's rule.
     """
     found: List[str] = []
+    for current in report_schema_closure(model):
+        for name in current.model_fields:
+            if name in FORBIDDEN_REPORT_FIELDS:
+                found.append(name)
+    return found
+
+
+def report_schema_closure(model: Type[BaseModel]) -> List[Type[BaseModel]]:
+    """`model` and every model reachable from its fields.
+
+    Named and exported so a check over the report schema can *discover* its
+    subjects instead of being handed them. A guard pointed at a hand-written
+    list of classes stops covering the schema the moment the schema grows,
+    and reports clean while doing it.
+    """
     seen: List[Type[BaseModel]] = []
 
     def walk(current: Type[BaseModel]) -> None:
         if current in seen:
             return
         seen.append(current)
-        for name, field in current.model_fields.items():
-            if name in FORBIDDEN_REPORT_FIELDS:
-                found.append(name)
+        for field in current.model_fields.values():
             for nested in _nested_models(field.annotation):
                 walk(nested)
 
     walk(model)
-    return found
+    return seen
 
 
 def _nested_models(annotation: Any) -> List[Type[BaseModel]]:

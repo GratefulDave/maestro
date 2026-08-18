@@ -35,6 +35,52 @@ def _load_json(path: Path, code: str) -> dict:
     return payload
 
 
+def _require_text(value: object, code: str, label: str) -> str:
+    """A field the projection carries verbatim: present, a string, non-empty.
+
+    `x.get("k") or <fallback>` is three different bugs wearing one operator.
+    It picks quietly between synonyms, it invents a value the plan never
+    declared, and it treats a deliberate falsy value — `0`, `""`, `[]` — as
+    absence. §7.4 records what the second one costs: a per-gate threshold the
+    destination had no field for was dropped, every gate in every run was
+    adjudicated against a default of 1 while plans declared 70, and a run
+    reached ACCEPTED that way. This function and its siblings below are how
+    that operator stops appearing on this path.
+    """
+    if not isinstance(value, str) or not value:
+        raise IngressError("{}:{}".format(code, label))
+    return value
+
+
+def _require_count(value: object, code: str, label: str) -> int:
+    """A threshold the adjudicator will count against. `bool` is not an `int`
+    here even though Python says otherwise: `min_cases: true` is a typo, not a
+    demand for one passing case."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise IngressError("{}:{}".format(code, label))
+    return value
+
+
+def _require_id_list(value: object, code: str, label: str) -> list:
+    """A list of ids, or nothing. Absence is legal and means the empty list;
+    a malformed value is not absence.
+
+    `list(lane.get("depends_on") or [])` accepted a *string* and spelled it
+    out one character per dependency, so `"depends_on": "lane-a"` projected
+    six phantom node ids. And a filtered comprehension over `source_ids`
+    dropped every non-string entry without a word, so evidence a lane declared
+    it reads simply vanished from `reads`.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise IngressError("{}:{}".format(code, label))
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise IngressError("{}:{}".format(code, label))
+    return list(value)
+
+
 def _require_relative(path: str, label: str) -> str:
     if (not path or path.startswith("/") or "\\" in path or ":" in path
             or any(part in (".", "..") for part in path.split("/"))):
@@ -119,18 +165,76 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     if not isinstance(sources, list) or not sources:
         raise IngressError("UNMAPPABLE_SOURCES")
 
+    # Every verifier is validated once, here, rather than absorbed by an
+    # `or []` inside the per-lane comprehension below. A malformed `lane_ids`
+    # there matched no lane, so the *lane* refused for having no verifier while
+    # the verifier that was actually malformed went unnamed — fail-closed, but
+    # pointing at the wrong object, which is how a plan defect gets read as a
+    # missing binding and edited in the wrong place.
+    for index, item in enumerate(verifiers):
+        if not isinstance(item, dict):
+            raise IngressError("UNMAPPABLE_VERIFIERS:verifier[{}]".format(index))
+        verifier_id = _require_text(
+            item.get("verifier_id"), "UNMAPPABLE_VERIFIERS",
+            "verifier[{}].verifier_id".format(index))
+        bound = _require_id_list(
+            item.get("lane_ids"), "UNMAPPABLE_VERIFIERS",
+            "{}.lane_ids".format(verifier_id))
+        if not bound:
+            raise IngressError(
+                "UNMAPPABLE_VERIFIERS:{}.lane_ids".format(verifier_id))
+
     evidence = []
-    for source in sources:
+    for index, source in enumerate(sources):
         if not isinstance(source, dict):
-            raise IngressError("UNMAPPABLE_SOURCES")
-        path = source.get("path")
-        if not isinstance(path, str):
-            raise IngressError("UNMAPPABLE_SOURCES")
-        _require_relative(path, source.get("source_id") or "source")
+            raise IngressError("UNMAPPABLE_SOURCES:{}".format(index))
+        # `source["source_id"]` was a bare index guarded by nothing, so an IR
+        # omitting it left this boundary as an untyped `KeyError` rather than
+        # as a refusal naming what was unmappable.
+        source_id = _require_text(
+            source.get("source_id"), "UNMAPPABLE_SOURCES",
+            "source[{}].source_id".format(index))
+        path = _require_text(
+            source.get("path"), "UNMAPPABLE_SOURCES",
+            "{}.path".format(source_id))
+        _require_relative(path, source_id)
+        # `required` had no reader at all, so a source declared optional was
+        # projected as an ordinary `Observed` and then refused downstream with
+        # `OBSERVED_PATH_ABSENT` if it happened to be missing — a refusal about
+        # a file, for a plan defect. Maestro's `Observed` evidence has no
+        # optional form: its path must exist at base and hash. §12.3 makes
+        # that a loud refusal rather than a silent upgrade to required.
+        required = source.get("required")
+        if required is not True:
+            raise IngressError(
+                "UNMAPPABLE_SOURCES:{}.required".format(source_id))
+        # The pin, carried rather than dropped. `docs/plan-authoring.md` makes
+        # a hash-pinned `source_artifacts` entry the only way a document enters
+        # the pipeline, and the projection was discarding the hash — so the
+        # plan's `Observed.sha256` was filled from the repository by
+        # `plan_author.fill_git_facts` and the IR's declaration was never
+        # compared to anything. Carrying it is what arms
+        # `plan_validate`'s EVIDENCE_TYPED_AGAINST_GIT obligation, and
+        # `fill_git_facts` now refuses `OBSERVED_DIGEST_MISMATCH` before any
+        # plan file is written.
+        #
+        # The comparison deliberately does not happen here. It needs the blob
+        # at the base commit, `fill_git_facts` already reads exactly that, and
+        # a second copy of the rule at this boundary would be the same fact in
+        # two places — resolved from HEAD twice, which is also two answers if
+        # HEAD moves between them.
+        digest = _require_text(
+            source.get("sha256"), "UNMAPPABLE_SOURCES",
+            "{}.sha256".format(source_id))
+        if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest):
+            raise IngressError(
+                "UNMAPPABLE_SOURCES:{}.sha256".format(source_id))
         evidence.append({
             "kind": "observed",
-            "evidence_id": source["source_id"],
+            "evidence_id": source_id,
             "path": path,
+            "sha256": digest,
         })
 
     nodes = []
@@ -162,30 +266,36 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
                 "path": output,
                 "producer": lane_id,
             })
-        lane_verifiers = [
-            item for item in verifiers
-            if isinstance(item, dict) and lane_id in (item.get("lane_ids") or [])
-        ]
+        lane_verifiers = [item for item in verifiers
+                          if lane_id in item["lane_ids"]]
         if len(lane_verifiers) != 1:
             raise IngressError("UNMAPPABLE_VERIFIERS:{}".format(lane_id))
         verifier = lane_verifiers[0]
         runner, argv = _parse_verifier_command(verifier.get("command"))
         if not argv:
             raise IngressError("BROAD_GATE:{}".format(verifier.get("verifier_id")))
-        min_cases = verifier.get("min_executed")
-        if not isinstance(min_cases, int) or min_cases < 1:
-            raise IngressError("UNMAPPABLE_VERIFIERS:{}".format(lane_id))
-        source_reads = [
-            item for item in (verifier.get("source_ids") or [])
-            if isinstance(item, str)
-        ]
+        min_cases = _require_count(
+            verifier.get("min_executed"), "UNMAPPABLE_VERIFIERS", lane_id)
+        source_reads = _require_id_list(
+            verifier.get("source_ids"), "UNMAPPABLE_VERIFIERS",
+            "{}.source_ids".format(lane_id))
+        needs = _require_id_list(
+            lane.get("depends_on"), "UNMAPPABLE_LANES",
+            "{}.depends_on".format(lane_id))
+        # The lane's title becomes the agent's `instruction` — the prompt it
+        # works from. Falling back to the lane id handed an agent the string
+        # `lane-freeze` as its whole brief, which is not a defaulted field but
+        # an absent one, silently.
+        instruction = _require_text(
+            lane.get("title"), "UNMAPPABLE_LANES",
+            "{}.title".format(lane_id))
         nodes.append({
             "kind": "agent",
             "node_id": lane_id,
-            "needs": list(lane.get("depends_on") or []),
+            "needs": needs,
             "reads": source_reads,
             "outputs": list(outputs),
-            "instruction": lane.get("title") or lane_id,
+            "instruction": instruction,
             "gate": {
                 "runner": runner,
                 "argv": list(argv),
@@ -195,21 +305,58 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             "prompt_assets": [],
         })
 
-    if integration.get("runner"):
-        ig_runner = integration["runner"]
-        ig_argv = tuple(integration.get("argv") or ())
+    # §8.8's one integration gate, in exactly one of two forms. It used to
+    # admit three overlapping ones — `runner` plus `argv`, a `command` line to
+    # parse, or `argv` treated as that command line — chosen by an `or` chain,
+    # so `argv` meant the gate's *selector* on one branch and the whole
+    # command including its binary on the other, and an IR carrying both a
+    # `runner` and a `command` had the `command` silently ignored.
+    spelled = [key for key in ("runner", "command") if key in integration]
+    if len(spelled) != 1:
+        raise IngressError("UNMAPPABLE_INTEGRATION:runner-or-command")
+    if spelled[0] == "runner":
+        ig_runner = _require_text(
+            integration.get("runner"), "UNMAPPABLE_INTEGRATION", "runner")
+        ig_argv = tuple(_require_id_list(
+            integration.get("argv"), "UNMAPPABLE_INTEGRATION", "argv"))
     else:
-        ig_runner, ig_argv = _parse_verifier_command(
-            integration.get("command") or integration.get("argv"))
+        if "argv" in integration:
+            raise IngressError("UNMAPPABLE_INTEGRATION:command-and-argv")
+        ig_runner, ig_argv = _parse_verifier_command(integration["command"])
     if not ig_argv:
-        raise IngressError("UNMAPPABLE_INTEGRATION")
-    ig_cwd = integration.get("cwd") or "."
-    ig_min = integration.get("min_cases") or integration.get("min_executed") or 1
-    return {
+        raise IngressError("UNMAPPABLE_INTEGRATION:argv")
+    # The only judged-legitimate default on this path, and it is keyed on the
+    # key's absence rather than on its falsiness. `.` is not a guess about what
+    # the author meant: §8.8 runs this gate once over the integrated tree, and
+    # the repository root is the only place that tree is whole. An empty
+    # string is a malformed value rather than an omission and refuses, and a
+    # declared cwd is now validated — it never was, so the integration gate
+    # was the one path on which `../elsewhere` reached a plan unchecked while
+    # every lane cwd beside it was refused `AMBIENT_PATH`.
+    if "cwd" in integration:
+        ig_cwd = _require_text(
+            integration.get("cwd"), "UNMAPPABLE_INTEGRATION", "cwd")
+        if ig_cwd != ".":
+            _require_relative(ig_cwd, "integration_gate")
+    else:
+        ig_cwd = "."
+    # One spelling, required, counted. Two accepted keys with `or` between
+    # them made a disagreement invisible, made an explicit `0` read as absent,
+    # and made an integration gate that declared no threshold adjudicate at 1
+    # — §7.4's failure exactly, at the one gate that speaks for the whole
+    # tree. The lane verifier above has always refused this way; this is that
+    # rule applied to the gate every lane ends at.
+    declared = [key for key in ("min_cases", "min_executed")
+                if key in integration]
+    if len(declared) != 1:
+        raise IngressError("UNMAPPABLE_INTEGRATION:min_cases")
+    ig_min = _require_count(
+        integration[declared[0]], "UNMAPPABLE_INTEGRATION", declared[0])
+    plan_id = _require_text(ir.get("plan_id"), "IR_SCHEMA", "plan_id")
+    draft = {
         "schema_version": "maestro-plan.v1",
-        "plan_id": ir["plan_id"],
-        "repo": maestro.get("repo") or Path(repo).name,
-        "intent": ir.get("title") or ir["plan_id"],
+        "plan_id": plan_id,
+        "intent": _require_text(ir.get("title"), "IR_SCHEMA", "title"),
         "evidence": evidence,
         "nodes": nodes,
         "merge_policy": {
@@ -222,6 +369,15 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             },
         },
     }
+    # Absent means "the repository this is being authored in", and
+    # `plan_author.fill_git_facts` already resolves exactly that from the
+    # `repo` it is handed. Resolving it here too would be one fact in two
+    # places, disagreeing the first time either moved, so the key is omitted
+    # rather than filled twice — RC1's shape, at the smallest scale it comes in.
+    if "repo" in maestro:
+        draft["repo"] = _require_text(
+            maestro["repo"], "MAESTRO_EXTENSION_MISSING", "repo")
+    return draft
 
 
 def author_from_plan_contract(

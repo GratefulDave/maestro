@@ -232,10 +232,80 @@ def branch_exists(repo: Path, name: str) -> bool:
     return code == 0
 
 
+class GitReadFailed(RuntimeError):
+    """git failed. This is a fact about the machine, never about the repository.
+
+    §7.5: "Only git's documented not-found exit code means 'the object is
+    absent.' Every other nonzero exit is ENVIRONMENTAL, never a fact about the
+    repository. Without it, a transient git failure is recorded as a missing
+    object, and a deterministic read over git objects — which every
+    eligibility obligation depends on (§6.4) — silently returns a wrong answer
+    instead of failing."
+    """
+
+
+class GitPathNotAFile(ValueError):
+    """The path exists at that commit and is not a blob.
+
+    A distinct answer from absence, because a plan citing a directory is a
+    different defect from a plan citing a file that is not there, and an
+    operator told the wrong one goes looking in the wrong place.
+    """
+
+
 def blob_at(repo: Path, commit: str, path: str) -> Optional[bytes]:
-    """The bytes of `path` at `commit`, or `None` when it is absent there."""
-    code, out = _git(repo, "cat-file", "blob", "{0}:{1}".format(commit, path))
-    return out if code == 0 else None
+    """The bytes of `path` at `commit`, or `None` when it is proven absent.
+
+    Absence is derived from a **successful** command's empty output, never
+    from a failure exit — which is the whole point. This used to be
+    `git cat-file blob <commit>:<path>` with `return out if code == 0 else
+    None`, and that form cannot support the distinction §7.5 requires:
+    `cat-file blob` exits 128 for a missing path, for a directory, for an
+    invalid revision, and for a path outside the repository alike, so every
+    one of those became "the object is absent" — as did a git that failed for
+    any reason at all.
+
+    `ls-tree` answers the question the caller is actually asking, and answers
+    it with exit zero: no record means the path is not in that tree, one
+    record carries git's own word for what it is. A nonzero exit is therefore
+    unambiguously an environmental failure and raises rather than resolving to
+    a fact. The blob is then read by object id rather than by path, so the
+    second call reads something already proven to exist.
+    """
+    code, out = _git(repo, "ls-tree", "-z", "--full-tree", commit, "--", path)
+    if code != 0:
+        raise GitReadFailed(
+            "GIT_READ_FAILED:ls-tree {0} -- {1}".format(commit, path))
+    records = [record for record in out.split(b"\x00") if record]
+    if not records:
+        return None
+    if len(records) > 1:
+        # A pathspec matched several entries, so it was a pattern rather than
+        # a path. Not absence, and not a file.
+        raise GitPathNotAFile(
+            "GIT_PATH_NOT_A_FILE:{0}@{1}:matched {2} entries".format(
+                path, commit, len(records)))
+    try:
+        meta, _, _name = records[0].partition(b"\t")
+        _mode, kind, object_id = meta.split(b" ", 2)
+        kind_name = kind.decode("ascii", "replace")
+        object_name = object_id.decode("ascii", "replace")
+    except ValueError as exc:
+        raise GitReadFailed(
+            "GIT_READ_FAILED:unparseable ls-tree record for {0}@{1}".format(
+                path, commit)) from exc
+    if kind_name != "blob":
+        raise GitPathNotAFile(
+            "GIT_PATH_NOT_A_FILE:{0}@{1}:is a {2}".format(
+                path, commit, kind_name))
+    code, out = _git(repo, "cat-file", "blob", object_name)
+    if code != 0:
+        # The object id came from `ls-tree`, so it exists; a failure to read it
+        # is the machine, not the repository.
+        raise GitReadFailed(
+            "GIT_READ_FAILED:cat-file blob {0} for {1}@{2}".format(
+                object_name, path, commit))
+    return out
 
 
 def _sha256(payload: bytes) -> str:
@@ -356,7 +426,20 @@ def _evidence_typed_against_git(plan: "pm.Plan", repo: Path) -> List[Blocker]:
     for index, item in enumerate(plan.evidence):
         pointer = "/evidence/{0}".format(index)
         if isinstance(item, pm.Observed):
-            stored = blob_at(repo, plan.base_commit, item.path)
+            # `GitPathNotAFile` is a fact about the repository, proven by a
+            # command that exited zero, so it is a blocker like any other. A
+            # `GitReadFailed` is not, and deliberately propagates: §6.4 keeps
+            # environment failures out of the blocker list, because a blocker
+            # says the authored bytes are wrong and a broken git does not.
+            try:
+                stored = blob_at(repo, plan.base_commit, item.path)
+            except GitPathNotAFile as exc:
+                blockers.append(Blocker(
+                    Obligation.EVIDENCE_TYPED_AGAINST_GIT,
+                    pointer + "/path",
+                    "{0} cites {1}, which at {2} is not a file: {3}".format(
+                        item.evidence_id, item.path, plan.base_commit, exc)))
+                continue
             if stored is None:
                 blockers.append(Blocker(
                     Obligation.EVIDENCE_TYPED_AGAINST_GIT,
@@ -382,7 +465,15 @@ def _evidence_typed_against_git(plan: "pm.Plan", repo: Path) -> List[Blocker]:
                         "{0} names {1} as producer of {2}, which {1} does not "
                         "declare as an output".format(
                             item.evidence_id, item.producer, item.path)))
-            stored = blob_at(repo, plan.base_commit, item.path)
+            try:
+                stored = blob_at(repo, plan.base_commit, item.path)
+            except GitPathNotAFile as exc:
+                blockers.append(Blocker(
+                    Obligation.EVIDENCE_TYPED_AGAINST_GIT,
+                    pointer + "/path",
+                    "{0} produces {1}, which at {2} is not a file: {3}".format(
+                        item.evidence_id, item.path, plan.base_commit, exc)))
+                continue
             if stored is not None:
                 if item.base_sha256 is None:
                     blockers.append(Blocker(

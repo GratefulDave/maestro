@@ -12,6 +12,7 @@ the projection still dropping the value, which is the defect, not a test of it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import maestro
 from adw_modules import lifecycle as lc
+from adw_modules import plan_contract_ingress
 from adw_modules import plan_model
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
@@ -235,6 +237,138 @@ class ToldAndJudgedAreOneNumberTest(unittest.TestCase):
                 "enforce".format(node_id))
             checked += 1
         self.assertTrue(checked, "no agent node was checked")
+
+
+class WhichArtifactIsAuthoritativeTest(unittest.TestCase):
+    """D-open — the authoring IR and the executable plan both carry a
+    threshold, and which one adjudicates had never been established.
+
+    Settled here from the code, not from preference. `maestro-plan.v1` is
+    authoritative: it is the only artifact `plan validate`, `plan finalize`,
+    `run start`, and the scheduler ever open. `plan-contract.v1` is
+    authoritative for *authoring* and takes no part after
+    `plan_contract_ingress.author_from_plan_contract` has projected it, so the
+    executable plan is a snapshot rather than a view.
+
+    A previous lane read the IR, reported "min_cases is not on node gates", and
+    was right about the artifact it read and wrong about the artifact that
+    executes. The IR spells the same quantity `min_executed`; the plan spells
+    it `min_cases`. Two names for one fact across one pipeline is RC1's shape,
+    and it is why that mistake was available to make.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.repo = _ingress_repo(self.root)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _author(self, ir: dict):
+        ir_path = self.root / "phase.plan.json"
+        ir_path.write_text(json.dumps(ir), encoding="utf-8")
+        receipt_path = self.root / "phase.plan-review.json"
+        receipt_path.write_text(json.dumps({
+            "schema_version": "plan-contract-review.v1",
+            "verdict": "PASS",
+            "ir_sha256": hashlib.sha256(ir_path.read_bytes()).hexdigest(),
+        }), encoding="utf-8")
+        stored, _trace = plan_contract_ingress.author_from_plan_contract(
+            ir_path, receipt_path, self.root / "maestro-plan.v1", self.repo)
+        return ir_path, stored
+
+    def test_editing_the_ir_after_authoring_changes_no_executable_threshold(self):
+        """The plan is a snapshot, so the IR cannot retroactively re-adjudicate
+        a gate. This is what "the executable plan is authoritative" means
+        operationally, and `docs/plan-authoring.md` says the same thing from
+        the other side: repairing a plan means re-rendering, re-validating and
+        obtaining a fresh receipt, never editing an approved IR in place."""
+        ir = _ingress_ir(min_executed=4)
+        ir_path, stored = self._author(ir)
+        projected = {node.node_id: node
+                     for node in plan_model.parse_bytes(stored).to_plan_nodes()}
+        self.assertEqual(projected["lane-freeze"].gate_min_cases, 4)
+
+        ir["verifiers"][0]["min_executed"] = 99
+        ir_path.write_text(json.dumps(ir), encoding="utf-8")
+        reloaded = {node.node_id: node
+                    for node in plan_model.parse_bytes(stored).to_plan_nodes()}
+        self.assertEqual(
+            reloaded["lane-freeze"].gate_min_cases, 4,
+            "the executable plan tracked an edit to the IR, so which artifact "
+            "adjudicates would depend on when it was read")
+
+    def test_a_lane_threshold_has_exactly_one_spelling_and_no_default(self):
+        """The lane half is already correct by construction, and this pins it.
+
+        `min_executed` is the only key read, an absent or sub-1 value is a hard
+        `UNMAPPABLE_VERIFIERS` refusal, and there is no second spelling to
+        disagree with and no silent fallback to 1.
+        """
+        for verifier in ({"min_cases": 4}, {}, {"min_executed": 0},
+                         {"min_executed": "4"}):
+            with self.subTest(verifier=verifier):
+                ir = _ingress_ir(min_executed=4)
+                ir["verifiers"][0].pop("min_executed")
+                ir["verifiers"][0].update(verifier)
+                with self.assertRaises(plan_contract_ingress.IngressError) as caught:
+                    self._author(ir)
+                self.assertIn("UNMAPPABLE_VERIFIERS", str(caught.exception))
+
+
+_README = b"base\n"
+
+
+def _ingress_repo(root: Path) -> Path:
+    repo = root / "ingress-repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "maestro@example.invalid")
+    git(repo, "config", "user.name", "Maestro MinCases")
+    (repo / "README.md").write_bytes(_README)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_existing.py").write_text(
+        "def test_existing():\n    assert True\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+def _ingress_ir(*, min_executed: int) -> dict:
+    """The smallest approved plan-contract.v1 IR that projects."""
+    return {
+        "schema_version": "plan-contract.v1",
+        "plan_id": "phase",
+        "title": "Phase",
+        "plan_kind": "brownfield",
+        "source_artifacts": [{
+            "source_id": "src-readme", "path": "README.md",
+            # The real hash of what `_ingress_repo` commits; a declared pin is
+            # now compared against the object rather than replacing it.
+            "sha256": hashlib.sha256(_README).hexdigest(), "required": True,
+        }],
+        "lanes": [{
+            "lane_id": "lane-freeze", "title": "Freeze writers",
+            "execution_context": ".", "depends_on": [],
+            "verifier_ids": ["verify-freeze"],
+        }],
+        "verifiers": [{
+            "verifier_id": "verify-freeze", "lane_ids": ["lane-freeze"],
+            "source_ids": ["src-readme"],
+            "command": "python3 -m pytest tests/test_existing.py",
+            "min_executed": min_executed,
+        }],
+        "extensions": {"maestro": {
+            "repo": "example",
+            "outputs": {"lane-freeze": ["src/greeting.py"]},
+            "integration_branch": "main",
+            "integration_gate": {
+                "runner": "pytest", "argv": ["tests"], "cwd": ".",
+                "min_cases": 1,
+            },
+        }},
+    }
 
 
 def _fixture_plan() -> "plan_model.Plan":

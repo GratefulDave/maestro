@@ -792,6 +792,15 @@ class OperatorCliTest(unittest.TestCase):
                     found = self.handles.get(requested)
                     return (found,) if found is not None else ()
 
+                def provision(self, _worktree):
+                    """§9.3's sixth adapter operation, a no-op here.
+
+                    Present because the contract has six operations and this
+                    stands in for an adapter: a double missing one is a double
+                    that cannot detect the harness beginning to use it.
+                    """
+                    return None
+
             route = FailingRoute()
             node = SimpleNamespace(
                 kind=scheduler_types.NodeKind.AGENT, node_id="agent")
@@ -1117,6 +1126,15 @@ class OperatorCliTest(unittest.TestCase):
                 def reclaim(self, _token):
                     return ()
 
+                def provision(self, _worktree):
+                    """§9.3's sixth adapter operation, a no-op here.
+
+                    Present because the contract has six operations and this
+                    stands in for an adapter: a double missing one is a double
+                    that cannot detect the harness beginning to use it.
+                    """
+                    return None
+
             route = RecordingRoute()
             shared = {"XDG_CACHE_HOME": str(scratch / "xdg")}
             code_node = SimpleNamespace(
@@ -1203,6 +1221,15 @@ class OperatorCliTest(unittest.TestCase):
 
                 def reclaim(self, _token):
                     return ()
+
+                def provision(self, _worktree):
+                    """§9.3's sixth adapter operation, a no-op here.
+
+                    Present because the contract has six operations and this
+                    stands in for an adapter: a double missing one is a double
+                    that cannot detect the harness beginning to use it.
+                    """
+                    return None
 
             node = SimpleNamespace(
                 kind=scheduler_types.NodeKind.AGENT, node_id="agent")
