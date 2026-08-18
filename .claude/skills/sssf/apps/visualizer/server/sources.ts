@@ -86,7 +86,7 @@ const PROBES: { kind: SourceKind; tables: string[] }[] = [
 export function probeKind(path: string): SourceKind | null {
   let db: Database;
   try {
-    db = openLedgerReadonly(path);
+    db = openLedgerReadonly(path).db;
   } catch (error) {
     console.warn(`[sssf] cannot read ${path}: ${(error as Error).message}`);
     return null;
