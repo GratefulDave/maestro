@@ -130,6 +130,12 @@ class BlockReason(str, Enum):
     ENVIRONMENTAL_BUDGET_EXHAUSTED = "ENVIRONMENTAL_BUDGET_EXHAUSTED"
     LAUNCHER_BUDGET_EXHAUSTED = "LAUNCHER_BUDGET_EXHAUSTED"
     CREDENTIAL_REFUSED = "CREDENTIAL_REFUSED"
+    #: A launcher refusal that is deterministic by construction (§16.3 item
+    #: 46). It names the refusal rather than the budget, because there was no
+    #: budget: `LAUNCHER_BUDGET_EXHAUSTED` on a refusal that could never have
+    #: succeeded tells an operator a number ran out and nothing about the
+    #: configuration or plan that has to change.
+    LAUNCH_REFUSED = "LAUNCH_REFUSED"
     MERGE_CONFLICT = "MERGE_CONFLICT"
     QUIESCENCE_UNPROVEN = "QUIESCENCE_UNPROVEN"
     OUTPUT_IDENTITY_INVALID = "OUTPUT_IDENTITY_INVALID"
@@ -140,16 +146,19 @@ class BlockReason(str, Enum):
 #: answer (§7.5). Without a dedicated reason each of these falls to the
 #: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
 #: then blocks with an infra-flavoured reason for what is a fact about content.
+#: Named as a set rather than behind a predicate. An `is_retryable(reason)`
+#: helper stood here and had no production caller for as long as it existed:
+#: production decides retryability from the `RetryClass` at classification
+#: time — `classify` returns a `block_reason` for exactly these three and a
+#: `retry_class` for everything else, so by the time a `BlockReason` exists
+#: the decision is already made and asking it again is a second representation
+#: of one fact (RC1). The tuple stays because §7.5's membership rule is a
+#: statement worth naming and testing; the predicate over it does not.
 NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.GATE_NOT_FALSIFIABLE,
     BlockReason.CODE_NODE_NO_EFFECT,
     BlockReason.PERMISSION_SCOPE_VIOLATION,
 )
-
-
-def is_retryable(reason: BlockReason) -> bool:
-    """Whether another attempt could change this reason's answer."""
-    return reason not in NON_RETRYABLE
 
 
 #: §11.3's tested property, as a table rather than a sentence: every stored
@@ -183,6 +192,12 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (
         Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     BlockReason.CREDENTIAL_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    # The refusal is deterministic against an unchanged configuration, not
+    # against every configuration: the operator's repair is to supply what the
+    # launcher said was missing, and plain retry is then a genuinely different
+    # launch. That is why this is not in NON_RETRYABLE beside the three
+    # content-level reasons, which no operator action outside the plan repairs.
+    BlockReason.LAUNCH_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     # A process group whose absence cannot be proven must be repaired before
     # retry; a retry would overlap an owned survivor with a new attempt.
     BlockReason.QUIESCENCE_UNPROVEN: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
@@ -522,3 +537,23 @@ class AttemptRecord:
     @property
     def key(self) -> Tuple[str, str, int]:
         return (self.run_id, self.node_id, self.attempt_no)
+
+    @property
+    def guidance_key(self) -> Tuple[str, str]:
+        """The scope retry guidance is valid within: `(node_id, base_sha)`.
+
+        §7.5 already scopes the prompt-mutation budget this way, and for the
+        same reason the guidance itself must be: a review finding or a
+        verification failure is evidence *about a tree*. When an upstream merge
+        advances the integration head, the next attempt starts from a base at
+        which that tree no longer exists, and handing the agent findings
+        derived from it is instructing it to fix code that is not there. Keyed
+        on `node_id` alone the ledger had no expiry at all — nothing cleared
+        it when the base moved, because nothing knew the base had moved.
+
+        A tuple rather than a cleared counter, for the reason §7.5 gives about
+        the budget itself: the scope is derived from a stored fact the attempt
+        row already carries, so there is no reset event to fire and nothing
+        that can drift.
+        """
+        return (self.node_id, self.base_sha)

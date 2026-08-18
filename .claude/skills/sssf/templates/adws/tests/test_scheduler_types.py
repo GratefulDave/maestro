@@ -122,8 +122,12 @@ class RetryClassTests(unittest.TestCase):
             {st.BlockReason.GATE_NOT_FALSIFIABLE,
              st.BlockReason.CODE_NODE_NO_EFFECT,
              st.BlockReason.PERMISSION_SCOPE_VIOLATION})
-        for reason in st.NON_RETRYABLE:
-            self.assertFalse(st.is_retryable(reason))
+        # The `is_retryable(reason)` predicate that stood here was deleted: it
+        # had no production caller, because `classify` already decides
+        # retryability from the RetryClass at classification time and a
+        # BlockReason only exists once that decision has been made. What the
+        # membership means operationally is asserted where it is observable —
+        # `test_non_retryable_reasons_do_not_offer_retry` below.
 
 
 # ── §11.3 every stored block reason has a real exit ─────────────────────────

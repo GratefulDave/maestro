@@ -177,7 +177,7 @@ class AgentNodeVerificationTests(unittest.TestCase):
         self.assertFalse(verdict.verified)
         self.assertEqual(verdict.failed_clause, 2)
         self.assertIs(verdict.block_reason, st.BlockReason.GATE_NOT_FALSIFIABLE)
-        self.assertFalse(st.is_retryable(verdict.block_reason))
+        self.assertIn(verdict.block_reason, st.NON_RETRYABLE)
 
     def test_a_red_post_gate_fails_clause_three(self):
         verdict = self.ok(post_gate=vf.adjudicate_counts(
@@ -267,7 +267,7 @@ class CodeNodeVerificationTests(unittest.TestCase):
         verdict = self.ok(expects_changes=True, diff_empty=True)
         self.assertFalse(verdict.verified)
         self.assertIs(verdict.block_reason, st.BlockReason.CODE_NODE_NO_EFFECT)
-        self.assertFalse(st.is_retryable(verdict.block_reason))
+        self.assertIn(verdict.block_reason, st.NON_RETRYABLE)
 
     def test_expects_changes_true_with_a_real_diff_verifies(self):
         self.assertTrue(self.ok(expects_changes=True, diff_empty=False).verified)
@@ -281,7 +281,7 @@ class CodeNodeVerificationTests(unittest.TestCase):
         self.assertFalse(verdict.verified)
         self.assertIs(verdict.block_reason,
                       st.BlockReason.PERMISSION_SCOPE_VIOLATION)
-        self.assertFalse(st.is_retryable(verdict.block_reason))
+        self.assertIn(verdict.block_reason, st.NON_RETRYABLE)
         self.assertIsNot(verdict.retry_class, st.RetryClass.SEMANTIC)
 
     def test_no_effect_is_not_left_to_the_environmental_default(self):

@@ -780,14 +780,28 @@ class GenerationFenceTests(SchedulerFixture):
         def provision(path):
             provision_calls.append(path)
             if len(provision_calls) == 1:
-                self.assertTrue(watchdog_quiesced.wait(timeout=3.0))
+                # Long enough that the watchdog, not this timeout, is what
+                # releases attempt 1. The node timeout below must expire while
+                # provision is still inside this wait, or the fence under test
+                # is never exercised.
+                self.assertTrue(watchdog_quiesced.wait(timeout=30.0))
 
         def quiesce(record, phase):
             if phase == "watchdog":
                 watchdog_quiesced.set()
 
         def gate(attempt, node, phase, cancel_requested):
-            gate_attempts.append(self.store.get_node("run1", node.node_id).attempt_no)
+            # `attempt.attempt_no` — the attempt this *worker* belongs to —
+            # and never the node's current attempt number. The two differ for
+            # exactly the worker this test fences: a stale generation the
+            # watchdog revoked still carries attempt 1 while the node row
+            # already reads 2. Reading the node made a fenced worker's gate
+            # indistinguishable from the live attempt's, so the assertion
+            # below could not convict the fence's removal — verified, by
+            # removing both `_require_running` guards on this path and
+            # watching the test still pass. With the worker's own number it
+            # convicts as `[1, 2, 2] != [2, 2]`.
+            gate_attempts.append(attempt.attempt_no)
             return self.run_gate(attempt, node, phase, cancel_requested)
 
         def runner(attempt, node, record, retry_prompt, on_launch,
@@ -799,9 +813,17 @@ class GenerationFenceTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule(
             [self.agent("a")],
-            config=self.config(node_timeout_s=0.01, turn_timeout_s=0.01,
-                               final_acceptance_timeout_s=1.0,
-                               backstop_t_s=5.0, environmental_retries=1),
+            # Timeouts sized so attempt 1 is convicted while it is still
+            # blocked in provision, and attempt 2 then has real headroom.
+            # At 0.01s the second attempt could not finish either: it does
+            # genuine git work — worktree creation, both gates, a commit —
+            # and was killed mid-flight on roughly 19 runs in 20, which made
+            # this a flake rather than a test. `environmental_retries=1`
+            # means attempt 1's timeout spends the whole budget, so any
+            # timeout landing on attempt 2 blocks the node.
+            config=self.config(node_timeout_s=4.0, turn_timeout_s=4.0,
+                               final_acceptance_timeout_s=4.0,
+                               backstop_t_s=30.0, environmental_retries=1),
             deps=self.deps(provision=provision, quiesce_attempt=quiesce,
                            run_gate=gate, run_node=runner)).run()
 

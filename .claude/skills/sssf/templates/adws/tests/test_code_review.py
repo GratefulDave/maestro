@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, cast
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -458,6 +459,32 @@ class ReviewKindTests(unittest.TestCase):
 
 # ── §7.5 the review budget, counted durably and kept separate ───────────────
 
+class CeilingProbe:
+    """A `Scheduler` reduced to exactly what the two ceiling methods read.
+
+    The production methods are invoked unbound against this, so what runs is
+    the rule the scheduler runs — not a second copy of it in a test. They
+    touch three things and nothing else: `run_id`, `config`, and
+    `deps.store.attempts_for`.
+
+    They are the only enforcers of §7.5's two ceilings.
+    `retry_policy.review_budget_exhausted` and `semantic_budget_exhausted`
+    stated the same rules from the outside, had no production caller, and
+    disagreed with these by one — they counted only the rows that already
+    existed, while the scheduler counts the attempt that is failing right now,
+    whose row is written by the very call the decision gates. Testing the
+    unused pair proved nothing about a run, so they were deleted and these
+    tests re-pointed at what enforces the rule.
+    """
+
+    def __init__(self, cfg, attempts):
+        self.run_id = "run1"
+        self.config = cfg
+        self.deps = SimpleNamespace(
+            store=SimpleNamespace(
+                attempts_for=lambda run_id, node_id: tuple(attempts)))
+
+
 class ReviewBudgetTests(unittest.TestCase):
 
     def _attempt(self, node_id, no, rejected):
@@ -483,14 +510,23 @@ class ReviewBudgetTests(unittest.TestCase):
         self.assertEqual(rp.semantic_attempts_total(attempts, "n"), 1)
 
     def test_the_ceiling_admits_exactly_its_count(self):
+        """`review_ceiling` attempts total, the in-flight one included.
+
+        The scheduler decides while the failing attempt still holds RUNNING
+        and before its marker row is written, so at a ceiling of 3 it stops
+        the node on the third rejection — two stored markers plus this one —
+        rather than admitting a fourth.
+        """
         cfg = st.SchedulerConfig(
             concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
             final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
             semantic_ceiling=3, review_ceiling=3)
-        rows = [self._attempt("n", i, True) for i in range(2)]
-        self.assertFalse(rp.review_budget_exhausted(cfg, "n", rows))
-        rows.append(self._attempt("n", 2, True))
-        self.assertTrue(rp.review_budget_exhausted(cfg, "n", rows))
+        rows = [self._attempt("n", i, True) for i in range(1)]
+        self.assertFalse(sch.Scheduler._review_ceiling_reached(
+            CeilingProbe(cfg, rows), "n", 0))
+        rows.append(self._attempt("n", 1, True))
+        self.assertTrue(sch.Scheduler._review_ceiling_reached(
+            CeilingProbe(cfg, rows), "n", 0))
 
     def test_a_forced_grant_reopens_an_exhausted_budget(self):
         """B10's missing operator escape: a flaky FAIL would otherwise strand
@@ -499,10 +535,27 @@ class ReviewBudgetTests(unittest.TestCase):
             concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
             final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
             semantic_ceiling=3, review_ceiling=3)
-        rows = [self._attempt("n", i, True) for i in range(3)]
-        self.assertTrue(rp.review_budget_exhausted(cfg, "n", rows))
-        self.assertFalse(
-            rp.review_budget_exhausted(cfg, "n", rows, granted_extra_attempts=1))
+        rows = [self._attempt("n", i, True) for i in range(2)]
+        self.assertTrue(sch.Scheduler._review_ceiling_reached(
+            CeilingProbe(cfg, rows), "n", 0))
+        self.assertFalse(sch.Scheduler._review_ceiling_reached(
+            CeilingProbe(cfg, rows), "n", 1))
+
+    def test_a_semantic_row_never_spends_the_review_ceiling(self):
+        """The disjointness, asserted against the live enforcer rather than
+        only against the counting helper: a node that burned every attempt on
+        red gates must still arrive at review with its full allowance."""
+        cfg = st.SchedulerConfig(
+            concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
+            final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
+            semantic_ceiling=3, review_ceiling=2)
+        rows = [
+            st.AttemptRecord(run_id="run1", node_id="n", attempt_no=i,
+                             base_sha=BASE_SHA, state=st.NodeState.PENDING,
+                             retry_class=st.RetryClass.SEMANTIC, extra={})
+            for i in range(5)]
+        self.assertFalse(sch.Scheduler._review_ceiling_reached(
+            CeilingProbe(cfg, rows), "n", 0))
 
     def test_a_zero_ceiling_is_refused_as_a_setting(self):
         with self.assertRaises(ValueError):

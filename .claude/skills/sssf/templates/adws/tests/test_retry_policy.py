@@ -25,11 +25,13 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import retry_policy as rp  # noqa: E402
+from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
 
@@ -45,6 +47,37 @@ def make_cfg(**overrides):
 def make_attempt(node_id, base_sha, attempt_no, retry_class, run_id="r1"):
     return st.AttemptRecord(run_id=run_id, node_id=node_id, attempt_no=attempt_no,
                             base_sha=base_sha, retry_class=retry_class)
+
+
+class CeilingProbe:
+    """A `Scheduler` reduced to what `_semantic_ceiling_reached` reads.
+
+    §7.5's cumulative ceiling has exactly one enforcer, and it is that method.
+    A pure `retry_policy.semantic_budget_exhausted` stated the same rule from
+    the outside, had no production caller, and disagreed with the enforcer by
+    one: it counted only the attempt rows that already existed, while the
+    scheduler also counts the attempt failing right now, whose row is written
+    by the very call the decision gates. Testing the unused copy proved
+    nothing about a run, so it was deleted and these tests were re-pointed
+    here — the production method is invoked unbound against this object, so
+    what executes is the rule the scheduler executes.
+
+    It reads three things: `run_id`, `config`, and `deps.store.attempts_for`.
+    """
+
+    def __init__(self, cfg, attempts):
+        self.run_id = "r1"
+        self.config = cfg
+        self.deps = SimpleNamespace(
+            store=SimpleNamespace(
+                attempts_for=lambda run_id, node_id: tuple(attempts)))
+
+
+def ceiling_reached(cfg, node_id, attempts, granted=0):
+    """§7.5's ceiling as production evaluates it, counting the in-flight
+    attempt. `n` stored SEMANTIC rows means this is attempt `n + 1`."""
+    return sch.Scheduler._semantic_ceiling_reached(
+        CeilingProbe(cfg, attempts), node_id, granted)
 
 
 # ── §7.5 classify() — structural, never lexical ─────────────────────────────
@@ -95,7 +128,7 @@ class ClassifyTests(unittest.TestCase):
         result = rp.classify(signal)
         self.assertEqual(result.block_reason, st.BlockReason.GATE_NOT_FALSIFIABLE)
         self.assertIsNone(result.retry_class)
-        self.assertFalse(st.is_retryable(result.block_reason))
+        self.assertIn(result.block_reason, st.NON_RETRYABLE)
 
     def test_code_node_no_effect(self):
         """§7.3 — exit zero, empty diff, expects_changes True: not ENVIRONMENTAL,
@@ -105,7 +138,7 @@ class ClassifyTests(unittest.TestCase):
             code_effect=rp.CodeEffect(exit_zero=True, diff_empty=True, expects_changes=True))
         result = rp.classify(signal)
         self.assertEqual(result.block_reason, st.BlockReason.CODE_NODE_NO_EFFECT)
-        self.assertFalse(st.is_retryable(result.block_reason))
+        self.assertIn(result.block_reason, st.NON_RETRYABLE)
 
     def test_idempotent_node_with_default_expectation_is_not_no_effect(self):
         """§7.3 — expects_changes defaults false; an empty diff there is the
@@ -161,7 +194,7 @@ class ClauseFourAsymmetryTests(unittest.TestCase):
         result = rp.classify(signal)
         self.assertEqual(result.block_reason, st.BlockReason.PERMISSION_SCOPE_VIOLATION)
         self.assertIsNone(result.retry_class)
-        self.assertFalse(st.is_retryable(result.block_reason))
+        self.assertIn(result.block_reason, st.NON_RETRYABLE)
 
     def test_agent_node_clause_four_failure_is_semantic(self):
         signal = rp.FailureSignal(node_kind=st.NodeKind.AGENT, permission=self.failing_verdict())
@@ -220,8 +253,12 @@ class NoInfraBudgetDecrementTests(unittest.TestCase):
             make_attempt("n1", "b2", 3, st.RetryClass.ENVIRONMENTAL),
         ]
         self.assertEqual(rp.semantic_attempts_total(attempts, "n1"), 0)
-        cfg = make_cfg(semantic_ceiling=1)
-        self.assertFalse(rp.semantic_budget_exhausted(cfg, "n1", attempts))
+        # Three infra failures, and the ceiling still admits the next
+        # attempt as if none had happened: no infra fault decrements the
+        # semantic budget (§7.5). At a ceiling of 2 the in-flight attempt is
+        # the only one counted.
+        cfg = make_cfg(semantic_ceiling=2)
+        self.assertFalse(ceiling_reached(cfg, "n1", attempts))
 
     def test_only_semantic_attempts_count_toward_the_ceiling(self):
         attempts = [
@@ -264,44 +301,47 @@ class SemanticBudgetTests(unittest.TestCase):
             self.assertEqual(rp.semantic_attempts_at_base(attempts, "n1", base), 1)
 
         self.assertEqual(rp.semantic_attempts_total(attempts, "n1"), 10)
-        self.assertTrue(rp.semantic_budget_exhausted(cfg, "n1", attempts))
+        self.assertTrue(ceiling_reached(cfg, "n1", attempts))
 
         # the cumulative ceiling stops the node well before the 10th merge —
-        # exactly at K, not scaling with the number of unrelated merges.
+        # exactly at K, not scaling with the number of unrelated merges. The
+        # enforcer counts the attempt failing right now, so K-1 stored rows
+        # plus this one is where it stops.
         first_exhausted_after = next(
-            i for i in range(1, 11)
-            if rp.semantic_budget_exhausted(cfg, "n1", attempts[:i]))
-        self.assertEqual(first_exhausted_after, cfg.semantic_ceiling)
+            i for i in range(0, 11)
+            if ceiling_reached(cfg, "n1", attempts[:i]))
+        self.assertEqual(first_exhausted_after + 1, cfg.semantic_ceiling)
 
     def test_retry_force_grants_exactly_one_attempt_beyond_the_ceiling(self):
         """`maestro retry --force` grants exactly one attempt beyond K without
         raising the cap, read from NodeLifecycle.granted_extra_attempts — the
         lifecycle column, never the audit tier (§5.3, §7.5)."""
         cfg = make_cfg(semantic_ceiling=2)
-        attempts = [make_attempt("n1", f"b{i}", i, st.RetryClass.SEMANTIC) for i in range(2)]
+        attempts = [make_attempt("n1", "b0", 0, st.RetryClass.SEMANTIC)]
         lifecycle = st.NodeLifecycle(node_id="n1")
 
-        # at the ceiling with no grant: exhausted, retry --force is the exit
-        self.assertTrue(rp.semantic_budget_exhausted(
+        # at the ceiling with no grant: exhausted, retry --force is the exit.
+        # One stored row plus the attempt failing right now is K=2.
+        self.assertTrue(ceiling_reached(
             cfg, "n1", attempts, lifecycle.granted_extra_attempts))
 
         # one grant admits exactly one more attempt
         lifecycle.granted_extra_attempts = 1
-        self.assertFalse(rp.semantic_budget_exhausted(
+        self.assertFalse(ceiling_reached(
             cfg, "n1", attempts, lifecycle.granted_extra_attempts))
 
         # spend the granted attempt — it fails semantically too
-        attempts.append(make_attempt("n1", "b2", 2, st.RetryClass.SEMANTIC))
-        self.assertTrue(rp.semantic_budget_exhausted(
+        attempts.append(make_attempt("n1", "b1", 1, st.RetryClass.SEMANTIC))
+        self.assertTrue(ceiling_reached(
             cfg, "n1", attempts, lifecycle.granted_extra_attempts))
 
         # refuses again without a second grant
-        self.assertTrue(rp.semantic_budget_exhausted(
+        self.assertTrue(ceiling_reached(
             cfg, "n1", attempts, lifecycle.granted_extra_attempts))
 
         # a second grant admits exactly one more, same pattern
         lifecycle.granted_extra_attempts = 2
-        self.assertFalse(rp.semantic_budget_exhausted(
+        self.assertFalse(ceiling_reached(
             cfg, "n1", attempts, lifecycle.granted_extra_attempts))
 
 

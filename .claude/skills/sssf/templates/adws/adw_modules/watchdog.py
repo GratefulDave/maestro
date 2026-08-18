@@ -222,6 +222,8 @@ class Watchdog:
         fail_attempt: AttemptFailer,
         poll_interval_s: float = 1.0,
         process_alive: Callable[[int], bool] = process_is_alive,
+        exit_status_observed: Callable[[st.AttemptRecord], bool] = (
+            lambda attempt: False),
         transcript_record_count: Callable[[st.AttemptRecord], int] = (
             _default_transcript_record_count),
         time_source: Callable[[], float] = time.monotonic,
@@ -234,6 +236,7 @@ class Watchdog:
         self._fail_attempt = fail_attempt
         self._poll_interval_s = poll_interval_s
         self._process_alive = process_alive
+        self._exit_status_observed = exit_status_observed
         self._transcript_record_count = transcript_record_count
         self._time_source = time_source
         self._on_error = on_error
@@ -297,7 +300,38 @@ class Watchdog:
             # construction. Only the wall-clock check above applies.
             return
 
-        if attempt.pid is not None and not self._process_alive(attempt.pid):
+        # §9.7's rule, which this site was the last of three to apply: **an
+        # artifact a worker wrote outranks any status a supervisor observes
+        # about that worker; absence of a process is not absence of output.**
+        # `launcher.poll` consults the declared result before it will report
+        # GONE, and `FinalizationWindow.poll` reads the reviewer's report
+        # before it will read the reviewer's pid. This check read the pid
+        # first and had no notion of completion at all, so a process that
+        # finished its work and exited zero was indistinguishable from one
+        # that died.
+        #
+        # Measured: a code node running `python -c "...write_text('done')"`
+        # exits in milliseconds. When the poll landed after that exit the
+        # attempt was failed PROCESS_DEAD, retried twice into the same race,
+        # and blocked ENVIRONMENTAL_BUDGET_EXHAUSTED — roughly one run in
+        # three, on the real scheduler path, for a node that had already
+        # succeeded.
+        #
+        # `exit_status_observed` is what closes it, and it is a fact about the
+        # harness rather than about the process: some other component holds
+        # this process's handle and reads its exit code directly, so the
+        # disappearance of the pid is not the only account of what happened
+        # and this signal is not the one entitled to rule. Structural, and
+        # among the facts §7.5 permits — an exit code and whether the process
+        # started, never output text.
+        #
+        # Where the signal keeps its full force is the case §7.6 wrote it for:
+        # an agent the herdr server spawned, whose handle Maestro does not
+        # hold and whose exit nothing else can see, where absence genuinely is
+        # the only signal there is.
+        if (attempt.pid is not None
+                and not self._exit_status_observed(attempt)
+                and not self._process_alive(attempt.pid)):
             self._heartbeats.pop(key, None)
             self._stall(attempt, StallReason.PROCESS_DEAD)
             return

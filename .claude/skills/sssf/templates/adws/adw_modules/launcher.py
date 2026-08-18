@@ -39,6 +39,82 @@ class ErrorClass(str, Enum):
     EXECUTION = "execution"
 
 
+class LaunchRefusal(Enum):
+    """One typed launcher refusal, with the two structural facts about it.
+
+    The refusal codes have always travelled in the exception's message
+    (`LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...`), and §7.5 forbids any
+    caller branching on that prose — matching the prefix to pick a retry class
+    is the lexical shortcut an AST test convicts. So each code is a member
+    here and carries what callers actually need to know, as fields:
+
+    * `pane_created` — whether a pane existed at the moment the refusal was
+      raised. §8.3's quiesce step proves an attempt's owned execution absent,
+      and §16.3 item 45 records what happens without this fact: a refusal
+      raised *before* the split hits a mandatory `finally: quiesce`, which
+      raises `PROCESS_GROUP_UNTRACKED` over a process that was never started,
+      and Python replaces the launch's own exception with it. The naive repair
+      — treating every failed launch as proven absent — lies for the refusals
+      raised *after* the split (`SHELL_NOT_READY`, `NO_PANE`), where a pane
+      really does exist and its group is exactly what quiescence is for.
+      Reported rather than inferred, so the proof is skipped only where
+      absence is established by construction.
+    * `deterministic` — whether another attempt could plausibly survive what
+      this one did not. §7.5 closes the retry classes at three and makes the
+      closure load-bearing, so this is *not* a fourth class: it sizes the
+      budget of a member inside LAUNCHER_TRANSIENT, exactly as
+      `LauncherFailure.CREDENTIAL`'s zero already does ("the budget is a
+      property of the member, not of the class"). A call site that omits an
+      environment omits it identically on every attempt, and spending two
+      more launches on it ends in `LAUNCHER_BUDGET_EXHAUSTED` — a reason that
+      says a budget ran out when nothing was ever retryable (§16.3 item 46).
+
+    Both default conservatively at every reader: an untyped launch failure is
+    quiesced as before and retried as before.
+    """
+
+    #: Raised while building the split's own arguments, so no pane exists and
+    #: none can. Deterministic: the environment is computed by the call site.
+    SCRATCH_REDIRECT_MISSING = ("SCRATCH_REDIRECT_MISSING", False, True)
+    #: Refused before any herdr call, against the verified admitted-route set.
+    ROUTE_NOT_ADMITTED = ("ROUTE_NOT_ADMITTED", False, True)
+    #: The split returned without a pane id. §16.3 item 45 names this among
+    #: the post-split refusals: herdr may hold a pane it did not report.
+    NO_PANE = ("NO_PANE", True, False)
+    #: The pane exists and never settled into an interactive shell.
+    SHELL_NOT_READY = ("SHELL_NOT_READY", True, False)
+
+    def __init__(self, code: str, pane_created: bool, deterministic: bool) -> None:
+        self.code = code
+        self.pane_created = pane_created
+        self.deterministic = deterministic
+
+
+class LaunchRefused(RuntimeError):
+    """A launcher refusal that names its own code as a typed member.
+
+    Subclasses `RuntimeError` and keeps the exact `LAUNCH_REFUSED:<code>[:...]`
+    message the operator-facing ledger already carries, so nothing that reads
+    the string changes. What is new is `refusal`, which is what callers branch
+    on — the same separation `HerdrCallError` already draws between `.code`
+    and the message Herdr may reword at any release.
+    """
+
+    def __init__(self, refusal: LaunchRefusal, detail: str = "") -> None:
+        super().__init__("LAUNCH_REFUSED:{}{}".format(
+            refusal.code, ":" + detail if detail else ""))
+        self.refusal = refusal
+        self.detail = detail
+
+    @property
+    def pane_created(self) -> bool:
+        return self.refusal.pane_created
+
+    @property
+    def deterministic(self) -> bool:
+        return self.refusal.deterministic
+
+
 class HarnessCancelled(RuntimeError):
     """A harness-owned process was cancelled and its process group quiesced."""
 
@@ -133,8 +209,8 @@ def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
     """
     missing = [key for key in SCRATCH_ENV_KEYS if not environment.get(key)]
     if missing:
-        raise RuntimeError(
-            "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:{}".format(",".join(missing)))
+        raise LaunchRefused(LaunchRefusal.SCRATCH_REDIRECT_MISSING,
+                            ",".join(missing))
     flags: List[str] = []
     for key in SCRATCH_ENV_KEYS:
         flags.extend(("--env", "{}={}".format(key, environment[key])))
@@ -163,6 +239,20 @@ class LaunchHandle:
     launched_cwd: Path
     transcript_path: Optional[Path] = None
     envelope_path: Optional[Path] = None
+    #: Honestly unreachable rather than mistakenly unwired, and the difference
+    #: is why this field stays. §8.3 states it plainly: for an agent node the
+    #: process is spawned by the herdr server, and herdr 0.8.0's recorded
+    #: surface (§9.1) exposes no pid and no process group, so there is no group
+    #: Maestro owns and no kill it can aim — agent-node settle is measurement,
+    #: not termination. §16.3 item 17 makes adopting one conditional on an
+    #: executed §9.8 receipt that does not exist yet: either herdr exposing the
+    #: agent pid with a guaranteed dedicated group, or `herdr agent start`
+    #: exec'ing an adapter-supplied group-leader wrapper verbatim, with the
+    #: receipt showing the group excludes the pane shell and every sibling
+    #: attempt. On that receipt §8.3's code-node quiesce extends to agent nodes
+    #: unchanged, and this is the field it writes into. Deleting it as "unused"
+    #: would delete the seam the receipt is meant to fill; the dead-seam sweep
+    #: therefore carries it as deliberate rather than deferred.
     process_group: Optional[int] = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
@@ -362,7 +452,16 @@ def _agent_name(token: str) -> str:
     return "maestro-{}".format(digest)
 
 
-def _extract(payload: dict, key: str) -> object:
+def _extract(payload: Mapping[str, object], key: str) -> object:
+    """One field out of a herdr reply, from the envelope or one level in.
+
+    `Mapping`, not `dict`: every read below is a lookup or an iteration and
+    nothing here mutates, while two callers hold a `Mapping[str, object]` —
+    `_available_shell` and `_agent_transcript_path` — and were passing it into
+    a `dict` annotation. Widening the parameter to what the function actually
+    requires is the honest direction; narrowing the callers would have been
+    annotating around a constraint that does not exist.
+    """
     result = payload.get("result", payload)
     if isinstance(result, dict):
         if key in result:
@@ -623,7 +722,7 @@ def _wait_for_available_shell(
         if ready >= settle_polls:
             return
         if time.monotonic() >= deadline:
-            raise RuntimeError("LAUNCH_REFUSED:SHELL_NOT_READY")
+            raise LaunchRefused(LaunchRefusal.SHELL_NOT_READY)
         time.sleep(0.1)
 
 
@@ -676,7 +775,7 @@ class HerdrLauncher:
 
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         if not self.admitted_routes.admits(spec.route):
-            raise RuntimeError("ROUTE_NOT_ADMITTED:{}".format(spec.route))
+            raise LaunchRefused(LaunchRefusal.ROUTE_NOT_ADMITTED, spec.route)
         worktree = spec.worktree.resolve()
         environment = MappingProxyType(dict(spec.environment))
         # The pane shell is forked by the herdr server, not by the CLI process
@@ -687,7 +786,7 @@ class HerdrLauncher:
                             *pane_env_flags(environment), env=environment)
         pane = _extract(split, "pane")
         if not isinstance(pane, dict) or not pane.get("pane_id"):
-            raise RuntimeError("LAUNCH_REFUSED:NO_PANE")
+            raise LaunchRefused(LaunchRefusal.NO_PANE)
         pane_id = str(pane["pane_id"])
         name = _agent_name(spec.correlation_token)
         route_argv = (build_omp_argv(self.omp_path, spec) if spec.route == "omp"

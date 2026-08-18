@@ -76,13 +76,48 @@ class CodeEffect:
 
 
 class LauncherFailure(str, Enum):
-    """§7.5's LAUNCHER_TRANSIENT triggers. CREDENTIAL is distinguished
-    because it alone carries a zero retry budget."""
+    """§7.5's LAUNCHER_TRANSIENT triggers, partitioned by budget below.
+
+    Members, not classes. §7.5 closes the retry classes at three and makes the
+    closure load-bearing, and it also says what varies inside a class: "the
+    budget is a property of the *member*, not of the class". CREDENTIAL has
+    always been the proof of that — zero retries inside a class named for
+    faults a second attempt might survive.
+
+    `DETERMINISTIC_REFUSAL` is the second member of that same shape (§16.3
+    item 46). LAUNCHER_TRANSIENT is named for an assumption — that another
+    attempt might survive what this one did not — and a refusal that is
+    deterministic *by construction* satisfies every structural test for the
+    class while violating that assumption: a call site that omits an
+    environment omits it identically on every attempt. Without a member for
+    it, `ErrorClass.CONFIGURATION` maps to STARTUP, the node makes two more
+    launches that cannot succeed, and it blocks LAUNCHER_BUDGET_EXHAUSTED —
+    telling an operator a budget ran out when nothing was ever retryable.
+
+    The determinism is stated by the launcher as a typed field on its own
+    refusal (`launcher.LaunchRefusal.deterministic`) and travels to the
+    classifier as this member. It is never inferred from the refusal's
+    message: `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...` carries its code in
+    prose, and matching that prefix is exactly the lexical shortcut §7.5
+    forbids and an AST test convicts.
+    """
 
     PANE_ALLOCATION = "PANE_ALLOCATION"
     STARTUP = "STARTUP"
     TRANSPORT = "TRANSPORT"
     CREDENTIAL = "CREDENTIAL"
+    DETERMINISTIC_REFUSAL = "DETERMINISTIC_REFUSAL"
+
+
+#: The partition §16.3 item 46's discharge requires: the members for which
+#: another attempt cannot produce a different answer. `launcher_retry_budget`
+#: is its only reader, and `_budget_reason` names the refusal rather than the
+#: budget for exactly this set, so a deterministic refusal blocks on its first
+#: occurrence saying what was refused.
+DETERMINISTIC_LAUNCHER_FAILURES: Tuple[LauncherFailure, ...] = (
+    LauncherFailure.CREDENTIAL,
+    LauncherFailure.DETERMINISTIC_REFUSAL,
+)
 
 
 @dataclass(frozen=True)
@@ -252,25 +287,6 @@ def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> 
               and not (a.extra or {}).get(REVIEW_REJECTED_KEY))
 
 
-def semantic_budget_exhausted(cfg: SchedulerConfig, node_id: str,
-                              attempts: Iterable[AttemptRecord],
-                              granted_extra_attempts: int = 0) -> bool:
-    """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts per
-    `(run_id, node_id)` across all bases, closing the refund loop that the
-    per-base scope alone leaves unbounded — every unrelated merge mints a new
-    base and re-arms the per-base scope, so without this ceiling total spend
-    scales with the number of merges rather than with the node.
-
-    `granted_extra_attempts` is read from the node's lifecycle row
-    (`NodeLifecycle.granted_extra_attempts`) — the authority tier, never the
-    audit tier, per §5.3's runtime-read allowlist — and grants exactly one
-    attempt beyond `K` per `retry --force` invocation without raising the cap.
-    """
-    total = semantic_attempts_total(attempts, node_id)
-    allowance = cfg.semantic_ceiling + granted_extra_attempts
-    return total >= allowance
-
-
 # ── the review budget, counted the same way and kept separate ───────────────
 
 #: The marker `fail_attempt`/`mark_blocked` write into `attempts.extra_json`
@@ -301,27 +317,27 @@ def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> in
                and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
 
 
-def review_budget_exhausted(cfg: SchedulerConfig, node_id: str,
-                            attempts: Iterable[AttemptRecord],
-                            granted_extra_attempts: int = 0) -> bool:
-    """At most `review_ceiling + granted` review-rejected attempts per node.
-
-    `granted_extra_attempts` is the same `retry --force` grant the semantic
-    ceiling honours, and here it is also B10's missing operator escape: a review
-    that FAILed for a flaky or environmental reason would otherwise strand the
-    producer, because a byte-identical resubmission replays the stored FAIL
-    rather than being re-reviewed into a different answer.
-    """
-    total = review_attempts_total(attempts, node_id)
-    return total >= cfg.review_ceiling + granted_extra_attempts
-
-
 # ── §7.5 launcher budgets — credential is the zero-retry exception ──────────
 
 def launcher_retry_budget(cfg: SchedulerConfig, failure: Optional[LauncherFailure]) -> int:
-    """LAUNCHER_TRANSIENT's budget, except CREDENTIAL, which is zero (§7.5)."""
+    """LAUNCHER_TRANSIENT's budget, sized from the member (§7.5).
+
+    Two members spend nothing. CREDENTIAL's zero is §7.5's own entry, the one
+    row in the retry table whose whole purpose is to *not* retry.
+    DETERMINISTIC_REFUSAL's zero is the same rule applied to the same class:
+    the refusal is a property of the configuration or the plan rather than of
+    the moment, so an identical relaunch produces an identical refusal, and
+    the two doomed attempts buy only a misleading block reason.
+
+    CREDENTIAL keeps reading its configured value rather than being folded
+    into the literal below, because it is an operator-settable number that
+    happens to default to zero. A deterministic refusal is not a budget at
+    all — there is nothing for an operator to raise — so it is a constant.
+    """
     if failure is LauncherFailure.CREDENTIAL:
         return cfg.credential_retries
+    if failure in DETERMINISTIC_LAUNCHER_FAILURES:
+        return 0
     return cfg.launcher_retries
 
 

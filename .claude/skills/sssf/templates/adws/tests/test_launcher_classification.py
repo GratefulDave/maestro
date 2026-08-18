@@ -312,12 +312,21 @@ class ClassificationIsNotLexicalTest(unittest.TestCase):
     TEXT_METHODS = ("startswith", "endswith", "find", "index", "split",
                     "lower", "upper", "strip")
 
-    def test_classification_reads_no_message_text(self):
-        """§7.5: "classification is structural, never lexical"."""
-        tree = ast.parse(Path(maestro.__file__).read_text(encoding="utf-8"))
+    #: The scheduler-side half of the same seam. §16.3 items 45 and 46 added
+    #: two readers of a launcher refusal — one deciding whether §8.3's
+    #: quiescence proof is owed, one deciding which budget the refusal spends
+    #: — and both are lifecycle decisions about a failed launch. The refusal
+    #: codes travel in the exception's message, so this is exactly where a
+    #: `startswith('LAUNCH_REFUSED:')` would be written next. Guarding
+    #: `maestro.py` alone would have left the rule stated at one site and
+    #: unenforced at the two newest ones.
+    SCHEDULER_CLASSIFYING = ("pane_created", "classified_failure",
+                             "_launch_left_nothing_to_reap")
+
+    def _lexical_offenders(self, source: str, names) -> list:
         offenders = []
-        for fn in ast.walk(tree):
-            if not isinstance(fn, ast.FunctionDef) or fn.name not in self.CLASSIFYING:
+        for fn in ast.walk(ast.parse(source)):
+            if not isinstance(fn, ast.FunctionDef) or fn.name not in names:
                 continue
             for node in ast.walk(fn):
                 if (isinstance(node, ast.Call)
@@ -327,7 +336,34 @@ class ClassificationIsNotLexicalTest(unittest.TestCase):
                 if isinstance(node, ast.Compare) and any(
                         isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
                     offenders.append("{}: membership test".format(fn.name))
-        self.assertEqual(offenders, [])
+        return offenders
+
+    def test_classification_reads_no_message_text(self):
+        """§7.5: "classification is structural, never lexical"."""
+        self.assertEqual(
+            self._lexical_offenders(
+                Path(maestro.__file__).read_text(encoding="utf-8"),
+                self.CLASSIFYING),
+            [])
+
+    def test_the_schedulers_refusal_readers_are_structural_too(self):
+        """Both read the exception's *type* and a typed field on it, which
+        §7.5 permits, and neither touches the refusal's message."""
+        source = Path(sch.__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            self._lexical_offenders(source, self.SCHEDULER_CLASSIFYING), [])
+        # ... and the names really are present, or the check above is vacuous.
+        for name in self.SCHEDULER_CLASSIFYING:
+            self.assertIn("def {}(".format(name), source)
+
+    def test_the_scheduler_guard_would_convict_a_planted_violation(self):
+        planted = (
+            "def classified_failure(self):\n"
+            "    if str(self.__cause__).startswith('LAUNCH_REFUSED:'):\n"
+            "        return 1\n")
+        self.assertEqual(
+            self._lexical_offenders(planted, self.SCHEDULER_CLASSIFYING),
+            ["classified_failure: .startswith()"])
 
     def test_the_guard_would_convict_a_planted_violation(self):
         """The mutation control: the guard is wired, not decorative."""
@@ -405,6 +441,45 @@ class PaneLaunchIsTypedTest(unittest.TestCase):
             maestro._typed_launch_pane(runner, self.spec())
         self.assertIs(caught.exception.failure, rp.LauncherFailure.STARTUP)
         self.assertIn("SCRATCH_REDIRECT_MISSING", caught.exception.detail)
+
+    def test_the_wrapper_carries_the_refusals_typed_facts_through(self):
+        """§16.3 items 45 and 46 end to end, through the real wrapper.
+
+        Both repairs read the launcher's typed refusal off `LaunchFailed`'s
+        `__cause__`, and that chaining is `_typed_launch`'s `raise ... from
+        exc` — a production line neither repair touches. If it were ever
+        changed to a bare `raise scheduler.LaunchFailed(...)`, both would
+        silently fall back to their conservative defaults: every refusal
+        quiesced and every refusal retried, which is exactly today's
+        behaviour, so nothing else would notice. Asserted here rather than
+        assumed, and against the real `_typed_launch_pane` rather than a
+        reproduction of it.
+        """
+        try:
+            launcher.pane_env_flags({})
+        except launcher.LaunchRefused as exc:
+            refusal = exc
+        else:  # pragma: no cover - the refusal is the point
+            self.fail("pane_env_flags did not refuse an empty environment")
+
+        runner = self._RefusingRunner(refusal)
+        with self.assertRaises(sch.LaunchFailed) as caught:
+            maestro._typed_launch_pane(runner, self.spec())
+        self.assertIs(caught.exception.__cause__, refusal)
+        self.assertFalse(caught.exception.pane_created)
+        self.assertIs(caught.exception.classified_failure,
+                      rp.LauncherFailure.DETERMINISTIC_REFUSAL)
+
+    def test_a_post_split_refusal_keeps_both_conservative_answers(self):
+        """The control on the same wrapper: a pane may exist and another
+        attempt may survive, so neither repair fires."""
+        runner = self._RefusingRunner(
+            launcher.LaunchRefused(launcher.LaunchRefusal.SHELL_NOT_READY))
+        with self.assertRaises(sch.LaunchFailed) as caught:
+            maestro._typed_launch_pane(runner, self.spec())
+        self.assertTrue(caught.exception.pane_created)
+        self.assertIsNot(caught.exception.classified_failure,
+                         rp.LauncherFailure.DETERMINISTIC_REFUSAL)
 
     def test_a_successful_launch_is_returned_untouched(self):
         """The control: the helper is a classifier, not a filter."""

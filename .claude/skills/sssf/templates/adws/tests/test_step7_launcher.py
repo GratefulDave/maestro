@@ -17,6 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adw_modules import launcher
+# Aliased as well, because several tests below bind a local named `launcher`
+# to a `HerdrLauncher` instance and would otherwise shadow the module.
+from adw_modules import launcher as launcher_module
 from adw_modules.launcher import (
     ErrorClass,
     FakeLauncher,
@@ -286,9 +289,19 @@ class LauncherContractTest(unittest.TestCase):
                                 admitted_routes=self.admitted_routes)
         with self.assertRaisesRegex(
                 RuntimeError,
-                "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"):
+                "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"
+                ) as caught:
             harness.launch(replace(self.spec(), environment=environment))
         self.assertFalse((self.root / "argv.jsonl").exists())
+        # The absence of `argv.jsonl` is what "before creating a pane" means
+        # here, and it is a fact this test can see because it drives the whole
+        # launcher. §8.3's quiesce step is downstream and cannot see it, so the
+        # launcher states it as a typed field on the refusal rather than
+        # leaving the scheduler to infer it from a message (§16.3 item 45).
+        self.assertIs(caught.exception.refusal,
+                      launcher_module.LaunchRefusal.SCRATCH_REDIRECT_MISSING)
+        self.assertFalse(caught.exception.pane_created)
+        self.assertTrue(caught.exception.deterministic)
 
     def test_launch_refuses_wrong_pane_cwd_before_starting_agent(self):
         os.environ["FAKE_HERDR_CWD"] = str(self.root / "wrong")
@@ -428,10 +441,16 @@ class LauncherContractTest(unittest.TestCase):
         launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
                                  claude_path=Path("/opt/claude"),
                                  admitted_routes=self.admitted_routes)
-        with self.assertRaisesRegex(RuntimeError, "LAUNCH_REFUSED"):
+        with self.assertRaisesRegex(RuntimeError, "LAUNCH_REFUSED") as caught:
             launcher.launch(self.spec())
         calls = [json.loads(line)["argv"] for line in (self.root / "argv.jsonl").read_text().splitlines()]
         self.assertIn(["pane", "close", "w1:p2"], calls)
+        # A pane was allocated, so the refusal must not claim otherwise: the
+        # close above is best-effort and its success is not a measured absence
+        # (§16.3 item 45). Whatever the refusal turns out to be, this site is
+        # past the split and must demand the proof.
+        if isinstance(caught.exception, launcher_module.LaunchRefused):
+            self.assertTrue(caught.exception.pane_created)
 
     def test_launch_refuses_os_failure_as_typed_refusal(self):
         launcher = HerdrLauncher(herdr_path=self.root / "missing-herdr",
