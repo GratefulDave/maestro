@@ -1,4 +1,4 @@
-"""The `maestro-plan.v1` model — nine in-plan types and nothing else (§6.2).
+"""The `maestro-plan.v1` model — ten in-plan types and nothing else (§6.2).
 
 Three planning modes converge here (§6.1). Each terminates by emitting one
 plan file, and there is no second authored structure anywhere in the system:
@@ -7,10 +7,23 @@ exists for anything else. The nodes below project directly onto the
 scheduler's own `PlanNode` (`scheduler_types`), so there is no converter and
 no parallel node type to drift from this one.
 
-The nine types:
+The ten types:
 
     Plan  Observed  Produced  Hypothesis  Gate  AgentNode  CodeNode
-    MergePolicy  PromptAsset
+    MergePolicy  PromptAsset  NodeEffect
+
+`NodeEffect` is the tenth, and it arrived after the other nine. §6.2 as
+written says nine and has to be brought level; `IN_PLAN_TYPES` is the enforced
+count and `tests/test_step2_plan_model.py` asserts it. Two other statements in
+§6 are in tension with it and are recorded here rather than left for someone to
+rediscover: §6.3 says a shipped version's model class is frozen forever, and
+`AgentNode.effects` is an added field on one; and the same section says a new
+field means a new version string. Both were weighed against leaving the
+reviewer unable to see what the code inside a node may do — the failure that
+let an executing object materializer read as compliant against its own brief —
+and the field was landed on v1 rather than behind a v2 that every consumer
+would have to learn. A `maestro-plan.v1` file written before the field still
+parses, because the field defaults to empty.
 
 Evidence is a **discriminated union of three types with disjoint mechanical
 duties** (§6.2) rather than an enum an author can mislabel. The duty is a
@@ -249,6 +262,29 @@ def command_core(gate: Gate) -> Tuple[str, str, Tuple[str, ...]]:
             tuple(sorted(flags)) + canonical_selector)
 
 
+class NodeEffect(BaseModel):
+    """One act this plan forbids, and what this node may do about it.
+
+    Three closed fields and no prose the reviewer has to weigh. `meaning` is
+    transcribed from the plan's source document by the plan author, and is
+    carried here rather than resolved from an effect name at the far end —
+    without it the plan reviewer and the node reviewer would resolve
+    `canonical_object_write` against two different documents, which is the
+    same failure this exists to fix, one level down.
+
+    Every field is required and non-empty. A `NodeEffect` is only ever built
+    from a prohibition, and a prohibition without its transcribed act is
+    already refused at admission, so an empty `meaning` here would be a
+    projection that dropped a field rather than a plan that omitted one.
+    """
+
+    model_config = _STRICT
+
+    effect: str = Field(min_length=1)
+    disposition: str = Field(min_length=1)
+    meaning: str = Field(min_length=1)
+
+
 # ── prompt assets, which are part of the identity (§6.3) ────────────────────
 
 class PromptAsset(BaseModel):
@@ -288,6 +324,15 @@ class AgentNode(_NodeBase):
     instruction: str = Field(min_length=1)
     gate: Gate
     prompt_assets: Tuple[PromptAsset, ...] = ()
+    #: What this node is authorised to do about each act its plan forbids.
+    #:
+    #: Defaulting to empty is not the optional-field-forever shape B8
+    #: convicts: the *authored* field is `requirements[].effects` in the
+    #: contract IR, which admission requires of every requirement. This
+    #: default exists so a `maestro-plan.v1` file written before the field
+    #: existed still parses, and an empty tuple renders no block rather than
+    #: an empty one.
+    effects: Tuple[NodeEffect, ...] = ()
 
 
 class CodeNode(_NodeBase):
@@ -425,7 +470,11 @@ class Plan(BaseModel):
                     # reviewer's B9 contract read it through a `getattr`
                     # default and every agent node in every run was reviewed
                     # against a goal derived from its own gate.
-                    instruction=node.instruction, **common)
+                    instruction=node.instruction,
+                    # Carried verbatim rather than re-encoded, so the totality
+                    # check below compares the same objects by value and there
+                    # is one representation of the fact.
+                    effects=tuple(node.effects), **common)
             else:
                 result = st.PlanNode(
                     kind=st.NodeKind.CODE, command=tuple(node.command),
@@ -550,7 +599,7 @@ def _assert_projection_is_total(node: "_NodeBase", projected: st.PlanNode) -> No
 
 IN_PLAN_TYPES: Tuple[Type[BaseModel], ...] = (
     Plan, Observed, Produced, Hypothesis, Gate, AgentNode, CodeNode,
-    MergePolicy, PromptAsset)
+    MergePolicy, PromptAsset, NodeEffect)
 
 
 # ── the append-only parser registry (§6.3) ──────────────────────────────────

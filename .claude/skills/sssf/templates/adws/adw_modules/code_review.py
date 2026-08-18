@@ -332,6 +332,24 @@ class ReviewHandoff(BaseModel):
     base_sha: str
     output_sha: str
     diff: str
+    #: What the code inside this node may do about each act the plan forbids.
+    #:
+    #: Every other field of this contract answers *where* work may happen —
+    #: the instruction, the declared outputs, the gate, its selector. None
+    #: answered what the code inside them may do, and the attempt-3 prompt
+    #: from run-0120c32064d144c2aa55c344087e0b0a shows the cost: its whole
+    #: brief was "make the gate pass over selector …, changing only the
+    #: declared outputs", and against that brief an object materializer that
+    #: constructs a client and copies bytes is compliant. The words the plan
+    #: actually used about that node — pure derivation, no object mutation,
+    #: injected clients — appeared nowhere in it.
+    #:
+    #: Empty for a code node, and for an agent node from a plan authored
+    #: before the field existed, so it is not in `require_complete` below. It
+    #: is not defaulted around either: an empty list renders no block rather
+    #: than an empty heading, so a reviewer is never shown a contract section
+    #: with nothing under it.
+    effects: List[Dict[str, str]] = []
     #: The cells to answer, and where to write the answers.
     matrix: List[Dict[str, Any]]
     pair_count: int
@@ -396,6 +414,24 @@ class ReviewHandoff(BaseModel):
                 "passing case(s)")
         else:
             lines.append("  (code node: acceptance is the command's exit code)")
+        if self.effects:
+            lines.extend([
+                "",
+                "## What this node may do",
+                "This plan forbids the acts below. Each line is what this node "
+                "is authorised to do about one of them, and the sentence under "
+                "it is the prohibition in the source document's own words.",
+                "",
+                "  performed = executes it for real | planned = emits a record "
+                "describing it and executes nothing",
+                "  fake_only = executes it only against an injected fake | "
+                "none = does not perform, plan, or fake it",
+            ])
+            for entry in self.effects:
+                lines.append("")
+                lines.append("  {0}: {1}".format(
+                    entry["effect"], entry["disposition"]))
+                lines.append("      forbidden act: " + entry["meaning"])
         lines.extend([
             "",
             "## The diff, base..proposed",
@@ -699,6 +735,13 @@ def build_handoff(
         gate_command=list(node.gate_command),
         gate_selector=node.gate_selector or "",
         gate_min_cases=node.gate_min_cases,
+        # Read as an attribute, never through a defaulted lookup: that
+        # operator is what let `min_cases` and `instruction` read as their
+        # defaults for every node in every run, and a field reached that way
+        # cannot fail loudly when the projection stops carrying it.
+        effects=[{"effect": effect.effect, "disposition": effect.disposition,
+                  "meaning": effect.meaning}
+                 for effect in node.effects],
         base_sha=base_sha,
         output_sha=output_sha,
         diff=diff,

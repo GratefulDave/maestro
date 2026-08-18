@@ -151,6 +151,49 @@ def _parse_verifier_command(command: object) -> Tuple[str, Tuple[str, ...]]:
     raise IngressError("UNMAPPABLE_COMMAND:{}".format(tokens[0]))
 
 
+def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
+    """The lane's dispositions toward each act the plan forbids.
+
+    A lane's effects are the union of the requirements it binds. Admission has
+    already refused two requirements on one lane that disagree about an
+    effect, so the union is well defined by the time this runs — the first
+    disposition found is the only one there is.
+
+    Only prohibited effects are carried. A disposition toward an act the plan
+    does not forbid is not a prohibition, and every prohibited effect has a
+    transcribed `meaning`, so every projected record is complete by
+    construction rather than by a later check.
+    """
+    extensions = ir.get("extensions")
+    maestro = extensions.get("maestro") if isinstance(extensions, dict) else {}
+    declared = maestro.get("prohibited_effects") if isinstance(maestro, dict) else None
+    meanings = {}
+    for entry in declared if isinstance(declared, list) else ():
+        if isinstance(entry, dict) and isinstance(entry.get("effect"), str):
+            meaning = entry.get("meaning")
+            if isinstance(meaning, str) and meaning.strip():
+                meanings[entry["effect"]] = meaning.strip()
+    if not meanings:
+        return []
+    by_id = {item.get("requirement_id"): item
+             for item in ir.get("requirements", [])
+             if isinstance(item, dict)}
+    dispositions = {}
+    for requirement_id in lane.get("requirement_ids") or []:
+        requirement = by_id.get(requirement_id)
+        if not isinstance(requirement, dict):
+            continue
+        for entry in requirement.get("effects") or []:
+            if not isinstance(entry, dict):
+                continue
+            effect, disposition = entry.get("effect"), entry.get("disposition")
+            if effect in meanings and isinstance(disposition, str):
+                dispositions.setdefault(effect, disposition)
+    return [{"effect": effect, "disposition": dispositions[effect],
+             "meaning": meanings[effect]}
+            for effect in sorted(dispositions)]
+
+
 def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     """Map one approved executable Plan IR onto a Maestro draft mapping."""
     if ir.get("schema_version") != "plan-contract.v1":
@@ -319,6 +362,11 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
                 "min_cases": min_cases,
             },
             "prompt_assets": [],
+            # What the code inside this node may do. The reviewer's contract
+            # answered where work could happen and nothing answered this, so a
+            # node told only "make the gate pass over these outputs" judged an
+            # executing materializer compliant.
+            "effects": _node_effects(ir, lane),
         })
 
     # Admission, before anything is written and therefore before a run can
