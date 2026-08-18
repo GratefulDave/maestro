@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from . import plan_author
+from . import plan_validate
 
 
 EXECUTABLE_KINDS = frozenset({"implementation", "brownfield", "prd", "workflow"})
@@ -18,7 +19,22 @@ RECEIPT_VERSION = "plan-contract-review.v1"
 
 
 class IngressError(plan_author.AuthoringError):
-    """A plan-contract package cannot become a Maestro plan."""
+    """A plan-contract package cannot become a Maestro plan.
+
+    `blockers` carries the typed admission blockers when the refusal is an
+    admission refusal, and is empty otherwise. The joined message stays for an
+    operator reading a terminal; a caller that needs to branch on which
+    obligation fired reads the tuple, because thirteen blockers rendered into
+    one string is a wall no code can take apart and `validate_plan` already
+    returns its blockers typed.
+    """
+
+    def __init__(self, message: str,
+                 blockers: Sequence["plan_validate.AdmissionBlocker"] = ()
+                 ) -> None:
+        super().__init__(message)
+        self.blockers: Tuple["plan_validate.AdmissionBlocker", ...] = tuple(
+            blockers)
 
 
 def _sha256(data: bytes) -> str:
@@ -133,6 +149,49 @@ def _parse_verifier_command(command: object) -> Tuple[str, Tuple[str, ...]]:
             rest = rest[1:]
         return "vitest", tuple(rest)
     raise IngressError("UNMAPPABLE_COMMAND:{}".format(tokens[0]))
+
+
+def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
+    """The lane's dispositions toward each act the plan forbids.
+
+    A lane's effects are the union of the requirements it binds. Admission has
+    already refused two requirements on one lane that disagree about an
+    effect, so the union is well defined by the time this runs — the first
+    disposition found is the only one there is.
+
+    Only prohibited effects are carried. A disposition toward an act the plan
+    does not forbid is not a prohibition, and every prohibited effect has a
+    transcribed `meaning`, so every projected record is complete by
+    construction rather than by a later check.
+    """
+    extensions = ir.get("extensions")
+    maestro = extensions.get("maestro") if isinstance(extensions, dict) else {}
+    declared = maestro.get("prohibited_effects") if isinstance(maestro, dict) else None
+    meanings = {}
+    for entry in declared if isinstance(declared, list) else ():
+        if isinstance(entry, dict) and isinstance(entry.get("effect"), str):
+            meaning = entry.get("meaning")
+            if isinstance(meaning, str) and meaning.strip():
+                meanings[entry["effect"]] = meaning.strip()
+    if not meanings:
+        return []
+    by_id = {item.get("requirement_id"): item
+             for item in ir.get("requirements", [])
+             if isinstance(item, dict)}
+    dispositions = {}
+    for requirement_id in lane.get("requirement_ids") or []:
+        requirement = by_id.get(requirement_id)
+        if not isinstance(requirement, dict):
+            continue
+        for entry in requirement.get("effects") or []:
+            if not isinstance(entry, dict):
+                continue
+            effect, disposition = entry.get("effect"), entry.get("disposition")
+            if effect in meanings and isinstance(disposition, str):
+                dispositions.setdefault(effect, disposition)
+    return [{"effect": effect, "disposition": dispositions[effect],
+             "meaning": meanings[effect]}
+            for effect in sorted(dispositions)]
 
 
 def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
@@ -303,7 +362,44 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
                 "min_cases": min_cases,
             },
             "prompt_assets": [],
+            # What the code inside this node may do. The reviewer's contract
+            # answered where work could happen and nothing answered this, so a
+            # node told only "make the gate pass over these outputs" judged an
+            # executing materializer compliant.
+            "effects": _node_effects(ir, lane),
         })
+
+    # Admission, before anything is written and therefore before a run can
+    # start. Two predicates over two domains, both answering "can any correct
+    # attempt satisfy this contract?": a lane whose requirement names a
+    # repository path the lane cannot write, and a requirement that prescribes
+    # an external act its own plan forbids. Both were paid for by the same run,
+    # in which one node could not write the file its behaviour needed and
+    # another was told in one paragraph to be a pure derivation module and to
+    # perform a server-side copy. Both read declared paths, declared
+    # enumerated values, declared ids, and the depends_on graph — no free
+    # text, §1.2.
+    #
+    # Both blocker sets are collected into one refusal rather than raised in
+    # turn: an author sent back twice for two defects in one document is the
+    # fail-fast validator §11.1 rejects.
+    #
+    # It runs here rather than on one caller because this is the chokepoint
+    # every route crosses: `plan author --from-plan-contract` and `plan ship`
+    # both reach a plan file only through `project_draft`. §19 M6 is the
+    # recorded cost of siting a check on a single launch path instead.
+    #
+    # It runs after the per-lane loop so that a malformed lane, verifier or
+    # output set is still refused in its own vocabulary; a surface blocker
+    # about a lane whose outputs never parsed would name the wrong defect.
+    admission_blockers = plan_validate.validate_admission(ir)
+    if admission_blockers:
+        raise IngressError(
+            "ADMISSION_REFUSED:" + " | ".join(
+                "{} {} {}".format(blocker.obligation.value, blocker.pointer,
+                                  blocker.message)
+                for blocker in admission_blockers),
+            admission_blockers)
 
     # §8.8's one integration gate, in exactly one of two forms. It used to
     # admit three overlapping ones — `runner` plus `argv`, a `command` line to

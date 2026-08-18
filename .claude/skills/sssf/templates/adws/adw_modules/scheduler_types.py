@@ -342,6 +342,33 @@ class PlanNode:
     #: author wrote — it is a projection that dropped the field. Both halves
     #: are refused below rather than defaulted around.
     instruction: str = ""
+    #: What this node is authorised to do about each act its plan forbids.
+    #:
+    #: The reviewer's contract answered *where* work could happen — declared
+    #: outputs, the gate, `reads`, `needs` — and nothing answered *what the
+    #: code inside may do*. Against the attempt-3 prompt from
+    #: run-0120c32064d144c2aa55c344087e0b0a, whose whole brief was "make the
+    #: gate pass over selector …, changing only the declared outputs", an
+    #: executing object materializer was compliant: the words "pure
+    #: derivation", "object mutation", and "injected clients" appeared zero
+    #: times, and the reviewers that found real defects did so because that
+    #: was the only work available to them.
+    #:
+    #: Typed rather than prose, and a closed enum over a closed enum. Handing
+    #: the reviewer the requirement's own text instead was considered and
+    #: declined: the text of the node this exists for says both "pure
+    #: derivation and policy module" and "server-side copy it", which puts the
+    #: reviewer in the builder's position adjudicating a contradiction, and a
+    #: verdict turning on which clause a model weighted is §1.2's prose
+    #: deciding a transition by the back door. Admission removes the
+    #: contradiction; this carries what survives it.
+    #:
+    #: The element type is the plan's own `NodeEffect`, which cannot be named
+    #: here: `plan_model` imports this module, so naming it would close the
+    #: cycle. The projection carries those objects verbatim rather than
+    #: re-encoding them, so there is one representation and
+    #: `_assert_projection_is_total` compares them by value.
+    effects: Tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.node_id).strip():

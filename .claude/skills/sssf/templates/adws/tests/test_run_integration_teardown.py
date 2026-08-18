@@ -100,6 +100,12 @@ class _RunSeamHarness:
         ), mock.patch.object(
                 maestro, "_scheduler_gate_deps", return_value=(gate, gate)
         ), mock.patch.object(
+                # Runner resolution probes a real interpreter, which is what
+                # these tests are not about. It joins the four seams above for
+                # the same reason they are here: this file asks what a run does
+                # to worktrees, and every other question is stubbed.
+                maestro, "_resolve_run_runners", return_value={}
+        ), mock.patch.object(
                 maestro.lc, "LifecycleStore"
         ), mock.patch.object(
                 maestro.scheduler, "Scheduler", scheduler_class):

@@ -31,8 +31,24 @@ from adw_modules import plan_digest as pd  # noqa: E402
 from adw_modules import plan_model as pm  # noqa: E402
 from adw_modules import workspace_model as wm  # noqa: E402
 from adw_modules import workspace_runtime as wr  # noqa: E402
+from adw_modules import runner_resolution as rr  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
 from adw_modules.launcher import HarnessQuiescenceError  # noqa: E402
+
+
+def _stub_runner(*prefix: str) -> rr.ResolvedRunner:
+    """A resolved runner standing for an arbitrary command.
+
+    `run_integration_gate` now takes a `ResolvedRunner` rather than a command,
+    which is the point of the change: a caller has nothing to build an
+    invocation from. A test that mocks the process away still has to name one,
+    and naming it here keeps that visible rather than reintroducing the bare
+    command through a default argument.
+    """
+    return rr.ResolvedRunner(
+        runner="pytest", executable=prefix[0],
+        launcher_args=tuple(prefix[1:]), origin="declared", probe_exit=5,
+        version="stub")
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
@@ -440,6 +456,43 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
         with self.assertRaises(wr.GateConfigurationError):
             wr.run_global_gates(acceptance, (gate,), lambda: False)
 
+    def test_the_runner_is_resolved_once_per_runner_and_checkout(self) -> None:
+        """Every probe is a real collection over the whole tree — ten seconds
+        on the repository this was measured against, and bounded at 180 — so
+        resolving inside the gate loop makes N gates on one runner pay N times
+        for one answer."""
+        api, _, candidate, _ = self._accepted_candidate()
+        accepted = _commit_gate_suite(candidate.candidate_worktree, "api")
+        gates = tuple(
+            pm.Gate(runner="pytest", cwd="repositories/api",
+                    argv=("-q", "test_gate.py"), min_cases=2)
+            for _ in range(3))
+        workspace = self._workspace((api, self._read_only()), gates)
+        paths = wr.resolve_repository_paths(self.manifest, workspace)
+        acceptance = wr.assemble_acceptance("run-1", workspace, paths,
+                                             {"api": accepted}, self.state_root)
+
+        real = wr.rr.resolve
+        calls = []
+
+        def counted(runner, repo, cwd=".", **kwargs):
+            calls.append((runner, str(repo), kwargs.get("env")))
+            return real(runner, repo, cwd, **kwargs)
+
+        with mock.patch.object(wr.rr, "resolve", counted):
+            results = wr.run_global_gates(acceptance, gates, lambda: False)
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(len(calls), 1, "three gates, one runner, one checkout")
+        # The probe must run under the environment the gate will run under.
+        # Establishing capability under an environment the gate will not have
+        # proves nothing about the gate, and the two differ by exactly the
+        # cache redirections `launch_env` overlays.
+        _runner, _repo, env = calls[0]
+        self.assertIsNotNone(env, "the probe inherited this process's environment")
+        self.assertIn("PYTEST_ADDOPTS", env)
+        self.assertIn(".maestro-gate-scratch", env["PYTEST_ADDOPTS"])
+
     def test_runs_global_gates_in_declaration_order_from_acceptance_relative_cwd(self) -> None:
         api, _, candidate, _ = self._accepted_candidate()
         accepted = _commit_gate_suite(candidate.candidate_worktree, "api")
@@ -460,9 +513,14 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
 
         self.assertEqual(tuple(result.label for result in results),
                          ("global-gate-0", "global-gate-1"))
-        self.assertEqual(tuple(result.command for result in results),
-                         (("pytest", "-q", "test_gate.py"),
-                          ("pytest", "-q", "test_gate.py")))
+        # The runner is resolved to an absolute interpreter rather than taken
+        # as the bare literal, so what is asserted is that each gate ran the
+        # pytest that resolution chose, with the gate's own argv behind it.
+        for result in results:
+            self.assertTrue(Path(result.command[0]).is_absolute(), result.command)
+            self.assertIn("pytest", result.command[0].rsplit("/", 1)[-1:]
+                          + list(result.command[1:3]))
+            self.assertEqual(tuple(result.command[-2:]), ("-q", "test_gate.py"))
         self.assertEqual(tuple(result.counts["passed"] for result in results), (2, 2))
 
 
@@ -477,16 +535,17 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
         with self.assertRaises(wr.GateFailure) as failure:
             wr.run_global_gates(acceptance, (insufficient,), lambda: False)
         self.assertEqual(failure.exception.gate_index, 0)
-        self.assertEqual(failure.exception.result.command,
-                         ("pytest", "-q", "test_gate.py"))
+        self.assertEqual(tuple(failure.exception.result.command[-2:]),
+                         ("-q", "test_gate.py"))
         self.assertEqual(failure.exception.result.counts["passed"], 2)
 
         exit_failure = pm.Gate(runner="pytest", cwd="repositories/api",
                                argv=("-q", "does-not-exist.py"), min_cases=1)
         with self.assertRaises(wr.GateFailure) as failure:
             wr.run_global_gates(acceptance, (exit_failure,), lambda: False)
-        self.assertEqual(failure.exception.result.command,
-                         ("pytest", "-q", "does-not-exist.py"))
+        command = failure.exception.result.command
+        self.assertTrue(Path(command[0]).is_absolute(), command)
+        self.assertEqual(tuple(command[-2:]), ("-q", "does-not-exist.py"))
         self.assertNotEqual(failure.exception.result.exit_code, 0)
 
     def test_gate_quiescence_error_propagates_as_a_typed_failure(self) -> None:
@@ -497,8 +556,8 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
                     "HARNESS_CONTEXT_QUIESCENCE_UNPROVEN")):
             with self.assertRaises(HarnessQuiescenceError):
                 wt.run_integration_gate(
-                    self.root, ("gate-command",), scratch, lambda: False,
-                    label="quiescence-gate")
+                    self.root, _stub_runner("gate-command"), (), scratch,
+                    lambda: False, label="quiescence-gate")
 
     def test_gate_environment_preserves_pytest_plugin_autoload_default(self) -> None:
         scratch = self.root / "plugin-scratch"

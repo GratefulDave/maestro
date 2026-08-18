@@ -52,10 +52,28 @@ def _ir() -> dict:
             "sha256": "a" * 64,
             "required": True,
         }],
+        "requirements": [{
+            "requirement_id": "req-freeze",
+            "text": "Freeze the writers behind a greeting module.",
+            # Where the requirement's behaviour lives, declared as paths and
+            # mutation kinds rather than left to the prose above. `written`
+            # must be one of this lane's own outputs; `unmodified` must be a
+            # pinned source artifact no lane rewrites.
+            "surface": [
+                {"path": "src/greeting.py", "mutation": "written"},
+                {"path": "README.md", "mutation": "unmodified"},
+            ],
+            # Required, like `surface`: a plan states what external acts it
+            # forbids and every requirement states its disposition toward each
+            # one. This fixture forbids nothing, which is a declaration rather
+            # than an omission.
+            "effects": [],
+        }],
         "lanes": [{
             "lane_id": "lane-freeze",
             "title": "Freeze writers",
             "execution_context": ".",
+            "requirement_ids": ["req-freeze"],
             "depends_on": [],
             "verifier_ids": ["verify-freeze"],
         }],
@@ -69,6 +87,7 @@ def _ir() -> dict:
         "extensions": {"maestro": {
             "repo": "example",
             "outputs": {"lane-freeze": ["src/greeting.py"]},
+            "prohibited_effects": [],
             "integration_branch": "main",
             "integration_gate": {
                 "runner": "pytest", "argv": ["tests"], "cwd": ".",

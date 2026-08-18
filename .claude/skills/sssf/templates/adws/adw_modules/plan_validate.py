@@ -44,10 +44,11 @@ from __future__ import annotations
 import hashlib
 import posixpath
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (Any, Dict, List, Mapping, Optional, Sequence, Set,
+                    Tuple, Union)
 
 try:  # pragma: no cover - typing only
     from typing import Protocol
@@ -57,6 +58,7 @@ except ImportError:  # pragma: no cover - Python < 3.8
 from . import plan_canonical as pc
 from . import plan_digest as pd
 from . import plan_model as pm
+from . import runner_resolution as rr
 
 
 class Obligation(str, Enum):
@@ -151,19 +153,16 @@ class GateCollector(Protocol):
         ...
 
 
-#: How each runner is asked to enumerate without executing.
+#: The collection flags, without a binary — the table used to carry one.
 #:
-#: pytest reads ``addopts`` from the repository's own ini file and prepends it,
-#: so a repository carrying ``-v`` there cancels the ``-q`` here: verbosity nets
-#: to the default and ``--collect-only`` prints its tree form (``<Function x>``)
-#: instead of flat ``path::case`` identifiers. ``_count`` reads identifiers, so
-#: that renders every gate in such a repository as zero collected cases.
-#: ``-o addopts=`` clears the inherited options, making collection output depend
-#: on this argv alone.
-COLLECT_ARGV: Dict[str, Tuple[str, ...]] = {
-    "pytest": ("pytest", "--collect-only", "-q", "-o", "addopts="),
-    "vitest": ("vitest", "list", "--run"),
-}
+#: `COLLECT_ARGV["pytest"]` began `("pytest", …)`, so the interpreter that
+#: enumerated a gate was whatever `PATH` exposed to the shell that started the
+#: verb. On the machine this was measured on that was pytest 8.4.0 from
+#: homebrew, which cannot import the target repository's `conftest.py` and
+#: reports every gate as zero collected cases. The binary now comes from
+#: `runner_resolution.ResolvedRunner`, and this module re-exports the flags
+#: from there so there is exactly one table rather than two that can disagree.
+COLLECT_ARGS = rr.COLLECT_ARGS
 
 
 @dataclass(frozen=True)
@@ -173,12 +172,41 @@ class SubprocessCollector:
     It is a seam rather than a hard dependency because collection is the one
     obligation that must touch the environment, and §6.4 puts environment
     facts outside eligibility. A missing runner raises rather than blocks.
+
+    The runner is **resolved**, never inherited. `resolver` is the single
+    producer `runner_resolution.resolve`, memoised per `(runner, cwd)` so the
+    twelve obligations pay the capability probe once for a plan rather than
+    once per gate. A resolution that refuses becomes `CollectorUnavailable` —
+    which is a reuse, not a new type: this module's own docstring already
+    states that a collector which cannot run is "an operational refusal with
+    no identity consequence, rather than being recorded as a blocker that
+    would make a missing binary look like a defect in the authored bytes",
+    and a runner that cannot import the repository is exactly that.
     """
 
     timeout_s: float = 120.0
+    #: Declared `runners:` values by runner literal, from `maestro.config.yaml`.
+    #: Empty means nothing is declared and discovery proposes.
+    declared: Mapping[str, str] = field(default_factory=dict)
+    env: Optional[Mapping[str, str]] = None
+    resolver: Any = staticmethod(rr.resolve)
+    _cache: Dict[Tuple[str, str], "rr.ResolvedRunner"] = field(
+        default_factory=dict, repr=False, compare=False)
 
-    def argv_for(self, gate: "pm.Gate") -> Tuple[str, ...]:
-        return COLLECT_ARGV[gate.runner] + tuple(gate.argv)
+    def runner_for(self, gate: "pm.Gate", tree: Path) -> "rr.ResolvedRunner":
+        key = (gate.runner, str(gate.cwd))
+        if key not in self._cache:
+            try:
+                self._cache[key] = self.resolver(
+                    gate.runner, Path(tree), gate.cwd,
+                    declared=self.declared.get(gate.runner), env=self.env)
+            except rr.RunnerUnusable as exc:
+                raise CollectorUnavailable(
+                    "{0}:{1}".format(rr.RUNNER_UNUSABLE, exc.detail)) from exc
+        return self._cache[key]
+
+    def argv_for(self, gate: "pm.Gate", tree: Path) -> Tuple[str, ...]:
+        return self.runner_for(gate, tree).collect_argv(gate)
 
     def collect(self, gate: "pm.Gate", tree: Path) -> int:
         cwd = Path(tree) / gate.cwd
@@ -186,7 +214,10 @@ class SubprocessCollector:
             raise CollectorUnavailable(
                 "the gate's working directory does not exist: {0}".format(cwd))
         try:
-            result = subprocess.run(list(self.argv_for(gate)), cwd=str(cwd),
+            result = subprocess.run(list(self.argv_for(gate, tree)),
+                                    cwd=str(cwd),
+                                    env=dict(self.env) if self.env is not None
+                                    else None,
                                     capture_output=True, text=True,
                                     timeout=self.timeout_s)
         except FileNotFoundError as exc:
@@ -673,3 +704,795 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))
     return ValidationResult(Outcome.FINALIZATION_ELIGIBLE,
                             pd.digest_of(stored), ())
+
+
+# ── contract-IR admission ───────────────────────────────────────────────────
+#
+# Two obligations over a `plan-contract.v1` IR, over two domains, asked at the
+# same moment: can any correct attempt satisfy this lane's contract, and does
+# any requirement prescribe an effect the plan forbids.
+#
+# ## What the run cost, and why prose could not decide it
+#
+# Recorded failure, run-0120c32064d144c2aa55c344087e0b0a. Plan
+# `cmo-consolidation-l` carried thirteen lanes and lost nodes to two distinct
+# shapes of unsatisfiable contract.
+#
+# **Shape (i) — a lane that cannot write what its requirement needs.**
+# `lane-p1-freeze-and-run-log` was required to freeze the legacy writers at a
+# high-water mark and prove no code path updates a historical record in place.
+# Its declared outputs were one new module and that module's test; the legacy
+# writers appeared in the declared outputs of none of the plan's fourteen
+# lanes. The builder could not write the file the behaviour needed, §8.3's
+# permission delta would have rejected it, and every attempt produced an
+# out-of-contract workaround the reviewer correctly rejected.
+#
+# **Shape (ii) — a requirement that both prohibits and prescribes one effect.**
+# `lane-p1-canonical-object-key`'s requirement declares "a pure derivation and
+# policy module with injected clients" and "no production migration, object
+# mutation, or backfill execution is authorized", and in the same paragraph
+# prescribes "verify and hash it first and then server-side copy it to the
+# canonical key". Three attempts, all correctly rejected.
+#
+# Eight of the thirteen catalogued instances are shape (i) and four are shape
+# (ii). The two shapes need two predicates because they are over two domains:
+# shape (i) is about repository paths, and shape (ii) is about **external**
+# effects — a bucket, a table, the network. `_is_declarable` below requires a
+# relative repository path, so `case-management-orders/sha256/{first2}/….pdf`
+# and `MDLDocumentCatalog` cannot be expressed in a surface entry at all. That
+# is a wrong-domain answer, not a gap in cleverness, and `validate_contract_
+# surface` catches zero of the four.
+#
+# Neither shape was visible to any relation the IR already carried. For the
+# freeze lane, every typed relation binding a path to it — its outputs, its
+# `depends_on` closure, its fixtures, its claim subject, its verifier argv, its
+# source artifacts — was *satisfied*. The only statement that the legacy
+# writers were in scope was prose, and §1.2 forbids a lifecycle transition
+# caused by free text. An admission decision is a lifecycle transition.
+#
+# ## Migration: a plan authored before these fields is refused
+#
+# Stated plainly because the alternative is worse. `requirements[].surface`,
+# `requirements[].effects`, and `extensions.maestro.prohibited_effects` are
+# **required**, so every plan authored before they existed is refused at
+# ingress with a blocker naming the requirement that lacks them, and must be
+# re-authored. Both real IRs are in that state today: `cmo-consolidation-l`
+# refuses with fourteen `SURFACE_DECLARED` blockers and `cmo-consolidation-l-r2`
+# with thirteen.
+#
+# Making them optional-and-checked-when-present was considered and refused on
+# §3.6 B8: a field added later is optional forever, and an optional write
+# surface would be declared by exactly the plans that already had one. There is
+# no upgrade function and no default, for the same reason §6.3 gives for the
+# plan schema: a default here is an answer nobody authored.
+#
+# ## What this does not catch, at the same volume as what it does
+#
+# * A false declaration. A surface listing only reachable paths, or an effect
+#   declared `planned` by a requirement whose module executes, is admitted.
+#   Both are now a single typed cell an author had to write, which is the
+#   plan-contract reviewer's to falsify (§3.6 B12) — a structural check cannot
+#   honestly claim more.
+# * Ordering contradictions. `req-p1-canonical-object-key` also contains one —
+#   verify *then* copy, in a module described as pure — and only the effect
+#   class is seen here, never the sequence.
+# * Effects outside the closed five. A filesystem write outside the repository,
+#   a queue, an email. Adding a member is cheap; guessing at one now is B15.
+# * A requirement whose oracle demands a different artifact from its own text.
+#   One of the thirteen is that shape and neither predicate here sees it.
+
+
+class AdmissionObligation(str, Enum):
+    """The obligations over a `plan-contract.v1` IR, at admission.
+
+    Named `Admission*` rather than `Surface*` because the set now spans two
+    domains. A class called `Surface…` carrying `EFFECT_AUTHORIZED` is how
+    "the twelve" stops being a checkable count and becomes a sentence in a
+    docstring — the failure `OBLIGATIONS` above carries a comment about.
+    """
+
+    #: The IR states a surface at all, in the declared shape.
+    SURFACE_DECLARED = "SURFACE_DECLARED"
+    #: Declared paths and declared outputs contain each other.
+    SURFACE_REACHABLE = "SURFACE_REACHABLE"
+    #: Every prohibited effect has exactly one declared disposition, in every
+    #: requirement, and the plan states what each prohibition means.
+    EFFECT_DECLARED = "EFFECT_DECLARED"
+    #: No requirement performs an effect the plan prohibits.
+    EFFECT_AUTHORIZED = "EFFECT_AUTHORIZED"
+    #: Every planned effect is executed by something in this plan.
+    EFFECT_DISCHARGED = "EFFECT_DISCHARGED"
+    #: Requirements bound to one lane agree about that lane's effects.
+    EFFECT_CONSISTENT = "EFFECT_CONSISTENT"
+
+
+#: Named as a tuple as well as an enum so the count is checkable rather than a
+#: sentence, and asserted in `tests/test_plan_admission.py`. The predecessor of
+#: this tuple had no reader anywhere in the tree, which is the B15 defect this
+#: module's own docstring cites — arriving on its first commit.
+ADMISSION_OBLIGATIONS: Tuple[AdmissionObligation, ...] = (
+    AdmissionObligation.SURFACE_DECLARED,
+    AdmissionObligation.SURFACE_REACHABLE,
+    AdmissionObligation.EFFECT_DECLARED,
+    AdmissionObligation.EFFECT_AUTHORIZED,
+    AdmissionObligation.EFFECT_DISCHARGED,
+    AdmissionObligation.EFFECT_CONSISTENT,
+)
+
+
+#: The three ways a requirement's behaviour can relate to a repository path,
+#: and the containment each one asserts. There is no fourth, and no default:
+#: an unrecognised value is a blocker rather than a guess, because the whole
+#: point of the field is that the author states which of the three it is.
+#:
+#: * ``written`` — the lane must create or modify this path. It must be one of
+#:   that lane's own declared outputs. A dependency's output does not satisfy
+#:   this: writing another lane's output from this worktree is exactly what
+#:   §8.3's permission delta rejects, and §6.4's single-output-owner
+#:   obligation forbids two lanes claiming it.
+#: * ``inherited`` — the behaviour lives in a path some lane in this lane's
+#:   `depends_on` closure produces. The lane reads it; it does not write it.
+#: * ``unmodified`` — the behaviour is asserted over a pre-existing path that
+#:   the plan changes nowhere. It must be a declared `source_artifacts` entry
+#:   **carrying a sha256**, and it must not appear in any lane's outputs — a
+#:   path some lane rewrites is not unmodified, whoever says otherwise.
+#:
+#: A fourth member was proposed and refused. `creates` buys nothing: "written
+#: and absent at base" is already distinguished downstream, where
+#: `plan_author.fill_git_facts` fills `base_sha256` from the git object and
+#: `_evidence_typed_against_git` blocks a produced path present at base that
+#: declares none. `deletes` is an object-store fact and lives in `EFFECTS`.
+#: `fake_only` is a disposition, not a mutation: it is a statement about an
+#: external effect, and putting it here would make a path field carry a
+#: non-path fact.
+MUTATIONS: Tuple[str, ...] = ("written", "inherited", "unmodified")
+
+
+#: The closed set of external effects a plan can prohibit.
+#:
+#: Named after the **act** rather than the mechanism, deliberately. An earlier
+#: draft named them `s3_object_write`, `network_retrieval`, and so on — but the
+#: source document prohibits acts, so a lane could use the mechanism without
+#: committing the act and no author could falsify the cell. `source_backfill`
+#: is retrieving an artifact from a provider because no local copy exists;
+#: reading an API to compare output is not that, and under a mechanism name it
+#: would have been indistinguishable.
+EFFECTS: Tuple[str, ...] = (
+    #: Writing an object into the canonical namespace. A report artifact
+    #: written elsewhere is not this.
+    "canonical_object_write",
+    #: Deleting, moving, or replacing an object at a source or canonical
+    #: locator.
+    "source_object_delete",
+    #: Writing a projection table in the document store.
+    "catalog_projection_write",
+    #: Retrieving an artifact from a provider source because no local copy
+    #: exists. Reading an API to compare output is not this.
+    "source_backfill",
+    #: Applying a migration. Authoring a revision file is not this.
+    "migration_execution",
+)
+
+
+#: What a requirement says its lane does about one effect.
+#:
+#: * ``performed`` — the lane's code executes the effect against a real client.
+#: * ``planned`` — the lane emits a typed record *describing* the effect and
+#:   executes nothing. Something else in the plan has to execute it, which is
+#:   what `EFFECT_DISCHARGED` checks; without that reader `planned` would be a
+#:   member that changes no decision.
+#: * ``fake_only`` — the lane's code executes the effect, and every invocation
+#:   the gate exercises reaches an injected fake.
+#: * ``none`` — the lane does not perform, plan, or fake this effect.
+#:
+#: `none` earns its place by measurement rather than by symmetry. With three
+#: values, an author forced to declare all five effects had no way to say "not
+#: applicable" and reached for `planned`: in the first IR authored against this
+#: field, `planned` was truthful in 3 of 51 entries. The field had stopped
+#: discriminating on first use. `none` narrows `planned` to something
+#: falsifiable.
+DISPOSITIONS: Tuple[str, ...] = ("performed", "planned", "fake_only", "none")
+
+#: The dispositions that execute an effect, and so discharge a plan for it.
+_EXECUTING_DISPOSITIONS: frozenset = frozenset({"performed", "fake_only"})
+
+
+@dataclass(frozen=True)
+class AdmissionBlocker:
+    """One typed blocker with a JSON pointer into the authored IR.
+
+    Deliberately not `Blocker`: those twelve are obligations over
+    `maestro-plan.v1` stored bytes and their count is asserted as twelve.
+    These are obligations over the contract IR, which is a different document
+    with different pointers, and merging the two enums would make "the twelve"
+    a sentence again rather than a checkable count.
+    """
+
+    obligation: AdmissionObligation
+    pointer: str
+    message: str
+
+
+def _normalized_path(value: str) -> str:
+    return posixpath.normpath(value)
+
+
+def _is_declarable(path: Any) -> bool:
+    """A relative repository path that does not leave the tree."""
+    if not isinstance(path, str) or not path:
+        return False
+    if path.startswith("/") or "\\" in path or ":" in path:
+        return False
+    return not any(part in (".", "..") for part in path.split("/"))
+
+
+def _is_digest(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
+
+
+def _lane_outputs(ir: Mapping[str, Any]) -> Dict[str, Set[str]]:
+    """`extensions.maestro.outputs`, normalized, keyed by lane id.
+
+    Malformed shapes resolve to no outputs rather than raising: the ingress
+    boundary already refuses those with `UNMAPPABLE_OUTPUTS`, naming the lane,
+    and a second refusal for the same defect would report one plan error as
+    two in two vocabularies.
+    """
+    extensions = ir.get("extensions")
+    maestro = extensions.get("maestro") if isinstance(extensions, dict) else None
+    declared = maestro.get("outputs") if isinstance(maestro, dict) else None
+    outputs: Dict[str, Set[str]] = {}
+    if not isinstance(declared, dict):
+        return outputs
+    for lane_id, paths in declared.items():
+        if not isinstance(lane_id, str) or not isinstance(paths, list):
+            continue
+        outputs[lane_id] = {_normalized_path(path) for path in paths
+                            if isinstance(path, str) and path}
+    return outputs
+
+
+def _pinned_paths(ir: Mapping[str, Any]) -> Set[str]:
+    """Source-artifact paths that actually pin their bytes.
+
+    An entry without a sha256 is not counted. The `unmodified` blocker below
+    says the point of the arm is that something pins the bytes the assertion
+    is about, and an unpinned entry defeats exactly that — so admitting one
+    would make the check's own stated purpose false.
+    """
+    sources = ir.get("source_artifacts")
+    if not isinstance(sources, list):
+        return set()
+    paths: Set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if _is_declarable(source.get("path")) and _is_digest(source.get("sha256")):
+            paths.add(_normalized_path(source["path"]))
+    return paths
+
+
+def _depends_closure(lane_id: str,
+                     depends: Mapping[str, Sequence[str]]) -> Set[str]:
+    """Every lane reachable through `depends_on`, excluding the lane itself.
+
+    Iterative and visited-guarded because a cycle is §6.4's own obligation to
+    report against the projected plan; discovering one here must not hang the
+    admission check that runs before it.
+    """
+    seen: Set[str] = set()
+    frontier: List[str] = list(depends.get(lane_id, ()))
+    while frontier:
+        current = frontier.pop()
+        if current in seen or current == lane_id:
+            continue
+        seen.add(current)
+        frontier.extend(depends.get(current, ()))
+    return seen
+
+
+def _lane_graph(ir: Mapping[str, Any]
+                ) -> Tuple[Dict[str, Sequence[str]], Dict[str, List[str]],
+                           Dict[str, List[str]]]:
+    """`(depends_on, lanes-by-requirement, requirements-by-lane)`.
+
+    One walk of `lanes[]`, because both predicates need the same three maps and
+    two walks would be two chances to disagree about which lane binds what.
+    """
+    lanes = ir.get("lanes")
+    records = [lane for lane in lanes if isinstance(lane, dict)] \
+        if isinstance(lanes, list) else []
+    depends: Dict[str, Sequence[str]] = {}
+    lanes_by_requirement: Dict[str, List[str]] = {}
+    requirements_by_lane: Dict[str, List[str]] = {}
+    for lane in records:
+        lane_id = lane.get("lane_id")
+        if not isinstance(lane_id, str) or not lane_id:
+            continue
+        needs = lane.get("depends_on")
+        depends[lane_id] = [need for need in needs if isinstance(need, str)] \
+            if isinstance(needs, list) else []
+        requirements_by_lane.setdefault(lane_id, [])
+        bound = lane.get("requirement_ids")
+        if not isinstance(bound, list):
+            continue
+        for requirement_id in bound:
+            if isinstance(requirement_id, str) and requirement_id:
+                lanes_by_requirement.setdefault(requirement_id, []).append(lane_id)
+                requirements_by_lane[lane_id].append(requirement_id)
+    return depends, lanes_by_requirement, requirements_by_lane
+
+
+def _requirement_surface(index: int, requirement: Mapping[str, Any],
+                         blockers: List[AdmissionBlocker]
+                         ) -> List[Tuple[int, str, str]]:
+    """The requirement's surface as `(entry index, path, mutation)` triples.
+
+    Every malformed entry is reported and dropped, so one unreadable record
+    does not hide the reachable/unreachable answer for the records beside it.
+    """
+    pointer = "/requirements/{0}/surface".format(index)
+    label = requirement.get("requirement_id", "at index {0}".format(index))
+    declared = requirement.get("surface")
+    if declared is None:
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.SURFACE_DECLARED, pointer,
+            "requirement {0} declares no surface; a requirement states the "
+            "repository paths its behaviour lives in, so a lane that cannot "
+            "write them is refused before a run starts rather than after a "
+            "node has spent its retry budget".format(label)))
+        return []
+    if not isinstance(declared, list) or not declared:
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.SURFACE_DECLARED, pointer,
+            "requirement {0} declares a surface that is not a non-empty "
+            "list".format(label)))
+        return []
+    entries: List[Tuple[int, str, str]] = []
+    for position, entry in enumerate(declared):
+        entry_pointer = "{0}/{1}".format(pointer, position)
+        if not isinstance(entry, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_DECLARED, entry_pointer,
+                "a surface entry is a {path, mutation} object"))
+            continue
+        path = entry.get("path")
+        if not _is_declarable(path):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_DECLARED, entry_pointer + "/path",
+                "{0!r} is not a relative repository path".format(path)))
+            continue
+        mutation = entry.get("mutation")
+        if mutation not in MUTATIONS:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_DECLARED,
+                entry_pointer + "/mutation",
+                "{0!r} is not one of {1}".format(
+                    mutation, ", ".join(MUTATIONS))))
+            continue
+        entries.append((position, _normalized_path(path), mutation))
+    return entries
+
+
+def validate_contract_surface(ir: Mapping[str, Any]
+                              ) -> Tuple[AdmissionBlocker, ...]:
+    """Refuse a `plan-contract.v1` IR whose lane cannot satisfy its contract.
+
+    The question is asked of the whole plan rather than of one lane: a path is
+    reachable when it lies in the lane's own declared outputs, in the outputs
+    of a lane in its `depends_on` closure, or among the hash-pinned source
+    artifacts the plan declares and changes nowhere. Which of the three a
+    requirement means is the requirement's own `mutation`, not an inference,
+    so a `written` path is never satisfied by a sibling's output and an
+    `unmodified` path is never satisfied by one either.
+
+    **Containment runs both ways, and the converse arm is what makes the check
+    a satisfiability check rather than a consistency one.** With forward
+    containment alone, an author who writes each requirement's surface as
+    exactly the outputs already chosen for its lane passes trivially: the
+    freeze lane's surface would have been its own module and its own test, and
+    the run would have burned identically. Requiring every declared output to
+    be claimed `written` by some requirement the lane binds means
+    under-declaration now needs a visibly unowned output, which the author has
+    to look at.
+
+    Nothing here reads `requirements[].text`, `verifiers[].oracle`,
+    `seams[].producer`, `fixtures[].meaning`, or any other free-text field.
+    Every input is a declared path, a declared enumerated value, or a declared
+    id — §1.2.
+    """
+    blockers: List[AdmissionBlocker] = []
+
+    requirements = ir.get("requirements")
+    if not isinstance(requirements, list) or not requirements:
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.SURFACE_DECLARED, "/requirements",
+            "the plan declares no requirements, so no lane has a contract to "
+            "be checked against; an executable plan states what it must make "
+            "true"))
+        return tuple(blockers)
+
+    outputs = _lane_outputs(ir)
+    every_output: Set[str] = set()
+    for paths in outputs.values():
+        every_output |= paths
+    pinned = _pinned_paths(ir)
+    depends, lanes_by_requirement, requirements_by_lane = _lane_graph(ir)
+
+    #: `(lane_id, path)` pairs some bound requirement claims as `written`, for
+    #: the converse arm below.
+    claimed: Set[Tuple[str, str]] = set()
+
+    for index, requirement in enumerate(requirements):
+        if not isinstance(requirement, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_DECLARED,
+                "/requirements/{0}".format(index),
+                "a requirement is an object"))
+            continue
+        requirement_id = requirement.get("requirement_id")
+        if not isinstance(requirement_id, str) or not requirement_id:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_DECLARED,
+                "/requirements/{0}/requirement_id".format(index),
+                "a requirement declares an id, which is how a lane binds to "
+                "it"))
+            continue
+        entries = _requirement_surface(index, requirement, blockers)
+        owners = lanes_by_requirement.get(requirement_id, [])
+        if not owners:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_REACHABLE,
+                "/requirements/{0}/requirement_id".format(index),
+                "{0} is declared by no lane, so no node in this plan can "
+                "satisfy it".format(requirement_id)))
+            continue
+        for lane_id in owners:
+            own = outputs.get(lane_id, set())
+            upstream: Set[str] = set()
+            for upstream_lane in _depends_closure(lane_id, depends):
+                upstream |= outputs.get(upstream_lane, set())
+            for position, path, mutation in entries:
+                pointer = "/requirements/{0}/surface/{1}/path".format(
+                    index, position)
+                if mutation == "written":
+                    claimed.add((lane_id, path))
+                    if path in own:
+                        continue
+                    holder = sorted(other for other, paths in outputs.items()
+                                    if path in paths)
+                    elsewhere = (
+                        "it is declared as an output of " + ", ".join(holder)
+                        if holder else
+                        "no lane in this plan declares it as an output")
+                    blockers.append(AdmissionBlocker(
+                        AdmissionObligation.SURFACE_REACHABLE, pointer,
+                        "lane {0} must write {1} to satisfy {2}, but {1} is "
+                        "not one of that lane's declared outputs ({3}); {4}. "
+                        "No attempt at this lane can write it, so every "
+                        "attempt either fails the permission-delta check or "
+                        "leaves the contract".format(
+                            lane_id, path, requirement_id,
+                            ", ".join(sorted(own)) or "none", elsewhere)))
+                elif mutation == "inherited":
+                    if path in upstream:
+                        continue
+                    blockers.append(AdmissionBlocker(
+                        AdmissionObligation.SURFACE_REACHABLE, pointer,
+                        "lane {0} inherits {1} for {2}, but no lane in its "
+                        "depends_on closure ({3}) produces it".format(
+                            lane_id, path, requirement_id,
+                            ", ".join(sorted(_depends_closure(lane_id, depends)))
+                            or "empty")))
+                else:
+                    if path not in pinned:
+                        blockers.append(AdmissionBlocker(
+                            AdmissionObligation.SURFACE_REACHABLE, pointer,
+                            "lane {0} asserts unmodified behaviour over {1} "
+                            "for {2}, but {1} is not a declared source "
+                            "artifact carrying a sha256, so nothing pins the "
+                            "bytes the assertion is about".format(
+                                lane_id, path, requirement_id)))
+                    if path in every_output:
+                        holder = sorted(other for other, paths in outputs.items()
+                                        if path in paths)
+                        blockers.append(AdmissionBlocker(
+                            AdmissionObligation.SURFACE_REACHABLE, pointer,
+                            "lane {0} asserts {1} is unmodified for {2}, but "
+                            "{3} declares it as an output".format(
+                                lane_id, path, requirement_id,
+                                ", ".join(holder))))
+
+    # The converse arm. A declared output no bound requirement claims is a
+    # lane doing work its own contract does not describe, which is exactly the
+    # under-declaration that made the forward arm passable by an author who
+    # copied the outputs into the surface.
+    for lane_id in sorted(outputs):
+        bound = requirements_by_lane.get(lane_id, [])
+        for path in sorted(outputs[lane_id]):
+            if (lane_id, path) in claimed:
+                continue
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.SURFACE_REACHABLE,
+                "/extensions/maestro/outputs/{0}".format(lane_id),
+                "lane {0} declares the output {1}, which no requirement it "
+                "binds ({2}) claims as written; a path the lane writes and no "
+                "requirement accounts for is work outside the contract the "
+                "reviewer will judge it against".format(
+                    lane_id, path,
+                    ", ".join(bound) if bound else "none")))
+    return tuple(blockers)
+
+
+# ── the second domain: effects a plan forbids ───────────────────────────────
+
+def _prohibited_effects(ir: Mapping[str, Any],
+                        blockers: List[AdmissionBlocker]
+                        ) -> "Dict[str, str]":
+    """`{effect: meaning}` from `extensions.maestro.prohibited_effects`.
+
+    Each entry is `{effect, meaning}` rather than a bare effect name, and
+    `meaning` is transcribed from the plan's source document in that
+    document's own terms. It has three readers and would not exist without
+    them: this presence check, which refuses a plan that leaves it blank; the
+    `EFFECT_AUTHORIZED` refusal below, which quotes it so an author is told
+    which prohibited act they declared rather than only which enum member; and
+    the node contract the reviewer is handed. Without that last one the plan
+    reviewer and the node reviewer would resolve an effect name from two
+    different documents, which is this same failure one level down.
+    """
+    extensions = ir.get("extensions")
+    maestro = extensions.get("maestro") if isinstance(extensions, dict) else None
+    declared = maestro.get("prohibited_effects") if isinstance(maestro, dict) \
+        else None
+    pointer = "/extensions/maestro/prohibited_effects"
+    if declared is None:
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.EFFECT_DECLARED, pointer,
+            "the plan declares no prohibited_effects; a plan states, once and "
+            "before any lane exists, which external acts it forbids, so a "
+            "requirement prescribing one is refused before a run starts"))
+        return {}
+    if not isinstance(declared, list):
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.EFFECT_DECLARED, pointer,
+            "prohibited_effects is a list of {effect, meaning} objects"))
+        return {}
+    prohibited: Dict[str, str] = {}
+    for index, entry in enumerate(declared):
+        entry_pointer = "{0}/{1}".format(pointer, index)
+        if not isinstance(entry, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED, entry_pointer,
+                "a prohibited effect is an {effect, meaning} object"))
+            continue
+        effect = entry.get("effect")
+        if effect not in EFFECTS:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED,
+                entry_pointer + "/effect",
+                "{0!r} is not one of {1}".format(effect, ", ".join(EFFECTS))))
+            continue
+        if effect in prohibited:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED,
+                entry_pointer + "/effect",
+                "{0} is prohibited twice; one prohibition means one "
+                "act".format(effect)))
+            continue
+        meaning = entry.get("meaning")
+        if not isinstance(meaning, str) or not meaning.strip():
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED,
+                entry_pointer + "/meaning",
+                "the prohibition of {0} states no meaning; an effect name is "
+                "resolved against the plan's source document, and without the "
+                "transcribed act the plan reviewer and the node reviewer "
+                "resolve it against different documents".format(effect)))
+            continue
+        prohibited[effect] = meaning.strip()
+    return prohibited
+
+
+def _requirement_effects(index: int, requirement: Mapping[str, Any],
+                         prohibited: Mapping[str, str],
+                         blockers: List[AdmissionBlocker]
+                         ) -> "Dict[str, Tuple[int, str]]":
+    """`{effect: (entry index, disposition)}` for one requirement.
+
+    Exhaustive over the prohibited set: every prohibited effect needs exactly
+    one entry here. That is what turns the bypass from silent omission into an
+    active false declaration in a typed field — an author who performs a
+    prohibited act can no longer stay quiet about it, they have to write a
+    disposition beside it, and a false one is a single cell the plan-contract
+    reviewer can falsify against the code the lane produces.
+    """
+    label = requirement.get("requirement_id", "at index {0}".format(index))
+    pointer = "/requirements/{0}/effects".format(index)
+    declared = requirement.get("effects")
+    if declared is None:
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.EFFECT_DECLARED, pointer,
+            "requirement {0} declares no effects; every prohibited effect "
+            "needs a disposition in every requirement, so silence about a "
+            "prohibited act is not a way to pass".format(label)))
+        return {}
+    if not isinstance(declared, list):
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.EFFECT_DECLARED, pointer,
+            "requirement {0} declares effects that are not a list".format(
+                label)))
+        return {}
+    found: Dict[str, Tuple[int, str]] = {}
+    for position, entry in enumerate(declared):
+        entry_pointer = "{0}/{1}".format(pointer, position)
+        if not isinstance(entry, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED, entry_pointer,
+                "an effect entry is an {effect, disposition} object"))
+            continue
+        effect = entry.get("effect")
+        if effect not in EFFECTS:
+            # An out-of-enum value and an omission are different author
+            # errors, and during migration both will be hit constantly, so
+            # they are never reported with one sentence.
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED,
+                entry_pointer + "/effect",
+                "requirement {0} declares the effect {1!r}, which is outside "
+                "the closed set {2}; this is a value error, not an "
+                "omission".format(label, effect, ", ".join(EFFECTS))))
+            continue
+        disposition = entry.get("disposition")
+        if disposition not in DISPOSITIONS:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED,
+                entry_pointer + "/disposition",
+                "requirement {0} declares the disposition {1!r} for {2}, "
+                "which is outside the closed set {3}; this is a value error, "
+                "not an omission".format(
+                    label, disposition, effect, ", ".join(DISPOSITIONS))))
+            continue
+        if effect in found:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED,
+                entry_pointer + "/effect",
+                "requirement {0} declares {1} twice, as {2} and as {3}; one "
+                "effect has one disposition".format(
+                    label, effect, found[effect][1], disposition)))
+            continue
+        found[effect] = (position, disposition)
+    for effect in EFFECTS:
+        if effect in prohibited and effect not in found:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.EFFECT_DECLARED, pointer,
+                "requirement {0} omits a required entry for the prohibited "
+                "effect {1} ({2}); declare it performed, planned, fake_only, "
+                "or none. This is an omission, not a value error".format(
+                    label, effect, prohibited[effect])))
+    return found
+
+
+def validate_effect_authorization(ir: Mapping[str, Any]
+                                  ) -> Tuple[AdmissionBlocker, ...]:
+    """Refuse a requirement that prescribes an act its own plan forbids.
+
+    Four of the thirteen catalogued instances are this shape, and none of them
+    is expressible as a repository path: the contentions are an object write
+    into the canonical namespace, a source backfill, and a projection write.
+    `validate_contract_surface` catches zero of the four, which is a
+    wrong-domain answer rather than a gap in it.
+
+    Three rules over the declared fields, and no others:
+
+    * **`EFFECT_AUTHORIZED`** — a requirement declaring an effect `performed`
+      while the plan prohibits it is refused. `planned`, `fake_only`, and
+      `none` are admitted under a prohibition: that is the distinction the
+      source document itself draws between describing an act, exercising it
+      against an injected fake, and not touching it.
+    * **`EFFECT_DISCHARGED`** — an effect some requirement declares `planned`,
+      that no requirement in the plan declares `performed` or `fake_only`, is
+      refused. A planned effect nothing discharges is a decision the plan
+      describes and never makes. Measured against the first IR authored with
+      this field, this alone refuses two of the five effects with no prose
+      read at all.
+    * **`EFFECT_CONSISTENT`** — a lane's effects are the union of the
+      requirements it binds, so two requirements on one lane declaring
+      different dispositions for one effect is refused rather than silently
+      merged. A lane cannot both fake and plan the same act.
+
+    The plan-level prohibition is what makes this stronger than a surface
+    check. `validate_contract_surface` compares two fields one author writes
+    in one sitting from one mental model, so copying outputs into the surface
+    passes it; `prohibited_effects` is transcribed once from the source
+    document before any lane exists, and the dispositions are written later,
+    one per lane. The contradiction is a fact between two fields written at
+    two moments about two different things.
+
+    Every input is a declared id or a member of a closed enumeration. No path,
+    no prose, no title — §1.2, satisfied more strongly than the surface
+    predicate's, which at least reads paths.
+    """
+    blockers: List[AdmissionBlocker] = []
+    prohibited = _prohibited_effects(ir, blockers)
+
+    requirements = ir.get("requirements")
+    if not isinstance(requirements, list) or not requirements:
+        # The surface predicate already refuses a plan with no requirements,
+        # naming it once. Reporting it twice would make one defect look like
+        # two in two vocabularies.
+        return tuple(blockers)
+
+    _depends, lanes_by_requirement, _by_lane = _lane_graph(ir)
+    planned: Dict[str, List[str]] = {}
+    planned_pointer: Dict[str, str] = {}
+    executed: Set[str] = set()
+    #: `(lane_id, effect) -> (requirement_id, disposition)`, first writer wins,
+    #: so the conflict below names the pair that disagreed.
+    by_lane: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+    for index, requirement in enumerate(requirements):
+        if not isinstance(requirement, dict):
+            continue
+        requirement_id = requirement.get("requirement_id")
+        if not isinstance(requirement_id, str) or not requirement_id:
+            continue
+        found = _requirement_effects(index, requirement, prohibited, blockers)
+        for effect, (position, disposition) in sorted(found.items()):
+            pointer = "/requirements/{0}/effects/{1}/disposition".format(
+                index, position)
+            if disposition == "performed" and effect in prohibited:
+                lanes = lanes_by_requirement.get(requirement_id, [])
+                blockers.append(AdmissionBlocker(
+                    AdmissionObligation.EFFECT_AUTHORIZED, pointer,
+                    "requirement {0} performs {1}, which this plan prohibits "
+                    "({2}); lane {3} would have to both do it and not do it. "
+                    "Declare the effect planned, fake_only, or none, or lift "
+                    "the plan-wide prohibition".format(
+                        requirement_id, effect, prohibited[effect],
+                        ", ".join(lanes) if lanes else "no lane binds it")))
+            if disposition == "planned":
+                planned.setdefault(effect, []).append(requirement_id)
+                planned_pointer.setdefault(effect, pointer)
+            if disposition in _EXECUTING_DISPOSITIONS:
+                executed.add(effect)
+            for lane_id in lanes_by_requirement.get(requirement_id, []):
+                key = (lane_id, effect)
+                if key not in by_lane:
+                    by_lane[key] = (requirement_id, disposition)
+                    continue
+                first_requirement, first_disposition = by_lane[key]
+                if first_disposition == disposition:
+                    continue
+                blockers.append(AdmissionBlocker(
+                    AdmissionObligation.EFFECT_CONSISTENT, pointer,
+                    "lane {0} binds {1} and {2}, which declare {3} as {4} and "
+                    "as {5}; a lane's effects are the union of its "
+                    "requirements', and a lane cannot both {4} and {5} one "
+                    "act".format(lane_id, first_requirement, requirement_id,
+                                 effect, first_disposition, disposition)))
+
+    for effect in sorted(planned):
+        if effect in executed:
+            continue
+        blockers.append(AdmissionBlocker(
+            AdmissionObligation.EFFECT_DISCHARGED, planned_pointer[effect],
+            "{0} is planned by {1} and executed by nothing in this plan; a "
+            "planned effect emits a record describing an act something else "
+            "carries out, so an undischarged one is a decision the plan "
+            "describes and never makes. Declare a lane that performs or fakes "
+            "it, or declare the effect none".format(
+                effect, ", ".join(planned[effect]))))
+    return tuple(blockers)
+
+
+def validate_admission(ir: Mapping[str, Any]) -> Tuple[AdmissionBlocker, ...]:
+    """Both admission predicates, in one pass, collecting every blocker.
+
+    Not short-circuiting, for §11.1's reason: an author sent back twice for
+    two admission defects in one document is the fail-fast validator this
+    design already refuses.
+    """
+    return (tuple(validate_contract_surface(ir))
+            + tuple(validate_effect_authorization(ir)))

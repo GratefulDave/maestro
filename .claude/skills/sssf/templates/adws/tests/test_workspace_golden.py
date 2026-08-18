@@ -465,8 +465,13 @@ class WorkspaceGoldenScenario(unittest.TestCase):
         gates_before_reopen = self.store.list_gates(RUN_ID)
         self.assertEqual(len(gates_before_reopen), 1)
         self.assertTrue(gates_before_reopen[0].passed)
-        self.assertEqual(gates_before_reopen[0].detail["command"], [
-            "pytest", "repositories/web/test_cross_repository_acceptance.py"])
+        # The runner is resolved to an absolute invocation before the gate
+        # runs, so what the ledger records is the interpreter that actually
+        # executed rather than the bare `Gate.runner` literal.
+        recorded = gates_before_reopen[0].detail["command"]
+        self.assertTrue(Path(recorded[0]).is_absolute(), recorded)
+        self.assertEqual(
+            recorded[-1], "repositories/web/test_cross_repository_acceptance.py")
         gate_owner = "golden-gate-check"
         self.assertTrue(self.store.acquire_lease(
             RUN_ID, gate_owner, 0.0, 60.0))

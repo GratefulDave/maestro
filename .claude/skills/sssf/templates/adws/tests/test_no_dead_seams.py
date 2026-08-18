@@ -129,37 +129,24 @@ ALLOWED: Dict[str, str] = {
                                             "semantic ceiling above.",
     "retry_policy.semantic_attempts_at_base": "DEFERRED D4: §7.5's "
                                               "(node_id, base_sha) "
-                                              "prompt-mutation scope. Possibly "
-                                              "a missing half of the rule "
-                                              "rather than a duplicate.",
-    "scheduler_types.mutates_prompt": "DEFERRED D4: the other half of the same "
-                                      "§7.5 rule; held pending D4's ruling.",
-    "retry_policy.classify_with_containment": "DEFERRED D5: §7.5's "
-                                              "fail-closed-to-ENVIRONMENTAL "
-                                              "containment wrapper. The "
-                                              "scheduler calls bare classify.",
+                                              "prompt-mutation scope. Its "
+                                              "companion predicate is wired "
+                                              "now; this half still is not.",
     "retry_policy.classify_git_exit": "DEFERRED D9: merge-path git exit "
                                       "classification, no production caller.",
 
-    # D1 / D2 / D7 / D8 / D9.
-    "worktree.check_pre_merge": "DEFERRED D1: §8.3 evaluates cleanliness twice "
-                                "with two consequences; production runs only "
-                                "the convicting one, so adapter residue is "
-                                "never reported.",
-    "lifecycle.record_result": "DEFERRED D7: §7.7's results table has no "
-                               "production writer, yet run status renders "
-                               "from it.",
-    "lifecycle.audit_results": "DEFERRED D7: reader over the same writerless "
-                               "results table.",
-    "verification.adjudicate_result": "DEFERRED D7: §7.7's adjudication, never "
-                                      "called in production.",
+    # D2 / D7 / D8 / D9. (D1, and the D4, D5, D7 and D9 rows that stood here,
+    # were removed when the bidirectional check below convicted them: each had
+    # acquired the production caller its entry said it lacked, and the entry
+    # had gone on suppressing a check for a defect that no longer existed.)
+    "lifecycle.audit_results": "DEFERRED D7: reader over §7.7's results "
+                               "table, which now has a production writer "
+                               "(scheduler._record_result) while this reader "
+                               "still has no production caller. Run status "
+                               "renders from the table; nothing audits it.",
     "scheduler_types.is_retryable": "DEFERRED D8: production decides "
                                     "retryability from RetryClass, never from "
                                     "BlockReason.",
-    "worktree.remove_attempt_worktree": "DEFERRED D9: unconfirmed — §8.8 "
-                                        "retains BLOCKED nodes' worktrees "
-                                        "deliberately; what removes the rest "
-                                        "is not yet established.",
     "worktree.with_state": "DEFERRED D9: superseded NodeRecord constructor.",
     "scheduler_types.to_record": "DEFERRED D9: superseded PlanNode converter.",
     "route_receipts.load_public_key": "DEFERRED D9: production derives keys via "
@@ -252,6 +239,17 @@ class _Index:
         self.scoped_writes: Dict[Tuple[str, str], Set[str]] = {}
         self.splatted: Set[str] = set()
         self.refs: Dict[str, Set[str]] = {}
+        #: Where each name is *called*, as opposed to merely mentioned.
+        #:
+        #: `refs` counts every appearance of a bare name, which is right for
+        #: the forward checks — over-counting there only makes them quieter.
+        #: The converse check needs the opposite bias, and `refs` gives it a
+        #: false positive immediately: `launcher.py` binds a local named
+        #: `complete`, and on `refs` alone that reads as a production call to
+        #: `FakeLauncher.complete`, which is the golden scenario's test double.
+        #: A call site cannot be a local binding, so this is what the converse
+        #: check keys on.
+        self.calls: Dict[str, Set[str]] = {}
 
     def define(self, path: Path, tree: ast.Module) -> None:
         module = path.stem
@@ -310,6 +308,8 @@ class _Index:
                 self.refs.setdefault(node.id, set()).add(loc)
             if isinstance(node, ast.Call):
                 name = _callee_name(node)
+                if name:
+                    self.calls.setdefault(name, set()).add(loc)
                 if name in self.field_order:
                     # Attribute the write to *that class's* field, never to
                     # every field of that name anywhere: `min_cases=` on a plan
@@ -404,6 +404,65 @@ class DeadSeamTest(unittest.TestCase):
             "it, or it is dead and should go with its tests, or it is "
             "deliberately test-only and belongs in ALLOWED with a reason.\n"
             + "\n".join(offenders))
+
+    def test_no_allowlist_entry_has_acquired_a_production_caller(self) -> None:
+        """The allowlist read in one direction only, and that is how an entry
+        outlives the defect it names.
+
+        The two checks above fail when a test-only symbol is *missing* from
+        `ALLOWED`. Neither ever fails when an allowlisted symbol *acquires* a
+        production writer or caller, so an entry — and the audit row, register
+        line, or architecture item written from it — stays true-sounding long
+        after the code stopped agreeing with it. Three entries were in exactly
+        that state when this was added: two named symbols the scheduler's
+        settle path had begun calling, and their reasons still read "no
+        production writer" and "never called in production".
+
+        This is the converse assertion over data the checks above already
+        compute. Two limits, stated rather than discovered:
+
+        * It keys on the callee name, so a same-named method on an unrelated
+          class reads as a caller. That is the masking this file's docstring
+          describes, in the direction that over-reports — which fails loudly
+          and sends someone to look, rather than passing quietly.
+        * An entry that names a symbol which no longer exists is a different
+          staleness and is not caught here. It needs its own reader.
+        """
+        prod, _test = _build()
+        stale: List[str] = []
+        for key in sorted(ALLOWED):
+            module_or_class, _, name = key.rpartition(".")
+            if not name:
+                continue
+            # A `Cls.field` entry: it claims no production writer.
+            # `scoped_writes` and nothing else: it attributes a write to the
+            # class the callee resolves to, which is the whole reason this file
+            # sees what a text search cannot. `writes` is keyed on the bare
+            # name and would report a namesake on an unrelated class.
+            writes = prod.scoped_writes.get((module_or_class, name), set())
+            if writes:
+                stale.append(
+                    f"{key} is allowlisted as having no production writer, "
+                    f"but production writes it at {sorted(writes)[:3]}")
+                continue
+            # A `module.callable` entry: it claims no production caller.
+            where = prod.callables.get(key)
+            if where is None:
+                continue
+            calls = {call for call in prod.calls.get(name, set())
+                     if call != where}
+            if calls:
+                stale.append(
+                    f"{key} is allowlisted as having no production caller, "
+                    f"but production calls it at {sorted(calls)[:3]}")
+        self.assertEqual(
+            [], stale,
+            "an allowlist entry that is no longer true. The symbol has "
+            "acquired a production writer or caller, so the entry now "
+            "suppresses a check for a defect that no longer exists — and "
+            "anything written from that entry, in an audit row or an "
+            "architecture register, went stale with it. Delete the entry.\n"
+            + "\n".join(stale))
 
     def test_every_allowlist_entry_carries_a_reason(self) -> None:
         """An entry with an empty or placeholder reason is a suppression

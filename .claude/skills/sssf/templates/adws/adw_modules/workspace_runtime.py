@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 from . import coordinator_store as cs
 from . import plan_digest
 from . import plan_model as pm
+from . import runner_resolution as rr
 from . import workspace_model as wm
 from . import worktree as wt
 
@@ -798,6 +799,7 @@ def run_global_gates(
         acceptance: AcceptanceWorkspace,
         gates: Sequence[pm.Gate],
         cancel_requested: Callable[[], bool],
+        declared_runners: Optional[Mapping[str, str]] = None,
 ) -> Tuple[wt.GateResult, ...]:
     """Run declared global gates in order with an explicit cancellation source."""
     if not isinstance(acceptance, AcceptanceWorkspace):
@@ -805,14 +807,44 @@ def run_global_gates(
     if not callable(cancel_requested):
         raise GateConfigurationError("global gates require a cancellation callback")
     _validate_acceptance_checkouts(acceptance)
+    declared_runners = dict(declared_runners or {})
+    #: One resolution per `(runner, cwd)`, not one per gate. Every probe costs
+    #: a real collection over the whole tree — ten seconds on the repository
+    #: this was measured against — and bounded by `PROBE_TIMEOUT_S` at 180s, so
+    #: N gates sharing a runner would pay N times for one answer.
+    resolved_runners: Dict[Tuple[str, str], rr.ResolvedRunner] = {}
     results = []
     for index, gate in enumerate(gates):
         if cancel_requested():
             raise wt.GateCancelled("global gate execution was cancelled")
         cwd = _acceptance_cwd(acceptance, gate.cwd)
+        scratch = acceptance.root / ".maestro-gate-scratch" / str(index)
+        # The runner is resolved here rather than inherited from whatever
+        # shell started this process. A global gate runs against a checkout of
+        # a participating repository, so the resolution is anchored at that
+        # checkout and probed there; an unusable runner raises before the gate
+        # is executed rather than producing an unparseable report that reads
+        # as an environmental fault.
+        #
+        # The probe runs under the environment the gate will run under, not
+        # under this process's. Establishing capability under an environment
+        # the gate will not have proves nothing about the gate, and the two
+        # differ by the seven cache redirections `launch_env` overlays —
+        # `PYTEST_ADDOPTS` among them, which is exactly the kind of variable
+        # that decides whether a collection succeeds.
+        key = (gate.runner, str(cwd))
+        if key not in resolved_runners:
+            try:
+                resolved_runners[key] = rr.resolve(
+                    gate.runner, cwd, ".",
+                    declared=declared_runners.get(gate.runner),
+                    env=wt.launch_env(scratch))
+            except rr.RunnerUnusable as exc:
+                raise GateConfigurationError(
+                    "{0}:{1}".format(rr.RUNNER_UNUSABLE, exc.detail)) from exc
+        resolved = resolved_runners[key]
         result = wt.run_integration_gate(
-            cwd, (gate.runner,) + tuple(gate.argv),
-            acceptance.root / ".maestro-gate-scratch" / str(index),
+            cwd, resolved, tuple(gate.argv), scratch,
             cancel_requested, label="global-gate-{0}".format(index))
         if not result.green or result.counts.get("passed", 0) < gate.min_cases:
             raise GateFailure(index, result, results)

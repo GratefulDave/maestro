@@ -245,6 +245,12 @@ class TheSchedulerIsGivenTheProvisionStepTest(unittest.TestCase):
             ), mock.patch.object(
                     maestro, "_load_runnable_plan", return_value=plan
             ), mock.patch.object(
+                    # Runner resolution probes a real interpreter. This plan is
+                    # a stub whose gate never executes, so resolution joins the
+                    # seams already substituted here rather than making every
+                    # CLI test depend on the machine's PATH.
+                    maestro, "_resolve_run_runners", return_value={}
+            ), mock.patch.object(
                     maestro, "_runtime_launcher", return_value=route_runner
             ), mock.patch.object(
                     maestro.lc, "LifecycleStore"

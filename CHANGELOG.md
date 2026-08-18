@@ -6,7 +6,52 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Plan admission now refuses a plan whose lane cannot satisfy its own contract, and a plan whose
+  requirement both prohibits and prescribes the same effect. Two obligations over the
+  `plan-contract.v1` IR, evaluated at `plan_contract_ingress.project_draft` — the chokepoint both
+  `plan author --from-plan-contract` and `plan ship` cross — emitting typed blockers with JSON
+  pointers into the authored IR. A requirement declares a `surface` of `{path, mutation}` records
+  (`written` must be one of the owning lane's declared outputs, `inherited` must be produced
+  somewhere in that lane's `depends_on` closure, `unmodified` must be a hash-pinned source
+  artifact no lane rewrites) and the containment is bidirectional: every declared output must also
+  appear in some bound requirement's surface, so a surface copied from the outputs does not pass
+  by construction. A plan declares the acts it prohibits once, in
+  `extensions.maestro.prohibited_effects`, each with the source document's own words as a
+  required `meaning`; each requirement declares a disposition toward each prohibited act
+  (`performed`, `planned`, `fake_only`, `none`), and performing a prohibited act is refused, as is
+  an act declared `planned` that no requirement in the plan ever executes. Nothing in either
+  predicate reads requirement text, verifier oracles, seam descriptions, or fixture meanings; a
+  regression test fills every free-text field with prose naming unreachable paths and asserts the
+  plan is still admitted. Both obligations require their fields from the first version rather than
+  accepting them as optional (§3.6 B8). See §19 M9, M10, M11, M12 and §17 items 122-125.
+- The gate runner is resolved from a declared interpreter rather than inherited from the
+  scheduler's `PATH`, once, into a type the collector and the gate executors accept in place of a
+  bare command, so no dispatch site can construct an unresolved invocation. Capability is proven
+  before the run by a probe independent of the plan's selectors, keyed on the runner's own
+  documented no-tests-collected exit code — the gate's own exit code cannot distinguish a broken
+  interpreter from a selector the lane has not built yet, since both report a usage error and zero
+  cases. An unusable runner refuses the run at preflight, with no attempt launched and no
+  environmental budget spent. See §19 M8 and §17 item 121.
+
 ### Changed
+
+- **Plans authored before the admission obligations no longer validate, and their approvals are no
+  longer reproducible.** `requirements[].surface`, `requirements[].effects` and
+  `extensions.maestro.prohibited_effects` are required from their first version rather than
+  optional, because a field added later is optional forever (§3.6 B8). An IR authored without them
+  therefore fails `planctl validate`: the approved plan `cmo-consolidation-l` returns exit 1 with
+  fifteen errors — `extensions.maestro missing: prohibited_effects`, and `requirements[0..13]
+  missing: effects, surface` for all fourteen. Its review receipt is **not** invalidated by this.
+  The IR bytes are unchanged, they still hash to `390619d5e9917e7562df600a1c473b90fcebc8b608f9286763a6ca61625d1511`,
+  that is the `ir_sha256` the receipt binds, and its HMAC verifies. What is no longer true is that
+  the approval can be re-derived: the receipt records that a validator returned PASS on those bytes,
+  and no validator that exists now will return PASS on them again. Existing approved plans keep
+  their receipts and their finalized projections; re-validating one is what fails. A plan that must
+  pass the current validator is re-authored under a new name and re-approved, which is the
+  supported repair path in any case, since editing an approved IR invalidates its receipt. Recorded
+  as §16.3 item 52, because this recurs for every future field that becomes required.
 
 - `docs/plan-authoring.md`: the single-repository step-by-step is rewritten around three
   intended plan-CLI verbs — `maestro plan gate`, `plan review`, `plan ship` — each taking only

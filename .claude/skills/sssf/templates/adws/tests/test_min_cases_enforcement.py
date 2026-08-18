@@ -349,9 +349,19 @@ def _ingress_ir(*, min_executed: int) -> dict:
             # now compared against the object rather than replacing it.
             "sha256": hashlib.sha256(_README).hexdigest(), "required": True,
         }],
+        "requirements": [{
+            "requirement_id": "req-freeze",
+            "text": "Freeze the writers behind a greeting module.",
+            "surface": [
+                {"path": "src/greeting.py", "mutation": "written"},
+                {"path": "README.md", "mutation": "unmodified"},
+            ],
+            "effects": [],
+        }],
         "lanes": [{
             "lane_id": "lane-freeze", "title": "Freeze writers",
             "execution_context": ".", "depends_on": [],
+            "requirement_ids": ["req-freeze"],
             "verifier_ids": ["verify-freeze"],
         }],
         "verifiers": [{
@@ -363,6 +373,7 @@ def _ingress_ir(*, min_executed: int) -> dict:
         "extensions": {"maestro": {
             "repo": "example",
             "outputs": {"lane-freeze": ["src/greeting.py"]},
+            "prohibited_effects": [],
             "integration_branch": "main",
             "integration_gate": {
                 "runner": "pytest", "argv": ["tests"], "cwd": ".",

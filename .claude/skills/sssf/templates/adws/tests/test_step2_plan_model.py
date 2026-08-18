@@ -87,12 +87,21 @@ def stored_bytes(mapping: dict) -> bytes:
 
 
 class ModelShapeTests(unittest.TestCase):
-    def test_nine_in_plan_types(self):
-        self.assertEqual(len(pm.IN_PLAN_TYPES), 9)
+    def test_ten_in_plan_types(self):
+        """§6.2 shipped with nine. `NodeEffect` is the tenth, and the count is
+        asserted rather than described for the reason §6.2 gives about every
+        other count in this design: a number in a docstring drifts, and a
+        member added without a decision is how a closed set stops being one.
+
+        MAESTRO_architecture.md §6.2 still reads "nine in-plan types" and has
+        to be brought level with this; the count here is the enforced one.
+        """
+        self.assertEqual(len(pm.IN_PLAN_TYPES), 10)
         self.assertEqual(
             {cls.__name__ for cls in pm.IN_PLAN_TYPES},
             {"Plan", "Observed", "Produced", "Hypothesis", "Gate",
-             "AgentNode", "CodeNode", "MergePolicy", "PromptAsset"})
+             "AgentNode", "CodeNode", "MergePolicy", "PromptAsset",
+             "NodeEffect"})
 
     def test_exactly_three_evidence_types(self):
         self.assertEqual(len(pm.EVIDENCE_TYPES), 3)

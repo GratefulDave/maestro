@@ -46,6 +46,7 @@ if str(ADWS) not in sys.path:
 from adw_modules import plan_canonical as pc  # noqa: E402
 from adw_modules import plan_digest as pd  # noqa: E402
 from adw_modules import plan_model as pm  # noqa: E402
+from adw_modules import runner_resolution as rr
 from adw_modules import plan_validate as pv  # noqa: E402
 
 README = "fixture repository\n"
@@ -565,17 +566,56 @@ class TheRealCollector(ValidationTestCase):
     def gate(self, argv, cwd="."):
         return pm.Gate(runner="pytest", cwd=cwd, argv=tuple(argv), min_cases=1)
 
+    def resolved(self, executable="/usr/bin/pytest", runner="pytest"):
+        """A runner already resolved, so the argv assertions below do not pay
+        a capability probe to state what the flags are."""
+        return rr.ResolvedRunner(runner=runner, executable=executable,
+                                 origin="declared", probe_exit=5,
+                                 version="stub")
+
+    def real_collector(self, resolved=None):
+        chosen = resolved if resolved is not None else self.resolved()
+        return pv.SubprocessCollector(resolver=lambda *a, **k: chosen)
+
     def test_collection_never_executes_the_suite(self):
-        argv = pv.SubprocessCollector().argv_for(self.gate(["tests"]))
+        argv = self.real_collector().argv_for(self.gate(["tests"]), self.repo)
         self.assertEqual(
             argv,
-            ("pytest", "--collect-only", "-q", "-o", "addopts=", "tests"))
+            ("/usr/bin/pytest", "--collect-only", "-q", "-o", "addopts=",
+             "tests"))
+
+    def test_the_collection_binary_is_resolved_and_not_the_bare_literal(self):
+        """The defect this replaced: `COLLECT_ARGV["pytest"]` began with the
+        string `"pytest"`, so the interpreter that enumerated a gate was
+        whatever `PATH` exposed. `argv[0]` is now the resolved executable."""
+        argv = self.real_collector(
+            self.resolved("/repo/.venv/bin/pytest")).argv_for(
+                self.gate(["tests"]), self.repo)
+        self.assertEqual(argv[0], "/repo/.venv/bin/pytest")
+        self.assertNotIn("pytest", argv[1:])
 
     def test_the_vitest_argv_lists_rather_than_watches(self):
         gate = pm.Gate(runner="vitest", cwd="web", argv=("src/a.test.ts",),
                        min_cases=1)
-        self.assertEqual(pv.SubprocessCollector().argv_for(gate),
-                         ("vitest", "list", "--run", "src/a.test.ts"))
+        argv = self.real_collector(
+            self.resolved("/repo/node_modules/.bin/vitest",
+                          runner="vitest")).argv_for(gate, self.repo)
+        self.assertEqual(
+            argv,
+            ("/repo/node_modules/.bin/vitest", "list", "--run",
+             "src/a.test.ts"))
+
+    def test_an_unresolvable_runner_is_an_operational_refusal(self):
+        """A runner that cannot be resolved is `CollectorUnavailable` — an
+        operational refusal with no identity consequence (§6.4) — and never a
+        blocker, which would say the authored bytes were wrong."""
+        def refuse(runner, repo, cwd, **kwargs):
+            raise rr.RunnerUnusable(runner, rr.Reason.UNRESOLVED, cwd)
+
+        collector = pv.SubprocessCollector(resolver=refuse)
+        with self.assertRaises(pv.CollectorUnavailable) as caught:
+            collector.collect(self.gate(["tests"]), self.repo)
+        self.assertIn(rr.RUNNER_UNUSABLE, str(caught.exception))
 
     def test_the_count_reads_identifiers_and_ignores_the_summary(self):
         stdout = ("tests/test_a.py::T::test_one\n"
@@ -586,8 +626,8 @@ class TheRealCollector(ValidationTestCase):
 
     def test_a_working_directory_that_does_not_exist_is_unavailable(self):
         with self.assertRaises(pv.CollectorUnavailable):
-            pv.SubprocessCollector().collect(self.gate(["tests"], cwd="no-such"),
-                                             self.repo)
+            self.real_collector().collect(self.gate(["tests"], cwd="no-such"),
+                                     self.repo)
 
 
 class ValidationLaunchesNoReviewer(unittest.TestCase):
