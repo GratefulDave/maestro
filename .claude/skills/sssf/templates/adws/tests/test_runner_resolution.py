@@ -33,6 +33,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -59,6 +60,83 @@ def _script(path: Path, body: str) -> Path:
     path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+class TheProbeIsMeasuredAgainstARealInterpreterTest(unittest.TestCase):
+    """The one empirical fact this design rests on, as a standing assertion.
+
+    Every other test here fakes the runner with a script whose exit code is
+    hardcoded, which proves the plumbing and nothing about the measurement.
+    `CAPABLE_EXIT["pytest"] == 5` compared against itself is a constant
+    compared against itself.
+
+    The failure that leaves open is concrete. Change `PROBE_ARGS["pytest"]`'s
+    `-k` value to a pattern that *matches* real tests and a capable runner
+    exits 0 rather than 5, so every run on every machine refuses INCAPABLE —
+    and the rest of this file stays green, because it asserts that `-k` is
+    present and never that its pattern selects nothing. These two tests run
+    the real interpreter and are the only thing between a one-token edit to
+    that table and a fleet-wide refusal.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tree = Path(self._tmp.name)
+        # A tree with real collectable tests, so "collected nothing" is a
+        # statement about the selector rather than about an empty directory.
+        (self.tree / "test_probe_subject.py").write_text(
+            "def test_one():\n    assert True\n\n"
+            "def test_two():\n    assert True\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_a_real_pytest_returns_the_capable_exit_and_collects_nothing(self):
+        """`5` is `pytest.ExitCode.NO_TESTS_COLLECTED`, and this asserts the
+        runner actually returns it for this argv rather than that the constant
+        equals itself."""
+        code = rr.probe("pytest", (sys.executable, "-m", "pytest"), self.tree)
+        self.assertEqual(code, rr.CAPABLE_EXIT["pytest"])
+        self.assertEqual(
+            code,
+            __import__("pytest").ExitCode.NO_TESTS_COLLECTED.value,
+            "the capable exit is pytest's own published enum member")
+
+    def test_the_probe_selector_is_what_makes_the_tree_collect_nothing(self):
+        """The control for the test above. The same interpreter, the same
+        tree, the same flags — with the no-match selector removed, collection
+        succeeds and the exit is no longer the capable one. Without this, a
+        `-k` pattern that matched everything would still look measured."""
+        args = list(rr.PROBE_ARGS["pytest"])
+        index = args.index("-k")
+        del args[index:index + 2]
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest"] + args, cwd=str(self.tree),
+            capture_output=True, text=True, timeout=rr.PROBE_TIMEOUT_S)
+        self.assertNotEqual(result.returncode, rr.CAPABLE_EXIT["pytest"])
+        self.assertIn("2 tests collected", result.stdout)
+
+    def test_an_interpreter_without_pytest_does_not_look_capable(self):
+        """The negative half. A runner that cannot start must not return the
+        capable exit, or `resolve` would accept an interpreter that runs
+        nothing."""
+        missing = self.tree / "no-such-interpreter"
+        code = rr.probe("pytest", (str(missing),), self.tree)
+        self.assertNotEqual(code, rr.CAPABLE_EXIT["pytest"])
+        with self.assertRaises(rr.RunnerUnusable) as caught:
+            rr.resolve("pytest", self.tree, declared=str(missing))
+        self.assertIn(caught.exception.reason,
+                      (rr.Reason.UNRESOLVED, rr.Reason.INCAPABLE))
+
+    def test_the_real_interpreter_resolves_through_the_public_entry(self):
+        """`resolve` end to end against a real interpreter, so the declared
+        path, the probe, and the recorded version are one measurement rather
+        than three stubs."""
+        wrapper = self.tree / "pytest-wrapper"
+        _script(wrapper, 'exec "{0}" -m pytest "$@"'.format(sys.executable))
+        resolved = rr.resolve("pytest", self.tree, declared=str(wrapper))
+        self.assertEqual(resolved.probe_exit, rr.CAPABLE_EXIT["pytest"])
+        self.assertTrue(resolved.version.strip(), "the version line is recorded")
 
 
 class ProbeTest(unittest.TestCase):

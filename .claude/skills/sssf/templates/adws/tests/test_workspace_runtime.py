@@ -456,6 +456,43 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
         with self.assertRaises(wr.GateConfigurationError):
             wr.run_global_gates(acceptance, (gate,), lambda: False)
 
+    def test_the_runner_is_resolved_once_per_runner_and_checkout(self) -> None:
+        """Every probe is a real collection over the whole tree — ten seconds
+        on the repository this was measured against, and bounded at 180 — so
+        resolving inside the gate loop makes N gates on one runner pay N times
+        for one answer."""
+        api, _, candidate, _ = self._accepted_candidate()
+        accepted = _commit_gate_suite(candidate.candidate_worktree, "api")
+        gates = tuple(
+            pm.Gate(runner="pytest", cwd="repositories/api",
+                    argv=("-q", "test_gate.py"), min_cases=2)
+            for _ in range(3))
+        workspace = self._workspace((api, self._read_only()), gates)
+        paths = wr.resolve_repository_paths(self.manifest, workspace)
+        acceptance = wr.assemble_acceptance("run-1", workspace, paths,
+                                             {"api": accepted}, self.state_root)
+
+        real = wr.rr.resolve
+        calls = []
+
+        def counted(runner, repo, cwd=".", **kwargs):
+            calls.append((runner, str(repo), kwargs.get("env")))
+            return real(runner, repo, cwd, **kwargs)
+
+        with mock.patch.object(wr.rr, "resolve", counted):
+            results = wr.run_global_gates(acceptance, gates, lambda: False)
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(len(calls), 1, "three gates, one runner, one checkout")
+        # The probe must run under the environment the gate will run under.
+        # Establishing capability under an environment the gate will not have
+        # proves nothing about the gate, and the two differ by exactly the
+        # cache redirections `launch_env` overlays.
+        _runner, _repo, env = calls[0]
+        self.assertIsNotNone(env, "the probe inherited this process's environment")
+        self.assertIn("PYTEST_ADDOPTS", env)
+        self.assertIn(".maestro-gate-scratch", env["PYTEST_ADDOPTS"])
+
     def test_runs_global_gates_in_declaration_order_from_acceptance_relative_cwd(self) -> None:
         api, _, candidate, _ = self._accepted_candidate()
         accepted = _commit_gate_suite(candidate.candidate_worktree, "api")

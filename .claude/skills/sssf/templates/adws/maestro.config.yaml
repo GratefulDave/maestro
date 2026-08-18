@@ -18,9 +18,15 @@ executables:
 # block to adopt. Declaring it is what removes the dependence on whatever PATH
 # the shell that started the scheduler happened to carry.
 #
+# vitest is NOT usable yet. Its capability probe has never been measured, so
+# `runner_resolution` has no probe row for it and any vitest gate refuses
+# `RUNNER_UNUSABLE:UNRESOLVED` whether or not it is declared here. The line is
+# shown so the shape is unambiguous when that row lands, not because
+# uncommenting it would work today.
+#
 # runners:
 #   pytest: .venv/bin/pytest
-#   vitest: node_modules/.bin/vitest
+#   vitest: node_modules/.bin/vitest   # refused: no measured probe row
 route_receipts:
   omp: route-receipts/omp.json
   claude: route-receipts/claude.json
