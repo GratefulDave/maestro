@@ -255,6 +255,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Marker detection strips the outbound prompt before scanning, so the prompt's
   own copy of the marker cannot be read as the agent's answer.
 
+- First end-to-end production evidence for the whole chain downstream of launch.
+  `run start` on `mdl-arch-cmo-extraction` in the lexgenius deployment returned
+  `{"blocked": [], "merged": ["lane-wrtop-store-document-tests"], "outcome": "ACCEPTED",
+  "run_id": "run-39b5d2a85faa451c907ee835dca3477c"}` — the first node ever merged in that
+  deployment. From the lifecycle ledger: attempt 1 launched, ran 52 turns, was rejected by
+  review and cancelled with `retry_class=SEMANTIC`; attempt 2 launched, ran 65 turns, reached
+  VERIFIED, and merged at `output_sha=6d81ef62fcebf931c955c03f234bac6f366ca3a3`. Review, the
+  semantic retry, re-review, the node gate, and the deterministic merge each executed in
+  sequence for the first time. One node ran, so this is evidence that the path exists rather
+  than that it is robust; §9.8 records the same result with its limits stated.
+
 ### Removed
 
 - Dead launcher helpers `_agent_visible_text` and `wait_for_agent_process`,

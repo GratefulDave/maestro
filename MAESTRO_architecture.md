@@ -1305,6 +1305,8 @@ Prior art warns that this layer's unknowns are discovered by running it: one com
 
 ---
 
+**The chain downstream of launch has now been executed once, end to end, and it merged.** Everything above establishes that an agent can be launched, watched, and adjudicated; none of it establishes that a node survives *rejection* and comes back. On 2026-08-18, after the launcher fixes recorded in §16.3 item 42 and §16.3 item 44, `run start` on a real plan in the lexgenius deployment returned `{"blocked": [], "merged": ["lane-wrtop-store-document-tests"], "outcome": "ACCEPTED", "run_id": "run-39b5d2a85faa451c907ee835dca3477c"}` — the first node ever merged in that deployment. Read from the lifecycle ledger rather than from the run's own output: attempt 1 launched, ran 52 turns, was rejected by review and CANCELLED with `retry_class=SEMANTIC`; attempt 2 launched, ran 65 turns, reached VERIFIED, and the node's lifecycle row is MERGED at `output_sha=6d81ef62fcebf931c955c03f234bac6f366ca3a3`. What that establishes, and only this: review, a semantic retry against a mutated prompt, re-review of a different diff, the node's own gate, and the merge each executed in sequence against a real repository with a real agent — the §7.5 semantic path and the §8.5 merge that every prior probe reached around rather than through. What it does not establish is concurrency (one node ran), the launcher's typed failure classes (nothing was refused in this run), or the two defects §16.3 items 45 and 46 register, which sit on the failure path this run never took. A single accepted run is evidence that the path exists, not that it is robust.
+
 ## 10. Typed envelopes, gates, and SQLite schema
 
 ### 10.1 Envelopes
