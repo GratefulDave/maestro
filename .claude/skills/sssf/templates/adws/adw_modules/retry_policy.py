@@ -118,11 +118,20 @@ class Classification:
     keyword (the reviewer-stall arm) before it existed as a field, which made
     that arm a TypeError waiting for its first stall; the field closes that
     and never participates in the exactly-one-of pairing.
+
+    `launcher_failure` is the typed LAUNCHER_TRANSIENT trigger, carried
+    forward from the signal because the budget is not a property of the class
+    alone: §7.5 gives CREDENTIAL zero retries and every other launcher failure
+    one or two. `launcher_retry_budget` below needs the *member*, not the
+    class, and until this field existed it had no production caller at all —
+    the zero-retry rule was expressible and unreachable. Like `reason`, it
+    takes no part in the exactly-one-of pairing.
     """
 
     retry_class: Optional[RetryClass] = None
     block_reason: Optional[BlockReason] = None
     reason: Optional[str] = None
+    launcher_failure: Optional[LauncherFailure] = None
 
     def __post_init__(self) -> None:
         if (self.retry_class is None) == (self.block_reason is None):
@@ -169,8 +178,13 @@ def classify(signal: FailureSignal) -> Classification:
         return Classification(retry_class=RetryClass.SEMANTIC)
 
     # ── LAUNCHER_TRANSIENT: pane allocation, startup, transport ──────────────
+    # The member travels with the class. Returning only the class discards the
+    # one fact that distinguishes CREDENTIAL's zero budget from every other
+    # launcher failure's one or two, and a budget rule whose input is thrown
+    # away here cannot fire anywhere downstream (§7.5).
     if signal.launcher_failure is not None:
-        return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT)
+        return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT,
+                              launcher_failure=signal.launcher_failure)
 
     if not signal.binary_resolved or not signal.process_started:
         return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT)

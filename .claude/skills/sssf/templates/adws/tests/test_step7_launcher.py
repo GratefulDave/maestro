@@ -59,7 +59,10 @@ elif argv[:2] == ["agent", "start"]:
     if os.environ.get("FAKE_HERDR_REFUSE"):
         sys.stderr.write(json.dumps({"error": {"code": "launch_refused"}}))
         sys.exit(1)
-    print(json.dumps({"result": {"agent": {"name": argv[2], "status": "idle", "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
+    agent = {"name": argv[2], "status": "idle"}
+    if not os.environ.get("FAKE_START_WITHOUT_SESSION"):
+        agent["transcript_path"] = os.environ["FAKE_TRANSCRIPT"]
+    print(json.dumps({"result": {"agent": agent}}))
 elif argv[:2] == ["agent", "wait"]:
     print(json.dumps({"result": {"ok": True, "status": "idle"}}))
 elif argv[:2] == ["agent", "prompt"]:
@@ -90,7 +93,18 @@ elif argv[:2] == ["agent", "get"]:
         print(json.dumps({"result": {}}))
     else:
         status = os.environ.get("FAKE_AGENT_STATUS", "working")
-        print(json.dumps({"result": {"agent": {"name": argv[2], "status": status, "interactive_ready": True, "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
+        agent = {"name": argv[2], "status": status, "interactive_ready": True}
+        if os.environ.get("FAKE_SESSION_NEVER"):
+            pass
+        elif os.environ.get("FAKE_SESSION_TAGGED"):
+            # What real herdr sends for a route that writes a JSONL
+            # transcript: a tagged value, never a flat `transcript_path`.
+            agent["agent_session"] = {"agent": "omp", "kind": "path",
+                                      "source": "herdr:omp",
+                                      "value": os.environ["FAKE_TRANSCRIPT"]}
+        else:
+            agent["transcript_path"] = os.environ["FAKE_TRANSCRIPT"]
+        print(json.dumps({"result": {"agent": agent}}))
 elif argv[:2] == ["pane", "close"]:
     if os.environ.get("FAKE_HERDR_CLOSE_FAILURE"):
         sys.stderr.write(json.dumps({"error": {"code": "close_failure"}}))
@@ -352,6 +366,62 @@ class LauncherContractTest(unittest.TestCase):
             call[:2] in (["pane", "run"], ["pane", "send-keys"],
                          ["agent", "send-keys"])
             for call in calls))
+
+    def test_launch_waits_for_a_transcript_path_that_arrives_after_start(self):
+        # `agent start` returns once herdr holds the process, which for the omp
+        # route is before the coder has opened its JSONL session -- so herdr
+        # sends no `agent_session` key at all. Reading only the start payload
+        # made SESSION_PATH_MISSING a race: on 2026-08-17 one of three attempts
+        # on the same node happened to win it and ran 61 turns, and the two
+        # that lost it died at turn zero.
+        os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
+        os.environ["FAKE_SESSION_TAGGED"] = "1"
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        handle = harness.launch(self.spec())
+        self.assertEqual(handle.transcript_path, self.transcript)
+        # The tailer must be registered for the resolved path, not skipped
+        # because the path was unknown at the instant the handle was built.
+        tailer = harness._tailers["run1-node_a-1"]
+        self.assertEqual(tailer.path, self.transcript)
+        # And the registry must still name the object the caller holds.
+        self.assertIs(harness._handles["run1-node_a-1"], handle)
+        self.assertIn(["agent", "get", handle.agent_name],
+                      self.recorded_calls())
+
+    def test_launch_bounds_the_wait_when_no_transcript_ever_arrives(self):
+        # The bounded half: when the path genuinely never appears the wait
+        # terminates and the handle carries None, so the caller's
+        # SESSION_PATH_MISSING is still reachable rather than traded for a hang.
+        os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
+        os.environ["FAKE_SESSION_NEVER"] = "1"
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        with mock.patch.object(launcher, "TRANSCRIPT_PATH_TIMEOUT_S", 0.05):
+            started = time.monotonic()
+            handle = harness.launch(self.spec())
+            elapsed = time.monotonic() - started
+        self.assertIsNone(handle.transcript_path)
+        self.assertNotIn("run1-node_a-1", harness._tailers)
+        self.assertLess(elapsed, 30.0)
+
+    def test_the_transcript_wait_reads_the_typed_field_and_terminates(self):
+        # The signal is `agent_session.kind`, a typed field, never pane text
+        # (§1.2). A route reporting an id rather than a path has no transcript
+        # here, and that is an answer the deadline is allowed to reach.
+        calls = []
+
+        def herdr_call(*args, **kwargs):
+            calls.append(args)
+            return {"result": {"agent": {
+                "agent_session": {"kind": "id", "value": "abc"}}}}
+
+        slept = []
+        self.assertIsNone(launcher.wait_for_agent_transcript(
+            herdr_call, "a", 0.0, poll_interval_s=0.0, sleep=slept.append))
+        self.assertEqual(calls, [("agent", "get", "a")])
 
     def test_launch_refusal_closes_the_allocated_pane(self):
         os.environ["FAKE_HERDR_REFUSE"] = "1"

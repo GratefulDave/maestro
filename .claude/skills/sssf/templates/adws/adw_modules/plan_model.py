@@ -397,13 +397,23 @@ class Plan(BaseModel):
         depths = self.node_depths()
         projected: List[st.PlanNode] = []
         for node in self.nodes:
-            common = dict(node_id=node.node_id, depth=depths[node.node_id],
-                          needs=tuple(node.needs), outputs=tuple(node.outputs))
+            # Annotated because the values are heterogeneous: unannotated,
+            # the inferred value type is a union and every parameter filled
+            # through `**common` is reported as a type error.
+            common: Dict[str, Any] = dict(
+                node_id=node.node_id, depth=depths[node.node_id],
+                needs=tuple(node.needs), outputs=tuple(node.outputs))
             if isinstance(node, AgentNode):
                 projected.append(st.PlanNode(
                     kind=st.NodeKind.AGENT,
                     gate_command=(node.gate.runner,) + tuple(node.gate.argv),
-                    gate_selector=selector_of(node.gate), **common))
+                    gate_selector=selector_of(node.gate),
+                    # The gate's threshold travels with the gate. Dropping it
+                    # here is what made §10.2's counting rule unenforceable:
+                    # the runner, argv and selector were copied, `min_cases`
+                    # was not, and the scheduler fell back to a per-run scalar
+                    # that no caller ever set (§10.2, §7.3 clause 3).
+                    gate_min_cases=node.gate.min_cases, **common))
             else:
                 projected.append(st.PlanNode(
                     kind=st.NodeKind.CODE, command=tuple(node.command),

@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Dict, cast
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
@@ -213,7 +214,10 @@ class HandoffPreflightTests(unittest.TestCase):
 class HandoffContractTests(unittest.TestCase):
 
     def _complete(self, **kw):
-        base = dict(
+        # Annotated because the literal is heterogeneous: without it every
+        # field of the unpack is inferred as the union of all value types and
+        # each typed constructor parameter is reported as mismatched.
+        base: Dict[str, Any] = dict(
             subject_digest="a" * 64, run_id="run1", node_id="build",
             node_kind="agent", instruction="Add the parser.",
             declared_outputs=["parser.py"], gate_command=["pytest"],
@@ -426,50 +430,15 @@ class ActorAbandonedTests(unittest.TestCase):
         self.assertIsNone(window.poll())
 
 
-# ── §7.3 the review-node predicate ──────────────────────────────────────────
-
-class ReviewNodePredicateTests(unittest.TestCase):
-
-    def test_a_signed_pass_verifies(self):
-        verdict = vf.verify_review_node(True, True, True, "PASS", True)
-        self.assertTrue(verdict.verified)
-
-    def test_an_unparsed_report_fails_clause_one(self):
-        verdict = vf.verify_review_node(False, False, False, None, False)
-        self.assertFalse(verdict.verified)
-        self.assertEqual(verdict.failed_clause, 1)
-
-    def test_a_report_that_fails_the_matrix_fails_clause_two(self):
-        verdict = vf.verify_review_node(True, False, True, "PASS", True)
-        self.assertEqual(verdict.failed_clause, 2)
-
-    def test_an_unmeasured_occupancy_convicts(self):
-        """NULL convicts, exactly as §6.5 requires of the finalization path —
-        an unmeasured context window is not a passing one."""
-        verdict = vf.verify_review_node(True, True, False, "PASS", True)
-        self.assertEqual(verdict.failed_clause, 3)
-
-    def test_a_fail_verdict_fails_clause_four_and_earns_a_retry(self):
-        verdict = vf.verify_review_node(True, True, True, "FAIL", True)
-        self.assertEqual(verdict.failed_clause, 4)
-        self.assertIs(verdict.retry_class, st.RetryClass.SEMANTIC)
-
-    def test_an_unsigned_receipt_fails_clause_five(self):
-        """The clause that makes the merge lawful: the transition is caused by
-        a signed artifact, never by what the reviewer said."""
-        verdict = vf.verify_review_node(True, True, True, "PASS", False)
-        self.assertEqual(verdict.failed_clause, 5)
-
-    def test_only_the_verdict_clause_carries_a_retry_class(self):
-        """A protocol failure of the review is not a verdict about the code,
-        so re-running the builder on one would spend its budget on a
-        reviewer's malfunction."""
-        for args in ((False, False, False, None, False),
-                     (True, False, True, "PASS", True),
-                     (True, True, False, "PASS", True),
-                     (True, True, True, "PASS", False)):
-            with self.subTest(args=args):
-                self.assertIsNone(vf.verify_review_node(*args).retry_class)
+# ── §7.3's review-node predicate ────────────────────────────────────────────
+#
+# `ReviewNodePredicateTests` stood here and exercised `vf.verify_review_node`,
+# which production never called. Both are gone: the five clauses are enforced
+# along the review path itself and are covered by the tests over that path —
+# report parsing and the matrix by `verify_report`'s tests, occupancy by
+# `check_occupancy`'s, the derived verdict by `derive_verdict`'s, and the signed
+# receipt by the `ReceiptStore` signature tests. Keeping a second predicate
+# green proved only that the copy nobody ran still worked.
 
 
 # ── B11: review is a kind, and never an authored one ────────────────────────
@@ -765,6 +734,211 @@ class ReviewObjectTests(unittest.TestCase):
             cr.CODE_RUBRIC, "c" * 64,
             (fin.ReviewObject(object_id="plan", kind=fin.ObjectKind.PLAN),))
         self.assertEqual(matrix.graded_cells, ())
+
+
+# ── §8.3: the reviewer's pane carries the redirection too ───────────────────
+
+def _pane_env(flags: "tuple[str, ...]") -> "dict[str, str]":
+    """What `--env KEY=VALUE` flags will actually put in the pane's shell."""
+    pane_env: "dict[str, str]" = {}
+    for index, token in enumerate(flags):
+        if token == "--env":
+            key, _, value = flags[index + 1].partition("=")
+            pane_env[key] = value
+    return pane_env
+
+
+
+class ReviewerLaunchEnvironmentTests(unittest.TestCase):
+    """The reviewer is an agent in a pane, so §8.3 binds its launch as well.
+
+    `LaunchSpec.environment` defaults to an empty mapping, and this launch was
+    the one construction that never passed one. `pane_env_flags` refuses a launch
+    whose redirection is incomplete — deliberately, since a silently dropped
+    redirect convicts an agent for a harness defect — so the omission did not
+    degrade quietly: it refused with all seven variables named and discarded a
+    verified attempt's 61 turns of work at the review stage.
+    """
+
+    def _repo_with_two_commits(self, root: Path) -> "tuple[Path, str, str]":
+        repo = root / "repo"
+        repo.mkdir()
+
+        def git(*args: str) -> str:
+            result = subprocess.run(["git", "-C", str(repo), *args],
+                                    capture_output=True, text=True, check=True)
+            return result.stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        git("add", "a.py")
+        git("commit", "-qm", "base")
+        base_sha = git("rev-parse", "HEAD")
+        (repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+        git("add", "a.py")
+        git("commit", "-qm", "output")
+        return repo, base_sha, git("rev-parse", "HEAD")
+
+    def test_the_reviewer_launch_carries_every_scratch_redirection(self):
+        import argparse
+        from unittest import mock
+
+        import maestro
+        from adw_modules import launcher as lch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, base_sha, output_sha = self._repo_with_two_commits(root)
+            data_dir = root / "sssf-data"
+            data_dir.mkdir()
+            seed = rc.generate_seed()
+            review_root = root / "state" / "review"
+            args = argparse.Namespace(
+                run_id="run-1", repo=str(repo),
+                review_root=str(review_root),
+                review_receipt_dir=str(review_root / "receipts"),
+                data_dir=str(data_dir),
+                verify_key=[rc.seed_to_public_key(seed).hex()],
+                signing_seed=seed.hex(),
+                reviewer_route="omp", reviewer_model="openai-codex/gpt-5.6-sol",
+                reviewer_effort="high", reviewer_profile="openai-performance",
+                reviewer_vendor="openai", execution_vendor="anthropic",
+                review_timeout_s=60.0, reviewer_turn_timeout_s=30.0,
+                reviewer_poll_interval_s=0.1)
+
+            captured = {}
+
+            class FakeRunner:
+                def launch(self, spec):
+                    captured["spec"] = spec
+                    return lch.LaunchHandle(
+                        correlation_token=spec.correlation_token,
+                        pane_id="w1:p2", agent_name="reviewer",
+                        launched_cwd=spec.worktree,
+                        environment=spec.environment)
+
+                def cancel(self, handle, deadline):
+                    return None
+
+                def agent_status(self, handle):
+                    return "working"
+
+            class CapturedWindow:
+                def __init__(self, **kwargs):
+                    self.launch = kwargs["launch"]
+
+            def stub_review_attempt(*, window_factory, **_kwargs):
+                window_factory(None).launch()
+                return "reviewed"
+
+            with mock.patch.object(maestro.agent_pi, "context_window",
+                                   return_value=400000), \
+                    mock.patch.object(maestro.finalization_window,
+                                      "FinalizationWindow", CapturedWindow), \
+                    mock.patch.object(maestro.code_review, "review_attempt",
+                                      stub_review_attempt):
+                review = maestro._code_review_runner(
+                    args, cast(lch.HerdrLauncher, FakeRunner()))
+                review(None, a_node(), None, base_sha, output_sha)
+
+            spec = captured["spec"]
+            # The refusal this closes is computed from exactly these keys, so
+            # the assertion is that `pane_env_flags` does not refuse.
+            pane_env = _pane_env(lch.pane_env_flags(spec.environment))
+            self.assertEqual(set(pane_env), set(lch.SCRATCH_ENV_KEYS))
+            # The reviewer runs at the repository rather than in an attempt
+            # worktree, so its byproducts must land under the run's own review
+            # root — never in the repo, and never in some attempt's scratch.
+            for key, value in pane_env.items():
+                path = (value.split("cache_dir=", 1)[-1]
+                        if key == "PYTEST_ADDOPTS" else value)
+                self.assertTrue(Path(path).is_relative_to(review_root), key)
+                self.assertFalse(Path(path).is_relative_to(repo), key)
+            self.assertEqual(spec.worktree, Path(str(repo)))
+
+    def test_the_plan_finalize_reviewer_launch_carries_every_redirection(self):
+        """The same omission, at the reviewer `plan finalize` builds.
+
+        It allocates its own launcher rather than sharing the node runner's, so
+        it is a second construction of the same `LaunchSpec` and failed the same
+        way — the refusal simply waits until the verb is exercised.
+        """
+        import argparse
+        from unittest import mock
+
+        import maestro
+        from adw_modules import launcher as lch
+        from adw_modules import route_receipts as rr
+
+        fixtures = Path(__file__).parent / "fixtures" / "step8"
+        key = rr.load_public_key(fixtures / "route_receipts.pub")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            state = root / "state"
+            session_dir = state / "finalize-session"
+            args = argparse.Namespace(
+                herdr="/bin/true", omp="/bin/true", claude="/bin/true",
+                repo=str(repo), reviewer_route="omp", reviewer_model="m",
+                reviewer_effort="high", reviewer_profile="p",
+                reviewer_session_dir=str(session_dir),
+                reviewer_report_file=str(state / "review" / "report.json"),
+                route_verify_key=[key.hex()],
+                route_receipt=["omp={}".format(fixtures / "omp.json")],
+                finalization_timeout_s=60, reviewer_turn_timeout_s=20,
+                reviewer_poll_interval_s=1)
+
+            captured = {}
+
+            class FakeLauncher:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def launch(self, spec):
+                    captured["spec"] = spec
+                    return lch.LaunchHandle(
+                        correlation_token=spec.correlation_token,
+                        pane_id="w1:p2", agent_name="reviewer",
+                        launched_cwd=spec.worktree,
+                        environment=spec.environment)
+
+                def cancel(self, handle, deadline):
+                    return None
+
+            windows = []
+
+            class CapturedWindow:
+                def __init__(self, **kwargs):
+                    self.launch = kwargs["launch"]
+                    windows.append(self)
+
+            matrix = fin.compute_matrix(
+                cr.CODE_RUBRIC, "c" * 64,
+                cr.review_objects(("a.py",), OUTPUT_SHA))
+            with mock.patch.object(maestro.launcher, "HerdrLauncher",
+                                   FakeLauncher), \
+                    mock.patch.object(maestro.finalization_window,
+                                      "FinalizationWindow", CapturedWindow):
+                maestro._reviewer_window_factory(args)(matrix)
+            windows[0].launch()
+
+            spec = captured["spec"]
+            pane_env = _pane_env(lch.pane_env_flags(spec.environment))
+            self.assertEqual(set(pane_env), set(lch.SCRATCH_ENV_KEYS))
+            # A sibling of the session directory the operator named, so it
+            # lands wherever that reviewer's own state does — never in the
+            # repository under review.
+            for key_name, value in pane_env.items():
+                path = (value.split("cache_dir=", 1)[-1]
+                        if key_name == "PYTEST_ADDOPTS" else value)
+                self.assertTrue(Path(path).is_relative_to(
+                    session_dir.with_name(session_dir.name + ".scratch")),
+                    key_name)
+                self.assertFalse(Path(path).is_relative_to(repo), key_name)
 
 
 if __name__ == "__main__":  # pragma: no cover

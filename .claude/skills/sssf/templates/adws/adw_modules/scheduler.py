@@ -74,12 +74,35 @@ class NodeExecution:
     reason `retry_policy.FailureSignal` has none: what the scheduler may
     learn from an execution is whether it produced a parseable envelope, what
     it exited, and whether it launched — never what it printed.
+
+    **`launch_detail` widens that on purpose, and the boundary it does not
+    cross is the point.** §16.3 item 42 left the ruling open rather than
+    adding a field silently: the launcher's typed poll vocabulary was
+    discarded on every branch of the real adapter, so a vanished agent and a
+    refused launch reached the ledger as the same empty ENVIRONMENTAL row.
+    The ruling taken here splits that vocabulary by what may read it.
+
+    * `launcher_failure` is TYPED and drives classification. It is a
+      `retry_policy.LauncherFailure` member, derived by the adapter from
+      `launcher.ErrorClass`, itself derived from the exception's *type* —
+      which §7.5 names explicitly among the facts a classifier may read.
+    * `launch_detail` is PROSE and drives nothing. It reaches
+      `Classification.reason`, and from there `transitions.detail_json`, and
+      no guard reads it back. It exists because §7.6 already established that
+      a typed reason computed at the point of failure and dropped before the
+      ledger is indistinguishable, to every later reader, from no reason.
+
+    Keying a retry class on `launch_detail` would be the lexical shortcut
+    §7.5 forbids, and the launcher already settled the same question for
+    itself (`HerdrCallError`: branch on `.code`, never on the message). This
+    field is carried, recorded, and never branched on.
     """
 
     envelope_parsed: bool = True
     exit_code: int = 0
     launched_pid: Optional[int] = None
     launcher_failure: Optional[rp.LauncherFailure] = None
+    launch_detail: str = ""
 
 
 #: Runner boundaries receive the scheduler's cancellation lease explicitly.
@@ -127,6 +150,31 @@ class AttemptCancelled(RuntimeError):
     """Cancellation was requested while the attempt still held RUNNING."""
 
 
+class LaunchFailed(RuntimeError):
+    """A launch or poll that produced no usable agent, typed at the seam.
+
+    The runner adapter raises this rather than a bare `RuntimeError` so the
+    containment handler can classify on the exception's *type* and a typed
+    enum member instead of on its message. §7.5 permits `_classify` to read an
+    exception type and forbids it reading process output; a message such as
+    `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...` carries its code in prose,
+    and matching that prefix would be exactly the lexical shortcut forbidden.
+
+    Before this existed every launcher fault reached the handler as some bare
+    exception, `classify` found nothing structural, and the failure spent the
+    ENVIRONMENTAL budget — which is how §16.3 item 42's reader-without-writer
+    survived: the branch was present and nothing could ever reach it.
+
+    `detail` is the underlying message, carried for the ledger and never
+    branched on.
+    """
+
+    def __init__(self, failure: rp.LauncherFailure, detail: str = "") -> None:
+        super().__init__(detail or failure.value)
+        self.failure = failure
+        self.detail = detail
+
+
 
 class DurableOutputIdentityError(RuntimeError):
     """A terminal durable row names no verifiable commit identity."""
@@ -145,7 +193,19 @@ class SchedulerDeps:
     run_gate: GateRunner
     run_integration_gate: IntegrationGateRunner
     quiesce_attempt: QuiesceAttempt
-    min_cases: int = 1
+    #: §10.2's threshold for the ONE integration gate this run ends with
+    #: (§8.8), taken from `merge_policy.integration_gate.min_cases`.
+    #:
+    #: It replaces a `min_cases` scalar that all three adjudication sites
+    #: read — both node gates and this one. That scalar could not be right:
+    #: a run has many node gates, each declaring its own threshold, so one
+    #: number per run structurally cannot carry them. It also had no
+    #: production writer, so every gate in every run was adjudicated at its
+    #: default of 1 while plans declared 5, 6, 8 and 70. A node's threshold
+    #: now travels on the node (`PlanNode.gate_min_cases`); this one stays a
+    #: scalar because there is exactly one integration gate per run, which is
+    #: the case the old field was accidentally right about.
+    integration_min_cases: int = 1
     #: `(attempt) -> None`. The watchdog performs the kill the worker cannot,
     #: because the worker thread is blocked reading the agent (§7.6). Killing
     #: an agent's process belongs to the launcher (§9.3, step 7), so it is
@@ -615,8 +675,16 @@ class Scheduler:
             if (context.record is not None
                     and not self._cancelled.is_set()
                     and self._owns_running(context.record)):
+                # A `LaunchFailed` names its own class in a typed enum member,
+                # so `classify`'s launcher branch is reachable from the real
+                # adapter for the first time (§16.3 item 42). Every other
+                # exception still falls to the ENVIRONMENTAL default,
+                # unchanged and fail-closed.
                 signal = rp.FailureSignal(
-                    node_kind=node.kind, exception_type=type(exc).__name__)
+                    node_kind=node.kind, exception_type=type(exc).__name__,
+                    launcher_failure=(exc.failure
+                                      if isinstance(exc, LaunchFailed)
+                                      else None))
                 # `classify` reads none of the signal's ENVIRONMENTAL evidence
                 # by design (§7.5 forbids the lexical shortcut), so its
                 # fall-through returns a classification with no account of
@@ -679,7 +747,7 @@ class Scheduler:
                     selector and selector in node.outputs
                     and not (attempt.path / selector).exists())
                 pre_verdict = vf.adjudicate_pre_gate(
-                    pre, self.deps.min_cases, selector_unbuilt=unbuilt)
+                    pre, node.gate_min_cases, selector_unbuilt=unbuilt)
         finally:
             # Provision and the pre gate both execute before the measurement
             # bracket; their process groups must be absent before its baseline.
@@ -765,7 +833,7 @@ class Scheduler:
             verdict = vf.verify_agent_node(
                 envelope_parsed=execution.envelope_parsed,
                 pre_gate=pre_verdict,
-                post_gate=vf.adjudicate_gate(post, self.deps.min_cases),
+                post_gate=vf.adjudicate_gate(post, node.gate_min_cases),
                 permission=permission)
             if not verdict.verified:
                 self._settle_context(context)
@@ -835,7 +903,13 @@ class Scheduler:
         classification = (rp.Classification(retry_class=verdict.retry_class)
                           if verdict.retry_class is not None
                           else rp.classify(signal))
-        self._settle_failure(node, classification, verdict, record)
+        # The adapter's own account of the execution, attached where every
+        # other observation is attached. `_with_reason` never overwrites, and
+        # neither arm above sets one, so this is the ledger's only chance to
+        # record what the launcher saw (§7.6).
+        self._settle_failure(
+            node, _with_reason(classification, execution.launch_detail or None),
+            verdict, record)
 
     def _settle_failure(self, node: st.PlanNode, classification: rp.Classification,
                         verdict: Optional["vf.VerificationVerdict"] = None,
@@ -884,12 +958,23 @@ class Scheduler:
                     node.node_id, rp.GuidanceLedger()).with_verification(
                         rp.verification_guidance(detail))
             else:
-                budget = self.config.retry_budget(retry_class)
+                # LAUNCHER_TRANSIENT's budget is a property of the member, not
+                # the class: §7.5 gives CREDENTIAL zero and the rest one or
+                # two. `config.retry_budget` cannot express that, so asking it
+                # alone gave a credential refusal the same two retries as a
+                # dropped transport — the zero-retry rule stated in §7.5 and
+                # implemented in `launcher_retry_budget` had no caller.
+                budget = (rp.launcher_retry_budget(
+                              self.config, classification.launcher_failure)
+                          if retry_class is st.RetryClass.LAUNCHER_TRANSIENT
+                          else self.config.retry_budget(retry_class))
                 spent = store.attempts_spent(
                     self.run_id, node.node_id, retry_class)
                 if spent >= budget:
                     store.mark_blocked(
-                        self.run_id, node.node_id, _budget_reason(retry_class),
+                        self.run_id, node.node_id,
+                        _budget_reason(retry_class,
+                                       classification.launcher_failure),
                         detail=detail or None, retry_class=retry_class)
                     return
 
@@ -1128,7 +1213,7 @@ class Scheduler:
             return AcceptanceResult(
                 green=False, specs=specs, gate=gate, ancestry=ancestry,
                 reason="cancellation requested during the final integration gate")
-        verdict = vf.adjudicate_gate(gate, self.deps.min_cases)
+        verdict = vf.adjudicate_gate(gate, self.deps.integration_min_cases)
         if time.monotonic() > deadline:
             return AcceptanceResult(green=False, specs=specs, gate=gate,
                                     ancestry=ancestry,
@@ -1185,8 +1270,25 @@ def _is_merged(store, run_id: str, node_id: str) -> bool:
                for r in store.node_records(run_id))
 
 
-def _budget_reason(retry_class: st.RetryClass) -> st.BlockReason:
+def _budget_reason(retry_class: st.RetryClass,
+                   launcher_failure: Optional[rp.LauncherFailure] = None
+                   ) -> st.BlockReason:
+    """The block a spent budget writes.
+
+    CREDENTIAL is separated because §7.5 gives it a *zero* budget: it blocks
+    on its first occurrence having spent no retry at all, so
+    LAUNCHER_BUDGET_EXHAUSTED would tell an operator a budget ran out when
+    none ever existed. `BlockReason.CREDENTIAL_REFUSED` had no production
+    writer before this, though §11.3's escape table already carries a row for
+    it — the reason existed, and nothing could produce it.
+
+    The default keeps the watchdog's call site correct rather than merely
+    compiling: a stall is never a launcher failure, so it passes no member and
+    lands on the environmental arm exactly as it did before.
+    """
     if retry_class is st.RetryClass.LAUNCHER_TRANSIENT:
+        if launcher_failure is rp.LauncherFailure.CREDENTIAL:
+            return st.BlockReason.CREDENTIAL_REFUSED
         return st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED
     return st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
 
@@ -1243,6 +1345,13 @@ def _failure_detail(classification: rp.Classification,
     reason = getattr(classification, "reason", None)
     if reason:
         detail["reason"] = reason
+    if classification.launcher_failure is not None:
+        # Typed, not prose: which of §7.5's four launcher triggers convicted
+        # this attempt. `reason` above carries the adapter's own message for a
+        # human to read; this is the field a later reader can count, and it is
+        # what tells CREDENTIAL_REFUSED apart from a spent launcher budget
+        # without re-deriving it from the block reason.
+        detail["launcher_failure"] = classification.launcher_failure.value
     if verdict is not None:
         detail["clause"] = verdict.failed_clause
         if verdict.reason:

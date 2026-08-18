@@ -555,6 +555,51 @@ def wait_for_interactive_agent(
         raise RuntimeError(
             "AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
 
+
+#: How long `launch` waits for herdr to report where the agent's transcript is.
+#: Bounded at the prompt submission's own 60s rather than the 180s readiness
+#: gate: by the time this runs the agent has already been waited to idle at its
+#: composer, so a session file that has not appeared within a minute is absent
+#: rather than late, and the caller's SESSION_PATH_MISSING is then correct.
+TRANSCRIPT_PATH_TIMEOUT_S = 60.0
+
+
+def wait_for_agent_transcript(
+        herdr_call: Callable[..., dict], name: str, timeout_s: float,
+        poll_interval_s: float = 0.25,
+        sleep: Callable[[float], None] = time.sleep,
+) -> Optional[Path]:
+    """Poll `agent get` until herdr reports this agent's transcript path.
+
+    `agent start` returns once herdr holds the process, which for a route that
+    writes a JSONL transcript is before the coder has created the file. herdr
+    then omits `agent_session` entirely, and reading the start payload alone
+    made SESSION_PATH_MISSING a race: of three attempts on one node on
+    2026-08-17, the one that happened to win it ran 61 turns and the two that
+    lost it died at turn zero.
+
+    Whether the path has arrived is read from the typed `agent_session.kind`
+    field, never from the pane (§1.2). `None` at the deadline rather than a
+    raise: the absence is the caller's to classify, and a route that writes no
+    transcript at all is not an error here.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            payload = herdr_call("agent", "get", name)
+        except RuntimeError:
+            # A transport hiccup, or herdr not yet holding the record, is a
+            # missing observation and not an answer. Keep polling to the
+            # deadline rather than converting it into a decision.
+            payload = {}
+        transcript = _agent_transcript_path(_extract(payload, "agent"))
+        if transcript is not None:
+            return transcript
+        if time.monotonic() >= deadline:
+            return None
+        sleep(poll_interval_s)
+
+
 def _wait_for_available_shell(
         herdr_call: Callable[..., dict], pane_id: str, timeout_s: float = 30.0,
         settle_polls: int = 5,
@@ -699,6 +744,24 @@ class HerdrLauncher:
         wait_for_interactive_agent(
             lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
             name)
+        if transcript is None:
+            # The start payload is a snapshot taken before the coder opened its
+            # session, not a statement that this route has no transcript. Poll
+            # for the typed path now that the agent is idle at its composer, so
+            # the caller's SESSION_PATH_MISSING means absent rather than early.
+            transcript = wait_for_agent_transcript(
+                lambda *args, **kwargs: self._herdr(*args, env=environment,
+                                                    **kwargs),
+                name, TRANSCRIPT_PATH_TIMEOUT_S)
+            if transcript is not None:
+                # The handle is already registered, and `_handles` must keep
+                # naming the same object the caller holds -- same frozen-field
+                # assignment `__post_init__` uses, rather than a second handle
+                # the registry and the caller could disagree about.
+                object.__setattr__(handle, "transcript_path", transcript)
+                with self._handles_lock:
+                    self._tailers[spec.correlation_token] = TranscriptTailer(
+                        transcript)
         bootstrap = "@{0}".format(spec.prompt_path.resolve())
         # Settle for either working or idle: the harness turn runs for as long
         # as the task takes, so waiting for idle here would hold the launch open

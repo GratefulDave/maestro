@@ -799,7 +799,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 node_by_id=lambda: {
                     "agent": SimpleNamespace(instruction="do the work")},
                 to_plan_nodes=lambda: ())
@@ -869,7 +869,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 to_plan_nodes=lambda: ())
             attempt = SimpleNamespace(path=root, scratch=root / "scratch")
             record = SimpleNamespace(node_id="code", attempt_no=1)
@@ -996,7 +996,7 @@ class OperatorCliTest(unittest.TestCase):
                         agent_nodes=(),
                         merge_policy=SimpleNamespace(
                             integration_branch="main",
-                            integration_gate=SimpleNamespace(runner="none", argv=())),
+                            integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                         to_plan_nodes=lambda: ())
             ), mock.patch.object(
                     maestro, "_validate_run_paths"
@@ -1044,7 +1044,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="integration/run-1",
-                    integration_gate=SimpleNamespace(runner="fixture", argv=("gate",))),
+                    integration_gate=SimpleNamespace(runner="fixture", argv=("gate",), min_cases=1)),
                 to_plan_nodes=lambda: (node,))
             green = maestro.worktree.GateResult(
                 label="gate", scope="node", selector="code",
@@ -1128,7 +1128,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(agent_node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 node_by_id=lambda: {
                     "agent": SimpleNamespace(instruction="do the work")},
                 to_plan_nodes=lambda: ())
@@ -1210,7 +1210,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 node_by_id=lambda: {
                     "agent": SimpleNamespace(instruction="do the work")},
                 to_plan_nodes=lambda: ())

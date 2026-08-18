@@ -46,7 +46,92 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `keys/signing.seed`, and `keys/route.pub` when the configured environment
   variables are unset.
 
+- `tests/test_no_dead_seams.py`: a structural guard that every production reader has a
+  production writer. `MAESTRO_architecture.md` Family B item B15 makes a check field with
+  zero *readers* a build failure; this enforces the mirror, which is the direction that had
+  been reaching production — a typed field, dataclass attribute, enum member, or callable
+  that production reads or branches on but never writes or calls. Such a value is
+  structurally unreachable, the branch guarding it silently never runs, and the suite stays
+  green because the tests construct the value by hand. An AST reference analyser over all 124
+  `.py` files in the runtime found eleven further instances of that class beyond the ones
+  fixed here. Deliberately test-only symbols remain legal but no longer silent: each of the
+  50 allowlist entries carries the reason it has no production writer, so landing a fix means
+  deleting a line. Attribution is by the class the callee resolves to, not by the bare name,
+  which is what lets it see through a same-named keyword argument on an unrelated class —
+  the masking that hid `SchedulerDeps.min_cases` from every grep anyone would have written.
+  The check for stale allowlist entries is present but disabled for now. Its own docstring
+  states what it cannot catch: dynamic writers, writers sitting inside unreachable branches,
+  and semantic deadness.
+- `tests/test_launcher_classification.py`: drives the launcher-failure path through the
+  production adapter rather than a hand-built `FailureSignal`, and asserts structurally that
+  no raw `.launch(` call site remains in `maestro.py`.
+- `tests/test_min_cases_enforcement.py`: asserts that a plan's declared threshold survives
+  projection onto `PlanNode` and is the value each of the three adjudication sites counts
+  against.
+
 ### Fixed
+
+- An agent's transcript path is waited for, not read once from the start payload. `herdr
+  agent start` returns as soon as the server holds the process, which on a route that writes
+  a JSONL transcript is before the coding agent has created the file; Herdr then omits
+  `agent_session` from that payload entirely. `HerdrLauncher.launch` read the path only from
+  the start payload, so whether an attempt got a transcript was a race against the coder's
+  first write. The attempt that lost it had no path to register with the `TranscriptTailer`,
+  was refused `SESSION_PATH_MISSING`, and died with `launched_at` NULL and `turn_count` 0.
+  Measured on 2026-08-17: of three attempts on one node, the one that won the race ran 61
+  turns and the two that lost it died at turn zero. `launcher.wait_for_agent_transcript()`
+  now polls `herdr agent get` up to `TRANSCRIPT_PATH_TIMEOUT_S` (60.0s) whenever the start
+  payload yields nothing, and the tailer is registered with the resolved path. Whether the
+  path has arrived is read from the typed `agent_session.kind` field and never from pane
+  text, so no lifecycle transition keys on prose (§1.2). The bound is 60s rather than the
+  180s readiness gate because the agent has already been waited to idle at its composer by
+  this point: a session file absent after a minute is absent, not late, and the caller's
+  `SESSION_PATH_MISSING` refusal is then correct.
+
+- Every `LaunchSpec` in `maestro.py` carries the redirected scratch environment. `LaunchSpec`
+  declares `environment` with `field(default_factory=dict)`, so a construction site that
+  omits it produces `{}` rather than a type error, and `pane_env_flags` then refuses the
+  launch with `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING` naming all seven `SCRATCH_ENV_KEYS`.
+  The omission existed at all four construction sites — the node build launch, the node
+  reviewer, `_reviewer_window_factory` (plan finalize), and `_deliver_author_turn` — so
+  `maestro deliver` could never have launched an author at all, and the code-review path
+  discarded 61 turns of completed work at the moment it tried to open a reviewer pane. A
+  required argument given a permissive default is invisible at every call site that forgets
+  it; the byproduct-redirection fix below made the refusal correct, and this makes the
+  callers correct.
+
+- The typed launcher-failure chain has a production writer, so `LAUNCHER_TRANSIENT` is
+  reachable from the real adapter. `MAESTRO_architecture.md` §16.3 item 42 recorded the
+  defect: `NodeExecution.launcher_failure` was read by `Scheduler._settle_verdict` and
+  branched on by `retry_policy.classify`, and nothing on any production path ever assigned
+  it, so every launcher fault fell through to the ENVIRONMENTAL default and §7.5's
+  zero-retry rule for `LauncherFailure.CREDENTIAL` could not fire. Four pieces close it.
+  `scheduler.LaunchFailed` is a typed exception carrying an `rp.LauncherFailure`;
+  `maestro._launcher_failure_for` is the first production caller of the adapter contract's
+  `LauncherAdapter.classify`, mapping `launcher.ErrorClass` onto that enum; `_typed_launch`
+  and `_typed_launch_pane` wrap every launch and poll in the module, so no raw `.launch(`
+  call site remains; and the scheduler's containment handler reads `exc.failure` into the
+  `FailureSignal`. `_settle_failure` then sizes the budget with `rp.launcher_retry_budget`
+  rather than `config.retry_budget`, because the budget is a property of the member and not
+  of the class, and `_budget_reason` gained a CREDENTIAL arm so a zero-budget refusal blocks
+  as `CREDENTIAL_REFUSED` instead of claiming a budget ran out that never existed.
+  Classification still keys on the exception's type and a typed enum member, never on the
+  message: `NodeExecution.launch_detail` carries the launcher's own prose to
+  `transitions.detail_json` for the operator, and no guard reads it back. `launcher.py`'s
+  typed vocabulary needed no change — it already existed and was simply never consulted.
+
+- A plan's declared `min_cases` reaches the adjudicator. `Plan.to_plan_nodes()` projected
+  each gate's runner, argv, and selector onto `scheduler_types.PlanNode` and silently dropped
+  its `min_cases`, because `PlanNode` had no field to hold it. All three adjudication sites
+  — the pre-gate, the post-gate, and final acceptance — instead read `SchedulerDeps.min_cases`,
+  a single per-run scalar that no production caller ever set, so every gate in every run was
+  counted against its default of 1 while plans declared 5, 6, 8, and 70. A plan told its
+  agent 70 and verified it at 1; `run-4ee9e079f9124b8cbe4c416923e34170` reached ACCEPTED that
+  way. One scalar per run could not have been right in any case: a run has many node gates,
+  each with its own threshold. `PlanNode.gate_min_cases` now carries the per-gate value and
+  is validated (`>= 1` on an agent node, exactly the default on a code node, which has no
+  gate to count for); `SchedulerDeps.integration_min_cases` replaces the deleted scalar and
+  serves the one integration gate per run that it was accidentally right about.
 
 - An agent's declared result outranks the pane's reported status. `poll()` returned
   `PollState.GONE` on `agent_not_found`, and on a non-dict agent payload, before reading the
@@ -175,3 +260,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Dead launcher helpers `_agent_visible_text` and `wait_for_agent_process`,
   along with `wait_for_coder_ui`, the banner-sentinel readiness poll they
   supported.
+
+- `verification.verify_review_node`. It was a second expression of §7.3's five-clause
+  review-node predicate and had no production caller: each clause is already enforced by the
+  code that owns the observation — `fin.ReviewerReport.model_validate` for parsing,
+  `fin.verify_report` for the matrix, `fin.check_occupancy` for the measured window,
+  `fin.derive_verdict` with `cr.require_located_findings` for the derived verdict, and
+  `fin.ReceiptStore` for the Ed25519 signature — all sequenced by `code_review.review_attempt`,
+  whose `ReviewOutcome.passed` is what the scheduler's review branch reads. Two expressions of
+  one rule with only one of them running is how the two drift, so the unexercised copy went
+  and the enforced one stayed. A comment in its place maps each clause to the code that
+  enforces it, and `scheduler_types.py`'s `NodeKind` docstring, which cited the deleted
+  symbol as the review node's predicate, now points at the review path instead.

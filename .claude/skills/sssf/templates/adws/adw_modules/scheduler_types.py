@@ -250,7 +250,8 @@ class NodeKind(str, Enum):
     Verdict-only reviewer" and "artifact-producing task", and PR #74's attempt
     to split them found 33 workflows depending on the hybrid and was closed
     rather than merged. A review node therefore has its own kind, its own
-    predicate (`verification.verify_review_node`), and its own evidence chain,
+    predicate (§7.3's five clauses, enforced along the review path itself and
+    sequenced by `code_review.review_attempt`), and its own evidence chain,
     and shares none of an agent node's clauses.
 
     But it is **derived by the scheduler, one per build-node attempt**, not
@@ -292,6 +293,19 @@ class PlanNode:
     specs: Tuple[str, ...] = ()
     gate_command: Tuple[str, ...] = ()
     gate_selector: Optional[str] = None
+    #: §10.2's counting threshold for THIS node's gate, carried from the plan.
+    #:
+    #: It lives on the node because it is a per-gate fact. It used to live
+    #: nowhere: `Plan.to_plan_nodes` copied the gate's runner, argv and
+    #: selector and dropped its `min_cases`, so the three adjudication sites
+    #: read one unset per-run scalar that was always its default of 1. A plan
+    #: declaring 70 told its agent 70 and verified it at 1, and
+    #: run-4ee9e079 reached ACCEPTED that way.
+    #:
+    #: The default of 1 is §10.2's floor rather than a fallback: it is what a
+    #: gate means when it demands nothing more than one passing case, and
+    #: `verification.adjudicate_counts` refuses anything below it.
+    gate_min_cases: int = 1
     command: Tuple[str, ...] = ()
     expects_changes: bool = False
 
@@ -328,6 +342,10 @@ class PlanNode:
                 raise ValueError(
                     f"{self.node_id}: expects_changes is a code-node clause (§7.3); "
                     "on an agent node it is a field nothing reads")
+            if self.gate_min_cases < 1:
+                raise ValueError(
+                    f"{self.node_id}: §10.2 counts `passed >= min_cases >= 1`; a "
+                    "gate demanding zero passing cases is green on an empty run")
         else:
             if not self.command:
                 raise ValueError(
@@ -337,6 +355,10 @@ class PlanNode:
                 raise ValueError(
                     f"{self.node_id}: a code node has no gate and no min_cases "
                     "(§7.3); a gate here is state nothing evaluates")
+            if self.gate_min_cases != 1:
+                raise ValueError(
+                    f"{self.node_id}: a code node has no gate to count cases "
+                    "for (§7.3); a threshold here is a number nothing reads")
 
     def to_record(self, state: NodeState) -> "wt.NodeRecord":
         """Project onto the merge protocol's record (§7.1, §8.5).

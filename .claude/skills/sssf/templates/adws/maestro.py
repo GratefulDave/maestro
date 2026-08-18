@@ -41,6 +41,7 @@ from adw_modules import plan_model
 from adw_modules import plan_validate as pv
 from adw_modules import publication
 from adw_modules import receipt_crypto
+from adw_modules import retry_policy
 from adw_modules import route_admission
 from adw_modules import route_receipts
 from adw_modules import scheduler
@@ -1136,6 +1137,11 @@ def _reviewer_window_factory(args: argparse.Namespace):
     report_path = Path(args.reviewer_report_file)
     prompt_path = report_path.with_suffix(".prompt.json")
     session_dir = Path(args.reviewer_session_dir)
+    # §8.3 again: this reviewer's pane needs the redirection exactly as the
+    # node reviewer's does. Its scratch is a sibling of the session directory
+    # the operator named, so it lands wherever that reviewer's own state does
+    # and never in the repository being reviewed.
+    scratch_dir = session_dir.with_name(session_dir.name + ".scratch")
 
     def factory(matrix: finalization.ApplicabilityMatrix):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1152,12 +1158,13 @@ def _reviewer_window_factory(args: argparse.Namespace):
 
         def launch_reviewer():
             nonlocal handle
-            handle = runner.launch(launcher.LaunchSpec(
+            handle = _typed_launch_pane(runner, launcher.LaunchSpec(
                 correlation_token="finalize-" + matrix.plan_digest,
                 worktree=Path(args.repo), prompt_path=prompt_path,
                 envelope_path=report_path, route=args.reviewer_route,
                 model=args.reviewer_model, effort=args.reviewer_effort,
-                profile=args.reviewer_profile, session_dir=session_dir))
+                profile=args.reviewer_profile, session_dir=session_dir,
+                environment=worktree.launch_env(scratch_dir)))
             return finalization_window.ReviewerSession(
                 route=args.reviewer_route, model=args.reviewer_model,
                 session_id=handle.pane_id, session_dir=str(session_dir),
@@ -1222,6 +1229,15 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         report_path = subject_root / "report.json"
         prompt_path = subject_root / "prompt.md"
         session_dir = subject_root / "session"
+        # §8.3 applies to the reviewer's pane exactly as it does to a node's.
+        # The reviewer runs at the repository, not inside an attempt worktree,
+        # so it owns a scratch beside its own session directory under the run's
+        # review root -- a location Maestro owns -- rather than borrowing some
+        # attempt's. Omitting it entirely left `LaunchSpec.environment` at its
+        # empty default, and `pane_env_flags` then refused the launch with
+        # SCRATCH_REDIRECT_MISSING for all seven variables, discarding a
+        # verified attempt's work at the review stage.
+        scratch_dir = subject_root / "scratch"
 
         diff, changed = code_review.read_diff(
             Path(args.repo), base_sha, output_sha)
@@ -1249,12 +1265,17 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
             prompt_path.write_text(text, encoding="utf-8")
 
             def launch_reviewer():
-                handle = runner.launch(launcher.LaunchSpec(
+                # The site that actually refused in
+                # run-f31686ea41b44c33b117f64e3b319317: its agent node had
+                # launched and done 61 turns before this reviewer's launch was
+                # refused, and the refusal spent an ENVIRONMENTAL retry.
+                handle = _typed_launch_pane(runner, launcher.LaunchSpec(
                     correlation_token="review-" + digest[:16],
                     worktree=Path(args.repo), prompt_path=prompt_path,
                     envelope_path=report_path, route=args.reviewer_route,
                     model=args.reviewer_model, effort=args.reviewer_effort,
-                    profile=args.reviewer_profile, session_dir=session_dir))
+                    profile=args.reviewer_profile, session_dir=session_dir,
+                    environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
                     route=args.reviewer_route, model=args.reviewer_model,
@@ -1815,6 +1836,175 @@ def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
         claude_path=Path(args.claude), admitted_routes=admitted)
 
 
+# ── §7.5's launcher triggers, from the adapter's own typed error class ───────
+#
+# The chain reads no text at any step: `launcher.classify_error` dispatches on
+# an exception's *type*, `ErrorClass` is a closed enum, and so is
+# `LauncherFailure`. §7.5 names exception type among the facts a classifier may
+# read and forbids it reading process output, so a refusal whose code is
+# embedded in a message string — `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...`
+# — is classified by what it *is* rather than by matching its prefix. Matching
+# the prefix would be the lexical shortcut §7.5 forbids, and the launcher has
+# already settled the same question for itself (`HerdrCallError`: branch on
+# `.code`, never on the message).
+#
+# Coarse on purpose. §7.5 closes the retry classes at three, so a
+# *deterministic* refusal — a missing scratch redirect, a missing session path
+# — still spends the launcher budget and blocks LAUNCHER_BUDGET_EXHAUSTED
+# rather than blocking at once. That is a stated cost, not an oversight:
+# separating it needs a fourth non-retryable reason and typed refusal codes at
+# the launcher boundary, which is a design change rather than this repair.
+_LAUNCHER_FAILURE_BY_ERROR_CLASS = {
+    launcher.ErrorClass.AUTHENTICATION: retry_policy.LauncherFailure.CREDENTIAL,
+    launcher.ErrorClass.TRANSIENT: retry_policy.LauncherFailure.TRANSPORT,
+    launcher.ErrorClass.CONFIGURATION: retry_policy.LauncherFailure.STARTUP,
+    launcher.ErrorClass.PROTOCOL: retry_policy.LauncherFailure.STARTUP,
+    launcher.ErrorClass.EXECUTION: retry_policy.LauncherFailure.STARTUP,
+}
+
+#: Exceptions that mean something other than "the launch failed" and must
+#: reach their own handlers untouched: cancellation, the quiescence proof, and
+#: a failure already carrying its type.
+_LAUNCH_PASSTHROUGH = (
+    launcher.HarnessCancelled, launcher.HarnessQuiescenceError,
+    scheduler.AttemptCancelled, scheduler.AttemptOwnershipLost,
+    scheduler.QuiescenceFailure, scheduler.LaunchFailed,
+)
+
+
+def _launcher_failure_for(adapter: Any,
+                          exc: BaseException) -> retry_policy.LauncherFailure:
+    """The typed launcher class for one failed launch or poll.
+
+    STARTUP is the fall-through rather than a raise: an `ErrorClass` this
+    mapping has not met is still a launch that failed, and refusing to name it
+    would drop the attempt back to the ENVIRONMENTAL default — the exact
+    misclassification this function exists to end.
+    """
+    return _LAUNCHER_FAILURE_BY_ERROR_CLASS.get(
+        adapter.classify(exc), retry_policy.LauncherFailure.STARTUP)
+
+
+def _typed_launch(adapter: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run one launcher call, converting its failure into a typed one.
+
+    `LauncherAdapter.classify` has been part of the adapter contract since the
+    seam was written and had no production caller: the runtime asked the
+    launcher to launch and never asked it what kind of failure it had just
+    had. This is the call site that was missing, and without it every launcher
+    fault arrived at the scheduler as a bare exception carrying its code in
+    prose (§16.3 item 42).
+    """
+    try:
+        return operation(*args, **kwargs)
+    except _LAUNCH_PASSTHROUGH:
+        raise
+    except Exception as exc:
+        raise scheduler.LaunchFailed(
+            _launcher_failure_for(adapter, exc),
+            "{0}: {1}".format(type(exc).__name__, exc)) from exc
+
+
+def _typed_launch_pane(runner: Any, spec: "launcher.LaunchSpec") -> Any:
+    """Open one agent pane, converting a refusal into a typed failure.
+
+    Named for the operation rather than for any one caller: its three callers
+    are the finalization window's reviewer, the node reviewer, and the plan
+    author, and only the first two are reviewers.
+
+    **The cause is already fixed; this closes the classification gap.** Every
+    `LaunchSpec` in this module now carries a redirected environment, so
+    `SCRATCH_REDIRECT_MISSING` cannot fire at these sites again. What was
+    still open is what happens to the *next* refusal here, whatever it turns
+    out to be: as a bare exception it reached the scheduler with nothing
+    structural in it and silently spent the ENVIRONMENTAL budget. Through
+    this it spends the launcher budget and names itself (§7.5). That makes
+    this a different defect at the same seam, not a second guard over a fixed
+    one.
+
+    Uniformity is the other reason it exists. With every `.launch(` in this
+    module behind one path, the structural guard in
+    `tests/test_launcher_classification.py` needs no allowlist — and an
+    allowlist with one entry on day one is how such a guard starts rotting.
+    """
+    return _typed_launch(runner, runner.launch, spec)
+
+
+def _require_session_path(handle: Any, node_id: str, attempt_no: int) -> None:
+    """Refuse a launch that produced no session file, with its class attached.
+
+    A handle without a transcript path produced no agent to watch: §7.6's
+    turn-count signal has nothing to read, so the attempt cannot be supervised
+    even if something is alive behind it. Module level so the refusal is
+    reachable from a test — as a bare `RuntimeError` inside the run-node
+    closure it was both unclassifiable and untestable, and it is the failure
+    that took every attempt of run-f31686ea41b44c33b117f64e3b319317.
+
+    STARTUP rather than the ENVIRONMENTAL default: this is the launcher's
+    output being incomplete, not the machine misbehaving, so it spends the
+    launcher budget (§7.5).
+    """
+    if handle.transcript_path is not None:
+        return
+    raise scheduler.LaunchFailed(
+        retry_policy.LauncherFailure.STARTUP,
+        "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no))
+
+
+def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
+                          record: Any, cancel_requested: Any,
+                          quiesce_attempt: Any,
+                          sleep: Any = time.sleep) -> "scheduler.NodeExecution":
+    """Poll one launched agent until it settles, and never spin on GONE.
+
+    Module level rather than a closure inside `_execute_run` because the real
+    adapter path was otherwise untestable: every existing test that reaches a
+    scheduler supplies its own `run_node`, the golden scenario included, which
+    is how §16.3 item 42's defect survived a green suite.
+
+    **The GONE branch is the repair.** `PollState.GONE` had no branch at all,
+    so a vanished agent fell through to the sleep below and the loop re-polled
+    at 20Hz forever. The worker thread never returned, its executor slot was
+    never released, and the watchdog's conviction could not stop it — the
+    worker checks nothing until the runner returns, and `cancel_requested` is
+    the run-level flag rather than this attempt's. With concurrency equal to
+    the pane limit, enough vanished agents wedge the run outright, and it ends
+    at §11.2's liveness backstop rather than at any node timeout. Returning
+    here ends the attempt carrying a typed launcher class, which is what makes
+    it a LAUNCHER_TRANSIENT retry rather than an ENVIRONMENTAL one (§7.5).
+    """
+    while True:
+        state = _typed_launch(adapter, adapter.poll, handle)
+        if state.state is launcher.PollState.EXITED:
+            parsed = False
+            try:
+                json.loads(envelope_path.read_text(encoding="utf-8"))
+                parsed = True
+            except (OSError, ValueError, UnicodeError):
+                pass
+            return scheduler.NodeExecution(
+                envelope_parsed=parsed, exit_code=state.exit_code or 1,
+                launched_pid=handle.process_group,
+                launch_detail=state.detail)
+        if state.state is launcher.PollState.GONE:
+            # TRANSPORT rather than STARTUP: the agent launched and then its
+            # record vanished, so what was lost is the channel to it, not its
+            # start. The budget is identical for all three non-CREDENTIAL
+            # members, so the choice between them is diagnostic only — the
+            # ledger reads this, never a branch.
+            return scheduler.NodeExecution(
+                envelope_parsed=False, exit_code=1,
+                launched_pid=handle.process_group,
+                launcher_failure=retry_policy.LauncherFailure.TRANSPORT,
+                launch_detail=state.detail)
+        if cancel_requested():
+            quiesce_attempt(record, "cancel")
+            return scheduler.NodeExecution(
+                envelope_parsed=False, exit_code=1,
+                launched_pid=handle.process_group)
+        sleep(0.05)
+
+
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     from threading import RLock
 
@@ -1892,7 +2082,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 _agent_node_prompt(plan.node_by_id()[node.node_id], envelope,
                                    retry_prompt),
                 encoding="utf-8")
-            handle = route_runner.launch(launcher.LaunchSpec(
+            handle = _typed_launch(route_runner, route_runner.launch, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
                     args.run_id, node.node_id, record.attempt_no),
                 worktree=attempt.path, prompt_path=prompt,
@@ -1904,32 +2094,15 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             with handles_lock:
                 handles[key] = handle
                 proven_absent.discard(key)
-            if handle.transcript_path is None:
-                raise RuntimeError("SESSION_PATH_MISSING:{}#{}".format(
-                    node.node_id, record.attempt_no))
+            _require_session_path(handle, node.node_id, record.attempt_no)
             store.mark_launched(
                 args.run_id, node.node_id, record.attempt_no,
                 handle.process_group,
                 extra={watchdog.SESSION_PATH_KEY: str(handle.transcript_path)})
             on_launch(handle.process_group)
-            while True:
-                state = route_runner.poll(handle)
-                if state.state is launcher.PollState.EXITED:
-                    parsed = False
-                    try:
-                        json.loads(envelope.read_text(encoding="utf-8"))
-                        parsed = True
-                    except (OSError, ValueError, UnicodeError):
-                        pass
-                    return scheduler.NodeExecution(
-                        envelope_parsed=parsed, exit_code=state.exit_code or 1,
-                        launched_pid=handle.process_group)
-                if cancel_requested():
-                    quiesce_attempt(record, "cancel")
-                    return scheduler.NodeExecution(
-                        envelope_parsed=False, exit_code=1,
-                        launched_pid=handle.process_group)
-                time.sleep(0.05)
+            return _poll_agent_execution(
+                route_runner, handle, envelope, record, cancel_requested,
+                quiesce_attempt)
 
         def quiesce_attempt(record, phase):
             key = (record.node_id, record.attempt_no)
@@ -1977,6 +2150,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             scratch_root=Path(args.scratch_root), run_node=run_node,
             run_gate=run_gate, run_integration_gate=run_integration_gate,
             quiesce_attempt=quiesce_attempt,
+            # §8.8's single integration gate, adjudicated at the number the
+            # plan declared for it. Omitting this is what left final
+            # acceptance counting to 1 while the plan asked for 70.
+            integration_min_cases=(
+                plan.merge_policy.integration_gate.min_cases),
             kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
             review_attempt=review_attempt)
         report = scheduler.Scheduler(
@@ -3058,11 +3236,24 @@ def _deliver_author_turn(config: Dict[str, Any],
         # from a previous attempt would end this one before it began.
         if envelope.exists():
             envelope.unlink()
-        handle = runner.launch(launcher.LaunchSpec(
+        # §8.3: the author writes in a pane like any other agent, so its
+        # byproducts are redirected to a scratch beside this turn's own session
+        # directory under the harness-owned session root -- never into the
+        # repository it is authoring against.
+        # What this does NOT buy, stated because the other two sites do buy
+        # it: the plan-author lane runs outside any scheduler attempt, so
+        # there is no containment handler here, no retry class, and no budget
+        # to spend correctly. It gains a typed error surface and a detail
+        # string, and nothing more. It is wrapped so that every `.launch(` in
+        # this module goes through one path, which is what lets the structural
+        # guard be a flat rule rather than a rule plus an exception.
+        handle = _typed_launch_pane(runner, launcher.LaunchSpec(
             correlation_token=token, worktree=Path(config["repo"]),
             prompt_path=prompt_path, envelope_path=envelope,
             route=lane.route, model=lane.model, effort=lane.effort,
-            profile=lane.profile, session_dir=session_dir))
+            profile=lane.profile, session_dir=session_dir,
+            environment=worktree.launch_env(
+                session_root / (token + ".scratch"))))
         deadline = time.monotonic() + lane.author_timeout_s
         state = None
         try:
