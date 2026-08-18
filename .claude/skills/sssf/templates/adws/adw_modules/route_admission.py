@@ -25,7 +25,16 @@ from . import route_receipts
 
 
 class AdmissionError(ValueError):
-    """Visible route capture cannot produce an admitting receipt."""
+    """Visible route capture cannot produce an admitting receipt.
+
+    `code` carries Herdr's own `error.code` when the refusal came from a Herdr
+    call. §1.2 forbids branching on prose, so every retry decision in this
+    module reads that field and never the message.
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 MARKERS = {
@@ -38,6 +47,44 @@ CONTINUATION_QUESTION = "previous exact marker"
 CONTINUATION_PROMPT = (
     "Reply with the previous exact marker and nothing else."
 )
+
+#: Herdr's refusal when the requested agent name is already registered.
+AGENT_NAME_TAKEN = "agent_name_taken"
+
+#: Herdr's refusal when the target pane is not back at its shell prompt.
+AGENT_PANE_BUSY = "agent_pane_busy"
+
+#: How many names one capture may ask for before giving up. The discriminator
+#: makes the first name collision-free by construction, so this only has to
+#: cover a same-instant collision between two installations.
+NAME_ATTEMPTS = 3
+
+
+def herdr_error_code(text: str) -> str:
+    """Herdr's `error.code` from a refused call's output, or `""`.
+
+    Herdr answers a refused call with a single JSON object,
+    `{"error": {"code": ..., "message": ...}}`. The code is a typed field; the
+    message is free text Herdr may reword at any release. §1.2 forbids keying a
+    decision on prose, so every retry branch below reads this and never the
+    message.
+
+    Anything that does not parse, or parses without an `error.code`, yields the
+    empty string rather than a guess: an unrecognised refusal must not be
+    mistaken for a recognised one.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return ""
+    code = error.get("code")
+    return code if isinstance(code, str) else ""
+
 
 # The plan-contract reviewer key lives with the rest of the state root's key
 # material so an operator never generates or types one. planctl requires at
@@ -358,9 +405,18 @@ def _start_visible_agent(
     except AdmissionError:
         _best_effort_close(call, {"pane_id": pane_id, "name": ""})
         raise
-    name = "admit-{}-{}".format(spec.route, "cont" if continuing else "first")
+    # The name carries a per-attempt discriminator. It used to be
+    # `admit-<route>-first`/`-cont` verbatim, which is the same name every run
+    # of every repository: a capture that ended without closing its panes -- a
+    # blocked run, an interrupted bootstrap -- leaves that agent registered, and
+    # the next bootstrap is refused `agent_name_taken` before it can do anything
+    # at all (D7). Removing the leftover instead is not an option: Herdr reports
+    # a healthy agent between turns as `idle`, exactly like an abandoned one, so
+    # reclaiming a name would eventually cancel a live run.
+    name = _admission_agent_name(spec.route, continuing=continuing)
     argv = _route_argv(spec, continuing=continuing, session_id=session_id)
     start_deadline = time.monotonic() + 60.0
+    names_tried = 1
     while True:
         try:
             started = call(
@@ -371,7 +427,15 @@ def _start_visible_agent(
                 timeout=185.0)
             break
         except AdmissionError as exc:
-            if "agent_pane_busy" not in str(exc) or time.monotonic() >= start_deadline:
+            # Branch on Herdr's typed `error.code`, never on its message (§1.2).
+            if (exc.code == AGENT_NAME_TAKEN
+                    and names_tried < NAME_ATTEMPTS):
+                # Step around the leftover with a new name; never take its own.
+                name = _admission_agent_name(spec.route, continuing=continuing)
+                names_tried += 1
+                continue
+            if (exc.code != AGENT_PANE_BUSY
+                    or time.monotonic() >= start_deadline):
                 _best_effort_close(call, {"pane_id": pane_id, "name": name})
                 raise
             try:
@@ -389,6 +453,7 @@ def _start_visible_agent(
     # state before submitting a prompt.
     launcher.wait_for_interactive_agent(
         call, name, timeout_s=spec.timeout_s)
+    _assert_agent_owns_pane(call, name, pane_id)
     agent = _extract(started, "agent")
     transcript = ""
     if isinstance(agent, dict) and agent.get("transcript_path"):
@@ -521,6 +586,54 @@ def _route_argv(
     return tuple(argv)
 
 
+def _admission_agent_name(route: str, *, continuing: bool) -> str:
+    """A capture-agent name no other run can already hold.
+
+    The discriminator is random rather than sequential: two installations
+    admitting the same route at the same instant must not compute the same
+    "next" name.
+
+    Contrast `launcher._agent_name`, which is deliberately left deterministic.
+    Its correlation token carries a per-run `uuid4` `run_id`, so a node agent
+    name is already collision-free by construction and a discriminator there
+    would only churn a name that post-mortems key on. Route admission has no
+    such run identity -- its name was derived from the route alone -- which is
+    why the collision lands here and only here.
+    """
+    return "admit-{}-{}-{}".format(
+        route, "cont" if continuing else "first", uuid.uuid4().hex[:8])
+
+
+def _assert_agent_owns_pane(
+        call: Callable[..., dict], name: str, pane_id: str) -> None:
+    """Refuse to prompt a name that resolves anywhere but our own pane.
+
+    `herdr agent prompt <TARGET> <TEXT>` types the text wherever Herdr resolves
+    `TARGET`. A name is a durable Herdr-side handle, so a name that once
+    belonged to some other agent -- a leftover record, a recycled pane -- sends
+    the admission prompt into whatever shell now sits there, which is how
+    `Reply with exactly MAESTRO_OMP_RECEIPT_OK...` ended up on the operator's
+    own command line instead of in the capture pane.
+
+    The pane we just split is the only correct destination, and `agent get`
+    reports the pane each agent occupies, so the two are compared before any
+    text is submitted. A pane Herdr will not report is not proof of anything, so
+    it is refused too: this runs before the prompt, where refusing is free.
+    """
+    try:
+        payload = call("agent", "get", name)
+    except AdmissionError as exc:
+        raise AdmissionError(
+            "ROUTE_AGENT_TARGET_UNPROVEN:{}".format(name)) from exc
+    agent = _extract(payload, "agent")
+    bound = (str(agent.get("pane_id") or "")
+             if isinstance(agent, dict) else "")
+    if bound != pane_id:
+        raise AdmissionError(
+            "ROUTE_AGENT_TARGET_MISMATCH:{}:{}!={}".format(
+                name, bound or "?", pane_id))
+
+
 def _assert_pane_cwd(call: Callable[..., dict], pane_id: str, cwd: Path) -> None:
     current = call("pane", "get", pane_id)
     bound = _extract(current, "pane")
@@ -638,8 +751,9 @@ def _herdr(herdr: Path, *args: str, timeout: Optional[float] = None) -> dict:
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise AdmissionError("LAUNCH_REFUSED:{}".format(exc)) from exc
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()[-400:]
-        raise AdmissionError("LAUNCH_REFUSED:{}".format(detail))
+        refusal = (result.stderr or result.stdout).strip()
+        raise AdmissionError("LAUNCH_REFUSED:{}".format(refusal[-400:]),
+                             herdr_error_code(refusal))
     try:
         payload = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:

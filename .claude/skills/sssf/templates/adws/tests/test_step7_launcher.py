@@ -77,6 +77,14 @@ elif argv[:2] == ["agent", "get"]:
     if os.environ.get("FAKE_HERDR_GET_FAILURE"):
         sys.stderr.write(json.dumps({"error": {"code": "transport_failure"}}))
         sys.exit(1)
+    if os.environ.get("FAKE_AGENT_SESSION_EXITED"):
+        # What real Herdr answers once a finished agent's session has exited:
+        # a refusal with a typed code, not an agent record with empty fields.
+        sys.stdout.write(json.dumps({
+            "error": {"code": "agent_not_found",
+                      "message": "agent target %s not found" % argv[2]},
+            "id": "cli:agent:get"}))
+        sys.exit(1)
     marker = os.environ.get("FAKE_HERDR_CLOSE_MARKER")
     if marker and os.path.exists(marker):
         print(json.dumps({"result": {}}))
@@ -530,6 +538,123 @@ class LauncherContractTest(unittest.TestCase):
         state = route.poll(handle)
         self.assertEqual(state.state, PollState.GONE)
         self.assertEqual(state.detail, "AGENT_GONE")
+
+    def test_a_success_envelope_outlives_the_agent_that_wrote_it(self):
+        # The live failure: the agent wrote a complete `"success": true`
+        # envelope and its session exited moments later, so `herdr agent get`
+        # answered `agent_not_found` and the attempt was scored GONE with the
+        # envelope sitting unread on disk. Three attempts of
+        # `lane-wrtop-store-document-tests` were thrown away this way and the
+        # node failed ENVIRONMENTAL_BUDGET_EXHAUSTED. The faster the agent, the
+        # likelier it loses this race.
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        self.envelope.write_text(
+            json.dumps({"success": True, "summary": "10 passed"}),
+            encoding="utf-8")
+        os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.EXITED)
+        self.assertEqual(state.exit_code, 0)
+        self.assertEqual(state.detail, "ENVELOPE_SUCCESS")
+
+    def test_a_failure_envelope_also_outlives_its_agent(self):
+        # The artifact wins in both directions: a declared failure must not be
+        # laundered into GONE either, or the retry class is decided by a race.
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        self.envelope.write_text(
+            json.dumps({"success": False}), encoding="utf-8")
+        os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.EXITED)
+        self.assertEqual(state.exit_code, 1)
+        self.assertEqual(state.detail, "ENVELOPE_FAILURE")
+
+    def test_a_transcript_declaration_outlives_its_agent(self):
+        # Routes that declare in the transcript rather than by writing the
+        # envelope file must survive the same race.
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        self.transcript.write_text(
+            json.dumps({"type": "maestro_envelope", "success": True}) + "\n")
+        os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.EXITED)
+        self.assertEqual(state.exit_code, 0)
+
+    def test_a_vanished_agent_that_declared_nothing_is_still_gone(self):
+        # GONE keeps its meaning: agent gone AND nothing declared. The failure
+        # this fix removes is good work scored as failure; the failure it must
+        # not introduce is no work scored as success.
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.GONE)
+        self.assertEqual(state.detail, "AGENT_GONE")
+
+    def test_a_half_written_envelope_is_never_a_success(self):
+        # The incident's own log has the agent SIGHUP'd *during* the envelope
+        # write -- its `write` returned "Aborted". That file happened to land
+        # complete; a truncated one must not be read as a declaration. Giving
+        # the artifact precedence makes this branch reachable for the first
+        # time, so it is worth a test rather than an assumption.
+        for content in ("", "{", '{"success": tru'):
+            with self.subTest(content=content):
+                route = self._launcher()
+                handle = route.launch(self.spec())
+                self.envelope.write_text(content, encoding="utf-8")
+                os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+                state = route.poll(handle)
+                self.assertEqual(state.state, PollState.EXITED)
+                self.assertEqual(state.exit_code, 1)
+                self.assertEqual(state.detail, "ENVELOPE_UNPARSED")
+
+    def test_an_envelope_without_a_success_verdict_is_not_a_success(self):
+        # `success` absent, or present but not the boolean `true`, is not a
+        # declaration of success. Only `is True` counts.
+        for payload in ({}, {"summary": "did things"}, {"success": "true"},
+                        {"success": 1}):
+            with self.subTest(payload=payload):
+                route = self._launcher()
+                handle = route.launch(self.spec())
+                self.envelope.write_text(json.dumps(payload), encoding="utf-8")
+                os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+                state = route.poll(handle)
+                self.assertEqual(state.exit_code, 1)
+                self.assertEqual(state.detail, "ENVELOPE_FAILURE")
+
+    def test_agent_absence_is_read_from_the_code_not_the_message(self):
+        # §1.2: `agent_not_found` is a typed field. A refusal whose prose
+        # merely contains the word is a different refusal and must surface.
+        script = self.root / "prose-herdr"
+        script.write_text(
+            "#!/bin/sh\nprintf '%s' 'agent_not_found'\nexit 1\n",
+            encoding="utf-8")
+        script.chmod(0o755)
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        prose = HerdrLauncher(
+            herdr_path=script, omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes)
+        with self.assertRaises(launcher.HerdrCallError) as caught:
+            prose.poll(handle)
+        self.assertEqual(caught.exception.code, "")
+
+    def test_cancel_proves_quiescence_for_an_attempt_that_succeeded(self):
+        # `cancel` runs in a `finally` after every attempt, successful ones
+        # included, so by then a successful attempt's envelope is on disk. If
+        # `cancel` asked `poll` whether the agent was gone it would be told
+        # EXITED -- the attempt's outcome, not the pane's state -- read that as
+        # PANE_STILL_LIVE, and refuse quiescence for every node that worked.
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        self.envelope.write_text(
+            json.dumps({"success": True}), encoding="utf-8")
+        route.cancel(handle, time.monotonic() + 1.0)
+        self.assertEqual(route.reclaim(handle.correlation_token), ())
 
 
 class TranscriptAndRouteTest(unittest.TestCase):

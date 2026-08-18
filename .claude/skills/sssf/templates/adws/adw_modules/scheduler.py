@@ -52,7 +52,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
                     Tuple)
@@ -508,6 +508,14 @@ class Scheduler:
                         node, attempt, QuiescenceFailure("watchdog-kill", exc))
 
         def fail(attempt, retry_class, reason):
+            # `reason` is the watchdog's `StallReason` value -- NODE_TIMEOUT,
+            # PROCESS_DEAD, or TURN_TIMEOUT, the typed answer to "which of the
+            # three signals convicted this attempt" (§7.6). It was accepted
+            # here and dropped, so every watchdog-driven ENVIRONMENTAL retry
+            # and every ENVIRONMENTAL_BUDGET_EXHAUSTED block reached the ledger
+            # with `detail_json == {}` and an operator learned the class and
+            # nothing else. It is carried into the classification below.
+            #
             # The watchdog's kill request is not proof: only the mandatory
             # quiescer can establish group absence before this generation is
             # released for retry. Fence again because this callback is also
@@ -524,8 +532,9 @@ class Scheduler:
                 return
             if not self._cancelled.is_set():
                 self._settle_failure(
-                    node, rp.Classification(retry_class=retry_class), record=attempt,
-                    allow_watchdog_fence=True)
+                    node,
+                    rp.Classification(retry_class=retry_class, reason=reason),
+                    record=attempt, allow_watchdog_fence=True)
 
         watchdog = wd.Watchdog(
             config=self.config,
@@ -608,8 +617,18 @@ class Scheduler:
                     and self._owns_running(context.record)):
                 signal = rp.FailureSignal(
                     node_kind=node.kind, exception_type=type(exc).__name__)
+                # `classify` reads none of the signal's ENVIRONMENTAL evidence
+                # by design (§7.5 forbids the lexical shortcut), so its
+                # fall-through returns a classification with no account of
+                # itself and the row lands empty. The exception is what this
+                # arm observed, and the launcher's typed vocabulary --
+                # LAUNCH_REFUSED, AGENT_GONE, ENVELOPE_UNPARSED -- travels in
+                # it. Recorded the way `_block_quiescence` records a cause:
+                # type and message, written and never read back (§10.1).
                 self._settle_failure(
-                    node, rp.classify(signal), record=context.record)
+                    node, _with_reason(rp.classify(signal),
+                                       _exception_reason(exc)),
+                    record=context.record)
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
@@ -631,8 +650,13 @@ class Scheduler:
         self._require_running(record)
         if not created.ok:
             self._settle_context(context)
+            # `CheckResult.detail` already names which of §8.3's checks failed
+            # and on what; discarding it here left the third ENVIRONMENTAL arm
+            # writing the same empty row as the other two.
             self._settle_failure(
-                node, rp.Classification(retry_class=st.RetryClass.ENVIRONMENTAL),
+                node, rp.Classification(
+                    retry_class=st.RetryClass.ENVIRONMENTAL,
+                    reason=_check_result_reason(created)),
                 record=record)
             return
 
@@ -1165,6 +1189,35 @@ def _budget_reason(retry_class: st.RetryClass) -> st.BlockReason:
     if retry_class is st.RetryClass.LAUNCHER_TRANSIENT:
         return st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED
     return st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+
+
+def _with_reason(classification: rp.Classification,
+                 reason: Optional[str]) -> rp.Classification:
+    """Give a classification an account of itself when it arrived without one.
+
+    `classify` is structural, never lexical (§7.5), so its ENVIRONMENTAL
+    fall-through deliberately reads none of the evidence that reached it and
+    returns `reason=None`. That is correct for *classifying* and wrong for
+    *recording*: the caller holds the observation, and this is where it is
+    attached. An existing reason is never overwritten -- the classifier's own
+    account outranks the call site's.
+    """
+    if not reason or classification.reason:
+        return classification
+    return replace(classification, reason=reason)
+
+
+def _exception_reason(exc: BaseException) -> str:
+    """Type and message, the shape `_block_quiescence` already records."""
+    return "{0}: {1}".format(type(exc).__name__, exc)
+
+
+def _check_result_reason(result: "wt.CheckResult") -> str:
+    """Which §8.3 check failed, from the check's own typed detail."""
+    if result.detail:
+        return "{0} check failed: {1}".format(
+            result.stage, "; ".join(result.detail))
+    return "{0} check failed".format(result.stage)
 
 
 def _failure_detail(classification: rp.Classification,

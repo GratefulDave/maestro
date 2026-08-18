@@ -48,6 +48,57 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- An agent's declared result outranks the pane's reported status. `poll()` returned
+  `PollState.GONE` on `agent_not_found`, and on a non-dict agent payload, before reading the
+  envelope, so an agent that finished its turn, wrote `{"success": true}`, and exited was
+  scored as an environmental failure. Herdr drops the agent record as soon as the session
+  ends, so the faster the agent, the more reliably it lost the race. Observed in run
+  `run-14b7b75944094c52ac9c0add41ae46a2`: three attempts, three complete success envelopes
+  of 330, 271, and 326 bytes, all three discarded, the node blocked
+  `ENVIRONMENTAL_BUDGET_EXHAUSTED` with no lane merged. `poll()` now consults a new
+  `_declared_result()` first — the envelope file, then the transcript's terminal record —
+  and GONE is reachable only when the agent is absent *and* nothing was declared. The rule
+  was already stated in the file's own comments, that what the agent wrote beats what the
+  pane reports; the code asked the pane first regardless. §9.7.
+
+- A quiescence proof asks whether the process is gone, never whether the work succeeded.
+  `cancel()` established quiescence by calling `poll()` and requiring GONE, so giving the
+  envelope precedence inside `poll()` would have raised `HERDR_QUIESCENCE_UNPROVEN` on every
+  successful node: `cancel()` runs in a `finally` after every attempt, and a successful
+  attempt is precisely the case that now reports EXITED. The two questions are now asked by
+  two predicates — `poll()` reports the attempt's outcome, `_agent_absent()` reports only
+  whether Herdr still holds a record of the agent. The existing cancel tests could not have
+  caught the regression, because none of them writes an envelope. §8.3, §9.7.
+
+- Watchdog-driven environmental failures record which signal convicted the attempt.
+  `Watchdog._stall` decides between `NODE_TIMEOUT`, `PROCESS_DEAD`, and `TURN_TIMEOUT` and
+  passes the value to the scheduler's `fail` callback, which accepted the argument and never
+  used it. `_failure_detail` therefore received neither a classifier reason nor a
+  verification verdict and wrote `{}`, so every watchdog-driven ENVIRONMENTAL retry row and
+  every `ENVIRONMENTAL_BUDGET_EXHAUSTED` block named the class and nothing else. The typed
+  value existed at the point of failure and was dropped one hop before the ledger. The two
+  neighbouring arms that also reach `_settle_failure` without a verdict are fixed in the same
+  way: the worker's containment handler records the exception type and message, in the shape
+  the quiescence arm already used, and the `check_at_create` arm records the failing check's
+  own `CheckResult.detail`. `watchdog.py` needed no change; it was already producing the
+  answer. This closes the arm the `mark_blocked` fix below did not reach. §1.1 item 4, §7.6.
+
+- `run start` reclaims a stranded integration checkout instead of asking the operator to move
+  it by hand. A previous run that died before releasing its integration worktree left the
+  integration branch checked out, and the next run refused with
+  `INTEGRATION_BRANCH_CHECKED_OUT` over state Maestro itself had created. The release verb
+  already carried the correct boundary, so `run start` now applies that same predicate before
+  refusing: a worktree inside this installation's own run root is reclaimed, and a checkout
+  anywhere else — which may be the operator's — is left exactly where it is and still
+  refuses, with the refusal now saying so. The decision is path containment against the
+  configured run root read from `git worktree list`, never a name or a claim (§1.2). Attempt
+  worktrees are untouched, including the blocked ones §8.8 retains for post-mortem.
+
+- Route-admission agent names carry a collision-free discriminator, so a leftover agent from a
+  previous run no longer refuses the next capture. The retry keys on the typed error code
+  rather than on message text, and a prompt is refused when its target name resolves to
+  another pane.
+
 - Byproduct redirection now reaches the agent's own pane. `scratch_env()`'s seven
   variables were passed as `env=` to the `herdr` CLI subprocess, but a pane's shell is
   forked by the herdr server, so the redirect configured the client and died there. The
