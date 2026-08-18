@@ -279,6 +279,7 @@ class PlanContractVerbFixture(unittest.TestCase):
                     {"path": "src/shipped.py", "mutation": "written"},
                     {"path": "README.md", "mutation": "unmodified"},
                 ],
+                "effects": [],
             }],
             "lanes": [{
                 "lane_id": "lane-ship",
@@ -299,6 +300,7 @@ class PlanContractVerbFixture(unittest.TestCase):
                 "maestro": {
                     "repo": "example",
                     "outputs": {"lane-ship": ["src/shipped.py"]},
+                    "prohibited_effects": [],
                     "integration_branch": "main",
                     "integration_gate": {
                         "runner": "pytest",

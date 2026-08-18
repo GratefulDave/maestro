@@ -356,6 +356,7 @@ def _ingress_ir(*, min_executed: int) -> dict:
                 {"path": "src/greeting.py", "mutation": "written"},
                 {"path": "README.md", "mutation": "unmodified"},
             ],
+            "effects": [],
         }],
         "lanes": [{
             "lane_id": "lane-freeze", "title": "Freeze writers",
@@ -372,6 +373,7 @@ def _ingress_ir(*, min_executed: int) -> dict:
         "extensions": {"maestro": {
             "repo": "example",
             "outputs": {"lane-freeze": ["src/greeting.py"]},
+            "prohibited_effects": [],
             "integration_branch": "main",
             "integration_gate": {
                 "runner": "pytest", "argv": ["tests"], "cwd": ".",

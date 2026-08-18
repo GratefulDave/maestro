@@ -63,6 +63,11 @@ def _ir() -> dict:
                 {"path": "src/greeting.py", "mutation": "written"},
                 {"path": "README.md", "mutation": "unmodified"},
             ],
+            # Required, like `surface`: a plan states what external acts it
+            # forbids and every requirement states its disposition toward each
+            # one. This fixture forbids nothing, which is a declaration rather
+            # than an omission.
+            "effects": [],
         }],
         "lanes": [{
             "lane_id": "lane-freeze",
@@ -82,6 +87,7 @@ def _ir() -> dict:
         "extensions": {"maestro": {
             "repo": "example",
             "outputs": {"lane-freeze": ["src/greeting.py"]},
+            "prohibited_effects": [],
             "integration_branch": "main",
             "integration_gate": {
                 "runner": "pytest", "argv": ["tests"], "cwd": ".",

@@ -19,7 +19,22 @@ RECEIPT_VERSION = "plan-contract-review.v1"
 
 
 class IngressError(plan_author.AuthoringError):
-    """A plan-contract package cannot become a Maestro plan."""
+    """A plan-contract package cannot become a Maestro plan.
+
+    `blockers` carries the typed admission blockers when the refusal is an
+    admission refusal, and is empty otherwise. The joined message stays for an
+    operator reading a terminal; a caller that needs to branch on which
+    obligation fired reads the tuple, because thirteen blockers rendered into
+    one string is a wall no code can take apart and `validate_plan` already
+    returns its blockers typed.
+    """
+
+    def __init__(self, message: str,
+                 blockers: Sequence["plan_validate.AdmissionBlocker"] = ()
+                 ) -> None:
+        super().__init__(message)
+        self.blockers: Tuple["plan_validate.AdmissionBlocker", ...] = tuple(
+            blockers)
 
 
 def _sha256(data: bytes) -> str:
@@ -307,11 +322,19 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         })
 
     # Admission, before anything is written and therefore before a run can
-    # start: a lane whose requirement names a repository path the lane cannot
-    # write has a contract no correct attempt can satisfy, and the node spends
-    # its whole retry budget discovering that. `validate_contract_surface`
-    # reads declared paths, declared mutation kinds, declared ids and the
-    # depends_on graph, and no free text — §1.2.
+    # start. Two predicates over two domains, both answering "can any correct
+    # attempt satisfy this contract?": a lane whose requirement names a
+    # repository path the lane cannot write, and a requirement that prescribes
+    # an external act its own plan forbids. Both were paid for by the same run,
+    # in which one node could not write the file its behaviour needed and
+    # another was told in one paragraph to be a pure derivation module and to
+    # perform a server-side copy. Both read declared paths, declared
+    # enumerated values, declared ids, and the depends_on graph — no free
+    # text, §1.2.
+    #
+    # Both blocker sets are collected into one refusal rather than raised in
+    # turn: an author sent back twice for two defects in one document is the
+    # fail-fast validator §11.1 rejects.
     #
     # It runs here rather than on one caller because this is the chokepoint
     # every route crosses: `plan author --from-plan-contract` and `plan ship`
@@ -321,12 +344,14 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     # It runs after the per-lane loop so that a malformed lane, verifier or
     # output set is still refused in its own vocabulary; a surface blocker
     # about a lane whose outputs never parsed would name the wrong defect.
-    surface_blockers = plan_validate.validate_contract_surface(ir)
-    if surface_blockers:
-        raise IngressError("UNREACHABLE_SURFACE:" + " | ".join(
-            "{} {} {}".format(blocker.obligation.value, blocker.pointer,
-                              blocker.message)
-            for blocker in surface_blockers))
+    admission_blockers = plan_validate.validate_admission(ir)
+    if admission_blockers:
+        raise IngressError(
+            "ADMISSION_REFUSED:" + " | ".join(
+                "{} {} {}".format(blocker.obligation.value, blocker.pointer,
+                                  blocker.message)
+                for blocker in admission_blockers),
+            admission_blockers)
 
     # §8.8's one integration gate, in exactly one of two forms. It used to
     # admit three overlapping ones — `runner` plus `argv`, a `command` line to
