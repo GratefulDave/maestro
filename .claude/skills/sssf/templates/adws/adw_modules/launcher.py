@@ -55,10 +55,16 @@ class LaunchRefusal(Enum):
       raises `PROCESS_GROUP_UNTRACKED` over a process that was never started,
       and Python replaces the launch's own exception with it. The naive repair
       — treating every failed launch as proven absent — lies for the refusals
-      raised *after* the split (`SHELL_NOT_READY`, `NO_PANE`), where a pane
-      really does exist and its group is exactly what quiescence is for.
-      Reported rather than inferred, so the proof is skipped only where
-      absence is established by construction.
+      raised *after* the split, where a pane may really exist and its group is
+      exactly what quiescence is for. Reported rather than inferred, so the
+      proof is skipped only where absence is established.
+
+      For a post-split member the answer is not a property of the member at
+      all: every such handler closes its own pane first, so whether a pane
+      survives depends on whether that close succeeded. Those members declare
+      `None` here and the raise site states the fact (`LaunchRefused(...,
+      pane_created=...)`) after its cleanup has run. `None` with nothing
+      stated falls back to `True`, which is the fail-closed answer.
     * `deterministic` — whether another attempt could plausibly survive what
       this one did not. §7.5 closes the retry classes at three and makes the
       closure load-bearing, so this is *not* a fourth class: it sizes the
@@ -80,12 +86,36 @@ class LaunchRefusal(Enum):
     ROUTE_NOT_ADMITTED = ("ROUTE_NOT_ADMITTED", False, True)
     #: The split returned without a pane id. §16.3 item 45 names this among
     #: the post-split refusals: herdr may hold a pane it did not report.
-    NO_PANE = ("NO_PANE", True, False)
+    NO_PANE = ("NO_PANE", None, False)
     #: The pane exists and never settled into an interactive shell.
-    SHELL_NOT_READY = ("SHELL_NOT_READY", True, False)
+    SHELL_NOT_READY = ("SHELL_NOT_READY", None, False)
+    #: `agent start` refused the pane herdr had just handed us. Herdr's own
+    #: precondition check is the authority on whether a pane can host an
+    #: agent, and it answers with a typed `error.code` -- so the refusal is
+    #: restated here rather than escaping as herdr's raw `HerdrCallError`,
+    #: which is not a `LaunchRefused` and therefore says nothing about the
+    #: pane the handler just closed.
+    AGENT_START_REFUSED = ("AGENT_START_REFUSED", None, False)
+    #: The pane herdr split is not bound to the worktree the spec named.
+    #: Non-deterministic: the binding is herdr's to get right and another
+    #: split may land correctly.
+    BINDING_MISMATCH = ("BINDING_MISMATCH", None, False)
+    #: The spec named a route this launcher cannot build an argv for. The
+    #: pane is already open by the time that is discovered, so it is reaped
+    #: and the refusal states the reap -- and it is deterministic, because the
+    #: route is a property of the spec and identical on every attempt.
+    UNSUPPORTED_ROUTE = ("UNSUPPORTED_ROUTE", None, True)
 
-    def __init__(self, code: str, pane_created: bool, deterministic: bool) -> None:
+    def __init__(self, code: str, pane_created: Optional[bool],
+                 deterministic: bool) -> None:
         self.code = code
+        #: `None` means "the raise site must state it". A refusal raised after
+        #: the split cannot answer this as a class constant: whether a pane
+        #: still exists depends on whether the handler's own `pane close`
+        #: succeeded, which is a fact about one attempt and not about the
+        #: member. A constant here was wrong in the dangerous direction --
+        #: every such handler closes the pane and then reported `True`, which
+        #: sends §8.3's quiesce step after a group that was never registered.
         self.pane_created = pane_created
         self.deterministic = deterministic
 
@@ -100,15 +130,28 @@ class LaunchRefused(RuntimeError):
     and the message Herdr may reword at any release.
     """
 
-    def __init__(self, refusal: LaunchRefusal, detail: str = "") -> None:
+    def __init__(self, refusal: LaunchRefusal, detail: str = "",
+                 pane_created: Optional[bool] = None) -> None:
         super().__init__("LAUNCH_REFUSED:{}{}".format(
             refusal.code, ":" + detail if detail else ""))
         self.refusal = refusal
         self.detail = detail
+        self._pane_created = pane_created
 
     @property
     def pane_created(self) -> bool:
-        return self.refusal.pane_created
+        """Whether a pane was left behind, stated by whoever cleaned up.
+
+        Three sources, in order. An explicit constructor argument wins,
+        because only the raise site knows what its own cleanup achieved. A
+        member that declares the fact by construction (nothing was split yet)
+        answers next. Anything else fails closed at `True`: §8.3 refuses to
+        report an absence nobody measured.
+        """
+        if self._pane_created is not None:
+            return self._pane_created
+        declared = self.refusal.pane_created
+        return True if declared is None else declared
 
     @property
     def deterministic(self) -> bool:
@@ -761,13 +804,24 @@ def _wait_for_available_shell(
         herdr_call: Callable[..., dict], pane_id: str, timeout_s: float = 30.0,
         settle_polls: int = 5,
 ) -> None:
-    """Wait until the pane is a settled interactive shell.
+    """Give the pane a chance to settle into an interactive shell. Advisory.
 
     A single ready snapshot is not enough: a freshly split pane can look like a
     lone zsh in the gap before login hooks (direnv, keychain lookups) spawn
     their own foreground processes. Starting an agent in that gap makes Herdr
-    report `agent_pane_busy`. Require several consecutive ready snapshots so the
-    pane has demonstrably stopped changing before we start the agent.
+    report `agent_pane_busy`, so several consecutive ready snapshots are worth
+    waiting for.
+
+    Worth waiting for, and nothing more. This used to *gate* the launch,
+    raising `SHELL_NOT_READY` at its deadline, and a wall clock over a
+    separate RPC cannot prove what it was asked to prove: the last snapshot is
+    already stale when `agent start` reaches the server, so a pane this
+    function called ready can be busy a millisecond later and a pane it called
+    busy can be free. Herdr runs the same precondition inside `agent start`,
+    on the server, with no gap — that check is the authority, it answers with
+    a typed `error.code`, and the caller now turns that answer into a typed
+    retryable refusal into a fresh pane. Returning at the deadline hands the
+    decision to the side that can actually make it.
     """
     deadline = time.monotonic() + timeout_s
     ready = 0
@@ -780,7 +834,7 @@ def _wait_for_available_shell(
         if ready >= settle_polls:
             return
         if time.monotonic() >= deadline:
-            raise LaunchRefused(LaunchRefusal.SHELL_NOT_READY)
+            return
         time.sleep(0.1)
 
 
@@ -801,6 +855,10 @@ class HerdrLauncher:
         self._handles: Dict[str, LaunchHandle] = {}
         self._tailers: Dict[str, TranscriptTailer] = {}
         self._proven_absent: Dict[str, LaunchHandle] = {}
+        #: The pane every split is taken from, resolved once from herdr's
+        #: `--current` selector. `None` until first asked; `""` records that
+        #: herdr could not answer, so the selector is used unchanged.
+        self._split_parent_id: Optional[str] = None
 
     def _herdr(self, *args: str, env: Optional[Mapping[str, str]] = None,
                timeout: float = 30.0) -> dict:
@@ -831,6 +889,54 @@ class HerdrLauncher:
             raise RuntimeError("PROTOCOL_INVALID_RESPONSE")
         return payload
 
+    def _split_parent(self, environment: Mapping[str, str]) -> Tuple[str, ...]:
+        """The `pane split` argument naming which pane to split, resolved once.
+
+        `--current` is not an identifier, it is a server-side selector over
+        mutable state: whichever pane holds focus at the instant the split
+        arrives. Two lanes splitting concurrently read that selector at two
+        different instants, so the second can split a pane the first has just
+        created — and did, on 2026-08-18, when one lane's agent landed in a
+        pane the sibling launch had opened 30ms earlier and herdr refused it
+        with `agent_pane_busy`. Resolving the selector once, to the pane id it
+        named at construction time, makes every subsequent split name a fixed
+        pane and removes the shared mutable read from the race entirely.
+
+        Cached deliberately: re-asking would reintroduce the moving target.
+        If herdr cannot answer, the selector is used unchanged rather than
+        guessed at — a degraded split is still a split, and inventing a pane
+        id would be worse than the race.
+        """
+        with self._handles_lock:
+            if self._split_parent_id is None:
+                try:
+                    payload = self._herdr("pane", "current", env=environment)
+                except BaseException:
+                    payload = {}
+                pane = _extract(payload, "pane")
+                pane_id = (pane.get("pane_id")
+                           if isinstance(pane, dict) else None)
+                self._split_parent_id = str(pane_id) if pane_id else ""
+            resolved = self._split_parent_id
+        return (resolved,) if resolved else ("--current",)
+
+    def _reap_pane(self, pane_id: str,
+                   environment: Mapping[str, str]) -> bool:
+        """Close one pane a failed launch is about to abandon; say if it went.
+
+        The return value is the whole point. Every post-split failure path in
+        `launch` closes its pane and then has to tell the scheduler whether a
+        pane still exists, and only this call knows. `True` iff herdr accepted
+        the close; a close that raised, or that herdr refused, is reported as
+        a pane that may still be there (§8.3: never report an absence nobody
+        measured).
+        """
+        try:
+            self._herdr("pane", "close", pane_id, env=environment)
+        except BaseException:
+            return False
+        return True
+
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         if not self.admitted_routes.admits(spec.route):
             raise LaunchRefused(LaunchRefusal.ROUTE_NOT_ADMITTED, spec.route)
@@ -839,29 +945,44 @@ class HerdrLauncher:
         # The pane shell is forked by the herdr server, not by the CLI process
         # below, so `env=` alone leaves the bracket's redirection outside the
         # pane entirely (§8.3). `--env` is the only surface that crosses.
-        split = self._herdr("pane", "split", "--current", "--direction", "right",
+        #
+        # Built before the parent pane is resolved, and the order is the
+        # point: `pane_env_flags` refuses an incomplete redirection, and
+        # SCRATCH_REDIRECT_MISSING declares `pane_created=False` because it is
+        # raised before herdr is called *at all*. Resolving the parent first
+        # would make one herdr call before that refusal and falsify it.
+        env_flags = pane_env_flags(environment)
+        split = self._herdr("pane", "split", *self._split_parent(environment),
+                            "--direction", "right",
                             "--cwd", str(worktree), "--no-focus",
-                            *pane_env_flags(environment), env=environment)
+                            *env_flags, env=environment)
         pane = _extract(split, "pane")
         if not isinstance(pane, dict) or not pane.get("pane_id"):
-            raise LaunchRefused(LaunchRefusal.NO_PANE)
+            # No id means nothing to close: herdr may hold a pane it did not
+            # report, and an unreapable pane is exactly the case `pane_created`
+            # exists to keep honest.
+            raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
         pane_id = str(pane["pane_id"])
         name = _agent_name(spec.correlation_token)
         route_argv = (build_omp_argv(self.omp_path, spec) if spec.route == "omp"
                       else build_claude_argv(self.claude_path, spec)
                       if spec.route == "claude" else None)
         if route_argv is None:
-            raise ValueError("UNSUPPORTED_ROUTE:{}".format(spec.route))
+            # The pane is already open. Raising here without closing it leaked
+            # one pane per refusal and told the scheduler nothing typed about
+            # what it had left behind.
+            closed = self._reap_pane(pane_id, environment)
+            raise LaunchRefused(LaunchRefusal.UNSUPPORTED_ROUTE, spec.route,
+                                pane_created=not closed)
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
         actual = (Path(str(bound.get("cwd"))).resolve()
                   if isinstance(bound, dict) and bound.get("cwd") else None)
         if actual != worktree:
-            try:
-                self._herdr("pane", "close", pane_id, env=environment)
-            except BaseException:
-                pass
-            raise RuntimeError("BINDING_MISMATCH:{}!={}".format(actual, worktree))
+            closed = self._reap_pane(pane_id, environment)
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "{}!={}".format(actual, worktree), pane_created=not closed)
         try:
             _wait_for_available_shell(
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
@@ -871,22 +992,39 @@ class HerdrLauncher:
                 "--pane", pane_id, "--timeout", "180000",
                 "--", *route_argv[1:],
                 env=environment, timeout=185.0)
-        except BaseException:
-            try:
-                self._herdr("pane", "close", pane_id, env=environment)
-            except BaseException:
-                pass
-            raise
+        except BaseException as exc:
+            # Reap first, then state what the reap achieved. Re-raising
+            # herdr's own `HerdrCallError` from here was the 2026-08-18
+            # defect: it is not a `LaunchRefused`, so `LaunchFailed`'s
+            # fail-closed `pane_created` said a pane survived a close that had
+            # just succeeded, the scheduler quiesced an attempt whose handle
+            # was never registered, and PROCESS_GROUP_UNTRACKED replaced a
+            # retryable launch failure with a terminal QUIESCENCE_UNPROVEN.
+            closed = self._reap_pane(pane_id, environment)
+            if not isinstance(exc, Exception):
+                # KeyboardInterrupt/SystemExit are not launch outcomes.
+                raise
+            raise LaunchRefused(
+                LaunchRefusal.AGENT_START_REFUSED,
+                "{0}: {1}".format(type(exc).__name__, exc),
+                pane_created=not closed) from exc
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
         actual = (Path(str(bound.get("cwd"))).resolve()
                   if isinstance(bound, dict) and bound.get("cwd") else None)
         if actual != worktree:
+            # An agent is running in this pane, so the reap is `cancel`'s
+            # (process group first, then the pane) rather than a bare close.
+            # It raises `HarnessQuiescenceError` when it cannot finish, which
+            # is the one case here that must not be restated as a refusal:
+            # something is still owned and the caller has to know.
             self.cancel(LaunchHandle(spec.correlation_token, pane_id, name,
                                      actual or Path("/"),
                                      environment=environment),
                         time.monotonic() + 1.0)
-            raise RuntimeError("BINDING_MISMATCH:{}!={}".format(actual, worktree))
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "{}!={}".format(actual, worktree), pane_created=False)
         agent = _extract(started, "agent")
         transcript = _agent_transcript_path(agent)
         handle = LaunchHandle(spec.correlation_token, pane_id, name, worktree,
@@ -1200,7 +1338,39 @@ class FakeLauncher:
         return None
 
 
+#: Herdr `error.code`s naming a condition another attempt can survive.
+#:
+#: The code is a typed field on `HerdrCallError`, parsed from herdr's
+#: `{"error": {"code": ...}}` envelope by `herdr_error_code` -- never matched
+#: out of the message, which §1.2 forbids and which herdr may reword at any
+#: release. `agent_pane_busy` is the one observed member: herdr refuses to
+#: start an agent in a pane that is not an available shell, and the next
+#: attempt gets a pane of its own. Without it the refusal fell through to
+#: `EXECUTION` -> `STARTUP` and was budgeted as a broken launcher rather than
+#: as contention.
+TRANSIENT_HERDR_ERROR_CODES: frozenset = frozenset({"agent_pane_busy"})
+
+
+def _herdr_error_code_of(exc: BaseException) -> str:
+    """Herdr's own error code for a failure, following the `from` chain.
+
+    A refusal is restated as a `LaunchRefused` before it leaves `launch`, so
+    the `HerdrCallError` that carries the code arrives as `__cause__`. Walking
+    the chain reads the same typed field wherever the restatement happened.
+    """
+    seen = set()
+    cursor: Optional[BaseException] = exc
+    while cursor is not None and id(cursor) not in seen:
+        seen.add(id(cursor))
+        if isinstance(cursor, HerdrCallError) and cursor.code:
+            return cursor.code
+        cursor = cursor.__cause__
+    return ""
+
+
 def classify_error(exc: BaseException) -> ErrorClass:
+    if _herdr_error_code_of(exc) in TRANSIENT_HERDR_ERROR_CODES:
+        return ErrorClass.TRANSIENT
     if isinstance(exc, FileNotFoundError):
         return ErrorClass.CONFIGURATION
     if isinstance(exc, PermissionError):

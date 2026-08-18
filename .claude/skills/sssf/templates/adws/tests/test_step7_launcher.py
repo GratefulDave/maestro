@@ -445,12 +445,16 @@ class LauncherContractTest(unittest.TestCase):
             launcher.launch(self.spec())
         calls = [json.loads(line)["argv"] for line in (self.root / "argv.jsonl").read_text().splitlines()]
         self.assertIn(["pane", "close", "w1:p2"], calls)
-        # A pane was allocated, so the refusal must not claim otherwise: the
-        # close above is best-effort and its success is not a measured absence
-        # (§16.3 item 45). Whatever the refusal turns out to be, this site is
-        # past the split and must demand the proof.
-        if isinstance(caught.exception, launcher_module.LaunchRefused):
-            self.assertTrue(caught.exception.pane_created)
+        # A pane was allocated and this handler closed it, so the refusal
+        # reports the close herdr accepted rather than a constant. Saying
+        # `True` after a successful close is what sent §8.3's quiesce step
+        # after an attempt that was never registered, turning a retryable
+        # launch failure into a terminal QUIESCENCE_UNPROVEN. The close-failed
+        # direction is the control, in `test_launch_refusal_cleanup.py`.
+        self.assertIsInstance(caught.exception, launcher_module.LaunchRefused)
+        self.assertIs(caught.exception.refusal,
+                      launcher_module.LaunchRefusal.AGENT_START_REFUSED)
+        self.assertFalse(caught.exception.pane_created)
 
     def test_launch_refuses_os_failure_as_typed_refusal(self):
         launcher = HerdrLauncher(herdr_path=self.root / "missing-herdr",
