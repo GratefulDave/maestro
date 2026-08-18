@@ -553,6 +553,26 @@ class PromptNotSubmitted(RuntimeError):
 SUBMIT_ATTEMPTS = 4
 
 
+def pane_revision(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int]:
+    """The pane's monotonic revision counter, or None when it cannot be read.
+
+    A typed integer the terminal maintains, not pane text: §1.2 permits reading
+    it, and it is the one signal that separates an agent that consumed a prompt
+    from one whose composer is still holding it. `agent_status` cannot — a pane
+    that never accepted the prompt and a pane whose short turn already finished
+    both report `idle`.
+    """
+    try:
+        payload = herdr_call("pane", "get", pane_id, timeout=15.0)
+    except Exception:
+        return None
+    pane = (payload or {}).get("result", {}).get("pane")
+    if not isinstance(pane, dict):
+        pane = payload if isinstance(payload, dict) else {}
+    revision = pane.get("revision")
+    return revision if isinstance(revision, int) else None
+
+
 def submit_agent_prompt(
         herdr_call: Callable[..., dict],
         pane_id: str,
@@ -596,21 +616,44 @@ def submit_agent_prompt(
     until_argv: List[str] = []
     for status in until:
         until_argv.extend(["--until", status])
+    # What the pane had consumed before the prompt was offered. Everything
+    # below compares against this rather than against a status word.
+    baseline = pane_revision(herdr_call, pane_id)
+
+    def consumed() -> bool:
+        """Whether the pane has taken anything since the prompt was offered.
+
+        `idle` is worthless as proof here and was the whole defect: a composer
+        holding an unsubmitted `@<path>` reports `idle`, so waiting for it
+        succeeded instantly against exactly the failure it existed to catch,
+        and the Enter recovery below never ran once. The revision counter
+        cannot be satisfied that way -- an unsubmitted composer does not
+        advance it.
+
+        Unreadable on either side means unproven, and unproven is not
+        submitted: the caller's next move is to press Enter again, which is
+        harmless against a prompt that did go through.
+        """
+        if baseline is None:
+            return False
+        current = pane_revision(herdr_call, pane_id)
+        return current is not None and current > baseline
 
     def wait_for(budget_s: float) -> bool:
         argv = ["agent", "wait", target, *until_argv,
                 "--timeout", str(int(budget_s * 1000))]
         try:
             herdr_call(*argv, timeout=budget_s + 5.0)
-            return True
         except Exception:
             return False
+        return consumed()
 
     argv = ["agent", "prompt", target, text, "--wait", *until_argv,
             "--timeout", str(int(total_s * 1000))]
     try:
         herdr_call(*argv, timeout=total_s + 5.0)
-        return
+        if consumed():
+            return
     except Exception as exc:
         if "agent_prompt_stalled" not in str(exc):
             raise
