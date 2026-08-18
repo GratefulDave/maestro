@@ -146,6 +146,9 @@ class RefusalCleanupTest(unittest.TestCase):
             effort="high",
             profile="openai-performance",
             session_dir=self.root / "session",
+            # B13: `omp` publishes a catalog, so a dispatched spec must carry
+            # the window `preflight_launch_prompt` measures the prompt against.
+            context_window_tokens=400_000,
             environment=worktree_module.launch_env(self.scratch))
 
     def build(self, admitted=None):

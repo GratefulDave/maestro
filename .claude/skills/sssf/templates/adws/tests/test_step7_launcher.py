@@ -203,6 +203,10 @@ class LauncherContractTest(unittest.TestCase):
             effort="high",
             profile="openai-performance" if route == "omp" else None,
             session_dir=self.root / "session",
+            # B13: `omp` publishes a catalog, so every spec dispatched on it
+            # must carry the window `preflight_launch_prompt` measures against.
+            # `claude` publishes none, so `None` is the honest value there.
+            context_window_tokens=400_000 if route == "omp" else None,
             environment=worktree_module.launch_env(self.scratch),
         )
 

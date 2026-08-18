@@ -986,7 +986,11 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                     mock.patch.object(maestro.finalization_window,
                                       "FinalizationWindow", CapturedWindow):
                 maestro._reviewer_window_factory(args)(matrix)
-            windows[0].launch()
+                # Inside the patch: the launch now resolves the reviewer's
+                # context window from the catalog to put it on the spec (B13 at
+                # the launcher chokepoint), so the stub has to still be in
+                # place when the spec is built, not only when it is assembled.
+                windows[0].launch()
 
             spec = captured["spec"]
             pane_env = _pane_env(lch.pane_env_flags(spec.environment))

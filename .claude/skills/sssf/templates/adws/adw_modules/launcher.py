@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import (Callable, Dict, List, Mapping, Optional, Protocol,
                     Sequence, Tuple)
 
+from . import handoff_budget as hb
 from .route_receipts import AdmittedRouteSet
 
 
@@ -105,6 +106,19 @@ class LaunchRefusal(Enum):
     #: and the refusal states the reap -- and it is deterministic, because the
     #: route is a property of the spec and identical on every attempt.
     UNSUPPORTED_ROUTE = ("UNSUPPORTED_ROUTE", None, True)
+    #: B13: the prompt file will not fit the window the spec declared. Raised
+    #: before any herdr call, so no pane exists. Deterministic: the prompt's
+    #: size and the model's window are both properties of the spec, identical
+    #: on every attempt, and a second launch would overflow exactly as far.
+    PROMPT_TOO_LARGE = ("PROMPT_TOO_LARGE", False, True)
+    #: B13's fail-closed half: the route publishes a catalog, so a window
+    #: exists to be measured against, and the comparison could not be made --
+    #: the spec carries no window, or the prompt file cannot be sized. Both
+    #: sub-facts are named in the detail string rather than split into two
+    #: members, because unlike D9's pair they do not lead to different
+    #: decisions: neither can show the handoff fits, and B13 is that an
+    #: unmeasured window is not a passing one.
+    PROMPT_UNMEASURED = ("PROMPT_UNMEASURED", False, True)
 
     def __init__(self, code: str, pane_created: Optional[bool],
                  deterministic: bool) -> None:
@@ -272,6 +286,22 @@ class LaunchSpec:
     profile: Optional[str]
     session_dir: Path
     environment: Mapping[str, str] = field(default_factory=dict)
+    #: The target's published context window, in tokens, as measured by
+    #: whoever owns the route's catalog. B13's size check is made against this
+    #: at `HerdrLauncher.launch`, which is the one path every dispatched prompt
+    #: passes through.
+    #:
+    #: Three values, three meanings, and the third is why this is not simply
+    #: `int`: a positive number is a measured window; `0` says the catalog was
+    #: read and carries no window for this model; `None` says nobody measured
+    #: it. On a route in `ROUTES_PUBLISHING_A_WINDOW` the last two are both
+    #: refusals — an unmeasured window is not a passing one — so leaving the
+    #: field off cannot quietly disable the check for a new call site.
+    #:
+    #: Resolution lives at the CLI rather than here because reading a route's
+    #: catalog means importing `agent_pi`, which `enforcement.py`'s
+    #: `base-execution-import` forbids every module in this package to do.
+    context_window_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +348,59 @@ class LauncherAdapter(Protocol):
     def reclaim(self, token: str) -> Tuple[LaunchHandle, ...]: ...
     def classify(self, exc: BaseException) -> ErrorClass: ...
     def provision(self, worktree: Path) -> None: ...
+
+
+def preflight_launch_prompt(spec: LaunchSpec) -> Optional[int]:
+    """B13 at the chokepoint: size-check the prompt file before dispatch.
+
+    Returns the token estimate when the route publishes a window and the prompt
+    fits, and `None` when the route publishes no window at all. Raises
+    `LaunchRefused` otherwise, before any herdr call, so nothing is left behind.
+
+    **Why here.** B13 was applied at three CLI dispatch sites, which is three
+    places a fourth dispatch site does not have to visit. `HerdrLauncher.launch`
+    is the single path every prompt this system dispatches actually takes — omp
+    carries the prompt in argv (`build_omp_argv`), claude submits it into the
+    composer — so a check here is the one that cannot be bypassed by adding a
+    caller. The CLI's own check stays: refusing earlier gives the operator the
+    failure at the site that assembled the oversized prompt.
+
+    **What it measures.** `spec.prompt_path.stat().st_size`, an integer, against
+    `spec.context_window_tokens`, an integer. Two integers and a ratio. Nothing
+    opens the file and nothing reads a word of it, which is the form §1.2
+    requires of anything that can stop a launch.
+
+    **A route with no declared context window.** `claude` publishes no model
+    catalog — `_deliver_author_turn` runs `opus`, which does not resolve in
+    omp's catalog — so there is no number to compare against. The deliberate
+    behaviour is to make no comparison and refuse nothing: a check that refused
+    every dispatch on a windowless route would not be a size check, it would be
+    a route that no longer launches. That is a statement about the route,
+    recorded once in `handoff_budget.ROUTES_PUBLISHING_A_WINDOW`, and not an
+    exemption a call site can claim for itself. When the claude route publishes
+    a catalog, adding it to that tuple covers every dispatch on it at once.
+    """
+    if not hb.route_publishes_a_window(spec.route):
+        return None
+    window = spec.context_window_tokens
+    if not window or window <= 0:
+        raise LaunchRefused(
+            LaunchRefusal.PROMPT_UNMEASURED,
+            "{0}:no-window:{1}".format(spec.route, spec.model))
+    try:
+        size = spec.prompt_path.stat().st_size
+    except OSError as exc:
+        raise LaunchRefused(
+            LaunchRefusal.PROMPT_UNMEASURED,
+            "{0}:unreadable-prompt:{1}".format(spec.route, exc)) from exc
+    estimate = hb.estimate_tokens_for_bytes(size)
+    budget = hb.handoff_budget(window)
+    if estimate > budget:
+        raise LaunchRefused(
+            LaunchRefusal.PROMPT_TOO_LARGE,
+            "{0} bytes is ~{1} tokens against a {2}-token window"
+            " (budget {3})".format(size, estimate, window, budget))
+    return estimate
 
 
 def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
@@ -975,6 +1058,12 @@ class HerdrLauncher:
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         if not self.admitted_routes.admits(spec.route):
             raise LaunchRefused(LaunchRefusal.ROUTE_NOT_ADMITTED, spec.route)
+        # B13, before anything is created. An overflowing agent does not error:
+        # it compaction-loops and answers about a different task, which costs a
+        # pane, an attempt, and a plausible-looking wrong result. Refusing here
+        # rather than after the split keeps `pane_created=False` true by
+        # construction.
+        preflight_launch_prompt(spec)
         worktree = spec.worktree.resolve()
         environment = MappingProxyType(dict(spec.environment))
         # The pane shell is forked by the herdr server, not by the CLI process

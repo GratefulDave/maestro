@@ -1265,6 +1265,8 @@ def _reviewer_window_factory(args: argparse.Namespace):
                 envelope_path=report_path, route=args.reviewer_route,
                 model=args.reviewer_model, effort=args.reviewer_effort,
                 profile=args.reviewer_profile, session_dir=session_dir,
+                context_window_tokens=_route_context_window(
+                    args.reviewer_route, args.reviewer_model),
                 environment=worktree.launch_env(scratch_dir)))
             return finalization_window.ReviewerSession(
                 route=args.reviewer_route, model=args.reviewer_model,
@@ -1373,6 +1375,8 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     envelope_path=report_path, route=args.reviewer_route,
                     model=args.reviewer_model, effort=args.reviewer_effort,
                     profile=args.reviewer_profile, session_dir=session_dir,
+                    context_window_tokens=_route_context_window(
+                        args.reviewer_route, args.reviewer_model),
                     environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
@@ -2108,6 +2112,13 @@ def _typed_launch_pane(runner: Any, spec: "launcher.LaunchSpec") -> Any:
     module behind one path, the structural guard in
     `tests/test_launcher_classification.py` needs no allowlist — and an
     allowlist with one entry on day one is how such a guard starts rotting.
+
+    Deliberately *not* the place the target's context window is attached. Every
+    caller here has already resolved that window to size-check its own prompt,
+    so filling it in centrally would only hide an omission: a dispatch site that
+    never measured anything would be handed a window it did not ask for and
+    would launch. Left off the spec, it reaches `preflight_launch_prompt` as
+    "nobody measured this" and is refused (§3.6 B13). Omission fails closed.
     """
     return _typed_launch(runner, runner.launch, spec)
 
@@ -2158,6 +2169,25 @@ def _preflight_prompt(text: str, route: str, model_spec: str) -> Optional[int]:
     Nothing here reads the prompt's content. A length in bytes against a
     ceiling in tokens is arithmetic on two integers, which is what §1.2 permits.
     """
+    window = _route_context_window(route, model_spec)
+    if window is None:
+        return None
+    return code_review.preflight_handoff(text, window)
+
+
+def _route_context_window(route: str, model_spec: str) -> Optional[int]:
+    """The window B13 measures against, or `None` if the route publishes none.
+
+    Split out of `_preflight_prompt` because the number has a second reader:
+    `launcher.preflight_launch_prompt` runs the same check at the dispatch
+    chokepoint and cannot read a catalog itself, so the window travels to it on
+    the `LaunchSpec`. One resolution, two enforcement points — rather than the
+    launcher re-deriving a window and the two disagreeing about which model a
+    pattern names.
+
+    Raises `HandoffTooLarge` when a route that *has* a catalog does not carry
+    this model: an unmeasured window on a measurable route is not a passing one.
+    """
     if not code_review.route_publishes_a_window(route):
         return None
     try:
@@ -2167,8 +2197,7 @@ def _preflight_prompt(text: str, route: str, model_spec: str) -> Optional[int]:
             "model {0!r} does not resolve in the {1} catalog, so the prompt "
             "cannot be shown to fit any window: {2} (B13)".format(
                 model_spec, route, exc)) from exc
-    return code_review.preflight_handoff(
-        text, agent_pi.context_window(provider, model_id))
+    return agent_pi.context_window(provider, model_id)
 
 
 def _clear_stale_reviewer_report(report_path: Path) -> None:
@@ -2370,7 +2399,12 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             # produces an attempt about a different task rather than an error.
             _preflight_prompt(prompt_text, args.agent_route, args.agent_model)
             prompt.write_text(prompt_text, encoding="utf-8")
-            handle = _typed_launch(route_runner, route_runner.launch, launcher.LaunchSpec(
+            # Through `_typed_launch_pane` like every other dispatch, so the
+            # builder's spec is given its route's window on the same path the
+            # reviewers' are. Called directly against `runner.launch` before,
+            # which meant one of the four dispatch sites would have reached the
+            # launcher's B13 check with nothing measured on its spec.
+            handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
                     args.run_id, node.node_id, record.attempt_no),
                 worktree=attempt.path, prompt_path=prompt,
@@ -2378,6 +2412,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 model=args.agent_model, effort=args.agent_effort,
                 profile=args.agent_profile,
                 session_dir=attempt.scratch / "session",
+                context_window_tokens=_route_context_window(
+                    args.agent_route, args.agent_model),
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
@@ -2622,21 +2658,15 @@ def _live_state(record: "lc.RunRecord",
     survives a resume — so a run that blocked, was rescued, and is now working
     still reads BLOCKED there. An operator watching a run needs the live
     shape, so the declared outcome is reported beside this rather than as it.
+
+    The derivation itself lives in `lifecycle` beside the rows it reads, so
+    `run status`, `run list`, and any later reader answer from one function
+    rather than from three re-derivations of the same rule (§10.6). Two of the
+    facts it turns on were previously not derivable at all: whether a
+    cancellation had *finished*, and whether any scheduler process is still
+    behind the run.
     """
-    if record.cancel_requested:
-        return "CANCELLING"
-    states = [node.state for node in nodes]
-    if any(state is scheduler_types.NodeState.RUNNING for state in states):
-        return "RUNNING"
-    if not states:
-        return "EMPTY"
-    if all(state is scheduler_types.NodeState.MERGED for state in states):
-        return "MERGED"
-    if any(state is scheduler_types.NodeState.BLOCKED for state in states):
-        return "BLOCKED"
-    if any(state is scheduler_types.NodeState.PENDING for state in states):
-        return "PENDING"
-    return "QUIESCENT"
+    return lc.derive_run_state(record, nodes)
 
 
 def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
@@ -2714,6 +2744,11 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
                              if record.latest_outcome else None),
         "declared_outcome_at": record.latest_outcome_at,
         "cancel_requested": record.cancel_requested,
+        # The three facts the state above was derived from, reported so an
+        # ABANDONED verdict can be checked rather than believed.
+        "scheduler_pid": record.scheduler_pid,
+        "scheduler_host": record.scheduler_host,
+        "scheduler_alive": lc.scheduler_liveness(record),
         "created_at": record.created_at,
         "last_transition_at": record.last_transition_at,
         "elapsed_s": _since(record.created_at, now),
@@ -2747,6 +2782,11 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         progress["last_transition_at"], _duration(progress["idle_s"])))
     if progress["cancel_requested"]:
         lines.append("  cancel       requested")
+    if progress["scheduler_pid"]:
+        alive = progress["scheduler_alive"]
+        lines.append("  scheduler    pid {} on {} — {}".format(
+            progress["scheduler_pid"], progress["scheduler_host"] or "?",
+            "alive" if alive else "gone" if alive is False else "unknown host"))
     integration = progress["integration"]
     if integration is None:
         lines.append("  integration  (no worktree found)")
@@ -2838,6 +2878,8 @@ def _run_list(args: argparse.Namespace) -> int:
                  "declared_outcome": (record.latest_outcome.value
                                       if record.latest_outcome else None),
                  "cancel_requested": record.cancel_requested,
+                 "scheduler_pid": record.scheduler_pid,
+                 "scheduler_alive": lc.scheduler_liveness(record),
                  "state": _live_state(record, reader.nodes(record.run_id))}
                 for record in records]
     finally:
@@ -3681,6 +3723,15 @@ def _deliver_author_turn(config: Dict[str, Any],
             prompt_path=prompt_path, envelope_path=envelope,
             route=lane.route, model=lane.model, effort=lane.effort,
             profile=lane.profile, session_dir=session_dir,
+            # B13 at the chokepoint, stated here rather than skipped. The
+            # author lane runs the `claude` route, which publishes no model
+            # catalog -- `opus` does not resolve in omp's -- so this resolves
+            # to `None` and `preflight_launch_prompt` makes no comparison.
+            # That is the answer for a route with no declared window: refuse
+            # to invent one, and refuse nothing. It is a property of the route
+            # (`handoff_budget.ROUTES_PUBLISHING_A_WINDOW`), so the day the
+            # route publishes a catalog this site is covered with no edit.
+            context_window_tokens=_route_context_window(lane.route, lane.model),
             environment=worktree.launch_env(
                 session_root / (token + ".scratch"))))
         deadline = time.monotonic() + lane.author_timeout_s

@@ -60,6 +60,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import finalization as fin
 from . import finalization_window as fw
+from . import handoff_budget as hb
 from . import scheduler_types as st
 
 
@@ -242,22 +243,15 @@ class HandoffTooLarge(RuntimeError):
     """
 
 
-#: Bytes per token. A deliberate under-estimate of tokenizer efficiency on
-#: source diffs, which tokenize worse than prose: punctuation, identifiers, and
-#: indentation all fragment. Being wrong in this direction refuses a handoff
-#: that would have fit; being wrong in the other direction is B13.
-BYTES_PER_TOKEN = 3.0
-
-#: The share of the window the input may occupy. Half, because the reviewer
-#: must also *think* and answer inside the same window, and because occupancy
-#: above 0.8 is refused after the fact by `finalization.check_occupancy` — a
-#: handoff admitted at 0.9 would be a turn spent to reach a guaranteed
-#: rejection.
-HANDOFF_CONTEXT_FRACTION = 0.5
-
-
-def estimate_tokens(text: str) -> int:
-    return int(len(text) / BYTES_PER_TOKEN) + 1
+#: B13's arithmetic and its route table live in `handoff_budget`, one module
+#: below `launcher`, because the check that cannot be bypassed has to run
+#: inside `launcher.HerdrLauncher.launch` and `launcher` cannot import this
+#: module (`code_review` -> `scheduler_types` -> `worktree` -> `launcher`).
+#: Re-exported here so the rule still reads as one rule from the reviewer's
+#: side, with exactly one definition of it.
+BYTES_PER_TOKEN = hb.BYTES_PER_TOKEN
+HANDOFF_CONTEXT_FRACTION = hb.HANDOFF_CONTEXT_FRACTION
+estimate_tokens = hb.estimate_tokens
 
 
 def preflight_handoff(text: str, context_window_tokens: Optional[int],
@@ -273,7 +267,7 @@ def preflight_handoff(text: str, context_window_tokens: Optional[int],
             "the reviewer's context window is unknown, so the handoff cannot be "
             "shown to fit; an unmeasured window is not a passing one (B13)")
     estimate = estimate_tokens(text)
-    budget = int(context_window_tokens * fraction)
+    budget = hb.handoff_budget(context_window_tokens, fraction)
     if estimate > budget:
         raise HandoffTooLarge(
             f"handoff is ~{estimate} tokens against a {context_window_tokens}-token "
@@ -282,27 +276,16 @@ def preflight_handoff(text: str, context_window_tokens: Optional[int],
     return estimate
 
 
-#: The routes that publish a context window the harness can measure against.
+#: Which routes publish a measurable window is a fact about the route, owned by
+#: `handoff_budget` and re-exported here.
 #:
-#: B13 says fail closed, and this is what "closed" can mean without lying: on a
-#: route with a model catalog, a model the catalog does not carry is an
-#: unmeasured window and refuses. A route that publishes no catalog at all
-#: publishes nothing to be closed against — refusing every dispatch on it would
-#: not be a size check, it would be a route that no longer launches. Which
-#: routes those are is a fact about the route, so it is named here once rather
-#: than decided at each call site.
-#:
-#: The lookup itself deliberately lives at the CLI rather than here: reading a
-#: route's catalog means importing `agent_pi`, and this module is on the far
-#: side of the `base-execution-import` boundary that `enforcement.py` convicts.
-#: So this module owns the arithmetic and the rule, and the caller owns the
+#: The *lookup* deliberately lives at the CLI rather than in either module:
+#: reading a route's catalog means importing `agent_pi`, and both are on the
+#: far side of the `base-execution-import` boundary that `enforcement.py`
+#: convicts. So the arithmetic and the rule are here, and the caller owns the
 #: window.
-ROUTES_PUBLISHING_A_WINDOW = ("omp",)
-
-
-def route_publishes_a_window(route: str) -> bool:
-    """Whether `route` has a catalog a prompt can be size-checked against."""
-    return route in ROUTES_PUBLISHING_A_WINDOW
+ROUTES_PUBLISHING_A_WINDOW = hb.ROUTES_PUBLISHING_A_WINDOW
+route_publishes_a_window = hb.route_publishes_a_window
 
 
 # ── B9: the reviewer's input is a declared, validated contract ──────────────

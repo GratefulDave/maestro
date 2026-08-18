@@ -414,6 +414,15 @@ class Scheduler:
                                        list(self.nodes.values()))
         except lc.RunAlreadyExists:
             pass
+        # This process now owns the run, whether it just projected the plan or
+        # adopted an existing projection. Recorded durably because it is the
+        # only fact that can later contradict a reader calling a dead run live:
+        # `runs.latest_outcome` is written by a scheduler declaring quiescence,
+        # so a scheduler that dies before declaring leaves nothing behind that
+        # says the run stopped (§7.3, §11.2). Written on the `RunAlreadyExists`
+        # path too — that is a second process taking over a run the ledger
+        # still attributes to the first.
+        self.deps.store.claim_run(self.run_id)
         # Both durable states carry authority only after their persisted SHA is
         # revalidated. A crash after VERIFIED has no in-memory output map, so
         # excluding it would strand a ready merge forever; trusting an
