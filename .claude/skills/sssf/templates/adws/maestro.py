@@ -1250,6 +1250,7 @@ def _reviewer_window_factory(args: argparse.Namespace):
             "plan_digest": matrix.plan_digest,
             "report_path": str(report_path.resolve()),
         }, sort_keys=True), encoding="utf-8")
+        _clear_stale_reviewer_report(report_path)
         handle = None
 
         def launch_reviewer():
@@ -1268,9 +1269,7 @@ def _reviewer_window_factory(args: argparse.Namespace):
                 pid=handle.process_group)
 
         def poll_report():
-            if not report_path.is_file():
-                return None
-            return json.loads(report_path.read_text(encoding="utf-8"))
+            return _poll_reviewer_report(report_path)
 
         def kill_reviewer(_session):
             if handle is not None:
@@ -1359,6 +1358,7 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         def window_factory(_matrix):
             subject_root.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(text, encoding="utf-8")
+            _clear_stale_reviewer_report(report_path)
 
             def launch_reviewer():
                 # The site that actually refused in
@@ -1380,15 +1380,7 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     pid=handle.process_group)
 
             def poll_report():
-                if not report_path.is_file():
-                    return None
-                try:
-                    return json.loads(report_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, UnicodeError):
-                    # A half-written report is not a report. Returning None
-                    # keeps the window open for the next poll rather than
-                    # crashing the whole review on a partial flush.
-                    return None
+                return _poll_reviewer_report(report_path)
 
             def read_status(_session):
                 handle = handle_box["handle"]
@@ -1713,6 +1705,17 @@ def _plan_finalize(args: argparse.Namespace) -> int:
     except (_PlanReceiptVerificationError, finalization.SignatureMissing,
             finalization.SignatureInvalid, finalization.ReceiptInvalid) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
+    except finalization.ReportRejected as exc:
+        # S6.5's terminal outcome for the bytes: no receipt exists, and the
+        # rejection reason is the operator's whole diagnosis. It is a verb
+        # outcome, not a crash -- `plan ship` reads the JSON `outcome`, so a
+        # traceback here is invisible to every caller that reads it.
+        return _refusal("REPORT_REJECTED", str(exc))
+    except finalization.FinalizationStalled as exc:
+        # A stall is a fact about the machine or the route, never a verdict
+        # about the plan, and it writes no receipt -- so rerunning
+        # `plan finalize` is legal and reviews afresh.
+        return _refusal("FINALIZATION_STALLED", str(exc))
     except (finalization.ReceiptStoreLocationError,
             receipt_crypto.KeyMaterialError,
             route_receipts.ReceiptInvalid, ValueError, OSError) as exc:
@@ -2126,6 +2129,59 @@ def _require_session_path(handle: Any, node_id: str, attempt_no: int) -> None:
     raise scheduler.LaunchFailed(
         retry_policy.LauncherFailure.STARTUP,
         "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no))
+
+
+def _clear_stale_reviewer_report(report_path: Path) -> None:
+    """Remove a report left by an earlier reviewer before launching a new one.
+
+    The window completes on the presence of a report, so a report already on
+    disk ends the new reviewer's window on its first poll -- with the bytes
+    some previous reviewer wrote. The receipt would then bind the new
+    session's route, model, and session id to a report that session did not
+    produce, which is exactly the identity the receipt exists to establish.
+
+    `_deliver_lane` already clears its envelope for the same reason ("a stale
+    envelope from a previous attempt would end this one before it began").
+    Replay is unaffected: `finalization.finalize` short-circuits on a stored
+    receipt for the digest before any window is built, so anything reaching
+    here has no receipt and is genuinely being reviewed afresh.
+    """
+    try:
+        report_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _poll_reviewer_report(report_path: Path) -> Optional[Any]:
+    """One poll of a reviewer's report file: the payload, or None while the
+    reviewer is still writing it.
+
+    Module level and shared by both reviewer windows because the failure it
+    prevents is a race, and a race reproduced in a test needs the production
+    reader, not a paraphrase of it. Two ways a poll can land mid-write:
+
+    * the bytes do not parse yet -- a partial flush;
+    * the bytes parse and the report is not finished -- fewer cells present
+      than the `pair_count` the reviewer itself declared.
+
+    The second one is what condemned `cmo-consolidation-l` on 2026-08-18: the
+    window accepted a draft carrying a handful of cells, `verify_report`
+    rejected it for a `CELL_SET` the reviewer was still filling in, and the
+    complete 136-cell report landed on disk moments later. A rejection is
+    terminal for the plan's bytes, so a read race became a verdict.
+
+    Neither test reads prose. `report_is_complete` compares a declared count
+    against a length (S1.2).
+    """
+    if not report_path.is_file():
+        return None
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not finalization.report_is_complete(payload):
+        return None
+    return payload
 
 
 def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
