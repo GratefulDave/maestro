@@ -29,6 +29,7 @@ attempt, and then the node's whole retry budget.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -135,6 +136,39 @@ class SubmissionProof(unittest.TestCase):
             lch.submit_agent_prompt(Broken(), "w1:p1", "@prompt", "agent",
                                     sleep=lambda _s: None)
         self.assertIn("pane_not_found", str(caught.exception))
+
+
+class OmpCarriesItsPromptInArgv(unittest.TestCase):
+    """The stall is deleted rather than mitigated for the omp route.
+
+    run-d7c242809fe74e74b7368393fa4de6de blocked both depth-0 lanes at 0 turns
+    with `AGENT_PROMPT_UNSUBMITTED ... after 4 submit attempts`: Enter was
+    pressed four times each at a composer that would not take the text. omp
+    documents a `MESSAGES` positional that accepts `@<file>`, so the process
+    that starts the agent delivers the prompt and no composer is involved.
+    """
+
+    def _spec(self, tmp):
+        return lch.LaunchSpec(
+            correlation_token="t", worktree=Path(tmp), prompt_path=Path(tmp) / "p.txt",
+            envelope_path=Path(tmp) / "e.json", route="omp", model="x-ai/grok-4.6",
+            effort="high", profile="grok", session_dir=Path(tmp) / "session")
+
+    def test_the_prompt_is_the_last_argument(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = lch.build_omp_argv(Path("/bin/omp"), self._spec(tmp))
+            self.assertEqual(argv[-1], "@{0}".format((Path(tmp) / "p.txt").resolve()))
+            self.assertIn("--pm-profile", argv)
+            self.assertEqual(argv[argv.index("--pm-profile") + 1], "grok")
+
+    def test_a_resumed_session_still_carries_it_after_the_continuation_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = self._spec(tmp)
+            spec.session_dir.mkdir(parents=True)
+            (spec.session_dir / "prior.jsonl").write_text("{}\n", encoding="utf-8")
+            argv = lch.build_omp_argv(Path("/bin/omp"), spec)
+            self.assertIn("-c", argv)
+            self.assertEqual(argv[-1], "@{0}".format(spec.prompt_path.resolve()))
 
 
 class PaneRevision(unittest.TestCase):

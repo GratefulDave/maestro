@@ -278,6 +278,20 @@ class LauncherAdapter(Protocol):
 
 
 def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
+    """omp's argv, carrying the prompt as a message rather than as typing.
+
+    The trailing `@<prompt-path>` is omp's documented `MESSAGES` positional
+    ("prefix files with @"), so the prompt is delivered by the process that
+    starts the agent instead of being typed into its composer afterwards.
+
+    That deletes a failure class rather than mitigating it. Typing into the
+    composer stalls against omp roughly half the time -- the text lands and is
+    never submitted -- and run-d7c242809fe74e74b7368393fa4de6de is what that
+    costs: both depth-0 lanes blocked at 0 turns with
+    `AGENT_PROMPT_UNSUBMITTED ... after 4 submit attempts`, having pressed
+    Enter four times each at a composer that would not take it. A message on
+    the command line has no composer to swallow it.
+    """
     if not spec.profile:
         raise ValueError("OMP_PROFILE_REQUIRED")
     argv = [
@@ -286,6 +300,7 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
     ]
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
         argv.append("-c")
+    argv.append("@{0}".format(spec.prompt_path.resolve()))
     return tuple(argv)
 
 
@@ -904,15 +919,22 @@ class HerdrLauncher:
                 with self._handles_lock:
                     self._tailers[spec.correlation_token] = TranscriptTailer(
                         transcript)
-        bootstrap = "@{0}".format(spec.prompt_path.resolve())
-        # Settle for either working or idle: the harness turn runs for as long
-        # as the task takes, so waiting for idle here would hold the launch open
-        # for the whole run, while a short task can be back at idle before the
-        # working state is ever sampled.
-        submit_agent_prompt(
-            lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
-            pane_id, bootstrap, name,
-            timeout_s=60.0, until=("working", "idle"))
+        if spec.route != "omp":
+            bootstrap = "@{0}".format(spec.prompt_path.resolve())
+            # Settle for either working or idle: the harness turn runs for as
+            # long as the task takes, so waiting for idle here would hold the
+            # launch open for the whole run, while a short task can be back at
+            # idle before the working state is ever sampled. Neither word is
+            # trusted on its own -- `submit_agent_prompt` requires the pane's
+            # revision to have moved, because `idle` is also what a composer
+            # holding an unsubmitted prompt reports.
+            submit_agent_prompt(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=environment, **kwargs),
+                pane_id, bootstrap, name,
+                timeout_s=60.0, until=("working", "idle"))
+        # The omp route carries its prompt in argv (`build_omp_argv`), so there
+        # is nothing to type and no composer to stall.
         return handle
 
     def agent_status(self, handle: LaunchHandle) -> Optional[str]:
