@@ -3339,6 +3339,97 @@ class _PaneTee:
         self._stream.flush()
 
 
+def _plan_ship_approved(args: argparse.Namespace) -> Callable[[str], bool]:
+    """Whether a digest carries a signed receipt whose verdict is PASS.
+
+    Read from the receipt store rather than from any file beside the plan: the
+    receipt is the only thing that binds a reviewer to a set of bytes, and it
+    is what a run consults.
+
+    Fails closed. Only a receipt that is absent proves a plan is unapproved;
+    a receipt that cannot be read, verified, or even located because the store
+    is misconfigured proves nothing, and the caller uses this answer to decide
+    whether to replace a plan's bytes. "I could not tell" must therefore read
+    as approved, so an unreadable receipt costs a refusal the operator can act
+    on rather than a plan silently replaced out from under a run.
+    """
+    def approved(digest: str) -> bool:
+        try:
+            store = _plan_receipt_store(
+                _configured_plan_step("finalize", args.plan_name),
+                missing_detail="receipt configuration is required to ship")
+        except (_PlanReceiptConfigurationError, _MaestroConfigurationError,
+                finalization.ReceiptStoreLocationError, OSError, ValueError):
+            # No store means no answer, and no answer means do not replace.
+            return True
+        try:
+            return store.load(digest).verdict is finalization.Verdict.PASS
+        except FileNotFoundError:
+            return False
+        except (finalization.ReceiptInvalid, finalization.SignatureMissing,
+                finalization.SignatureInvalid, UnicodeError, ValueError,
+                KeyError, OSError):
+            return True
+    return approved
+
+
+class _ShipSupersedeRefused(RuntimeError):
+    """The plan on disk differs from the projection and is already approved."""
+
+
+def _superseded_plan_path(destination: Path, digest: str) -> Path:
+    """Where a replaced plan's bytes are kept, keyed by their own digest."""
+    return destination.parent / "superseded" / digest / destination.name
+
+
+def _plan_ship_authoring(destination: Path, projected: bytes,
+                         approved: Callable[[str], bool]) -> Optional[str]:
+    """Decide what the ship's author step must do, and make room for it.
+
+    Returns the digest of a plan that was superseded, or None when nothing was
+    moved. Raises `_ShipSupersedeRefused` when the existing plan must not be
+    replaced.
+
+    `plan ship` is one command by design, and a command the operator cannot
+    re-run is not one command -- it is one command plus a manual `rm`. Its
+    author step is create-once (`PLAN_EXISTS`), which is right for a plan's
+    bytes and wrong for a pipeline that has to be resumable: a ship whose
+    finalize step failed refused on the file its own author step had just
+    written. Three cases, decided from bytes and receipts rather than from
+    intent:
+
+    * nothing on disk -- author writes, as before;
+    * identical bytes -- the author step already ran and produced exactly this
+      plan, so it is skipped and the ship resumes at validate. Re-running is
+      then free and changes nothing;
+    * different bytes -- the IR moved. The existing plan is kept under its own
+      digest and the new one takes its place, unless that plan is approved.
+
+    An approved plan is never replaced. `Verdict.PASS` means a receipt exists
+    that binds a reviewer to those exact bytes, and a run keys on the digest,
+    so replacing the file could pull the plan out from under work that refers
+    to it. `FAIL` carries no such risk -- it is terminal for those bytes, so
+    nothing may ever run them -- and neither does a plan with no receipt at
+    all.
+    """
+    if not destination.exists():
+        return None
+    existing = destination.read_bytes()
+    if existing == projected:
+        return None
+    superseded = plan_digest.digest_of(existing)
+    if approved(superseded):
+        raise _ShipSupersedeRefused(
+            "the plan on disk ({}) is approved and differs from the projected "
+            "plan; finalize it or remove its approval before re-shipping"
+            .format(superseded))
+    archive = _superseded_plan_path(destination, superseded)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_bytes(existing)
+    destination.unlink()
+    return superseded
+
+
 def _plan_ship_step_failure(step: str, status: int,
                             pane: Dict[str, Any]) -> int:
     payload = {"outcome": "PLAN_SHIP_FAILED", "step": step, "status": status}
@@ -3375,20 +3466,44 @@ def _plan_ship(args: argparse.Namespace) -> int:
             "the installed plan author verb has no "
             + _PLAN_CONTRACT_AUTHOR_OPTION
             + ", so an approved Plan IR cannot be projected onto a Maestro plan")
+    author_args = _configured_plan_step("author", args.plan_name)
+    setattr(author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION],
+            str(artifacts["plan_ir"]))
+    setattr(author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION],
+            str(artifacts["receipt"]))
+    setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
+            str(artifacts["rendered"]))
+
+    # What the author step would write, computed before anything is written, so
+    # a re-run can tell "already authored" from "the IR moved" -- see
+    # `_plan_ship_authoring`. Projection failures are the author step's own
+    # refusals and are reported as that step failing, not as a ship that never
+    # started.
+    destination = Path(author_args.plan_file)
+    try:
+        projected, _draft, _ir = plan_contract_ingress.project_canonical_plan(
+            artifacts["plan_ir"], artifacts["receipt"], Path(author_args.repo),
+            artifacts["rendered"])
+    except (plan_author.AuthoringError,
+            plan_contract_ingress.IngressError) as exc:
+        return _refusal("PLAN_AUTHORING_FAILED", str(exc))
+    try:
+        superseded = _plan_ship_authoring(
+            destination, projected, _plan_ship_approved(args))
+    except _ShipSupersedeRefused as exc:
+        return _refusal("PLAN_SUPERSEDE_REFUSED", str(exc))
+    except OSError as exc:
+        return _refusal("PLAN_SUPERSEDE_FAILED", str(exc))
+    authored_already = destination.exists()
+
     # Fail closed before authoring anything: no pane, no work, no leftovers.
     pane = _PlanPane(layout, _plan_step_log(layout, args.plan_name, "ship"))
     pane.open()
     try:
-        author_args = _configured_plan_step("author", args.plan_name)
-        setattr(author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION],
-                str(artifacts["plan_ir"]))
-        setattr(author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION],
-                str(artifacts["receipt"]))
-        setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
-                str(artifacts["rendered"]))
-        steps = (("author", _plan_author, author_args),
-                 ("validate", _plan_validate, None),
+        steps = (("validate", _plan_validate, None),
                  ("finalize", _plan_finalize, None))
+        if not authored_already:
+            steps = (("author", _plan_author, author_args),) + steps
         for step, handler, prepared in steps:
             pane.note("$ maestro plan " + step + " " + args.plan_name)
             with _redirect_stdout(_PaneTee(sys.stdout, pane.log)):
@@ -3404,7 +3519,9 @@ def _plan_ship(args: argparse.Namespace) -> int:
         "plan": args.plan_name,
         "plan_ir": str(artifacts["plan_ir"]),
         "receipt": str(artifacts["receipt"]),
-        "steps": ["author", "validate", "finalize"],
+        "steps": [step for step, _handler, _prepared in steps],
+        "authored": not authored_already,
+        "superseded": superseded,
     }
     payload.update(pane.report())
     print(json.dumps(payload, sort_keys=True))

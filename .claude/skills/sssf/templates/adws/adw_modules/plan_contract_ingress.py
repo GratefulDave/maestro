@@ -380,10 +380,21 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     return draft
 
 
-def author_from_plan_contract(
-        ir_path: Path, receipt_path: Path, destination: Path, repo: Path,
-        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict]:
-    """Verify the receipt, project, canonicalize, and write maestro-plan.v1."""
+def project_canonical_plan(
+        ir_path: Path, receipt_path: Path, repo: Path,
+        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict, dict]:
+    """Verify the receipt and project, without writing anything.
+
+    Split out from `author_from_plan_contract` so a caller can learn what the
+    plan *would* be before deciding whether to write it. `plan author` is
+    create-once by design -- the bytes are the plan's identity, and silently
+    overwriting them would change a digest out from under whatever already
+    refers to it -- but that left `plan ship` unable to resume: a ship whose
+    finalize step failed could not be re-run, because its author step refused
+    with `PLAN_EXISTS` against the file it had itself written moments earlier.
+    Projection is a pure function of the IR, the receipt, and the repository,
+    so computing it twice costs nothing and decides the question exactly.
+    """
     ir_bytes = Path(ir_path).read_bytes()
     ir = _load_json(ir_path, "IR_UNREADABLE")
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
@@ -391,6 +402,16 @@ def author_from_plan_contract(
     _verify_receipt(ir_bytes, receipt, rendered)
     draft = project_draft(ir, repo)
     stored = plan_author.author_plan(draft, repo)
+    return stored, draft, ir
+
+
+def author_from_plan_contract(
+        ir_path: Path, receipt_path: Path, destination: Path, repo: Path,
+        rendered_path: Optional[Path] = None) -> Tuple[bytes, dict]:
+    """Verify the receipt, project, canonicalize, and write maestro-plan.v1."""
+    stored, draft, ir = project_canonical_plan(
+        ir_path, receipt_path, repo, rendered_path)
+    receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
     plan_author.write_canonical_plan(destination, stored)
     trace = {
         "plan_id": ir.get("plan_id"),
