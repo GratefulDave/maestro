@@ -45,6 +45,48 @@ class HarnessCancelled(RuntimeError):
 class HarnessQuiescenceError(RuntimeError):
     """A harness-owned process group could not be proven absent."""
 
+
+class HerdrCallError(RuntimeError):
+    """A refused `herdr` call, carrying Herdr's own structured error code.
+
+    §1.2 forbids keying a lifecycle decision on prose. Herdr answers a refused
+    call with `{"error": {"code": ..., "message": ...}}`: the code is a typed
+    field, the message is free text Herdr may reword at any release. Callers
+    that must branch on *why* a call was refused read `.code`. The string form
+    is preserved unchanged so operator-facing detail is unaffected.
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def herdr_error_code(text: str) -> str:
+    """Herdr's `error.code` from a refused call's output, or `""`.
+
+    Anything that does not parse, or parses without an `error.code`, yields the
+    empty string rather than a guess: an unrecognised refusal must not be
+    mistaken for a recognised one, which is what a substring match on the
+    message does.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return ""
+    code = error.get("code")
+    return code if isinstance(code, str) else ""
+
+
+#: Herdr's refusal when it holds no record of the requested agent. A finished
+#: agent whose session has exited is reported this way, not as an agent with an
+#: empty record.
+AGENT_NOT_FOUND = "agent_not_found"
+
 #: §8.3's cache-redirection variables, named here rather than only beside
 #: `worktree.scratch_env`, because this module is where they cross the herdr
 #: boundary. A variable absent from this tuple never reaches the agent's shell
@@ -571,7 +613,10 @@ class HerdrLauncher:
         except (OSError, ValueError) as exc:
             raise RuntimeError("LAUNCH_REFUSED:{}".format(exc)) from exc
         if result.returncode != 0:
-            raise RuntimeError("LAUNCH_REFUSED:{}".format((result.stderr or result.stdout).strip()[-400:]))
+            refusal = (result.stderr or result.stdout).strip()
+            raise HerdrCallError(
+                "LAUNCH_REFUSED:{}".format(refusal[-400:]),
+                herdr_error_code(refusal))
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -690,16 +735,90 @@ class HerdrLauncher:
         raw = agent.get("agent_status") or agent.get("status")
         return str(raw) if raw else None
 
-    def poll(self, handle: LaunchHandle) -> PollResult:
+    def _agent_absent(self, handle: LaunchHandle) -> bool:
+        """Whether Herdr still holds a record of this agent.
+
+        `cancel` needs this and *not* `poll`. They answer different questions:
+        `poll` asks what the attempt's outcome is, `cancel` asks whether the
+        agent is gone. They were the same call until the artifact was given
+        precedence in `poll`, at which point sharing them would have made every
+        *successful* attempt -- the ones that leave an envelope on disk --
+        report EXITED to `cancel`, which reads anything but GONE as
+        `PANE_STILL_LIVE` and raises `HERDR_QUIESCENCE_UNPROVEN`. Quiescence is
+        a fact about the process, never about the work it produced.
+        """
         try:
             payload = self._herdr("agent", "get", handle.agent_name,
                                   env=handle.environment)
-        except RuntimeError as exc:
+        except HerdrCallError as exc:
             # An agent whose pane is closed is not reported as an agent with no
             # record: herdr exits nonzero with `agent_not_found`. Reading that
-            # as an error rather than as GONE makes `cancel` treat a successful
-            # close as unproven quiescence, which blocks every agent node.
-            if "agent_not_found" not in str(exc):
+            # as an error rather than as absence makes `cancel` treat a
+            # successful close as unproven quiescence, which blocks every agent
+            # node. Keyed on the typed code, never the message (§1.2).
+            if exc.code != AGENT_NOT_FOUND:
+                raise
+            return True
+        return not isinstance(_extract(payload, "agent"), dict)
+
+    def _declared_result(self, handle: LaunchHandle) -> Optional[PollResult]:
+        """The turn's own declaration, or `None` if it has not declared.
+
+        Reads only what the agent WROTE -- the envelope file it was told to
+        write, then the transcript's terminal record for routes that declare
+        there. Never the pane, never a status, never prose (§1.2).
+
+        The envelope path is per-attempt
+        (`.../scratch/<run>-<node>-a<N>/agent-envelope.json`), so a previous
+        attempt's envelope cannot be mistaken for this one's.
+        """
+        envelope = handle.envelope_path
+        if envelope is not None and envelope.is_file():
+            try:
+                payload = json.loads(envelope.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                return PollResult(PollState.EXITED, 1, "ENVELOPE_UNPARSED")
+            success = isinstance(payload, dict) and payload.get("success") is True
+            return PollResult(PollState.EXITED, 0 if success else 1,
+                              "ENVELOPE_SUCCESS" if success else "ENVELOPE_FAILURE")
+        with self._handles_lock:
+            tailer = self._tailers.get(handle.correlation_token)
+        # `terminal_envelope` returns None rather than a failing exit when the
+        # turn has not declared, so an unfinished turn cannot be mistaken for a
+        # failed one.
+        if tailer is not None:
+            tailer.read_new()
+            declared = tailer.terminal_envelope()
+            if declared is not None:
+                exit_code, detail = declared
+                return PollResult(PollState.EXITED, exit_code, detail)
+        return None
+
+    def poll(self, handle: LaunchHandle) -> PollResult:
+        # ── the artifact is read BEFORE the agent is observed ───────────────
+        #
+        # It used to be read after, and the two GONE returns below sat in front
+        # of it. That lost every attempt whose agent finished fast: `herdr agent
+        # get` answers `agent_not_found` as soon as the finished agent's session
+        # exits, so a complete `"success": true` envelope already on disk was
+        # never opened and the attempt was scored GONE, retried as
+        # ENVIRONMENTAL, and eventually failed the node with
+        # ENVIRONMENTAL_BUDGET_EXHAUSTED. It is a race the *fast* agent loses:
+        # the sooner it declares and exits, the likelier the next poll sees the
+        # empty record first. Observed on run
+        # run-14b7b75944094c52ac9c0add41ae46a2, whose three attempts each wrote
+        # a valid success envelope and were each thrown away.
+        #
+        # GONE is now reachable only when the agent is gone AND nothing was
+        # declared, which is what GONE was always supposed to mean.
+        declared = self._declared_result(handle)
+        if declared is not None:
+            return declared
+        try:
+            payload = self._herdr("agent", "get", handle.agent_name,
+                                  env=handle.environment)
+        except HerdrCallError as exc:
+            if exc.code != AGENT_NOT_FOUND:
                 raise
             return PollResult(PollState.GONE, detail="AGENT_GONE")
         agent = _extract(payload, "agent")
@@ -713,6 +832,9 @@ class HerdrLauncher:
             tailer.read_new()
             turns = len(tailer._records)
 
+        # Reaching here means `_declared_result` found nothing: the turn has
+        # not declared, so the pane's status is all there is to go on.
+        #
         # The attempt ends when the agent writes its terminal envelope. The
         # envelope is a file the agent is told to write, not a record in the
         # route's transcript: an interactive route writes its own event schema
@@ -722,12 +844,14 @@ class HerdrLauncher:
         # ── precedence: what the agent WROTE beats what the pane REPORTS ────
         #
         # `agent_status` is a lagging observation of a pane; a written envelope
-        # is the turn's own declaration. Two real failures came from letting
-        # the status win. A completed turn behind a stale `working` status held
-        # the poll in RUNNING until a wall clock expired and charged the
-        # attempt ENVIRONMENTAL; and a successful turn observed at `idle` fell
-        # through to the no-envelope branch and scored a passing attempt as
-        # exit 1, burning a third of a three-attempt budget on a lie.
+        # is the turn's own declaration. Three real failures came from letting
+        # an observation of the pane win. A completed turn behind a stale
+        # `working` status held the poll in RUNNING until a wall clock expired
+        # and charged the attempt ENVIRONMENTAL; a successful turn observed at
+        # `idle` fell through to the no-envelope branch and scored a passing
+        # attempt as exit 1; and a successful turn whose agent had already
+        # exited was scored GONE because the *absence* of the pane was read
+        # before the envelope it had already written.
         #
         # This is the same rule `FinalizationWindow.poll` follows when it
         # checks for the report before consulting any signal, and it does not
@@ -736,27 +860,6 @@ class HerdrLauncher:
         # says a status of any kind is stale once the turn has declared. One is
         # about absence of output before liveness, the other about presence of
         # output after it; both resolve the same way — the artifact wins.
-        envelope = handle.envelope_path
-        if envelope is not None and envelope.is_file():
-            try:
-                payload = json.loads(envelope.read_text(encoding="utf-8"))
-            except (OSError, ValueError, UnicodeError):
-                return PollResult(PollState.EXITED, 1, "ENVELOPE_UNPARSED")
-            success = isinstance(payload, dict) and payload.get("success") is True
-            return PollResult(PollState.EXITED, 0 if success else 1,
-                              "ENVELOPE_SUCCESS" if success else "ENVELOPE_FAILURE")
-
-        # The transcript's own terminal record, for routes that declare there
-        # rather than by writing the envelope file. Read before the status
-        # branches for the reason above, and `terminal_envelope` returns None
-        # rather than a failing exit when the turn has not declared, so an
-        # unfinished turn cannot be mistaken for a failed one.
-        if tailer is not None:
-            declared = tailer.terminal_envelope()
-            if declared is not None:
-                exit_code, detail = declared
-                return PollResult(PollState.EXITED, exit_code, detail)
-
         if status in ("starting", "unknown"):
             return PollResult(PollState.STARTING)
         # Idle after at least one turn and still no envelope: the agent
@@ -796,8 +899,12 @@ class HerdrLauncher:
             if not confirmed:
                 raise RuntimeError("PANE_CLOSE_UNCONFIRMED:{}".format(
                     handle.pane_id))
-            state = self.poll(handle)
-            if state.state is not PollState.GONE:
+            # `_agent_absent`, not `poll`: a successful attempt leaves an
+            # envelope, and `poll` now reports that declaration in preference
+            # to any observation of the pane. Asking `poll` here would read a
+            # success as EXITED, conclude the pane was still live, and refuse
+            # quiescence for every node that worked.
+            if not self._agent_absent(handle):
                 raise RuntimeError("PANE_STILL_LIVE:{}".format(handle.pane_id))
         except BaseException as exc:
             raise HarnessQuiescenceError(

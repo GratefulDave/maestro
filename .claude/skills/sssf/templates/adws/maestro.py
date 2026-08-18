@@ -1396,6 +1396,64 @@ def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
     return None
 
 
+def _configured_runs_root(args: argparse.Namespace) -> Optional[Path]:
+    """This installation's run root, or `None` when nothing declares one.
+
+    `repository_state` is bound only when a run resolves through installed
+    repository configuration. A run spelled out by hand on the command line has
+    no declared run root, so no worktree can be *proven* to be this system's
+    own, and the reclaim below stays out of it and lets the refusal speak.
+    """
+    state = getattr(args, "repository_state", None)
+    return (Path(state) / "runs") if state else None
+
+
+def _reclaim_stranded_integration_worktree(
+        repo: Path, runs_root: Optional[Path], branch: str) -> Optional[Path]:
+    """Take back an integration checkout this system's own run root still holds.
+
+    Permanent Maestro semantics, not a repair for one installation: an operator
+    is never asked to hand-move a checkout to unblock a run that Maestro itself
+    stranded. Maestro reclaims what Maestro created, and refuses only for
+    checkouts it did not create. Every installation gets this, because the
+    boundary below is derived from configuration and names no plan, no
+    repository, and no deployment.
+
+    One rule, one representation: `run start` and `deliver`'s release verb both
+    reach the same question -- something holds the integration branch, may it
+    be removed? -- and a second copy of the answer is how the two drift into
+    disagreeing about whose worktree they are deleting.
+
+    The predicate is path containment against the configured run root, read
+    from `git worktree list`. It is deliberately not a claim, a message, or a
+    naming convention (§1.2): a worktree *under this repository's own runs
+    directory* was created by this system and is a leftover of a previous run;
+    anything else may be the operator's own checkout and is left exactly where
+    it is, so the caller still refuses and explains itself.
+
+    Only the checkout holding the integration branch is ever named here.
+    Attempt worktrees -- including the blocked ones §8.8 retains for
+    post-mortem -- hold their own attempt branches, never this one, so they are
+    outside what this function can even select. `worktree prune` drops
+    administrative records of directories that are already gone and never
+    removes a worktree that still exists.
+
+    Returns the path released, or `None` when nothing was.
+    """
+    occupant = _worktree_holding_branch(repo, branch)
+    released: Optional[Path] = None
+    if (occupant is not None and runs_root is not None
+            and _path_is_within(occupant.resolve(), runs_root.resolve())):
+        result = subprocess.run(
+            ("git", "-C", str(repo), "worktree", "remove", "--force",
+             str(occupant)), capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            released = occupant
+    subprocess.run(("git", "-C", str(repo), "worktree", "prune"),
+                   capture_output=True, text=True, check=False)
+    return released
+
+
 def _release_run_integration_worktree(repo: Path, path: Optional[Path]) -> None:
     """Give up a run's own integration checkout, keeping its branch.
 
@@ -1780,6 +1838,14 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         # to take the branch back, because every attempt is based on its head.
         if not Path(args.integration_path).exists():
             branch = plan.merge_policy.integration_branch
+            # A previous run's integration checkout is this system's own litter,
+            # and telling an operator to go clean it up by hand is a refusal
+            # over a state Maestro created and can prove it created. Reclaim it
+            # under exactly the boundary the release verb already applies -- and
+            # under no other -- so an operator's checkout of the same branch
+            # still reaches the refusal below untouched.
+            _reclaim_stranded_integration_worktree(
+                Path(args.repo), _configured_runs_root(args), branch)
             occupant = _worktree_holding_branch(Path(args.repo), branch)
             if occupant is not None:
                 return _refusal(
@@ -1788,8 +1854,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     + str(occupant) + ", and git gives a branch to one worktree "
                     "at a time. The run's integration worktree must hold it, "
                     "because every attempt is based on that branch's head and a "
-                    "detached copy would never advance it. Move that checkout "
-                    "to another branch and start the run again")
+                    "detached copy would never advance it. Maestro reclaims the "
+                    "stranded integration checkouts inside its own run root "
+                    "without asking, and this one is not among them, so it has "
+                    "been left exactly as it is. Move that checkout to another "
+                    "branch and start the run again")
             subprocess.run(
                 ("git", "-C", str(args.repo), "worktree", "add",
                  str(args.integration_path), branch),
@@ -3183,7 +3252,10 @@ def _deliver_release_run(config: Dict[str, Any], name: str):
     operator's checkout of the same branch is left exactly where it is, so
     `run start` still refuses with its own message and explains itself; a verb
     that deleted an operator's worktree to get its own work started would be a
-    far worse bug than the one it is working around.
+    far worse bug than the one it is working around. That boundary is
+    `_reclaim_stranded_integration_worktree`, shared with `run start`, which
+    now applies it to the backlog itself before it refuses -- there is one
+    rule about whose worktree may be removed and one place it is written.
     """
     stored = _deliver_plan_bytes(config, name)
     if stored is None:
@@ -3192,19 +3264,9 @@ def _deliver_release_run(config: Dict[str, Any], name: str):
         branch = plan_model.parse_bytes(stored).merge_policy.integration_branch
     except (ValueError, KeyError):
         return ()
-    repo = Path(config["repo"])
-    occupant = _worktree_holding_branch(repo, branch)
-    runs_root = (config["repository_state"] / "runs").resolve()
-    released = []
-    if occupant is not None and _path_is_within(occupant.resolve(), runs_root):
-        result = subprocess.run(
-            ("git", "-C", str(repo), "worktree", "remove", "--force",
-             str(occupant)), capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            released.append(str(occupant))
-    subprocess.run(("git", "-C", str(repo), "worktree", "prune"),
-                   capture_output=True, text=True, check=False)
-    return tuple(released)
+    released = _reclaim_stranded_integration_worktree(
+        Path(config["repo"]), config["repository_state"] / "runs", branch)
+    return () if released is None else (str(released),)
 
 
 def _deliver_reviewer_report(config: Dict[str, Any], name: str):

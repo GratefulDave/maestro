@@ -12,6 +12,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -24,6 +25,7 @@ import contextlib
 import io
 
 import maestro
+from adw_modules import launcher
 from adw_modules import receipt_crypto
 from adw_modules import route_admission as ra
 from adw_modules.route_receipts import load_admitted_routes, load_route_receipt
@@ -74,6 +76,20 @@ elif argv[:2] == ["agent", "start"]:
         open(busy_path, "w").write(str(consumed + 1))
         sys.stderr.write(json.dumps({"error": {"code": "agent_pane_busy"}}))
         sys.exit(1)
+    # An agent that was never released still owns its name. Herdr keeps the
+    # record when a run ends without closing its panes, which is the leftover
+    # a fresh capture then collides with.
+    taken_path = os.path.join(root, "taken_names")
+    taken = [name for name in os.environ.get("FAKE_TAKEN_NAMES", "").split(",")
+             if name]
+    if os.path.exists(taken_path):
+        taken += open(taken_path, encoding="utf-8").read().split()
+    if argv[2] in taken:
+        sys.stdout.write(json.dumps({"error": {
+            "code": "agent_name_taken",
+            "message": "agent name %s already in use" % argv[2]}}))
+        sys.exit(1)
+    open(taken_path, "a", encoding="utf-8").write(argv[2] + "\n")
     write("starts.jsonl", {"argv": argv})
     print(json.dumps({"result": {"agent": {
         "name": argv[2], "status": "idle",
@@ -150,7 +166,11 @@ elif argv[:2] == ["agent", "get"]:
     if os.path.exists(closed_path) and pane_id in open(closed_path, encoding="utf-8").read().split():
         print(json.dumps({"result": {}}))
     else:
-        print(json.dumps({"result": {"agent": {"interactive_ready": True}}}))
+        # Herdr reports which pane an agent occupies; a name that resolves to
+        # somebody else's pane is what sends prompt text to the wrong shell.
+        reported = os.environ.get("FAKE_AGENT_PANE") or pane_id
+        print(json.dumps({"result": {"agent": {
+            "interactive_ready": True, "pane_id": reported}}}))
 else:
     print(json.dumps({"result": {}}))
 '''
@@ -178,6 +198,8 @@ class RouteAdmissionTest(unittest.TestCase):
         os.environ.pop("FAKE_OMIT_MARKER", None)
         os.environ.pop("FAKE_DELAY_MARKER", None)
         os.environ.pop("FAKE_CLOSE_FAIL", None)
+        os.environ.pop("FAKE_TAKEN_NAMES", None)
+        os.environ.pop("FAKE_AGENT_PANE", None)
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -321,13 +343,16 @@ class RouteAdmissionTest(unittest.TestCase):
                     start_panes.append(pane_id)
                     last_start = index
                 self.assertEqual(len(set(start_panes)), len(starts))
-                self.assertEqual(
-                    [command[2] for _, command in starts],
-                    ["admit-{}-first".format(route), "admit-{}-cont".format(route)])
+                started_names = [command[2] for _, command in starts]
+                for name, role in zip(started_names, ("first", "cont")):
+                    prefix = "admit-{}-{}-".format(route, role)
+                    self.assertTrue(
+                        name.startswith(prefix),
+                        "{!r} does not start with {!r}".format(name, prefix))
+                    self.assertTrue(name[len(prefix):])
                 # Each start must be followed by the documented readiness gate
                 # before its prompt is submitted to the agent composer.
-                for name in ("admit-{}-first".format(route),
-                             "admit-{}-cont".format(route)):
+                for name in started_names:
                     waits = [
                         index for index, command in enumerate(argv)
                         if command[:3] == ["agent", "wait", name]
@@ -362,13 +387,144 @@ class RouteAdmissionTest(unittest.TestCase):
                 json.loads(line) for line in
                 (self.root / "argv.jsonl").read_text(encoding="utf-8").splitlines())
         ]
-        first = "admit-omp-first"
+        first = next(
+            c[2] for c in argv
+            if c[:2] == ["agent", "start"] and c[2].startswith("admit-omp-first-"))
         prompts = [c for c in argv if c[:3] == ["agent", "prompt", first]]
         self.assertEqual(len(prompts), 1)
         keys = [c for c in argv if c[:3] == ["agent", "send-keys", first]]
         self.assertEqual(len(keys), 1)
         self.assertEqual(keys[0], ["agent", "send-keys", first, "enter"])
         self.assertLess(argv.index(prompts[0]), argv.index(keys[0]))
+
+    def _argv_log(self) -> list:
+        text = (self.root / "argv.jsonl").read_text(encoding="utf-8")
+        entries = [json.loads(line) for line in text.splitlines()]
+        return [entry["argv"] for entry in entries]
+
+    def _turn_text(self, receipt, key: str = "first_turn") -> str:
+        turn = receipt[key]
+        assert isinstance(turn, dict)
+        return str(turn["text"])
+
+    def test_a_leftover_agent_does_not_refuse_the_next_capture(self):
+        # D7: a blocked run left its panes behind, so its agents stayed
+        # registered, and the next bootstrap was refused before it could do
+        # anything -- `agent start` answered `agent_name_taken` for a name the
+        # previous capture had already burned. The fake keeps every accepted
+        # name registered, which is exactly that leftover.
+        first = ra.capture_route(self.spec("omp"))
+        self.assertEqual(self._turn_text(first), "MAESTRO_OMP_RECEIPT_OK")
+        for leftover in ("closed", "argv.jsonl", "starts.jsonl", "pane_seq",
+                         "launched"):
+            path = self.root / leftover
+            if path.exists():
+                path.unlink()
+        second = ra.capture_route(self.spec("omp"))
+        self.assertEqual(self._turn_text(second), "MAESTRO_OMP_RECEIPT_OK")
+
+    def test_a_capture_never_reuses_a_name_another_run_could_hold(self):
+        # Every start name must be unique across runs by construction, not by
+        # the leftover happening to be gone. Two captures back to back must not
+        # request a single name twice.
+        names = []
+        for _ in range(2):
+            for leftover in ("closed", "argv.jsonl", "starts.jsonl",
+                             "pane_seq", "launched"):
+                path = self.root / leftover
+                if path.exists():
+                    path.unlink()
+            ra.capture_route(self.spec("omp"))
+            names.extend(
+                command[2] for command in self._argv_log()
+                if command[:2] == ["agent", "start"])
+        self.assertEqual(len(names), 4)
+        self.assertEqual(len(set(names)), 4)
+
+    def test_a_taken_name_is_stepped_around_never_taken_back(self):
+        # The leftover belongs to a run this one knows nothing about, and Herdr
+        # reports a healthy agent between turns as `idle` exactly like an
+        # abandoned one. So the collision is answered with a different name and
+        # never with a rename, a close, or any other removal of the record.
+        names = iter(["admit-omp-first-" + "aa" * 4,
+                      "admit-omp-first-" + "bb" * 4,
+                      "admit-omp-cont-" + "cc" * 4,
+                      "admit-omp-cont-" + "dd" * 4])
+        taken = "admit-omp-first-" + "aa" * 4
+        os.environ["FAKE_TAKEN_NAMES"] = taken
+        with mock.patch.object(ra, "_admission_agent_name",
+                               lambda route, *, continuing: next(names)):
+            receipt = ra.capture_route(self.spec("omp"))
+        self.assertEqual(self._turn_text(receipt), "MAESTRO_OMP_RECEIPT_OK")
+        argv = self._argv_log()
+        starts = [c[2] for c in argv if c[:2] == ["agent", "start"]]
+        # The taken name was asked for once, refused, and stepped around.
+        self.assertEqual(starts[:2], [taken, "admit-omp-first-" + "bb" * 4])
+        self.assertFalse([c for c in argv if c[:2] == ["agent", "rename"]])
+        self.assertFalse([c for c in argv if c[:2] == ["agent", "stop"]])
+        self.assertFalse([c for c in argv if c[:2] == ["agent", "prompt"]
+                          and c[2] == taken])
+
+    def test_the_taken_name_refusal_is_read_as_a_code_not_as_prose(self):
+        # §1.2: the retry keys on Herdr's typed `error.code`. A refusal whose
+        # message happens to mention the name is not a taken name.
+        script = self.root / "coded-herdr"
+        script.write_text(
+            "#!/bin/sh\n"
+            "printf '%s' "
+            "'{\"error\":{\"code\":\"agent_name_taken\",\"message\":\"x\"}}'\n"
+            "exit 1\n",
+            encoding="utf-8")
+        script.chmod(0o755)
+        with self.assertRaises(ra.AdmissionError) as caught:
+            ra._herdr(script, "agent", "start", "n")
+        self.assertEqual(caught.exception.code, "agent_name_taken")
+
+        prose = self.root / "prose-herdr"
+        prose.write_text(
+            "#!/bin/sh\nprintf '%s' 'agent_name_taken'\nexit 1\n",
+            encoding="utf-8")
+        prose.chmod(0o755)
+        with self.assertRaises(ra.AdmissionError) as caught:
+            ra._herdr(prose, "agent", "start", "n")
+        self.assertEqual(caught.exception.code, "")
+
+    def test_herdr_error_code_reads_the_typed_field_only(self):
+        self.assertEqual(
+            ra.herdr_error_code(
+                '{"error":{"code":"agent_name_taken","message":"x"},'
+                '"id":"cli:agent:start"}'),
+            "agent_name_taken")
+        for text in ("agent_name_taken", "", "[]",
+                     '{"error":"agent_name_taken"}',
+                     '{"error":{"message":"agent_name_taken"}}'):
+            self.assertEqual(ra.herdr_error_code(text), "")
+
+    def test_the_node_launcher_name_is_left_deterministic(self):
+        # Measured premise: a node agent name is `maestro-` + sha256 of
+        # `{run_id}-{node_id}-{attempt_no}`, and `run_id` is a fresh uuid4 per
+        # run, so it cannot collide across runs. Adding a discriminator there
+        # would churn a name post-mortems key on for no defect. Route admission
+        # is the only surface whose name is run-independent.
+        first = launcher._agent_name("run1-node_a-1")
+        self.assertEqual(first, launcher._agent_name("run1-node_a-1"))
+        self.assertTrue(first.startswith("maestro-"))
+        self.assertNotEqual(first, launcher._agent_name("run2-node_a-1"))
+
+    def test_the_prompt_is_refused_when_the_name_resolves_to_another_pane(self):
+        # `herdr agent prompt <TARGET> <TEXT>` types the text wherever Herdr
+        # resolves TARGET. A name bound to a pane this capture did not create
+        # sends `Reply with exactly MAESTRO_OMP_RECEIPT_OK...` into whatever
+        # shell sits there -- the operator's own command line. Refuse before
+        # submitting anything.
+        os.environ["FAKE_AGENT_PANE"] = "w9:p9"
+        with self.assertRaises(ra.AdmissionError) as caught:
+            ra.capture_route(self.spec("omp"))
+        self.assertIn("ROUTE_AGENT_TARGET_MISMATCH", str(caught.exception))
+        argv = self._argv_log()
+        self.assertFalse(
+            [c for c in argv if c[:2] == ["agent", "prompt"]],
+            "prompt text was submitted to an unproven target")
 
     def test_busy_agent_pane_retries_after_shell_recheck(self):
         os.environ["FAKE_BUSY_STARTS"] = "1"

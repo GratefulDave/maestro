@@ -47,6 +47,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
@@ -54,6 +55,7 @@ sys.path.insert(0, str(ADWS))
 from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import watchdog as wd  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
 
 
@@ -518,6 +520,140 @@ class ContainmentTests(SchedulerFixture):
         self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.MERGED)
         self.assertEqual(self.store.get_node("run1", "a").attempt_no, 2)
 
+
+
+class EnvironmentalDetailTests(SchedulerFixture):
+    """§1.1 item 4 on the ENVIRONMENTAL arm, which had no evidence at all.
+
+    An observed run spent three ENVIRONMENTAL retries and blocked
+    `ENVIRONMENTAL_BUDGET_EXHAUSTED` with `detail_json == {}` on every row, so
+    the operator learned the class and nothing else -- not which signal
+    convicted the attempt, not what the failure was. The three arms that reach
+    the ledger without a verification verdict are the ones that were empty: a
+    watchdog stall, an unanticipated worker exception, and a failed
+    create-time check. Each now carries the typed observation it already held.
+    """
+
+    def _transitions(self, node_id="a"):
+        return self.store.audit_transitions("run1", node_id)
+
+    def _row(self, reason_prefix, node_id="a"):
+        rows = [row for row in self._transitions(node_id)
+                if str(row.get("reason", "")).startswith(reason_prefix)]
+        self.assertTrue(rows, "no {} row: {}".format(
+            reason_prefix, [r.get("reason") for r in self._transitions(node_id)]))
+        return rows[0]
+
+    def _running_attempt(self, scheduler):
+        """One RUNNING attempt owned by the store, with no thread racing it.
+
+        The watchdog's failure callback is the code under test, so it is
+        called directly rather than waited for: a real stall would need a real
+        clock, and a test that sleeps to observe a timeout is a test that
+        flakes on a loaded machine.
+        """
+        scheduler.project()
+        head = wt.integration_head(self.repo, "integration/run1")
+        attempt_no = self.store.start_attempt("run1", "a", head)
+        return self.store.get_attempt("run1", "a", attempt_no)
+
+    def test_a_watchdog_stall_records_which_signal_convicted_the_attempt(self):
+        """§7.6 names three signals and the watchdog already decides between
+        them; the scheduler accepted that answer as an argument and dropped
+        it."""
+        scheduler = self.schedule([self.agent("a")])
+        record = self._running_attempt(scheduler)
+        watchdog, _ = scheduler._start_liveness()
+
+        watchdog._fail_attempt(record, st.RetryClass.ENVIRONMENTAL,
+                               wd.StallReason.NODE_TIMEOUT.value)
+
+        detail = self._row("retry:ENVIRONMENTAL").get("detail", {})
+        self.assertEqual(detail.get("reason"), "NODE_TIMEOUT")
+
+    def test_an_environmental_block_records_which_signal_convicted_it(self):
+        """The same evidence on the terminal row. A block is the ledger's last
+        chance to say what happened, and this arm said nothing."""
+        scheduler = self.schedule([self.agent("a")],
+                                  config=self.config(environmental_retries=0))
+        record = self._running_attempt(scheduler)
+        watchdog, _ = scheduler._start_liveness()
+
+        watchdog._fail_attempt(record, st.RetryClass.ENVIRONMENTAL,
+                               wd.StallReason.PROCESS_DEAD.value)
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.block_reason,
+                      st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED)
+        detail = self._row("blocked:ENVIRONMENTAL_BUDGET_EXHAUSTED").get(
+            "detail", {})
+        self.assertEqual(detail.get("reason"), "PROCESS_DEAD")
+
+    def test_the_reason_is_the_watchdogs_and_is_not_invented_here(self):
+        """Three signals exist, so a row that always says the same one proves
+        nothing. The value travels from the watchdog rather than a constant."""
+        observed = []
+        for stall in (wd.StallReason.TURN_TIMEOUT, wd.StallReason.NODE_TIMEOUT):
+            self.setUp()
+            scheduler = self.schedule([self.agent("a")])
+            record = self._running_attempt(scheduler)
+            watchdog, _ = scheduler._start_liveness()
+            watchdog._fail_attempt(record, st.RetryClass.ENVIRONMENTAL,
+                                   stall.value)
+            observed.append(
+                self._row("retry:ENVIRONMENTAL").get("detail", {}).get("reason"))
+        self.assertEqual(observed, ["TURN_TIMEOUT", "NODE_TIMEOUT"])
+
+    def test_an_unanticipated_worker_exception_records_what_it_was(self):
+        """`classify` reads no ENVIRONMENTAL evidence by design (§7.5), so the
+        containment arm has to record the observation itself. The launcher's
+        typed vocabulary arrives inside the exception."""
+        self.raise_for = {"a": RuntimeError("LAUNCH_REFUSED:agent_name_taken")}
+        self.written = {"a": {"a.py": "A\n"}}
+        self.schedule([self.agent("a")],
+                      config=self.config(environmental_retries=0)).run()
+
+        detail = self._row("blocked:ENVIRONMENTAL_BUDGET_EXHAUSTED").get(
+            "detail", {})
+        self.assertIn("RuntimeError", detail.get("reason", ""))
+        self.assertIn("LAUNCH_REFUSED:agent_name_taken", detail.get("reason", ""))
+
+    def test_a_failed_create_check_records_which_check_failed(self):
+        """The third empty arm. `CheckResult.detail` already names the failing
+        §8.3 check and was discarded at the call site.
+
+        Patched rather than injected because `check_at_create` is a measurement
+        this module performs, not one of the adapter seams the fixture wires --
+        the alternative is corrupting a real worktree's HEAD to provoke it,
+        which tests git rather than this branch.
+        """
+        broken = wt.CheckResult(
+            stage="create", branch_checked_out=False, head_resolves=True,
+            base_is_ancestor=True, cleanliness=None, ok=False,
+            merge_permitted=False,
+            detail=("HEAD is not on maestro/a/1: detached",))
+        self.written = {"a": {"a.py": "A\n"}}
+        with mock.patch.object(sch.wt, "check_at_create", return_value=broken):
+            self.schedule([self.agent("a")],
+                          config=self.config(environmental_retries=0)).run()
+
+        detail = self._row("blocked:ENVIRONMENTAL_BUDGET_EXHAUSTED").get(
+            "detail", {})
+        self.assertIn("create check failed", detail.get("reason", ""))
+        self.assertIn("HEAD is not on maestro/a/1", detail.get("reason", ""))
+
+    def test_the_retry_row_carries_it_too_not_only_the_block(self):
+        """A retried node that later succeeds still has to say why it was
+        retried; the retry row is the only place that failure is recorded."""
+        self.raise_for = {"a": OSError("transient device failure")}
+        self.written = {"a": {"a.py": "A\n"}}
+        self.schedule([self.agent("a")]).run()
+
+        self.assertIs(self.store.get_node("run1", "a").state,
+                      st.NodeState.MERGED)
+        detail = self._row("retry:ENVIRONMENTAL").get("detail", {})
+        self.assertIn("OSError", detail.get("reason", ""))
+        self.assertIn("transient device failure", detail.get("reason", ""))
 
 
 class QuiescenceTests(SchedulerFixture):

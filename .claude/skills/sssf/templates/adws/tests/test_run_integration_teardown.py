@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -39,8 +40,13 @@ def _worktree_paths(repo):
     }
 
 
-class RunIntegrationTeardownTest(unittest.TestCase):
-    """§8.8 keeps the branch; nothing keeps the run's own checkout of it."""
+class _RunSeamHarness:
+    """A git repository, a plan, and the seam `_execute_run` is driven through.
+
+    Shared by the teardown tests and the reclaim tests below, because both ask
+    what a run does to worktrees and a second copy of this fixture would let
+    the two answers drift apart.
+    """
 
     def _repository(self, root):
         repo = root / "repo"
@@ -57,13 +63,22 @@ class RunIntegrationTeardownTest(unittest.TestCase):
         subprocess.run(["git", "branch", BRANCH], cwd=repo, check=True)
         return repo
 
-    def _arguments(self, root, repo, integration):
-        return SimpleNamespace(
+    def _arguments(self, root, repo, integration, repository_state=None):
+        # `argparse.Namespace` rather than `SimpleNamespace`: it takes the same
+        # arbitrary keywords, and it is what `_run_start` and `_execute_run`
+        # actually declare, so the seam is checked instead of merely duck-typed.
+        arguments = argparse.Namespace(
             plan_file=str(root / "plan.json"), db=str(root / "state.db"),
             run_id="run-1", integration_path=str(integration), repo=str(repo),
             data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
             worktrees_root=str(root / "worktrees"),
             scratch_root=str(root / "scratch"), digest="a" * 64)
+        # Bound only by installed repository configuration, so a hand-spelled
+        # run genuinely arrives without it -- and must, or the reclaim would be
+        # tested against a boundary the real unconfigured path never has.
+        if repository_state is not None:
+            arguments.repository_state = str(repository_state)
+        return arguments
 
     def _plan(self):
         return SimpleNamespace(
@@ -104,6 +119,10 @@ class RunIntegrationTeardownTest(unittest.TestCase):
                     merged=(), blocked=())
 
         return AcceptingScheduler
+
+
+class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
+    """§8.8 keeps the branch; nothing keeps the run's own checkout of it."""
 
     def test_accepted_run_releases_its_checkout_and_keeps_the_branch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +246,113 @@ class RunIntegrationTeardownTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(integration.is_dir())
             self.assertIn(integration.resolve(), _worktree_paths(repo))
+
+
+class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
+    """`run start` clears its own litter, and refuses over everyone else's.
+
+    The distinction is path containment against the configured run root, never
+    a name or a claim (§1.2): a checkout under `<repository state>/runs` was
+    created by this system, and one anywhere else may be the operator's.
+    """
+
+    def _installation(self, root):
+        repo = self._repository(root)
+        state = root / "state"
+        (state / "runs").mkdir(parents=True)
+        return repo, state
+
+    def _strand_integration(self, repo, state, run_id="run-0"):
+        """What a run that died before its release leaves holding the branch."""
+        stranded = state / "runs" / run_id / "integration"
+        stranded.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "add", "-q", str(stranded), BRANCH],
+            cwd=repo, check=True)
+        return stranded
+
+    def _start(self, root, repo, state, run_id="run-1"):
+        integration = state / "runs" / run_id / "integration"
+        integration.parent.mkdir(parents=True, exist_ok=True)
+        output = io.StringIO()
+        with self._run_seam(self._accepting_scheduler()), \
+                contextlib.redirect_stdout(output):
+            code = maestro._run_start(
+                self._arguments(root, repo, integration, repository_state=state))
+        return code, json.loads(output.getvalue()), integration
+
+    def test_a_stranded_checkout_in_our_own_run_root_is_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, state = self._installation(root)
+            stranded = self._strand_integration(repo, state)
+
+            code, payload, _ = self._start(root, repo, state)
+
+            self.assertEqual(code, 0, payload)
+            self.assertEqual(payload["outcome"], "ACCEPTED")
+            self.assertFalse(
+                stranded.exists(),
+                "a previous run's own integration checkout is this system's "
+                "litter, not an operator's work")
+            self.assertNotIn(stranded.resolve(), _worktree_paths(repo))
+            self.assertEqual(
+                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0,
+                "reclaiming a checkout never takes the branch with it")
+
+    def test_an_operator_checkout_outside_the_run_root_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, state = self._installation(root)
+            occupant = root / "operator"
+            subprocess.run(
+                ["git", "worktree", "add", "-q", str(occupant), BRANCH],
+                cwd=repo, check=True)
+            (occupant / "operator-work.txt").write_text("mine\n", encoding="utf-8")
+
+            code, payload, integration = self._start(root, repo, state)
+
+            self.assertEqual(code, 3, payload)
+            self.assertEqual(payload["outcome"], "INTEGRATION_BRANCH_CHECKED_OUT")
+            self.assertTrue(occupant.is_dir())
+            self.assertEqual(
+                (occupant / "operator-work.txt").read_text(encoding="utf-8"),
+                "mine\n")
+            self.assertIn(occupant.resolve(), _worktree_paths(repo))
+            self.assertFalse(integration.exists())
+
+    def test_retained_blocked_attempt_worktrees_are_never_swept(self):
+        """§8.8 keeps a blocked node's worktree for post-mortem. Keep it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, state = self._installation(root)
+            stranded = self._strand_integration(repo, state)
+            retained = []
+            for node in ("node-a", "node-b"):
+                attempt = state / "runs" / "run-0" / "worktrees" / node
+                subprocess.run(
+                    ["git", "worktree", "add", "-q", "-b",
+                     "attempt/" + node + "-1", str(attempt), "main"],
+                    cwd=repo, check=True)
+                (attempt / "evidence.txt").write_text(node + "\n", encoding="utf-8")
+                retained.append(attempt)
+
+            code, payload, _ = self._start(root, repo, state)
+
+            self.assertEqual(code, 0, payload)
+            self.assertFalse(stranded.exists())
+            listed = _worktree_paths(repo)
+            for attempt in retained:
+                self.assertTrue(
+                    attempt.is_dir(),
+                    "a blocked node's worktree is post-mortem evidence")
+                self.assertEqual(
+                    (attempt / "evidence.txt").read_text(encoding="utf-8"),
+                    attempt.name + "\n")
+                self.assertIn(attempt.resolve(), listed)
+                self.assertEqual(
+                    _git(repo, "rev-parse", "--verify",
+                         "attempt/" + attempt.name + "-1").returncode, 0)
 
 
 if __name__ == "__main__":
