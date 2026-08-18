@@ -54,6 +54,17 @@ assuming it is current against a deployment** — `diff -rq` against the instanc
 trusting this file, which can itself go stale. When landing a change, say explicitly which copies
 you touched, and mirror deliberately rather than assuming a mirror already happened.
 
+**State as of 2026-08-18.** The two template copies were reconciled that day and are identical
+for every tracked file — `tests/test_template_parity.py` passes from this repo, and its mirror
+passes from the-library. `lexgenius/adws/` was **not** brought level: its most recent `adws/`
+commit is the reviewer-report fix, so it is missing every launcher, worktree, run-state, and
+reviewer-contract fix that landed after it, and it holds files the template does not
+(`adw_data/`, `adw_sssf_config/`, a stray `worktree.py.orig`) while missing files the template
+does (`code_review.py`, `deliver.py`, `handoff_budget.py`, `tests/conftest.py`). Do not read
+"reconciled" as covering the deployment. Re-derive this paragraph with `diff -rq` before relying
+on it; it is a dated observation, not an invariant, and the only invariant here is the parity
+test between the two template copies.
+
 `maestro.config.yaml` is deliberately *not* copied from a deployment. It is deployment-specific:
 its lane vendors, models, and concurrency name a particular installation. The template's copy
 carries the same schema keys as the deployments, with template-shaped values, and the parity test
@@ -80,6 +91,12 @@ no ambiguity.
 - Never gate progress on a zero-finding LLM sweep with restart-on-any-finding — it has no
   bounded termination. Bound the loop or accept graded findings (A9).
 - If a check's field has zero readers, that is a build failure (B15).
+
+§19 records where Maestro itself broke these. B9's declared contract was degenerate in
+production until 2026-08-18 — a projection silently dropped the node's `instruction`, so every
+agent-node reviewer was told "make the gate pass" and nothing else (§19 M1) — and B13's size
+check sat on one launch path instead of the chokepoint every route crosses (§19 M6). A lesson in
+the list above is not a property of the code; read §19 beside it.
 
 ## Verifiers
 

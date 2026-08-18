@@ -71,6 +71,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The reviewer is given the node's contract instead of a placeholder. `PlanNode` carried no
+  `instruction` field and `Plan.to_plan_nodes` projected the node field by field, so the
+  instruction never crossed the projection. `code_review.py` read it as
+  `getattr(node, "instruction", "")`, always received `""`, and fell through to
+  `_fallback_instruction` — which told the reviewer of every agent node, in every run that
+  has ever run, to "make the gate pass". The node's goal, its `produces`, its acceptance,
+  and its `min_cases` never reached the reviewer at all, so the declared reviewer contract of
+  `MAESTRO_architecture.md` §3.6 B9 was degenerate in production while the whole suite stayed
+  green. `min_cases` had been dropped by the same projection earlier and fixed as a one-field
+  patch, which is why `instruction` was still there to find. The projection now carries the
+  field, and a class-level projection-totality guard compares every declared field between the
+  two representations by name **and** by value, so the next dropped field fails the build
+  rather than the review. Recorded as §19 M1 with the lesson it binds (§17 item 115).
+
+- The write-permission check measures the delta over git's tree, not over the disk.
+  `worktree.py::inventory()` enumerated the attempt worktree with `os.walk` under a comment
+  stating "No excludes and no ignore list", so §8.3's permission check counted **16,090
+  gitignored `.venv/**` paths** as writes outside the node's declared globs and discarded an
+  attempt that had run **209 turns** of real work. Every path in the conviction was real,
+  which is what let it survive. The inventory is now bounded to
+  `git ls-files --cached --others --exclude-standard`; the unbounded `offending_paths` join
+  that made the resulting message unreadable is bounded at the point of rendering; and a
+  B13-shaped prompt size preflight was added on the same path. Recorded as §19 M2
+  (§17 item 116).
+
+- Post-split launch failures raise a typed refusal. Every launcher exit after the process
+  split raised an untyped `HerdrCallError`, so `LaunchFailed.pane_created` had nothing to read
+  and fell back to its fail-closed default of `True`; the scheduler then demanded quiescence
+  for a pane handle that had never been registered, and `PROCESS_GROUP_UNTRACKED` converted a
+  retryable launch failure into terminal `QUIESCENCE_UNPROVEN`. The cleanup had in fact
+  succeeded — the run died terminally because of it. Every post-split exit now raises
+  `LaunchRefused`, constructed after cleanup has run. Recorded as §19 M3 (§17 item 117).
+
+- `AGENT_PROMPT_UNOBSERVED` is distinct from `AGENT_PROMPT_UNSUBMITTED`. One terminal code
+  covered both "the pane's revision counter could not be read" and "the pane's revision
+  counter did not move", so a momentary failure to read the instrument retired an attempt that
+  would have succeeded on retry. The first is transient and a property of the observer; the
+  second is terminal and a property of the agent. Recorded as §19 M4 (§17 item 118). Landed
+  alongside 23 stale tests repaired (herdr fakes that carried no `revision`, the argv-borne
+  prompt, the ship fixtures), 8 unmirrored parity files, and a fix for `plan ship` mutating
+  disk above `pane.open()`, which made the verb non-resumable without hand-deleting the plan
+  it had just written.
+
+- A run reaches a terminal state when its scheduler exits. `latest_outcome` had exactly one
+  writer, `Scheduler._declare`; a scheduler that was killed, crashed, or cancelled through
+  `_run_cancel` — which never touched the column — left its run reading live forever, and
+  `run list` reported two runs dead at 0 turns as still running. Run state is now derived from
+  node states plus scheduler liveness, with a new `ABANDONED` state for a run whose scheduler
+  is gone and whose nodes are not terminal. In the same change the B13 prompt size preflight
+  moved to the universal chokepoint in `HerdrLauncher.launch`, above the process split, so its
+  coverage is a property of the call graph rather than of a route list. Recorded as §19 M5 and
+  M6 (§17 items 119 and 120).
+
+- The visualizer stops serving a deleted run as live. It opened the ledger with
+  `immutable=1`, so SQLite never re-read the file and deleted runs kept rendering as live
+  panes, and `MaestroRunDetail.vue` never cleared `run` on a 404, so a detail view outlived
+  its subject. A diagnostic surface that fails in the same direction as the defect it exists
+  to reveal masks that defect; here it would have masked the run-state defect above. Recorded
+  as §19 M7.
+
 - An agent's transcript path is waited for, not read once from the start payload. `herdr
   agent start` returns as soon as the server holds the process, which on a route that writes
   a JSONL transcript is before the coding agent has created the file; Herdr then omits
