@@ -85,7 +85,7 @@ class _RunSeamHarness:
             agent_nodes=(),
             merge_policy=SimpleNamespace(
                 integration_branch=BRANCH,
-                integration_gate=SimpleNamespace(runner="none", argv=())),
+                integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
             to_plan_nodes=lambda: ())
 
     @contextlib.contextmanager

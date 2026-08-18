@@ -122,8 +122,12 @@ class RetryClassTests(unittest.TestCase):
             {st.BlockReason.GATE_NOT_FALSIFIABLE,
              st.BlockReason.CODE_NODE_NO_EFFECT,
              st.BlockReason.PERMISSION_SCOPE_VIOLATION})
-        for reason in st.NON_RETRYABLE:
-            self.assertFalse(st.is_retryable(reason))
+        # The `is_retryable(reason)` predicate that stood here was deleted: it
+        # had no production caller, because `classify` already decides
+        # retryability from the RetryClass at classification time and a
+        # BlockReason only exists once that decision has been made. What the
+        # membership means operationally is asserted where it is observable —
+        # `test_non_retryable_reasons_do_not_offer_retry` below.
 
 
 # ── §11.3 every stored block reason has a real exit ─────────────────────────
@@ -171,7 +175,7 @@ class PlanNodeTests(unittest.TestCase):
     def agent(self, **kw):
         base = dict(node_id="n1", kind=st.NodeKind.AGENT, depth=0,
                     gate_command=("pytest",), gate_selector="tests/test_n1.py",
-                    outputs=("src/n1.py",))
+                    outputs=("src/n1.py",), instruction="Build n1.")
         base.update(kw)
         return st.PlanNode(**base)
 

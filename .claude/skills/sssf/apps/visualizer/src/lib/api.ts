@@ -12,9 +12,26 @@ import type {
   SourceInfo,
 } from './types'
 
+/**
+ * Thrown by `getJson` on a non-2xx response, carrying the HTTP status so a
+ * caller can tell "this entity is gone" (404) apart from "the server is
+ * unreachable right now" — a poll loop that only sees `Error` cannot make
+ * that distinction and ends up leaving a deleted entity's last-known state on
+ * screen forever, which is indistinguishable from it still being live.
+ */
+export class ApiHttpError extends Error {
+  constructor(
+    readonly status: number,
+    url: string,
+  ) {
+    super(`GET ${url} → ${status}`)
+    this.name = 'ApiHttpError'
+  }
+}
+
 async function getJson(url: string): Promise<unknown> {
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`GET ${url} → ${res.status}`)
+  if (!res.ok) throw new ApiHttpError(res.status, url)
   return res.json()
 }
 

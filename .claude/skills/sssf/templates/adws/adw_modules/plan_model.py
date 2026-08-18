@@ -390,25 +390,162 @@ class Plan(BaseModel):
     def to_plan_nodes(self) -> Tuple[st.PlanNode, ...]:
         """Project onto the scheduler's own node — no second authored type.
 
-        `st.PlanNode`'s constructor owns the three refusals (§7.3, §7.4); the
+        `st.PlanNode`'s constructor owns the refusals (§7.3, §7.4); the
         projection copies fields and lets them fire, rather than restating
         them here where the two copies could disagree.
+
+        Every projected node is then checked against the model it came from
+        by `_assert_projection_is_total`, so a declared field this function
+        forgets is a raised `ProjectionIncomplete` on the first projection of
+        every run rather than a value that quietly reads as its default
+        somewhere downstream.
         """
         depths = self.node_depths()
         projected: List[st.PlanNode] = []
         for node in self.nodes:
-            common = dict(node_id=node.node_id, depth=depths[node.node_id],
-                          needs=tuple(node.needs), outputs=tuple(node.outputs))
+            # Annotated because the values are heterogeneous: unannotated,
+            # the inferred value type is a union and every parameter filled
+            # through `**common` is reported as a type error.
+            common: Dict[str, Any] = dict(
+                node_id=node.node_id, depth=depths[node.node_id],
+                needs=tuple(node.needs), outputs=tuple(node.outputs))
             if isinstance(node, AgentNode):
-                projected.append(st.PlanNode(
+                result = st.PlanNode(
                     kind=st.NodeKind.AGENT,
                     gate_command=(node.gate.runner,) + tuple(node.gate.argv),
-                    gate_selector=selector_of(node.gate), **common))
+                    gate_selector=selector_of(node.gate),
+                    # The gate's threshold travels with the gate. Dropping it
+                    # here is what made §10.2's counting rule unenforceable:
+                    # the runner, argv and selector were copied, `min_cases`
+                    # was not, and the scheduler fell back to a per-run scalar
+                    # that no caller ever set (§10.2, §7.3 clause 3).
+                    gate_min_cases=node.gate.min_cases,
+                    # The goal. Dropped exactly as `min_cases` was, and with
+                    # the same shape of consequence one layer further on: the
+                    # reviewer's B9 contract read it through a `getattr`
+                    # default and every agent node in every run was reviewed
+                    # against a goal derived from its own gate.
+                    instruction=node.instruction, **common)
             else:
-                projected.append(st.PlanNode(
+                result = st.PlanNode(
                     kind=st.NodeKind.CODE, command=tuple(node.command),
-                    expects_changes=node.expects_changes, **common))
+                    expects_changes=node.expects_changes, **common)
+            _assert_projection_is_total(node, result)
+            projected.append(result)
         return tuple(projected)
+
+
+# ── the projection is total, or it raises (§6.2, §3.6 B15) ─────────────────
+
+class ProjectionIncomplete(RuntimeError):
+    """`to_plan_nodes` did not account for a field the plan node declares.
+
+    This class of defect has now been paid for twice. `Gate.min_cases` was
+    projected nowhere, so §10.2's counting rule read a per-run scalar no
+    caller set and a plan demanding 70 passing cases was verified at 1.
+    `AgentNode.instruction` was projected nowhere, so the reviewer's B9
+    contract fell back to "make your own gate pass" for every agent node in
+    every run. Neither was a hard failure. Both were a field that read as its
+    default, in a subsystem three modules away, discovered in production.
+
+    A hand-written projection cannot be trusted to stay total, because the
+    author of a new field is not the author of this function. So totality is
+    checked instead of maintained: for every field the plan node declares,
+    either `st.PlanNode` carries a field of the same name **holding the same
+    value**, or the field is listed in `_NODE_PROJECTION_EXEMPT` with the
+    reason it is not carried. A new field is neither until someone decides
+    which, and until then it raises here — on the first projection, which
+    every run and every plan validation performs.
+
+    The value comparison is what makes this stronger than a name check: a
+    field that exists on both types but is never copied (the `min_cases`
+    shape, had the names matched) fails too.
+    """
+
+
+def _normalized(value: Any) -> Any:
+    """Sequences compare by content, so a tuple and a list of the same items
+    are the same projected value; everything else compares as itself."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalized(item) for item in value)
+    return value
+
+
+#: Node fields deliberately **not** carried onto `st.PlanNode`, each with the
+#: reason. A reason is required because "we did not need it" and "we forgot"
+#: are indistinguishable in an empty set — this table is where that
+#: distinction is written down and reviewed.
+_NODE_PROJECTION_EXEMPT: Dict[str, str] = {
+    "kind": ("carried as `st.NodeKind`, which the projection sets explicitly "
+             "on each branch; the two enums are the same two kinds"),
+    "gate": ("decomposed rather than dropped, into gate_command, "
+             "gate_selector and gate_min_cases; `_GATE_PROJECTION` below "
+             "accounts for every one of its own fields"),
+    "reads": ("evidence ids, meaningful only against `Plan.evidence`, which "
+              "is not on a node. Read from the plan by plan_validate and by "
+              "the plan rubric's node.reads_are_sufficient check, so the ids "
+              "resolve to the evidence they name rather than travelling as "
+              "opaque strings"),
+    "cwd": ("a code node's command runs in that attempt's own worktree "
+            "(§8.3), which is the isolation guarantee; the plan's cwd is not "
+            "the runtime cwd and carrying it would offer a second answer"),
+    "prompt_assets": ("consumed while authoring the plan, not while running "
+                      "it; nothing on the scheduler's side reads one"),
+}
+
+#: Every `Gate` field, and where it lands on `st.PlanNode`. `None` means the
+#: gate's own value is deliberately not carried. Checked for completeness
+#: against `Gate.model_fields`, so a new gate field raises here too.
+_GATE_PROJECTION: Dict[str, Optional[str]] = {
+    "runner": "gate_command",
+    "argv": "gate_command",
+    "min_cases": "gate_min_cases",
+    "cwd": None,  # the gate runs in the attempt worktree, as above
+}
+
+
+def _assert_projection_is_total(node: "_NodeBase", projected: st.PlanNode) -> None:
+    """Raise unless every field `node` declares is carried or exempted."""
+    for name in sorted(type(node).model_fields):
+        if name in _NODE_PROJECTION_EXEMPT:
+            continue
+        if not hasattr(projected, name):
+            raise ProjectionIncomplete(
+                "{0}: {1}.{2} is declared in the plan but `to_plan_nodes` "
+                "neither carries it onto scheduler_types.PlanNode nor lists "
+                "it in _NODE_PROJECTION_EXEMPT with a reason. A dropped field "
+                "reads as a default somewhere downstream instead of failing "
+                "here.".format(node.node_id, type(node).__name__, name))
+        declared = _normalized(getattr(node, name))
+        carried = _normalized(getattr(projected, name))
+        if declared != carried:
+            raise ProjectionIncomplete(
+                "{0}: {1}.{2} is {3!r} in the plan but {4!r} on the projected "
+                "PlanNode; the projection carries the field name and not its "
+                "value.".format(node.node_id, type(node).__name__, name,
+                                declared, carried))
+
+    gate = getattr(node, "gate", None)
+    gate_fields = set(Gate.model_fields)
+    if gate is not None:
+        gate_fields |= set(type(gate).model_fields)
+    unaccounted = sorted(gate_fields - set(_GATE_PROJECTION))
+    if unaccounted:
+        raise ProjectionIncomplete(
+            "Gate declares {0} with no entry in _GATE_PROJECTION; a gate "
+            "field with nowhere to land is how `min_cases` came to be "
+            "declared at 70 and enforced at 1.".format(", ".join(unaccounted)))
+    if gate is not None:
+        if projected.gate_min_cases != gate.min_cases:
+            raise ProjectionIncomplete(
+                "{0}: the gate declares min_cases={1}, the projected node "
+                "carries {2}.".format(node.node_id, gate.min_cases,
+                                      projected.gate_min_cases))
+        if tuple(projected.gate_command) != (gate.runner,) + tuple(gate.argv):
+            raise ProjectionIncomplete(
+                "{0}: the projected gate_command {1!r} is not this gate's "
+                "runner and argv.".format(node.node_id,
+                                          tuple(projected.gate_command)))
 
 
 IN_PLAN_TYPES: Tuple[Type[BaseModel], ...] = (

@@ -157,6 +157,19 @@ class RepositoryStateIdentityTest(unittest.TestCase):
 
 
 class OperatorCliTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # B13's builder preflight resolves `agent_model` through omp's merged
+        # catalog before a prompt is dispatched. These tests launch stub models
+        # into fake runners, so the catalog is stubbed to carry them: without
+        # it every launch here refuses for a reason that has nothing to do with
+        # what the test is about, and the assertions would be about whichever
+        # models this machine happens to have registered.
+        patch = mock.patch.object(
+            maestro.agent_pi, "catalog",
+            lambda: (("stub", "model", 400_000), ("stub", "m", 400_000)))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_all_public_verbs_exist_in_the_real_parser(self):
         parser = maestro.build_parser()
         enforcement.assert_verbs(maestro.parser_verbs(parser))
@@ -792,6 +805,15 @@ class OperatorCliTest(unittest.TestCase):
                     found = self.handles.get(requested)
                     return (found,) if found is not None else ()
 
+                def provision(self, _worktree):
+                    """§9.3's sixth adapter operation, a no-op here.
+
+                    Present because the contract has six operations and this
+                    stands in for an adapter: a double missing one is a double
+                    that cannot detect the harness beginning to use it.
+                    """
+                    return None
+
             route = FailingRoute()
             node = SimpleNamespace(
                 kind=scheduler_types.NodeKind.AGENT, node_id="agent")
@@ -799,7 +821,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 node_by_id=lambda: {
                     "agent": SimpleNamespace(instruction="do the work")},
                 to_plan_nodes=lambda: ())
@@ -869,7 +891,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 to_plan_nodes=lambda: ())
             attempt = SimpleNamespace(path=root, scratch=root / "scratch")
             record = SimpleNamespace(node_id="code", attempt_no=1)
@@ -996,7 +1018,7 @@ class OperatorCliTest(unittest.TestCase):
                         agent_nodes=(),
                         merge_policy=SimpleNamespace(
                             integration_branch="main",
-                            integration_gate=SimpleNamespace(runner="none", argv=())),
+                            integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                         to_plan_nodes=lambda: ())
             ), mock.patch.object(
                     maestro, "_validate_run_paths"
@@ -1044,7 +1066,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="integration/run-1",
-                    integration_gate=SimpleNamespace(runner="fixture", argv=("gate",))),
+                    integration_gate=SimpleNamespace(runner="fixture", argv=("gate",), min_cases=1)),
                 to_plan_nodes=lambda: (node,))
             green = maestro.worktree.GateResult(
                 label="gate", scope="node", selector="code",
@@ -1117,6 +1139,15 @@ class OperatorCliTest(unittest.TestCase):
                 def reclaim(self, _token):
                     return ()
 
+                def provision(self, _worktree):
+                    """§9.3's sixth adapter operation, a no-op here.
+
+                    Present because the contract has six operations and this
+                    stands in for an adapter: a double missing one is a double
+                    that cannot detect the harness beginning to use it.
+                    """
+                    return None
+
             route = RecordingRoute()
             shared = {"XDG_CACHE_HOME": str(scratch / "xdg")}
             code_node = SimpleNamespace(
@@ -1128,7 +1159,7 @@ class OperatorCliTest(unittest.TestCase):
                 agent_nodes=(agent_node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 node_by_id=lambda: {
                     "agent": SimpleNamespace(instruction="do the work")},
                 to_plan_nodes=lambda: ())
@@ -1204,13 +1235,22 @@ class OperatorCliTest(unittest.TestCase):
                 def reclaim(self, _token):
                     return ()
 
+                def provision(self, _worktree):
+                    """§9.3's sixth adapter operation, a no-op here.
+
+                    Present because the contract has six operations and this
+                    stands in for an adapter: a double missing one is a double
+                    that cannot detect the harness beginning to use it.
+                    """
+                    return None
+
             node = SimpleNamespace(
                 kind=scheduler_types.NodeKind.AGENT, node_id="agent")
             plan = SimpleNamespace(
                 agent_nodes=(node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=())),
+                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
                 node_by_id=lambda: {
                     "agent": SimpleNamespace(instruction="do the work")},
                 to_plan_nodes=lambda: ())

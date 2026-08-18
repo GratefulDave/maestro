@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 
 from unittest import mock
 
@@ -950,6 +951,81 @@ class RunStartIsolationTest(unittest.TestCase):
         # It builds the string; it never spawns it.
         for spawn in ("subprocess", "os.system", "os.exec", "Popen"):
             self.assertNotIn(spawn, source)
+
+
+class AuthorTurnEnvironmentTest(unittest.TestCase):
+    """§8.3 binds the author's pane exactly as it binds a node's or a
+    reviewer's.
+
+    `LaunchSpec.environment` defaults to an empty mapping, and this launch was
+    one of three constructions that never passed one. `pane_env_flags` refuses
+    an incomplete redirection rather than degrading it — a redirect that
+    silently fails to arrive convicts an agent for a harness defect — so the
+    omission is a hard `SCRATCH_REDIRECT_MISSING` refusal the moment the verb
+    runs, not a quiet cache written into the repository.
+    """
+
+    def test_the_author_turn_launch_carries_every_scratch_redirection(self):
+        from adw_modules import launcher as lch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            session_root = root / "state" / "deliver"
+            session_root.mkdir(parents=True)
+            envelope = root / "state" / "envelope.json"
+
+            captured = {}
+
+            class FakeRunner:
+                def launch(self, spec):
+                    captured["spec"] = spec
+                    envelope.parent.mkdir(parents=True, exist_ok=True)
+                    envelope.write_text(json.dumps({"success": True}),
+                                        encoding="utf-8")
+                    # An empty pane id keeps the best-effort pane close from
+                    # spawning anything: this test owns no terminal.
+                    return lch.LaunchHandle(
+                        correlation_token=spec.correlation_token, pane_id="",
+                        agent_name="author", launched_cwd=spec.worktree,
+                        environment=spec.environment)
+
+                def poll(self, _handle):
+                    return lch.PollResult(lch.PollState.EXITED, 0, "")
+
+                def cancel(self, _handle, _deadline):
+                    return None
+
+            lane = deliver.AuthorLane(
+                route="claude", model="opus", effort="high", profile=None,
+                author_timeout_s=5.0, turn_timeout_s=5.0, poll_interval_s=0.01)
+            turn = maestro._deliver_author_turn(
+                {"repo": str(repo), "executables": {"herdr": "/bin/true"}},
+                lane, cast(lch.HerdrLauncher, FakeRunner()), session_root)
+            self.assertEqual(turn("spec", "write it", envelope),
+                             {"success": True})
+
+            spec = captured["spec"]
+            # The assertion that matters is that `pane_env_flags` does not
+            # refuse: it is the function that raised in production.
+            flags = lch.pane_env_flags(spec.environment)
+            pane_env = {}
+            for index, token in enumerate(flags):
+                if token == "--env":
+                    key, _, value = flags[index + 1].partition("=")
+                    pane_env[key] = value
+            self.assertEqual(set(pane_env), set(lch.SCRATCH_ENV_KEYS))
+            # Beside this turn's own session directory, under the harness-owned
+            # session root — never inside the repository being authored against.
+            for key, value in pane_env.items():
+                path = (value.split("cache_dir=", 1)[-1]
+                        if key == "PYTEST_ADDOPTS" else value)
+                self.assertTrue(Path(path).is_relative_to(session_root), key)
+                self.assertFalse(Path(path).is_relative_to(repo), key)
+            self.assertEqual(
+                Path(pane_env["XDG_CACHE_HOME"]).parent,
+                spec.session_dir.with_name(spec.session_dir.name + ".scratch"))
 
 
 if __name__ == "__main__":

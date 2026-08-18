@@ -15,7 +15,7 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { ChevronRight, GitBranch, TriangleAlert } from 'lucide-vue-next'
 import type { MaestroAttempt, MaestroNode, MaestroRunDetail } from '../lib/types'
-import { fetchRun } from '../lib/api'
+import { ApiHttpError, fetchRun } from '../lib/api'
 import { fmtDate, fmtDuration, ts } from '../lib/format'
 import MaestroStateChip from './MaestroStateChip.vue'
 
@@ -23,6 +23,16 @@ const props = defineProps<{ sourceId: string; runId: string }>()
 
 const run = shallowRef<MaestroRunDetail | null>(null)
 const apiError = ref<string | null>(null)
+/**
+ * A 404 for this run id, as opposed to a transient `apiError`. Distinct from
+ * "no run yet" (`!run`) because that state is also true while the first
+ * fetch is in flight — a plain `!run` render would say "loading" forever for
+ * a run that will never come back, and worse, a `catch` that only set
+ * `apiError` without clearing `run` would leave the *previous* run's panes
+ * on screen looking live while a small banner most operators never read said
+ * otherwise. This is the state that was silently missing.
+ */
+const notFound = ref(false)
 const open = ref<Set<string>>(new Set())
 /** Browser clock minus server clock, so both agree on "now". */
 const skewMs = ref(0)
@@ -33,7 +43,7 @@ let clock: ReturnType<typeof setInterval> | undefined
 let inflight = false
 
 async function tick() {
-  if (inflight) return
+  if (inflight || notFound.value) return
   inflight = true
   try {
     const detail = await fetchRun(props.sourceId, props.runId)
@@ -41,7 +51,16 @@ async function tick() {
     run.value = detail
     apiError.value = null
   } catch (err) {
-    apiError.value = err instanceof Error ? err.message : String(err)
+    if (err instanceof ApiHttpError && err.status === 404) {
+      // The run this URL names is gone from the ledger — stop polling for it
+      // and drop any stale copy so nothing keeps rendering it as live.
+      notFound.value = true
+      run.value = null
+      apiError.value = null
+      if (timer) clearInterval(timer)
+    } else {
+      apiError.value = err instanceof Error ? err.message : String(err)
+    }
   } finally {
     inflight = false
   }
@@ -58,7 +77,15 @@ onUnmounted(() => {
   clearInterval(timer)
   clearInterval(clock)
 })
-watch(() => props.runId, () => void tick())
+watch(
+  () => props.runId,
+  () => {
+    notFound.value = false
+    run.value = null
+    if (!timer) timer = setInterval(() => void tick(), 1000)
+    void tick()
+  },
+)
 
 /** The server's clock, right now, as this browser can best estimate it. */
 const serverNow = computed(() => nowMs.value - skewMs.value)
@@ -133,10 +160,15 @@ function expanded(node: MaestroNode): boolean {
 
 <template>
   <div class="detail">
-    <div v-if="apiError" class="error-bar">api unreachable — retrying {{ apiError }}</div>
-    <div v-if="!run" class="empty-state">loading run…</div>
+    <div v-if="notFound" class="empty-state error-state">
+      run <code class="run-id">{{ runId }}</code> not found — it is no longer in this ledger
+    </div>
 
     <template v-else>
+      <div v-if="apiError" class="error-bar">api unreachable — retrying {{ apiError }}</div>
+      <div v-if="!run" class="empty-state">loading run…</div>
+
+      <template v-else>
       <section class="head">
         <div class="head-line">
           <MaestroStateChip :state="run.state" />
@@ -284,6 +316,7 @@ function expanded(node: MaestroNode): boolean {
           <pre>{{ JSON.stringify(result.payload, null, 2) }}</pre>
         </div>
       </section>
+      </template>
     </template>
   </div>
 </template>
@@ -667,5 +700,10 @@ function expanded(node: MaestroNode): boolean {
 
 .error-bar {
   color: var(--red);
+}
+
+.error-state {
+  color: var(--red);
+  font-weight: 600;
 }
 </style>

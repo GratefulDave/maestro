@@ -547,18 +547,36 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
 
         thread = threading.Thread(target=execute)
         thread.start()
-        deadline = time.monotonic() + 3.0
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(marker.exists())
-        process_group = int(marker.read_text())
-        cancelled.set()
-        thread.join(timeout=4.0)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(len(failures), 1)
-        self.assertIsInstance(failures[0], wt.GateCancelled)
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(process_group, 0)
+        # Reaching the gate is a precondition, not an assertion: the gate is a
+        # real pytest process started inside a git worktree, and under full
+        # suite load it does not reach its first line within three seconds.
+        # Bounding a precondition at roughly its own duration is what made
+        # this fail in the suite while passing 8/8 alone. What the test is
+        # actually for — the cancellation, and the process group being gone
+        # afterwards — is asserted below and deliberately unchanged.
+        #
+        # The `finally` is the more important half. The gate spawns a child
+        # that sleeps 60s, and on the old path an expired precondition
+        # returned without ever setting `cancelled`, leaving that child and
+        # its parent alive for a minute. That is cross-test damage: every test
+        # after it in the same run competes with a spinning process group,
+        # which is a plausible reason failures clustered rather than scattered.
+        try:
+            deadline = time.monotonic() + 30.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            process_group = int(marker.read_text())
+            cancelled.set()
+            thread.join(timeout=10.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], wt.GateCancelled)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(process_group, 0)
+        finally:
+            cancelled.set()
+            thread.join(timeout=10.0)
         wr.cleanup_acceptance(acceptance)
 
     def test_cleanup_removes_only_acceptance_worktrees(self) -> None:

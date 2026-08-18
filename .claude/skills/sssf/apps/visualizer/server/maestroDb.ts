@@ -40,18 +40,35 @@ export const MAESTRO_TABLES = ["runs", "dag_nodes", "node_lifecycle", "attempts"
 /** The plan file every named plan directory holds. Its bytes are its identity. */
 const PLAN_FILE = "maestro-plan.v1";
 
+/** A readonly ledger connection, plus whether it had to be opened `immutable=1`. */
+export interface LedgerConnection {
+  db: Database;
+  /**
+   * `immutable=1` tells SQLite the file will never change, which is only true
+   * for as long as nothing else writes to it. A row deleted or added by
+   * another process afterwards is invisible to this connection — or worse,
+   * `SQLITE_CORRUPT` — because it stops checking the file for changes at all.
+   * Callers that hold one of these across requests must reopen it once the
+   * file's mtime moves; see `MaestroDb.freshDb()`.
+   */
+  immutable: boolean;
+}
+
 /**
  * Open a ledger read-only, tolerating a cleanly-closed WAL database.
  *
  * Kept as a free function so the schema probe can borrow it without
  * constructing a reader for a database that may turn out to be an sssf.db.
  */
-export function openLedgerReadonly(path: string): Database {
+export function openLedgerReadonly(path: string): LedgerConnection {
   try {
-    return probed(new Database(path, { readonly: true }));
+    return { db: probed(new Database(path, { readonly: true })), immutable: false };
   } catch {
     const flags = constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI;
-    return probed(new Database(`file:${encodeURI(path)}?mode=ro&immutable=1`, flags));
+    return {
+      db: probed(new Database(`file:${encodeURI(path)}?mode=ro&immutable=1`, flags)),
+      immutable: true,
+    };
   }
 }
 
@@ -148,7 +165,10 @@ export class MaestroDb {
   /** The repository's plans directory, when it could be located. */
   readonly plansDir: string | null;
   readonly journalMode: string;
-  private readonly db: Database;
+  private db: Database;
+  private immutable: boolean;
+  /** File mtime at the moment `db` was opened; used to detect a stale immutable handle. */
+  private dbStamp: number;
   /** digest → plan name, rebuilt whenever the plans directory changes on disk. */
   private planNames = new Map<string, string>();
   private planNamesStamp = 0;
@@ -160,7 +180,10 @@ export class MaestroDb {
     this.path = path;
     this.runsDir = resolve(dirname(path), "runs");
     this.plansDir = plansDir;
-    this.db = openLedgerReadonly(path);
+    const opened = openLedgerReadonly(path);
+    this.db = opened.db;
+    this.immutable = opened.immutable;
+    this.dbStamp = statSync(path).mtimeMs;
     // A readonly connection cannot set journal_mode; take the busy_timeout so a
     // transacting scheduler never turns a poll into a failed request.
     this.db.exec("PRAGMA busy_timeout = 5000");
@@ -173,8 +196,35 @@ export class MaestroDb {
     this.db.close();
   }
 
+  /**
+   * The connection to read through for this call, reopened first if it was
+   * opened `immutable=1` and the file has moved since.
+   *
+   * A live WAL writer's readonly connection already sees fresh commits
+   * through the shared WAL index, so it is left alone. An `immutable=1`
+   * connection — the only way to open a *finished* run's ledger at all,
+   * because its `-wal`/`-shm` sidecars are gone — explicitly tells SQLite the
+   * file will never change and stops checking; once something does write to
+   * it (the maestro CLI, a direct `sqlite3` edit, a resumed scheduler), that
+   * connection either keeps serving its boot-time snapshot or throws
+   * `SQLITE_CORRUPT`. Reopening on a moved mtime is what makes a per-request
+   * query actually observe a per-request state of the file.
+   */
+  private freshDb(): Database {
+    if (!this.immutable) return this.db;
+    const stamp = statSync(this.path).mtimeMs;
+    if (stamp === this.dbStamp) return this.db;
+    const opened = openLedgerReadonly(this.path);
+    this.db.close();
+    this.db = opened.db;
+    this.immutable = opened.immutable;
+    this.dbStamp = stamp;
+    this.db.exec("PRAGMA busy_timeout = 5000");
+    return this.db;
+  }
+
   runCount(): number {
-    return this.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()?.n ?? 0;
+    return this.freshDb().query<{ n: number }, []>("SELECT COUNT(*) AS n FROM runs").get()?.n ?? 0;
   }
 
   /**
@@ -208,19 +258,18 @@ export class MaestroDb {
   }
 
   private runRows(runId?: string): RunRow[] {
+    const db = this.freshDb();
     const sql =
       `SELECT run_id, plan_digest, created_at, last_transition_at,
               latest_outcome, latest_outcome_at, cancel_requested
          FROM runs`;
     return runId
-      ? this.db.query<RunRow, [string]>(`${sql} WHERE run_id = ?`).all(runId)
-      : this.db
-          .query<RunRow, []>(`${sql} ORDER BY created_at DESC, rowid DESC`)
-          .all();
+      ? db.query<RunRow, [string]>(`${sql} WHERE run_id = ?`).all(runId)
+      : db.query<RunRow, []>(`${sql} ORDER BY created_at DESC, rowid DESC`).all();
   }
 
   private nodeRows(runId: string): NodeRow[] {
-    return this.db
+    return this.freshDb()
       .query<NodeRow, [string]>(
         `SELECT d.node_id, d.kind, d.depth, d.needs_json, d.outputs_json,
                 l.state, l.attempt_no, l.block_reason, l.output_sha,
@@ -266,21 +315,24 @@ export class MaestroDb {
     if (!row) return null;
 
     const nodeRows = this.nodeRows(runId);
-    const attemptRows = this.db
+    // Same open-or-reopened connection nodeRows() just settled on: mtime
+    // cannot have moved again between these calls in this one request.
+    const db = this.freshDb();
+    const attemptRows = db
       .query<AttemptRow, [string]>(
         `SELECT node_id, attempt_no, base_sha, state, started_at, launched_at,
                 pid, turn_count, retry_class, extra_json
            FROM attempts WHERE run_id = ? ORDER BY node_id, attempt_no`,
       )
       .all(runId);
-    const transitionRows = this.db
+    const transitionRows = db
       .query<TransitionRow, [string]>(
         `SELECT node_id, kind, from_state, to_state, reason, actor,
                 detail_json, created_at
            FROM transitions WHERE run_id = ? ORDER BY id`,
       )
       .all(runId);
-    const resultRows = this.db
+    const resultRows = db
       .query<ResultRow, [string]>(
         `SELECT node_id, attempt_no, subject_sha, payload_json, adjudication,
                 created_at

@@ -44,8 +44,19 @@ class PlanAuthorTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_author_fills_observed_sha_and_writes_canonical_bytes(self):
+        """Filling is supplying what the draft did not declare.
+
+        This test used to set `sha256` to `"0" * 64` and then assert that the
+        authored plan carried the README's real hash — that is, it asserted
+        that a declared pin is silently replaced by an observed one, which is
+        the defect written down as intended behaviour. It is why
+        `plan_validate`'s EVIDENCE_TYPED_AGAINST_GIT obligation could never go
+        red: the value it compares had just been computed from the object it
+        compares against. The draft now omits the key, which is the only case
+        `fill_git_facts` should be filling.
+        """
         draft = plan_mapping(self.base)
-        draft["evidence"][0]["sha256"] = "0" * 64
+        draft["evidence"][0].pop("sha256")
         destination = self.root / "out" / "maestro-plan.v1"
         stored = plan_author.author_from_draft(
             _write_draft(self.root / "draft.json", draft),
@@ -58,6 +69,80 @@ class PlanAuthorTest(unittest.TestCase):
             stored, self.repo, receipts=Receipts(), collector=Collector())
         self.assertTrue(result.eligible)
         self.assertEqual(result.digest, pd.digest_of(stored))
+
+    def test_author_refuses_an_observed_sha_that_does_not_match_the_object(self):
+        """A declared pin is verified, never overwritten.
+
+        The sibling `produced` branch has always been guarded this way
+        (`not item.get("base_sha256")`); this one was not, so every
+        `source_artifacts` hash in every plan was theatre — the author declared
+        a hash, authoring replaced it, and nothing ever compared the two.
+        """
+        draft = plan_mapping(self.base)
+        draft["evidence"][0]["sha256"] = "0" * 64
+        with self.assertRaises(plan_author.AuthoringError) as caught:
+            plan_author.author_plan(draft, self.repo)
+        message = str(caught.exception)
+        self.assertIn("OBSERVED_DIGEST_MISMATCH", message)
+        # The refusal names both hashes: an operator has to be able to tell a
+        # stale pin from a changed file without re-running anything.
+        self.assertIn("0" * 64, message)
+        self.assertIn(sha256_text(README), message)
+
+    def test_a_matching_declared_observed_sha_survives_authoring(self):
+        """The control. Without it the refusal above could be passing because
+        authoring refuses every declared pin."""
+        draft = plan_mapping(self.base)
+        draft["evidence"][0]["sha256"] = sha256_text(README)
+        stored = plan_author.author_plan(draft, self.repo)
+        self.assertEqual(json.loads(stored)["evidence"][0]["sha256"],
+                         sha256_text(README))
+
+    def test_the_git_obligation_can_now_convict_a_fabricated_citation(self):
+        """§7.4's argument, applied to a validator rather than a gate.
+
+        `Observed`'s docstring says the validator re-reads the hash and that a
+        fabricated citation fails. It could not: authoring overwrote the
+        citation with the truth before the validator ever saw it, so the check
+        compared a value against the thing it had just been computed from. This
+        drives `validate_plan` over a plan whose stored bytes carry a wrong
+        hash and asserts the obligation goes red — the red control the
+        obligation never had.
+        """
+        draft = plan_mapping(self.base)
+        draft["evidence"][0].pop("sha256")
+        stored = plan_author.author_plan(draft, self.repo)
+        tampered = json.loads(stored)
+        tampered["evidence"][0]["sha256"] = "0" * 64
+        result = pv.validate_plan(
+            json.dumps(tampered).encode("utf-8"), self.repo,
+            receipts=Receipts(), collector=Collector())
+        self.assertFalse(result.eligible)
+        self.assertTrue(
+            any("sha256" in blocker.pointer for blocker in result.blockers),
+            "EVIDENCE_TYPED_AGAINST_GIT did not convict a wrong pin: "
+            + repr([b.pointer for b in result.blockers]))
+
+    def test_author_refuses_an_empty_repo_rather_than_substituting_one(self):
+        """`repo` is filled when absent, not when falsy.
+
+        `if not repo_name` treated `""` as an omission and substituted the
+        checkout's directory name — the same substitution of an observation for
+        a declaration that made the observed hash unfalsifiable, one field over
+        and one order of magnitude smaller. `plan_model` requires a non-empty
+        repo, so the malformed draft now refuses there.
+        """
+        draft = plan_mapping(self.base)
+        draft["repo"] = ""
+        with self.assertRaises(plan_author.AuthoringError) as caught:
+            plan_author.author_plan(draft, self.repo)
+        self.assertIn("PLAN_DRAFT_INVALID", str(caught.exception))
+
+    def test_author_still_fills_a_repo_the_draft_omits(self):
+        draft = plan_mapping(self.base)
+        draft.pop("repo", None)
+        stored = plan_author.author_plan(draft, self.repo)
+        self.assertEqual(json.loads(stored)["repo"], self.repo.name)
 
     def test_author_resolves_head_when_base_commit_omitted(self):
         draft = plan_mapping(self.base)

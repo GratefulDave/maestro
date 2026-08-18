@@ -17,6 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adw_modules import launcher
+# Aliased as well, because several tests below bind a local named `launcher`
+# to a `HerdrLauncher` instance and would otherwise shadow the module.
+from adw_modules import launcher as launcher_module
 from adw_modules.launcher import (
     ErrorClass,
     FakeLauncher,
@@ -44,10 +47,32 @@ if record:
             "argv": argv,
             "environment": os.environ.get("FAKE_LAUNCH_ENV"),
         }) + "\n")
+ROOT = os.path.dirname(record) if record else "/tmp"
+# The monotonic per-pane counter real herdr publishes on `pane get`. It is the
+# only signal `launcher.submit_agent_prompt` accepts as proof that a composer
+# actually took a prompt, so a fake that omits it models a pane that can never
+# accept anything -- which is what silently blinded this suite to the launcher
+# path that killed two production runs on 2026-08-18.
+REV = os.path.join(ROOT, "pane_revision")
+
+def revision():
+    return int(open(REV).read()) if os.path.exists(REV) else 4096
+
+def bump():
+    nxt = revision() + 1
+    open(REV, "w").write(str(nxt))
+
 if argv[:2] == ["pane", "split"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"]}}}))
 elif argv[:2] == ["pane", "get"]:
-    print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"], "foreground_cwd": "/wrong"}}}))
+    if os.environ.get("FAKE_PANE_GET_FAILURE"):
+        sys.stderr.write(json.dumps({"error": {"code": "transport_failure"}}))
+        sys.exit(1)
+    pane = {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"],
+            "foreground_cwd": "/wrong"}
+    if not os.environ.get("FAKE_PANE_WITHOUT_REVISION"):
+        pane["revision"] = revision()
+    print(json.dumps({"result": {"pane": pane}}))
 elif argv[:2] == ["pane", "process-info"]:
     root = os.path.dirname(record) if record else "/tmp"
     launched = os.path.join(root, "launched")
@@ -59,10 +84,25 @@ elif argv[:2] == ["agent", "start"]:
     if os.environ.get("FAKE_HERDR_REFUSE"):
         sys.stderr.write(json.dumps({"error": {"code": "launch_refused"}}))
         sys.exit(1)
-    print(json.dumps({"result": {"agent": {"name": argv[2], "status": "idle", "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
+    agent = {"name": argv[2], "status": "idle"}
+    if not os.environ.get("FAKE_START_WITHOUT_SESSION"):
+        agent["transcript_path"] = os.environ["FAKE_TRANSCRIPT"]
+    print(json.dumps({"result": {"agent": agent}}))
 elif argv[:2] == ["agent", "wait"]:
     print(json.dumps({"result": {"ok": True, "status": "idle"}}))
 elif argv[:2] == ["agent", "prompt"]:
+    stalls = os.path.join(ROOT, "stalls")
+    seen = int(open(stalls).read()) if os.path.exists(stalls) else 0
+    if seen < int(os.environ.get("FAKE_PROMPT_STALLS", "0")):
+        # The composer took the text and never submitted it: no lifecycle
+        # change, and -- the part that matters -- no revision movement.
+        open(stalls, "w").write(str(seen + 1))
+        sys.stderr.write(json.dumps({"error": {"code": "agent_prompt_stalled"}}))
+        sys.exit(1)
+    bump()
+    print(json.dumps({"result": {"ok": True}}))
+elif argv[:2] == ["agent", "send-keys"]:
+    bump()
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["agent", "read"]:
     name = argv[2]
@@ -90,7 +130,18 @@ elif argv[:2] == ["agent", "get"]:
         print(json.dumps({"result": {}}))
     else:
         status = os.environ.get("FAKE_AGENT_STATUS", "working")
-        print(json.dumps({"result": {"agent": {"name": argv[2], "status": status, "interactive_ready": True, "transcript_path": os.environ["FAKE_TRANSCRIPT"]}}}))
+        agent = {"name": argv[2], "status": status, "interactive_ready": True}
+        if os.environ.get("FAKE_SESSION_NEVER"):
+            pass
+        elif os.environ.get("FAKE_SESSION_TAGGED"):
+            # What real herdr sends for a route that writes a JSONL
+            # transcript: a tagged value, never a flat `transcript_path`.
+            agent["agent_session"] = {"agent": "omp", "kind": "path",
+                                      "source": "herdr:omp",
+                                      "value": os.environ["FAKE_TRANSCRIPT"]}
+        else:
+            agent["transcript_path"] = os.environ["FAKE_TRANSCRIPT"]
+        print(json.dumps({"result": {"agent": agent}}))
 elif argv[:2] == ["pane", "close"]:
     if os.environ.get("FAKE_HERDR_CLOSE_FAILURE"):
         sys.stderr.write(json.dumps({"error": {"code": "close_failure"}}))
@@ -152,6 +203,10 @@ class LauncherContractTest(unittest.TestCase):
             effort="high",
             profile="openai-performance" if route == "omp" else None,
             session_dir=self.root / "session",
+            # B13: `omp` publishes a catalog, so every spec dispatched on it
+            # must carry the window `preflight_launch_prompt` measures against.
+            # `claude` publishes none, so `None` is the honest value there.
+            context_window_tokens=400_000 if route == "omp" else None,
             environment=worktree_module.launch_env(self.scratch),
         )
 
@@ -272,9 +327,19 @@ class LauncherContractTest(unittest.TestCase):
                                 admitted_routes=self.admitted_routes)
         with self.assertRaisesRegex(
                 RuntimeError,
-                "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"):
+                "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"
+                ) as caught:
             harness.launch(replace(self.spec(), environment=environment))
         self.assertFalse((self.root / "argv.jsonl").exists())
+        # The absence of `argv.jsonl` is what "before creating a pane" means
+        # here, and it is a fact this test can see because it drives the whole
+        # launcher. §8.3's quiesce step is downstream and cannot see it, so the
+        # launcher states it as a typed field on the refusal rather than
+        # leaving the scheduler to infer it from a message (§16.3 item 45).
+        self.assertIs(caught.exception.refusal,
+                      launcher_module.LaunchRefusal.SCRATCH_REDIRECT_MISSING)
+        self.assertFalse(caught.exception.pane_created)
+        self.assertTrue(caught.exception.deterministic)
 
     def test_launch_refuses_wrong_pane_cwd_before_starting_agent(self):
         os.environ["FAKE_HERDR_CWD"] = str(self.root / "wrong")
@@ -320,9 +385,13 @@ class LauncherContractTest(unittest.TestCase):
              "--pane", "w1:p2", "--timeout", "180000"])
         self.assertEqual(start[9], "--")
         self.assertEqual(calls[start_indexes[0] + 1][:2], ["pane", "get"])
-        # The coder must be waited for with the documented readiness gate, and
-        # the prompt must be handed to the agent composer -- not typed into the
-        # pane's shell -- so text plus Enter are submitted atomically.
+        # The coder must still be waited for with the documented readiness
+        # gate. What changed on 2026-08-18 (`7f03ee2`) is where the prompt
+        # travels: omp documents a `MESSAGES` positional that accepts
+        # `@<file>`, so the process that starts the agent carries the prompt
+        # and there is no composer in the path at all. Typing it stalled
+        # against omp roughly half the time -- run-d7c242809fe74e74b7368393fa4de6de
+        # blocked both depth-0 lanes at 0 turns on exactly that.
         wait_indexes = [
             index for index, call in enumerate(calls)
             if call[:2] == ["agent", "wait"]
@@ -331,37 +400,90 @@ class LauncherContractTest(unittest.TestCase):
         wait = calls[wait_indexes[0]]
         self.assertEqual(wait[:5], ["agent", "wait", start[2], "--until", "idle"])
         self.assertIn("--timeout", wait)
-        prompt_indexes = [
-            index for index, call in enumerate(calls)
-            if call[:2] == ["agent", "prompt"] and call[3].startswith("@")
-        ]
-        self.assertEqual(len(prompt_indexes), 1)
-        prompt = calls[prompt_indexes[0]]
+        route_argv = start[start.index("--") + 1:]
+        self.assertEqual(route_argv[-1], "@{0}".format(self.prompt.resolve()))
         self.assertEqual(
-            prompt[:5],
-            ["agent", "prompt", start[2],
-             "@{0}".format(self.prompt.resolve()), "--wait"])
-        # The harness turn runs as long as the task does, so the launch settles
-        # on either working or idle rather than holding open until the run ends.
-        self.assertEqual(
-            [prompt[i + 1] for i, a in enumerate(prompt) if a == "--until"],
-            ["working", "idle"])
-        self.assertGreater(int(prompt[prompt.index("--timeout") + 1]), 5000)
-        self.assertLess(wait_indexes[0], prompt_indexes[0])
+            [call for call in calls if call[:2] == ["agent", "prompt"]], [])
         self.assertFalse(any(
             call[:2] in (["pane", "run"], ["pane", "send-keys"],
                          ["agent", "send-keys"])
             for call in calls))
+
+    def test_launch_waits_for_a_transcript_path_that_arrives_after_start(self):
+        # `agent start` returns once herdr holds the process, which for the omp
+        # route is before the coder has opened its JSONL session -- so herdr
+        # sends no `agent_session` key at all. Reading only the start payload
+        # made SESSION_PATH_MISSING a race: on 2026-08-17 one of three attempts
+        # on the same node happened to win it and ran 61 turns, and the two
+        # that lost it died at turn zero.
+        os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
+        os.environ["FAKE_SESSION_TAGGED"] = "1"
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        handle = harness.launch(self.spec())
+        self.assertEqual(handle.transcript_path, self.transcript)
+        # The tailer must be registered for the resolved path, not skipped
+        # because the path was unknown at the instant the handle was built.
+        tailer = harness._tailers["run1-node_a-1"]
+        self.assertEqual(tailer.path, self.transcript)
+        # And the registry must still name the object the caller holds.
+        self.assertIs(harness._handles["run1-node_a-1"], handle)
+        self.assertIn(["agent", "get", handle.agent_name],
+                      self.recorded_calls())
+
+    def test_launch_bounds_the_wait_when_no_transcript_ever_arrives(self):
+        # The bounded half: when the path genuinely never appears the wait
+        # terminates and the handle carries None, so the caller's
+        # SESSION_PATH_MISSING is still reachable rather than traded for a hang.
+        os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
+        os.environ["FAKE_SESSION_NEVER"] = "1"
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        with mock.patch.object(launcher, "TRANSCRIPT_PATH_TIMEOUT_S", 0.05):
+            started = time.monotonic()
+            handle = harness.launch(self.spec())
+            elapsed = time.monotonic() - started
+        self.assertIsNone(handle.transcript_path)
+        self.assertNotIn("run1-node_a-1", harness._tailers)
+        self.assertLess(elapsed, 30.0)
+
+    def test_the_transcript_wait_reads_the_typed_field_and_terminates(self):
+        # The signal is `agent_session.kind`, a typed field, never pane text
+        # (§1.2). A route reporting an id rather than a path has no transcript
+        # here, and that is an answer the deadline is allowed to reach.
+        calls = []
+
+        def herdr_call(*args, **kwargs):
+            calls.append(args)
+            return {"result": {"agent": {
+                "agent_session": {"kind": "id", "value": "abc"}}}}
+
+        slept = []
+        self.assertIsNone(launcher.wait_for_agent_transcript(
+            herdr_call, "a", 0.0, poll_interval_s=0.0, sleep=slept.append))
+        self.assertEqual(calls, [("agent", "get", "a")])
 
     def test_launch_refusal_closes_the_allocated_pane(self):
         os.environ["FAKE_HERDR_REFUSE"] = "1"
         launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
                                  claude_path=Path("/opt/claude"),
                                  admitted_routes=self.admitted_routes)
-        with self.assertRaisesRegex(RuntimeError, "LAUNCH_REFUSED"):
+        with self.assertRaisesRegex(RuntimeError, "LAUNCH_REFUSED") as caught:
             launcher.launch(self.spec())
         calls = [json.loads(line)["argv"] for line in (self.root / "argv.jsonl").read_text().splitlines()]
         self.assertIn(["pane", "close", "w1:p2"], calls)
+        # A pane was allocated and this handler closed it, so the refusal
+        # reports the close herdr accepted rather than a constant. Saying
+        # `True` after a successful close is what sent §8.3's quiesce step
+        # after an attempt that was never registered, turning a retryable
+        # launch failure into a terminal QUIESCENCE_UNPROVEN. The close-failed
+        # direction is the control, in `test_launch_refusal_cleanup.py`.
+        self.assertIsInstance(caught.exception, launcher_module.LaunchRefused)
+        self.assertIs(caught.exception.refusal,
+                      launcher_module.LaunchRefusal.AGENT_START_REFUSED)
+        self.assertFalse(caught.exception.pane_created)
 
     def test_launch_refuses_os_failure_as_typed_refusal(self):
         launcher = HerdrLauncher(herdr_path=self.root / "missing-herdr",
@@ -468,6 +590,44 @@ class LauncherContractTest(unittest.TestCase):
         bootstrap = prompt_calls[0][-1]
         self.assertNotIn(prompt_bytes, json.dumps(calls))
         self.assertLess(len(bootstrap), len(str(self.prompt.resolve())) + 2)
+
+    def test_a_claude_composer_that_stalls_is_recovered_with_enter(self):
+        """The composer route still exists, so its stall must still be caught.
+
+        Only omp carries its prompt in argv; the claude route hands `@<path>`
+        to a composer, and a composer that swallows the text reports `idle`
+        exactly like one that took it. The pane's monotonic `revision` is the
+        only thing that separates them, so this drives the real recovery loop
+        in `submit_agent_prompt` through `launch` rather than in isolation.
+        """
+        os.environ["FAKE_PROMPT_STALLS"] = "1"
+        runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        runtime.launch(self.spec("claude"))
+        calls = self.recorded_calls()
+        self.assertEqual(
+            len([call for call in calls if call[:2] == ["agent", "prompt"]]), 1)
+        # Enter was pressed on what the composer was already holding, and the
+        # prompt was never re-issued -- a second `agent prompt` would append to
+        # the unsubmitted line and send both as one garbled turn.
+        send_keys = [call for call in calls if call[:2] == ["agent", "send-keys"]]
+        self.assertEqual(len(send_keys), 1)
+        self.assertEqual(send_keys[0][3], "enter")
+
+    def test_a_pane_that_never_advances_its_revision_refuses_the_launch(self):
+        """The blindness this suite carried until 2026-08-18.
+
+        With no `revision` key at all the launcher can never prove submission,
+        so the launch must refuse rather than hand back a handle for an agent
+        that was never given any work.
+        """
+        os.environ["FAKE_PANE_WITHOUT_REVISION"] = "1"
+        runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        with self.assertRaises(launcher.PromptSubmissionUnobservable):
+            runtime.launch(self.spec("claude"))
 
     def test_reclaim_matches_exact_token_only(self):
         launcher = FakeLauncher()

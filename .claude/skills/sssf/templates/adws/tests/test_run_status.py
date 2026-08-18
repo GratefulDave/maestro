@@ -29,9 +29,11 @@ from adw_modules import scheduler_types as st
 
 AGENT_NODE = st.PlanNode(
     node_id="lane-one", kind=st.NodeKind.AGENT, depth=0,
+    instruction="Build lane one.",
     gate_command=("pytest",), gate_selector="tests/test_one.py")
 SECOND_NODE = st.PlanNode(
     node_id="lane-two", kind=st.NodeKind.AGENT, depth=0,
+    instruction="Build lane two.",
     gate_command=("pytest",), gate_selector="tests/test_two.py")
 
 
@@ -457,6 +459,85 @@ class RunManualInvocationTest(RunStatusFixture):
         self.assertEqual(code, 3)
         self.assertEqual(json.loads(output)["outcome"],
                          "MAESTRO_CONFIGURATION_INVALID")
+
+
+class RunListStopsReportingDeadRunsAsLive(RunStatusFixture):
+    """D4 through the operator's verbs, not through the derivation directly.
+
+    `run list` reporting a dead run as RUNNING is the whole operator-visible
+    bug: it is what sent an operator back to run-75dfc6914946487f998453fefb51a0cf
+    twice believing it was live.
+    """
+
+    def _kill_the_scheduler(self, run_id, pid=424242):
+        """Point the run's recorded owner at a pid that is not a process.
+
+        Not a stub of the liveness probe: the row really names a pid, and the
+        production `os.kill(pid, 0)` really finds nothing there.
+        """
+        with self._store() as store:
+            store.conn.execute(
+                "UPDATE runs SET scheduler_pid=?, scheduler_host=?"
+                " WHERE run_id=?", (pid, lc.scheduler_host(), run_id))
+
+    def test_a_run_whose_scheduler_died_reads_abandoned_not_running(self):
+        run_id = self._live_run()
+        self._kill_the_scheduler(run_id)
+        code, output = self._run(["run", "list", "--json"])
+        self.assertEqual(code, 0, output)
+        row = [r for r in json.loads(output) if r["run_id"] == run_id][0]
+        self.assertEqual(row["state"], "ABANDONED")
+        self.assertIs(row["scheduler_alive"], False)
+
+    def test_a_live_run_is_still_reported_as_running(self):
+        """The false positive that must never happen. The fixture's own run is
+        owned by this process, which is definitely alive."""
+        run_id = self._live_run()
+        code, output = self._run(["run", "list", "--json"])
+        self.assertEqual(code, 0, output)
+        row = [r for r in json.loads(output) if r["run_id"] == run_id][0]
+        self.assertEqual(row["state"], "RUNNING")
+        self.assertIs(row["scheduler_alive"], True)
+
+    def test_a_finished_cancellation_reads_cancelled_not_cancelling(self):
+        run_id = self._live_run("run-cancelled")
+        with self._store() as store:
+            store.cancel_run(run_id)
+        self._kill_the_scheduler(run_id)
+        code, output = self._run(["run", "list", "--json"])
+        self.assertEqual(code, 0, output)
+        row = [r for r in json.loads(output) if r["run_id"] == run_id][0]
+        # No scheduler ever declared an outcome for it, and it is still
+        # reported terminally.
+        self.assertIsNone(row["declared_outcome"])
+        self.assertEqual(row["state"], "CANCELLED")
+
+    def test_status_shows_the_facts_the_verdict_was_derived_from(self):
+        run_id = self._live_run()
+        self._kill_the_scheduler(run_id)
+        code, output = self._run(["run", "status", run_id])
+        self.assertEqual(code, 0, output)
+        self.assertIn("ABANDONED", output)
+        self.assertIn("pid 424242", output)
+        self.assertIn("gone", output)
+
+    def test_an_accepted_run_is_unaffected_by_its_scheduler_being_gone(self):
+        """A scheduler that declared and exited is supposed to be gone."""
+        run_id = self._accepted_run()
+        self._kill_the_scheduler(run_id)
+        code, output = self._run(["run", "list", "--json"])
+        self.assertEqual(code, 0, output)
+        row = [r for r in json.loads(output) if r["run_id"] == run_id][0]
+        self.assertEqual(row["state"], "MERGED")
+        self.assertEqual(row["declared_outcome"], "ACCEPTED")
+
+    def test_a_blocked_declared_run_is_not_relabelled_as_abandoned(self):
+        run_id = self._blocked_run()
+        self._kill_the_scheduler(run_id)
+        code, output = self._run(["run", "list", "--json"])
+        self.assertEqual(code, 0, output)
+        row = [r for r in json.loads(output) if r["run_id"] == run_id][0]
+        self.assertEqual(row["state"], "BLOCKED")
 
 
 if __name__ == "__main__":

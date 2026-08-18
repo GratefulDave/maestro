@@ -55,8 +55,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
-                    Sequence, Tuple, Type, Union)
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
+                    Optional, Sequence, Tuple, Type, Union)
 
 from pydantic import BaseModel, ConfigDict
 
@@ -309,6 +309,36 @@ class ReviewerReport(BaseModel):
     cells: List[ReportCell]
 
 
+def report_is_complete(payload: object) -> bool:
+    """Whether a polled report carries every cell it says it answers.
+
+    A reviewer writes its report with an ordinary file write, so a poll that
+    lands mid-write reads a file that parses and is not finished. Accepting
+    it converts the reviewer's own incomplete draft into a `CELL_SET`
+    rejection, which is terminal for the plan's bytes -- a read race
+    condemning a plan the reviewer went on to clear.
+
+    `pair_count` is the reviewer's echo of the matrix size (the fabrication
+    canary above), so a payload carrying fewer cells than it claims is, by
+    its own account, still being written. This is structural per S1.2: the
+    only things read are the declared count and the number of cells present,
+    never a message, a status, or any other prose the reviewer produced.
+
+    A report that stays incomplete for the whole window stalls it, and a
+    stall is a fact about the machine that permits a rerun (S6.5), which is
+    the correct classification for a reviewer that stopped writing.
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    declared = payload.get("pair_count")
+    cells = payload.get("cells")
+    if not isinstance(declared, int) or isinstance(declared, bool):
+        return False
+    if not isinstance(cells, list):
+        return False
+    return len(cells) == declared
+
+
 #: Names that must never appear anywhere in the report schema.
 FORBIDDEN_REPORT_FIELDS = ("verdict", "severity")
 
@@ -322,20 +352,33 @@ def find_forbidden_report_fields(model: Type[BaseModel]) -> List[str]:
     this convicts it, per §13.4's rule.
     """
     found: List[str] = []
+    for current in report_schema_closure(model):
+        for name in current.model_fields:
+            if name in FORBIDDEN_REPORT_FIELDS:
+                found.append(name)
+    return found
+
+
+def report_schema_closure(model: Type[BaseModel]) -> List[Type[BaseModel]]:
+    """`model` and every model reachable from its fields.
+
+    Named and exported so a check over the report schema can *discover* its
+    subjects instead of being handed them. A guard pointed at a hand-written
+    list of classes stops covering the schema the moment the schema grows,
+    and reports clean while doing it.
+    """
     seen: List[Type[BaseModel]] = []
 
     def walk(current: Type[BaseModel]) -> None:
         if current in seen:
             return
         seen.append(current)
-        for name, field in current.model_fields.items():
-            if name in FORBIDDEN_REPORT_FIELDS:
-                found.append(name)
+        for field in current.model_fields.values():
             for nested in _nested_models(field.annotation):
                 walk(nested)
 
     walk(model)
-    return found
+    return seen
 
 
 def _nested_models(annotation: Any) -> List[Type[BaseModel]]:

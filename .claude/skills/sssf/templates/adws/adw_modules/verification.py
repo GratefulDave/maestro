@@ -340,111 +340,133 @@ def verify_code_node(exit_code: int,
     return VerificationVerdict(verified=True)
 
 
-def verify_review_node(report_parsed: bool,
-                       matrix_verified: bool,
-                       occupancy_measured: bool,
-                       receipt_verdict: Optional[str],
-                       receipt_signed: bool) -> VerificationVerdict:
-    """§7.3's **review-node** predicate — its own clauses, sharing none.
-
-    A review node has no gate, no `min_cases`, no declared outputs, and no
-    permission check: it writes one report file into a fresh session directory
-    and touches the repository not at all. Reusing an agent node's four clauses
-    for it would be the unscoped-VERIFIED defect §7.3 exists to prevent, one
-    kind further along — clause 2 (pre-gate red) and clause 3 (post-gate green)
-    are not merely unsatisfiable here, they are meaningless.
-
-    Five clauses, and every one of them is a fact about *code's* observation of
-    the review, never about what the reviewer said:
-
-    1. The report parsed against the frozen schema, in which `verdict` and
-       `severity` are unrepresentable.
-    2. The report survived the matrix: digest echo, pair count, exact cell set,
-       and both canaries. A reviewer that cannot echo what it was given did not
-       read what it was given.
-    3. The reviewer's context-window occupancy was **measured** and under
-       threshold. NULL convicts, per §6.5 — an unmeasured window is not a
-       passing one, and B13 is what an overflowing reviewer does instead of
-       erroring.
-    4. Code derived PASS from the rubric's severities.
-    5. A create-once receipt exists and its Ed25519 signature verifies. This is
-       the clause that makes the merge lawful under §1.2: the transition is
-       caused by a signed artifact, not by pane text, prompt text, a free-text
-       field, or an agent's claim about its own work.
-
-    Clause 4 is the only one that can be false without something being broken —
-    a FAIL is a working review — so it alone carries a retry class. The others
-    are protocol failures of the review itself, and re-running the *builder* on
-    them would spend a node's budget on a reviewer's malfunction.
-    """
-    if not report_parsed:
-        return VerificationVerdict(
-            verified=False, failed_clause=1,
-            reason="the reviewer wrote no parseable report")
-
-    if not matrix_verified:
-        return VerificationVerdict(
-            verified=False, failed_clause=2,
-            reason=("the report did not survive the matrix: echo, pair count, "
-                    "cell set, or a canary"))
-
-    if not occupancy_measured:
-        return VerificationVerdict(
-            verified=False, failed_clause=3,
-            reason=("no context-window occupancy was recorded for the reviewer "
-                    "session; a NULL row convicts (§6.5)"))
-
-    if not receipt_signed:
-        return VerificationVerdict(
-            verified=False, failed_clause=5,
-            reason="no signed receipt exists for this review subject")
-
-    if receipt_verdict != "PASS":
-        return VerificationVerdict(
-            verified=False, failed_clause=4,
-            reason=f"code derived {receipt_verdict} from the reviewer's cells",
-            # The one clause that is a verdict about the code under review, so
-            # the one that earns the builder another attempt against a mutated
-            # prompt. The scheduler counts it under its own ceiling, never the
-            # semantic one — a red gate and a rejected diff are different
-            # failures and share no budget.
-            retry_class=st.RetryClass.SEMANTIC)
-
-    return VerificationVerdict(verified=True)
+# ── §7.3's review-node predicate lives in the review path, not here ─────────
+#
+# `verify_review_node` stood here as a second expression of §7.3's five-clause
+# review predicate and was never called by production. Its clauses were already
+# enforced, each by the code that owns the observation:
+#
+#   1. report parsed          `fin.ReviewerReport.model_validate`
+#   2. survived the matrix    `fin.verify_report`
+#   3. occupancy measured     `fin.check_occupancy` (NULL convicts, §6.5)
+#   4. code derived PASS      `fin.derive_verdict` + `cr.require_located_findings`
+#   5. signed receipt         `fin.ReceiptStore` verifies the Ed25519 signature
+#                             over the persisted bytes on load
+#
+# all sequenced by `code_review.review_attempt`, whose `ReviewOutcome.passed` is
+# what the scheduler's review branch actually reads. Two expressions of one rule
+# with only one of them running is how the two drift, so the unexercised copy
+# went rather than the enforced one.
+#
+# OWED, round 2: the mirror of this comment at the scheduler's review branch,
+# naming where each clause is enforced. A deleted predicate with no pointer at
+# the call site is how the next person re-derives it from scratch.
 
 
 # ── §10.1 no guard reads free text ──────────────────────────────────────────
 
+def _free_text_names(node: ast.AST) -> List[str]:
+    """Every §10.1 free-text field read anywhere inside `node`.
+
+    Both access shapes, because catching only the attribute form would leave
+    the mapping form silently permitted. Parsed rather than grepped: a field
+    name inside a docstring or a string constant is not a read, and a detector
+    that convicted one would be the lexical matching this design forbids.
+    """
+    found: List[str] = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in FREE_TEXT_FIELDS:
+            found.append(sub.attr)
+        elif isinstance(sub, ast.Subscript):
+            index = sub.slice
+            # Python 3.9 still wraps a constant subscript in ast.Index on some
+            # parse paths, so unwrap before testing rather than assuming 3.10.
+            if isinstance(index, ast.Index):  # pragma: no cover - version dependent
+                index = index.value  # type: ignore[attr-defined]
+            if isinstance(index, ast.Constant) and index.value in FREE_TEXT_FIELDS:
+                found.append(index.value)
+    return found
+
+
 class _FreeTextVisitor(ast.NodeVisitor):
+    """Free-text reads that reach a **decision**, not every read.
+
+    §1.2 forbids a *lifecycle transition* caused by free text. It does not
+    forbid reading free text — §7.6's own ledger records it, an error message
+    quotes it, and the console prints it, all of which the rule permits and
+    all of which the previous form convicted. That is why this guard could
+    only ever be pointed at `verification.py`: run tree-wide it reported three
+    hits, every one a tracer payload, an f-string in a `raise`, or a console
+    line, and the only way to widen a rule that convicts permitted code is an
+    allowlist — which is how a guard dies.
+
+    So the rule now asks the question §1.2 actually asks: does this value
+    **decide** anything? A free-text read convicts when it sits inside a
+    branch test, a comparison, a boolean operator, an assertion, or a
+    comprehension filter — the places a value changes what happens next. It
+    acquits when the value only flows into a call argument or a formatted
+    string, which is recording and display.
+
+    **A stated limit.** This is a syntactic reach, not dataflow: free text
+    assigned to a local and branched on later escapes it. Closing that needs
+    reaching-definitions analysis, and the honest move is to name the gap
+    rather than to widen the shape until it convicts the innocent again.
+    """
 
     def __init__(self) -> None:
         self.found: List[str] = []
 
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr in FREE_TEXT_FIELDS:
-            self.found.append(node.attr)
+    def _decide(self, node: Optional[ast.AST]) -> None:
+        if node is not None:
+            self.found.extend(_free_text_names(node))
+
+    def visit_If(self, node: ast.If) -> None:
+        self._decide(node.test)
         self.generic_visit(node)
 
-    def visit_Subscript(self, node: ast.Subscript) -> None:
-        index = node.slice
-        # Python 3.9 still wraps a constant subscript in ast.Index on some
-        # parse paths, so unwrap before testing rather than assuming 3.10.
-        if isinstance(index, ast.Index):  # pragma: no cover - version dependent
-            index = index.value  # type: ignore[attr-defined]
-        if isinstance(index, ast.Constant) and index.value in FREE_TEXT_FIELDS:
-            self.found.append(index.value)
+    def visit_While(self, node: ast.While) -> None:
+        self._decide(node.test)
+        self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self._decide(node.test)
+        self.generic_visit(node)
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self._decide(node.test)
+        self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        for operand in (node.left, *node.comparators):
+            self._decide(operand)
+        self.generic_visit(node)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        for value in node.values:
+            self._decide(value)
+        self.generic_visit(node)
+
+    def visit_comprehension(self, node: ast.comprehension) -> None:
+        for condition in node.ifs:
+            self._decide(condition)
+        self.generic_visit(node)
+
+    def visit_Match(self, node: "ast.Match") -> None:  # pragma: no cover
+        self._decide(node.subject)
         self.generic_visit(node)
 
 
 def free_text_reads(source: str) -> Tuple[str, ...]:
-    """Every read of a §10.1 free-text field in `source`, by AST.
+    """Every §10.1 free-text field that **decides** something in `source`.
 
-    Parsed rather than grepped, and the distinction is the same one §7.5
-    makes about stderr: a field name inside a docstring or a string constant
-    is not a read, and a detector that convicted one would be the lexical
-    matching this design forbids. Both access shapes are covered, because
-    catching only the attribute form would leave the mapping form silently
-    permitted.
+    §1.2's rule has the widest scope in the specification — a run fails if ANY
+    lifecycle transition is caused by pane text, prompt text, a free-text
+    envelope field, or an agent's claim — and lifecycle transitions happen in
+    `scheduler.py`, not here. Checking the widest rule in the narrowest place
+    is what this now stops doing: it runs over the whole tree.
+
+    See `_FreeTextVisitor` for what separates a read from a decision, and for
+    the dataflow case this deliberately does not reach.
     """
     visitor = _FreeTextVisitor()
     visitor.visit(ast.parse(source))

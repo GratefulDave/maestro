@@ -130,6 +130,12 @@ class BlockReason(str, Enum):
     ENVIRONMENTAL_BUDGET_EXHAUSTED = "ENVIRONMENTAL_BUDGET_EXHAUSTED"
     LAUNCHER_BUDGET_EXHAUSTED = "LAUNCHER_BUDGET_EXHAUSTED"
     CREDENTIAL_REFUSED = "CREDENTIAL_REFUSED"
+    #: A launcher refusal that is deterministic by construction (§16.3 item
+    #: 46). It names the refusal rather than the budget, because there was no
+    #: budget: `LAUNCHER_BUDGET_EXHAUSTED` on a refusal that could never have
+    #: succeeded tells an operator a number ran out and nothing about the
+    #: configuration or plan that has to change.
+    LAUNCH_REFUSED = "LAUNCH_REFUSED"
     MERGE_CONFLICT = "MERGE_CONFLICT"
     QUIESCENCE_UNPROVEN = "QUIESCENCE_UNPROVEN"
     OUTPUT_IDENTITY_INVALID = "OUTPUT_IDENTITY_INVALID"
@@ -140,16 +146,19 @@ class BlockReason(str, Enum):
 #: answer (§7.5). Without a dedicated reason each of these falls to the
 #: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
 #: then blocks with an infra-flavoured reason for what is a fact about content.
+#: Named as a set rather than behind a predicate. An `is_retryable(reason)`
+#: helper stood here and had no production caller for as long as it existed:
+#: production decides retryability from the `RetryClass` at classification
+#: time — `classify` returns a `block_reason` for exactly these three and a
+#: `retry_class` for everything else, so by the time a `BlockReason` exists
+#: the decision is already made and asking it again is a second representation
+#: of one fact (RC1). The tuple stays because §7.5's membership rule is a
+#: statement worth naming and testing; the predicate over it does not.
 NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.GATE_NOT_FALSIFIABLE,
     BlockReason.CODE_NODE_NO_EFFECT,
     BlockReason.PERMISSION_SCOPE_VIOLATION,
 )
-
-
-def is_retryable(reason: BlockReason) -> bool:
-    """Whether another attempt could change this reason's answer."""
-    return reason not in NON_RETRYABLE
 
 
 #: §11.3's tested property, as a table rather than a sentence: every stored
@@ -183,6 +192,12 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (
         Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     BlockReason.CREDENTIAL_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+    # The refusal is deterministic against an unchanged configuration, not
+    # against every configuration: the operator's repair is to supply what the
+    # launcher said was missing, and plain retry is then a genuinely different
+    # launch. That is why this is not in NON_RETRYABLE beside the three
+    # content-level reasons, which no operator action outside the plan repairs.
+    BlockReason.LAUNCH_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     # A process group whose absence cannot be proven must be repaired before
     # retry; a retry would overlap an owned survivor with a new attempt.
     BlockReason.QUIESCENCE_UNPROVEN: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
@@ -250,7 +265,8 @@ class NodeKind(str, Enum):
     Verdict-only reviewer" and "artifact-producing task", and PR #74's attempt
     to split them found 33 workflows depending on the hybrid and was closed
     rather than merged. A review node therefore has its own kind, its own
-    predicate (`verification.verify_review_node`), and its own evidence chain,
+    predicate (§7.3's five clauses, enforced along the review path itself and
+    sequenced by `code_review.review_attempt`), and its own evidence chain,
     and shares none of an agent node's clauses.
 
     But it is **derived by the scheduler, one per build-node attempt**, not
@@ -292,8 +308,40 @@ class PlanNode:
     specs: Tuple[str, ...] = ()
     gate_command: Tuple[str, ...] = ()
     gate_selector: Optional[str] = None
+    #: §10.2's counting threshold for THIS node's gate, carried from the plan.
+    #:
+    #: It lives on the node because it is a per-gate fact. It used to live
+    #: nowhere: `Plan.to_plan_nodes` copied the gate's runner, argv and
+    #: selector and dropped its `min_cases`, so the three adjudication sites
+    #: read one unset per-run scalar that was always its default of 1. A plan
+    #: declaring 70 told its agent 70 and verified it at 1, and
+    #: run-4ee9e079 reached ACCEPTED that way.
+    #:
+    #: The default of 1 is §10.2's floor rather than a fallback: it is what a
+    #: gate means when it demands nothing more than one passing case, and
+    #: `verification.adjudicate_counts` refuses anything below it.
+    gate_min_cases: int = 1
     command: Tuple[str, ...] = ()
     expects_changes: bool = False
+    #: §3.6 B9's first field of the reviewer's declared contract: what this
+    #: node was asked to do, carried verbatim from the plan.
+    #:
+    #: It lives on the node because the reviewer is handed a node, not a plan.
+    #: It used to live nowhere: `Plan.to_plan_nodes` copied the id, needs,
+    #: outputs and gate and dropped `instruction`, so `build_handoff` read it
+    #: through a `getattr(node, "instruction", "")` that could only ever
+    #: answer `""`. Every agent node in every run therefore reached its
+    #: reviewer with a goal derived from its own gate — "make this command
+    #: pass" — and a reviewer that cannot see the contract judges the diff it
+    #: was given against the only standard it has, which is not the standard
+    #: the plan set.
+    #:
+    #: The empty default belongs to a code node and to no other kind: a code
+    #: node's goal is its command (§6.2), and `AgentNode.instruction` is
+    #: `min_length=1`, so a blank one on an agent node is never a plan the
+    #: author wrote — it is a projection that dropped the field. Both halves
+    #: are refused below rather than defaulted around.
+    instruction: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.node_id).strip():
@@ -328,7 +376,23 @@ class PlanNode:
                 raise ValueError(
                     f"{self.node_id}: expects_changes is a code-node clause (§7.3); "
                     "on an agent node it is a field nothing reads")
+            if self.gate_min_cases < 1:
+                raise ValueError(
+                    f"{self.node_id}: §10.2 counts `passed >= min_cases >= 1`; a "
+                    "gate demanding zero passing cases is green on an empty run")
+            if not self.instruction.strip():
+                raise ValueError(
+                    f"{self.node_id}: an agent node carries the instruction the "
+                    "plan declared for it (§3.6 B9). `AgentNode.instruction` is "
+                    "min_length=1, so a blank one here is not a plan that omitted "
+                    "a goal -- it is a projection that dropped one, and the "
+                    "reviewer would be handed a goal derived from the very gate "
+                    "it is meant to judge independently")
         else:
+            if self.instruction:
+                raise ValueError(
+                    f"{self.node_id}: a code node's goal is its command (§6.2); an "
+                    "instruction here is a field nothing reads (§12.3)")
             if not self.command:
                 raise ValueError(
                     f"{self.node_id}: a code node's acceptance is its command's exit "
@@ -337,6 +401,10 @@ class PlanNode:
                 raise ValueError(
                     f"{self.node_id}: a code node has no gate and no min_cases "
                     "(§7.3); a gate here is state nothing evaluates")
+            if self.gate_min_cases != 1:
+                raise ValueError(
+                    f"{self.node_id}: a code node has no gate to count cases "
+                    "for (§7.3); a threshold here is a number nothing reads")
 
     def to_record(self, state: NodeState) -> "wt.NodeRecord":
         """Project onto the merge protocol's record (§7.1, §8.5).
@@ -500,3 +568,23 @@ class AttemptRecord:
     @property
     def key(self) -> Tuple[str, str, int]:
         return (self.run_id, self.node_id, self.attempt_no)
+
+    @property
+    def guidance_key(self) -> Tuple[str, str]:
+        """The scope retry guidance is valid within: `(node_id, base_sha)`.
+
+        §7.5 already scopes the prompt-mutation budget this way, and for the
+        same reason the guidance itself must be: a review finding or a
+        verification failure is evidence *about a tree*. When an upstream merge
+        advances the integration head, the next attempt starts from a base at
+        which that tree no longer exists, and handing the agent findings
+        derived from it is instructing it to fix code that is not there. Keyed
+        on `node_id` alone the ledger had no expiry at all — nothing cleared
+        it when the base moved, because nothing knew the base had moved.
+
+        A tuple rather than a cleared counter, for the reason §7.5 gives about
+        the budget itself: the scope is derived from a stored fact the attempt
+        row already carries, so there is no reset event to fire and nothing
+        that can drift.
+        """
+        return (self.node_id, self.base_sha)

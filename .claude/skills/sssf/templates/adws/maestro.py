@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
 import os
@@ -41,6 +42,7 @@ from adw_modules import plan_model
 from adw_modules import plan_validate as pv
 from adw_modules import publication
 from adw_modules import receipt_crypto
+from adw_modules import retry_policy
 from adw_modules import route_admission
 from adw_modules import route_receipts
 from adw_modules import scheduler
@@ -180,6 +182,36 @@ def _config_positive_integer(value, label):
     if (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
         raise _MaestroConfigurationError(label + " must be a positive integer")
     return value
+
+
+def _config_nonnegative_integer(value, label):
+    """A count that is allowed to be zero.
+
+    Separate from `_config_positive_integer` because zero is the *point* of
+    one of these: §7.5 gives `LauncherFailure.CREDENTIAL` a budget of zero, and
+    a validator that refuses zero would make the one row of the retry table
+    whose whole purpose is not to retry unexpressible in configuration.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _MaestroConfigurationError(
+            label + " must be a non-negative integer")
+    return value
+
+
+def _config_argv(value, label) -> Tuple[str, ...]:
+    """A command as a real argv list, never a shell string.
+
+    The same rule the plan's gates already live under (`docs/plan-authoring.md`,
+    "Pass the real argv, never a script alias"): a string would have to be
+    split by something, and whatever split it would be a shell this process
+    does not run.
+    """
+    if not isinstance(value, list) or not value:
+        raise _MaestroConfigurationError(
+            label + " must be a non-empty list of argv strings")
+    return tuple(
+        _config_string(item, label + "[{}]".format(index))
+        for index, item in enumerate(value))
 
 
 def _path_is_within(path: Path, boundary: Path) -> bool:
@@ -371,6 +403,20 @@ def _resolve_key_environment(
     return value
 
 
+#: Every `SchedulerConfig` field that declares a default, and that default.
+#:
+#: Read off the dataclass rather than restated, so there is exactly one of each
+#: number. `_run_configuration` uses it for the settings an operator may leave
+#: unspecified, and looking up a field that has no default raises `KeyError`
+#: rather than inventing one — a required field with no argument is the
+#: `missing run configuration` refusal's job, not a fallback's.
+_SCHEDULER_CONFIG_DEFAULTS: Dict[str, Any] = {
+    field.name: field.default
+    for field in dataclasses.fields(scheduler_types.SchedulerConfig)
+    if field.default is not dataclasses.MISSING
+}
+
+
 def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     """Repository layout, binaries, and route destinations. No key material."""
     try:
@@ -453,7 +499,9 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         root["execution"], "execution",
         ("route", "model", "effort", "concurrency", "node_timeout_s",
          "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
-         "semantic_ceiling"), ("profile", "vendor", "review_ceiling"))
+         "semantic_ceiling"),
+        ("profile", "vendor", "review_ceiling", "provision",
+         "environmental_retries", "launcher_retries", "credential_retries"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -501,6 +549,45 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             _config_positive_integer(execution_raw["review_ceiling"],
                                      "execution.review_ceiling")
             if "review_ceiling" in execution_raw else 3),
+        # §8.3/§9.3's provision step: the ecosystem's setup, run in every
+        # attempt's fresh worktree after `git worktree add` and before the
+        # pre-node gate and the baseline inventory. `npm ci` for a JavaScript
+        # repository; absent for a pytest one, which is §9.3's stated no-op
+        # default. Deployment-specific for the same reason `execution.model`
+        # is — it names the ecosystem this installation builds — so it lives
+        # here rather than being inferred from a runner.
+        #
+        # Without it §7.4's falsifiable gate claims nothing in any repository
+        # with an install step: a pre-node gate red because `node_modules` is
+        # absent is not red for the intended reason, and its post-node partner
+        # can never go green, so every agent node blocks on a fact about the
+        # tree rather than about the work.
+        "provision": (_config_argv(execution_raw["provision"],
+                                   "execution.provision")
+                      if "provision" in execution_raw else ()),
+        # §7.5's two non-semantic budgets and CREDENTIAL's zero. The defaults
+        # are read off `SchedulerConfig` rather than restated here: a literal
+        # in this file would be a second representation of a number the
+        # dataclass already declares, which is RC1's shape and the reason
+        # these three keys were unreachable in the first place.
+        "environmental_retries": (
+            _config_nonnegative_integer(
+                execution_raw["environmental_retries"],
+                "execution.environmental_retries")
+            if "environmental_retries" in execution_raw
+            else _SCHEDULER_CONFIG_DEFAULTS["environmental_retries"]),
+        "launcher_retries": (
+            _config_nonnegative_integer(
+                execution_raw["launcher_retries"],
+                "execution.launcher_retries")
+            if "launcher_retries" in execution_raw
+            else _SCHEDULER_CONFIG_DEFAULTS["launcher_retries"]),
+        "credential_retries": (
+            _config_nonnegative_integer(
+                execution_raw["credential_retries"],
+                "execution.credential_retries")
+            if "credential_retries" in execution_raw
+            else _SCHEDULER_CONFIG_DEFAULTS["credential_retries"]),
     }
     # `author` is optional so an installation that never runs `maestro deliver`
     # keeps working unchanged; `deliver` refuses when it is absent rather than
@@ -797,6 +884,16 @@ def _apply_repository_config(
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
         args.review_ceiling = execution["review_ceiling"]
+        # §7.5's non-semantic budgets. Present in `SchedulerConfig` and in
+        # `maestro.config.yaml` for as long as both existed, and connected by
+        # nothing: a deployment that set them changed no run, because the
+        # projection onto `SchedulerConfig` never named them and every budget
+        # stayed at its dataclass default.
+        args.environmental_retries = execution["environmental_retries"]
+        args.launcher_retries = execution["launcher_retries"]
+        args.credential_retries = execution["credential_retries"]
+        # §8.3's provision argv, consumed by `_run_provisioner`.
+        args.provision_argv = list(execution["provision"])
         args.agent_route = execution["route"]
         args.agent_model = execution["model"]
         args.agent_effort = execution["effort"]
@@ -1136,10 +1233,15 @@ def _reviewer_window_factory(args: argparse.Namespace):
     report_path = Path(args.reviewer_report_file)
     prompt_path = report_path.with_suffix(".prompt.json")
     session_dir = Path(args.reviewer_session_dir)
+    # §8.3 again: this reviewer's pane needs the redirection exactly as the
+    # node reviewer's does. Its scratch is a sibling of the session directory
+    # the operator named, so it lands wherever that reviewer's own state does
+    # and never in the repository being reviewed.
+    scratch_dir = session_dir.with_name(session_dir.name + ".scratch")
 
     def factory(matrix: finalization.ApplicabilityMatrix):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_path.write_text(json.dumps({
+        prompt_text = json.dumps({
             "matrix": [
                 {"check_id": cell.check_id, "object_id": cell.object_id,
                  "canary": cell.canary.value if cell.canary else None}
@@ -1147,17 +1249,25 @@ def _reviewer_window_factory(args: argparse.Namespace):
             ],
             "plan_digest": matrix.plan_digest,
             "report_path": str(report_path.resolve()),
-        }, sort_keys=True), encoding="utf-8")
+        }, sort_keys=True)
+        # B13 for the finalization reviewer. The matrix grows with the plan, so
+        # this prompt is runtime-sized too.
+        _preflight_prompt(prompt_text, args.reviewer_route, args.reviewer_model)
+        prompt_path.write_text(prompt_text, encoding="utf-8")
+        _clear_stale_reviewer_report(report_path)
         handle = None
 
         def launch_reviewer():
             nonlocal handle
-            handle = runner.launch(launcher.LaunchSpec(
+            handle = _typed_launch_pane(runner, launcher.LaunchSpec(
                 correlation_token="finalize-" + matrix.plan_digest,
                 worktree=Path(args.repo), prompt_path=prompt_path,
                 envelope_path=report_path, route=args.reviewer_route,
                 model=args.reviewer_model, effort=args.reviewer_effort,
-                profile=args.reviewer_profile, session_dir=session_dir))
+                profile=args.reviewer_profile, session_dir=session_dir,
+                context_window_tokens=_route_context_window(
+                    args.reviewer_route, args.reviewer_model),
+                environment=worktree.launch_env(scratch_dir)))
             return finalization_window.ReviewerSession(
                 route=args.reviewer_route, model=args.reviewer_model,
                 session_id=handle.pane_id, session_dir=str(session_dir),
@@ -1165,9 +1275,7 @@ def _reviewer_window_factory(args: argparse.Namespace):
                 pid=handle.process_group)
 
         def poll_report():
-            if not report_path.is_file():
-                return None
-            return json.loads(report_path.read_text(encoding="utf-8"))
+            return _poll_reviewer_report(report_path)
 
         def kill_reviewer(_session):
             if handle is not None:
@@ -1222,6 +1330,15 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         report_path = subject_root / "report.json"
         prompt_path = subject_root / "prompt.md"
         session_dir = subject_root / "session"
+        # §8.3 applies to the reviewer's pane exactly as it does to a node's.
+        # The reviewer runs at the repository, not inside an attempt worktree,
+        # so it owns a scratch beside its own session directory under the run's
+        # review root -- a location Maestro owns -- rather than borrowing some
+        # attempt's. Omitting it entirely left `LaunchSpec.environment` at its
+        # empty default, and `pane_env_flags` then refused the launch with
+        # SCRATCH_REDIRECT_MISSING for all seven variables, discarding a
+        # verified attempt's work at the review stage.
+        scratch_dir = subject_root / "scratch"
 
         diff, changed = code_review.read_diff(
             Path(args.repo), base_sha, output_sha)
@@ -1237,24 +1354,30 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         # B13 — measured against the reviewer's real window before a pane is
         # allocated, so an oversized handoff is a refusal rather than a
         # confident verdict about something else.
-        provider, _, model_name = str(args.reviewer_model).partition("/")
-        window = agent_pi.context_window(provider, model_name)
         text = handoff.render()
-        code_review.preflight_handoff(text, window)
+        _preflight_prompt(text, args.reviewer_route, args.reviewer_model)
 
         handle_box: Dict[str, Any] = {"handle": None}
 
         def window_factory(_matrix):
             subject_root.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(text, encoding="utf-8")
+            _clear_stale_reviewer_report(report_path)
 
             def launch_reviewer():
-                handle = runner.launch(launcher.LaunchSpec(
+                # The site that actually refused in
+                # run-f31686ea41b44c33b117f64e3b319317: its agent node had
+                # launched and done 61 turns before this reviewer's launch was
+                # refused, and the refusal spent an ENVIRONMENTAL retry.
+                handle = _typed_launch_pane(runner, launcher.LaunchSpec(
                     correlation_token="review-" + digest[:16],
                     worktree=Path(args.repo), prompt_path=prompt_path,
                     envelope_path=report_path, route=args.reviewer_route,
                     model=args.reviewer_model, effort=args.reviewer_effort,
-                    profile=args.reviewer_profile, session_dir=session_dir))
+                    profile=args.reviewer_profile, session_dir=session_dir,
+                    context_window_tokens=_route_context_window(
+                        args.reviewer_route, args.reviewer_model),
+                    environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
                     route=args.reviewer_route, model=args.reviewer_model,
@@ -1263,15 +1386,7 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     pid=handle.process_group)
 
             def poll_report():
-                if not report_path.is_file():
-                    return None
-                try:
-                    return json.loads(report_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, UnicodeError):
-                    # A half-written report is not a report. Returning None
-                    # keeps the window open for the next poll rather than
-                    # crashing the whole review on a partial flush.
-                    return None
+                return _poll_reviewer_report(report_path)
 
             def read_status(_session):
                 handle = handle_box["handle"]
@@ -1378,14 +1493,24 @@ def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
     failed `worktree add`, so the refusal can name the checkout standing in
     the way instead of echoing git's exit status.
     """
+    # §7.5: a git failure is a fact about the machine, never about the
+    # repository. `return None` here reads to every caller as "no worktree
+    # holds this branch" — a repository fact — so a git that failed for any
+    # reason silently authorised the run to take a branch that may well be
+    # checked out, and the operator got a raw `worktree add` error instead of
+    # the refusal this function exists to phrase. `_execute_run` turns the
+    # raised error into a typed refusal.
     try:
         listed = subprocess.run(
             ("git", "-C", str(repo), "worktree", "list", "--porcelain"),
             capture_output=True, text=True, check=False)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise RuntimeError(
+            "GIT_READ_FAILED:worktree list in {}".format(repo)) from exc
     if listed.returncode != 0:
-        return None
+        raise RuntimeError(
+            "GIT_READ_FAILED:worktree list in {} exited {}".format(
+                repo, listed.returncode))
     wanted = "refs/heads/" + branch
     path: Optional[Path] = None
     for line in (listed.stdout or "").splitlines():
@@ -1586,6 +1711,17 @@ def _plan_finalize(args: argparse.Namespace) -> int:
     except (_PlanReceiptVerificationError, finalization.SignatureMissing,
             finalization.SignatureInvalid, finalization.ReceiptInvalid) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
+    except finalization.ReportRejected as exc:
+        # S6.5's terminal outcome for the bytes: no receipt exists, and the
+        # rejection reason is the operator's whole diagnosis. It is a verb
+        # outcome, not a crash -- `plan ship` reads the JSON `outcome`, so a
+        # traceback here is invisible to every caller that reads it.
+        return _refusal("REPORT_REJECTED", str(exc))
+    except finalization.FinalizationStalled as exc:
+        # A stall is a fact about the machine or the route, never a verdict
+        # about the plan, and it writes no receipt -- so rerunning
+        # `plan finalize` is legal and reviews afresh.
+        return _refusal("FINALIZATION_STALLED", str(exc))
     except (finalization.ReceiptStoreLocationError,
             receipt_crypto.KeyMaterialError,
             route_receipts.ReceiptInvalid, ValueError, OSError) as exc:
@@ -1714,12 +1850,43 @@ def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerCon
     if missing:
         raise _PlanReceiptConfigurationError(
             "missing run configuration: {}".format(", ".join(missing)))
+    # Every field of `SchedulerConfig` is named here, and
+    # `test_every_scheduler_config_field_is_projected` fails if one is not.
+    # This is the projection §7.4 describes: the one that copied a gate's
+    # runner, argv and selector and dropped its threshold, because a
+    # field-by-field copy has no way to notice the field it did not copy.
     return scheduler_types.SchedulerConfig(
         concurrency=args.concurrency, node_timeout_s=args.node_timeout_s,
         turn_timeout_s=args.turn_timeout_s,
         final_acceptance_timeout_s=args.final_acceptance_timeout_s,
         backstop_t_s=args.backstop_t_s, semantic_ceiling=args.semantic_ceiling,
-        review_ceiling=getattr(args, "review_ceiling", None) or 3)
+        review_ceiling=_scheduler_setting(args, "review_ceiling"),
+        environmental_retries=_scheduler_setting(
+            args, "environmental_retries"),
+        launcher_retries=_scheduler_setting(args, "launcher_retries"),
+        credential_retries=_scheduler_setting(args, "credential_retries"))
+
+
+def _scheduler_setting(args: argparse.Namespace, name: str) -> Any:
+    """One optional `SchedulerConfig` setting, from the run's arguments.
+
+    Not `getattr(args, name, 2)`. A literal here would be a second
+    representation of a number `SchedulerConfig` already declares, and the two
+    would drift the first time either changed — the shape RC1 names. The
+    fallback is the dataclass's own default, so there is exactly one of it, and
+    a field with no default raises `KeyError` rather than acquiring an invented
+    one.
+
+    A configured run never reaches the fallback: `_apply_repository_config`
+    writes all four of these from `maestro.config.yaml`, which resolves its own
+    absent keys against the same table. The fallback exists for the manual
+    `maestro run start --concurrency ...` invocation, where every one of these
+    is an unsupplied `argparse` option.
+    """
+    value = getattr(args, name, None)
+    if value is None:
+        return _SCHEDULER_CONFIG_DEFAULTS[name]
+    return value
 
 
 def _paths_share_inode(left: Path, right: Path) -> bool:
@@ -1812,7 +1979,343 @@ def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
         {route: Path(path) for route, path in paths.items()}, verify_keys=keys)
     return launcher.HerdrLauncher(
         herdr_path=Path(args.herdr), omp_path=Path(args.omp),
-        claude_path=Path(args.claude), admitted_routes=admitted)
+        claude_path=Path(args.claude), admitted_routes=admitted,
+        # §9.3's sixth operation. The adapter has implemented it since it was
+        # written; nothing had ever handed it the argv to run, so it returned
+        # immediately for every attempt of every run.
+        provision_argv=tuple(getattr(args, "provision_argv", None) or ()))
+
+
+class _ConfiguredProvisioner:
+    """§9.3's `provision(worktree)` for a run that launches no agent.
+
+    Provision is a runner-adapter operation, and a plan of code nodes alone has
+    no runner adapter: the scheduler starts those commands itself (§8.3). The
+    tree they run in still needs provisioning — §8.3's baseline is the
+    provisioned tree for a code node exactly as it is for an agent node, and a
+    code node's command in an unprovisioned JavaScript checkout fails on the
+    absent install, not on the work.
+
+    `HerdrLauncher.provision` is reused rather than restated. A second copy of
+    "run the configured argv in the worktree, refuse on a nonzero exit" is one
+    behaviour with two representations, and the two would answer differently
+    the first time either changed.
+    """
+
+    provision = launcher.HerdrLauncher.provision
+
+    def __init__(self, provision_argv: Sequence[str]) -> None:
+        self.provision_argv = tuple(provision_argv)
+
+
+def _run_provisioner(args: argparse.Namespace, route_runner):
+    """§8.3's provision step, for whichever kind of run this is.
+
+    Returns `None` only when nothing is configured to run, which is §9.3's
+    stated default of a no-op and is what a pytest repository wants.
+    """
+    if route_runner is not None:
+        return route_runner.provision
+    argv = tuple(getattr(args, "provision_argv", None) or ())
+    if not argv:
+        return None
+    return _ConfiguredProvisioner(argv).provision
+
+
+# ── §7.5's launcher triggers, from the adapter's own typed error class ───────
+#
+# The chain reads no text at any step: `launcher.classify_error` dispatches on
+# an exception's *type*, `ErrorClass` is a closed enum, and so is
+# `LauncherFailure`. §7.5 names exception type among the facts a classifier may
+# read and forbids it reading process output, so a refusal whose code is
+# embedded in a message string — `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...`
+# — is classified by what it *is* rather than by matching its prefix. Matching
+# the prefix would be the lexical shortcut §7.5 forbids, and the launcher has
+# already settled the same question for itself (`HerdrCallError`: branch on
+# `.code`, never on the message).
+#
+# Coarse on purpose. §7.5 closes the retry classes at three, so a
+# *deterministic* refusal — a missing scratch redirect, a missing session path
+# — still spends the launcher budget and blocks LAUNCHER_BUDGET_EXHAUSTED
+# rather than blocking at once. That is a stated cost, not an oversight:
+# separating it needs a fourth non-retryable reason and typed refusal codes at
+# the launcher boundary, which is a design change rather than this repair.
+_LAUNCHER_FAILURE_BY_ERROR_CLASS = {
+    launcher.ErrorClass.AUTHENTICATION: retry_policy.LauncherFailure.CREDENTIAL,
+    launcher.ErrorClass.TRANSIENT: retry_policy.LauncherFailure.TRANSPORT,
+    launcher.ErrorClass.CONFIGURATION: retry_policy.LauncherFailure.STARTUP,
+    launcher.ErrorClass.PROTOCOL: retry_policy.LauncherFailure.STARTUP,
+    launcher.ErrorClass.EXECUTION: retry_policy.LauncherFailure.STARTUP,
+}
+
+#: Exceptions that mean something other than "the launch failed" and must
+#: reach their own handlers untouched: cancellation, the quiescence proof, and
+#: a failure already carrying its type.
+_LAUNCH_PASSTHROUGH = (
+    launcher.HarnessCancelled, launcher.HarnessQuiescenceError,
+    scheduler.AttemptCancelled, scheduler.AttemptOwnershipLost,
+    scheduler.QuiescenceFailure, scheduler.LaunchFailed,
+)
+
+
+def _launcher_failure_for(adapter: Any,
+                          exc: BaseException) -> retry_policy.LauncherFailure:
+    """The typed launcher class for one failed launch or poll.
+
+    STARTUP is the fall-through rather than a raise: an `ErrorClass` this
+    mapping has not met is still a launch that failed, and refusing to name it
+    would drop the attempt back to the ENVIRONMENTAL default — the exact
+    misclassification this function exists to end.
+    """
+    return _LAUNCHER_FAILURE_BY_ERROR_CLASS.get(
+        adapter.classify(exc), retry_policy.LauncherFailure.STARTUP)
+
+
+def _typed_launch(adapter: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run one launcher call, converting its failure into a typed one.
+
+    `LauncherAdapter.classify` has been part of the adapter contract since the
+    seam was written and had no production caller: the runtime asked the
+    launcher to launch and never asked it what kind of failure it had just
+    had. This is the call site that was missing, and without it every launcher
+    fault arrived at the scheduler as a bare exception carrying its code in
+    prose (§16.3 item 42).
+    """
+    try:
+        return operation(*args, **kwargs)
+    except _LAUNCH_PASSTHROUGH:
+        raise
+    except Exception as exc:
+        raise scheduler.LaunchFailed(
+            _launcher_failure_for(adapter, exc),
+            "{0}: {1}".format(type(exc).__name__, exc)) from exc
+
+
+def _typed_launch_pane(runner: Any, spec: "launcher.LaunchSpec") -> Any:
+    """Open one agent pane, converting a refusal into a typed failure.
+
+    Named for the operation rather than for any one caller: its three callers
+    are the finalization window's reviewer, the node reviewer, and the plan
+    author, and only the first two are reviewers.
+
+    **The cause is already fixed; this closes the classification gap.** Every
+    `LaunchSpec` in this module now carries a redirected environment, so
+    `SCRATCH_REDIRECT_MISSING` cannot fire at these sites again. What was
+    still open is what happens to the *next* refusal here, whatever it turns
+    out to be: as a bare exception it reached the scheduler with nothing
+    structural in it and silently spent the ENVIRONMENTAL budget. Through
+    this it spends the launcher budget and names itself (§7.5). That makes
+    this a different defect at the same seam, not a second guard over a fixed
+    one.
+
+    Uniformity is the other reason it exists. With every `.launch(` in this
+    module behind one path, the structural guard in
+    `tests/test_launcher_classification.py` needs no allowlist — and an
+    allowlist with one entry on day one is how such a guard starts rotting.
+
+    Deliberately *not* the place the target's context window is attached. Every
+    caller here has already resolved that window to size-check its own prompt,
+    so filling it in centrally would only hide an omission: a dispatch site that
+    never measured anything would be handed a window it did not ask for and
+    would launch. Left off the spec, it reaches `preflight_launch_prompt` as
+    "nobody measured this" and is refused (§3.6 B13). Omission fails closed.
+    """
+    return _typed_launch(runner, runner.launch, spec)
+
+
+def _require_session_path(handle: Any, node_id: str, attempt_no: int) -> None:
+    """Refuse a launch that produced no session file, with its class attached.
+
+    A handle without a transcript path produced no agent to watch: §7.6's
+    turn-count signal has nothing to read, so the attempt cannot be supervised
+    even if something is alive behind it. Module level so the refusal is
+    reachable from a test — as a bare `RuntimeError` inside the run-node
+    closure it was both unclassifiable and untestable, and it is the failure
+    that took every attempt of run-f31686ea41b44c33b117f64e3b319317.
+
+    STARTUP rather than the ENVIRONMENTAL default: this is the launcher's
+    output being incomplete, not the machine misbehaving, so it spends the
+    launcher budget (§7.5).
+    """
+    if handle.transcript_path is not None:
+        return
+    raise scheduler.LaunchFailed(
+        retry_policy.LauncherFailure.STARTUP,
+        "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no))
+
+
+def _preflight_prompt(text: str, route: str, model_spec: str) -> Optional[int]:
+    """Size-check one assembled prompt against its target's window (B13).
+
+    Returns the token estimate when the route publishes a window and the prompt
+    fits, and ``None`` when the route publishes no window at all. Raises
+    `code_review.HandoffTooLarge` when the prompt does not fit, and when a route
+    that has a catalog does not carry this model — an unmeasured window on a
+    measurable route is not a passing one.
+
+    The model is resolved through the route's own catalog rather than split on a
+    slash. `x-ai/grok-4.6` is a *pattern*, and reading its two halves as a
+    provider and an id looks it up under a provider the catalog does not have:
+    the window comes back 0, and a check that fails closed on 0 refuses every
+    launch of a correctly configured lane. Resolution is the catalog's job and
+    it already does it.
+
+    This lives at the CLI rather than beside `preflight_handoff` because
+    reading a catalog means importing `agent_pi`, and `enforcement.py`'s
+    `base-execution-import` check convicts any `adw_modules` policy module that
+    does. The rule and the arithmetic stay in `code_review`; the window is
+    fetched here and passed in.
+
+    Nothing here reads the prompt's content. A length in bytes against a
+    ceiling in tokens is arithmetic on two integers, which is what §1.2 permits.
+    """
+    window = _route_context_window(route, model_spec)
+    if window is None:
+        return None
+    return code_review.preflight_handoff(text, window)
+
+
+def _route_context_window(route: str, model_spec: str) -> Optional[int]:
+    """The window B13 measures against, or `None` if the route publishes none.
+
+    Split out of `_preflight_prompt` because the number has a second reader:
+    `launcher.preflight_launch_prompt` runs the same check at the dispatch
+    chokepoint and cannot read a catalog itself, so the window travels to it on
+    the `LaunchSpec`. One resolution, two enforcement points — rather than the
+    launcher re-deriving a window and the two disagreeing about which model a
+    pattern names.
+
+    Raises `HandoffTooLarge` when a route that *has* a catalog does not carry
+    this model: an unmeasured window on a measurable route is not a passing one.
+    """
+    if not code_review.route_publishes_a_window(route):
+        return None
+    try:
+        provider, model_id = agent_pi.resolve_model(str(model_spec))
+    except ValueError as exc:
+        raise code_review.HandoffTooLarge(
+            "model {0!r} does not resolve in the {1} catalog, so the prompt "
+            "cannot be shown to fit any window: {2} (B13)".format(
+                model_spec, route, exc)) from exc
+    return agent_pi.context_window(provider, model_id)
+
+
+def _clear_stale_reviewer_report(report_path: Path) -> None:
+    """Remove a report left by an earlier reviewer before launching a new one.
+
+    The window completes on the presence of a report, so a report already on
+    disk ends the new reviewer's window on its first poll -- with the bytes
+    some previous reviewer wrote. The receipt would then bind the new
+    session's route, model, and session id to a report that session did not
+    produce, which is exactly the identity the receipt exists to establish.
+
+    `_deliver_lane` already clears its envelope for the same reason ("a stale
+    envelope from a previous attempt would end this one before it began").
+    Replay is unaffected: `finalization.finalize` short-circuits on a stored
+    receipt for the digest before any window is built, so anything reaching
+    here has no receipt and is genuinely being reviewed afresh.
+    """
+    try:
+        report_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _poll_reviewer_report(report_path: Path) -> Optional[Any]:
+    """One poll of a reviewer's report file: the payload, or None while the
+    reviewer is still writing it.
+
+    Module level and shared by both reviewer windows because the failure it
+    prevents is a race, and a race reproduced in a test needs the production
+    reader, not a paraphrase of it. Two ways a poll can land mid-write:
+
+    * the bytes do not parse yet -- a partial flush;
+    * the bytes parse and the report is not finished -- fewer cells present
+      than the `pair_count` the reviewer itself declared.
+
+    The second one is what condemned `cmo-consolidation-l` on 2026-08-18: the
+    window accepted a draft carrying a handful of cells, `verify_report`
+    rejected it for a `CELL_SET` the reviewer was still filling in, and the
+    complete 136-cell report landed on disk moments later. A rejection is
+    terminal for the plan's bytes, so a read race became a verdict.
+
+    Neither test reads prose. `report_is_complete` compares a declared count
+    against a length (S1.2).
+    """
+    if not report_path.is_file():
+        return None
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not finalization.report_is_complete(payload):
+        return None
+    return payload
+
+
+def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
+                          record: Any, cancel_requested: Any,
+                          quiesce_attempt: Any,
+                          sleep: Any = time.sleep) -> "scheduler.NodeExecution":
+    """Poll one launched agent until it settles, and never spin on GONE.
+
+    Module level rather than a closure inside `_execute_run` because the real
+    adapter path was otherwise untestable: every existing test that reaches a
+    scheduler supplies its own `run_node`, the golden scenario included, which
+    is how §16.3 item 42's defect survived a green suite.
+
+    **The GONE branch is the repair.** `PollState.GONE` had no branch at all,
+    so a vanished agent fell through to the sleep below and the loop re-polled
+    at 20Hz forever. The worker thread never returned, its executor slot was
+    never released, and the watchdog's conviction could not stop it — the
+    worker checks nothing until the runner returns, and `cancel_requested` is
+    the run-level flag rather than this attempt's. With concurrency equal to
+    the pane limit, enough vanished agents wedge the run outright, and it ends
+    at §11.2's liveness backstop rather than at any node timeout. Returning
+    here ends the attempt carrying a typed launcher class, which is what makes
+    it a LAUNCHER_TRANSIENT retry rather than an ENVIRONMENTAL one (§7.5).
+    """
+    while True:
+        state = _typed_launch(adapter, adapter.poll, handle)
+        if state.state is launcher.PollState.EXITED:
+            parsed = False
+            payload = None
+            try:
+                declared = json.loads(envelope_path.read_text(encoding="utf-8"))
+                parsed = True
+                # §7.7's result payload. This object was already being parsed
+                # here and thrown away, which is the whole of why the
+                # `results` table had a live reader in `run status` and no
+                # writer anywhere: not a missing mechanism, a dropped value.
+                # Only a mapping is carried — `ResultRecord` stores a payload,
+                # and a bare list or scalar is a parseable envelope that
+                # declares nothing this row can hold.
+                if isinstance(declared, dict):
+                    payload = declared
+            except (OSError, ValueError, UnicodeError):
+                pass
+            return scheduler.NodeExecution(
+                envelope_parsed=parsed, exit_code=state.exit_code or 1,
+                launched_pid=handle.process_group,
+                launch_detail=state.detail,
+                envelope_payload=payload)
+        if state.state is launcher.PollState.GONE:
+            # TRANSPORT rather than STARTUP: the agent launched and then its
+            # record vanished, so what was lost is the channel to it, not its
+            # start. The budget is identical for all three non-CREDENTIAL
+            # members, so the choice between them is diagnostic only — the
+            # ledger reads this, never a branch.
+            return scheduler.NodeExecution(
+                envelope_parsed=False, exit_code=1,
+                launched_pid=handle.process_group,
+                launcher_failure=retry_policy.LauncherFailure.TRANSPORT,
+                launch_detail=state.detail)
+        if cancel_requested():
+            quiesce_attempt(record, "cancel")
+            return scheduler.NodeExecution(
+                envelope_parsed=False, exit_code=1,
+                launched_pid=handle.process_group)
+        sleep(0.05)
 
 
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
@@ -1888,11 +2391,20 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             assert route_runner is not None
             prompt = attempt.scratch / "agent-prompt.txt"
             envelope = attempt.scratch / "agent-envelope.json"
-            prompt.write_text(
-                _agent_node_prompt(plan.node_by_id()[node.node_id], envelope,
-                                   retry_prompt),
-                encoding="utf-8")
-            handle = route_runner.launch(launcher.LaunchSpec(
+            prompt_text = _agent_node_prompt(
+                plan.node_by_id()[node.node_id], envelope, retry_prompt)
+            # B13 for the builder. A retry prompt carries guidance derived from
+            # the previous attempt's measured failure, so its size is a runtime
+            # quantity and not an authored one; dispatching one that cannot fit
+            # produces an attempt about a different task rather than an error.
+            _preflight_prompt(prompt_text, args.agent_route, args.agent_model)
+            prompt.write_text(prompt_text, encoding="utf-8")
+            # Through `_typed_launch_pane` like every other dispatch, so the
+            # builder's spec is given its route's window on the same path the
+            # reviewers' are. Called directly against `runner.launch` before,
+            # which meant one of the four dispatch sites would have reached the
+            # launcher's B13 check with nothing measured on its spec.
+            handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
                     args.run_id, node.node_id, record.attempt_no),
                 worktree=attempt.path, prompt_path=prompt,
@@ -1900,36 +2412,21 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 model=args.agent_model, effort=args.agent_effort,
                 profile=args.agent_profile,
                 session_dir=attempt.scratch / "session",
+                context_window_tokens=_route_context_window(
+                    args.agent_route, args.agent_model),
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
                 proven_absent.discard(key)
-            if handle.transcript_path is None:
-                raise RuntimeError("SESSION_PATH_MISSING:{}#{}".format(
-                    node.node_id, record.attempt_no))
+            _require_session_path(handle, node.node_id, record.attempt_no)
             store.mark_launched(
                 args.run_id, node.node_id, record.attempt_no,
                 handle.process_group,
                 extra={watchdog.SESSION_PATH_KEY: str(handle.transcript_path)})
             on_launch(handle.process_group)
-            while True:
-                state = route_runner.poll(handle)
-                if state.state is launcher.PollState.EXITED:
-                    parsed = False
-                    try:
-                        json.loads(envelope.read_text(encoding="utf-8"))
-                        parsed = True
-                    except (OSError, ValueError, UnicodeError):
-                        pass
-                    return scheduler.NodeExecution(
-                        envelope_parsed=parsed, exit_code=state.exit_code or 1,
-                        launched_pid=handle.process_group)
-                if cancel_requested():
-                    quiesce_attempt(record, "cancel")
-                    return scheduler.NodeExecution(
-                        envelope_parsed=False, exit_code=1,
-                        launched_pid=handle.process_group)
-                time.sleep(0.05)
+            return _poll_agent_execution(
+                route_runner, handle, envelope, record, cancel_requested,
+                quiesce_attempt)
 
         def quiesce_attempt(record, phase):
             key = (record.node_id, record.attempt_no)
@@ -1977,6 +2474,17 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             scratch_root=Path(args.scratch_root), run_node=run_node,
             run_gate=run_gate, run_integration_gate=run_integration_gate,
             quiesce_attempt=quiesce_attempt,
+            # §8.8's single integration gate, adjudicated at the number the
+            # plan declared for it. Omitting this is what left final
+            # acceptance counting to 1 while the plan asked for 70.
+            integration_min_cases=(
+                plan.merge_policy.integration_gate.min_cases),
+            # §8.3's provision step, which the scheduler has always called and
+            # nothing had ever supplied. Omitting it measured every baseline
+            # against an unprovisioned tree and left §7.4's pre-gate red for
+            # the ecosystem's missing install rather than for the node's
+            # missing work.
+            provision=_run_provisioner(args, route_runner),
             kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
             review_attempt=review_attempt)
         report = scheduler.Scheduler(
@@ -2077,12 +2585,24 @@ def _integration_head(path: Path) -> Optional[Dict[str, Any]]:
             "head": ("rev-parse", "HEAD"),
             "subject": ("log", "-1", "--format=%s")}
     found: Dict[str, Any] = {"path": str(path)}
+    # A key is present when git answered and absent when it did not. The
+    # ternary this replaces wrote `None` on every nonzero exit, which reads as
+    # "the repository has no head" rather than "this process could not read
+    # one" — §7.5's conflation, in the diagnostics rather than in an
+    # obligation. The renderer already prints `?` for a key it does not find,
+    # so an unread field looks unread, and `unreadable` says so outright
+    # rather than leaving an operator to infer it from a null.
+    unreadable = []
     for key, command in read.items():
         completed = subprocess.run(
             ("git", "-C", str(path)) + command,
             capture_output=True, text=True)
-        found[key] = (completed.stdout.strip()
-                      if completed.returncode == 0 else None)
+        if completed.returncode == 0:
+            found[key] = completed.stdout.strip()
+        else:
+            unreadable.append(key)
+    if unreadable:
+        found["unreadable"] = sorted(unreadable)
     return found
 
 
@@ -2138,21 +2658,15 @@ def _live_state(record: "lc.RunRecord",
     survives a resume — so a run that blocked, was rescued, and is now working
     still reads BLOCKED there. An operator watching a run needs the live
     shape, so the declared outcome is reported beside this rather than as it.
+
+    The derivation itself lives in `lifecycle` beside the rows it reads, so
+    `run status`, `run list`, and any later reader answer from one function
+    rather than from three re-derivations of the same rule (§10.6). Two of the
+    facts it turns on were previously not derivable at all: whether a
+    cancellation had *finished*, and whether any scheduler process is still
+    behind the run.
     """
-    if record.cancel_requested:
-        return "CANCELLING"
-    states = [node.state for node in nodes]
-    if any(state is scheduler_types.NodeState.RUNNING for state in states):
-        return "RUNNING"
-    if not states:
-        return "EMPTY"
-    if all(state is scheduler_types.NodeState.MERGED for state in states):
-        return "MERGED"
-    if any(state is scheduler_types.NodeState.BLOCKED for state in states):
-        return "BLOCKED"
-    if any(state is scheduler_types.NodeState.PENDING for state in states):
-        return "PENDING"
-    return "QUIESCENT"
+    return lc.derive_run_state(record, nodes)
 
 
 def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
@@ -2230,6 +2744,11 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
                              if record.latest_outcome else None),
         "declared_outcome_at": record.latest_outcome_at,
         "cancel_requested": record.cancel_requested,
+        # The three facts the state above was derived from, reported so an
+        # ABANDONED verdict can be checked rather than believed.
+        "scheduler_pid": record.scheduler_pid,
+        "scheduler_host": record.scheduler_host,
+        "scheduler_alive": lc.scheduler_liveness(record),
         "created_at": record.created_at,
         "last_transition_at": record.last_transition_at,
         "elapsed_s": _since(record.created_at, now),
@@ -2263,6 +2782,11 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         progress["last_transition_at"], _duration(progress["idle_s"])))
     if progress["cancel_requested"]:
         lines.append("  cancel       requested")
+    if progress["scheduler_pid"]:
+        alive = progress["scheduler_alive"]
+        lines.append("  scheduler    pid {} on {} — {}".format(
+            progress["scheduler_pid"], progress["scheduler_host"] or "?",
+            "alive" if alive else "gone" if alive is False else "unknown host"))
     integration = progress["integration"]
     if integration is None:
         lines.append("  integration  (no worktree found)")
@@ -2354,6 +2878,8 @@ def _run_list(args: argparse.Namespace) -> int:
                  "declared_outcome": (record.latest_outcome.value
                                       if record.latest_outcome else None),
                  "cancel_requested": record.cancel_requested,
+                 "scheduler_pid": record.scheduler_pid,
+                 "scheduler_alive": lc.scheduler_liveness(record),
                  "state": _live_state(record, reader.nodes(record.run_id))}
                 for record in records]
     finally:
@@ -2910,6 +3436,97 @@ class _PaneTee:
         self._stream.flush()
 
 
+def _plan_ship_approved(args: argparse.Namespace) -> Callable[[str], bool]:
+    """Whether a digest carries a signed receipt whose verdict is PASS.
+
+    Read from the receipt store rather than from any file beside the plan: the
+    receipt is the only thing that binds a reviewer to a set of bytes, and it
+    is what a run consults.
+
+    Fails closed. Only a receipt that is absent proves a plan is unapproved;
+    a receipt that cannot be read, verified, or even located because the store
+    is misconfigured proves nothing, and the caller uses this answer to decide
+    whether to replace a plan's bytes. "I could not tell" must therefore read
+    as approved, so an unreadable receipt costs a refusal the operator can act
+    on rather than a plan silently replaced out from under a run.
+    """
+    def approved(digest: str) -> bool:
+        try:
+            store = _plan_receipt_store(
+                _configured_plan_step("finalize", args.plan_name),
+                missing_detail="receipt configuration is required to ship")
+        except (_PlanReceiptConfigurationError, _MaestroConfigurationError,
+                finalization.ReceiptStoreLocationError, OSError, ValueError):
+            # No store means no answer, and no answer means do not replace.
+            return True
+        try:
+            return store.load(digest).verdict is finalization.Verdict.PASS
+        except FileNotFoundError:
+            return False
+        except (finalization.ReceiptInvalid, finalization.SignatureMissing,
+                finalization.SignatureInvalid, UnicodeError, ValueError,
+                KeyError, OSError):
+            return True
+    return approved
+
+
+class _ShipSupersedeRefused(RuntimeError):
+    """The plan on disk differs from the projection and is already approved."""
+
+
+def _superseded_plan_path(destination: Path, digest: str) -> Path:
+    """Where a replaced plan's bytes are kept, keyed by their own digest."""
+    return destination.parent / "superseded" / digest / destination.name
+
+
+def _plan_ship_authoring(destination: Path, projected: bytes,
+                         approved: Callable[[str], bool]) -> Optional[str]:
+    """Decide what the ship's author step must do, and make room for it.
+
+    Returns the digest of a plan that was superseded, or None when nothing was
+    moved. Raises `_ShipSupersedeRefused` when the existing plan must not be
+    replaced.
+
+    `plan ship` is one command by design, and a command the operator cannot
+    re-run is not one command -- it is one command plus a manual `rm`. Its
+    author step is create-once (`PLAN_EXISTS`), which is right for a plan's
+    bytes and wrong for a pipeline that has to be resumable: a ship whose
+    finalize step failed refused on the file its own author step had just
+    written. Three cases, decided from bytes and receipts rather than from
+    intent:
+
+    * nothing on disk -- author writes, as before;
+    * identical bytes -- the author step already ran and produced exactly this
+      plan, so it is skipped and the ship resumes at validate. Re-running is
+      then free and changes nothing;
+    * different bytes -- the IR moved. The existing plan is kept under its own
+      digest and the new one takes its place, unless that plan is approved.
+
+    An approved plan is never replaced. `Verdict.PASS` means a receipt exists
+    that binds a reviewer to those exact bytes, and a run keys on the digest,
+    so replacing the file could pull the plan out from under work that refers
+    to it. `FAIL` carries no such risk -- it is terminal for those bytes, so
+    nothing may ever run them -- and neither does a plan with no receipt at
+    all.
+    """
+    if not destination.exists():
+        return None
+    existing = destination.read_bytes()
+    if existing == projected:
+        return None
+    superseded = plan_digest.digest_of(existing)
+    if approved(superseded):
+        raise _ShipSupersedeRefused(
+            "the plan on disk ({}) is approved and differs from the projected "
+            "plan; finalize it or remove its approval before re-shipping"
+            .format(superseded))
+    archive = _superseded_plan_path(destination, superseded)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_bytes(existing)
+    destination.unlink()
+    return superseded
+
+
 def _plan_ship_step_failure(step: str, status: int,
                             pane: Dict[str, Any]) -> int:
     payload = {"outcome": "PLAN_SHIP_FAILED", "step": step, "status": status}
@@ -2946,20 +3563,50 @@ def _plan_ship(args: argparse.Namespace) -> int:
             "the installed plan author verb has no "
             + _PLAN_CONTRACT_AUTHOR_OPTION
             + ", so an approved Plan IR cannot be projected onto a Maestro plan")
+    author_args = _configured_plan_step("author", args.plan_name)
+    setattr(author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION],
+            str(artifacts["plan_ir"]))
+    setattr(author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION],
+            str(artifacts["receipt"]))
+    setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
+            str(artifacts["rendered"]))
+
+    destination = Path(author_args.plan_file)
+
     # Fail closed before authoring anything: no pane, no work, no leftovers.
+    # The projection and the supersede both live *inside* the pane, not before
+    # it. `_plan_ship_authoring` archives and unlinks the plan on disk, and a
+    # command that moves a plan's bytes while no pane exists is precisely the
+    # invisible work `VisiblePaneTest` forbids -- it was hoisted above the pane
+    # when ship was made resumable and has to come back down.
     pane = _PlanPane(layout, _plan_step_log(layout, args.plan_name, "ship"))
     pane.open()
     try:
-        author_args = _configured_plan_step("author", args.plan_name)
-        setattr(author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION],
-                str(artifacts["plan_ir"]))
-        setattr(author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION],
-                str(artifacts["receipt"]))
-        setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
-                str(artifacts["rendered"]))
-        steps = (("author", _plan_author, author_args),
-                 ("validate", _plan_validate, None),
+        # What the author step would write, computed before anything is
+        # written, so a re-run can tell "already authored" from "the IR moved"
+        # -- see `_plan_ship_authoring`. Projection failures are the author
+        # step's own refusals and are reported as that step failing, not as a
+        # ship that never started.
+        try:
+            projected, _draft, _ir = (
+                plan_contract_ingress.project_canonical_plan(
+                    artifacts["plan_ir"], artifacts["receipt"],
+                    Path(author_args.repo), artifacts["rendered"]))
+        except (plan_author.AuthoringError,
+                plan_contract_ingress.IngressError) as exc:
+            return _refusal("PLAN_AUTHORING_FAILED", str(exc))
+        try:
+            superseded = _plan_ship_authoring(
+                destination, projected, _plan_ship_approved(args))
+        except _ShipSupersedeRefused as exc:
+            return _refusal("PLAN_SUPERSEDE_REFUSED", str(exc))
+        except OSError as exc:
+            return _refusal("PLAN_SUPERSEDE_FAILED", str(exc))
+        authored_already = destination.exists()
+        steps = (("validate", _plan_validate, None),
                  ("finalize", _plan_finalize, None))
+        if not authored_already:
+            steps = (("author", _plan_author, author_args),) + steps
         for step, handler, prepared in steps:
             pane.note("$ maestro plan " + step + " " + args.plan_name)
             with _redirect_stdout(_PaneTee(sys.stdout, pane.log)):
@@ -2975,7 +3622,9 @@ def _plan_ship(args: argparse.Namespace) -> int:
         "plan": args.plan_name,
         "plan_ir": str(artifacts["plan_ir"]),
         "receipt": str(artifacts["receipt"]),
-        "steps": ["author", "validate", "finalize"],
+        "steps": [step for step, _handler, _prepared in steps],
+        "authored": not authored_already,
+        "superseded": superseded,
     }
     payload.update(pane.report())
     print(json.dumps(payload, sort_keys=True))
@@ -3058,11 +3707,33 @@ def _deliver_author_turn(config: Dict[str, Any],
         # from a previous attempt would end this one before it began.
         if envelope.exists():
             envelope.unlink()
-        handle = runner.launch(launcher.LaunchSpec(
+        # §8.3: the author writes in a pane like any other agent, so its
+        # byproducts are redirected to a scratch beside this turn's own session
+        # directory under the harness-owned session root -- never into the
+        # repository it is authoring against.
+        # What this does NOT buy, stated because the other two sites do buy
+        # it: the plan-author lane runs outside any scheduler attempt, so
+        # there is no containment handler here, no retry class, and no budget
+        # to spend correctly. It gains a typed error surface and a detail
+        # string, and nothing more. It is wrapped so that every `.launch(` in
+        # this module goes through one path, which is what lets the structural
+        # guard be a flat rule rather than a rule plus an exception.
+        handle = _typed_launch_pane(runner, launcher.LaunchSpec(
             correlation_token=token, worktree=Path(config["repo"]),
             prompt_path=prompt_path, envelope_path=envelope,
             route=lane.route, model=lane.model, effort=lane.effort,
-            profile=lane.profile, session_dir=session_dir))
+            profile=lane.profile, session_dir=session_dir,
+            # B13 at the chokepoint, stated here rather than skipped. The
+            # author lane runs the `claude` route, which publishes no model
+            # catalog -- `opus` does not resolve in omp's -- so this resolves
+            # to `None` and `preflight_launch_prompt` makes no comparison.
+            # That is the answer for a route with no declared window: refuse
+            # to invent one, and refuse nothing. It is a property of the route
+            # (`handoff_budget.ROUTES_PUBLISHING_A_WINDOW`), so the day the
+            # route publishes a catalog this site is covered with no edit.
+            context_window_tokens=_route_context_window(lane.route, lane.model),
+            environment=worktree.launch_env(
+                session_root / (token + ".scratch"))))
         deadline = time.monotonic() + lane.author_timeout_s
         state = None
         try:
@@ -3746,6 +4417,12 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backstop-t-s", type=float)
     parser.add_argument("--semantic-ceiling", type=int)
     parser.add_argument("--review-ceiling", type=int)
+    parser.add_argument("--environmental-retries", type=int)
+    parser.add_argument("--launcher-retries", type=int)
+    parser.add_argument("--credential-retries", type=int)
+    # One argv word per flag, in order: `--provision npm --provision ci`. The
+    # same reason a gate takes real argv rather than a shell string.
+    parser.add_argument("--provision", action="append", dest="provision_argv")
     parser.add_argument("--herdr")
     parser.add_argument("--omp")
     parser.add_argument("--claude")

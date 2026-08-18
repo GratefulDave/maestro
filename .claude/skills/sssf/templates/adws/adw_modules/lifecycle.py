@@ -31,6 +31,8 @@ combinations can prove it never raises and never falls outside the four.
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple)
 
 from . import scheduler_types as st
+from . import watchdog as wd
 from . import worktree as wt
 from .utils import ensure_dir, now_iso
 
@@ -98,7 +101,15 @@ CREATE TABLE IF NOT EXISTS runs (
   last_transition_at TEXT NOT NULL,
   latest_outcome     TEXT,              -- NULL = no scheduler ever declared quiescence
   latest_outcome_at  TEXT,
-  cancel_requested   INTEGER NOT NULL DEFAULT 0
+  cancel_requested   INTEGER NOT NULL DEFAULT 0,
+  -- The scheduler process that last took ownership of this run. Written when a
+  -- process projects the plan or resumes the run, never cleared: a pid that is
+  -- no longer running is the structural fact that says the run has no owner,
+  -- and clearing it on a clean exit would delete the evidence for the case
+  -- that matters -- the process that did *not* exit cleanly.
+  scheduler_pid       INTEGER,
+  scheduler_host      TEXT,
+  scheduler_claimed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS dag_nodes (
   run_id       TEXT NOT NULL REFERENCES runs(run_id),
@@ -193,6 +204,59 @@ READY_SET_INDEX = "idx_ready_set"
 #: and §7.7 adjudicates a late arrival against `attempts.state`, so a row left
 #: RUNNING would ACCEPT a result from an attempt nobody is waiting for.
 CLOSED_ATTEMPT_STATE = st.NodeState.CANCELLED
+
+
+#: Columns added to `runs` after the first ledgers were written. `SCHEMA` uses
+#: `CREATE TABLE IF NOT EXISTS`, so it is inert against a database that already
+#: has the table: a ledger created before these columns existed keeps its old
+#: shape forever unless something adds them. Declared as a list rather than
+#: inlined so the migration and the schema cannot drift into two answers.
+_RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("scheduler_pid", "INTEGER"),
+    ("scheduler_host", "TEXT"),
+    ("scheduler_claimed_at", "TEXT"),
+)
+
+
+def scheduler_host() -> str:
+    """The machine whose pid namespace `scheduler_pid` was taken from.
+
+    A pid is only meaningful on the host that issued it. A ledger on a shared
+    filesystem, or copied between machines, would otherwise have its pids read
+    against a completely unrelated process table — and the direction that
+    breaks is the dangerous one: some *other* machine's pid 41022 is very
+    likely alive here, so a dead scheduler would read as live forever. Stored
+    beside the pid so the liveness question can be *declined* rather than
+    answered wrongly (`scheduler_liveness` returns `None`).
+    """
+    try:
+        return socket.gethostname()
+    except OSError:
+        return ""
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, ...]:
+    """The column names a table actually has right now."""
+    return tuple(str(row[1]) for row in
+                 conn.execute("PRAGMA table_info({0})".format(table)).fetchall())
+
+
+def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
+    """Add any `runs` column this version needs and an older ledger lacks.
+
+    `ADD COLUMN` is the only shape used, and every added column is nullable
+    with no default: an existing row keeps NULL, and NULL is read everywhere
+    below as "nobody recorded this", never as a value. So the migration cannot
+    invent a fact about a run that predates the column.
+    """
+    present = set(_table_columns(conn, "runs"))
+    added = []
+    for name, kind in _RUNS_ADDED_COLUMNS:
+        if name in present:
+            continue
+        conn.execute("ALTER TABLE runs ADD COLUMN {0} {1}".format(name, kind))
+        added.append(name)
+    return tuple(added)
 
 
 def _enable_wal(conn: sqlite3.Connection, attempts: int = 50) -> None:
@@ -396,6 +460,7 @@ class LifecycleStore:
         _enable_wal(self.conn)
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self.conn.executescript(SCHEMA)
+        _migrate(self.conn)
 
     # ── run / plan projection ────────────────────────────────────────────────
 
@@ -413,9 +478,11 @@ class LifecycleStore:
         try:
             self.conn.execute(
                 "INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,"
-                " latest_outcome, latest_outcome_at, cancel_requested)"
-                " VALUES (?,?,?,?,NULL,NULL,0)",
-                (run_id, plan_digest, now, now))
+                " latest_outcome, latest_outcome_at, cancel_requested,"
+                " scheduler_pid, scheduler_host, scheduler_claimed_at)"
+                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?)",
+                (run_id, plan_digest, now, now,
+                 os.getpid(), scheduler_host(), now))
             for node in nodes:
                 self.conn.execute(
                     "INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind, depth,"
@@ -1051,12 +1118,40 @@ class LifecycleStore:
             raise
 
     @serialized
+    def claim_run(self, run_id: str) -> None:
+        """Record *this* process as the run's scheduler (§7.3, §11.2).
+
+        The only durable statement that a run has an owner. Without it a run's
+        state is whatever the last live scheduler remembered to write, so a
+        scheduler that died — crash, SIGKILL, machine sleep, an operator
+        closing the pane — left `latest_outcome` NULL and its nodes RUNNING,
+        and every read verb went on reporting the run as live. There was no
+        fact in the ledger that could contradict them.
+
+        Written on projection and on resume, which are the two moments a
+        process takes ownership. Never cleared: see the schema comment.
+        """
+        now = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "UPDATE runs SET scheduler_pid=?, scheduler_host=?,"
+                " scheduler_claimed_at=? WHERE run_id=?",
+                (os.getpid(), scheduler_host(), now, run_id))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
     def _write_resume_transition(self, run_id: str) -> None:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             now = now_iso()
             self.conn.execute(
-                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id))
+                "UPDATE runs SET last_transition_at=?, scheduler_pid=?,"
+                " scheduler_host=?, scheduler_claimed_at=? WHERE run_id=?",
+                (now, os.getpid(), scheduler_host(), now, run_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -1224,6 +1319,13 @@ class RunRecord:
     latest_outcome: Optional[st.RunOutcome]
     latest_outcome_at: Optional[str]
     cancel_requested: bool
+    #: The scheduler process that last claimed the run, and the host whose pid
+    #: namespace it belongs to. `None` on a ledger written before the columns
+    #: existed, which is why `scheduler_liveness` answers `None` there rather
+    #: than guessing: an absent pid is not a dead one.
+    scheduler_pid: Optional[int] = None
+    scheduler_host: Optional[str] = None
+    scheduler_claimed_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1240,6 +1342,111 @@ class NodeRow:
     output_sha: Optional[str]
     granted_extra_attempts: int
     updated_at: str
+
+
+# ── the run's live state, derived rather than remembered (§7.3, §11.2) ───────
+
+#: What `derive_run_state` can answer. Two of these are new, and both name a
+#: fact the old vocabulary could not express:
+#:
+#: * `CANCELLED` — the cancellation *finished*. `CANCELLING` used to be
+#:   returned for the whole remaining life of any run whose `cancel_requested`
+#:   flag was set, so run-1907d9c1f9d84def80272cb39b5fc137 sat at CANCELLING
+#:   permanently with all 14 of its nodes correctly CANCELLED. Deleting the row
+#:   was the only way to clear it.
+#: * `ABANDONED` — the run has no scheduler process behind it and never
+#:   declared an outcome. run-75dfc6914946487f998453fefb51a0cf read RUNNING for
+#:   half an hour after its scheduler died, with two nodes RUNNING, no pid, and
+#:   nothing left alive to move them.
+RUN_STATES: Tuple[str, ...] = (
+    "EMPTY", "PENDING", "RUNNING", "BLOCKED", "QUIESCENT",
+    "CANCELLING", "CANCELLED", "MERGED", "ABANDONED",
+)
+
+
+def scheduler_liveness(
+        record: RunRecord, *,
+        is_alive: Callable[[int], bool] = wd.process_is_alive,
+        host: Optional[str] = None) -> Optional[bool]:
+    """Is a scheduler process still behind this run? `None` = cannot be said.
+
+    Three answers, and the third is the one that keeps this honest:
+
+    * `True` — a pid was recorded on this host and the process exists. Pid
+      reuse can make this wrong, and it is wrong in the *safe* direction: the
+      run keeps being reported exactly as it is today.
+    * `False` — a pid was recorded on this host and no such process exists.
+      That is a structural fact about the process table, read with
+      `os.kill(pid, 0)` and nothing else. Not stdout, not a log line, not a
+      pane (§1.2).
+    * `None` — no pid was recorded (a ledger older than the column), or it was
+      recorded on another host, whose pid namespace this machine cannot be
+      asked about. Callers must treat `None` as "unknown" and never as "dead":
+      declaring a live run dead is the failure that would strand working work.
+    """
+    pid = record.scheduler_pid
+    if not pid or pid <= 0:
+        return None
+    recorded_host = record.scheduler_host
+    if recorded_host and recorded_host != (host if host is not None
+                                           else scheduler_host()):
+        return None
+    return bool(is_alive(int(pid)))
+
+
+def derive_run_state(
+        record: RunRecord, nodes: Sequence[NodeRow], *,
+        is_alive: Callable[[int], bool] = wd.process_is_alive,
+        host: Optional[str] = None) -> str:
+    """What the run *is*, computed from durable facts alone.
+
+    `runs.latest_outcome` is written by exactly one actor — a live scheduler
+    declaring quiescence — so it says nothing at all about a scheduler that
+    never got to declare. A run's state therefore cannot be a thing a process
+    remembers to write; it has to be derivable from what is already durable:
+    the node rows, the cancellation flag, and whether the pid that claimed the
+    run is still a process. All three are typed records (§1.2). Nothing here
+    reads prose, and this function performs no write — `LifecycleReader` opens
+    the database `mode=ro` precisely so that asking cannot change the answer.
+
+    Order matters, and it is chosen so that no branch can claim liveness it has
+    not established:
+
+    1. A run with no nodes is EMPTY.
+    2. A run whose every node is absolutely terminal is *settled*, whatever any
+       process is doing. Cancellation that reached every node is CANCELLED, not
+       CANCELLING — this is the second observed defect, and it needs no
+       liveness check at all because the node rows already say it.
+    3. Otherwise there is work left. Work left with a provably dead scheduler
+       is ABANDONED, but only where the death matters: a run with a node still
+       RUNNING (nothing can finish it), or one that never declared an outcome
+       (nothing will ever declare one). A run that *did* declare — BLOCKED,
+       say — and then exited is reported by its node states as before; its
+       scheduler is supposed to be gone.
+    4. Only then may the node states be read as live.
+    """
+    states = [node.state for node in nodes]
+    if not states:
+        return "EMPTY"
+    if all(state in st.ABSOLUTELY_TERMINAL for state in states):
+        if record.cancel_requested:
+            return "CANCELLED"
+        if all(state is st.NodeState.MERGED for state in states):
+            return "MERGED"
+        return "QUIESCENT"
+    running = any(state is st.NodeState.RUNNING for state in states)
+    alive = scheduler_liveness(record, is_alive=is_alive, host=host)
+    if alive is False and (running or record.latest_outcome is None):
+        return "ABANDONED"
+    if record.cancel_requested:
+        return "CANCELLING"
+    if running:
+        return "RUNNING"
+    if any(state is st.NodeState.BLOCKED for state in states):
+        return "BLOCKED"
+    if any(state is st.NodeState.PENDING for state in states):
+        return "PENDING"
+    return "QUIESCENT"
 
 
 class LifecycleReader:
@@ -1300,8 +1507,18 @@ class LifecycleReader:
     def runs(self, plan_digest: Optional[str] = None) -> Tuple[RunRecord, ...]:
         """Run rows, newest first — the index `run list` renders and `run
         status` resolves a plan name through."""
+        # The reader is `mode=ro`, so it cannot migrate a ledger that predates
+        # the scheduler-ownership columns — and must not refuse to read one
+        # either. Ask the database what it has and select only that; an absent
+        # column reads back as `None`, which `scheduler_liveness` already
+        # treats as "cannot be said".
+        available = set(_table_columns(self.conn, "runs"))
+        optional = tuple(name for name, _ in _RUNS_ADDED_COLUMNS
+                         if name in available)
         sql = ("SELECT run_id, plan_digest, created_at, last_transition_at,"
-               " latest_outcome, latest_outcome_at, cancel_requested FROM runs")
+               " latest_outcome, latest_outcome_at, cancel_requested"
+               + "".join(", " + name for name in optional)
+               + " FROM runs")
         params: Tuple[Any, ...] = ()
         if plan_digest is not None:
             sql += " WHERE plan_digest=?"
@@ -1314,7 +1531,14 @@ class LifecycleReader:
                 latest_outcome=(st.RunOutcome(row["latest_outcome"])
                                 if row["latest_outcome"] else None),
                 latest_outcome_at=row["latest_outcome_at"],
-                cancel_requested=bool(row["cancel_requested"]))
+                cancel_requested=bool(row["cancel_requested"]),
+                scheduler_pid=(row["scheduler_pid"]
+                               if "scheduler_pid" in optional else None),
+                scheduler_host=(row["scheduler_host"]
+                                if "scheduler_host" in optional else None),
+                scheduler_claimed_at=(row["scheduler_claimed_at"]
+                                      if "scheduler_claimed_at" in optional
+                                      else None))
             for row in self._rows(sql + " ORDER BY created_at DESC, run_id DESC",
                                   params))
 

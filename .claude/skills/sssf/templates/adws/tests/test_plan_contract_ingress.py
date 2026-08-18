@@ -15,11 +15,12 @@ for _path in (str(ADWS), str(TESTS)):
         sys.path.insert(0, _path)
 
 from adw_modules import plan_canonical as pc
+from adw_modules import plan_author as pa
 from adw_modules import plan_contract_ingress as pci
 from adw_modules import plan_digest as pd
 from adw_modules import plan_model as pm
 
-from test_step2_plan_validation import make_repo
+from test_step2_plan_validation import README, make_repo
 
 
 def _write(path: Path, payload) -> Path:
@@ -36,7 +37,14 @@ def _ir(**overrides):
         "source_artifacts": [{
             "source_id": "src-readme",
             "path": "README.md",
-            "sha256": "a" * 64,
+            # The real hash of the bytes `make_repo` commits. It used to be
+            # `"a" * 64` — a knowingly wrong value that projected clean for as
+            # long as this fixture existed, which is the proof that nothing
+            # read it. `plan_author.fill_git_facts` overwrote the declared pin
+            # with the hash of the object it was meant to be checked against,
+            # so no declaration could ever be wrong. Computed here rather than
+            # pasted, because a pasted digest is the same hole one edit later.
+            "sha256": hashlib.sha256(README.encode("utf-8")).hexdigest(),
             "required": True,
         }],
         "lanes": [{
@@ -131,6 +139,43 @@ class PlanContractIngressTest(unittest.TestCase):
         ir["verifiers"][0]["command"] = "python3 -m pytest"
         with self.assertRaisesRegex(pci.IngressError, "BROAD_GATE"):
             pci.project_draft(ir, self.repo)
+
+    def test_refuses_a_source_whose_pinned_digest_does_not_match(self):
+        """End to end: the IR's pin now reaches the object it names.
+
+        The IR declares a hash, the projection carries it, and
+        `plan_author.fill_git_facts` compares it against the blob at the base
+        commit instead of overwriting it. Before this, the pin was theatre —
+        and this file's own `_ir()` fixture proved it, because it carried
+        `"a" * 64` for a README whose real content is `"fixture repository\\n"`
+        and authored a plan from it without complaint.
+        """
+        ir = _ir()
+        ir["source_artifacts"][0]["sha256"] = "0" * 64
+        ir_path = _write(self.root / "phase-1.plan.json", ir)
+        receipt_path = _write(
+            self.root / "phase-1.plan-review.json",
+            _receipt(ir_path.read_bytes()))
+        with self.assertRaisesRegex(pa.AuthoringError,
+                                    "OBSERVED_DIGEST_MISMATCH"):
+            pci.author_from_plan_contract(
+                ir_path, receipt_path, self.root / "maestro-plan.v1", self.repo)
+
+    def test_no_plan_file_is_written_when_the_pin_does_not_match(self):
+        """`write_canonical_plan` is create-once (`PLAN_EXISTS`), so a plan
+        authored before the refusal would have to be deleted by hand before
+        the corrected IR could be authored at all."""
+        ir = _ir()
+        ir["source_artifacts"][0]["sha256"] = "0" * 64
+        ir_path = _write(self.root / "phase-1.plan.json", ir)
+        receipt_path = _write(
+            self.root / "phase-1.plan-review.json",
+            _receipt(ir_path.read_bytes()))
+        destination = self.root / "maestro-plan.v1"
+        with self.assertRaises(pa.AuthoringError):
+            pci.author_from_plan_contract(
+                ir_path, receipt_path, destination, self.repo)
+        self.assertFalse(destination.exists())
 
     def test_refuses_unmappable_outputs(self):
         ir = _ir()

@@ -30,7 +30,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .scheduler_types import (
     AttemptRecord,
@@ -76,13 +76,48 @@ class CodeEffect:
 
 
 class LauncherFailure(str, Enum):
-    """§7.5's LAUNCHER_TRANSIENT triggers. CREDENTIAL is distinguished
-    because it alone carries a zero retry budget."""
+    """§7.5's LAUNCHER_TRANSIENT triggers, partitioned by budget below.
+
+    Members, not classes. §7.5 closes the retry classes at three and makes the
+    closure load-bearing, and it also says what varies inside a class: "the
+    budget is a property of the *member*, not of the class". CREDENTIAL has
+    always been the proof of that — zero retries inside a class named for
+    faults a second attempt might survive.
+
+    `DETERMINISTIC_REFUSAL` is the second member of that same shape (§16.3
+    item 46). LAUNCHER_TRANSIENT is named for an assumption — that another
+    attempt might survive what this one did not — and a refusal that is
+    deterministic *by construction* satisfies every structural test for the
+    class while violating that assumption: a call site that omits an
+    environment omits it identically on every attempt. Without a member for
+    it, `ErrorClass.CONFIGURATION` maps to STARTUP, the node makes two more
+    launches that cannot succeed, and it blocks LAUNCHER_BUDGET_EXHAUSTED —
+    telling an operator a budget ran out when nothing was ever retryable.
+
+    The determinism is stated by the launcher as a typed field on its own
+    refusal (`launcher.LaunchRefusal.deterministic`) and travels to the
+    classifier as this member. It is never inferred from the refusal's
+    message: `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...` carries its code in
+    prose, and matching that prefix is exactly the lexical shortcut §7.5
+    forbids and an AST test convicts.
+    """
 
     PANE_ALLOCATION = "PANE_ALLOCATION"
     STARTUP = "STARTUP"
     TRANSPORT = "TRANSPORT"
     CREDENTIAL = "CREDENTIAL"
+    DETERMINISTIC_REFUSAL = "DETERMINISTIC_REFUSAL"
+
+
+#: The partition §16.3 item 46's discharge requires: the members for which
+#: another attempt cannot produce a different answer. `launcher_retry_budget`
+#: is its only reader, and `_budget_reason` names the refusal rather than the
+#: budget for exactly this set, so a deterministic refusal blocks on its first
+#: occurrence saying what was refused.
+DETERMINISTIC_LAUNCHER_FAILURES: Tuple[LauncherFailure, ...] = (
+    LauncherFailure.CREDENTIAL,
+    LauncherFailure.DETERMINISTIC_REFUSAL,
+)
 
 
 @dataclass(frozen=True)
@@ -118,11 +153,20 @@ class Classification:
     keyword (the reviewer-stall arm) before it existed as a field, which made
     that arm a TypeError waiting for its first stall; the field closes that
     and never participates in the exactly-one-of pairing.
+
+    `launcher_failure` is the typed LAUNCHER_TRANSIENT trigger, carried
+    forward from the signal because the budget is not a property of the class
+    alone: §7.5 gives CREDENTIAL zero retries and every other launcher failure
+    one or two. `launcher_retry_budget` below needs the *member*, not the
+    class, and until this field existed it had no production caller at all —
+    the zero-retry rule was expressible and unreachable. Like `reason`, it
+    takes no part in the exactly-one-of pairing.
     """
 
     retry_class: Optional[RetryClass] = None
     block_reason: Optional[BlockReason] = None
     reason: Optional[str] = None
+    launcher_failure: Optional[LauncherFailure] = None
 
     def __post_init__(self) -> None:
         if (self.retry_class is None) == (self.block_reason is None):
@@ -169,8 +213,13 @@ def classify(signal: FailureSignal) -> Classification:
         return Classification(retry_class=RetryClass.SEMANTIC)
 
     # ── LAUNCHER_TRANSIENT: pane allocation, startup, transport ──────────────
+    # The member travels with the class. Returning only the class discards the
+    # one fact that distinguishes CREDENTIAL's zero budget from every other
+    # launcher failure's one or two, and a budget rule whose input is thrown
+    # away here cannot fire anywhere downstream (§7.5).
     if signal.launcher_failure is not None:
-        return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT)
+        return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT,
+                              launcher_failure=signal.launcher_failure)
 
     if not signal.binary_resolved or not signal.process_started:
         return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT)
@@ -238,25 +287,6 @@ def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> 
               and not (a.extra or {}).get(REVIEW_REJECTED_KEY))
 
 
-def semantic_budget_exhausted(cfg: SchedulerConfig, node_id: str,
-                              attempts: Iterable[AttemptRecord],
-                              granted_extra_attempts: int = 0) -> bool:
-    """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts per
-    `(run_id, node_id)` across all bases, closing the refund loop that the
-    per-base scope alone leaves unbounded — every unrelated merge mints a new
-    base and re-arms the per-base scope, so without this ceiling total spend
-    scales with the number of merges rather than with the node.
-
-    `granted_extra_attempts` is read from the node's lifecycle row
-    (`NodeLifecycle.granted_extra_attempts`) — the authority tier, never the
-    audit tier, per §5.3's runtime-read allowlist — and grants exactly one
-    attempt beyond `K` per `retry --force` invocation without raising the cap.
-    """
-    total = semantic_attempts_total(attempts, node_id)
-    allowance = cfg.semantic_ceiling + granted_extra_attempts
-    return total >= allowance
-
-
 # ── the review budget, counted the same way and kept separate ───────────────
 
 #: The marker `fail_attempt`/`mark_blocked` write into `attempts.extra_json`
@@ -287,27 +317,27 @@ def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> in
                and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
 
 
-def review_budget_exhausted(cfg: SchedulerConfig, node_id: str,
-                            attempts: Iterable[AttemptRecord],
-                            granted_extra_attempts: int = 0) -> bool:
-    """At most `review_ceiling + granted` review-rejected attempts per node.
-
-    `granted_extra_attempts` is the same `retry --force` grant the semantic
-    ceiling honours, and here it is also B10's missing operator escape: a review
-    that FAILed for a flaky or environmental reason would otherwise strand the
-    producer, because a byte-identical resubmission replays the stored FAIL
-    rather than being re-reviewed into a different answer.
-    """
-    total = review_attempts_total(attempts, node_id)
-    return total >= cfg.review_ceiling + granted_extra_attempts
-
-
 # ── §7.5 launcher budgets — credential is the zero-retry exception ──────────
 
 def launcher_retry_budget(cfg: SchedulerConfig, failure: Optional[LauncherFailure]) -> int:
-    """LAUNCHER_TRANSIENT's budget, except CREDENTIAL, which is zero (§7.5)."""
+    """LAUNCHER_TRANSIENT's budget, sized from the member (§7.5).
+
+    Two members spend nothing. CREDENTIAL's zero is §7.5's own entry, the one
+    row in the retry table whose whole purpose is to *not* retry.
+    DETERMINISTIC_REFUSAL's zero is the same rule applied to the same class:
+    the refusal is a property of the configuration or the plan rather than of
+    the moment, so an identical relaunch produces an identical refusal, and
+    the two doomed attempts buy only a misleading block reason.
+
+    CREDENTIAL keeps reading its configured value rather than being folded
+    into the literal below, because it is an operator-settable number that
+    happens to default to zero. A deterministic refusal is not a budget at
+    all — there is nothing for an operator to raise — so it is a constant.
+    """
     if failure is LauncherFailure.CREDENTIAL:
         return cfg.credential_retries
+    if failure in DETERMINISTIC_LAUNCHER_FAILURES:
+        return 0
     return cfg.launcher_retries
 
 
@@ -470,6 +500,43 @@ _TRUNCATION_MARKER = (
     "above still binds in full]")
 
 
+#: How many offending paths the retry prompt names individually.
+#:
+#: The whole list used to be joined into one line, which is unbounded in the
+#: only place a bound matters: a permission failure whose delta was measured
+#: over a whole dependency tree rendered 16090 paths as a single 1.1MB line.
+#: `_fit` could then do nothing with it but drop it entirely — the surface
+#: header survived, the paths did not, and the prompt told the agent that it
+#: had failed clause 4 without naming one path it wrote. Unbounded and useless
+#: at the same time.
+#:
+#: Twenty, because a breach is shaped like a directory rather than a scatter:
+#: twenty entries show the prefix, the depth, and whether more than one root is
+#: involved, which is what an agent can actually act on, and they cost ~2KB
+#: against a 12,000-character budget the review surface also draws from. One
+#: path per line so that `_fit` can trim the sample from the end and still
+#: leave the count and the first entries standing.
+OFFENDING_PATH_SAMPLE = 20
+
+
+def _offending_path_lines(paths: Sequence[str]) -> List[str]:
+    """The offending paths, bounded, with the total preserved as a count.
+
+    The count is a structural fact about the measured delta and survives
+    whatever the sample elides — an elision that silently changed "16090" into
+    "20" would be the prompt lying about the size of the breach.
+    """
+    total = len(paths)
+    shown = list(paths[:OFFENDING_PATH_SAMPLE])
+    lines = ["Paths written outside this node's declared outputs "
+             f"({total} in total):"]
+    lines.extend("  " + path for path in shown)
+    if total > len(shown):
+        lines.append(f"  ... and {total - len(shown)} more, elided here; the "
+                     "full list is recorded in this attempt's failure detail")
+    return lines
+
+
 def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     lines = ["Verification (§8.3):",
              "A prior attempt for this node did not verify."
@@ -479,8 +546,7 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     if g.reason:
         lines.append(g.reason)
     if g.offending_paths:
-        lines.append("Paths written outside this node's declared outputs: "
-                     + ", ".join(g.offending_paths))
+        lines.extend(_offending_path_lines(g.offending_paths))
     lines.append("Declared outputs: "
                  + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)"))
     return lines
@@ -580,16 +646,38 @@ def classify_git_exit(exit_code: int, not_found_exit_code: int) -> GitResult:
 
 # ── §7.5 AST detector #1: no comparison against process output text ─────────
 
-_STDIO_NAME_MARKERS = ("stderr", "stdout", "output", "text", "tail")
+#: Identifiers that denote a process's own output bytes, matched **exactly**.
+#: `text` was a member and is deliberately not: it is the most generic string
+#: name in Python and denoted process output only by local convention, so it
+#: convicted newline normalisation (`text.endswith("\n")`) in three modules
+#: and a markdown-fence check in a fourth, while the four names below are
+#: unambiguous. The cost of dropping it is stated rather than hidden — see
+#: `find_output_content_comparisons`.
+_STDIO_NAME_MARKERS = ("stderr", "stdout", "output", "tail")
 _STDIO_COMPARISON_OPS = (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
 _STDIO_COMPARISON_METHODS = ("startswith", "endswith", "find", "lower", "upper")
 
 
 def _looks_like_output(node: ast.AST) -> bool:
+    """Whether this operand denotes a process's own output bytes.
+
+    **Exact identifier match, never a substring.** The substring form this
+    replaces convicted `node.outputs` — a plan node's *declared output paths*,
+    which are harness-computed state and exactly what §7.5 permits a
+    classifier to read — because "outputs" contains "output". Nine such hits
+    across the tree, every one a false positive on an ordinary membership test
+    like `selector in node.outputs`, and they are why this rule could only
+    ever be pointed at its own module.
+
+    Narrowing the input rather than exempting the callers is the whole point:
+    a rule that needs an allowlist to widen has stopped describing what it is
+    about. `outputs` is not `output`; the plural is a different concept, not a
+    special case of the singular.
+    """
     if isinstance(node, ast.Name):
-        return any(marker in node.id.lower() for marker in _STDIO_NAME_MARKERS)
+        return node.id.lower() in _STDIO_NAME_MARKERS
     if isinstance(node, ast.Attribute):
-        return any(marker in node.attr.lower() for marker in _STDIO_NAME_MARKERS)
+        return node.attr.lower() in _STDIO_NAME_MARKERS
     return False
 
 
@@ -622,11 +710,28 @@ class _OutputComparisonVisitor(ast.NodeVisitor):
 
 
 def find_output_content_comparisons(source: str) -> List[Tuple[int, str]]:
-    """Parse `source` and return every place it compares against, or
-    pattern-matches, a value that looks derived from process output. Run
-    against this file's own source as a test, and against
-    `PLANTED_OUTPUT_COMPARISON_FIXTURE` to prove the detector actually goes
-    red on a real violation.
+    """Every place `source` compares against or pattern-matches process output.
+
+    §7.5: `_classify` "may **not** read stderr or stdout content; an AST test
+    forbids string comparison against process output, because a regex over
+    stderr is how ecosystem specifics leak into a general engine."
+
+    **Runs over the whole tree, not one module.** It was scoped to
+    `retry_policy.py` alone, which is the narrowest possible reading of a rule
+    about the engine's behaviour, and the same single-module shape that let a
+    live violation sit unseen in `plan_validate.py` under a detector written
+    for exactly that bug. Widening needed no allowlist — only an input
+    narrowed to what the rule is actually about (`_looks_like_output`).
+
+    **A stated limit, because the widening bought it at a price.** The rule
+    matches operands *named* like process output. Output bound to a generic
+    local first — `text = str(error).lower()`, then `"locked" not in text` —
+    is invisible to it, and that construct exists at
+    `coordinator_store.py:288`, where a sqlite failure is classified by
+    matching its message rather than its error code. That is an instance of
+    this rule's own shape which this rule does not catch; it is reported
+    rather than papered over with a marker so generic it convicted three
+    modules' newline handling. Closing it needs dataflow, not another name.
     """
     tree = ast.parse(source)
     visitor = _OutputComparisonVisitor()

@@ -58,6 +58,7 @@ from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
                     Tuple)
 
 from . import code_review as cr
+from . import launcher as lch
 from . import lifecycle as lc
 from . import retry_policy as rp
 from . import scheduler_types as st
@@ -74,12 +75,51 @@ class NodeExecution:
     reason `retry_policy.FailureSignal` has none: what the scheduler may
     learn from an execution is whether it produced a parseable envelope, what
     it exited, and whether it launched — never what it printed.
+
+    **`launch_detail` widens that on purpose, and the boundary it does not
+    cross is the point.** §16.3 item 42 left the ruling open rather than
+    adding a field silently: the launcher's typed poll vocabulary was
+    discarded on every branch of the real adapter, so a vanished agent and a
+    refused launch reached the ledger as the same empty ENVIRONMENTAL row.
+    The ruling taken here splits that vocabulary by what may read it.
+
+    * `launcher_failure` is TYPED and drives classification. It is a
+      `retry_policy.LauncherFailure` member, derived by the adapter from
+      `launcher.ErrorClass`, itself derived from the exception's *type* —
+      which §7.5 names explicitly among the facts a classifier may read.
+    * `launch_detail` is PROSE and drives nothing. It reaches
+      `Classification.reason`, and from there `transitions.detail_json`, and
+      no guard reads it back. It exists because §7.6 already established that
+      a typed reason computed at the point of failure and dropped before the
+      ledger is indistinguishable, to every later reader, from no reason.
+
+    Keying a retry class on `launch_detail` would be the lexical shortcut
+    §7.5 forbids, and the launcher already settled the same question for
+    itself (`HerdrCallError`: branch on `.code`, never on the message). This
+    field is carried, recorded, and never branched on.
     """
 
     envelope_parsed: bool = True
     exit_code: int = 0
     launched_pid: Optional[int] = None
     launcher_failure: Optional[rp.LauncherFailure] = None
+    launch_detail: str = ""
+    #: The agent's terminal envelope, parsed — §7.7's result payload.
+    #:
+    #: The ruling item 43 held open, taken the same way item 42's was: by what
+    #: may read it. This is DATA, recorded in the `results` row beside its
+    #: adjudication and read back by nothing that decides anything. It is not
+    #: `launch_detail`'s prose and it is not a classifier input; §7.7 requires
+    #: the payload to be retained in all four adjudications, so it has to
+    #: travel, and the only component that possesses it is the adapter that
+    #: read the envelope file.
+    #:
+    #: `_poll_agent_execution` already parsed exactly this object and threw it
+    #: away, keeping only `envelope_parsed`. That discard is why the `results`
+    #: table had a live reader in `run status` and no writer at all: not a
+    #: missing mechanism, a dropped value — §7.6's lesson about a typed reason
+    #: computed and never recorded, in its second instance.
+    envelope_payload: Optional[Mapping[str, Any]] = None
 
 
 #: Runner boundaries receive the scheduler's cancellation lease explicitly.
@@ -127,6 +167,76 @@ class AttemptCancelled(RuntimeError):
     """Cancellation was requested while the attempt still held RUNNING."""
 
 
+class LaunchFailed(RuntimeError):
+    """A launch or poll that produced no usable agent, typed at the seam.
+
+    The runner adapter raises this rather than a bare `RuntimeError` so the
+    containment handler can classify on the exception's *type* and a typed
+    enum member instead of on its message. §7.5 permits `_classify` to read an
+    exception type and forbids it reading process output; a message such as
+    `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...` carries its code in prose,
+    and matching that prefix would be exactly the lexical shortcut forbidden.
+
+    Before this existed every launcher fault reached the handler as some bare
+    exception, `classify` found nothing structural, and the failure spent the
+    ENVIRONMENTAL budget — which is how §16.3 item 42's reader-without-writer
+    survived: the branch was present and nothing could ever reach it.
+
+    `detail` is the underlying message, carried for the ledger and never
+    branched on.
+    """
+
+    def __init__(self, failure: rp.LauncherFailure, detail: str = "") -> None:
+        super().__init__(detail or failure.value)
+        self.failure = failure
+        self.detail = detail
+
+    @property
+    def pane_created(self) -> bool:
+        """Whether a pane existed when the launch failed (§16.3 item 45).
+
+        Read from the launcher's own typed refusal, which arrives here as this
+        exception's `__cause__` because the wrapper chains it (`raise ... from
+        exc`). One representation of the fact, at the only layer that knows
+        it: the launcher raised the refusal and is the only thing that can say
+        whether it had split a pane first.
+
+        `True` for everything else, and the default is the whole point. §8.3's
+        quiesce step exists to prove an attempt's owned execution absent, and
+        a launch failure that has not *stated* it created nothing is a launch
+        failure that may have left a pane. Reporting absence nobody measured
+        is the shape §8.3 refuses on principle, so the fall-through keeps
+        today's behaviour: prove it.
+        """
+        cause = self.__cause__
+        if isinstance(cause, lch.LaunchRefused):
+            return cause.pane_created
+        return True
+
+    @property
+    def classified_failure(self) -> rp.LauncherFailure:
+        """The member the retry budget is sized from (§16.3 item 46).
+
+        `failure` is what the adapter's own `classify` made of the exception,
+        and it is wrong in one direction only: `ErrorClass.CONFIGURATION` maps
+        to STARTUP, which carries a retry budget, while a refusal that is
+        deterministic by construction cannot succeed on any attempt. The
+        launcher states that determinism as a typed field on its refusal, so
+        the member is upgraded from a structural fact rather than inferred
+        from the refusal's message — branching on
+        `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:` would be the lexical
+        shortcut §7.5 forbids.
+
+        This is a member of LAUNCHER_TRANSIENT, not a fourth retry class:
+        §7.5's closure at three holds, and the budget varies by member exactly
+        as CREDENTIAL's zero already does.
+        """
+        cause = self.__cause__
+        if isinstance(cause, lch.LaunchRefused) and cause.deterministic:
+            return rp.LauncherFailure.DETERMINISTIC_REFUSAL
+        return self.failure
+
+
 
 class DurableOutputIdentityError(RuntimeError):
     """A terminal durable row names no verifiable commit identity."""
@@ -145,7 +255,19 @@ class SchedulerDeps:
     run_gate: GateRunner
     run_integration_gate: IntegrationGateRunner
     quiesce_attempt: QuiesceAttempt
-    min_cases: int = 1
+    #: §10.2's threshold for the ONE integration gate this run ends with
+    #: (§8.8), taken from `merge_policy.integration_gate.min_cases`.
+    #:
+    #: It replaces a `min_cases` scalar that all three adjudication sites
+    #: read — both node gates and this one. That scalar could not be right:
+    #: a run has many node gates, each declaring its own threshold, so one
+    #: number per run structurally cannot carry them. It also had no
+    #: production writer, so every gate in every run was adjudicated at its
+    #: default of 1 while plans declared 5, 6, 8 and 70. A node's threshold
+    #: now travels on the node (`PlanNode.gate_min_cases`); this one stays a
+    #: scalar because there is exactly one integration gate per run, which is
+    #: the case the old field was accidentally right about.
+    integration_min_cases: int = 1
     #: `(attempt) -> None`. The watchdog performs the kill the worker cannot,
     #: because the worker thread is blocked reading the agent (§7.6). Killing
     #: an agent's process belongs to the launcher (§9.3, step 7), so it is
@@ -202,6 +324,13 @@ class RunReport:
     upstream_blocked: Tuple[str, ...] = ()
     acceptance: Optional[AcceptanceResult] = None
     ancestry: Dict[str, bool] = field(default_factory=dict)
+    #: §8.3's pre-merge cleanliness evaluation, `node_id -> diverging paths`.
+    #: Residue found after the post-node gate is an adapter hygiene defect,
+    #: not a verdict about the node: the commit was sealed before the gate ran
+    #: and the merge consumes committed objects, so the node merges on its
+    #: measured content and this is what the operator is told instead. Empty in
+    #: the ordinary case, and empty is the claim that the adapters are clean.
+    adapter_hygiene: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     #: `node_id -> findings` for every node blocked `REVIEW_BUDGET_EXHAUSTED`.
     #: Reported beside the blocked set for the same reason the acceptance
     #: result is: a block reason names the rule that fired, never the thing to
@@ -242,6 +371,10 @@ class Scheduler:
         # unblocked by the watchdog from entering a gate or runner.
         self._watchdog_fences: Dict[Tuple[str, str, int], None] = {}
         self._output_shas: Dict[str, str] = {}
+        #: The latest attempt worktree per node, so §8.8's cleanup has
+        #: something to remove. Replaced on every attempt: an earlier attempt's
+        #: checkout is superseded by the one that produced the merged SHA.
+        self._attempt_worktrees: Dict[str, "wt.AttemptWorktree"] = {}
         # Latest typed guidance per acceptance surface, per node. Replaced a
         # plain last-failure string: verification and review took turns
         # overwriting one slot, and each attempt fixed exactly what the last
@@ -249,10 +382,22 @@ class Scheduler:
         # mentioned (run-32b19abadf4a4d6b801ae0f4456976c7 BLOCKED after five
         # such attempts). Rendered into the retry prompt at dispatch and read
         # nowhere else — nothing transitions on it (§10.1/§1.2).
-        self._guidance: Dict[str, rp.GuidanceLedger] = {}
+        #: Keyed by `(node_id, base_sha)` — `AttemptRecord.guidance_key` —
+        #: never by node alone. See that property for why the base belongs in
+        #: the key.
+        self._guidance: Dict[Tuple[str, str], rp.GuidanceLedger] = {}
         #: Findings from the review that exhausted a node's budget, kept so the
         #: run report can surface *why* rather than only that a count ran out.
         self._review_findings: Dict[str, str] = {}
+        #: `node_id -> every harness-hygiene fact observed about that node`.
+        #: Two surfaces write here — §8.3's pre-merge residue report and
+        #: §8.8's cleanup refusal — and they **accumulate** rather than
+        #: replace. A single slot two independent surfaces assign to is the
+        #: shape that made `_guidance` lose a standing constraint every time
+        #: the other surface fired; it is no more acceptable for a report than
+        #: it was for a retry prompt, and it was caught here by a leaky-gate
+        #: test whose residue entry a cleanup refusal had overwritten.
+        self._adapter_hygiene: Dict[str, Tuple[str, ...]] = {}
         self._pool: Optional[ThreadPoolExecutor] = None
         self._projected = False
         self._stuck = False
@@ -269,6 +414,15 @@ class Scheduler:
                                        list(self.nodes.values()))
         except lc.RunAlreadyExists:
             pass
+        # This process now owns the run, whether it just projected the plan or
+        # adopted an existing projection. Recorded durably because it is the
+        # only fact that can later contradict a reader calling a dead run live:
+        # `runs.latest_outcome` is written by a scheduler declaring quiescence,
+        # so a scheduler that dies before declaring leaves nothing behind that
+        # says the run stopped (§7.3, §11.2). Written on the `RunAlreadyExists`
+        # path too — that is a second process taking over a run the ledger
+        # still attributes to the first.
+        self.deps.store.claim_run(self.run_id)
         # Both durable states carry authority only after their persisted SHA is
         # revalidated. A crash after VERIFIED has no in-memory output map, so
         # excluding it would strand a ready merge forever; trusting an
@@ -345,6 +499,18 @@ class Scheduler:
             self.deps.quiesce_attempt(record, phase)
         except BaseException as exc:
             raise QuiescenceFailure(phase, exc) from exc
+
+    def _settling(self) -> bool:
+        """Whether any node's durable row still says RUNNING.
+
+        Called only when no future is in flight, so a RUNNING row here has no
+        worker behind it: the worker returned and the verdict that will move
+        the node — the watchdog's, or its own settle — has not committed yet.
+        That is a node mid-transition, not a quiescent one, and §7.3 defines
+        quiescence as "nothing in flight and no node can progress".
+        """
+        return any(record.state == st.NodeState.RUNNING.value
+                   for record in self.deps.store.node_records(self.run_id))
 
     def _settle_context(self, context: _AttemptContext) -> None:
         if context.record is not None and not context.settled:
@@ -461,9 +627,29 @@ class Scheduler:
                     # start either, no node can progress and the run is
                     # quiescent.
                     self._merge_frontier()
-                    if not self.deps.store.ready_nodes(self.run_id):
-                        break
-                    continue
+                    if self.deps.store.ready_nodes(self.run_id):
+                        continue
+                    if self._settling():
+                        # Not quiescent — mid-verdict. `ready_nodes` returns
+                        # only PENDING nodes, so a node whose durable row still
+                        # says RUNNING while no worker holds it is invisible to
+                        # the readiness check AND to the blocked set. The loop
+                        # therefore declared the residual BLOCKED naming
+                        # nothing: `{"blocked": [], "merged": [], "outcome":
+                        # "BLOCKED"}`, with the node still PENDING at attempt 2
+                        # and no block_reason — a run that stops with work left
+                        # to do and reports it as a mystery. Reproduced 8 times
+                        # in 40 whenever a worker returned before the
+                        # watchdog's verdict committed.
+                        #
+                        # Waiting is bounded rather than open-ended: if no
+                        # verdict ever lands, §11.2's backstop declares STUCK,
+                        # which is the truthful answer for a run that stopped
+                        # with something in flight. The wait is on the
+                        # cancellation event so a cancel stays responsive.
+                        self._cancelled.wait(_SETTLING_POLL_S)
+                        continue
+                    break
 
                 done, _ = _wait_any(list(in_flight.items()))
                 for node_id in done:
@@ -536,12 +722,47 @@ class Scheduler:
                     rp.Classification(retry_class=retry_class, reason=reason),
                     record=attempt, allow_watchdog_fence=True)
 
+        def exit_status_observed(attempt: st.AttemptRecord) -> bool:
+            """Whether something other than the watchdog sees this process end.
+
+            §9.7: an artifact a worker wrote outranks any status a supervisor
+            observes about that worker, and absence of a process is not
+            absence of output. The watchdog is the supervisor here, and this
+            is the fact that tells it when it is not the component entitled to
+            rule — which depends on who holds the process handle, so the
+            scheduler answers it rather than the watchdog guessing.
+
+            A **code** node's command is started by the harness itself, as the
+            leader of its own process group (§8.3), and the runner polls that
+            handle until it exits and returns the exit code the verification
+            predicate then reads (§7.3). Its exit is fully accounted for, and
+            a healthy fast command — the measured case exits in milliseconds —
+            is otherwise convicted PROCESS_DEAD purely for finishing between
+            two polls.
+
+            An **agent** node's process is spawned by the herdr server. §8.3
+            is explicit that herdr's recorded surface exposes no pid and no
+            process group, so Maestro holds no handle and nothing else can see
+            that process end: absence really is the only signal, which is the
+            case §7.6 wrote the signal for, and it keeps its full force.
+
+            Worth recording because it inverts what the code looked like: the
+            signal was **unreachable** for the kind it was written for — an
+            agent attempt's `pid` is `handle.process_group`, which §16.3 item
+            17 establishes is never populated — and **armed** for the one kind
+            whose completion the harness already observes. It fired only where
+            it was wrong.
+            """
+            node = self.nodes.get(attempt.node_id)
+            return node is not None and node.kind is st.NodeKind.CODE
+
         watchdog = wd.Watchdog(
             config=self.config,
             attempts_provider=running_attempts,
             write_heartbeat=store.record_heartbeat,
             kill=kill,
             fail_attempt=fail,
+            exit_status_observed=exit_status_observed,
             time_source=time.time)
 
         backstop = wd.RunBackstop(
@@ -571,6 +792,13 @@ class Scheduler:
                 if unmet:
                     why = f" (waiting on {', '.join(sorted(unmet))})"
             lines.append(f"  {record.node_id}: {record.state}{why}")
+        # §8.3's pre-merge hygiene report. Surfaced here as well as on the
+        # RunReport because a stalled run is exactly when an operator is
+        # looking for what the harness itself did, and a runner adapter
+        # rewriting the tree after every post-gate is that shape.
+        for node_id, entries in sorted(self._adapter_hygiene.items()):
+            lines.append(f"  {node_id}: harness hygiene — "
+                         + "; ".join(entries))
         # §7.8 — panes a resumed process could not reach are recorded in
         # `orphans` and reported here. The scheduler never adopts them and
         # never kills them, so if this text does not name them the stated cost
@@ -615,8 +843,31 @@ class Scheduler:
             if (context.record is not None
                     and not self._cancelled.is_set()
                     and self._owns_running(context.record)):
-                signal = rp.FailureSignal(
-                    node_kind=node.kind, exception_type=type(exc).__name__)
+                # A `LaunchFailed` names its own class in a typed enum member,
+                # so `classify`'s launcher branch is reachable from the real
+                # adapter for the first time (§16.3 item 42). Every other
+                # exception still falls to the ENVIRONMENTAL default,
+                # unchanged and fail-closed.
+                # `classify_with_containment` rather than bare `classify`:
+                # §7.5 requires that *any* exception reaching a worker's
+                # top-level handler without a classification default to
+                # ENVIRONMENTAL, and a build that raises while turning a raw
+                # failure into a signal is precisely an engine bug rather than
+                # a fact about the code under test. Bare `classify` left that
+                # to the shape of the build happening not to raise, which is a
+                # property of today's fields rather than an invariant.
+                #
+                # `classified_failure`, not `failure`: a refusal the launcher
+                # typed as deterministic is upgraded to the zero-budget member
+                # so it blocks on its first occurrence naming the refusal,
+                # rather than spending two launches that cannot differ (§16.3
+                # item 46).
+                def build_signal() -> rp.FailureSignal:
+                    return rp.FailureSignal(
+                        node_kind=node.kind, exception_type=type(exc).__name__,
+                        launcher_failure=(exc.classified_failure
+                                          if isinstance(exc, LaunchFailed)
+                                          else None))
                 # `classify` reads none of the signal's ENVIRONMENTAL evidence
                 # by design (§7.5 forbids the lexical shortcut), so its
                 # fall-through returns a classification with no account of
@@ -626,8 +877,9 @@ class Scheduler:
                 # it. Recorded the way `_block_quiescence` records a cause:
                 # type and message, written and never read back (§10.1).
                 self._settle_failure(
-                    node, _with_reason(rp.classify(signal),
-                                       _exception_reason(exc)),
+                    node, _with_reason(
+                        rp.classify_with_containment(build_signal),
+                        _exception_reason(exc)),
                     record=context.record)
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
@@ -644,6 +896,8 @@ class Scheduler:
         attempt = wt.create_attempt_worktree(
             self.deps.repo, self.run_id, node.node_id, attempt_no, head,
             Path(self.deps.worktrees_root), Path(self.deps.scratch_root))
+        with self._lock:
+            self._attempt_worktrees[node.node_id] = attempt
         self._require_running(record)
 
         created = wt.check_at_create(attempt)
@@ -679,7 +933,7 @@ class Scheduler:
                     selector and selector in node.outputs
                     and not (attempt.path / selector).exists())
                 pre_verdict = vf.adjudicate_pre_gate(
-                    pre, self.deps.min_cases, selector_unbuilt=unbuilt)
+                    pre, node.gate_min_cases, selector_unbuilt=unbuilt)
         finally:
             # Provision and the pre gate both execute before the measurement
             # bracket; their process groups must be absent before its baseline.
@@ -707,12 +961,34 @@ class Scheduler:
         try:
             execution = self.deps.run_node(
                 attempt, node, record,
-                rp.render_guidance(node, self._guidance.get(node.node_id)),
+                rp.render_guidance(node, self._guidance.get(record.guidance_key)),
                 on_launch, self._cancelled.is_set)
-        finally:
-            # This runs even if the runner raises; classification below cannot
-            # release or block the attempt until its owned group is absent.
+        except BaseException as exc:
+            # §16.3 item 45. The quiesce below used to sit in a bare `finally`,
+            # which is right about ordering and wrong about exceptions: an
+            # exception raised inside a `finally` REPLACES the one in flight,
+            # so a launch that failed before anything was registered blocked
+            # QUIESCENCE_UNPROVEN — terminal — over a process that was never
+            # started, and its own `LaunchFailed` never reached the
+            # containment handler that would have classified it. That is item
+            # 42's discharge defeated for exactly this family of failure.
+            #
+            # The repair is not "treat every failed launch as absent", which
+            # lies for the refusals raised after the pane split. It is to skip
+            # the proof only where the launcher has *stated*, as a typed fact,
+            # that it created nothing to reap — absence by construction rather
+            # than absence asserted. Every other failure is quiesced exactly as
+            # before, and when that quiesce genuinely fails the resulting
+            # QuiescenceFailure carries this exception as its chained context,
+            # so `_block_quiescence`'s cause chain records both.
+            if not _launch_left_nothing_to_reap(exc):
+                self._quiesce(record, "pre-inventory")
+            raise
+        else:
+            # Classification cannot release or block the attempt until its
+            # owned group is absent.
             self._quiesce(record, "pre-inventory")
+        self._record_result(node, record, execution)
         self._require_running(record)
         if execution.launched_pid is not None:
             # A runner that reports its pid only on return still arms the
@@ -753,9 +1029,27 @@ class Scheduler:
                 attempt, measured, after,
                 f"{node.node_id} attempt {attempt_no}")
         self._require_running(record)
-        wt.check_post_commit(
-            attempt, wt.expected_inventory(baseline, measured, after))
+        expected = wt.expected_inventory(baseline, measured, after)
+        committed = wt.check_post_commit(attempt, expected)
         self._require_running(record)
+        if not committed.ok:
+            # §8.3: at the post-commit evaluation a divergence from the
+            # expected full inventory **convicts**. Nothing but the harness has
+            # executed between the after-inventory and §8.4's index refresh, so
+            # a divergence is a stray write inside a window in which nothing is
+            # permitted to write — ENVIRONMENTAL by §8.4's own rule for that
+            # window, a fact about the machine rather than a verdict about the
+            # work. The verdict used to be computed here and dropped on the
+            # floor, which is the same defect as the pre-merge evaluation never
+            # running at all: §8.3 specifies two evaluations with two
+            # consequences and production delivered neither.
+            self._settle_context(context)
+            self._settle_failure(
+                node, rp.Classification(
+                    retry_class=st.RetryClass.ENVIRONMENTAL,
+                    reason=_check_result_reason(committed)),
+                record=record)
+            return
 
         if node.kind is st.NodeKind.AGENT:
             self._require_running(record)
@@ -765,7 +1059,7 @@ class Scheduler:
             verdict = vf.verify_agent_node(
                 envelope_parsed=execution.envelope_parsed,
                 pre_gate=pre_verdict,
-                post_gate=vf.adjudicate_gate(post, self.deps.min_cases),
+                post_gate=vf.adjudicate_gate(post, node.gate_min_cases),
                 permission=permission)
             if not verdict.verified:
                 self._settle_context(context)
@@ -775,6 +1069,25 @@ class Scheduler:
         # The final proof covers post-gates as well as every failure path
         # above. Only then may the scheduler make a durable state transition.
         self._settle_context(context)
+
+        # §8.3's SECOND cleanliness evaluation, after the gate has run and
+        # after the quiesce above — the ordering §8.3 requires, so the report
+        # names the adapter's real residue rather than a still-running
+        # writer's moving target. Its consequence is deliberately not the
+        # post-commit one: the commit was sealed before the gate ran and §8.6
+        # merges the output SHA, so residue here is an adapter hygiene defect
+        # with its paths named and never a merge hazard. Reported, never
+        # convicting — a node that did its work correctly must not be blocked
+        # for the harness's own runner leaving a cache behind.
+        #
+        # It had no production caller at all until now, so §8.3's stated
+        # maintenance signal did not exist: an adapter could leak on every
+        # attempt of every run and nothing would say so.
+        residue = wt.check_pre_merge(attempt, expected)
+        if residue.cleanliness is not None and not residue.cleanliness.clean:
+            self._report_hygiene(node.node_id, tuple(
+                "{0} {1}".format(d.kind, d.path)
+                for d in residue.cleanliness.divergences))
 
         # ── the review gate (§7.3's review-node predicate) ──────────────────
         #
@@ -815,6 +1128,41 @@ class Scheduler:
 
     # ── settling a failed attempt ───────────────────────────────────────────
 
+    def _record_result(self, node: st.PlanNode, record: st.AttemptRecord,
+                       execution: NodeExecution) -> None:
+        """§7.7 — land the agent's declared result in one adjudicated row.
+
+        **Placed here, before `_require_running`, and that ordering is the
+        mechanism rather than an accident.** §7.7 exists for "a reclaimed
+        attempt's late result", and the only way one is produced is an attempt
+        whose envelope arrives after its generation stopped being the live
+        one. Recording after the ownership check would drop exactly the
+        payload the section was written to preserve — the correct FAIL
+        carrying two real findings that vanished behind a byte-identical
+        journal — and would leave `SUPERSEDED` unreachable, so three of the
+        four adjudications would be decoration.
+
+        The adjudication is **not** made here. `verification.adjudicate_result`
+        owns it and judges the result solely against the attempt row it names,
+        never against the node's current state (§7.7); this supplies the row
+        and stores what it returns. The write is unconditional on the verdict
+        because the payload is retained in all four outcomes.
+
+        Silent on absence rather than refusing: a code node has no envelope
+        and an agent whose envelope did not parse has no payload, and neither
+        is a result that failed to land — there was none. `ResultRecord`
+        refuses to exist without a payload, so the guard is a precondition of
+        constructing one, not a policy choice made here.
+        """
+        payload = execution.envelope_payload
+        if payload is None:
+            return
+        adjudged = vf.adjudicate_result(
+            st.ResultRecord(node_id=node.node_id, attempt_no=record.attempt_no,
+                            subject_sha=record.base_sha, payload=payload),
+            self.deps.store.attempts_for(self.run_id, node.node_id))
+        self.deps.store.record_result(self.run_id, adjudged)
+
     def _settle_verdict(self, node: st.PlanNode, verdict: "vf.VerificationVerdict",
                         execution: NodeExecution, record: st.AttemptRecord) -> None:
         """Turn a failed VERIFIED predicate into a classification (§7.5)."""
@@ -835,7 +1183,13 @@ class Scheduler:
         classification = (rp.Classification(retry_class=verdict.retry_class)
                           if verdict.retry_class is not None
                           else rp.classify(signal))
-        self._settle_failure(node, classification, verdict, record)
+        # The adapter's own account of the execution, attached where every
+        # other observation is attached. `_with_reason` never overwrites, and
+        # neither arm above sets one, so this is the ledger's only chance to
+        # record what the launcher saw (§7.6).
+        self._settle_failure(
+            node, _with_reason(classification, execution.launch_detail or None),
+            verdict, record)
 
     def _settle_failure(self, node: st.PlanNode, classification: rp.Classification,
                         verdict: Optional["vf.VerificationVerdict"] = None,
@@ -864,7 +1218,12 @@ class Scheduler:
                 return
 
             retry_class = classification.retry_class or st.DEFAULT_RETRY_CLASS
-            if retry_class is st.RetryClass.SEMANTIC:
+            # `st.mutates_prompt`, not an inline `is SEMANTIC`: §7.5's rule
+            # about which class rewrites the agent's instructions was written
+            # twice, once as that predicate and once as this branch, and two
+            # representations of one rule is the RC1 shape this design
+            # convicts. The predicate owns the rule; this owns acting on it.
+            if st.mutates_prompt(retry_class):
                 lifecycle = store.get_node(self.run_id, node.node_id)
                 if self._semantic_ceiling_reached(
                         node.node_id, lifecycle.granted_extra_attempts):
@@ -880,16 +1239,27 @@ class Scheduler:
                 # rows get — one representation of the failure, not two — and
                 # replaces only this surface's slot: the reviewer's standing
                 # findings, if any, survive into the next prompt.
-                self._guidance[node.node_id] = self._guidance.get(
-                    node.node_id, rp.GuidanceLedger()).with_verification(
+                self._guidance[record.guidance_key] = self._guidance.get(
+                    record.guidance_key, rp.GuidanceLedger()).with_verification(
                         rp.verification_guidance(detail))
             else:
-                budget = self.config.retry_budget(retry_class)
+                # LAUNCHER_TRANSIENT's budget is a property of the member, not
+                # the class: §7.5 gives CREDENTIAL zero and the rest one or
+                # two. `config.retry_budget` cannot express that, so asking it
+                # alone gave a credential refusal the same two retries as a
+                # dropped transport — the zero-retry rule stated in §7.5 and
+                # implemented in `launcher_retry_budget` had no caller.
+                budget = (rp.launcher_retry_budget(
+                              self.config, classification.launcher_failure)
+                          if retry_class is st.RetryClass.LAUNCHER_TRANSIENT
+                          else self.config.retry_budget(retry_class))
                 spent = store.attempts_spent(
                     self.run_id, node.node_id, retry_class)
                 if spent >= budget:
                     store.mark_blocked(
-                        self.run_id, node.node_id, _budget_reason(retry_class),
+                        self.run_id, node.node_id,
+                        _budget_reason(retry_class,
+                                       classification.launcher_failure),
                         detail=detail or None, retry_class=retry_class)
                     return
 
@@ -945,27 +1315,57 @@ class Scheduler:
             # Replaces only the REVIEW slot: a rejection must not erase what
             # verification said, or the node oscillates between the two
             # surfaces fixing one constraint while regressing the other.
-            self._guidance[node.node_id] = self._guidance.get(
-                node.node_id, rp.GuidanceLedger()).with_review(
+            self._guidance[record.guidance_key] = self._guidance.get(
+                record.guidance_key, rp.GuidanceLedger()).with_review(
                     rp.review_guidance(review))
             store.fail_attempt(self.run_id, node.node_id,
                                st.RetryClass.SEMANTIC,
                                detail=detail, attempt_extra=marker)
 
     def _review_ceiling_reached(self, node_id: str, granted: int) -> bool:
-        """The review ceiling, counting the attempt that is failing right now.
+        """At most `review_ceiling + granted` review-rejected attempts per node.
 
         The same off-by-one `_semantic_ceiling_reached` documents: the policy
         counts marker rows that already exist, and this attempt's marker is
         written by the call this decision gates. Without the increment K would
         admit K+1 attempts.
+
+        `granted` is the same `retry --force` grant the semantic ceiling
+        honours, and here it is also B10's missing operator escape: a review
+        that FAILed for a flaky or environmental reason would otherwise strand
+        the producer, because a byte-identical resubmission replays the stored
+        FAIL rather than being re-reviewed into a different answer.
+
+        This is the only enforcer of that rule. A second copy of it lived in
+        `retry_policy.review_budget_exhausted`, had no production caller, and
+        disagreed with this one by exactly the increment above — two
+        representations of one rule, of which the unused one was wrong (RC1).
+        The prose that justified the rule was carried here when it was deleted.
         """
         attempts = self.deps.store.attempts_for(self.run_id, node_id)
         already = rp.review_attempts_total(attempts, node_id)
         return already + 1 >= self.config.review_ceiling + granted
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
-        """§7.5's ceiling, counting the attempt that is failing right now.
+        """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts
+        per `(run_id, node_id)` across all bases, counting the attempt that is
+        failing right now.
+
+        The ceiling closes the refund loop the per-base scope alone leaves
+        unbounded — every unrelated merge mints a new base and re-arms
+        `(node_id, base_sha)`, so without a cumulative bound total spend scales
+        with the number of merges rather than with the node.
+
+        `granted` is read from the node's lifecycle row
+        (`NodeLifecycle.granted_extra_attempts`) — the authority tier, never
+        the audit tier, per §5.3's runtime-read allowlist — and grants exactly
+        one attempt beyond `K` per `retry --force` invocation without raising
+        the cap.
+
+        This is the only enforcer. `retry_policy.semantic_budget_exhausted`
+        stated the same rule without the increment below and had no production
+        caller; it was deleted rather than kept as a second, wrong copy, and
+        its justification is the two paragraphs above.
 
         The retry policy counts SEMANTIC rows that already exist, and the
         attempt currently failing is not one of them yet — its class is
@@ -1024,6 +1424,58 @@ class Scheduler:
             if self._cancelled.is_set():
                 return
             self.deps.store.mark_merged(self.run_id, candidate.node_id)
+            self._remove_merged_worktree(candidate.node_id, result.ancestry_proven)
+
+    def _remove_merged_worktree(self, node_id: str, ancestry_proven: bool) -> None:
+        """§8.8's cleanup for a node that merged with its ancestry proven.
+
+        Nothing removed an attempt worktree before this. `run start`'s
+        `finally` releases the run's *integration* checkout and reclaims
+        stranded integration checkouts, and both are explicit that attempt
+        worktrees are not their business — correctly, since those hold their
+        own attempt branches. So every attempt of every node left a checkout
+        and a branch behind, growing with the run rather than with the graph.
+
+        Three properties of §8.8 are kept exactly:
+
+        * **Only after ancestry is proven.** Deleting an unmerged branch
+          destroys the only copy of the work, and `remove_attempt_worktree`
+          refuses rather than warns. The flag is the merge's own measured
+          answer, passed through rather than re-derived.
+        * **Blocked nodes' worktrees are retained for post-mortem** — by never
+          reaching here, which is the mechanism that function's docstring
+          names.
+        * **Nothing forces.** `git worktree remove` and `git branch -d` are
+          both allowed to refuse, and a refusal is reported rather than
+          overridden: a worktree that will not come away cleanly is evidence
+          about the attempt.
+
+        The refusal is reported and not raised. This runs on the merge loop
+        thread, where an exception would abandon the remaining frontier and
+        turn a leaked directory into a lost run — a cleanup failure must not
+        be more destructive than the leak it is cleaning up. It lands on the
+        same operator-visible surface as §8.3's hygiene report.
+        """
+        with self._lock:
+            attempt = self._attempt_worktrees.pop(node_id, None)
+        if attempt is None:
+            return
+        try:
+            wt.remove_attempt_worktree(
+                attempt, ancestry_proven=ancestry_proven,
+                integration_path=Path(self.deps.integration_path))
+        except (wt.WorktreeError, OSError) as exc:
+            self._report_hygiene(node_id, (
+                "attempt worktree {0} was not removed: {1}".format(
+                    attempt.path, exc),))
+
+    def _report_hygiene(self, node_id: str, entries: Tuple[str, ...]) -> None:
+        """Add harness-hygiene facts about one node without losing the others."""
+        if not entries:
+            return
+        with self._lock:
+            self._adapter_hygiene[node_id] = (
+                self._adapter_hygiene.get(node_id, ()) + entries)
 
     # ── §8.8 final acceptance, and §7.3's declaration ───────────────────────
 
@@ -1070,6 +1522,7 @@ class Scheduler:
             upstream_blocked=store.upstream_blocked(self.run_id),
             acceptance=acceptance,
             ancestry=dict(acceptance.ancestry) if acceptance else {},
+            adapter_hygiene=dict(self._adapter_hygiene),
             review_findings={
                 node_id: findings
                 for node_id, findings in self._review_findings.items()
@@ -1128,7 +1581,7 @@ class Scheduler:
             return AcceptanceResult(
                 green=False, specs=specs, gate=gate, ancestry=ancestry,
                 reason="cancellation requested during the final integration gate")
-        verdict = vf.adjudicate_gate(gate, self.deps.min_cases)
+        verdict = vf.adjudicate_gate(gate, self.deps.integration_min_cases)
         if time.monotonic() > deadline:
             return AcceptanceResult(green=False, specs=specs, gate=gate,
                                     ancestry=ancestry,
@@ -1185,10 +1638,50 @@ def _is_merged(store, run_id: str, node_id: str) -> bool:
                for r in store.node_records(run_id))
 
 
-def _budget_reason(retry_class: st.RetryClass) -> st.BlockReason:
+def _budget_reason(retry_class: st.RetryClass,
+                   launcher_failure: Optional[rp.LauncherFailure] = None
+                   ) -> st.BlockReason:
+    """The block a spent budget writes.
+
+    CREDENTIAL is separated because §7.5 gives it a *zero* budget: it blocks
+    on its first occurrence having spent no retry at all, so
+    LAUNCHER_BUDGET_EXHAUSTED would tell an operator a budget ran out when
+    none ever existed. `BlockReason.CREDENTIAL_REFUSED` had no production
+    writer before this, though §11.3's escape table already carries a row for
+    it — the reason existed, and nothing could produce it.
+
+    The default keeps the watchdog's call site correct rather than merely
+    compiling: a stall is never a launcher failure, so it passes no member and
+    lands on the environmental arm exactly as it did before.
+    """
     if retry_class is st.RetryClass.LAUNCHER_TRANSIENT:
+        if launcher_failure is rp.LauncherFailure.CREDENTIAL:
+            return st.BlockReason.CREDENTIAL_REFUSED
+        if launcher_failure in rp.DETERMINISTIC_LAUNCHER_FAILURES:
+            # Same reasoning one member over: the budget was zero, so saying
+            # it was exhausted describes a spend that never happened and
+            # points the operator at a number instead of at the refusal
+            # (§16.3 item 46).
+            return st.BlockReason.LAUNCH_REFUSED
         return st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED
     return st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+
+
+#: How long the loop pauses while a node is mid-verdict. Short enough that a
+#: settled verdict is picked up promptly, long enough not to spin a core.
+_SETTLING_POLL_S = 0.05
+
+
+def _launch_left_nothing_to_reap(exc: BaseException) -> bool:
+    """Whether a failed launch typed itself as having created no pane.
+
+    Structural on both counts: the exception's *type*, which §7.5 names among
+    the facts a classifier may read, and a typed boolean the launcher set. No
+    message is inspected — `LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:...`
+    carries its code in prose and matching that prefix is the shortcut §7.5
+    forbids (§16.3 item 45).
+    """
+    return isinstance(exc, LaunchFailed) and not exc.pane_created
 
 
 def _with_reason(classification: rp.Classification,
@@ -1213,10 +1706,32 @@ def _exception_reason(exc: BaseException) -> str:
 
 
 def _check_result_reason(result: "wt.CheckResult") -> str:
-    """Which §8.3 check failed, from the check's own typed detail."""
-    if result.detail:
-        return "{0} check failed: {1}".format(
-            result.stage, "; ".join(result.detail))
+    """Which §8.3 check failed, from the check's own typed detail.
+
+    `CheckResult.detail` carries the three git-side checks only, so a
+    cleanliness failure — the check with no git symptom at all — arrived at
+    the ledger as the bare stage name. §8.3 says a divergence is reported
+    "with the paths named", and an operator told only "post-commit check
+    failed" has to re-run the attempt to learn which path convicted it. The
+    divergences are typed (`Divergence.kind`, `.path`), so they are rendered
+    here beside the git detail rather than summarised into prose.
+
+    Bounded, because a pathological delta could otherwise write an unbounded
+    row: the count is always stated and the first few paths are named, which
+    is enough to identify the writer.
+    """
+    parts: List[str] = list(result.detail)
+    cleanliness = result.cleanliness
+    if cleanliness is not None and not cleanliness.clean:
+        shown = cleanliness.divergences[:8]
+        named = ", ".join(
+            "{0} {1}".format(d.kind, d.path) for d in shown)
+        parts.append("{0} path(s) diverge from the expected inventory: {1}{2}"
+                     .format(len(cleanliness.divergences), named,
+                             ", ..." if len(cleanliness.divergences) > len(shown)
+                             else ""))
+    if parts:
+        return "{0} check failed: {1}".format(result.stage, "; ".join(parts))
     return "{0} check failed".format(result.stage)
 
 
@@ -1243,6 +1758,13 @@ def _failure_detail(classification: rp.Classification,
     reason = getattr(classification, "reason", None)
     if reason:
         detail["reason"] = reason
+    if classification.launcher_failure is not None:
+        # Typed, not prose: which of §7.5's four launcher triggers convicted
+        # this attempt. `reason` above carries the adapter's own message for a
+        # human to read; this is the field a later reader can count, and it is
+        # what tells CREDENTIAL_REFUSED apart from a spent launcher budget
+        # without re-deriving it from the block reason.
+        detail["launcher_failure"] = classification.launcher_failure.value
     if verdict is not None:
         detail["clause"] = verdict.failed_clause
         if verdict.reason:

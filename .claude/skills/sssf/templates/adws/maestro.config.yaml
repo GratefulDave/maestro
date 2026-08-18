@@ -50,3 +50,26 @@ execution:
   # from semantic_ceiling. Three total: reject, reject, reject -> the lane
   # blocks REVIEW_BUDGET_EXHAUSTED with the findings reported.
   review_ceiling: 3
+  # Section 7.5's two non-semantic budgets, plus the credential rule's zero.
+  # These are the numbers the scheduler spends on faults that are not the
+  # code's fault: an OS error, a timeout, a git failure, a pane that would not
+  # allocate. CREDENTIAL is zero on purpose -- retrying a rejected credential
+  # cannot produce a different answer, and spending a budget on it only delays
+  # the refusal an operator has to act on.
+  environmental_retries: 2
+  launcher_retries: 2
+  credential_retries: 0
+  # Section 8.3's provision step: the ecosystem's setup command, run in every
+  # attempt's fresh worktree after `git worktree add` and before the pre-node
+  # gate and the baseline inventory. Real argv, one list entry per word.
+  #
+  # Omitted here because this template ships a Python factory whose gates are
+  # pytest, and section 9.3's default for such a runner is a no-op. A
+  # JavaScript or TypeScript installation MUST set it -- without an install
+  # step every gate in the repository is red because nothing is installed, and
+  # section 7.4's falsifiable pre-gate then proves nothing about the work:
+  #
+  #   provision: ["npm", "ci"]
+  #
+  # Use the ecosystem's concurrency-safe install invocation. Up to
+  # `concurrency` provisions may share the download cache at once.

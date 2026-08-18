@@ -805,12 +805,27 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         outcomes = []
         thread = threading.Thread(target=lambda: outcomes.append(coordinator.run()))
         thread.start()
-        self.assertTrue(runner.started.wait(timeout=1.0))
-        self.store.request_cancellation("workspace-run")
-        started = time.monotonic()
-        thread.join(timeout=0.5)
-        elapsed = time.monotonic() - started
+        # A generous bound, because reaching the first dispatch is a
+        # precondition of this test rather than anything it asserts. Measured
+        # over 15 runs on an idle machine, the coordinator takes 0.735s to
+        # 1.154s to get here — real git subprocess work in its pre-dispatch
+        # phase, not a lease wait and not a hang — so the previous 1.0s bound
+        # sat at the mean of the distribution it was measuring and failed
+        # roughly 8 runs in 20. What this test is actually for is the
+        # cancellation bound below, and that one is deliberately unchanged.
+        #
+        # Released and joined in the `finally`, whatever happens here. When
+        # this assertion fired mid-flight the coordinator thread was left
+        # running, `tearDown` closed the store under it, and the failure was
+        # reported as `sqlite3.ProgrammingError: Cannot operate on a closed
+        # database` — a consequence of the timeout that read like a database
+        # defect.
         try:
+            self.assertTrue(runner.started.wait(timeout=20.0))
+            self.store.request_cancellation("workspace-run")
+            started = time.monotonic()
+            thread.join(timeout=0.5)
+            elapsed = time.monotonic() - started
             self.assertFalse(thread.is_alive())
             self.assertLess(elapsed, 0.5)
             self.assertEqual(outcomes, [wm.WorkspaceOutcome.BLOCKED])
@@ -821,7 +836,12 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         finally:
             runner.release_cancel.set()
             runner.release_worker.set()
-            self.assertTrue(runner.worker_finished.wait(timeout=1.0))
+            # Still asserted — it is the leak check, not cleanup: the worker
+            # must actually finish rather than be abandoned. Only the bound is
+            # relaxed, and the join after it is what keeps `tearDown` from
+            # closing the store under a thread that is still running.
+            self.assertTrue(runner.worker_finished.wait(timeout=5.0))
+            thread.join(timeout=5.0)
 
 
     def test_failed_participant_retries_unproven_cleanup_before_blocking(self):
