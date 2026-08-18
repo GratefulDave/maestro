@@ -886,8 +886,15 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 window_factory(None).launch()
                 return "reviewed"
 
-            with mock.patch.object(maestro.agent_pi, "context_window",
-                                   return_value=400000), \
+            # B13's preflight resolves the model through omp's merged
+            # catalog. Stubbing the catalog keeps this test about the launch
+            # environment instead of about whichever models this machine has
+            # registered.
+            with mock.patch.object(
+                    maestro.agent_pi, "catalog",
+                    lambda: (("openai-codex", "gpt-5.6-sol", 400_000),)), \
+                    mock.patch.object(maestro.agent_pi, "context_window",
+                                      return_value=400000), \
                     mock.patch.object(maestro.finalization_window,
                                       "FinalizationWindow", CapturedWindow), \
                     mock.patch.object(maestro.code_review, "review_attempt",
@@ -974,6 +981,8 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 cr.review_objects(("a.py",), OUTPUT_SHA))
             with mock.patch.object(maestro.launcher, "HerdrLauncher",
                                    FakeLauncher), \
+                    mock.patch.object(maestro.agent_pi, "catalog",
+                                      lambda: (("stub", "m", 400_000),)), \
                     mock.patch.object(maestro.finalization_window,
                                       "FinalizationWindow", CapturedWindow):
                 maestro._reviewer_window_factory(args)(matrix)

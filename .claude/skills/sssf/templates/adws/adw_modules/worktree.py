@@ -352,17 +352,51 @@ def _symlink_blob_id(worktree: Path, relpath: str) -> str:
                 stdin=target).stdout.strip()
 
 
+def _committable_paths(worktree: Path) -> List[str]:
+    """git's own enumeration of this working tree, as relative paths (§8.3).
+
+    `--cached` is every path in the index — including one git tracks in spite
+    of an ignore rule, because tracking is what settles membership, not the
+    rule. `--others --exclude-standard` adds the untracked paths git would
+    still consider part of the tree, and excludes the ones it would not:
+    `.gitignore`, `.git/info/exclude`, and `core.excludesFile` alike, resolved
+    by git rather than re-implemented here. `.git` never appears.
+
+    `-z` because a path containing a newline must survive this readback;
+    quoting it would make the inventory lie about exactly the paths most worth
+    measuring. `--full-name` pins the paths to the tree's top so the caller's
+    working directory cannot shift what a relative path means.
+    """
+    raw = _git(worktree, "ls-files", "-z", "--full-name",
+               "--cached", "--others", "--exclude-standard").stdout
+    return [rel for rel in raw.split("\0") if rel]
+
+
 def inventory(worktree: Path) -> Inventory:
-    """Every path in the worktree, tracked and untracked alike, as tuples (§8.3).
+    """Every path git considers part of the worktree, as tuples (§8.3).
 
-    No excludes and no ignore list: the baseline's inclusion of untracked
-    content is load-bearing, because it is what lets conjunct (2) convict
-    tampering with provisioned content that no declared glob covers. The single
-    omission is git's own `.git` administrative path, which git can never
-    commit and which is therefore not content any delta could carry — omitting
-    it is a statement about what git tracks, not a permitted set.
+    The universe is git's, not the filesystem's. A git-ignored path is not
+    content this bracket can measure, commit, or merge: §8.4 stages the
+    measured delta into a private index and §8.5 merges the resulting commit,
+    so a path git will not carry cannot reach the integration branch no matter
+    what any inventory said about it. Enumerating it anyway does not make the
+    check stricter — it makes it wrong in both directions at once. A lane that
+    runs its ecosystem's own install step inside its worktree had the whole
+    dependency tree counted as undeclared writes and lost the attempt to §7.3
+    clause 4, while the delta it did earn was never affected either way.
 
-    Both inventories hash every path in full. A stat-based short-circuit is
+    Untracked content stays in scope, and that is what conjunct (2) needs: a
+    provisioned untracked file git would commit is measured, so tampering with
+    it still convicts unconditionally. Only what git itself excludes is out,
+    which is why this is a statement about membership rather than an allowlist
+    — no name is permitted here, and no caller can name one.
+
+    A path git lists but the tree does not hold — a tracked file deleted in the
+    worktree — is absent from the result, so `delta` sees it as removed. A path
+    that is neither a regular file nor a symlink (a submodule's gitlink, a
+    device node) is not committable content and carries no tuple.
+
+    Every path in scope is hashed in full. A stat-based short-circuit is
     forbidden here (§8.3): an agent that rewrites a provisioned file and
     restores its stat metadata defeats a stat cache, which is the precise hole
     the content hash was chosen to close.
@@ -370,28 +404,12 @@ def inventory(worktree: Path) -> Inventory:
     worktree = Path(worktree)
     regular: List[str] = []
     inv: Inventory = {}
-    for dirpath, dirnames, filenames in os.walk(worktree, followlinks=False):
-        here = Path(dirpath)
-        kept = []
-        for name in dirnames:
-            if name == ".git":
-                continue
-            if (here / name).is_symlink():
-                # A symlink to a directory is content, not a directory to walk.
-                rel = str((here / name).relative_to(worktree))
-                inv[rel] = (MODE_SYMLINK, _symlink_blob_id(worktree, rel))
-                continue
-            kept.append(name)
-        dirnames[:] = kept
-        for name in filenames:
-            if name == ".git":
-                continue
-            full = here / name
-            rel = str(full.relative_to(worktree))
-            if full.is_symlink():
-                inv[rel] = (MODE_SYMLINK, _symlink_blob_id(worktree, rel))
-            else:
-                regular.append(rel)
+    for rel in _committable_paths(worktree):
+        full = worktree / rel
+        if full.is_symlink():
+            inv[rel] = (MODE_SYMLINK, _symlink_blob_id(worktree, rel))
+        elif full.is_file():
+            regular.append(rel)
     for rel, blob in zip(regular, _blob_ids(worktree, regular)):
         inv[rel] = (_mode_class(worktree / rel), blob)
     return inv

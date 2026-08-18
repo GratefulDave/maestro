@@ -282,6 +282,29 @@ def preflight_handoff(text: str, context_window_tokens: Optional[int],
     return estimate
 
 
+#: The routes that publish a context window the harness can measure against.
+#:
+#: B13 says fail closed, and this is what "closed" can mean without lying: on a
+#: route with a model catalog, a model the catalog does not carry is an
+#: unmeasured window and refuses. A route that publishes no catalog at all
+#: publishes nothing to be closed against — refusing every dispatch on it would
+#: not be a size check, it would be a route that no longer launches. Which
+#: routes those are is a fact about the route, so it is named here once rather
+#: than decided at each call site.
+#:
+#: The lookup itself deliberately lives at the CLI rather than here: reading a
+#: route's catalog means importing `agent_pi`, and this module is on the far
+#: side of the `base-execution-import` boundary that `enforcement.py` convicts.
+#: So this module owns the arithmetic and the rule, and the caller owns the
+#: window.
+ROUTES_PUBLISHING_A_WINDOW = ("omp",)
+
+
+def route_publishes_a_window(route: str) -> bool:
+    """Whether `route` has a catalog a prompt can be size-checked against."""
+    return route in ROUTES_PUBLISHING_A_WINDOW
+
+
 # ── B9: the reviewer's input is a declared, validated contract ──────────────
 
 class HandoffIncomplete(RuntimeError):

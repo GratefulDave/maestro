@@ -157,6 +157,19 @@ class RepositoryStateIdentityTest(unittest.TestCase):
 
 
 class OperatorCliTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # B13's builder preflight resolves `agent_model` through omp's merged
+        # catalog before a prompt is dispatched. These tests launch stub models
+        # into fake runners, so the catalog is stubbed to carry them: without
+        # it every launch here refuses for a reason that has nothing to do with
+        # what the test is about, and the assertions would be about whichever
+        # models this machine happens to have registered.
+        patch = mock.patch.object(
+            maestro.agent_pi, "catalog",
+            lambda: (("stub", "model", 400_000), ("stub", "m", 400_000)))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_all_public_verbs_exist_in_the_real_parser(self):
         parser = maestro.build_parser()
         enforcement.assert_verbs(maestro.parser_verbs(parser))

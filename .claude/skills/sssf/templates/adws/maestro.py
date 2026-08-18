@@ -1241,7 +1241,7 @@ def _reviewer_window_factory(args: argparse.Namespace):
 
     def factory(matrix: finalization.ApplicabilityMatrix):
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_path.write_text(json.dumps({
+        prompt_text = json.dumps({
             "matrix": [
                 {"check_id": cell.check_id, "object_id": cell.object_id,
                  "canary": cell.canary.value if cell.canary else None}
@@ -1249,7 +1249,11 @@ def _reviewer_window_factory(args: argparse.Namespace):
             ],
             "plan_digest": matrix.plan_digest,
             "report_path": str(report_path.resolve()),
-        }, sort_keys=True), encoding="utf-8")
+        }, sort_keys=True)
+        # B13 for the finalization reviewer. The matrix grows with the plan, so
+        # this prompt is runtime-sized too.
+        _preflight_prompt(prompt_text, args.reviewer_route, args.reviewer_model)
+        prompt_path.write_text(prompt_text, encoding="utf-8")
         _clear_stale_reviewer_report(report_path)
         handle = None
 
@@ -1348,10 +1352,8 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         # B13 — measured against the reviewer's real window before a pane is
         # allocated, so an oversized handoff is a refusal rather than a
         # confident verdict about something else.
-        provider, _, model_name = str(args.reviewer_model).partition("/")
-        window = agent_pi.context_window(provider, model_name)
         text = handoff.render()
-        code_review.preflight_handoff(text, window)
+        _preflight_prompt(text, args.reviewer_route, args.reviewer_model)
 
         handle_box: Dict[str, Any] = {"handle": None}
 
@@ -2131,6 +2133,44 @@ def _require_session_path(handle: Any, node_id: str, attempt_no: int) -> None:
         "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no))
 
 
+def _preflight_prompt(text: str, route: str, model_spec: str) -> Optional[int]:
+    """Size-check one assembled prompt against its target's window (B13).
+
+    Returns the token estimate when the route publishes a window and the prompt
+    fits, and ``None`` when the route publishes no window at all. Raises
+    `code_review.HandoffTooLarge` when the prompt does not fit, and when a route
+    that has a catalog does not carry this model — an unmeasured window on a
+    measurable route is not a passing one.
+
+    The model is resolved through the route's own catalog rather than split on a
+    slash. `x-ai/grok-4.6` is a *pattern*, and reading its two halves as a
+    provider and an id looks it up under a provider the catalog does not have:
+    the window comes back 0, and a check that fails closed on 0 refuses every
+    launch of a correctly configured lane. Resolution is the catalog's job and
+    it already does it.
+
+    This lives at the CLI rather than beside `preflight_handoff` because
+    reading a catalog means importing `agent_pi`, and `enforcement.py`'s
+    `base-execution-import` check convicts any `adw_modules` policy module that
+    does. The rule and the arithmetic stay in `code_review`; the window is
+    fetched here and passed in.
+
+    Nothing here reads the prompt's content. A length in bytes against a
+    ceiling in tokens is arithmetic on two integers, which is what §1.2 permits.
+    """
+    if not code_review.route_publishes_a_window(route):
+        return None
+    try:
+        provider, model_id = agent_pi.resolve_model(str(model_spec))
+    except ValueError as exc:
+        raise code_review.HandoffTooLarge(
+            "model {0!r} does not resolve in the {1} catalog, so the prompt "
+            "cannot be shown to fit any window: {2} (B13)".format(
+                model_spec, route, exc)) from exc
+    return code_review.preflight_handoff(
+        text, agent_pi.context_window(provider, model_id))
+
+
 def _clear_stale_reviewer_report(report_path: Path) -> None:
     """Remove a report left by an earlier reviewer before launching a new one.
 
@@ -2311,10 +2351,14 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             assert route_runner is not None
             prompt = attempt.scratch / "agent-prompt.txt"
             envelope = attempt.scratch / "agent-envelope.json"
-            prompt.write_text(
-                _agent_node_prompt(plan.node_by_id()[node.node_id], envelope,
-                                   retry_prompt),
-                encoding="utf-8")
+            prompt_text = _agent_node_prompt(
+                plan.node_by_id()[node.node_id], envelope, retry_prompt)
+            # B13 for the builder. A retry prompt carries guidance derived from
+            # the previous attempt's measured failure, so its size is a runtime
+            # quantity and not an authored one; dispatching one that cannot fit
+            # produces an attempt about a different task rather than an error.
+            _preflight_prompt(prompt_text, args.agent_route, args.agent_model)
+            prompt.write_text(prompt_text, encoding="utf-8")
             handle = _typed_launch(route_runner, route_runner.launch, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
                     args.run_id, node.node_id, record.attempt_no),

@@ -30,7 +30,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .scheduler_types import (
     AttemptRecord,
@@ -500,6 +500,43 @@ _TRUNCATION_MARKER = (
     "above still binds in full]")
 
 
+#: How many offending paths the retry prompt names individually.
+#:
+#: The whole list used to be joined into one line, which is unbounded in the
+#: only place a bound matters: a permission failure whose delta was measured
+#: over a whole dependency tree rendered 16090 paths as a single 1.1MB line.
+#: `_fit` could then do nothing with it but drop it entirely — the surface
+#: header survived, the paths did not, and the prompt told the agent that it
+#: had failed clause 4 without naming one path it wrote. Unbounded and useless
+#: at the same time.
+#:
+#: Twenty, because a breach is shaped like a directory rather than a scatter:
+#: twenty entries show the prefix, the depth, and whether more than one root is
+#: involved, which is what an agent can actually act on, and they cost ~2KB
+#: against a 12,000-character budget the review surface also draws from. One
+#: path per line so that `_fit` can trim the sample from the end and still
+#: leave the count and the first entries standing.
+OFFENDING_PATH_SAMPLE = 20
+
+
+def _offending_path_lines(paths: Sequence[str]) -> List[str]:
+    """The offending paths, bounded, with the total preserved as a count.
+
+    The count is a structural fact about the measured delta and survives
+    whatever the sample elides — an elision that silently changed "16090" into
+    "20" would be the prompt lying about the size of the breach.
+    """
+    total = len(paths)
+    shown = list(paths[:OFFENDING_PATH_SAMPLE])
+    lines = ["Paths written outside this node's declared outputs "
+             f"({total} in total):"]
+    lines.extend("  " + path for path in shown)
+    if total > len(shown):
+        lines.append(f"  ... and {total - len(shown)} more, elided here; the "
+                     "full list is recorded in this attempt's failure detail")
+    return lines
+
+
 def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     lines = ["Verification (§8.3):",
              "A prior attempt for this node did not verify."
@@ -509,8 +546,7 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     if g.reason:
         lines.append(g.reason)
     if g.offending_paths:
-        lines.append("Paths written outside this node's declared outputs: "
-                     + ", ".join(g.offending_paths))
+        lines.extend(_offending_path_lines(g.offending_paths))
     lines.append("Declared outputs: "
                  + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)"))
     return lines
