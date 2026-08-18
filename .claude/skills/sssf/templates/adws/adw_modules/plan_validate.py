@@ -47,7 +47,8 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (Any, Dict, List, Mapping, Optional, Sequence, Set,
+                    Tuple, Union)
 
 try:  # pragma: no cover - typing only
     from typing import Protocol
@@ -673,3 +674,353 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))
     return ValidationResult(Outcome.FINALIZATION_ELIGIBLE,
                             pd.digest_of(stored), ())
+
+
+# ── contract-IR admission: a lane's declared surface must be reachable ──────
+#
+# Recorded failure, run-0120c32064d144c2aa55c344087e0b0a. Plan
+# `cmo-consolidation-l` carried a lane, `lane-p1-freeze-and-run-log`, whose
+# requirement was behaviour *over the legacy writers* — freeze them at a
+# high-water mark, and prove no code path updates a historical record in
+# place. Its declared outputs were one new module and that module's test, and
+# the legacy writers appeared in the declared outputs of none of the plan's
+# fourteen lanes. The builder therefore could not write the file the behaviour
+# needed; §8.3's permission-delta check would have rejected it if it had
+# tried; and every attempt produced an out-of-contract workaround that the
+# reviewer correctly rejected. The node burned its whole retry budget on a
+# task no correct attempt could pass, and nothing before the run said so.
+#
+# The gap was invisible to every relation the IR carried, and that is the
+# finding rather than an implementation detail. `seams[].producer` and
+# `.consumer`, `fixtures[].consumer_obligation` and `.prohibited_behavior`,
+# `claims[].object`, `verifiers[].oracle` — all prose. The typed relations
+# that do carry paths — `fixtures[].path` with `affected_lane_ids`,
+# `claims[].subject`, `source_artifacts[].path`, the verifier's argv, and
+# `extensions.maestro.outputs` — were every one of them *satisfied* by that
+# lane: it read `tests/conftest.py`, which is a pinned source artifact, and it
+# gated on the test file it produced. Nothing structural named the legacy
+# writers. So the fact the check needs was not merely hard to reach; it was
+# not declared anywhere, and no predicate over the existing relations could
+# have recovered it.
+#
+# Deciding it from the requirement's prose is refused by §1.2: no lifecycle
+# transition may be caused by free text, and an admission decision is a
+# lifecycle transition. The repair is therefore a declared field —
+# `requirements[].surface`, a list of `{path, mutation}` records — checked
+# structurally against what the plan says each lane may write. The field is
+# **required from v1** rather than optional, on §3.6 B8: a field added later
+# is optional forever, and an optional write surface would be declared by
+# exactly the plans that had one to declare.
+#
+# Two independent declarations are what make the check non-trivial. The
+# requirement says where its behaviour lives; `extensions.maestro.outputs`
+# says what the lane may write; containment between them is a fact neither
+# author of either field states directly. A requirement that names a path no
+# lane can write is refused here, before a run exists. A requirement whose
+# prose and whose declared surface disagree is a semantic question, and it is
+# a single reviewable cell for the plan-contract reviewer (§3.6 B12) rather
+# than an invisible gap — which is the most a structural check can honestly
+# claim, and it is stated here so the claim is not read as more.
+
+
+class SurfaceObligation(str, Enum):
+    """The two admission obligations over a `plan-contract.v1` IR."""
+
+    #: The IR states a surface at all, in the declared shape.
+    SURFACE_DECLARED = "SURFACE_DECLARED"
+    #: Every declared path is reachable from the lane that must satisfy it.
+    SURFACE_REACHABLE = "SURFACE_REACHABLE"
+
+
+SURFACE_OBLIGATIONS: Tuple[SurfaceObligation, ...] = (
+    SurfaceObligation.SURFACE_DECLARED,
+    SurfaceObligation.SURFACE_REACHABLE,
+)
+
+
+#: The three ways a requirement's behaviour can relate to a repository path,
+#: and the containment each one asserts. There is no fourth, and no default:
+#: an unrecognised value is a blocker rather than a guess, because the whole
+#: point of the field is that the author states which of the three it is.
+#:
+#: * ``written`` — the lane must create or modify this path. It must be one of
+#:   that lane's own declared outputs. A dependency's output does not satisfy
+#:   this: writing another lane's output from this worktree is exactly what
+#:   §8.3's permission delta rejects, and §6.4's single-output-owner
+#:   obligation forbids two lanes claiming it.
+#: * ``inherited`` — the behaviour lives in a path some lane in this lane's
+#:   `depends_on` closure produces. The lane reads it; it does not write it.
+#: * ``unmodified`` — the behaviour is asserted over a pre-existing path that
+#:   the plan changes nowhere. It must be a declared, hash-pinned
+#:   `source_artifacts` entry, and it must not appear in any lane's outputs —
+#:   a path some lane rewrites is not unmodified, whoever says otherwise.
+MUTATIONS: Tuple[str, ...] = ("written", "inherited", "unmodified")
+
+
+@dataclass(frozen=True)
+class SurfaceBlocker:
+    """One typed blocker with a JSON pointer into the authored IR.
+
+    Deliberately not `Blocker`: those twelve are obligations over
+    `maestro-plan.v1` stored bytes and their count is asserted as twelve.
+    These two are obligations over the contract IR, which is a different
+    document with different pointers, and merging the two enums would make
+    "the twelve" a sentence again rather than a checkable count.
+    """
+
+    obligation: SurfaceObligation
+    pointer: str
+    message: str
+
+
+def _normalized_path(value: str) -> str:
+    return posixpath.normpath(value)
+
+
+def _is_declarable(path: Any) -> bool:
+    """A relative repository path that does not leave the tree."""
+    if not isinstance(path, str) or not path:
+        return False
+    if path.startswith("/") or "\\" in path or ":" in path:
+        return False
+    return not any(part in (".", "..") for part in path.split("/"))
+
+
+def _lane_outputs(ir: Mapping[str, Any]) -> Dict[str, Set[str]]:
+    """`extensions.maestro.outputs`, normalized, keyed by lane id.
+
+    Malformed shapes resolve to no outputs rather than raising: the ingress
+    boundary already refuses those with `UNMAPPABLE_OUTPUTS`, naming the lane,
+    and a second refusal for the same defect would report one plan error as
+    two in two vocabularies.
+    """
+    extensions = ir.get("extensions")
+    maestro = extensions.get("maestro") if isinstance(extensions, dict) else None
+    declared = maestro.get("outputs") if isinstance(maestro, dict) else None
+    outputs: Dict[str, Set[str]] = {}
+    if not isinstance(declared, dict):
+        return outputs
+    for lane_id, paths in declared.items():
+        if not isinstance(lane_id, str) or not isinstance(paths, list):
+            continue
+        outputs[lane_id] = {_normalized_path(path) for path in paths
+                            if isinstance(path, str) and path}
+    return outputs
+
+
+def _source_paths(ir: Mapping[str, Any]) -> Set[str]:
+    sources = ir.get("source_artifacts")
+    if not isinstance(sources, list):
+        return set()
+    paths: Set[str] = set()
+    for source in sources:
+        if isinstance(source, dict) and isinstance(source.get("path"), str):
+            paths.add(_normalized_path(source["path"]))
+    return paths
+
+
+def _depends_closure(lane_id: str,
+                     depends: Mapping[str, Sequence[str]]) -> Set[str]:
+    """Every lane reachable through `depends_on`, excluding the lane itself.
+
+    Iterative and visited-guarded because a cycle is §6.4's own obligation to
+    report against the projected plan; discovering one here must not hang the
+    admission check that runs before it.
+    """
+    seen: Set[str] = set()
+    frontier: List[str] = list(depends.get(lane_id, ()))
+    while frontier:
+        current = frontier.pop()
+        if current in seen or current == lane_id:
+            continue
+        seen.add(current)
+        frontier.extend(depends.get(current, ()))
+    return seen
+
+
+def _requirement_surface(index: int, requirement: Mapping[str, Any],
+                         blockers: List[SurfaceBlocker]
+                         ) -> List[Tuple[int, str, str]]:
+    """The requirement's surface as `(entry index, path, mutation)` triples.
+
+    Every malformed entry is reported and dropped, so one unreadable record
+    does not hide the reachable/unreachable answer for the records beside it.
+    """
+    pointer = "/requirements/{0}/surface".format(index)
+    declared = requirement.get("surface")
+    if declared is None:
+        blockers.append(SurfaceBlocker(
+            SurfaceObligation.SURFACE_DECLARED, pointer,
+            "requirement {0} declares no surface; a requirement states the "
+            "repository paths its behaviour lives in, so a lane that cannot "
+            "write them is refused before a run starts rather than after a "
+            "node has spent its retry budget".format(
+                requirement.get("requirement_id", "at index {0}".format(index)))))
+        return []
+    if not isinstance(declared, list) or not declared:
+        blockers.append(SurfaceBlocker(
+            SurfaceObligation.SURFACE_DECLARED, pointer,
+            "requirement {0} declares a surface that is not a non-empty "
+            "list".format(requirement.get("requirement_id",
+                                          "at index {0}".format(index)))))
+        return []
+    entries: List[Tuple[int, str, str]] = []
+    for position, entry in enumerate(declared):
+        entry_pointer = "{0}/{1}".format(pointer, position)
+        if not isinstance(entry, dict):
+            blockers.append(SurfaceBlocker(
+                SurfaceObligation.SURFACE_DECLARED, entry_pointer,
+                "a surface entry is a {path, mutation} object"))
+            continue
+        path = entry.get("path")
+        if not _is_declarable(path):
+            blockers.append(SurfaceBlocker(
+                SurfaceObligation.SURFACE_DECLARED, entry_pointer + "/path",
+                "{0!r} is not a relative repository path".format(path)))
+            continue
+        mutation = entry.get("mutation")
+        if mutation not in MUTATIONS:
+            blockers.append(SurfaceBlocker(
+                SurfaceObligation.SURFACE_DECLARED,
+                entry_pointer + "/mutation",
+                "{0!r} is not one of {1}".format(
+                    mutation, ", ".join(MUTATIONS))))
+            continue
+        entries.append((position, _normalized_path(path), mutation))
+    return entries
+
+
+def validate_contract_surface(ir: Mapping[str, Any]
+                              ) -> Tuple[SurfaceBlocker, ...]:
+    """Refuse a `plan-contract.v1` IR whose lane cannot satisfy its contract.
+
+    The question is asked of the whole plan rather than of one lane: a path is
+    reachable when it lies in the lane's own declared outputs, in the outputs
+    of a lane in its `depends_on` closure, or among the hash-pinned source
+    artifacts the plan declares and changes nowhere. Which of the three a
+    requirement means is the requirement's own `mutation`, not an inference,
+    so a `written` path is never satisfied by a sibling's output and an
+    `unmodified` path is never satisfied by one either.
+
+    Nothing here reads `requirements[].text`, `verifiers[].oracle`,
+    `seams[].producer`, `fixtures[].meaning`, or any other free-text field.
+    Every input is a declared path, a declared enumerated value, or a declared
+    id — §1.2.
+    """
+    blockers: List[SurfaceBlocker] = []
+
+    requirements = ir.get("requirements")
+    if not isinstance(requirements, list) or not requirements:
+        blockers.append(SurfaceBlocker(
+            SurfaceObligation.SURFACE_DECLARED, "/requirements",
+            "the plan declares no requirements, so no lane has a contract to "
+            "be checked against; an executable plan states what it must make "
+            "true"))
+        return tuple(blockers)
+
+    outputs = _lane_outputs(ir)
+    every_output: Set[str] = set()
+    for paths in outputs.values():
+        every_output |= paths
+    pinned = _source_paths(ir)
+
+    lanes = ir.get("lanes")
+    lane_records = [lane for lane in lanes if isinstance(lane, dict)] \
+        if isinstance(lanes, list) else []
+    depends: Dict[str, Sequence[str]] = {}
+    lanes_by_requirement: Dict[str, List[str]] = {}
+    for lane in lane_records:
+        lane_id = lane.get("lane_id")
+        if not isinstance(lane_id, str) or not lane_id:
+            continue
+        needs = lane.get("depends_on")
+        depends[lane_id] = [need for need in needs
+                            if isinstance(need, str)] \
+            if isinstance(needs, list) else []
+        bound = lane.get("requirement_ids")
+        if not isinstance(bound, list):
+            continue
+        for requirement_id in bound:
+            if isinstance(requirement_id, str) and requirement_id:
+                lanes_by_requirement.setdefault(requirement_id, []).append(
+                    lane_id)
+
+    for index, requirement in enumerate(requirements):
+        if not isinstance(requirement, dict):
+            blockers.append(SurfaceBlocker(
+                SurfaceObligation.SURFACE_DECLARED,
+                "/requirements/{0}".format(index),
+                "a requirement is an object"))
+            continue
+        requirement_id = requirement.get("requirement_id")
+        if not isinstance(requirement_id, str) or not requirement_id:
+            blockers.append(SurfaceBlocker(
+                SurfaceObligation.SURFACE_DECLARED,
+                "/requirements/{0}/requirement_id".format(index),
+                "a requirement declares an id, which is how a lane binds to "
+                "it"))
+            continue
+        entries = _requirement_surface(index, requirement, blockers)
+        owners = lanes_by_requirement.get(requirement_id, [])
+        if not owners:
+            blockers.append(SurfaceBlocker(
+                SurfaceObligation.SURFACE_REACHABLE,
+                "/requirements/{0}/requirement_id".format(index),
+                "{0} is declared by no lane, so no node in this plan can "
+                "satisfy it".format(requirement_id)))
+            continue
+        for lane_id in owners:
+            own = outputs.get(lane_id, set())
+            upstream: Set[str] = set()
+            for upstream_lane in _depends_closure(lane_id, depends):
+                upstream |= outputs.get(upstream_lane, set())
+            for position, path, mutation in entries:
+                pointer = "/requirements/{0}/surface/{1}/path".format(
+                    index, position)
+                if mutation == "written":
+                    if path in own:
+                        continue
+                    holder = sorted(other for other, paths in outputs.items()
+                                    if path in paths)
+                    elsewhere = (
+                        "it is declared as an output of " + ", ".join(holder)
+                        if holder else
+                        "no lane in this plan declares it as an output")
+                    blockers.append(SurfaceBlocker(
+                        SurfaceObligation.SURFACE_REACHABLE, pointer,
+                        "lane {0} must write {1} to satisfy {2}, but {1} is "
+                        "not one of that lane's declared outputs ({3}); {4}. "
+                        "No attempt at this lane can write it, so every "
+                        "attempt either fails the permission-delta check or "
+                        "leaves the contract".format(
+                            lane_id, path, requirement_id,
+                            ", ".join(sorted(own)) or "none", elsewhere)))
+                elif mutation == "inherited":
+                    if path in upstream:
+                        continue
+                    blockers.append(SurfaceBlocker(
+                        SurfaceObligation.SURFACE_REACHABLE, pointer,
+                        "lane {0} inherits {1} for {2}, but no lane in its "
+                        "depends_on closure ({3}) produces it".format(
+                            lane_id, path, requirement_id,
+                            ", ".join(sorted(_depends_closure(lane_id, depends)))
+                            or "empty")))
+                else:
+                    if path not in pinned:
+                        blockers.append(SurfaceBlocker(
+                            SurfaceObligation.SURFACE_REACHABLE, pointer,
+                            "lane {0} asserts unmodified behaviour over {1} "
+                            "for {2}, but {1} is not a declared source "
+                            "artifact, so nothing pins the bytes the "
+                            "assertion is about".format(
+                                lane_id, path, requirement_id)))
+                    if path in every_output:
+                        holder = sorted(other for other, paths in outputs.items()
+                                        if path in paths)
+                        blockers.append(SurfaceBlocker(
+                            SurfaceObligation.SURFACE_REACHABLE, pointer,
+                            "lane {0} asserts {1} is unmodified for {2}, but "
+                            "{3} declares it as an output".format(
+                                lane_id, path, requirement_id,
+                                ", ".join(holder))))
+    return tuple(blockers)

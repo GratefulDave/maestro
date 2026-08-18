@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from . import plan_author
+from . import plan_validate
 
 
 EXECUTABLE_KINDS = frozenset({"implementation", "brownfield", "prd", "workflow"})
@@ -304,6 +305,28 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             },
             "prompt_assets": [],
         })
+
+    # Admission, before anything is written and therefore before a run can
+    # start: a lane whose requirement names a repository path the lane cannot
+    # write has a contract no correct attempt can satisfy, and the node spends
+    # its whole retry budget discovering that. `validate_contract_surface`
+    # reads declared paths, declared mutation kinds, declared ids and the
+    # depends_on graph, and no free text — §1.2.
+    #
+    # It runs here rather than on one caller because this is the chokepoint
+    # every route crosses: `plan author --from-plan-contract` and `plan ship`
+    # both reach a plan file only through `project_draft`. §19 M6 is the
+    # recorded cost of siting a check on a single launch path instead.
+    #
+    # It runs after the per-lane loop so that a malformed lane, verifier or
+    # output set is still refused in its own vocabulary; a surface blocker
+    # about a lane whose outputs never parsed would name the wrong defect.
+    surface_blockers = plan_validate.validate_contract_surface(ir)
+    if surface_blockers:
+        raise IngressError("UNREACHABLE_SURFACE:" + " | ".join(
+            "{} {} {}".format(blocker.obligation.value, blocker.pointer,
+                              blocker.message)
+            for blocker in surface_blockers))
 
     # §8.8's one integration gate, in exactly one of two forms. It used to
     # admit three overlapping ones — `runner` plus `argv`, a `command` line to

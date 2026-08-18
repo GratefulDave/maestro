@@ -272,10 +272,19 @@ class PlanContractVerbFixture(unittest.TestCase):
                 "sha256": hashlib.sha256(readme.encode("utf-8")).hexdigest(),
                 "required": True,
             }],
+            "requirements": [{
+                "requirement_id": "req-ship",
+                "text": "Ship the module.",
+                "surface": [
+                    {"path": "src/shipped.py", "mutation": "written"},
+                    {"path": "README.md", "mutation": "unmodified"},
+                ],
+            }],
             "lanes": [{
                 "lane_id": "lane-ship",
                 "title": "Ship it",
                 "execution_context": ".",
+                "requirement_ids": ["req-ship"],
                 "depends_on": [],
                 "verifier_ids": ["verify-ship"],
             }],
