@@ -56,14 +56,28 @@ you touched, and mirror deliberately rather than assuming a mirror already happe
 
 **State as of 2026-08-18.** The two template copies were reconciled that day and are identical
 for every tracked file — `tests/test_template_parity.py` passes from this repo, and its mirror
-passes from the-library. `lexgenius/adws/` was **not** brought level: its most recent `adws/`
-commit is the reviewer-report fix, so it is missing every launcher, worktree, run-state, and
-reviewer-contract fix that landed after it, and it holds files the template does not
-(`adw_data/`, `adw_sssf_config/`, a stray `worktree.py.orig`) while missing files the template
-does (`code_review.py`, `deliver.py`, `handoff_budget.py`, `tests/conftest.py`). Do not read
-"reconciled" as covering the deployment. Re-derive this paragraph with `diff -rq` before relying
-on it; it is a dated observation, not an invariant, and the only invariant here is the parity
-test between the two template copies.
+passes from the-library. Neither deployment was brought level, and the cost of that is now
+measured rather than assumed. `lexgenius-pipeline/adws/` still differs from the template in
+twelve modules and seventeen test modules, and is missing `handoff_budget.py` outright. The
+divergence that matters is in `code_review.py`: the deployed copy has **no `_node_goal`
+function**, so the M1 reviewer-contract fix has never reached it, and run
+`run-0120c32064d144c2aa55c344087e0b0a` had every reviewer told "Make the gate '…' pass over
+selector '…', changing only the declared outputs" — verbatim, while the plan it was running
+carried the correct instruction. See §19 M13. `lexgenius/adws/` is behind by at least as much:
+its most recent `adws/` commit is the reviewer-report fix, so it is missing every launcher,
+worktree, run-state, and reviewer-contract fix that landed after it, and it holds files the
+template does not (`adw_data/`, `adw_sssf_config/`, a stray `worktree.py.orig`).
+
+Do not read "reconciled" as covering either deployment, and do not read a `diff -rq` filename as
+a cost — `code_review.py` was reported as differing the whole time it was silently degrading
+every review in that deployment. Re-derive this paragraph with `diff -rq` before relying on it;
+it is a dated observation, not an invariant, and the only invariant here is the parity test
+between the two template copies. For the one divergence with a known behavioural cost there is a
+direct check, which is cheaper than reading a diff and states what it means:
+
+```bash
+grep -c "def _node_goal" <deployment>/adws/adw_modules/code_review.py   # 0 = reviewers are judging against a placeholder
+```
 
 `maestro.config.yaml` is deliberately *not* copied from a deployment. It is deployment-specific:
 its lane vendors, models, and concurrency name a particular installation. The template's copy
