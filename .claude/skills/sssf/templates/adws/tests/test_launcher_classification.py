@@ -58,7 +58,7 @@ def red_gate() -> "wt.GateResult":
 
 def agent_node(node_id: str = "a") -> st.PlanNode:
     return st.PlanNode(node_id=node_id, kind=st.NodeKind.AGENT, depth=0,
-                       outputs=(node_id + ".py",),
+                       outputs=(node_id + ".py",), instruction="Build " + node_id,
                        gate_command=("pytest",), gate_selector="k")
 
 

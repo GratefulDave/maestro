@@ -323,6 +323,12 @@ class ReviewHandoff(BaseModel):
     #: The acceptance contract. B9's third missing field.
     gate_command: List[str]
     gate_selector: str
+    #: §10.2's counting threshold, which is half of what the gate demands.
+    #: A gate over one new module passes on one test and on seven; the plan
+    #: that asked for seven said so here and nowhere else, so a reviewer
+    #: shown the command alone cannot tell a satisfied acceptance contract
+    #: from a third of one.
+    gate_min_cases: int = 1
     base_sha: str
     output_sha: str
     diff: str
@@ -385,6 +391,9 @@ class ReviewHandoff(BaseModel):
         if self.gate_command:
             lines.append("  " + " ".join(self.gate_command))
             lines.append(f"  selector: {self.gate_selector or '(none)'}")
+            lines.append(
+                f"  and it must collect at least {self.gate_min_cases} "
+                "passing case(s)")
         else:
             lines.append("  (code node: acceptance is the command's exit code)")
         lines.extend([
@@ -685,10 +694,11 @@ def build_handoff(
         run_id=run_id,
         node_id=node.node_id,
         node_kind=node.kind.value,
-        instruction=getattr(node, "instruction", "") or _fallback_instruction(node),
+        instruction=_node_goal(node),
         declared_outputs=list(node.outputs),
         gate_command=list(node.gate_command),
         gate_selector=node.gate_selector or "",
+        gate_min_cases=node.gate_min_cases,
         base_sha=base_sha,
         output_sha=output_sha,
         diff=diff,
@@ -705,16 +715,41 @@ def build_handoff(
     ).require_complete()
 
 
-def _fallback_instruction(node: st.PlanNode) -> str:
-    """A node with no stored instruction still owes the reviewer a goal.
+class InstructionNotCarried(HandoffIncomplete):
+    """An agent node reached the reviewer with no instruction on it.
 
-    Derived from what the node declares rather than left blank, because
-    `require_complete` refuses a blank one and a refused launch is worse than
-    a thin goal when the plan genuinely carries none.
+    Kept as its own class because the two ways a goal can be missing are not
+    the same failure and must not be handled the same way. A code node has no
+    instruction to carry — its goal *is* its command (§6.2), and deriving one
+    from that command is reading the contract, not guessing at it. An agent
+    node's instruction is `min_length=1` in the plan model, so a blank one
+    cannot be a plan that omitted a goal; it can only be a projection that
+    dropped one, and that is exactly the state the system shipped in.
+
+    So this is a refusal rather than a fallback. A fallback here would rebuild
+    the defect it is meant to catch: the derivable goal is "make your own gate
+    pass", which is not independent of the thing the reviewer is judging, and
+    it is indistinguishable in the prompt from a real instruction that happens
+    to be terse. Refusing fails closed at the one place that can still tell
+    the difference — before a reviewer pane opens, with the node named.
+    """
+
+
+def _node_goal(node: st.PlanNode) -> str:
+    """The goal the plan declared for this node, by node kind (§1.1 item 4).
+
+    An agent node's goal is carried; a code node's goal is its command, which
+    is what a code node declares in place of an instruction.
     """
     if node.kind is st.NodeKind.CODE:
         return ("Run the command {0!r} and change only the declared outputs."
                 .format(" ".join(node.command)))
-    return ("Make the gate {0!r} pass over selector {1!r}, changing only the "
-            "declared outputs.".format(" ".join(node.gate_command),
-                                       node.gate_selector or ""))
+    if not node.instruction.strip():
+        raise InstructionNotCarried(
+            "{0}: the reviewer's contract has no instruction. An agent node's "
+            "instruction is required and non-empty in the plan, so this is a "
+            "projection that dropped it, not a plan that omitted it. Deriving "
+            "one from the node's own gate is what made every agent node in "
+            "every run reviewable only against 'make this command pass' "
+            "(B9).".format(node.node_id))
+    return node.instruction

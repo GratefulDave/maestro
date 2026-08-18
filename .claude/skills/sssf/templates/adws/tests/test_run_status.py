@@ -29,9 +29,11 @@ from adw_modules import scheduler_types as st
 
 AGENT_NODE = st.PlanNode(
     node_id="lane-one", kind=st.NodeKind.AGENT, depth=0,
+    instruction="Build lane one.",
     gate_command=("pytest",), gate_selector="tests/test_one.py")
 SECOND_NODE = st.PlanNode(
     node_id="lane-two", kind=st.NodeKind.AGENT, depth=0,
+    instruction="Build lane two.",
     gate_command=("pytest",), gate_selector="tests/test_two.py")
 
 

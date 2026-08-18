@@ -192,6 +192,7 @@ class SchedulerFixture(unittest.TestCase):
                            outputs=tuple(outputs if outputs is not None
                                          else (f"{node_id}.py",)),
                            specs=tuple(specs),
+                           instruction=f"Build {node_id}.",
                            gate_command=("gate",), gate_selector=f"tests/{node_id}")
 
     def code(self, node_id, depth=0, needs=(), outputs=(), expects_changes=False):

@@ -175,7 +175,7 @@ class PlanNodeTests(unittest.TestCase):
     def agent(self, **kw):
         base = dict(node_id="n1", kind=st.NodeKind.AGENT, depth=0,
                     gate_command=("pytest",), gate_selector="tests/test_n1.py",
-                    outputs=("src/n1.py",))
+                    outputs=("src/n1.py",), instruction="Build n1.")
         base.update(kw)
         return st.PlanNode(**base)
 

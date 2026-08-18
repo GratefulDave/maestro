@@ -80,6 +80,7 @@ def cell(check_id, object_id, status, severity, message="", canary=None):
 def a_node(node_id="build"):
     return st.PlanNode(node_id=node_id, kind=st.NodeKind.AGENT, depth=0,
                        outputs=(f"{node_id}.py",),
+                       instruction=f"Implement {node_id} as the plan declares.",
                        gate_command=("pytest",),
                        gate_selector=f"tests/{node_id}")
 

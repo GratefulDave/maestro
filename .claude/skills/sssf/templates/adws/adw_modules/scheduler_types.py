@@ -323,6 +323,25 @@ class PlanNode:
     gate_min_cases: int = 1
     command: Tuple[str, ...] = ()
     expects_changes: bool = False
+    #: §3.6 B9's first field of the reviewer's declared contract: what this
+    #: node was asked to do, carried verbatim from the plan.
+    #:
+    #: It lives on the node because the reviewer is handed a node, not a plan.
+    #: It used to live nowhere: `Plan.to_plan_nodes` copied the id, needs,
+    #: outputs and gate and dropped `instruction`, so `build_handoff` read it
+    #: through a `getattr(node, "instruction", "")` that could only ever
+    #: answer `""`. Every agent node in every run therefore reached its
+    #: reviewer with a goal derived from its own gate — "make this command
+    #: pass" — and a reviewer that cannot see the contract judges the diff it
+    #: was given against the only standard it has, which is not the standard
+    #: the plan set.
+    #:
+    #: The empty default belongs to a code node and to no other kind: a code
+    #: node's goal is its command (§6.2), and `AgentNode.instruction` is
+    #: `min_length=1`, so a blank one on an agent node is never a plan the
+    #: author wrote — it is a projection that dropped the field. Both halves
+    #: are refused below rather than defaulted around.
+    instruction: str = ""
 
     def __post_init__(self) -> None:
         if not str(self.node_id).strip():
@@ -361,7 +380,19 @@ class PlanNode:
                 raise ValueError(
                     f"{self.node_id}: §10.2 counts `passed >= min_cases >= 1`; a "
                     "gate demanding zero passing cases is green on an empty run")
+            if not self.instruction.strip():
+                raise ValueError(
+                    f"{self.node_id}: an agent node carries the instruction the "
+                    "plan declared for it (§3.6 B9). `AgentNode.instruction` is "
+                    "min_length=1, so a blank one here is not a plan that omitted "
+                    "a goal -- it is a projection that dropped one, and the "
+                    "reviewer would be handed a goal derived from the very gate "
+                    "it is meant to judge independently")
         else:
+            if self.instruction:
+                raise ValueError(
+                    f"{self.node_id}: a code node's goal is its command (§6.2); an "
+                    "instruction here is a field nothing reads (§12.3)")
             if not self.command:
                 raise ValueError(
                     f"{self.node_id}: a code node's acceptance is its command's exit "

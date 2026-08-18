@@ -66,6 +66,7 @@ INTEGRATION_DECLARED = 70
 def agent_node(node_id: str = "a", min_cases: int = DECLARED) -> st.PlanNode:
     return st.PlanNode(node_id=node_id, kind=st.NodeKind.AGENT, depth=0,
                        outputs=(node_id + ".py",), gate_command=("pytest",),
+                       instruction="Build " + node_id,
                        gate_selector="k", gate_min_cases=min_cases)
 
 
@@ -207,7 +208,7 @@ class DeclaredNumberSurvivesProjectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             st.PlanNode(node_id="a", kind=st.NodeKind.AGENT, depth=0,
                         gate_command=("pytest",), gate_selector="k",
-                        gate_min_cases=0)
+                        instruction="Build a.", gate_min_cases=0)
 
 
 class ToldAndJudgedAreOneNumberTest(unittest.TestCase):
