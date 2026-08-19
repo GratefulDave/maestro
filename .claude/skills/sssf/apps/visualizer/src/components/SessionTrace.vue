@@ -13,6 +13,7 @@ import type {
 } from '../lib/types'
 import { Bot, SquareTerminal, UserRound } from 'lucide-vue-next'
 import { fetchEnvelopes, fetchEvents, fetchGates, fetchSession } from '../lib/api'
+import { tracePayloadAfterError } from '../lib/traceLoad'
 import { axisTicks, fmtDate, payloadOk, ts } from '../lib/format'
 import { modelIcon, modelName } from '../lib/models'
 import { agentColor, hexAlpha, parseAgentStart } from '../lib/events'
@@ -73,7 +74,31 @@ async function tick() {
     apiError.value = null
     loaded.value = true
   } catch (err) {
-    apiError.value = err instanceof Error ? err.message : String(err)
+    const cleared = tracePayloadAfterError(
+      {
+        session: session.value,
+        phases: phases.value,
+        agents: agents.value,
+        usage: usage.value,
+        events: events.value,
+        envelopes: envelopes.value,
+        gates: gates.value,
+        cursor,
+        loaded: loaded.value,
+        apiError: apiError.value,
+      },
+      err,
+    )
+    session.value = cleared.session
+    phases.value = cleared.phases
+    agents.value = cleared.agents
+    usage.value = cleared.usage
+    events.value = cleared.events
+    envelopes.value = cleared.envelopes
+    gates.value = cleared.gates
+    cursor = cleared.cursor
+    loaded.value = cleared.loaded
+    apiError.value = cleared.apiError
   } finally {
     inflight = false
   }
@@ -428,7 +453,7 @@ function selectPhase(p: Phase) {
 
 <template>
   <div class="trace">
-    <div v-if="apiError" class="error-bar">api unreachable — retrying {{ apiError }}</div>
+    <div v-if="apiError" class="error-bar">failed to load session — {{ apiError }}</div>
 
     <div v-if="session" class="run-strip">
       <span class="request" :title="session.request ?? ''">{{ session.request }}</span>

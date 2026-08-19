@@ -53,11 +53,12 @@ Verified against just 1.46.0: `--global-justfile` reads
 is placed on `PATH` and no shell rc file is involved; the recipe carries an
 absolute path, so moving this repository means editing that one line.
 
-Do not start the visualizer with `bun run dev`. That script is `vite` alone: it
-starts the frontend without the API, every `/api` request then fails with
-`ECONNREFUSED`, and the UI sits on `loading sources…` forever while the startup
-output looks entirely successful. `bun run dev:all` starts both but only from
-the visualizer's own directory.
+Do not start the visualizer with `bun run dev`. That script now refuses: it
+prints the commands that start both halves and exits non-zero. It used to start
+Vite alone, every `/api` request then failed with `ECONNREFUSED`, and the UI
+sat on `loading sources…` forever while the startup output looked entirely
+successful. `bun run dev:all` starts both but only from the visualizer's own
+directory. `bun run dev:ui` is Vite alone, for the two-process form below.
 
 ## Running it against a Maestro DAG run
 
@@ -77,7 +78,7 @@ API there and the Vite dev server with `--cwd`:
 ```sh
 cd /path/to/target-repo
 bun run /path/to/maestro/.claude/skills/sssf/apps/visualizer/server/index.ts &
-bun run --cwd /path/to/maestro/.claude/skills/sssf/apps/visualizer dev
+bun run --cwd /path/to/maestro/.claude/skills/sssf/apps/visualizer dev:ui
 ```
 
 Or name the ledgers explicitly — `--db` is repeatable and each database is
