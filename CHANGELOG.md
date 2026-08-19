@@ -407,6 +407,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `skip --accept-sha` names an abbreviated SHA as a shape defect instead of reporting it as an
+  ancestry failure (issue #78). `worktree.is_valid_output_commit` folds shape, existence and
+  ancestry into one boolean — correct for a predicate, useless for a diagnostic — so a SHA that
+  failed the canonical-digest regex, before `cat-file` or `merge-base` ever ran, came back as *"is
+  not a valid output commit descending from attempt base …"*. In the incident that produced this
+  the commit descended from its base perfectly well and `git merge-base --is-ancestor` agreed; the
+  only thing wrong with it was seven hex digits instead of forty. The operator was sent looking for
+  a history problem that did not exist.
+
+  The requirement is deliberately unchanged: skip records a durable identity, and an abbreviation
+  is ambiguous by construction. `worktree.is_object_digest` is now public so a caller that refuses
+  a SHA can say which check it failed, and `skip` tests it first, refusing with the defect and the
+  one-line remedy (`git -C <repo> rev-parse <sha>`).
+
+  `SkipAncestryRefused`'s docstring is corrected with it. It said the exception meant a SHA that is
+  not an ancestor of HEAD; it has always been the refusal channel for every identity check `skip`
+  makes — no attempt base, no checked-out branch, not the current HEAD, an unclean worktree — and
+  the message is what distinguishes them. That is why a message describing a different failure was
+  a defect rather than a wording nit.
+
 - `attempt salvage` reports a declared output git will not commit, instead of committing around it
   in silence (issue #67). A run refuses this at start with `DECLARED_OUTPUT_UNCOMMITTABLE` and the
   scheduler blocks it again at attempt settle; salvage took neither path, so the same node could

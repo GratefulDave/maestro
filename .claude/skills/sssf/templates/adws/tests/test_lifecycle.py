@@ -662,6 +662,57 @@ class EscapeTests(unittest.TestCase):
                 store.skip("run1", "b", accept_sha=bad_sha, repo_path=repo)
             self.assertEqual(store.get_node("run1", "b").state, st.NodeState.BLOCKED)
 
+    def test_skip_names_an_abbreviated_sha_as_a_shape_defect(self):
+        """#78. The refusal must describe the defect it actually found.
+
+        `is_valid_output_commit` folds shape, existence and ancestry into one
+        boolean, so an abbreviated SHA -- which fails on shape, before
+        `cat-file` or `merge-base` ever run -- was reported as not descending
+        from its base. In the incident that produced this, the commit
+        descended from the base perfectly well and `git merge-base
+        --is-ancestor` agreed; the only thing wrong with it was seven hex
+        digits instead of forty. An operator reading that message goes looking
+        for a history problem that does not exist.
+
+        The requirement is deliberately unchanged: skip records a durable
+        identity and an abbreviation is ambiguous by construction. This
+        asserts the message, and that the node stays BLOCKED.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            head = _init_git_repo(repo)
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha=head)
+            store.mark_blocked("run1", "a", st.BlockReason.GATE_NOT_FALSIFIABLE)
+            store.declare_outcome("run1")
+            with self.assertRaises(lc.SkipAncestryRefused) as caught:
+                store.skip("run1", "a", accept_sha=head[:7], repo_path=repo)
+            message = str(caught.exception)
+            self.assertIn("not a full object digest", message)
+            self.assertIn("rev-parse", message,
+                          "the refusal should carry the remedy")
+            self.assertNotIn("descending", message,
+                             "an abbreviated SHA is not an ancestry failure")
+            self.assertEqual(store.get_node("run1", "a").state,
+                             st.NodeState.BLOCKED)
+
+    def test_skip_accepts_the_full_digest_of_that_same_commit(self):
+        """The acquitting arm: the SHA above was fine, only its length was not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            head = _init_git_repo(repo)
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha=head)
+            store.mark_blocked("run1", "a", st.BlockReason.GATE_NOT_FALSIFIABLE)
+            store.declare_outcome("run1")
+            store.skip("run1", "a", accept_sha=head, repo_path=repo)
+            self.assertEqual(store.get_node("run1", "a").state,
+                             st.NodeState.MERGED)
+
     def test_skip_rejects_an_older_ancestor_of_head(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
