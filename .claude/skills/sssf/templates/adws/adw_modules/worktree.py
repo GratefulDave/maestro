@@ -322,13 +322,17 @@ def create_attempt_worktree(repo: Path, run_id: str, node_id: str, attempt_no: i
 
 
 def inventory_at_commit(repo: Path, sha: str) -> Inventory:
-    """The recorded base tree as inventory tuples — a1's before-side.
+    """The recorded base tree as inventory tuples — what git *tracked* at `sha`.
 
-    `take_baseline` walks a live worktree. After the attempt process dies
-    that walk is gone. The recorded base commit is the durable half of the
-    same bracket: every path git tracked at `sha`, with the mode and blob
-    git stored. Provision leftovers git would not commit are out of this
-    universe the same way `inventory` excludes them.
+    This is the durable source for `tracked_at_base`, and nothing else. It is
+    **not** the measurement baseline and must never be substituted for one:
+    §8.3's baseline is the provisioned tree, which deliberately keeps
+    untracked non-ignored content in scope so conjunct (2) can convict
+    tampering with it. A commit holds no untracked path, so the two universes
+    differ by exactly the provisioned untracked set — and reading this as the
+    baseline reports every one of those as a path the attempt added. The
+    baseline is recorded when the bracket opens and read back from the ledger;
+    it is not reconstructable from git.
     """
     result = _git(Path(repo), "ls-tree", "-r", "-z", sha, check=False)
     if result.returncode != 0:
@@ -358,6 +362,20 @@ def reopen_attempt_worktree(
 
     Salvage has to measure in a1's own worktree against a1's own recorded
     base. Creating a new worktree would mint attempt 2's bracket.
+
+    **`baseline` is left `None`, and that is the contract.** The base commit
+    can rebuild `tracked_at_base` — tracking is a property of the commit — but
+    it cannot rebuild the baseline, which §8.3 defines as the *provisioned*
+    tree and which therefore holds untracked paths no commit contains.
+    Handing back `inventory_at_commit` as if it were the baseline made every
+    provisioned untracked path read as a path the attempt added; where one was
+    covered by a declared output it was committed as the attempt's measured
+    delta and signed for (§1.1 item 4). A caller that needs the before-side
+    must supply the one that was recorded when the bracket opened
+    (`LifecycleStore.attempt_baseline`), and `permission_check` and
+    `commit_measured_delta` both refuse a `None` baseline rather than reading
+    it as an empty one — an empty baseline reads *everything* as added, which
+    is worse than the substitution it replaces.
     """
     repo = Path(repo).resolve()
     worktrees_root = Path(worktrees_root).resolve()
@@ -368,12 +386,12 @@ def reopen_attempt_worktree(
     scratch = Path(scratch_root).resolve() / worktree_dirname(run_id, node_id, attempt_no)
     scratch.mkdir(parents=True, exist_ok=True)
     private_index = worktrees_root / f".index-{worktree_dirname(run_id, node_id, attempt_no)}"
-    baseline = inventory_at_commit(repo, base)
+    tracked_at_base = frozenset(inventory_at_commit(repo, base))
     return AttemptWorktree(
         repo=repo, path=path.resolve(), branch=branch, base=base,
         scratch=scratch, private_index=private_index,
         run_id=run_id, node_id=node_id, attempt_no=attempt_no,
-        tracked_at_base=frozenset(baseline), baseline=baseline,
+        tracked_at_base=tracked_at_base, baseline=None,
     )
 
 

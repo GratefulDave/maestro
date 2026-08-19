@@ -286,15 +286,11 @@ def salvage_attempt(
             "SALVAGE_BASE_MOVED",
             f"HEAD is {head}, not the attempt's recorded base {attempt.base}")
 
-    # `reopen_attempt_worktree` fills `baseline` from `inventory_at_commit`,
-    # which is `git ls-tree` of the base commit and therefore tracked paths
-    # only. That is the right derivation for `tracked_at_base` — tracking is a
-    # property of the commit — and the wrong one for the baseline, which
-    # deliberately includes provisioned untracked content (§8.3). Measuring
-    # against the reconstruction attributes every provisioned untracked path
-    # to the attempt, and where one of them falls under the node's declared
-    # outputs the permission check passes and the receipt asserts a sha256 for
-    # bytes no attempt produced. The recorded baseline replaces it here.
+    # `reopen_attempt_worktree` leaves `baseline` unset, because the base
+    # commit cannot rebuild it: `git ls-tree` is tracked paths only and §8.3's
+    # baseline deliberately includes provisioned untracked content. Supplying
+    # the recorded one is what opens the bracket for this measurement, and it
+    # is the only thing that may.
     attempt.baseline = recorded_baseline
     after = wt.inventory(attempt.path)
     measured = wt.delta(attempt.baseline, after)

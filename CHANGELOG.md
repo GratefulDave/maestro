@@ -212,6 +212,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   no record. The signed record now also names the `baseline_digest` the delta was measured
   against.
 
+  `worktree.reopen_attempt_worktree` no longer returns the reconstruction in `baseline` at all.
+  It leaves the field `None`, so the defect is gone rather than merely unreachable from the one
+  caller that overrode it. `tracked_at_base` keeps its derivation from the base commit, which is
+  correct — tracking is a property of the commit. `permission_check` and `commit_measured_delta`
+  already refused a `None` baseline and now have tests pinning that they fail closed rather than
+  reading it as an empty one, together with the control that says why: measured against `{}` the
+  delta claims the tracked file and the provisioned file as well as the deliverable, which is
+  strictly worse than the substitution it would replace.
+
 - `tests/test_coordinator.py` no longer fails one to six of its cases at random under `pytest -n
   auto`, which is this suite's default (issue #50). Six of its thirty-two cases drive the
   coordinator from a thread and then wait for it to reach a participant dispatch or a global gate.
