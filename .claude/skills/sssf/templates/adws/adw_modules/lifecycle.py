@@ -71,6 +71,19 @@ class EscapeRefused(LifecycleError):
     not admit it (§7.3, §11.2) — refusing here is what stops an escape from
     racing a scheduler that may still be alive."""
 
+class SchedulerStillAlive(EscapeRefused):
+    """An escape against RUNNING was refused because the scheduler pid is
+    still a process. The race the node-state gate was standing in for."""
+
+    refusal = st.EscapeRefusal.SCHEDULER_STILL_ALIVE
+
+
+class SchedulerLivenessUnknown(EscapeRefused):
+    """An escape against RUNNING was refused because liveness cannot be
+    said. Fail closed: unknown is not dead."""
+
+    refusal = st.EscapeRefusal.SCHEDULER_LIVENESS_UNKNOWN
+
 
 class ResumeRefused(LifecycleError):
     """`run resume` was attempted against ACCEPTED or CANCELLED (§7.3)."""
@@ -1532,21 +1545,106 @@ class LifecycleStore:
                 f"{outcome.value if outcome else 'NULL'} — an escape against an "
                 "undeclared run would race a scheduler that may still be alive")
 
+    @serialized
+    def _scheduler_claim(self, run_id: str) -> Tuple[Optional[int], Optional[str]]:
+        row = self.conn.execute(
+            "SELECT scheduler_pid, scheduler_host FROM runs WHERE run_id=?",
+            (run_id,)).fetchone()
+        if row is None:
+            raise UnknownNode(f"run {run_id} does not exist")
+        pid = int(row[0]) if row[0] is not None else None
+        return pid, row[1]
+
+    def _require_scheduler_dead(self, run_id: str) -> None:
+        """RUNNING is escapable only when the scheduler is provably not a process.
+
+        The node-state gate (`require_state=BLOCKED`) existed to stop an
+        escape racing a scheduler that may still own the node. That reason is
+        entirely a run-level liveness fact. Fail closed on UNKNOWN.
+        """
+        pid, recorded_host = self._scheduler_claim(run_id)
+        record = RunRecord(
+            run_id=run_id, plan_digest="", created_at="", last_transition_at="",
+            latest_outcome=None, latest_outcome_at=None, cancel_requested=False,
+            scheduler_pid=pid, scheduler_host=recorded_host)
+        alive = scheduler_liveness(record)
+        if alive is True:
+            raise SchedulerStillAlive(
+                f"{run_id}: scheduler pid {pid} is still alive on "
+                f"{recorded_host or scheduler_host()}; an escape against a "
+                "RUNNING node would race a scheduler that is still there")
+        if alive is None:
+            if not pid or pid <= 0:
+                condition = "no scheduler pid is recorded"
+            else:
+                condition = (
+                    f"scheduler pid {pid} was recorded on {recorded_host}, "
+                    "not this host")
+            raise SchedulerLivenessUnknown(
+                f"{run_id}: scheduler liveness is unknown ({condition}); "
+                "refusing rather than guessing the scheduler is dead")
+
+    def _close_running_attempt(
+            self, run_id: str, node_id: str, *,
+            retry_class: Optional[st.RetryClass] = None):
+        """Close the live attempt row in the same transaction as the escape.
+
+        The row stays; only its state (and optional classification) change.
+        Leaving it RUNNING collides the next attempt with §10.3's partial
+        unique index and makes §7.7 adjudicate a late arrival ACCEPTED.
+        """
+        def extra(lifecycle: st.NodeLifecycle):
+            if retry_class is None:
+                return [(
+                    "UPDATE attempts SET state=? "
+                    "WHERE run_id=? AND node_id=? AND state=?",
+                    (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
+                     st.NodeState.RUNNING.value))]
+            return [(
+                "UPDATE attempts SET retry_class=?, state=? "
+                "WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (retry_class.value, CLOSED_ATTEMPT_STATE.value,
+                 run_id, node_id, lifecycle.attempt_no))]
+        return extra
+
+    def _prepare_stranded_running(self, run_id: str, node_id: str, *,
+                                    retry_class: Optional[st.RetryClass] = None):
+        """If the node is RUNNING, demand a dead scheduler and close the attempt.
+
+        Returns `(extra_writes, detail)` for `_transition_node`. BLOCKED is
+        unchanged. Other states fall through to `require_state`.
+        """
+        current = self.get_node(run_id, node_id).state
+        if current is not st.NodeState.RUNNING:
+            return None, None
+        self._require_scheduler_dead(run_id)
+        return (self._close_running_attempt(run_id, node_id,
+                                            retry_class=retry_class),
+                {"scheduler_liveness": False})
+
     def retry(self, run_id: str, node_id: str, *, force: bool = False) -> st.NodeLifecycle:
-        """BLOCKED -> PENDING. `force` grants exactly one extra attempt beyond
-        the semantic ceiling, never raising the cap itself (§7.5, §11.3)."""
+        """BLOCKED -> PENDING, or stranded RUNNING -> PENDING when the
+        scheduler is provably dead. `force` grants exactly one extra attempt
+        beyond the semantic ceiling, never raising the cap itself (§7.5, §11.3)."""
         self._require_escape_legal(run_id)
+        extra, detail = self._prepare_stranded_running(
+            run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL)
         reason = st.Escape.RETRY_FORCE.value if force else st.Escape.RETRY.value
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="operator", reason=reason,
-            require_state=(st.NodeState.BLOCKED,), granted_extra_delta=1 if force else 0)
+            require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
+            granted_extra_delta=1 if force else 0,
+            detail=detail, extra_writes=extra)
 
     def skip(self, run_id: str, node_id: str, *, accept_sha: str, repo_path) -> st.NodeLifecycle:
-        """BLOCKED -> MERGED: the operator supplied the work by hand. Verifies
-        `git merge-base --is-ancestor` and the four worktree checks against the
-        supplied SHA before accepting — it does not bypass those gates (§11.3).
+        """BLOCKED -> MERGED, or stranded RUNNING -> MERGED when the
+        scheduler is provably dead: the operator supplied the work by hand.
+        Verifies `git merge-base --is-ancestor` and the four worktree checks
+        against the supplied SHA before accepting — it does not bypass those
+        gates (§11.3).
         """
         self._require_escape_legal(run_id)
+        extra, detail = self._prepare_stranded_running(run_id, node_id)
         repo = Path(repo_path)
         latest_attempt = self.conn.execute(
             "SELECT base_sha FROM attempts"
@@ -1592,8 +1690,9 @@ class LifecycleStore:
                 "skip does not bypass cleanliness (§11.3)")
         return self._transition_node(
             run_id, node_id, st.NodeState.MERGED, actor="operator",
-            reason=st.Escape.SKIP.value, require_state=(st.NodeState.BLOCKED,),
-            output_sha=accept_sha)
+            reason=st.Escape.SKIP.value,
+            require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
+            output_sha=accept_sha, detail=detail, extra_writes=extra)
 
     def abandon(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         """Any non-absolutely-terminal state -> CANCELLED (§7.3, §7.8, §11.3).
@@ -1603,17 +1702,18 @@ class LifecycleStore:
         rather than a request to stop the machine. Descendants become
         derived-unready (§8.7) with no state written for them at all.
 
+        A RUNNING node is admitted only when the scheduler is provably dead —
+        the same liveness fact retry/skip consult. BLOCKED needs no probe:
+        the declaration already says the scheduler left.
+
         Closes the node's live attempt row in the same transaction, for the
         same reason `cancel_run` does: `abandon` is the node-level form of
         cancellation, and a result arriving from the abandoned attempt must
         adjudicate as SUPERSEDED (§7.7)."""
         self._require_escape_legal(run_id)
-
-        def extra(lifecycle: st.NodeLifecycle):
-            return [(
-                "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND state=?",
-                (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
-                 st.NodeState.RUNNING.value))]
+        extra, _detail = self._prepare_stranded_running(run_id, node_id)
+        if extra is None:
+            extra = self._close_running_attempt(run_id, node_id)
         return self._transition_node(
             run_id, node_id, st.NodeState.CANCELLED, actor="operator",
             reason=st.Escape.ABANDON.value,

@@ -153,6 +153,17 @@ class Escape(str, Enum):
     ABANDON = "abandon"
 
 
+class EscapeRefusal(str, Enum):
+    """Why an escape against a RUNNING node failed closed.
+
+    The race these name is a run-level fact — is the scheduler still a
+    process — not a node-state fact. UNKNOWN is not dead.
+    """
+
+    SCHEDULER_STILL_ALIVE = "SCHEDULER_STILL_ALIVE"
+    SCHEDULER_LIVENESS_UNKNOWN = "SCHEDULER_LIVENESS_UNKNOWN"
+
+
 class BlockReason(str, Enum):
     """Every *stored* reason a node stopped.
 

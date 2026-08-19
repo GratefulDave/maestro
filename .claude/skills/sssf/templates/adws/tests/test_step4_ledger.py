@@ -124,6 +124,9 @@ class PartialUniqueIndexTests(LedgerFixture):
         self.seed("run1", "a")
         self.store.start_attempt("run1", "a", base_sha="sha0")
         self.store.declare_outcome("run1", stuck=True)
+        self.store.conn.execute(
+            "UPDATE runs SET scheduler_pid=?, scheduler_host=? WHERE run_id=?",
+            (2_000_000_000, lc.scheduler_host(), "run1"))
         self.store.abandon("run1", "a")
         live = [a for a in self.store.attempts_for("run1", "a")
                 if a.state is st.NodeState.RUNNING]
