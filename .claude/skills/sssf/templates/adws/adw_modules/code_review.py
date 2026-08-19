@@ -34,11 +34,16 @@ The named invariants this module carries, each a testable object because B15's
 lesson is that an invariant which is only a field is an invariant a rewrite
 silently drops:
 
-* `CodeReportCell`            — A9 + B8: a finding carries a reviewer-assigned
-  grade, a message that locates it, and a reason for the grade, or the report
-  does not parse. Severity is still stamped from the rubric by code and is
-  still unrepresentable to the reviewer (§6.5); the grade is the second axis,
-  and code alone decides what it means.
+* `CodeReportCell`            — A9 + B8 + B9: a finding carries a
+  reviewer-assigned grade, a message that locates it, a reason for the grade,
+  and a scope saying whether the fix lands inside the paths this node may
+  write, or the report does not parse. Severity is still stamped from the
+  rubric by code and is still unrepresentable to the reviewer (§6.5); grade and
+  scope are the second and third axes, and code alone decides what they mean.
+* `FindingScope`              — B9: every rubric question is asked *inside* the
+  node's declared write scope, and a finding whose only remedy is a forbidden
+  path cannot reject. Presenting the reviewer with a declared contract and then
+  asking a question that overruns it is the demand no diff can satisfy.
 * `require_located_findings`  — B8: FAIL is unrepresentable without at least
   one located finding graded at or above the configured threshold.
 * `ReviewHandoff`             — B9: the reviewer's input is a declared,
@@ -88,20 +93,39 @@ CHANGED_FILE = fin.ObjectKind.CHANGED_FILE
 #: the selection rule: a question a passing test already answers does not
 #: belong here, because it would spend a reviewer turn re-deriving something
 #: mechanical, and §10.2's counting rule already owns it.
+#: **Every question is asked inside the node's declared write scope.** Two of
+#: them were not, and the cost is §19's `lane-p4-enrichment-ordering`: the
+#: reviewer read "does this diff do what the node was asked to do" as a demand
+#: that a production caller be wired up, the caller's file was a *different*
+#: node's declared output, `plan_validate`'s single-producer rule forbade this
+#: node from declaring it, and `worktree`'s permission check convicts any
+#: attempt that writes it. The reviewer rejected every diff that did not touch
+#: that path and the permission check rejected every diff that did — six
+#: attempts against a demand no diff could satisfy, ending
+#: `REVIEW_BUDGET_EXHAUSTED`. B9 says the reviewer's input is a declared
+#: contract of goal, `produces` and acceptance; handing it the declared paths
+#: and then asking a question that overruns them is the violation, not the
+#: reviewer's answer to it.
 CODE_RUBRIC = fin.Rubric(
-    version="maestro-code-rubric.v1",
+    version="maestro-code-rubric.v2",
     checks=(
         fin.RubricCheck(
             check_id="diff.implements_the_stated_instruction",
-            question=("Does this diff do what the node was asked to do, rather "
-                      "than something adjacent that happens to pass the gate?"),
+            question=("Within the paths this node was permitted to write, does "
+                      "this diff do what the node was asked to do, rather than "
+                      "something adjacent that happens to pass the gate? Work "
+                      "the instruction names that no permitted path can reach "
+                      "is out of this node's scope — record it out_of_scope "
+                      "rather than as a defect in the diff."),
             applies_to=(DIFF,),
             severity=fin.Severity.BLOCKING),
         fin.RubricCheck(
             check_id="diff.gate_is_passed_on_the_merits",
             question=("Does the code satisfy the gate because the behaviour is "
                       "present, rather than by hardcoding, special-casing the "
-                      "test input, or weakening the assertion?"),
+                      "test input, or weakening the assertion? Judge the "
+                      "behaviour the permitted paths own; a call site or wiring "
+                      "that lives outside them is out of this node's scope."),
             applies_to=(DIFF,),
             severity=fin.Severity.BLOCKING),
         fin.RubricCheck(
@@ -231,6 +255,41 @@ def parse_reject_grade(value: object) -> FindingGrade:
                 value, ", ".join(g.value for g in GRADE_ORDER))) from exc
 
 
+# ── B9: the second axis a bounded question needs — where the fix would land ─
+
+class FindingScope(str, Enum):
+    """Whether this finding can be fixed from the paths the node may write.
+
+    **This is not a grade and not a severity.** `Severity` is a property of the
+    question, stamped by code. `FindingGrade` is how bad this instance is.
+    Neither can express the fact that broke `lane-p4-enrichment-ordering`: a
+    finding can be correct, blocking, and graded ERROR, and *still* be
+    unactionable, because the only edit that would answer it is an edit the
+    permission check convicts.
+
+    Grading alone cannot carry it. A reviewer told to soften such a finding to
+    a warning is being told to lie about consequence — the merged tree really
+    is wrong, the stated work really is not done — and A9's remedy is grading
+    the bar, never lowering it. So the reviewer answers both: how bad it is,
+    and where the fix would have to land.
+
+    * IN_SCOPE     — the fix is an edit to a path this node declared. The
+                     ordinary finding, and the ordinary rejection.
+    * OUT_OF_SCOPE — the only edit that answers it writes a path this node was
+                     forbidden to write. A statement about the **plan**, not
+                     about the diff.
+
+    An OUT_OF_SCOPE finding cannot reject (`GradedCell.rejects`), because a
+    rejection whose remedy is forbidden is a retry loop with no exit. It is not
+    discarded either: it reaches the finding ledger, the retry prompt, and
+    `ReviewOutcome.unreachable`, which is what an operator reads to learn the
+    plan gave a node an instruction its declared outputs cannot reach.
+    """
+
+    IN_SCOPE = "in_scope"
+    OUT_OF_SCOPE = "out_of_scope"
+
+
 # ── the reviewer's report, extended by exactly one axis ─────────────────────
 
 class CodeReportCell(fin.ReportCell):
@@ -264,9 +323,16 @@ class CodeReportCell(fin.ReportCell):
     #: retry guidance, and by the ledger an operator reads back — so it is a
     #: field with readers rather than B15's field with none.
     grade_rationale: str = ""
+    #: Where the fix would land. Required on every finding from this schema's
+    #: first version, and that is deliberate: §3.6 B8's rule is that a field
+    #: added after reports exist is optional forever, and an optional scope is
+    #: one every reviewer omits, which is the unbounded demand this axis was
+    #: added to end. Read by `GradedCell.rejects`, by `GradedVerdict.
+    #: unreachable`, by the finding ledger, and by the retry prompt.
+    scope: Optional[FindingScope] = None
 
     @model_validator(mode="after")
-    def _a_finding_is_graded_and_located(self) -> "CodeReportCell":
+    def _a_finding_is_graded_located_and_scoped(self) -> "CodeReportCell":
         if self.status is fin.CellStatus.FINDING:
             if self.grade is None:
                 raise ValueError(
@@ -280,9 +346,16 @@ class CodeReportCell(fin.ReportCell):
                 raise ValueError(
                     "a finding must say why it carries the grade it does; a "
                     "grade nobody justified is a verdict by another name (B8)")
-        elif self.grade is not None or self.grade_rationale.strip():
+            if self.scope is None:
+                raise ValueError(
+                    "a finding must carry a scope saying whether the fix lands "
+                    "inside the paths this node may write; a finding whose "
+                    "remedy is forbidden is a rejection with no exit (B9)")
+        elif (self.grade is not None or self.grade_rationale.strip()
+                or self.scope is not None):
             raise ValueError(
-                "a cleared cell carries no grade and no grade rationale")
+                "a cleared cell carries no grade, no grade rationale, and no "
+                "scope")
         return self
 
 
@@ -312,21 +385,58 @@ class GradedCell:
     message: str = ""
     rationale: str = ""
     canary: Optional[fin.CanaryKind] = None
+    #: The reviewer's third axis. `None` only where none was ever recorded — a
+    #: cell that is not a finding, a review family that scopes nothing, or a
+    #: cell reconstructed from a receipt, whose frozen schema does not carry it.
+    #: `None` is read as IN_SCOPE everywhere below, which is the behaviour that
+    #: predates the axis and keeps a replayed verdict identical to the one that
+    #: was signed.
+    scope: Optional[FindingScope] = None
 
     @property
     def is_finding(self) -> bool:
         return self.canary is None and self.status is fin.CellStatus.FINDING
 
+    @property
+    def out_of_scope(self) -> bool:
+        """Whether the only edit that answers this finding is a forbidden one."""
+        return self.scope is FindingScope.OUT_OF_SCOPE
+
     def rejects(self, reject_at: FindingGrade) -> bool:
         """Whether this cell alone is a reason to refuse the merge.
 
-        Both axes, and both are load-bearing. `severity` keeps an ADVISORY
+        Three axes now, and each is load-bearing. `severity` keeps an ADVISORY
         check unable to reject however the reviewer grades it, which is the
         property `diff.is_coherent_with_its_surroundings` already had. `grade`
         is what lets a BLOCKING check answer truthfully without ending the lane.
+        `scope` is what stops a correct, blocking, ERROR-graded finding from
+        rejecting when the edit that would answer it is one the permission
+        check convicts.
+
+        The third axis narrows nothing else. A finding inside the node's
+        declared paths rejects exactly as it did before — a lazy diff that
+        stayed in scope and did something adjacent to its instruction is still
+        refused, which is the whole distinction being drawn: *did not do the
+        work it could do* is a rejection; *was asked for work it was
+        structurally forbidden to do* is a fact about the plan.
         """
         return (self.is_finding
                 and self.severity is fin.Severity.BLOCKING
+                and not self.out_of_scope
+                and grade_at_or_above(self.grade, reject_at))
+
+    def unreachable(self, reject_at: FindingGrade) -> bool:
+        """Whether this cell says the instruction overran the declared outputs.
+
+        The exact complement of `rejects` on the scope axis: a finding that
+        would have refused the merge on both other axes and does not, only
+        because its remedy is forbidden. That is the typed record §1.2 demands
+        — a `check_id`, a severity stamped by code, a grade enum, and a scope
+        enum — and never a reviewer's prose about being unable to comply.
+        """
+        return (self.is_finding
+                and self.severity is fin.Severity.BLOCKING
+                and self.out_of_scope
                 and grade_at_or_above(self.grade, reject_at))
 
     @classmethod
@@ -375,6 +485,23 @@ class GradedVerdict:
         return tuple(c for c in self.cells if c.rejects(self.reject_at))
 
     @property
+    def unreachable(self) -> Tuple[GradedCell, ...]:
+        """The findings that say this node's instruction overran its outputs.
+
+        Blocking, graded at or above the threshold, and answerable only from a
+        path the node was forbidden to write. Non-empty means the **plan** is
+        defective: it gave a node work its declared outputs cannot reach, and
+        no diff this node can produce will ever clear the cell. Empty is the
+        ordinary case and says nothing.
+
+        Partitioned out of `recorded` rather than sharing its slot, because
+        the two carry opposite instructions to whoever reads them. A recorded
+        finding is "we merged with this; fix it if you agree." An unreachable
+        one is "stop asking this node for it."
+        """
+        return tuple(c for c in self.cells if c.unreachable(self.reject_at))
+
+    @property
     def recorded(self) -> Tuple[GradedCell, ...]:
         """Every other finding: sub-threshold and advisory-severity alike.
 
@@ -382,7 +509,9 @@ class GradedVerdict:
         lowering it. These go to the ledger and into the retry prompt.
         """
         return tuple(c for c in self.cells
-                     if c.is_finding and not c.rejects(self.reject_at))
+                     if c.is_finding
+                     and not c.rejects(self.reject_at)
+                     and not c.unreachable(self.reject_at))
 
     def derived(self) -> fin.DerivedVerdict:
         """The projection onto the receipt's cell shape.
@@ -430,7 +559,7 @@ def grade_verdict(matrix: fin.ApplicabilityMatrix,
             check_id=cell.check_id, object_id=cell.object_id,
             status=answer.status, severity=severity, grade=answer.grade,
             message=answer.message, rationale=answer.grade_rationale,
-            canary=cell.canary))
+            canary=cell.canary, scope=answer.scope))
     graded = tuple(cells)
     failed = any(c.rejects(reject_at) for c in graded)
     return GradedVerdict(
@@ -443,7 +572,7 @@ def grade_verdict(matrix: fin.ApplicabilityMatrix,
 #: The file `write_finding_ledger` produces, beside the reviewer's own report
 #: under the subject digest's directory, so a reader can tell at a glance which
 #: schema they are looking at.
-FINDING_LEDGER_SCHEMA = "maestro-code-review-findings.v1"
+FINDING_LEDGER_SCHEMA = "maestro-code-review-findings.v2"
 
 #: Its filename. One definition, so the writer and the operator's `cat` agree.
 FINDING_LEDGER_FILENAME = "findings.json"
@@ -480,7 +609,13 @@ def write_finding_ledger(path: Path, *, run_id: str, node_id: str,
                 "object_id": c.object_id,
                 "severity": c.severity.value,
                 "grade": None if c.grade is None else c.grade.value,
+                "scope": None if c.scope is None else c.scope.value,
                 "rejecting": c.rejects(graded.reject_at),
+                # The plan-level fact, recorded beside the diff-level ones so
+                # an operator reading a merged node's ledger can see that a
+                # blocking, ERROR-graded finding went unfixed because no path
+                # this node could write would have fixed it.
+                "unreachable": c.unreachable(graded.reject_at),
                 "message": c.message,
                 "rationale": c.rationale,
             }
@@ -517,6 +652,7 @@ def read_finding_ledger(path: Path) -> Tuple[GradedCell, ...]:
             return ()
         try:
             grade = entry["grade"]
+            scope = entry["scope"]
             cells.append(GradedCell(
                 check_id=str(entry["check_id"]),
                 object_id=str(entry["object_id"]),
@@ -525,7 +661,8 @@ def read_finding_ledger(path: Path) -> Tuple[GradedCell, ...]:
                 grade=None if grade is None else FindingGrade(grade),
                 message=str(entry["message"]),
                 rationale=str(entry.get("rationale", "")),
-                canary=None))
+                canary=None,
+                scope=None if scope is None else FindingScope(scope)))
         except (KeyError, TypeError, ValueError):
             return ()
     return tuple(cells)
@@ -557,6 +694,11 @@ def require_located_findings(graded: GradedVerdict) -> None:
     grade at or above the threshold decides the merge, and a decision nobody
     gave a reason for is the same contentless verdict one level down.
 
+    Both bars apply to the out-of-scope partition too. Such a finding does not
+    refuse the merge, but it is the record an operator repairs the *plan* from,
+    and a plan-level claim that locates nothing is the contentless verdict one
+    level up.
+
     This is the *second* place both hold. The first is `CodeReportCell`, where
     a report violating them does not parse. Keeping the invariant as an
     executed object here as well is B15's rule: an invariant that lives only in
@@ -565,18 +707,24 @@ def require_located_findings(graded: GradedVerdict) -> None:
     """
     rejecting: List[GradedCell] = []
     for cell in graded.cells:
-        if not cell.rejects(graded.reject_at):
+        # The out-of-scope partition is held to the same bar. It does not
+        # refuse the merge, but it is the record an operator repairs the plan
+        # from, and a plan-level claim that locates nothing is the contentless
+        # verdict B8 convicts one level up.
+        if not (cell.rejects(graded.reject_at)
+                or cell.unreachable(graded.reject_at)):
             continue
         if not cell.message.strip():
             raise VerdictNotLocated(
-                f"rejecting finding on {cell.check_id}/{cell.object_id} carries "
-                "no message, so it locates nothing and cannot be acted on")
+                f"finding on {cell.check_id}/{cell.object_id} carries no "
+                "message, so it locates nothing and cannot be acted on")
         if not cell.rationale.strip():
             raise VerdictNotLocated(
-                f"rejecting finding on {cell.check_id}/{cell.object_id} grades "
-                f"itself {cell.grade.value if cell.grade else '?'} with no "
-                "reason, so the grade that refuses the merge is unjustified")
-        rejecting.append(cell)
+                f"finding on {cell.check_id}/{cell.object_id} grades itself "
+                f"{cell.grade.value if cell.grade else '?'} with no reason, so "
+                "the grade that decides this merge is unjustified")
+        if cell.rejects(graded.reject_at):
+            rejecting.append(cell)
 
     if graded.verdict is fin.Verdict.FAIL and not rejecting:
         raise VerdictNotLocated(
@@ -832,6 +980,15 @@ class ReviewHandoff(BaseModel):
             "## Paths this node was permitted to write",
         ]
         lines.extend("  " + path for path in (self.declared_outputs or ["(none declared)"]))
+        lines.extend([
+            "",
+            "Every question below is asked inside those paths and nowhere "
+            "else. A change to anything not listed fails the attempt outright, "
+            "so work the instruction names that no listed path can reach is "
+            "not a defect this diff could have avoided — it is a defect in the "
+            "plan. Record such a finding with scope out_of_scope; do not grade "
+            "it down and do not withhold it.",
+        ])
         lines.append("")
         lines.append("## The acceptance contract it had to satisfy")
         if self.gate_command:
@@ -900,7 +1057,8 @@ class ReviewHandoff(BaseModel):
                      "status": "finding",
                      "message": "<what is wrong, and where>",
                      "grade": "error|warning|note",
-                     "grade_rationale": "<why that grade>"},
+                     "grade_rationale": "<why that grade>",
+                     "scope": "in_scope|out_of_scope"},
                 ],
             }, indent=2),
             "```",
@@ -912,16 +1070,18 @@ class ReviewHandoff(BaseModel):
             "Report every problem you find. Grade it honestly; do not soften a "
             "finding to let it through and do not withhold one.",
             "",
-            "A `clear` cell carries no `grade` and no `grade_rationale`. A "
-            "report that puts either on a cleared cell is rejected unparsed.",
+            "A `clear` cell carries no `grade`, no `grade_rationale`, and no "
+            "`scope`. A report that puts any of them on a cleared cell is "
+            "rejected unparsed.",
             "",
-            "Every `finding` carries three things, and a finding missing any of "
+            "Every `finding` carries four things, and a finding missing any of "
             "them makes the whole report unparseable:",
             "",
             "  message          what is wrong and exactly where",
             "  grade            error | warning | note",
             "  grade_rationale  one sentence: the consequence that puts it at "
             "that grade",
+            "  scope            in_scope | out_of_scope",
             "",
             "Grade on consequence, not on how much work the fix is:",
             "",
@@ -932,12 +1092,31 @@ class ReviewHandoff(BaseModel):
             "correctly delivered with it present.",
             "  note    — an observation or a preference.",
             "",
+            "Scope on where the fix would land, not on how important it is:",
+            "",
+            "  in_scope      — the fix is an edit to one of the permitted "
+            "paths listed above.",
+            "  out_of_scope  — the only edit that answers it writes a path "
+            "that is NOT listed above. A caller to wire up, a registration, a "
+            "migration, an entry point in another module: if the file that "
+            "would have to change is not on the permitted list, the finding is "
+            "out_of_scope however correct and however serious it is.",
+            "",
+            "Grade and scope are independent. An out_of_scope finding is still "
+            "graded on consequence — do not soften it to a warning to get it "
+            "through, and do not suppress it. Code alone decides what an "
+            "out_of_scope finding costs, and it does not refuse this merge: it "
+            "is recorded against the plan that gave this node work its paths "
+            "cannot reach.",
+            "",
             "Judge against what this node was asked to do, above. A defect in "
             "code this diff did not write, or a hardening this node's "
             "instruction did not ask for, is at most a warning however real it "
             "is.",
             "",
-            "A control cell answered `finding` states its grade like any other.",
+            "A control cell answered `finding` states its grade and its scope like "
+            "any other. Its scope is in_scope: the control is part of "
+            "this review, not of the plan.",
         ])
         return "\n".join(lines)
 
@@ -1048,10 +1227,23 @@ class ReviewOutcome:
     #: Everything else that was found. Recorded, never a reason to reject, and
     #: still handed to the builder.
     advisories: Tuple[GradedCell, ...] = ()
+    #: The findings that would have refused the merge but for their scope: the
+    #: instruction named work no path this node may write can reach. A typed
+    #: record about the **plan**, never about the builder's competence.
+    unreachable: Tuple[GradedCell, ...] = ()
 
     @property
     def passed(self) -> bool:
         return self.verdict is fin.Verdict.PASS
+
+    @property
+    def instruction_unreachable(self) -> bool:
+        """Whether this review found the node's instruction out of its reach.
+
+        The predicate a caller branches on, so no caller has to re-derive
+        "non-empty tuple" and two callers cannot disagree about what it means.
+        """
+        return bool(self.unreachable)
 
     def findings_text(self) -> str:
         """The findings as retry guidance, rejecting first.
@@ -1072,6 +1264,16 @@ class ReviewOutcome:
             lines.append("Recorded findings — they did not refuse the merge; "
                          "address them if you agree:")
             lines.extend(self._render(self.advisories))
+        if self.instruction_unreachable:
+            # Rendered so the builder stops trying. Without it the retry
+            # prompt carries a finding whose only remedy the permission check
+            # convicts, and the attempt after it is spent discovering that.
+            lines.append(
+                "Out of this node's scope — the reviewer judged that no path "
+                "this node may write can answer these. Do NOT attempt them; "
+                "writing an undeclared path fails the attempt outright. They "
+                "are recorded against the plan:")
+            lines.extend(self._render(self.unreachable))
         return "\n".join(lines)
 
     @staticmethod
@@ -1147,12 +1349,13 @@ def review_attempt(
     # spending a reviewer turn to re-derive an answer already on disk.
     if store.has(subject_digest):
         receipt = store.load(subject_digest)
-        findings, advisories = _replayed_findings(receipt, ledger_path,
-                                                  reject_at)
+        findings, advisories, unreachable = _replayed_findings(
+            receipt, ledger_path, reject_at)
         return ReviewOutcome(
             subject_digest=subject_digest, verdict=receipt.verdict,
             receipt=receipt, replayed=True,
-            findings=findings, advisories=advisories)
+            findings=findings, advisories=advisories,
+            unreachable=unreachable)
 
     matrix = fin.compute_matrix(rubric, subject_digest, objects)
     window = window_factory(matrix)
@@ -1193,6 +1396,7 @@ def review_attempt(
         reject_at=graded.reject_at.value)
     replayed = False
     findings, advisories = graded.rejecting, graded.recorded
+    unreachable = graded.unreachable
     try:
         store.write(receipt)
     except fin.ReceiptExists:
@@ -1200,8 +1404,8 @@ def review_attempt(
         # record and ours are discarded — the same create-once rule the store
         # enforces, applied to the evidence beside it.
         receipt = store.load(subject_digest)
-        findings, advisories = _replayed_findings(receipt, ledger_path,
-                                                  reject_at)
+        findings, advisories, unreachable = _replayed_findings(
+            receipt, ledger_path, reject_at)
         replayed = True
     else:
         # After the receipt, never before it: the receipt is the record the
@@ -1217,12 +1421,14 @@ def review_attempt(
                 graded=graded)
     return ReviewOutcome(
         subject_digest=subject_digest, verdict=receipt.verdict, receipt=receipt,
-        replayed=replayed, findings=findings, advisories=advisories)
+        replayed=replayed, findings=findings, advisories=advisories,
+        unreachable=unreachable)
 
 
 def _replayed_findings(receipt: fin.Receipt, ledger_path: Optional[Path],
                        reject_at: FindingGrade,
-                       ) -> Tuple[Tuple[GradedCell, ...], Tuple[GradedCell, ...]]:
+                       ) -> Tuple[Tuple[GradedCell, ...], Tuple[GradedCell, ...],
+                                  Tuple[GradedCell, ...]]:
     """A stored receipt's findings, partitioned by the grades that decided it.
 
     The receipt is the authority for the verdict — signed, already loaded by
@@ -1240,12 +1446,14 @@ def _replayed_findings(receipt: fin.Receipt, ledger_path: Optional[Path],
     threshold = _recorded_threshold(receipt, reject_at)
     derived = fin.DerivedVerdict(verdict=receipt.verdict, cells=receipt.cells)
     if ledger_path is None:
-        return receipt_findings(derived, threshold)
+        return receipt_findings(derived, threshold) + ((),)
     recorded = read_finding_ledger(ledger_path)
     if not recorded:
-        return receipt_findings(derived, threshold)
+        return receipt_findings(derived, threshold) + ((),)
     return (tuple(c for c in recorded if c.rejects(threshold)),
-            tuple(c for c in recorded if not c.rejects(threshold)))
+            tuple(c for c in recorded
+                  if not c.rejects(threshold) and not c.unreachable(threshold)),
+            tuple(c for c in recorded if c.unreachable(threshold)))
 
 
 def _recorded_threshold(receipt: fin.Receipt,
