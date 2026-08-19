@@ -62,7 +62,21 @@ def bump():
     nxt = revision() + 1
     open(REV, "w").write(str(nxt))
 
-if argv[:2] == ["pane", "split"]:
+if argv[:2] == ["pane", "current"]:
+    # A real herdr session always answers this: `route_admission` refuses
+    # admission outright with HERDR_SESSION_REQUIRED when it cannot, so no
+    # launch can be reached from a session that has no current pane. The fake
+    # used to fall through to `{}` and the launcher quietly used the
+    # `--current` selector instead; that fallback is gone (it reinstated the
+    # focus race and scattered panes across workspaces), so the fake now
+    # models the session it was always standing in for. `p0` in the same
+    # workspace as the split child below, because a split lands beside its
+    # parent.
+    if os.environ.get("FAKE_NO_CURRENT_PANE"):
+        print(json.dumps({"result": {}}))
+    else:
+        print(json.dumps({"result": {"pane": {"pane_id": "w1:p0"}}}))
+elif argv[:2] == ["pane", "split"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p2", "cwd": os.environ["FAKE_HERDR_CWD"]}}}))
 elif argv[:2] == ["pane", "get"]:
     if os.environ.get("FAKE_PANE_GET_FAILURE"):
@@ -315,6 +329,57 @@ class LauncherContractTest(unittest.TestCase):
         pane_env = self.pane_environment(("pane", "split") + flags)
         self.assertEqual(pane_env["PYTEST_ADDOPTS"],
                          "-o cache_dir={}".format(self.scratch / "pytest_cache"))
+
+    def test_launch_refuses_when_herdr_cannot_name_the_current_pane(self):
+        """No pane to split from is a refusal, not a fall back to `--current`.
+
+        The selector used to be the answer here. It reinstated the focus race
+        the resolved-once parent exists to remove, and because focus can sit in
+        any workspace it put panes wherever focus happened to be — one run's
+        agents scattered across w13F, w13G, w13H, w13J and w13K while its first
+        pane sat in w13A. §1.2 forbids keying a decision on ambient mutable
+        state, so this refuses and splits nothing.
+
+        Reachable only in this fake: `route_admission._require_herdr_session`
+        refuses admission with HERDR_SESSION_REQUIRED when `pane current` has
+        no answer, so no production launch runs from a session in this state.
+        The refusal is the fail-closed floor under that check, not a path the
+        runtime is expected to take.
+        """
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        os.environ["FAKE_NO_CURRENT_PANE"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_NO_CURRENT_PANE", None)
+        with self.assertRaises(launcher_module.LaunchRefused) as caught:
+            harness.launch(self.spec())
+
+        self.assertIs(caught.exception.refusal,
+                      launcher_module.LaunchRefusal.SPLIT_PARENT_UNRESOLVED)
+        # Nothing was split, so nothing was left behind and the refusal says so
+        # — and it stays retryable, because herdr may answer the next ask.
+        self.assertEqual(
+            [call for call in self.recorded_calls()
+             if call[:2] == ["pane", "split"]], [])
+        self.assertFalse(caught.exception.pane_created)
+        self.assertFalse(caught.exception.deterministic)
+
+    def test_launch_splits_the_resolved_parent_and_stays_in_its_workspace(self):
+        """Every pane of a run belongs to one workspace, and it is measured."""
+        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+                                claude_path=Path("/opt/claude"),
+                                admitted_routes=self.admitted_routes)
+        handle = harness.launch(self.spec())
+
+        split = self.split_call(self.recorded_calls())
+        self.assertEqual(split[2], "w1:p0")
+        self.assertNotIn("--current", split)
+        self.assertEqual(launcher_module.workspace_of(handle.pane_id),
+                         launcher_module.workspace_of("w1:p0"))
+        # The direction is a pure function of how many panes this launcher has
+        # already split, so the first is deterministic (§ the alternation rule
+        # lives in `test_pane_placement.py`).
+        self.assertEqual(split[split.index("--direction") + 1], "right")
 
     def test_launch_refuses_before_creating_a_pane_when_redirection_is_missing(self):
         # A redirect that silently fails to arrive convicts the agent for a
