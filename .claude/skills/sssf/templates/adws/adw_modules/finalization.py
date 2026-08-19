@@ -611,11 +611,13 @@ class Receipt:
     still records a verdict whose derivation cannot be re-checked from the
     receipt alone — which is the exact argument that put the grade there, one
     field short. It is `None` for plan finalization, whose verdict has no
-    threshold to run under, and it is written from the first version that
-    grades anything for §3.6 B8's reason: a field added after receipts exist
-    is optional forever. `maestro-rubric.v1` receipts omit the key — they
-    predate the field — and `from_bytes` requires it only after that
-    version, so a signed v1 receipt still replays after the upgrade.
+    threshold to run under, and for any receipt written before grading
+    existed. `rubric_version` names the rubric, not the receipt schema: the
+    graded fields were added under `maestro-rubric.v2` without moving that
+    version, so two incompatible v2 shapes exist. `from_bytes` discriminates
+    on whether `reject_at` is present, not on the rubric label. A pre-grading
+    v2 receipt — no `reject_at`, cells with no `grade` — replays with both
+    honestly `None`. A receipt that carries the graded keys must carry both.
     The threshold is configuration (`execution.review_reject_grade`, §6.2), so
     it can differ between the review and any later reading of it. That is
     precisely why the receipt must carry the one the verdict was derived with
@@ -691,11 +693,15 @@ class Receipt:
         rubric_version = payload.get("rubric_version")
         if not isinstance(rubric_version, str):
             raise ReceiptInvalid("rubric_version must be a string")
+        # `reject_at` present → graded schema. Absent → pre-grading (v1, or
+        # v2 written before the fields existed). The rubric label is not
+        # the discriminator: v2 names both shapes.
+        has_reject_at = "reject_at" in payload
         expected = {
             "plan_digest", "rubric_version", "verdict", "created_at_epoch",
             "reviewer", "cells",
         }
-        if rubric_version != "maestro-rubric.v1":
+        if has_reject_at:
             expected = expected | {"reject_at"}
         if set(payload) != expected:
             raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
@@ -712,17 +718,34 @@ class Receipt:
             created_at_epoch = payload["created_at_epoch"]
             _require_created_at_epoch(created_at_epoch)
             verdict = Verdict(payload["verdict"])
-            if rubric_version == "maestro-rubric.v1":
-                reject_at = None
-            else:
+            if has_reject_at:
                 reject_at = payload["reject_at"]
                 if reject_at is not None and not isinstance(reject_at, str):
                     raise ReceiptInvalid("receipt reject_at must be a string or null")
+            else:
+                reject_at = None
+            cell_base = {
+                "check_id", "object_id", "status", "severity",
+                "message", "canary",
+            }
+            cell_graded = cell_base | {"grade"}
             derived_cells = []
             for cell in cells:
-                if (not isinstance(cell, dict) or set(cell) != {
-                        "check_id", "object_id", "status", "severity",
-                        "message", "canary", "grade"}):
+                if not isinstance(cell, dict):
+                    raise ReceiptInvalid(
+                        "receipt cell fields do not match the frozen receipt schema")
+                keys = set(cell)
+                if keys == cell_graded:
+                    if not has_reject_at and rubric_version != "maestro-rubric.v1":
+                        raise ReceiptInvalid(
+                            "receipt fields do not match the frozen receipt schema")
+                    grade = cell["grade"]
+                elif keys == cell_base:
+                    if has_reject_at:
+                        raise ReceiptInvalid(
+                            "receipt cell fields do not match the frozen receipt schema")
+                    grade = None
+                else:
                     raise ReceiptInvalid(
                         "receipt cell fields do not match the frozen receipt schema")
                 if not all(isinstance(cell[field], str)
@@ -731,7 +754,6 @@ class Receipt:
                 canary = cell["canary"]
                 if canary is not None and not isinstance(canary, str):
                     raise ReceiptInvalid("receipt cell canary must be a string or null")
-                grade = cell["grade"]
                 if grade is not None and not isinstance(grade, str):
                     raise ReceiptInvalid("receipt cell grade must be a string or null")
                 derived_cells.append(DerivedCell(
