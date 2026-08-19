@@ -14,11 +14,30 @@ Existing files are skipped unless --force.
 """
 
 import argparse
-import shutil
+import importlib.util
 import sys
 from pathlib import Path
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+
+
+def _load_runtime_sync():
+    """Load the template's own verified-copy primitive.
+
+    An install is a copy of runtime bytes between checkouts, which is the same
+    operation `tools/runtime_sync.py` exists to make provable. Loading it here
+    rather than calling `shutil.copy2` directly means there is exactly one
+    definition in this repository of what counts as a copy having arrived, and
+    one place to change if that definition ever needs to get stricter.
+    """
+    module_path = TEMPLATES / "adws" / "tools" / "runtime_sync.py"
+    spec = importlib.util.spec_from_file_location("runtime_sync", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+runtime_sync = _load_runtime_sync()
 
 GITIGNORE_ENTRIES = [
     "adws/adw_data/sessions/",
@@ -51,18 +70,36 @@ def is_junk(child: Path) -> bool:
     return child.suffix in {".pyc", ".pyo"} or child.name == ".DS_Store"
 
 
-def stamp(src: Path, dest: Path, force: bool, stamped: list, skipped: list) -> None:
+def stamp(src: Path, dest: Path, force: bool, stamped: list, skipped: list,
+          refused: list = None, overwrite_newer: bool = False) -> None:
+    """Copy one file or tree into the destination, proving each copy arrived.
+
+    `--force` used to be an unconditional overwrite, which made re-stamping an
+    installed repository a way to silently discard work that existed nowhere
+    else — the installed `maestro.config.yaml` naming that installation's lane
+    vendors is the obvious case, but any locally patched runtime file has the
+    same shape. A destination that differs from the template and is *newer*
+    than it is now refused by name and listed at the end, unless the operator
+    asks for the discard explicitly with `--overwrite-newer`.
+    """
+    if refused is None:
+        refused = []
     if src.is_dir():
         for child in sorted(src.iterdir()):
             if is_junk(child):
                 continue
-            stamp(child, dest / child.name, force, stamped, skipped)
+            stamp(child, dest / child.name, force, stamped, skipped,
+                  refused, overwrite_newer)
         return
     if dest.exists() and not force:
         skipped.append(str(dest))
         return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
+    if dest.exists() and not overwrite_newer:
+        if (src.read_bytes() != dest.read_bytes()
+                and dest.stat().st_mtime_ns > src.stat().st_mtime_ns):
+            refused.append(str(dest))
+            return
+    runtime_sync.copy_verified(src, dest)
     stamped.append(str(dest))
 
 
@@ -80,6 +117,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="overwrite existing files")
     parser.add_argument(
+        "--overwrite-newer",
+        action="store_true",
+        help="with --force, also discard destination files that are newer than "
+             "the template's; without it those are refused and listed",
+    )
+    parser.add_argument(
         "--adws-only",
         action="store_true",
         help="stamp only adws/; leave root files and .gitignore untouched",
@@ -87,22 +130,27 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path.cwd()
-    stamped, skipped = [], []
+    stamped, skipped, refused = [], [], []
+    newer = args.overwrite_newer
 
-    stamp(TEMPLATES / "adws", root / "adws", args.force, stamped, skipped)
+    stamp(TEMPLATES / "adws", root / "adws", args.force, stamped, skipped, refused, newer)
     stamp(TEMPLATES / "prompt_engineering",
-          root / "adws" / "adw_data" / "prompt_engineering", args.force, stamped, skipped)
+          root / "adws" / "adw_data" / "prompt_engineering", args.force, stamped,
+          skipped, refused, newer)
     stamp(TEMPLATES / "harness_engineering",
-          root / "adws" / "adw_data" / "harness_engineering", args.force, stamped, skipped)
+          root / "adws" / "adw_data" / "harness_engineering", args.force, stamped,
+          skipped, refused, newer)
     stamp(TEMPLATES / "sssf.config.yaml",
           root / "adws" / "adw_sssf_config" / "sssf.config.yaml",
-          args.force, stamped, skipped)
+          args.force, stamped, skipped, refused, newer)
     if not args.adws_only:
-        stamp(TEMPLATES / "env.sample", root / ".env.sample", args.force, stamped, skipped)
+        stamp(TEMPLATES / "env.sample", root / ".env.sample", args.force, stamped,
+              skipped, refused, newer)
         # The recipes are part of the operating experience, and several cookbooks
         # plus the run banner tell you to use them, so a stamped repo has to have
         # them. Skipped like any other file if the repo already has a justfile.
-        stamp(TEMPLATES / "justfile", root / "justfile", args.force, stamped, skipped)
+        stamp(TEMPLATES / "justfile", root / "justfile", args.force, stamped,
+              skipped, refused, newer)
         ensure_gitignore(root, stamped)
 
     print(f"sssf installed into {root}")
@@ -111,6 +159,13 @@ def main() -> int:
         print(f"    + {s}")
     if skipped:
         print(f"  skipped (already exist, use --force to overwrite): {len(skipped)}")
+    if refused:
+        print(f"  REFUSED (destination is newer than the template): {len(refused)}")
+        for r in refused:
+            print(f"    ! {r}")
+        print("    Reconcile those by hand, or re-run with --overwrite-newer to")
+        print("    discard the installed version. They were not written.")
+        return 1
     print("\nnext step:")
     if args.adws_only:
         print("  uv run adws/maestro.py workspace --help  # verify Maestro")

@@ -35,17 +35,30 @@ from __future__ import annotations
 import collections
 import pathlib
 import subprocess
+import sys
 import unittest
 import warnings
+
+_TOOLS = str(pathlib.Path(__file__).resolve().parent.parent / "tools")
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+
+import runtime_sync  # noqa: E402  (needs the path above)
 
 #: Every known template checkout: the repository directory name, and the path
 #: of the ADW runtime inside it. Consumers sort this longest-path-first so that
 #: the-library's layout, which is a suffix of maestro's, cannot claim a maestro
 #: checkout.
-TEMPLATE_LOCATIONS = (
-    ("maestro", pathlib.PurePosixPath(".claude/skills/sssf/templates/adws")),
-    ("the-library", pathlib.PurePosixPath("skills/sssf/templates/adws")),
-)
+#:
+#: The table is *owned* by `tools/runtime_sync`, not by this module, and the
+#: direction of that dependency is deliberate. `runtime_sync` is production: it
+#: ships with the runtime to every deployment, it needs the same table to tell a
+#: template checkout from a deployed instance, and it must not import anything
+#: out of `tests/`. This module is test support -- it raises `SkipTest` and
+#: warns -- so it is the one that imports. Duplicating the literal instead would
+#: leave two answers to "where does a template live", which is the same defect
+#: class the mirror in `runtime_sync` exists to close.
+TEMPLATE_LOCATIONS = runtime_sync.TEMPLATE_LAYOUTS
 
 #: Asking git for the repository layout is a local metadata read. A bound is
 #: still set: a wedged git must degrade this to the filesystem derivation

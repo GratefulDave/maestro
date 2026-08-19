@@ -12,6 +12,17 @@ checkouts file by file and report exactly which files differ and in which
 direction, so the failure names the repair rather than merely announcing that
 the copies disagree.
 
+Two modules own the parts of that, and neither owns the other's part:
+
+* `checkout_layout` answers *where the other checkout is*, from git rather than
+  from this file's path.
+* `tools/runtime_sync` answers *whether two given trees are level*, and is also
+  what moves the bytes when they are not. The comparison is not reimplemented
+  here, so the definition of "level" this test fails on is the definition its
+  `mirror` verb repairs. Two implementations of that would be the very defect
+  class the mirror exists to close — a second, uninstrumented copy path — turned
+  on this test.
+
 Scope and limits, stated plainly:
 
 * Only the *template* checkouts are compared. A repository that has installed
@@ -31,56 +42,30 @@ Scope and limits, stated plainly:
   treated as the deletion this module exists to catch, and it fails.
 * The files compared on this side are the ones in the working tree the test
   runs from, so a lane's uncommitted template edits are the bytes checked.
+* Bytes agreeing on disk is not bytes agreeing in git. A peer whose runtime is
+  uncommitted passes here and is still one `git checkout` from losing it.
 """
 
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+ADWS = pathlib.Path(__file__).resolve().parent.parent
+for _path in (str(ADWS / "tests"), str(ADWS / "tools")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
-import checkout_layout  # noqa: E402  (needs the path above)
-
-# Paths excluded from the comparison. The exclusions are enumerated rather than
-# matched by a loose pattern: anything not named here is compared, so a genuinely
-# new runtime file cannot slip out of the check by accident.
-#
-#   __pycache__, .pytest_cache, .ruff_cache, .mypy_cache  interpreter and tool caches
-#   .omc, .omp, .omx                                      agent-harness scratch state
-#   .venv                                                 a local interpreter, never runtime
-#   adw_data, adw_sssf_config, .maestro, .maestro-state   per-instance run state
-#   route-receipts                                        per-machine signed route receipts
-IGNORED_DIR_NAMES = frozenset(
-    {
-        "__pycache__",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".mypy_cache",
-        ".omc",
-        ".omp",
-        ".omx",
-        ".venv",
-        "adw_data",
-        "adw_sssf_config",
-        ".maestro",
-        ".maestro-state",
-        "route-receipts",
-    }
-)
-
-IGNORED_FILE_NAMES = frozenset({".DS_Store"})
-
-IGNORED_SUFFIXES = frozenset(
-    {".pyc", ".pyo", ".pyd", ".db", ".sqlite", ".sqlite3", ".log"}
-)
+import checkout_layout                                       # noqa: E402
+import runtime_sync                                          # noqa: E402
 
 _REPAIR = (
-    "Reconcile the checkouts before landing anything else: copy the newer "
-    "runtime across so both template checkouts hold the same bytes, then "
-    "re-run this test."
+    "Reconcile the checkouts before landing anything else: "
+    "`python3 tools/runtime_sync.py check <source> <destination>` shows the "
+    "drift, and `... mirror <source> <destination> --apply` copies the newer "
+    "runtime across with a sha256 assertion per file, refusing any destination "
+    "file that looks ahead of the source. Then re-run this test."
 )
 
 
@@ -95,34 +80,9 @@ def _peer_locations(checkout):
     return peers
 
 
-def _runtime_files(root):
-    """Map every compared file under ``root`` to its absolute path."""
-    files = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name not in IGNORED_DIR_NAMES)
-        for filename in sorted(filenames):
-            if filename in IGNORED_FILE_NAMES:
-                continue
-            if pathlib.PurePath(filename).suffix in IGNORED_SUFFIXES:
-                continue
-            path = pathlib.Path(dirpath) / filename
-            files[path.relative_to(root).as_posix()] = path
-    return files
-
-
-def _line_count(path):
-    try:
-        with open(path, "rb") as handle:
-            return sum(1 for _ in handle)
-    except OSError:
-        return -1
-
-
 def _resolve_pair():
     """Return (self_name, self_root, peer_name, peer_root) or raise SkipTest."""
-    checkout = checkout_layout.identify_template_checkout(
-        pathlib.Path(__file__).resolve().parent.parent
-    )
+    checkout = checkout_layout.identify_template_checkout(ADWS)
     if checkout is None:
         checkout_layout.skip_visibly(
             "this ADW runtime is a deployed instance, not a template checkout, "
@@ -162,70 +122,31 @@ def _resolve_pair():
 class TemplateParityTests(unittest.TestCase):
     def setUp(self):
         self.self_name, self.self_root, self.peer_name, self.peer_root = _resolve_pair()
-        self.mine = _runtime_files(self.self_root)
-        self.theirs = _runtime_files(self.peer_root)
-
-    def _describe(self):
-        return "{a} ({a_path}) vs {b} ({b_path})".format(
-            a=self.self_name,
-            a_path=self.self_root,
-            b=self.peer_name,
-            b_path=self.peer_root,
+        self.report = runtime_sync.compare(
+            runtime_sync.describe_copy(self.self_root, self.self_name),
+            runtime_sync.describe_copy(self.peer_root, self.peer_name),
+        )
+        # Both endpoints are template checkouts, so nothing is held back --
+        # including `maestro.config.yaml`, which is deployment-owned only when a
+        # deployment is one of the two. If that ever stops being true here the
+        # exclusion has widened past its reason, and this check is where it
+        # would otherwise go unnoticed.
+        self.assertEqual(
+            (), self.report.excluded,
+            "two template checkouts compare every file; nothing is deployment-owned "
+            "between them",
         )
 
     def test_both_template_checkouts_hold_the_same_runtime_files(self):
-        only_mine = sorted(set(self.mine) - set(self.theirs))
-        only_theirs = sorted(set(self.theirs) - set(self.mine))
-        if not only_mine and not only_theirs:
+        """A file in one copy and not the other is a deletion, not an edit."""
+        if not self.report.missing_files:
             return
-
-        report = ["The ADW template checkouts disagree on which files exist: " + self._describe()]
-        if only_mine:
-            report.append(
-                "  present in {a} but absent from {b}:".format(a=self.self_name, b=self.peer_name)
-            )
-            report.extend("    {rel}".format(rel=rel) for rel in only_mine)
-        if only_theirs:
-            report.append(
-                "  present in {b} but absent from {a}:".format(a=self.self_name, b=self.peer_name)
-            )
-            report.extend("    {rel}".format(rel=rel) for rel in only_theirs)
-        report.append("  " + _REPAIR)
-        self.fail("\n".join(report))
+        self.fail(self.report.describe(_REPAIR))
 
     def test_shared_runtime_files_are_byte_identical(self):
-        shared = sorted(set(self.mine) & set(self.theirs))
-        differing = [
-            rel
-            for rel in shared
-            if self.mine[rel].read_bytes() != self.theirs[rel].read_bytes()
-        ]
-        if not differing:
+        if not self.report.differing:
             return
-
-        report = ["The ADW template checkouts disagree on file contents: " + self._describe()]
-        for rel in differing:
-            mine_lines = _line_count(self.mine[rel])
-            theirs_lines = _line_count(self.theirs[rel])
-            if mine_lines == theirs_lines:
-                direction = "same line count ({lines}), differing bytes".format(lines=mine_lines)
-            elif mine_lines > theirs_lines:
-                direction = "{a} is ahead by {delta} lines ({a_lines} vs {b_lines})".format(
-                    a=self.self_name,
-                    delta=mine_lines - theirs_lines,
-                    a_lines=mine_lines,
-                    b_lines=theirs_lines,
-                )
-            else:
-                direction = "{b} is ahead by {delta} lines ({b_lines} vs {a_lines})".format(
-                    b=self.peer_name,
-                    delta=theirs_lines - mine_lines,
-                    b_lines=theirs_lines,
-                    a_lines=mine_lines,
-                )
-            report.append("    {rel}: {direction}".format(rel=rel, direction=direction))
-        report.append("  " + _REPAIR)
-        self.fail("\n".join(report))
+        self.fail(self.report.describe(_REPAIR))
 
 
 if __name__ == "__main__":
