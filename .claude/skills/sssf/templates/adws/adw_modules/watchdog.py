@@ -40,6 +40,17 @@ applies. Process-alive and turn-count arm at launch: "a dead process is
 stalled immediately" means a process that launched and then died, never
 one that has not launched yet, and the turn-timeout clock starts at
 launch, not at attempt start.
+
+Disarming (§9.7). Both clocks stop convicting an attempt that has already
+landed a typed, adjudicated result row of its own. An artifact a worker
+wrote outranks any status a supervisor observes about that worker, and
+this module is the supervisor: silence after a declared result is the
+worker having finished, not the worker having died. `exit_status_observed`
+is the same rule applied to the process signal; `declared_result_observed`
+applies it to the two clocks. Neither is a fact about the agent -- both are
+facts about the harness, supplied by the scheduler, because whether some
+other component already holds the answer is not something the watchdog can
+know about itself.
 """
 
 from __future__ import annotations
@@ -224,6 +235,8 @@ class Watchdog:
         process_alive: Callable[[int], bool] = process_is_alive,
         exit_status_observed: Callable[[st.AttemptRecord], bool] = (
             lambda attempt: False),
+        declared_result_observed: Callable[[st.AttemptRecord], bool] = (
+            lambda attempt: False),
         transcript_record_count: Callable[[st.AttemptRecord], int] = (
             _default_transcript_record_count),
         time_source: Callable[[], float] = time.monotonic,
@@ -237,6 +250,7 @@ class Watchdog:
         self._poll_interval_s = poll_interval_s
         self._process_alive = process_alive
         self._exit_status_observed = exit_status_observed
+        self._declared_result_observed = declared_result_observed
         self._transcript_record_count = transcript_record_count
         self._time_source = time_source
         self._on_error = on_error
@@ -289,11 +303,38 @@ class Watchdog:
         # Wall clock applies across the whole attempt window, pre-launch
         # and post-launch alike, and wins over the other two signals
         # whatever they say (§7.6).
+        #
+        # §9.7 moves this bound for an attempt that has already declared a
+        # result; it does not remove it, and the difference is the whole of
+        # the judgement here. This is the LAST bound an agent attempt has --
+        # PROCESS_DEAD is unreachable for one (`attempt.pid` is
+        # `handle.process_group`, which herdr never populates, §16.3 item 17)
+        # and the turn clock below is disarmed by the same result row -- so an
+        # unconditional exemption would trade a false kill for a hang, and the
+        # only thing left watching would be §11.2's run-level backstop, which
+        # a sibling node's transitions keep refreshing indefinitely.
+        #
+        # `backstop_t_s` is the deferred bound because it is the one number
+        # already proven to be both finite and strictly greater:
+        # `SchedulerConfig.__post_init__` raises `LivenessBoundUnsatisfied`
+        # unless it exceeds `greatest_run_window_s`, which is at least
+        # `node_timeout_s`. So every config the watchdog can be handed has
+        # node_timeout_s < backstop_t_s < infinity, and a result-holding
+        # attempt that genuinely hangs is still convicted -- late, by design,
+        # because at that horizon the run is stopping anyway.
+        # The predicate is asked lazily, only once the smaller bound has
+        # already been exceeded: this loop runs every poll interval over every
+        # RUNNING attempt, and the overwhelmingly common case is an attempt
+        # nowhere near either horizon, which must not cost a ledger read.
         elapsed = now - attempt.started_at
         if elapsed > self._config.node_timeout_s:
-            self._heartbeats.pop(key, None)
-            self._stall(attempt, StallReason.NODE_TIMEOUT)
-            return
+            bound = (self._config.backstop_t_s
+                     if self._declared_result_observed(attempt)
+                     else self._config.node_timeout_s)
+            if elapsed > bound:
+                self._heartbeats.pop(key, None)
+                self._stall(attempt, StallReason.NODE_TIMEOUT)
+                return
 
         if not attempt.armed:
             # Pre-launch: no process and no transcript exist yet, by
@@ -350,8 +391,32 @@ class Watchdog:
             self._heartbeats[key] = state
             self._write_heartbeat(attempt, state.turn_count, state.observed_at)
 
+        # §9.7 again, and this is the site that fired. The worker quiesces
+        # the builder BEFORE it commits the work, runs the post gate, and
+        # dispatches the cross-vendor reviewer, so from that moment this exact
+        # file cannot grow again by construction -- while this loop goes on
+        # measuring it. Review latency tracks reviewer turn count at roughly
+        # 7s/turn over 15-64 turns, so it is unbounded and this is a threshold
+        # rather than a race.
+        #
+        # Measured on run-9e9ac412669140039ae078601048f6c7: ten reviews, 46s
+        # to 461s, and exactly the two that exceeded turn_timeout_s=300 were
+        # killed ENVIRONMENTAL -- attempts that had written a success
+        # envelope, been committed by the scheduler, had an adjudicated result
+        # row written, and were legitimately sitting in review. The cost was
+        # not only the kill: an infra retry was debited for what the reviewer
+        # returned as a rejection 164s and 72s later, the reviewer's findings
+        # were discarded so the retry relaunched blind, and a full review was
+        # burned. `attempts.extra_json.review_rejected` present on all six
+        # correctly-settled rejections and absent on all three of these is how
+        # the distortion was confirmed.
+        #
+        # The predicate is asked only once a clock would otherwise fire: it
+        # reaches the ledger, and this loop runs once a second over every
+        # RUNNING attempt.
         since_progress = now - state.observed_at
-        if since_progress > self._config.turn_timeout_s:
+        if (since_progress > self._config.turn_timeout_s
+                and not self._declared_result_observed(attempt)):
             self._stall(attempt, StallReason.TURN_TIMEOUT)
 
     def _stall(self, attempt: st.AttemptRecord, reason: StallReason) -> None:

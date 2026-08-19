@@ -795,6 +795,38 @@ class LifecycleStore:
         return self._audit_query(sql + " ORDER BY id", params)
 
     @serialized
+    def result_adjudication(self, run_id: str, node_id: str, attempt_no: int
+                             ) -> Optional[st.Adjudication]:
+        """The typed verdict on one attempt's declared result, or None (§7.7).
+
+        The per-attempt lookup `audit_results` never offered: that one returns
+        every row for a run or a node, which answers "what has this node
+        produced" and not "did *this generation* declare a result". §7.6's two
+        clock guards need the second question, keyed exactly as §7.7 keys a
+        result — `(run_id, node_id, attempt_no)`.
+
+        **`payload_json` is deliberately absent from the projection.** §1.2 is
+        binding: no lifecycle transition may be caused by a free-text envelope
+        field, and a guard able to reach the payload's `summary` is one edit
+        away from keying on model prose. What this returns is a closed enum,
+        and the payload's absence from the SELECT is what makes reading it
+        impossible here rather than merely discouraged.
+
+        The latest row wins. A reclaimed attempt's late arrival lands a second
+        row against the same `(node_id, attempt_no)` and adjudicates
+        SUPERSEDED (§7.7), and that newer verdict is the one describing what
+        the generation is now — an older ACCEPTED must not outlive it.
+        """
+        row = self.conn.execute(
+            "SELECT adjudication FROM results"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?"
+            " ORDER BY id DESC LIMIT 1",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return st.Adjudication(row[0])
+
+    @serialized
     def record_orphan(self, run_id: str, *, node_id: Optional[str] = None,
                        attempt_no: Optional[int] = None, pid: Optional[int] = None,
                        handle: Optional[str] = None, reason: str = "") -> None:
@@ -1175,7 +1207,26 @@ class LifecycleStore:
         `last_transition_at` — BEFORE touching any inherited RUNNING attempt,
         so the backstop measures silence from the resume, not from the dead
         run's last act (§7.8, §11.2). Every inherited RUNNING attempt is
-        treated as ENVIRONMENTAL-failed and re-launched, never adopted.
+        returned to PENDING and re-launched, never adopted — the resumed
+        process owns none of their panes and cannot resume reading an agent
+        mid-turn.
+
+        What it is *charged* depends on whether it declared a result. §9.7:
+        an artifact a worker wrote outranks any status a supervisor observes
+        about that worker, and a resume is the supervisor here. An inherited
+        attempt may be one that had already finished — envelope written, work
+        committed, result row adjudicated ACCEPTED — and was sitting in review
+        when the scheduler died. Charging that ENVIRONMENTAL debits an infra
+        retry for an attempt that did its work, the same accounting distortion
+        the watchdog's turn clock produced before it learned to read the same
+        row. Such an attempt is closed UNCLASSIFIED instead, and
+        `attempts_spent` counts only classified rows, so it costs nothing.
+        Everything else is charged ENVIRONMENTAL exactly as before.
+
+        Re-launched either way, and deliberately: adoption would mean binding
+        the resumed process to a worktree, a pane, and a gate run it never
+        started, which is a different design. Only the budget is corrected
+        here, never the work.
 
         Each one's pane is recorded in `orphans` before its attempt row is
         closed — the pid lives on that row, so reading it afterwards would read
@@ -1202,9 +1253,41 @@ class LifecycleStore:
                     pid=inherited.pid,
                     handle=str(inherited.extra.get("pane")) if inherited.extra.get("pane") else None,
                     reason="resume: inherited a RUNNING attempt this process does not own")
-            self.fail_attempt(run_id, node_id, st.RetryClass.ENVIRONMENTAL)
+            if (self.result_adjudication(run_id, node_id, node.attempt_no)
+                    is st.Adjudication.ACCEPTED):
+                # Only ACCEPTED spares it. The other three verdicts each say
+                # the row does not describe this generation's own work:
+                # SUPERSEDED named an attempt that was no longer live,
+                # UNKNOWN_ATTEMPT names no attempt at all, and SHA_MISMATCH
+                # names a different base (§7.7).
+                self._release_unclassified_attempt(run_id, node_id)
+            else:
+                self.fail_attempt(run_id, node_id, st.RetryClass.ENVIRONMENTAL)
             reclaimed.append(node_id)
         return tuple(reclaimed)
+
+    def _release_unclassified_attempt(self, run_id: str,
+                                       node_id: str) -> st.NodeLifecycle:
+        """RUNNING -> PENDING with the attempt row closed but UNCLASSIFIED.
+
+        The same write set as `fail_attempt` minus the one column that costs
+        something: `retry_class` stays NULL, and `attempts_spent` counts only
+        rows already classified, so this decrements no budget. Closing the row
+        is not optional — leaving it RUNNING collides the node's next attempt
+        with §10.3's partial unique index, keeps §7.6's watchdog polling an
+        attempt nobody is running, and makes §7.7 adjudicate a late arrival
+        ACCEPTED rather than SUPERSEDED.
+        """
+        def extra(lifecycle: st.NodeLifecycle):
+            return [(
+                "UPDATE attempts SET state=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
+                 lifecycle.attempt_no))]
+        return self._transition_node(
+            run_id, node_id, st.NodeState.PENDING, actor="scheduler",
+            reason="resume:result-declared",
+            require_state=(st.NodeState.RUNNING,), extra_writes=extra)
 
     # ── operator escapes (§11.3) ────────────────────────────────────────────
 

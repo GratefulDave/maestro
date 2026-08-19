@@ -419,6 +419,78 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
             self.assertLess(resume_idx, reclaim_idx)
 
 
+    def test_resume_does_not_charge_an_inherited_attempt_that_declared_a_result(self):
+        """§9.7 at resume. An inherited RUNNING attempt may be one that had
+        already finished: envelope written, work committed, result row
+        adjudicated, sitting in review when the scheduler died. Failing it
+        ENVIRONMENTAL debits an infra retry for an attempt that did its
+        work, which is the same accounting distortion the watchdog's turn
+        clock produced before it learned to read the results row.
+
+        It is still returned to PENDING -- nothing in the resumed process
+        owns it, and a node left RUNNING is in no ready set and collides
+        with §10.3's partial unique index forever -- but the attempt row is
+        closed UNCLASSIFIED, and `attempts_spent` counts only classified
+        rows.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.record_result("run1", st.ResultRecord(
+                node_id="a", attempt_no=1, subject_sha="s1",
+                payload={"status": "success"},
+                adjudication=st.Adjudication.ACCEPTED))
+
+            reclaimed = store.resume_run("run1")
+
+            self.assertEqual(reclaimed, ("a",))
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.PENDING)
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 0)
+            row = store.conn.execute(
+                "SELECT state, retry_class FROM attempts"
+                " WHERE run_id=? AND node_id=? AND attempt_no=1",
+                ("run1", "a")).fetchone()
+            self.assertEqual(row[0], lc.CLOSED_ATTEMPT_STATE.value)
+            self.assertIsNone(row[1])
+            # The result the attempt declared is retained, not discarded.
+            self.assertEqual(len(store.audit_results("run1", "a")), 1)
+            # The orphaned pane is still recorded either way (§7.8).
+            self.assertEqual(len(store.audit_orphans("run1")), 1)
+
+    def test_resume_still_charges_an_inherited_attempt_that_declared_nothing(self):
+        """The inverse: a genuinely in-flight attempt is ENVIRONMENTAL, as
+        it always was. Only a typed, adjudicated result row spares it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+
+            store.resume_run("run1")
+
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 1)
+
+    def test_resume_charges_an_inherited_attempt_whose_result_was_superseded(self):
+        """Only ACCEPTED spares the attempt. A SUPERSEDED row names an
+        attempt that was no longer the live one when its result landed, so
+        it is not this generation's declared work and must not exempt it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.record_result("run1", st.ResultRecord(
+                node_id="a", attempt_no=1, subject_sha="s1",
+                payload={"status": "success"},
+                adjudication=st.Adjudication.SUPERSEDED))
+
+            store.resume_run("run1")
+
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 1)
+
+
 # ── §7.8 cancellation ────────────────────────────────────────────────────────
 
 class CancellationTests(unittest.TestCase):
