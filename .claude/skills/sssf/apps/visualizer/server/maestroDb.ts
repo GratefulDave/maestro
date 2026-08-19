@@ -335,15 +335,16 @@ export class MaestroDb {
   runs(): MaestroRunSummary[] {
     return this.runRows().map((row) => {
       const nodes = this.nodeRows(row.run_id);
+      const state = liveState(row, nodes);
       return {
         run_id: row.run_id,
         plan_name: this.planNameFor(row.plan_digest),
         plan_digest: row.plan_digest,
-        state: liveState(row, nodes),
+        state,
         declared_outcome: row.latest_outcome,
         declared_outcome_at: row.latest_outcome_at,
         cancel_cause: row.cancel_cause,
-        resumable: isResumable(row),
+        resumable: isResumable(row, state),
         cancel_requested: Boolean(row.cancel_requested),
         created_at: row.created_at,
         last_transition_at: row.last_transition_at,
@@ -431,15 +432,16 @@ export class MaestroDb {
       attempts: attemptsByNode.get(node.node_id) ?? [],
     }));
 
+    const state = liveState(row, nodeRows);
     return {
       run_id: row.run_id,
       plan_name: this.planNameFor(row.plan_digest),
       plan_digest: row.plan_digest,
-      state: liveState(row, nodeRows),
+      state,
       declared_outcome: row.latest_outcome,
       declared_outcome_at: row.latest_outcome_at,
       cancel_cause: row.cancel_cause,
-      resumable: isResumable(row),
+      resumable: isResumable(row, state),
       cancel_requested: Boolean(row.cancel_requested),
       created_at: row.created_at,
       last_transition_at: row.last_transition_at,
@@ -549,28 +551,29 @@ const ABSOLUTELY_TERMINAL = new Set(["MERGED", "CANCELLED"]);
  * still reads BLOCKED there. The dashboard shows both, and this is the one
  * that answers "is it moving".
  *
- * The order below is `lifecycle.derive_run_state`'s and must stay that way —
- * the two are one rule in two languages, and the reason this reads `settled`
- * before `cancel_requested` is the defect that made a finished cancellation
- * render `CANCELLING` forever (issue #39). `cancel_requested` is a *request*,
- * cleared only by a resume and by nothing else, so it says a stop was asked
- * for and never that the stop is still in progress. The node rows say that,
- * and once every one of them is absolutely terminal the run has stopped
- * whatever any flag or any process is doing.
+ * Settled node rows are read before `cancel_requested` — issue #39. The flag
+ * is a *request*, cleared only by a resume, so it never says the stop is
+ * still in progress. The node rows say that.
  *
- * The declared outcome is consulted in exactly one place: the settled branch,
- * where it is the scheduler's own typed statement about a run that has already
- * stopped and cannot be stale. Outside that branch it is deliberately ignored,
- * because a resumed run's declaration describes a life the run has moved past.
+ * `latest_outcome` is consulted only inside the settled branch, and only
+ * when the live rows do not already contradict it. A resume leaves
+ * `latest_outcome=CANCELLED` standing until the scheduler declares again.
+ * Once every reopened node is MERGED the rows say MERGED; treating the
+ * leftover declaration as the live state is §19 M5's stale-outcome
+ * projection during the final-acceptance window. Mixes of MERGED and
+ * CANCELLED still read the declaration so an abandon-by-node run stays
+ * CANCELLED (no `cancel_requested`, and the declaration is the typed
+ * statement that it is).
  */
 function liveState(row: RunRow, nodes: { state: string }[]): string {
   if (nodes.length === 0) return "EMPTY";
   const states = nodes.map((node) => node.state);
   if (states.every((state) => ABSOLUTELY_TERMINAL.has(state))) {
+    const allMerged = states.every((state) => state === "MERGED");
+    if (allMerged && !row.cancel_requested) return "MERGED";
     if (row.cancel_requested || row.latest_outcome === "CANCELLED") {
       return "CANCELLED";
     }
-    if (states.every((state) => state === "MERGED")) return "MERGED";
     return "QUIESCENT";
   }
   if (row.cancel_requested) return "CANCELLING";
@@ -590,11 +593,16 @@ function liveState(row: RunRow, nodes: { state: string }[]): string {
  * RUN_CANCEL. An operator looking at a cancelled run could not tell those
  * apart, which is what this answers.
  *
+ * The displayed live state wins when it already names the window resume
+ * would refuse: a run whose nodes are all MERGED is in final acceptance,
+ * even if `latest_outcome` is still the CANCELLED a resume left behind.
+ *
  * Everything else is resumable, including the run that declared nothing: a
  * NULL latest outcome means no scheduler ever declared quiescence, and a
  * legality rule that refused it would make crash recovery unreachable (§7.3).
  */
-function isResumable(row: RunRow): boolean {
+function isResumable(row: RunRow, state: string): boolean {
+  if (state === "MERGED") return false;
   if (row.latest_outcome === "ACCEPTED") return false;
   if (row.latest_outcome === "CANCELLED") {
     return row.cancel_cause === "RUN_CANCEL";

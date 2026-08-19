@@ -344,6 +344,31 @@ describe("run state", () => {
     expect(db.run("run-back")?.state).toBe("RUNNING");
     db.close();
   });
+
+  test("a resumed run whose nodes have all merged is MERGED, not CANCELLED", () => {
+    // Resume clears cancel_requested and leaves latest_outcome=CANCELLED
+    // until the scheduler declares again. Once every reopened node is
+    // MERGED the live rows contradict that leftover declaration — this
+    // is the final-acceptance window, and projecting CANCELLED here is
+    // §19 M5's stale-outcome defect (issue #39's sibling).
+    const db = new MaestroDb(
+      ledger("resumed-merged", (seed) => {
+        insertRun(seed, "run-accepting", {
+          latest_outcome: "CANCELLED",
+          cancel_cause: "RUN_CANCEL",
+          cancel_requested: 0,
+        });
+        insertNode(seed, "run-accepting", "merged-one", "MERGED");
+        insertNode(seed, "run-accepting", "merged-two", "MERGED");
+      }),
+    );
+    const run = db.run("run-accepting");
+    expect(run?.state).toBe("MERGED");
+    expect(run?.declared_outcome).toBe("CANCELLED");
+    expect(run?.cancel_requested).toBe(false);
+    expect(run?.resumable).toBe(false);
+    db.close();
+  });
 });
 
 describe("whether a cancelled run can be resumed", () => {
