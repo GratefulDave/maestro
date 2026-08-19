@@ -63,10 +63,10 @@ Run these in the repository the plan will change.
    validates the projection, and finalizes it. Finalizing is required before the plan can run, and
    before it can participate in a workspace.
 
-> **Not built yet.** `gate`, `review`, and `ship` are the intended surface for Maestro's plan CLI —
-> one verb, one argument, everything else resolved from `maestro.config.yaml`. The companion change
-> that adds them is in progress in the lexgenius repository and has not merged. Until it lands, run
-> the calls each verb wraps directly; see "What each verb runs" below.
+`gate`, `review`, and `ship` are the plan CLI's shipped surface — one verb, one argument,
+everything else resolved from `maestro.config.yaml`. They landed in commit 6707e50 (PR #8) and are
+registered on the `plan` subparser in `maestro.py`. Run them directly; "What each verb runs" below
+documents the calls each one wraps, for reading the trace rather than for hand-running the steps.
 
 `gate` and `review` are two separate commands, on purpose, because of who is allowed to hold what.
 A review receipt only proves that someone other than the author looked at the plan if the author

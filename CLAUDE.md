@@ -54,27 +54,27 @@ assuming it is current against a deployment** — `diff -rq` against the instanc
 trusting this file, which can itself go stale. When landing a change, say explicitly which copies
 you touched, and mirror deliberately rather than assuming a mirror already happened.
 
-**State as of 2026-08-19.** `tests/test_template_parity.py` **fails** from this repo today, on both
-of its assertions. It reports two files present in the-library and absent here —
-`tests/test_base_commit_enforcement.py` and `tests/test_review_clock_siblings.py` — and six files
-differing by content: `adw_modules/launcher.py` (this repo ahead by 357 lines),
-`tests/test_pane_placement.py` (395), `maestro.py` (28), `tests/test_agent_start_busy_retry.py`
-(26), `maestro.config.yaml` (17), `tests/test_launch_refusal_cleanup.py` (7). Five of those six
-are this repository's **uncommitted working tree**, not a divergence between the copies: compared
-against `HEAD` rather than against the working tree, all five hash identically in the-library and
-in `lexgenius-pipeline/adws/`. The sixth is real and committed — this template's
-`maestro.config.yaml` carries the `execution.review_reject_grade` block and neither peer's does.
-Its absence leaves the loader on `code_review.DEFAULT_REJECT_GRADE` rather than changing a
-verdict, so the cost is that the template the-library ships no longer documents the knob.
+**State as of 2026-08-19, re-derived by running the test.** `tests/test_template_parity.py`
+**passes** from this repo — both assertions, same-files and byte-identical-contents. The earlier
+reading recorded here was stale twice over: it reported six content differences, five of which were
+this repository's own uncommitted working tree rather than a divergence between the copies, and it
+reported `tests/test_base_commit_enforcement.py` and `tests/test_review_clock_siblings.py` as
+present in the-library and absent here. The direction was backwards. Neither template copy held
+those tests, and neither held the two functions they exercise; both files existed only on the
+unmerged `issues/sweep` branch. They have since been carved onto `carve/sweep-parity-tests` with
+`maestro._validate_review_clocks`, `maestro._refuse_base_commit_divergence`, and
+`worktree.resolve_commit`, and mirrored across. The one committed divergence that reading did find
+is also closed: both copies' `maestro.config.yaml` now carries `execution.review_reject_grade`.
 
-Two qualifications on that reading, both of which outrank the numbers above. **the-library's
-mirror is uncommitted there**: `git -C the-library status --short` reports 18 modified and 11
-untracked files under `skills/sssf/templates/adws/`, on `main`, ahead 1 of `origin/main`. A
-`diff -rq` that matches says the bytes on disk agree, and says nothing about whether the change is
-committed — an agent that resets or checks out in that repository takes the mirror with it. And
-the differing set moved while it was being measured: `test_agent_start_busy_retry.py` was clean at
-the start of the observation and modified minutes later, because another lane is writing into this
-template right now. A `diff -rq` between these copies is a reading of a moving tree.
+Two qualifications outrank any such snapshot, this one included. **the-library's mirror can be
+uncommitted there** — the four files this carve mirrored (2 modified, 2 untracked under
+`skills/sssf/templates/adws/`) are on disk and not in a commit. A `diff -rq` or a green parity run
+says the bytes on disk agree; it says nothing about whether they are committed, and an agent that
+resets or checks out in that repository takes the mirror with it. And the differing set moves while
+it is being measured, because other lanes write into this template concurrently: an earlier
+observation watched `test_agent_start_busy_retry.py` go from clean to modified minutes apart. Any
+comparison between these copies is a reading of a moving tree — run the test, do not trust this
+paragraph.
 
 `lexgenius-pipeline/adws/` reports the same six differing files and the same two absent-here tests,
 plus deployment-only `adw_data/`, `adw_sssf_config/`, and a stray `maestro.py.orig`. Its

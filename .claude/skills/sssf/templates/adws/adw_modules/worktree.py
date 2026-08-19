@@ -181,6 +181,22 @@ def integration_head(repo: Path, branch: str) -> str:
         raise WorktreeError(f"integration branch {branch!r} does not resolve in {repo}")
     return result.stdout.strip()
 
+
+def resolve_commit(repo: Path, spec: str) -> str:
+    """The commit object a revision names, whatever spelling recorded it.
+
+    `rev-parse <spec>^{commit}` peels tags and abbreviated SHAs to the
+    object id. Spelling is not identity: `abc1234` and the full SHA are
+    the same commit when they resolve to the same object.
+    """
+    result = _git(repo, "rev-parse", "--verify", "--quiet",
+                  "{0}^{{commit}}".format(spec), check=False)
+    if result.returncode != 0:
+        raise WorktreeError(
+            "revision {0!r} does not resolve in {1}".format(spec, repo))
+    return result.stdout.strip()
+
+
 _OBJECT_DIGEST = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 

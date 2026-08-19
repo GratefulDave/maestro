@@ -20,7 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -465,6 +465,52 @@ _SCHEDULER_CONFIG_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _validate_review_clocks(reviewer: Mapping[str, Any],
+                            execution: Mapping[str, Any]) -> None:
+    """Refuse review windows that the remaining live bound cannot hold.
+
+    `execution.turn_timeout_s` is *not* compared to
+    `reviewer.finalization_timeout_s`. After §19 M15 the builder turn clock
+    is disarmed once the attempt has an ACCEPTED result, so a 600s review
+    against a 300s turn clock is the shipping configuration, not an
+    inconsistency. The clocks that still apply during review are the
+    reviewer's own window and the run-level backstop. Review starts after
+    the node attempt, so a healthy sequential path spends
+    `node_timeout_s + finalization_timeout_s` before the next lifecycle
+    transition. Observed worst case: 461s / 64 turns; the template's 600s
+    window holds that with 139s of margin, and backstop_t_s=7200 holds
+    1800+600.
+    """
+    finalization_s = reviewer["finalization_timeout_s"]
+    reviewer_turn_s = reviewer["turn_timeout_s"]
+    backstop_s = execution["backstop_t_s"]
+    node_timeout_s = execution["node_timeout_s"]
+    if reviewer_turn_s >= finalization_s:
+        raise _MaestroConfigurationError(
+            "LIVENESS_BOUND_UNSATISFIED: reviewer.turn_timeout_s must be "
+            "less than reviewer.finalization_timeout_s, or a single silent "
+            "turn consumes the whole review window. "
+            "reviewer_turn={0}, finalization={1}".format(
+                reviewer_turn_s, finalization_s))
+    if finalization_s >= backstop_s:
+        raise _MaestroConfigurationError(
+            "LIVENESS_BOUND_UNSATISFIED: reviewer.finalization_timeout_s "
+            "must be less than execution.backstop_t_s, or the run-level "
+            "backstop fires inside a healthy review. "
+            "finalization={0}, backstop={1}".format(
+                finalization_s, backstop_s))
+    sequential_s = node_timeout_s + finalization_s
+    if sequential_s >= backstop_s:
+        raise _MaestroConfigurationError(
+            "LIVENESS_BOUND_UNSATISFIED: execution.node_timeout_s plus "
+            "reviewer.finalization_timeout_s must be less than "
+            "execution.backstop_t_s, or the run-level backstop fires on a "
+            "healthy sequential node-and-review path. "
+            "node_timeout={0}, finalization={1}, sequential={2}, "
+            "backstop={3}".format(
+                node_timeout_s, finalization_s, sequential_s, backstop_s))
+
+
 def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     """Repository layout, binaries, and route destinations. No key material."""
     try:
@@ -706,6 +752,15 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
                 execution["vendor"], reviewer["vendor"])
         except code_review.SelfJudgeRefused as exc:
             raise _MaestroConfigurationError(str(exc)) from exc
+
+    # Sibling clocks. After §19 M15, execution.turn_timeout_s is disarmed
+    # for an attempt that already holds an ACCEPTED result, so a review
+    # window of 600s against a builder turn clock of 300s is legal — the
+    # old inequality would refuse the shipping template for a closed bug.
+    # The remaining live bound during review is the run-level backstop,
+    # which node_timeout defers to once a result exists. The per-turn
+    # reviewer silence clock must also sit inside the review window.
+    _validate_review_clocks(reviewer, execution)
 
     data_dir = repository_state / "data"
     receipt_dir = repository_state / "receipts"
@@ -2179,6 +2234,45 @@ def _is_within_run_boundary(path: Path, boundary: Path) -> bool:
     return _paths_share_inode(ancestor, boundary)
 
 
+def _refuse_base_commit_divergence(args: argparse.Namespace,
+                                   plan: plan_model.Plan) -> Optional[int]:
+    """Single-repo twin of workspace_runtime.prepare_candidate's SHA check.
+
+    Attempt worktrees still branch from the integration head so `needs` works
+    (§8.1). This only asserts that, at run start, that head still *is* the
+    recorded authoring base. Resume skips it: merges in the same run are
+    supposed to move the head. A fixture or double without those fields is
+    left to the existing worktree-add refusal rather than invented here.
+
+    Identity is the resolved commit object, not the spelling of the revision
+    the plan recorded. Ingress accepts any nonempty Git revision that
+    resolves to a commit, including an abbreviated SHA or a tag. A recorded
+    base that cannot resolve is a refusal: failing open here used to create
+    attempt worktrees from whatever the integration head currently is (#32).
+    """
+    branch = getattr(getattr(plan, "merge_policy", None), "integration_branch", None)
+    base = getattr(plan, "base_commit", None)
+    if not branch or not base:
+        return None
+    try:
+        head = worktree.resolve_commit(Path(args.repo), branch)
+        base_sha = worktree.resolve_commit(Path(args.repo), str(base))
+    except worktree.WorktreeError as exc:
+        return _refusal(
+            "BASE_COMMIT_UNRESOLVABLE",
+            "plan.base_commit {0} or integration branch {1} could not be "
+            "resolved, so recorded-base identity cannot be verified: {2}"
+            .format(base, branch, exc))
+    if head.lower() != base_sha.lower():
+        return _refusal(
+            "BASE_COMMIT_DIVERGED",
+            "integration branch {0} is at {1}, plan.base_commit {2} "
+            "resolves to {3}. The single-repo path used to create attempt "
+            "worktrees against whatever {0} pointed at and never compared "
+            "the two.".format(branch, head, base, base_sha))
+    return None
+
+
 def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> None:
     """Refuse lifecycle authority writable through a run participant boundary.
 
@@ -2715,6 +2809,10 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     try:
         if resuming:
             store.resume_run(args.run_id)
+        else:
+            refused = _refuse_base_commit_divergence(args, plan)
+            if refused is not None:
+                return refused
         # Not `elif`: a resumed run whose predecessor released the checkout has
         # to take the branch back, because every attempt is based on its head.
         if not Path(args.integration_path).exists():
