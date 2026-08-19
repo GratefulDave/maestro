@@ -36,6 +36,31 @@ from adw_modules import worktree as wt  # noqa: E402
 from adw_modules.launcher import HarnessQuiescenceError  # noqa: E402
 
 
+# How long a test here waits for a real gate subprocess to *arrive* at its
+# first line, or for a cancelled gate thread to return. Every wait expressed
+# in terms of this constant is a precondition: overrunning it means "the gate
+# has not got there yet", never "the runtime is wrong". A gate is a real
+# `pytest` process started inside a git worktree, and this suite's default is
+# `-n auto` (see pytest.ini), so on an 18-core machine eighteen workers fork
+# subprocesses against one disk while the operator's other work runs alongside.
+#
+# The bound this replaced was 30.0s, and it was already a *raised* bound
+# carrying a comment recording that 3.0s had not been enough under full-suite
+# load. Thirty was not enough either: it expired in an `-n auto` run and the
+# failure surfaced as `assertTrue(marker.exists())`. That is the argument
+# against picking a number by measuring — a bound placed at roughly the
+# duration it measures is a coin toss whoever measures it. This one is a hang
+# detector instead: generous enough that only a genuine deadlock reaches it,
+# bounded so a deadlock still reports rather than hanging the suite (#57,
+# same treatment as `ARRIVAL_TIMEOUT_S` in tests/test_coordinator.py for #50).
+#
+# A bound that asserts a latency *property* must not be folded in here. The
+# sites below wait for arrival and for termination only; what those tests
+# actually assert — that the cancellation happens and the process group is
+# gone afterwards — is asserted separately and is not a timing claim.
+ARRIVAL_TIMEOUT_S = float(os.environ.get("MAESTRO_TEST_ARRIVAL_TIMEOUT_S", "60.0"))
+
+
 def _stub_runner(*prefix: str) -> rr.ResolvedRunner:
     """A resolved runner standing for an arbitrary command.
 
@@ -621,13 +646,13 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
         # after it in the same run competes with a spinning process group,
         # which is a plausible reason failures clustered rather than scattered.
         try:
-            deadline = time.monotonic() + 30.0
+            deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(marker.exists())
             process_group = int(marker.read_text())
             cancelled.set()
-            thread.join(timeout=10.0)
+            thread.join(timeout=ARRIVAL_TIMEOUT_S)
             self.assertFalse(thread.is_alive())
             self.assertEqual(len(failures), 1)
             self.assertIsInstance(failures[0], wt.GateCancelled)
@@ -635,7 +660,7 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
                 os.killpg(process_group, 0)
         finally:
             cancelled.set()
-            thread.join(timeout=10.0)
+            thread.join(timeout=ARRIVAL_TIMEOUT_S)
         wr.cleanup_acceptance(acceptance)
 
     def test_cleanup_removes_only_acceptance_worktrees(self) -> None:

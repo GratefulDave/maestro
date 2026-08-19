@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from adw_modules.launcher import quiesce_process_group
+from adw_modules.launcher import quiesce_process_group  # noqa: E402
 from adw_modules.participant import (
     PARTICIPANT_RESULT_SCHEMA,
     ParticipantCancelled,
@@ -26,6 +26,35 @@ from adw_modules.participant import (
     SubprocessParticipantRunner,
     load_participant_result,
 )
+
+
+# How long a test here waits for a participant subprocess, or a thread driving
+# one, to *arrive* somewhere — launch entered, communicate entered, a
+# cancellation returned, a thread joined, a pair of participants both showing
+# up in `active_participant_ids`. Every wait expressed in terms of this
+# constant is a precondition: overrunning it means "not yet", never "wrong". A
+# participant is a real Python subprocess, and this suite's default is
+# `-n auto` (see pytest.ini), so on an 18-core machine eighteen workers fork
+# subprocesses against one disk while the operator's other work runs alongside.
+#
+# The bounds this replaced were 1.0s, 2.0s and 3.0s. Under full-suite load
+# they produced failures that read as defects in the code under test rather
+# than as expired preconditions: `test_simultaneous_repositories_and_targeted
+# _cancellation` surfaced as `AttributeError: 'ParticipantExecutionError' has
+# no attribute 'outcome'`, which is the second participant's 0.8s sleep
+# overrunning a 2.0s run timeout and returning an error object where the test
+# expected a result. Nothing about latency is under test there. This is a hang
+# detector instead: generous enough that only a genuine deadlock reaches it,
+# bounded so a deadlock still reports rather than hanging the suite (#57, same
+# treatment as `ARRIVAL_TIMEOUT_S` in tests/test_coordinator.py for #50).
+#
+# One bound in this module is a genuine property and is deliberately NOT
+# expressed in terms of this constant: the
+# `assertFalse(cancel_completed.wait(timeout=0.05))` in
+# `test_cancel_during_launch_...`, which asserts that cancellation does *not*
+# complete while the launch is still held. Folding that in would invert it
+# into a sixty-second sleep asserting nothing. Do not fold it in.
+ARRIVAL_TIMEOUT_S = float(os.environ.get("MAESTRO_TEST_ARRIVAL_TIMEOUT_S", "60.0"))
 
 
 PARTICIPANT = r'''
@@ -159,7 +188,7 @@ class ParticipantRunnerTest(unittest.TestCase):
             run_argv=(sys.executable, str(probe)),
         )
 
-        result = self.runner.run(context, timeout=2.0)
+        result = self.runner.run(context, timeout=ARRIVAL_TIMEOUT_S)
 
         payload = json.loads(
             context.participant_result_path.read_text(encoding="utf-8"))
@@ -178,7 +207,7 @@ class ParticipantRunnerTest(unittest.TestCase):
         })
 
     def test_parses_exact_accepted_result(self) -> None:
-        result = self.runner.run(self.context("accepted"), timeout=2.0)
+        result = self.runner.run(self.context("accepted"), timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertEqual(result.schema, PARTICIPANT_RESULT_SCHEMA)
         self.assertEqual(result.child_run_id, "child-repository")
@@ -192,11 +221,11 @@ class ParticipantRunnerTest(unittest.TestCase):
 
         result = self.runner.run(
             self.context("descendant", str(child_pid), repository_id="descendant"),
-            timeout=2.0)
+            timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertEqual(result.outcome, "accepted")
         pid = int(child_pid.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
         while time.monotonic() < deadline:
             try:
                 os.kill(pid, 0)
@@ -246,7 +275,7 @@ class ParticipantRunnerTest(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 result = self.runner.run(
                     self.context(outcome, repository_id="result-" + outcome),
-                    timeout=2.0)
+                    timeout=ARRIVAL_TIMEOUT_S)
                 self.assertEqual(result.outcome, outcome)
                 self.assertIsNone(result.accepted_sha)
 
@@ -274,7 +303,7 @@ class ParticipantRunnerTest(unittest.TestCase):
                 with self.assertRaises(ParticipantProtocolError):
                     self.runner.run(
                         self.context(mode, repository_id="invalid-" + mode),
-                        timeout=2.0)
+                        timeout=ARRIVAL_TIMEOUT_S)
 
     def test_rejects_a_result_file_that_predates_launch(self) -> None:
         context = self.context("accepted")
@@ -282,11 +311,11 @@ class ParticipantRunnerTest(unittest.TestCase):
         context.participant_result_path.write_text("{}", encoding="utf-8")
 
         with self.assertRaises(ParticipantProtocolError):
-            self.runner.run(context, timeout=2.0)
+            self.runner.run(context, timeout=ARRIVAL_TIMEOUT_S)
 
     def test_nonzero_exit_refuses_even_valid_result(self) -> None:
         with self.assertRaises(ParticipantExecutionError) as caught:
-            self.runner.run(self.context("nonzero"), timeout=2.0)
+            self.runner.run(self.context("nonzero"), timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertIn("exit_code=9", str(caught.exception))
 
@@ -299,9 +328,9 @@ class ParticipantRunnerTest(unittest.TestCase):
                 with self.assertRaises(error_type):
                     self.runner.run(
                         self.context(mode, str(child_pid), repository_id=mode),
-                        timeout=2.0)
+                        timeout=ARRIVAL_TIMEOUT_S)
                 pid = int(child_pid.read_text(encoding="utf-8"))
-                deadline = time.monotonic() + 1.0
+                deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
                 while time.monotonic() < deadline:
                     try:
                         os.kill(pid, 0)
@@ -330,10 +359,10 @@ class ParticipantRunnerTest(unittest.TestCase):
 
         self.assertTrue(self.runner.cancel(
             context.workspace_run_id, context.repository_id,
-            time.monotonic() + 1.0))
+            time.monotonic() + ARRIVAL_TIMEOUT_S))
         with mock.patch("adw_modules.participant.subprocess.Popen") as popen:
             with self.assertRaises(ParticipantCancelled):
-                self.runner.run(context, timeout=2.0)
+                self.runner.run(context, timeout=ARRIVAL_TIMEOUT_S)
 
         popen.assert_not_called()
 
@@ -353,7 +382,7 @@ class ParticipantRunnerTest(unittest.TestCase):
                     "adw_modules.participant._quiesce_owned_group",
                     return_value=False):
             with self.assertRaises(ParticipantExecutionError):
-                self.runner.run(context, timeout=2.0)
+                self.runner.run(context, timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertEqual(
             self.runner.active_participant_ids,
@@ -363,7 +392,7 @@ class ParticipantRunnerTest(unittest.TestCase):
                 return_value=True):
             self.assertTrue(self.runner.cancel(
                 context.workspace_run_id, context.repository_id,
-                time.monotonic() + 1.0))
+                time.monotonic() + ARRIVAL_TIMEOUT_S))
         self.assertEqual(self.runner.active_participant_ids, ())
 
     def test_cancellation_cannot_miss_a_concurrent_launch(self) -> None:
@@ -380,27 +409,28 @@ class ParticipantRunnerTest(unittest.TestCase):
 
             def __init__(self, *args, **kwargs) -> None:
                 launch_entered.set()
-                release_launch.wait(timeout=1.0)
+                release_launch.wait(ARRIVAL_TIMEOUT_S)
 
             def poll(self):
                 return None
 
             def communicate(self, timeout=None):
                 communicate_entered.set()
-                release_communicate.wait(timeout=1.0)
+                release_communicate.wait(ARRIVAL_TIMEOUT_S)
                 return "", ""
 
         def run_participant() -> None:
             try:
                 outcome["value"] = self.runner.run(
                     self.context("absent", repository_id="launch-race"),
-                    timeout=2.0)
+                    timeout=ARRIVAL_TIMEOUT_S)
             except BaseException as exc:
                 outcome["value"] = exc
 
         def cancel_participant() -> None:
             outcome["cancelled"] = self.runner.cancel(
-                "workspace-run", "launch-race", time.monotonic() + 1.0)
+                "workspace-run", "launch-race",
+                time.monotonic() + ARRIVAL_TIMEOUT_S)
             cancel_completed.set()
 
         with mock.patch(
@@ -411,15 +441,18 @@ class ParticipantRunnerTest(unittest.TestCase):
             runner_thread = threading.Thread(target=run_participant)
             cancel_thread = threading.Thread(target=cancel_participant)
             runner_thread.start()
-            self.assertTrue(launch_entered.wait(timeout=1.0))
+            self.assertTrue(launch_entered.wait(ARRIVAL_TIMEOUT_S))
             cancel_thread.start()
+            # A property under test, not an arrival: cancellation must NOT
+            # complete while the launch is still held. Deliberately literal —
+            # see the note on ARRIVAL_TIMEOUT_S. Do not fold this in.
             self.assertFalse(cancel_completed.wait(timeout=0.05))
             release_launch.set()
-            self.assertTrue(communicate_entered.wait(timeout=1.0))
-            self.assertTrue(cancel_completed.wait(timeout=1.0))
+            self.assertTrue(communicate_entered.wait(ARRIVAL_TIMEOUT_S))
+            self.assertTrue(cancel_completed.wait(ARRIVAL_TIMEOUT_S))
             release_communicate.set()
-            runner_thread.join(timeout=1.0)
-            cancel_thread.join(timeout=1.0)
+            runner_thread.join(timeout=ARRIVAL_TIMEOUT_S)
+            cancel_thread.join(timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertTrue(outcome["cancelled"])
         self.assertIsInstance(outcome["value"], ParticipantCancelled)
@@ -432,7 +465,8 @@ class ParticipantRunnerTest(unittest.TestCase):
 
         def invoke(context: ParticipantContext) -> None:
             try:
-                outcomes[context.repository_id] = self.runner.run(context, timeout=2.0)
+                outcomes[context.repository_id] = self.runner.run(
+                    context, timeout=ARRIVAL_TIMEOUT_S)
             except BaseException as exc:
                 outcomes[context.repository_id] = exc
 
@@ -440,7 +474,7 @@ class ParticipantRunnerTest(unittest.TestCase):
         second_thread = threading.Thread(target=invoke, args=(second,))
         first_thread.start()
         second_thread.start()
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
         while self.runner.active_participant_ids != (
                 ("workspace-run", "first"), ("workspace-run", "second")):
             if time.monotonic() >= deadline:
@@ -451,10 +485,11 @@ class ParticipantRunnerTest(unittest.TestCase):
                 "adw_modules.participant.quiesce_process_group",
                 wraps=quiesce_process_group) as quiesce:
             self.assertTrue(
-                self.runner.cancel("workspace-run", "first", time.monotonic() + 1.0))
+                self.runner.cancel("workspace-run", "first",
+                                   time.monotonic() + ARRIVAL_TIMEOUT_S))
 
-        first_thread.join(timeout=3.0)
-        second_thread.join(timeout=3.0)
+        first_thread.join(timeout=ARRIVAL_TIMEOUT_S)
+        second_thread.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertIsInstance(outcomes["first"], ParticipantCancelled)
         self.assertEqual(outcomes["second"].outcome, "accepted")
         self.assertEqual(quiesce.call_count, 1)

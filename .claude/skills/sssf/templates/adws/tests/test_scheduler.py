@@ -40,6 +40,7 @@ Run with:  uv run adws/adw_test.py        (the whole suite; `-k` filters on
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -58,6 +59,30 @@ from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import watchdog as wd  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
+
+
+# How long a test here waits for the scheduler's watchdog to *arrive* at a
+# quiescence phase. Every wait expressed in terms of this constant is a
+# precondition: overrunning it means "the watchdog has not fired yet", never
+# "the watchdog is wrong". Reaching that phase costs real work — a provision
+# call, a node timeout expiring, a kill and its quiescence proof — and this
+# suite's default is `-n auto` (see pytest.ini), so on an 18-core machine
+# eighteen workers contend for one disk while the operator's other work runs
+# alongside.
+#
+# The bounds this replaced were 3.0s and 30.0s, and the 30.0s one was itself
+# already a *raised* bound carrying a comment explaining why 3.0s had been too
+# low. It failed anyway, in a full-suite `-n auto` run, which is the argument
+# against picking a number by measuring: a bound placed at roughly the
+# duration it measures is a coin toss whoever measures it. This one is a hang
+# detector instead — generous enough that only a genuine deadlock reaches it,
+# bounded so a deadlock still reports rather than hanging the suite (#57,
+# same treatment as `ARRIVAL_TIMEOUT_S` in tests/test_coordinator.py for #50).
+#
+# A bound that asserts a latency *property* must not be folded in here. The
+# two sites below wait for arrival only; nothing in this module asserts that
+# the watchdog is fast.
+ARRIVAL_TIMEOUT_S = float(os.environ.get("MAESTRO_TEST_ARRIVAL_TIMEOUT_S", "60.0"))
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -706,7 +731,7 @@ class QuiescenceTests(SchedulerFixture):
         watchdog_quiesced = threading.Event()
 
         def provision(_path):
-            self.assertTrue(watchdog_quiesced.wait(timeout=3.0))
+            self.assertTrue(watchdog_quiesced.wait(ARRIVAL_TIMEOUT_S))
 
         def kill_attempt(_record):
             kill_called.set()
@@ -786,7 +811,7 @@ class GenerationFenceTests(SchedulerFixture):
                 # releases attempt 1. The node timeout below must expire while
                 # provision is still inside this wait, or the fence under test
                 # is never exercised.
-                self.assertTrue(watchdog_quiesced.wait(timeout=30.0))
+                self.assertTrue(watchdog_quiesced.wait(ARRIVAL_TIMEOUT_S))
 
         def quiesce(record, phase):
             if phase == "watchdog":
@@ -930,7 +955,7 @@ class CancellationTests(SchedulerFixture):
                      cancel_requested):
             on_launch(None)
             started.set()
-            self.assertTrue(release.wait(timeout=5))
+            self.assertTrue(release.wait(ARRIVAL_TIMEOUT_S))
             (attempt.path / "a.py").write_text("A\n")
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
 
@@ -938,7 +963,7 @@ class CancellationTests(SchedulerFixture):
             [self.agent("a")], deps=self.deps(run_node=run_node))
 
         def pause_when_running():
-            self.assertTrue(started.wait(timeout=5))
+            self.assertTrue(started.wait(ARRIVAL_TIMEOUT_S))
             scheduler.request_pause()
             release.set()
 
@@ -946,7 +971,7 @@ class CancellationTests(SchedulerFixture):
         waiter.start()
         with self.assertRaises(sch.RunPaused):
             scheduler.run()
-        waiter.join(timeout=5)
+        waiter.join(timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertIsNone(self.store.latest_outcome("run1"))
         self.assertIsNot(self.store.get_node("run1", "a").state,
@@ -1269,7 +1294,7 @@ class LivenessWiringTests(SchedulerFixture):
                      cancel_requested):
             on_launch(None)
             started.set()
-            deadline = time.time() + 5
+            deadline = time.time() + ARRIVAL_TIMEOUT_S
             while time.time() < deadline:
                 if any(phase == "cancel" for _, phase in self.quiesce_calls):
                     (attempt.path / "a.py").write_text("A\n")
@@ -1285,7 +1310,7 @@ class LivenessWiringTests(SchedulerFixture):
         scheduler.project()
 
         def fire_after_launch():
-            self.assertTrue(started.wait(timeout=5))
+            self.assertTrue(started.wait(ARRIVAL_TIMEOUT_S))
             self.store.conn.execute(
                 "UPDATE runs SET last_transition_at=? WHERE run_id=?",
                 ("1990-01-01T00:00:00.000+00:00", "run1"))
@@ -1293,7 +1318,7 @@ class LivenessWiringTests(SchedulerFixture):
         waiter = threading.Thread(target=fire_after_launch)
         waiter.start()
         report = scheduler.run()
-        waiter.join(timeout=5)
+        waiter.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertIs(report.outcome, st.RunOutcome.STUCK)
         self.assertIn("cancel", [phase for _, phase in self.quiesce_calls])
 
