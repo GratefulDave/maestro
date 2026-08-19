@@ -372,7 +372,8 @@ class OneQueryPathTests(LedgerFixture):
         tables = {name for kind, name in objects
                   if kind == "table" and not name.startswith("sqlite_")}
         self.assertEqual(tables, {"runs", "dag_nodes", "node_lifecycle", "attempts",
-                                  "transitions", "results", "orphans"})
+                                  "attempt_baselines", "transitions", "results",
+                                  "orphans"})
 
 
 if __name__ == "__main__":

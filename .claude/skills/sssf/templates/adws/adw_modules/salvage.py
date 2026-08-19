@@ -176,6 +176,32 @@ def _refuse_if_already_committed(repo: Path, attempt_row: st.AttemptRecord) -> N
 
 
 
+def _recorded_baseline(store: lc.LifecycleStore, run_id: str, node_id: str,
+                       attempt_no: int) -> Dict[str, Tuple[str, str]]:
+    """The attempt's own recorded baseline, or a refusal — never a rebuild.
+
+    The measurement bracket's before-side is the *provisioned* tree, which
+    holds untracked paths no commit contains. Rebuilding it from the base
+    commit after the attempt died reports each of those as a path the attempt
+    added; one of them covered by the node's declared outputs is committed,
+    measured as the attempt's delta, and signed for. Absence is therefore a
+    refusal, not a licence to approximate (§1.1 item 4).
+    """
+    try:
+        return store.attempt_baseline(run_id, node_id, attempt_no)
+    except lc.BaselineUnrecorded as exc:
+        raise SalvageRefused(
+            "SALVAGE_BASELINE_UNRECORDED",
+            f"{run_id}/{node_id}#{attempt_no} has no recorded measurement "
+            "baseline; its before-side cannot be rebuilt from the base commit "
+            "without attributing provisioned untracked content to the attempt",
+            run_id=run_id, node_id=node_id, attempt_no=attempt_no) from exc
+    except lc.BaselineCorrupt as exc:
+        raise SalvageRefused(
+            "SALVAGE_BASELINE_CORRUPT", str(exc),
+            run_id=run_id, node_id=node_id, attempt_no=attempt_no) from exc
+
+
 def _refuse_if_live(store: lc.LifecycleStore, attempt: st.AttemptRecord) -> None:
     if attempt.state is not st.NodeState.RUNNING:
         return
@@ -232,6 +258,9 @@ def salvage_attempt(
 
     declared = store.node_outputs(run_id, node_id)
     _refuse_if_already_committed(repo, attempt_row)
+    # Read before the worktree is reopened, so an attempt whose before-side
+    # was never recorded costs nothing and leaves no commit and no record.
+    recorded_baseline = _recorded_baseline(store, run_id, node_id, attempt_no)
 
 
     worktree_path = (
@@ -257,8 +286,18 @@ def salvage_attempt(
             "SALVAGE_BASE_MOVED",
             f"HEAD is {head}, not the attempt's recorded base {attempt.base}")
 
+    # `reopen_attempt_worktree` fills `baseline` from `inventory_at_commit`,
+    # which is `git ls-tree` of the base commit and therefore tracked paths
+    # only. That is the right derivation for `tracked_at_base` — tracking is a
+    # property of the commit — and the wrong one for the baseline, which
+    # deliberately includes provisioned untracked content (§8.3). Measuring
+    # against the reconstruction attributes every provisioned untracked path
+    # to the attempt, and where one of them falls under the node's declared
+    # outputs the permission check passes and the receipt asserts a sha256 for
+    # bytes no attempt produced. The recorded baseline replaces it here.
+    attempt.baseline = recorded_baseline
     after = wt.inventory(attempt.path)
-    measured = wt.delta(attempt.baseline or {}, after)
+    measured = wt.delta(attempt.baseline, after)
     if measured.is_empty:
         raise SalvageRefused(
             "SALVAGE_EMPTY_DELTA",
@@ -291,6 +330,8 @@ def salvage_attempt(
         "node_id": node_id,
         "attempt_no": attempt_no,
         "base_sha": attempt.base,
+        "baseline_digest": lc.baseline_digest(
+            lc.encode_baseline(recorded_baseline)),
         "output_sha": output_sha,
         "invoked_by": invoked_by,
         "reason": reason,

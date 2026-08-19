@@ -110,6 +110,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `attempt salvage` no longer signs a receipt for bytes no attempt produced. The verb measured a
+  stranded attempt against a baseline it rebuilt with `worktree.inventory_at_commit` — `git
+  ls-tree` of the recorded base commit, which is tracked paths only. The measurement bracket's
+  real before-side is `worktree.inventory` of the *provisioned* tree, which §8.3 deliberately
+  keeps untracked non-ignored content in, so every path an adapter's `provision` or the pre-node
+  gate left behind read as a path the attempt had added. Where one of them fell under the node's
+  declared outputs — an ordinary glob such as `src/<pkg>/cmo/*.py` covering a provisioned
+  `__init__.py` — the permission check passed, `commit_measured_delta` committed the file as the
+  attempt's measured delta, and the Ed25519 salvage record asserted its sha256. That is a
+  complete, verifiable evidence chain for work that never happened, which is the failure §1.1
+  item 4 exists to prevent. The same reconstruction also disabled conjunct (2): a provisioned
+  file the attempt rewrote read as `added` rather than `changed`, and a glob is allowed to
+  authorize an addition, so tampering with provisioned content was admitted instead of convicted.
+
+  The scheduler now persists the baseline the moment `take_baseline` returns, into a new
+  `attempt_baselines` table keyed by `(run_id, node_id, attempt_no)`, with its sha256 digest
+  stamped onto the attempt row so the two records must agree before either is believed. Salvage
+  reads that record and refuses `SALVAGE_BASELINE_UNRECORDED` when an attempt predates it, rather
+  than falling back to the reconstruction — failing open was the defect, not a mitigation of it —
+  and `SALVAGE_BASELINE_CORRUPT` when the stored inventory and the stamped digest disagree. The
+  refusals are taken before the worktree is reopened, so a refused salvage writes no commit and
+  no record. The signed record now also names the `baseline_digest` the delta was measured
+  against.
+
 - Signed finalization receipts written before grading existed parse, verify and replay again.
   `rubric_version` names the rubric, not the receipt schema, and the grading fields
   (`Receipt.reject_at`, `DerivedCell.grade`) landed under `maestro-rubric.v2` without moving that
