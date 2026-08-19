@@ -1312,6 +1312,21 @@ class Scheduler:
         payload = execution.envelope_payload
         if payload is None:
             return
+        # A watchdog fence is in-memory. Adjudication reads attempts.state.
+        # If this generation is convicted but fail() has not released RUNNING
+        # yet, a result recorded now is ACCEPTED; declared_result_observed then
+        # defers NODE_TIMEOUT to backstop_t_s, and the worker cannot settle
+        # because _require_running raises on the fence (issue #48). Release
+        # first so the late result is SUPERSEDED — the case §7.7 exists for.
+        with self._lock:
+            fenced = record.key in self._watchdog_fences
+        if fenced and self._owns_running(record):
+            self._settle_failure(
+                node,
+                rp.Classification(
+                    retry_class=st.RetryClass.ENVIRONMENTAL,
+                    reason=wd.StallReason.NODE_TIMEOUT.value),
+                record=record, allow_watchdog_fence=True)
         adjudged = vf.adjudicate_result(
             st.ResultRecord(node_id=node.node_id, attempt_no=record.attempt_no,
                             subject_sha=record.base_sha, payload=payload),

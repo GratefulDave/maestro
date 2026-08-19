@@ -177,20 +177,33 @@ class Rubric:
 
 
 #: The rubric's questions are §6.2's judgments that no git object can
-#: settle: whether the graph accomplishes the stated intent, whether a
-#: node gate's selector is scoped to its own node's work and whether the
-#: integration gate's covers the merged surface instead, whether a
-#: hypothesis is dischargeable, whether evidence supports the claim made
-#: from it. Severity is a property of the question, fixed here in code.
+#: settle: whether the graph accomplishes the stated intent, whether a node
+#: can do its work from the reads it declares and within the writes it is
+#: permitted, whether a node gate's selector is scoped to its own node's work
+#: and whether the integration gate's covers the merged surface instead,
+#: whether a hypothesis is dischargeable, whether evidence supports the claim
+#: made from it. Severity is a property of the question, fixed here in code.
 #:
 #: The version names the applicability matrix as much as the questions. A
 #: receipt persists its full per-cell matrix (§6.5) and that matrix is only
 #: interpretable against the rubric that produced it, so moving a check
 #: between object kinds is a new version even when no question's text
 #: changes. `v2` moved the two node-scoped gate checks off the plan's
-#: integration gate.
+#: integration gate. `v3` added `node.writes_are_sufficient`, so a v2 receipt
+#: records a matrix in which that question was never asked of any node —
+#: which is exactly why the label has to move.
+#:
+#: A rubric version is not a receipt schema version, and §19 M21 is the price
+#: of confusing the two: `Receipt.from_bytes` discriminates on the presence of
+#: the key whose presence is in question, never on this label, so bumping the
+#: rubric adds no key, requires no key, and leaves every signed v1 and v2
+#: receipt parseable, verifiable and replayable at bytes nobody touched. The
+#: new question is nonetheless mandatory from v3 onward rather than optional
+#: forever (§3.6 B8): it is a matrix cell, `compute_matrix` emits it for every
+#: node, and `verify_report` refuses a report that does not answer every cell,
+#: so no v3 review can skip it.
 DEFAULT_RUBRIC = Rubric(
-    version="maestro-rubric.v2",
+    version="maestro-rubric.v3",
     checks=(
         RubricCheck(
             check_id="plan.intent_is_accomplished_by_the_graph",
@@ -208,6 +221,33 @@ DEFAULT_RUBRIC = Rubric(
             check_id="node.reads_are_sufficient",
             question=("Can this node's agent do the work from its declared "
                       "reads alone?"),
+            applies_to=(ObjectKind.NODE,),
+            severity=Severity.BLOCKING),
+        # The write-scope counterpart of the check above, and the reason it
+        # exists: `outputs` is not a wish list, it is the node's entire write
+        # permission. Single-producer ownership gives a path to exactly one
+        # node (§6.4 SINGLE_OUTPUT_OWNER) and the attempt's permission check
+        # convicts any diff touching a path the node does not declare, so a
+        # node whose instruction can only be discharged by editing someone
+        # else's output is unsatisfiable from its first attempt — the reviewer
+        # rejects every diff that does not wire production and the permission
+        # check would reject every diff that does. That is a question about
+        # the authored bytes, so it belongs at plan review, where the answer
+        # costs one cell instead of a review budget.
+        #
+        # The question is deliberately about the *instruction*, not about the
+        # shape of `outputs`: a node that creates a new module nothing at base
+        # yet imports is the ordinary case, legitimate whenever its
+        # instruction stops at the module it owns and a downstream node owns
+        # the wiring. What convicts is an instruction stating a property that
+        # only some other node's file could be changed to satisfy.
+        RubricCheck(
+            check_id="node.writes_are_sufficient",
+            question=("Can this node's agent discharge its instruction by "
+                      "changing only its declared `outputs`, or does the "
+                      "instruction state a property that some file this node "
+                      "is not permitted to write would have to change for it "
+                      "to hold?"),
             applies_to=(ObjectKind.NODE,),
             severity=Severity.BLOCKING),
         RubricCheck(

@@ -5,13 +5,14 @@
   "type": "module",
   "description": "Read-only observability UI for the Super Simple Software Factory — polls a target repo's sssf.db and/or Maestro lifecycle ledger.",
   "scripts": {
-    "dev": "vite",
+    "dev": "bun run scripts/dev.ts",
+    "dev:ui": "vite",
     "server": "bun run server/index.ts",
     "dev:all": "bun run server/index.ts & vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "bun run server/index.ts",
     "typecheck": "vue-tsc --noEmit",
-    "test": "bun test server",
+    "test": "bun test",
     "lint": "oxlint ."
   },
   "dependencies": {

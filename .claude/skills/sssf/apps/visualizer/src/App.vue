@@ -13,6 +13,7 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import type { SourceInfo } from './lib/types'
 import { fetchSources } from './lib/api'
+import { sourcesErrorMessage } from './lib/sourcesLoad'
 import { useRoute, hrefFor, hrefForSource, phaseCrumb } from './lib/router'
 import SessionsList from './components/SessionsList.vue'
 import SessionTrace from './components/SessionTrace.vue'
@@ -22,6 +23,7 @@ import MaestroRunDetail from './components/MaestroRunDetail.vue'
 const route = useRoute()
 const sources = shallowRef<SourceInfo[]>([])
 const sourcesLoaded = ref(false)
+const sourcesError = ref<string | null>(null)
 
 let timer: ReturnType<typeof setInterval> | undefined
 
@@ -29,9 +31,10 @@ async function loadSources() {
   try {
     sources.value = await fetchSources()
     sourcesLoaded.value = true
-  } catch {
-    // The sessions/runs views already surface an unreachable API; the tab
-    // strip simply stays as it was rather than flickering an error of its own.
+    sourcesError.value = null
+  } catch (err) {
+    sourcesLoaded.value = true
+    sourcesError.value = sourcesErrorMessage(err)
   }
 }
 
@@ -156,6 +159,7 @@ const showTabs = computed(() => sources.value.length > 1)
            answer `/api/sessions` with `no sssf database is loaded`, once per
            poll, and the operator saw an empty page over a stream of 404s. -->
       <div v-else-if="!sourcesLoaded" class="loading">loading sources…</div>
+      <div v-else-if="sourcesError" class="loading error-state">{{ sourcesError }}</div>
       <div v-else-if="route.sourceId" class="unknown-source">
         no source “{{ route.sourceId }}” is loaded — this server is serving
         {{ sources.map((s) => s.id).join(', ') || 'nothing' }}
@@ -302,10 +306,14 @@ const showTabs = computed(() => sources.value.length > 1)
   font-size: 13px;
   color: var(--faint);
 }
-
 .unknown-source,
 .loading {
   padding: 40px 24px;
   color: var(--dim);
+}
+
+.error-state {
+  color: var(--red);
+  font-weight: 600;
 }
 </style>

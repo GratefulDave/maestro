@@ -38,6 +38,7 @@ for _path in (str(ADWS), str(TESTS)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+import checkout_layout                                 # noqa: E402
 from adw_modules import plan_contract_ingress as pci   # noqa: E402
 from adw_modules import plan_validate as pv            # noqa: E402
 
@@ -595,20 +596,35 @@ class TheAuthoringSchemaAdmitsWhatMaestroRequiresTest(unittest.TestCase):
     It skips only when the-library is not checked out beside this repository,
     on the same rule `test_template_parity` uses: a peer that is present but
     missing the file it must carry is the failure this exists to catch.
+
+    Where "beside this repository" is comes from `checkout_layout`, which asks
+    git. The arithmetic this used to do -- five levels up from the runtime,
+    then one more -- was maestro's layout spelled out, so it missed the peer
+    twice over: it landed inside `.claude/worktrees` for any lane running in a
+    linked worktree, and it left the-library's own checkout entirely when the
+    runtime under test was the-library's. Both skipped, silently.
     """
 
     SCHEMA = pathlib.PurePosixPath(
         "skills/plan-contract/schemas/plan-ir-v1.schema.json")
 
     def schema(self):
-        siblings = ADWS.parents[4].parent
-        path = siblings / "the-library" / self.SCHEMA
-        if not (siblings / "the-library").is_dir():
-            self.skipTest("the-library is not checked out at " + str(siblings))
+        checkout = checkout_layout.identify_template_checkout(ADWS)
+        if checkout is None:
+            checkout_layout.skip_visibly(
+                "this ADW runtime is a deployed instance, not a template "
+                "checkout, so the authoring schema it would be read against "
+                "is not beside it")
+        root = checkout_layout.checkout_root(checkout, "the-library")
+        path = root / self.SCHEMA
+        if not root.is_dir():
+            checkout_layout.skip_visibly(
+                "the-library is not checked out at " + str(root)
+                + ". " + checkout.provenance)
         self.assertTrue(
             path.is_file(),
             "the-library is present but carries no authoring schema at "
-            + str(path))
+            + str(path) + " (" + checkout.provenance + ")")
         return json.loads(path.read_text(encoding="utf-8"))
 
     def defs(self):

@@ -129,7 +129,7 @@ class ScriptedReviewer:
     def __init__(self, findings: Dict[str, Tuple[str, str, str]],
                  *, clear_the_known_bad: bool = False,
                  mutate: Optional[Any] = None) -> None:
-        #: check_id -> (grade, message, rationale)
+        #: check_id -> (grade, message, rationale[, scope])
         self.findings = findings
         self.clear_the_known_bad = clear_the_known_bad
         self.mutate = mutate
@@ -144,7 +144,7 @@ class ScriptedReviewer:
                      "status": "clear"} if self.clear_the_known_bad else
                     {"check_id": cell.check_id, "object_id": cell.object_id,
                      "status": "finding", "message": "the control is bad",
-                     "grade": "note",
+                     "grade": "note", "scope": "in_scope",
                      "grade_rationale": "it is a control, by construction"})
                 continue
             if cell.canary is fin.CanaryKind.KNOWN_GOOD:
@@ -156,11 +156,14 @@ class ScriptedReviewer:
                 cells.append({"check_id": cell.check_id,
                               "object_id": cell.object_id, "status": "clear"})
                 continue
-            grade, message, rationale = scripted
+            # A script may state the scope as a fourth element; the default
+            # is the in-scope finding every case before `FindingScope` meant.
+            grade, message, rationale = scripted[:3]
+            scope = scripted[3] if len(scripted) > 3 else "in_scope"
             cells.append({"check_id": cell.check_id,
                           "object_id": cell.object_id, "status": "finding",
                           "message": message, "grade": grade,
-                          "grade_rationale": rationale})
+                          "grade_rationale": rationale, "scope": scope})
         report: Dict[str, Any] = {"plan_digest": matrix.plan_digest,
                                   "pair_count": matrix.pair_count,
                                   "cells": cells}
@@ -646,12 +649,13 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
     def test_a_finding_without_a_message_does_not_parse(self):
         self._refused({"check_id": "c", "object_id": "o", "status": "finding",
                        "grade": "error", "message": "   ",
-                       "grade_rationale": "it is broken"})
+                       "grade_rationale": "it is broken",
+                       "scope": "in_scope"})
 
     def test_a_finding_without_a_reason_for_its_grade_does_not_parse(self):
         self._refused({"check_id": "c", "object_id": "o", "status": "finding",
                        "grade": "error", "message": REAL_MESSAGE,
-                       "grade_rationale": "  "})
+                       "grade_rationale": "  ", "scope": "in_scope"})
 
     def test_a_cleared_cell_carrying_a_grade_does_not_parse(self):
         self._refused({"check_id": "c", "object_id": "o", "status": "clear",
@@ -662,8 +666,10 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
         parsed = cr.CodeReportCell.model_validate(
             {"check_id": "c", "object_id": "o", "status": "finding",
              "grade": "warning", "message": REAL_MESSAGE,
-             "grade_rationale": "delivered work is unaffected"})
+             "grade_rationale": "delivered work is unaffected",
+             "scope": "in_scope"})
         self.assertIs(cr.FindingGrade.WARNING, parsed.grade)
+        self.assertIs(cr.FindingScope.IN_SCOPE, parsed.scope)
 
     def test_the_whole_review_is_refused_when_a_finding_is_ungraded(self):
         """Not merely the cell: the driver must refuse, so an ungraded finding
@@ -675,6 +681,7 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
                         "diff."):
                     cell.pop("grade")
                     cell.pop("grade_rationale")
+                    cell.pop("scope")
 
         with tempfile.TemporaryDirectory() as tmp:
             store = make_store(Path(tmp))
@@ -1071,14 +1078,16 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
         """The only number available for a receipt written before the field
         existed, and the old behaviour, kept where it is still the truth."""
         receipt = self._receipt(None, digest="4")
-        findings, advisories = cr._replayed_findings(
+        findings, advisories, unreachable = cr._replayed_findings(
             receipt, None, cr.FindingGrade.WARNING)
         self.assertEqual(1, len(findings))
         self.assertEqual((), advisories)
+        self.assertEqual((), unreachable)
 
     def test_a_threshold_this_version_cannot_name_does_not_fail_the_replay(self):
         receipt = self._receipt("catastrophe", digest="5")
-        findings, advisories = cr._replayed_findings(
+        findings, advisories, unreachable = cr._replayed_findings(
             receipt, None, cr.FindingGrade.ERROR)
         self.assertEqual((), findings)
         self.assertEqual(1, len(advisories))
+        self.assertEqual((), unreachable)

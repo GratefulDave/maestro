@@ -431,3 +431,41 @@ _PLAN_JSON = json.dumps({
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentPromptRoutingTests(unittest.TestCase):
+    """The builder is told how to look things up, and it costs no identity.
+
+    A builder that reads files whole and greps the tree to locate them spends
+    context on bytes it never needed, and one that exhausts its context
+    mid-attempt lands a partial change rather than an error. The routing
+    guidance is one paragraph and is appended last, after every term the
+    attempt is judged on, so an agent that stops reading early has already
+    read what binds it.
+    """
+
+    def test_the_prompt_tells_the_builder_how_to_look_things_up(self):
+        plan = _fixture_plan()
+        examined = 0
+        for node_id, authored in plan.node_by_id().items():
+            if getattr(authored, "instruction", None) is None:
+                continue
+            examined += 1
+            prompt = maestro._agent_node_prompt(
+                authored, Path("/tmp/envelope.json"), None)
+            self.assertIn("code-intel-routing", prompt,
+                          "node {0} is not told how to search".format(node_id))
+            self.assertTrue(
+                prompt.rstrip().endswith(
+                    maestro.AGENT_DISCOVERY_ROUTING.rstrip()),
+                "routing guidance must come after the judged terms")
+        # A loop over an empty set passes for the wrong reason.
+        self.assertGreater(examined, 0, "the fixture plan has no agent node")
+
+    def test_the_guidance_names_no_term_the_attempt_is_judged_on(self):
+        # Guidance is not a contract: if this paragraph named a path, a gate or
+        # an output, it would be adding a term to the attempt through the one
+        # channel that carries no receipt.
+        for word in ("Write only these paths", "collecting at least",
+                     "success", "envelope"):
+            self.assertNotIn(word, maestro.AGENT_DISCOVERY_ROUTING)

@@ -30,7 +30,7 @@ export class ApiHttpError extends Error {
 }
 
 async function getJson(url: string): Promise<unknown> {
-  const res = await fetch(url)
+  const res = await fetch(url, { signal: AbortSignal.timeout(8000) })
   if (!res.ok) throw new ApiHttpError(res.status, url)
   return res.json()
 }

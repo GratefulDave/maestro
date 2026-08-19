@@ -8,6 +8,84 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `code_review.FindingScope`: the reviewer's third axis, required on every finding from v1 —
+  `in_scope` when the fix is an edit to a path the node declared, `out_of_scope` when the only
+  edit that answers it writes a path the node was forbidden to write. A blocking, at-threshold
+  finding cannot refuse a merge on a forbidden remedy (`GradedCell.rejects`), because a rejection
+  whose repair the permission check convicts is a retry loop with no exit; it is recorded instead,
+  in `GradedVerdict.unreachable`, `ReviewOutcome.unreachable`, the finding ledger's `scope` and
+  `unreachable` columns, and a retry-guidance section that tells the builder not to attempt it.
+  `CODE_RUBRIC`'s two unbounded questions —
+  `diff.implements_the_stated_instruction` and `diff.gate_is_passed_on_the_merits` — now name the
+  declared write scope in the question text, and `ReviewHandoff.render` states the bound directly
+  under the paths it bounds. Rubric version moves to `maestro-code-rubric.v2` and the finding
+  ledger to `maestro-code-review-findings.v2`, because `review_digest` binds the rubric version
+  and a replay must not answer a question that changed under it. Carried with
+  `tests/test_review_scope_bounding.py`; §19 M22 records the incident.
+
+- `node.writes_are_sufficient`, a BLOCKING plan-review rubric check asked of every node, and the
+  rubric version `maestro-rubric.v3` that carries it. `node.reads_are_sufficient` already asked
+  whether a node's agent can do the work from what it is allowed to *read*; nothing asked the same
+  question of what it is allowed to *write*. A node's `outputs` are its entire write permission —
+  single-producer ownership gives each path to exactly one node and the attempt permission check
+  convicts any diff touching an undeclared path — so a node whose instruction can only be
+  discharged by editing another node's output is unsatisfiable from its first attempt: the reviewer
+  rejects every diff that does not wire production and the permission check would reject every diff
+  that does. In run `run-2a44d226e75a4be391a14f02b78a6d25` that cost node
+  `lane-p4-enrichment-ordering` eight attempts, six reviews, six builder sessions, a launcher
+  failure and a turn timeout before `BLOCKED`/`REVIEW_BUDGET_EXHAUSTED`, on a property of the
+  authored bytes that one plan-review cell now settles. The question is phrased over the
+  instruction, not over the shape of `outputs`: a node that creates a module nothing at base yet
+  imports is the ordinary case and passes whenever a downstream node owns the wiring. Carried with
+  `tests/test_node_write_scope.py`, whose control half asserts the legitimate new-module node still
+  finalizes PASS.
+
+  No mechanical refusal accompanies it, deliberately. Both structurally decidable signals were
+  tested against the incident plan and refuted by it: "a node whose outputs contain no path
+  existing at `base_commit`" fires on ten of that plan's twelve nodes and on every legitimate
+  new-module node, and "a plan in which no node declares a pre-existing file" does not fire on the
+  incident plan at all, because two of its nodes did. `plan_validate.py` is unchanged and the
+  twelve obligations are still twelve.
+
+  The version bump adds no receipt key and requires none. `Receipt.from_bytes` still discriminates
+  the graded payload shape on the presence of `reject_at` rather than on the rubric label (§19
+  M21), so every signed `maestro-rubric.v1` and pre-grading `maestro-rubric.v2` receipt still
+  parses, still verifies against its original signature, and still replays with zero reviewer
+  launches — asserted directly rather than assumed. The new question is nonetheless mandatory from
+  v3 onward rather than optional forever (§3.6 B8): it is a matrix cell, and `verify_report`
+  refuses a report that leaves any cell unanswered.
+
+- `maestro._validate_review_clocks`: refuses a review window the remaining live bound cannot hold.
+  `reviewer.turn_timeout_s` must be under `reviewer.finalization_timeout_s`, or one silent turn
+  consumes the whole review window; `finalization_timeout_s` and `node_timeout_s +
+  finalization_timeout_s` must both sit under `execution.backstop_t_s`, or the run-level backstop
+  fires inside a healthy review or a healthy sequential node-and-review path. It deliberately does
+  not compare `execution.turn_timeout_s` to the review window: after §19 M15 the builder turn clock
+  is disarmed once an attempt holds an ACCEPTED result, so the old inequality would have refused
+  the shipping template for a closed bug. Carried with `tests/test_review_clock_siblings.py`.
+- `maestro._refuse_base_commit_divergence` plus `worktree.resolve_commit`: the single-repo twin of
+  `workspace_runtime.prepare_candidate`'s SHA check. At run start — not on resume, where merges are
+  supposed to move the head — the integration branch must still resolve to the same commit object
+  as the plan's recorded `base_commit`, and an unresolvable recorded base is a refusal rather than
+  a fall-through. The single-repo path previously created attempt worktrees against whatever the
+  integration branch pointed at and never compared the two (#32). Identity is the resolved commit
+  object, so an abbreviated SHA or a tag that names the same commit is admitted. Carried with
+  `tests/test_base_commit_enforcement.py`.
+
+- `watchdog.process_start_epoch`, the wall-clock start of a pid, with a Darwin implementation
+  reading `proc_pidinfo`'s `PROC_PIDTBSDINFO` at microsecond resolution. A pid is not proof of
+  process identity: `os.kill(pid, 0)` answers only that *something* holds the pid, and the
+  whole-second clock `ps lstart` exposes cannot separate a process from a reuse of its pid within
+  the same second (#37) - so anything that signals or convicts on a recorded pid alone can reach a
+  different process than the one it recorded. Linux answers from `/proc/<pid>/stat` at clock-tick
+  resolution. On any other platform it refuses, returning `None`, which a caller must read as
+  "identity unproven" rather than as "the same process"; returning a coarse or fabricated start
+  there would let a reused pid pass for the original, which is the failure the probe exists to
+  prevent. Carried with `SignalPidIdentity` in `tests/test_run_liveness.py`. The probe has no
+  production caller yet - the scheduler-pid identity check that consumes it has not landed - so it
+  is recorded as a named `DEFERRED` row in `tests/test_no_dead_seams.py` rather than left as a
+  silent dead seam; landing that caller means deleting the row.
+
 - A one-command launcher for the visualizer, `bin/maestro-viz`, reachable from any directory as
   `just -g viz`. The only invocation that started a working visualizer was `bun run dev:all` from
   the app's own directory; `bun run dev` — the obvious thing to type — is `vite` alone, which
@@ -133,6 +211,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   refusals are taken before the worktree is reopened, so a refused salvage writes no commit and
   no record. The signed record now also names the `baseline_digest` the delta was measured
   against.
+
+- `tests/test_coordinator.py` no longer fails one to six of its cases at random under `pytest -n
+  auto`, which is this suite's default (issue #50). Six of its thirty-two cases drive the
+  coordinator from a thread and then wait for it to reach a participant dispatch or a global gate.
+  Reaching either costs real `git` subprocess work — repository binding, branch creation, candidate
+  worktree creation — measured at 0.735s to 1.154s on an idle machine, and each of those waits was
+  bounded at 3.0s. Under `-n auto` eighteen workers fork `git` against one disk, that distribution
+  moves past the bound, and the precondition reports as a failure: observed here at 8 of 12
+  consecutive runs, failing 1, 3, 3, 4, 4, 5, 5 and 6 cases, while `-n 0` passed every time. The
+  failing set is not random — it is exactly the six threaded cases, entering in the order of how
+  much pre-dispatch work precedes their wait, which is what a load-scaled distribution crossing a
+  fixed threshold looks like rather than a race on a shared resource. Every such bound in the file
+  now derives from one `ARRIVAL_TIMEOUT_S` constant (60s, `MAESTRO_TEST_ARRIVAL_TIMEOUT_S`
+  overrides) documented as a hang detector rather than a latency gate. Nothing the file asserts
+  changed: the one wall-clock bound that is a property under test — the 0.5s cancellation bound in
+  `test_stuck_participant_cancellation_returns_with_blocked_cleanup_evidence` — is deliberately
+  left alone and deliberately not expressed in terms of the constant. This shape had already been
+  diagnosed twice in this suite and fixed at one instance each time, in that same stuck-cancellation
+  case and in `test_workspace_runtime.py`'s global-gate cancellation case; the siblings left behind
+  are what the issue reported.
+
+- Cross-checkout tests resolve their peer repository from git rather than from their own file
+  path, so they run inside a linked worktree instead of skipping. `tests/test_template_parity.py`,
+  `tests/test_schema_vocabulary_parity.py` and `tests/test_plan_admission.py` each walked up from
+  `__file__` to the enclosing repository root and looked for the peer checkout beside it. In a
+  linked worktree that root is `.claude/worktrees/<lane>`, so the peer was looked for at
+  `.claude/worktrees/the-library`, which exists on no machine, and all twelve tests skipped.
+  Every lane authors its template changes in a worktree, which means the parity invariant — the
+  only mechanical thing holding the two template copies together — had never once examined lane
+  work, and reported nothing while not examining it. The new `tests/checkout_layout.py` asks
+  `git rev-parse --git-common-dir` for the main working tree and looks for peers beside that,
+  falling back to the old filesystem derivation only when git cannot answer. `test_plan_admission`
+  additionally spelled maestro's layout depth into its arithmetic, so it also skipped when the
+  runtime under test was the-library's own; it now resolves the-library's checkout by name from
+  either side. Skips are no longer silent: each carries the path searched and how that path was
+  chosen, and is raised as a `PeerCheckoutMissing` warning so it appears in a default `-q` run
+  rather than as an unexplained `s`. The one legitimate skip is unchanged — the peer repository
+  not being checked out at all — and a peer that is checked out with its runtime or schema missing
+  still fails.
+
+- `docs/plan-authoring.md`: removed the "Not built yet" blockquote over `maestro plan gate`,
+  `review`, and `ship`. Those verbs shipped in commit 6707e50 (PR #8) and are registered on the
+  `plan` subparser; the binding runbook was still directing plan authors to hand-run the `planctl`
+  calls each verb wraps. The earlier release note that recorded the same claim while it was true
+  is left as written.
 
 - Signed finalization receipts written before grading existed parse, verify and replay again.
   `rubric_version` names the rubric, not the receipt schema, and the grading fields
