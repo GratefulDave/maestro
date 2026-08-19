@@ -28,6 +28,7 @@ Run with:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sqlite3
 import sys
@@ -54,7 +55,8 @@ def node_row(node_id: str, state: st.NodeState) -> lc.NodeRow:
         granted_extra_attempts=0, updated_at="2026-08-18T00:00:00+00:00")
 
 
-def record(*, pid=None, host=HOST, outcome=None, cancel=False) -> lc.RunRecord:
+def record(*, pid=None, host=HOST, outcome=None, cancel=False,
+           start_epoch=None) -> lc.RunRecord:
     return lc.RunRecord(
         run_id="run-1", plan_digest="d" * 64,
         created_at="2026-08-18T00:00:00+00:00",
@@ -62,7 +64,8 @@ def record(*, pid=None, host=HOST, outcome=None, cancel=False) -> lc.RunRecord:
         latest_outcome=outcome, latest_outcome_at=None,
         cancel_requested=cancel, scheduler_pid=pid,
         scheduler_host=host if pid else None,
-        scheduler_claimed_at="2026-08-18T00:00:00+00:00" if pid else None)
+        scheduler_claimed_at="2026-08-18T00:00:00+00:00" if pid else None,
+        scheduler_start_epoch=start_epoch)
 
 
 def derive(rec, nodes, *, alive=True, host=HOST) -> str:
@@ -333,6 +336,14 @@ class TheOwnerIsWrittenToTheLedger(unittest.TestCase):
         self.assertEqual(rec.scheduler_host, lc.scheduler_host())
         self.assertIsNotNone(rec.scheduler_claimed_at)
         self.assertIs(lc.scheduler_liveness(rec), True)
+        # And the identity half (#37): the projection records the process's
+        # start epoch beside its pid, so the pid is provably signallable
+        # rather than merely present in the process table.
+        started = wd.process_start_epoch(os.getpid())
+        if started is None:
+            self.skipTest("no process start epoch on this platform")
+        self.assertEqual(rec.scheduler_start_epoch, started)
+        self.assertEqual(lc.scheduler_signal_pid(rec), os.getpid())
 
     def test_the_scheduler_claims_the_run_when_it_projects_it(self):
         """The production writer. `create_run` stamps the owner on the row it
@@ -400,6 +411,54 @@ class TheOwnerIsWrittenToTheLedger(unittest.TestCase):
         # The migration invents nothing about a run that predates the column.
         self.assertIsNone(rec.scheduler_pid)
         self.assertIsNone(lc.scheduler_liveness(rec))
+        # Including the start epoch (#37). A row written before that column
+        # still loads, and reads as *unproven* -- never as proven, which is
+        # the direction that would hand a signal to whatever now holds the
+        # pid. §19 M21: a schema change must not make a pre-existing row
+        # unreadable, nor silently reclassify it.
+        self.assertIsNone(rec.scheduler_start_epoch)
+        self.assertIsNone(lc.scheduler_signal_pid(rec))
+
+    def test_a_run_recorded_before_the_start_epoch_stays_live_but_unproven(self):
+        """The deployed shape #37 has to survive: a ledger that already has
+        the ownership columns and a live pid, but no start epoch.
+
+        §19 M21 is the failure to avoid -- a schema change that made a
+        previously-optional thing required turned every pre-existing signed
+        receipt unparseable, a 110-cell PASS included. So this row must still
+        load, and must still read RUNNING with a live scheduler. What it must
+        *not* do is read as proven: nothing recorded who that pid was, and
+        an unproven pid is not authority to signal.
+        """
+        store = lc.LifecycleStore(self.db)
+        try:
+            store.create_run("run1", "d" * 64, [self._node()])
+            # Rewind the row to its pre-F9 content: the column exists (the
+            # migration added it) but this run was written before anything
+            # populated it.
+            store.conn.execute(
+                "UPDATE runs SET scheduler_start_epoch=NULL WHERE run_id=?",
+                ("run1",))
+            store.conn.commit()
+        finally:
+            store.close()
+        reader = lc.LifecycleReader.open(self.db)
+        try:
+            rec = reader.run("run1")
+            nodes = reader.nodes("run1")
+        finally:
+            reader.close()
+        self.assertEqual(rec.scheduler_pid, os.getpid())
+        self.assertIsNone(rec.scheduler_start_epoch)
+        # Still readable, still live, and the derivation is untouched by the
+        # missing column: the same answer as the identical row that has one.
+        self.assertIs(lc.scheduler_liveness(rec), True)
+        with_epoch = dataclasses.replace(rec, scheduler_start_epoch=100.5)
+        self.assertEqual(lc.derive_run_state(rec, nodes),
+                         lc.derive_run_state(with_epoch, nodes))
+        self.assertEqual(lc.derive_run_state(rec, nodes), "PENDING")
+        # But not signallable.
+        self.assertIsNone(lc.scheduler_signal_pid(rec))
 
     def test_a_read_only_reader_tolerates_a_ledger_it_cannot_migrate(self):
         """`LifecycleReader` opens `mode=ro` on purpose, so it must read an
@@ -581,6 +640,76 @@ class SignalPidIdentity(unittest.TestCase):
     """#37 -- a pid alone is not proof of process identity, so the start
     epoch that identifies a process has to be finer than the second a
     pid can be reused within."""
+
+    def test_matching_recorded_start_is_proven(self):
+        """The one case that yields a pid: liveness holds *and* the live
+        process started at the instant the ledger recorded."""
+        rec = record(pid=42, start_epoch=100.5)
+        self.assertEqual(
+            lc.scheduler_signal_pid(
+                rec, is_alive=lambda _pid: True,
+                start_epoch=lambda _pid: 100.5, host=HOST),
+            42)
+
+    def test_same_second_reuse_is_unproven(self):
+        """The case `scheduler_liveness` cannot see. Pid 42 exists, so
+        liveness says True, but the process behind it started 767ms after
+        the one that claimed the run: a different process wearing a reused
+        number. Signalling it would SIGINT a stranger."""
+        rec = record(pid=42, start_epoch=100.123)
+        self.assertIs(
+            lc.scheduler_liveness(rec, is_alive=lambda _pid: True, host=HOST),
+            True)
+        self.assertIsNone(
+            lc.scheduler_signal_pid(
+                rec, is_alive=lambda _pid: True,
+                start_epoch=lambda _pid: 100.890, host=HOST))
+        # And the resolution is what convicts it: truncated to the whole
+        # second either side records 100, so a `started <= claimed_at`
+        # comparison at second resolution would have called this proven.
+        self.assertEqual(int(100.123), int(100.890))
+
+    def test_missing_recorded_start_is_unproven(self):
+        """A run whose ledger predates the column records no start, and an
+        absent identity is never a proven one."""
+        rec = record(pid=42, start_epoch=None)
+        self.assertIsNone(
+            lc.scheduler_signal_pid(
+                rec, is_alive=lambda _pid: True,
+                start_epoch=lambda _pid: 100.5, host=HOST))
+
+    def test_a_platform_that_cannot_answer_is_unproven(self):
+        """`process_start_epoch` returns None where it cannot read the
+        process table. Unknown is not identity."""
+        rec = record(pid=42, start_epoch=100.5)
+        self.assertIsNone(
+            lc.scheduler_signal_pid(
+                rec, is_alive=lambda _pid: True,
+                start_epoch=lambda _pid: None, host=HOST))
+
+    def test_a_dead_or_unknown_scheduler_is_never_signalled(self):
+        """Liveness is a precondition, not the proof -- but a failed
+        precondition still short-circuits before any identity question."""
+        dead = record(pid=42, start_epoch=100.5)
+        self.assertIsNone(
+            lc.scheduler_signal_pid(
+                dead, is_alive=lambda _pid: False,
+                start_epoch=lambda _pid: 100.5, host=HOST))
+        elsewhere = record(pid=42, host="other-box", start_epoch=100.5)
+        self.assertIsNone(
+            lc.scheduler_signal_pid(
+                elsewhere, is_alive=lambda _pid: True,
+                start_epoch=lambda _pid: 100.5, host=HOST))
+
+    def test_this_processs_own_claim_is_proven_by_the_real_probe(self):
+        """End to end against the platform rather than a lambda: the epoch
+        the ledger would record for this process is the epoch the probe
+        reads back for it."""
+        started = wd.process_start_epoch(os.getpid())
+        if started is None:
+            self.skipTest("no process start epoch on this platform")
+        rec = record(pid=os.getpid(), start_epoch=started)
+        self.assertEqual(lc.scheduler_signal_pid(rec, host=HOST), os.getpid())
 
     @unittest.skipUnless(
         sys.platform == "darwin" or sys.platform.startswith("linux"),
