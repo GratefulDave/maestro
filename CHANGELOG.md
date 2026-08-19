@@ -8,6 +8,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `tools/runtime_sync.py`, shipped inside the template so it reaches every deployment: the
+  supported way to move ADW runtime bytes between checkouts, in place of a hand-run `cp`. `check`
+  returns a structured drift report in which **absence is its own field**, separate from a content
+  difference — a file present in one copy and missing from the other is a deletion, and that is the
+  shape in which 6,009 lines of runtime were once lost without anything noticing. `mirror` plans by
+  default and writes only under `--apply`; every write is `shutil.copy2` followed by reading both
+  files back and asserting equal sha256, never `git apply`, which no-ops silently on some setups
+  while reporting success. It never deletes, and it refuses a destination that is ahead.
+  `maestro.config.yaml` is held back whenever either endpoint is a deployment, because lane
+  vendors, models and concurrency name a particular installation; it is still compared between the
+  two template checkouts. `install.py` and `make_config.py` now copy through the same verified
+  primitive, and `test_template_parity.py` delegates its comparison to it, so what the parity test
+  fails on is exactly what the mirror repairs. Carried with `tests/test_runtime_sync.py` and
+  `tests/test_install_copy_path.py`.
+
+  The "destination is ahead" refusal takes two independent signals, and that is not belt-and-braces
+  — it is a measured correction. The mtime signal alone refused **zero** files across both real
+  deployments, because a git worktree checkout stamps every source file with checkout time, so the
+  template always looks newer than a long-lived deployment. Adding a line-count signal made the
+  same survey refuse seven files that hold content the template does not, one of them 91 lines
+  longer than the file that would have replaced it.
+
 - `code_review.FindingScope`: the reviewer's third axis, required on every finding from v1 —
   `in_scope` when the fix is an edit to a path the node declared, `out_of_scope` when the only
   edit that answers it writes a path the node was forbidden to write. A blocking, at-threshold
