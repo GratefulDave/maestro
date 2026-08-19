@@ -2920,6 +2920,12 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
                              if record.latest_outcome else None),
         "declared_outcome_at": record.latest_outcome_at,
         "cancel_requested": record.cancel_requested,
+        # Which of §7.3's two cancellation shapes the declared CANCELLED was,
+        # and therefore whether `run resume` will take this run back. Reported
+        # rather than left to be inferred from the node states: the inference
+        # is exactly the heuristic the stored cause exists to replace.
+        "cancel_cause": (record.cancel_cause.value
+                         if record.cancel_cause else None),
         # The three facts the state above was derived from, reported so an
         # ABANDONED verdict can be checked rather than believed.
         "scheduler_pid": record.scheduler_pid,
@@ -2958,6 +2964,13 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         progress["last_transition_at"], _duration(progress["idle_s"])))
     if progress["cancel_requested"]:
         lines.append("  cancel       requested")
+    if progress["cancel_cause"]:
+        lines.append("  cancel cause {}{}".format(
+            progress["cancel_cause"],
+            "   (resumable)"
+            if progress["cancel_cause"]
+            == scheduler_types.CancelCause.RUN_CANCEL.value
+            else "   (not reopenable)"))
     if progress["scheduler_pid"]:
         alive = progress["scheduler_alive"]
         lines.append("  scheduler    pid {} on {} — {}".format(

@@ -102,6 +102,13 @@ CREATE TABLE IF NOT EXISTS runs (
   latest_outcome     TEXT,              -- NULL = no scheduler ever declared quiescence
   latest_outcome_at  TEXT,
   cancel_requested   INTEGER NOT NULL DEFAULT 0,
+  -- Why the latest declared outcome was CANCELLED (`st.CancelCause`), NULL
+  -- for every other outcome. An attribute of `latest_outcome`, rewritten in
+  -- the same transaction, never a second copy of `cancel_requested`: that
+  -- column is the live request an operator made, this one is the cause the
+  -- scheduler recorded, and a resume clears the first while leaving the
+  -- second standing as the record of the outcome it is superseding.
+  cancel_cause       TEXT,
   -- The scheduler process that last took ownership of this run. Written when a
   -- process projects the plan or resumes the run, never cleared: a pid that is
   -- no longer running is the structural fact that says the run has no owner,
@@ -128,6 +135,13 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   state                  TEXT NOT NULL,
   attempt_no             INTEGER NOT NULL DEFAULT 0,
   block_reason           TEXT,
+  -- Why this node is CANCELLED (`st.CancelCause`), NULL in every other state.
+  -- The node-level twin of `runs.cancel_cause`, and not a convenience: a run
+  -- an operator cancelled after abandoning one lane holds both causes at
+  -- once, and a resume that reopened every CANCELLED node would resurrect the
+  -- lane the operator gave up on. The column is what lets the resume reopen
+  -- exactly the nodes the stop request took, and nothing else.
+  cancel_cause           TEXT,
   output_sha             TEXT,
   granted_extra_attempts INTEGER NOT NULL DEFAULT 0,
   updated_at             TEXT NOT NULL,
@@ -215,6 +229,21 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("scheduler_pid", "INTEGER"),
     ("scheduler_host", "TEXT"),
     ("scheduler_claimed_at", "TEXT"),
+    ("cancel_cause", "TEXT"),
+)
+
+#: The same, for `node_lifecycle`. Kept as a second list rather than folded
+#: into the one above because the read-only projection selects the `runs`
+#: additions by name and must not be handed a column from another table.
+_NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("cancel_cause", "TEXT"),
+)
+
+#: Every table an older ledger may be missing a column from, in one place so
+#: `_migrate` cannot silently cover one table and not the other.
+_ADDED_COLUMNS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...] = (
+    ("runs", _RUNS_ADDED_COLUMNS),
+    ("node_lifecycle", _NODE_LIFECYCLE_ADDED_COLUMNS),
 )
 
 
@@ -242,20 +271,28 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, ...]:
 
 
 def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
-    """Add any `runs` column this version needs and an older ledger lacks.
+    """Add any column this version needs and an older ledger lacks.
 
     `ADD COLUMN` is the only shape used, and every added column is nullable
     with no default: an existing row keeps NULL, and NULL is read everywhere
     below as "nobody recorded this", never as a value. So the migration cannot
-    invent a fact about a run that predates the column.
+    invent a fact about a run that predates the column. A pre-migration
+    `CANCELLED` therefore carries no cause, and `run resume` refuses it — the
+    safe direction, since the alternative is guessing that a run nobody
+    recorded a cause for was merely paused.
+
+    Returns `table.column` for each addition, so a caller cannot mistake two
+    same-named columns on different tables for one.
     """
-    present = set(_table_columns(conn, "runs"))
     added = []
-    for name, kind in _RUNS_ADDED_COLUMNS:
-        if name in present:
-            continue
-        conn.execute("ALTER TABLE runs ADD COLUMN {0} {1}".format(name, kind))
-        added.append(name)
+    for table, columns in _ADDED_COLUMNS:
+        present = set(_table_columns(conn, table))
+        for name, kind in columns:
+            if name in present:
+                continue
+            conn.execute(
+                "ALTER TABLE {0} ADD COLUMN {1} {2}".format(table, name, kind))
+            added.append("{0}.{1}".format(table, name))
     return tuple(added)
 
 
@@ -374,6 +411,10 @@ class OutcomeReport:
     block_reasons: Mapping[str, st.BlockReason] = field(default_factory=dict)
     abandoned_nodes: Tuple[str, ...] = ()
     acceptance_result: Optional[bool] = None
+    #: Which of §7.3's two cancellation shapes reached `CANCELLED`, and `None`
+    #: for every other outcome. The evidence behind the `CANCELLED` arm in
+    #: exactly the way `blocked_nodes` is the evidence behind `BLOCKED`.
+    cancel_cause: Optional[st.CancelCause] = None
 
 
 def total_run_outcome(
@@ -402,7 +443,17 @@ def total_run_outcome(
     if cancel_requested or all_cancelled:
         cancelled = tuple(nid for nid, state, _ in node_states
                           if state is st.NodeState.CANCELLED)
-        return OutcomeReport(outcome=st.RunOutcome.CANCELLED, abandoned_nodes=cancelled)
+        # The two conditions are not interchangeable and the outcome records
+        # which one fired. `cancel_requested` is the operator's stop control,
+        # under which nothing was adjudicated; `all_cancelled` without it is a
+        # run given up on node by node, each node individually adjudicated as
+        # work the run should finish without. `run resume` reopens the first
+        # and refuses the second (§7.8), and the precedence here is the same
+        # precedence the arm above it already had.
+        cause = (st.CancelCause.RUN_CANCEL if cancel_requested
+                 else st.CancelCause.ABANDONED)
+        return OutcomeReport(outcome=st.RunOutcome.CANCELLED,
+                             abandoned_nodes=cancelled, cancel_cause=cause)
 
     merged = [nid for nid, state, _ in node_states if state is st.NodeState.MERGED]
     cancelled = tuple(nid for nid, state, _ in node_states
@@ -422,11 +473,31 @@ def total_run_outcome(
 
 # ── the legal transition guard (§7.3) ───────────────────────────────────────
 
-def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: str) -> None:
+def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: str,
+                      cancel_cause: Optional[st.CancelCause] = None) -> None:
+    """The legal-transition guard, with one exception it states rather than hides.
+
+    `MERGED` and `CANCELLED` are absolutely terminal (§7.3) — with the single
+    exception that a node written `CANCELLED` by `run cancel` may be returned
+    to `PENDING` by an operator resuming that same run. The exception is
+    narrow on purpose and every conjunct earns its place: only from
+    `CANCELLED`, only to `PENDING`, only for `RUN_CANCEL`, only by the
+    operator. It exists because a `RUN_CANCEL` `CANCELLED` is terminal only in
+    the sense that the operator asked the machine to stop, and a resume is the
+    same operator withdrawing the request — nothing was adjudicated about the
+    node, so there is no verdict the terminality is protecting. An `ABANDONED`
+    `CANCELLED` is a decision about the work itself and stays absolutely
+    terminal, as does `MERGED`.
+    """
     if current in st.ABSOLUTELY_TERMINAL:
-        raise IllegalTransition(
-            f"{current.value} is absolutely terminal (§7.3); no transition leaves it, "
-            f"including this attempted move to {to_state.value}")
+        reopening = (current is st.NodeState.CANCELLED
+                     and to_state is st.NodeState.PENDING
+                     and actor == "operator"
+                     and cancel_cause in st.REOPENABLE_CANCEL_CAUSES)
+        if not reopening:
+            raise IllegalTransition(
+                f"{current.value} is absolutely terminal (§7.3); no transition leaves it, "
+                f"including this attempted move to {to_state.value}")
     if (current is st.NodeState.BLOCKED and to_state is not st.NodeState.BLOCKED
             and actor != "operator"):
         raise IllegalTransition(
@@ -867,6 +938,7 @@ class LifecycleStore:
         granted_extra_delta: int = 0,
         require_state: Optional[Tuple[st.NodeState, ...]] = None,
         detail: Optional[Mapping[str, Any]] = None,
+        cancel_cause: Optional[st.CancelCause] = None,
         extra_writes: Optional[Callable[[st.NodeLifecycle], Sequence[Tuple[str, Tuple]]]] = None,
     ) -> st.NodeLifecycle:
         """Guard, then write the lifecycle row, the audit row, and the run's
@@ -876,13 +948,16 @@ class LifecycleStore:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute(
-                "SELECT state, attempt_no, block_reason, output_sha, granted_extra_attempts"
+                "SELECT state, attempt_no, block_reason, output_sha,"
+                " granted_extra_attempts, cancel_cause"
                 " FROM node_lifecycle WHERE run_id=? AND node_id=?",
                 (run_id, node_id)).fetchone()
             if row is None:
                 raise UnknownNode(f"{run_id}/{node_id} has no lifecycle row")
             current = st.NodeState(row[0])
-            _guard_transition(current, to_state, actor=actor)
+            current_cause = st.CancelCause(row[5]) if row[5] else None
+            _guard_transition(current, to_state, actor=actor,
+                              cancel_cause=current_cause)
             if require_state is not None and current not in require_state:
                 raise IllegalTransition(
                     f"{node_id}: expected state in "
@@ -900,14 +975,21 @@ class LifecycleStore:
                 block_reason=new_block_reason, output_sha=new_output_sha,
                 granted_extra_attempts=new_granted)
 
+            # Scoped to CANCELLED exactly as `block_reason` is scoped to
+            # BLOCKED: any transition out of CANCELLED clears the cause with
+            # the state that made it meaningful, so no row can carry a cause
+            # for a cancellation it is no longer under.
+            new_cancel_cause = (cancel_cause
+                                if to_state is st.NodeState.CANCELLED else None)
             now = now_iso()
             self.conn.execute(
                 "UPDATE node_lifecycle SET state=?, attempt_no=?, block_reason=?,"
-                " output_sha=?, granted_extra_attempts=?, updated_at=?"
+                " output_sha=?, granted_extra_attempts=?, cancel_cause=?, updated_at=?"
                 " WHERE run_id=? AND node_id=?",
                 (lifecycle.state.value, lifecycle.attempt_no,
                  lifecycle.block_reason.value if lifecycle.block_reason else None,
-                 lifecycle.output_sha, lifecycle.granted_extra_attempts, now,
+                 lifecycle.output_sha, lifecycle.granted_extra_attempts,
+                 new_cancel_cause.value if new_cancel_cause else None, now,
                  run_id, node_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
@@ -1071,7 +1153,14 @@ class LifecycleStore:
     @serialized
     def cancel_run(self, run_id: str) -> Tuple[str, ...]:
         """Write CANCELLED for every non-terminal node in ONE transaction (§7.8).
-        Never blocks on a kill — that is the adapter's problem, not this store's."""
+        Never blocks on a kill — that is the adapter's problem, not this store's.
+
+        Every node it takes is stamped `RUN_CANCEL`, which is what makes the
+        stop reversible: a resume reopens exactly these nodes and leaves a
+        node the operator had separately abandoned where it is (§7.8).
+        `MERGED` nodes are absolutely terminal and are skipped, so the merged,
+        gate-verified, reviewed work a long run has already landed survives
+        the stop and is not re-executed by the resume."""
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self.conn.execute(
@@ -1084,9 +1173,11 @@ class LifecycleStore:
                 if current in st.ABSOLUTELY_TERMINAL:
                     continue
                 self.conn.execute(
-                    "UPDATE node_lifecycle SET state=?, block_reason=NULL, updated_at=?"
+                    "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
+                    " cancel_cause=?, updated_at=?"
                     " WHERE run_id=? AND node_id=?",
-                    (st.NodeState.CANCELLED.value, now, run_id, node_id))
+                    (st.NodeState.CANCELLED.value,
+                     st.CancelCause.RUN_CANCEL.value, now, run_id, node_id))
                 self.conn.execute(
                     "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                     " reason, actor, detail_json, created_at)"
@@ -1104,6 +1195,11 @@ class LifecycleStore:
             self.conn.execute(
                 "UPDATE runs SET last_transition_at=?, cancel_requested=1 WHERE run_id=?",
                 (now, run_id))
+            # `cancel_cause` is written by `declare_outcome` alone -- it is an
+            # attribute of the declared outcome, and this verb declares
+            # nothing. Writing it here would state a cause for an outcome no
+            # scheduler has reached, and a cancel that never quiesces would
+            # leave that claim standing.
             self.conn.execute("COMMIT")
             return tuple(cancelled)
         except Exception:
@@ -1132,9 +1228,18 @@ class LifecycleStore:
                 node_states, stuck=stuck, cancel_requested=bool(run_row[0]),
                 acceptance_result=acceptance_result)
             now = now_iso()
+            # `cancel_cause` is written on every declaration, including the
+            # ones that clear it. A run that was cancelled, resumed, and then
+            # accepted must not keep the cause of the outcome it superseded --
+            # `runs` holds the latest outcome only (§7.3), and a stale cause
+            # beside a fresh outcome is the two-representations shape RC1
+            # convicts.
             self.conn.execute(
-                "UPDATE runs SET latest_outcome=?, latest_outcome_at=?, last_transition_at=?"
-                " WHERE run_id=?", (report.outcome.value, now, now, run_id))
+                "UPDATE runs SET latest_outcome=?, latest_outcome_at=?,"
+                " last_transition_at=?, cancel_cause=? WHERE run_id=?",
+                (report.outcome.value, now, now,
+                 report.cancel_cause.value if report.cancel_cause else None,
+                 run_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -1142,7 +1247,9 @@ class LifecycleStore:
                 (run_id, report.outcome.value,
                  json.dumps({"blocked_nodes": list(report.blocked_nodes),
                             "abandoned_nodes": list(report.abandoned_nodes),
-                            "acceptance_result": report.acceptance_result}), now))
+                            "acceptance_result": report.acceptance_result,
+                            "cancel_cause": (report.cancel_cause.value
+                                             if report.cancel_cause else None)}), now))
             self.conn.execute("COMMIT")
             return report
         except Exception:
@@ -1177,12 +1284,30 @@ class LifecycleStore:
 
     @serialized
     def _write_resume_transition(self, run_id: str) -> None:
+        """The resume boundary, in one transaction (§7.8, §11.2).
+
+        `cancel_requested` is cleared here, and it is not bookkeeping: the
+        flag is the outcome function's input for the `CANCELLED` arm (§7.3),
+        so a resumed run that left it set would declare `CANCELLED` again at
+        the quiescence it reaches after doing all of its remaining work — and
+        `derive_run_state` would report it `CANCELLING` for the whole of that
+        life. The operator withdrew the stop request by resuming; the request
+        stops standing at that instant.
+
+        `cancel_cause` is deliberately *not* cleared. It is an attribute of
+        the latest declared outcome, which this resume supersedes but does not
+        erase, and the next `declare_outcome` rewrites it. Clearing it here
+        would strand the next resume: a scheduler that dies before declaring
+        leaves `latest_outcome` at `CANCELLED`, and a `CANCELLED` with no
+        cause is refused.
+        """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             now = now_iso()
             self.conn.execute(
-                "UPDATE runs SET last_transition_at=?, scheduler_pid=?,"
-                " scheduler_host=?, scheduler_claimed_at=? WHERE run_id=?",
+                "UPDATE runs SET last_transition_at=?, cancel_requested=0,"
+                " scheduler_pid=?, scheduler_host=?, scheduler_claimed_at=?"
+                " WHERE run_id=?",
                 (now, os.getpid(), scheduler_host(), now, run_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
@@ -1201,9 +1326,55 @@ class LifecycleStore:
             (run_id, st.NodeState.RUNNING.value)).fetchall()
         return tuple(r[0] for r in rows)
 
+    @serialized
+    def run_cancel_cause(self, run_id: str) -> Optional[st.CancelCause]:
+        """Why the latest declared outcome was CANCELLED, or None.
+
+        None both for a run whose outcome is not CANCELLED and for a
+        `CANCELLED` written by a ledger older than the column. The two are not
+        distinguished on purpose: neither is a recorded operator stop, and
+        `resume_run` refuses both.
+        """
+        row = self.conn.execute(
+            "SELECT cancel_cause FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            raise UnknownNode(f"run {run_id} does not exist")
+        return st.CancelCause(row[0]) if row[0] else None
+
+    @serialized
+    def _run_cancelled_node_ids(self, run_id: str) -> Tuple[str, ...]:
+        """Nodes this run's `run cancel` took, in id order.
+
+        Nodes stamped `ABANDONED` are excluded by the predicate rather than by
+        a later filter, because a mixed run — one lane abandoned by hand, then
+        the whole run cancelled — is the shape where reopening every
+        `CANCELLED` node would resurrect the lane the operator gave up on.
+        """
+        rows = self.conn.execute(
+            "SELECT node_id FROM node_lifecycle"
+            " WHERE run_id=? AND state=? AND cancel_cause=? ORDER BY node_id",
+            (run_id, st.NodeState.CANCELLED.value,
+             st.CancelCause.RUN_CANCEL.value)).fetchall()
+        return tuple(r[0] for r in rows)
+
+    def _reopen_run_cancelled_node(self, run_id: str, node_id: str) -> st.NodeLifecycle:
+        """CANCELLED(RUN_CANCEL) -> PENDING, the resume's half of the stop.
+
+        `attempt_no` is carried forward unchanged and no retry class is
+        debited: `cancel_run` closed the attempt row without classifying it,
+        so a node stopped mid-attempt returns to the frontier with the budget
+        it had. Nothing about it was adjudicated, so there is nothing to
+        charge it for.
+        """
+        return self._transition_node(
+            run_id, node_id, st.NodeState.PENDING, actor="operator",
+            reason="resume:run-cancel",
+            require_state=(st.NodeState.CANCELLED,))
+
     def resume_run(self, run_id: str) -> Tuple[str, ...]:
-        """Legal against BLOCKED, STUCK, and NULL; refused against ACCEPTED and
-        CANCELLED (§7.3). Writes the resume transition — refreshing
+        """Legal against BLOCKED, STUCK, NULL, and a run the operator stopped
+        with `run cancel`; refused against ACCEPTED and against a run given up
+        on node by node (§7.3). Writes the resume transition — refreshing
         `last_transition_at` — BEFORE touching any inherited RUNNING attempt,
         so the backstop measures silence from the resume, not from the dead
         run's last act (§7.8, §11.2). Every inherited RUNNING attempt is
@@ -1233,13 +1404,55 @@ class LifecycleStore:
         a row whose launch details are no longer the live ones. The resumed
         process cannot reach those panes and does not try: §7.8's stated cost is
         one abandoned pane per in-flight node, and these rows are what makes
-        `run status` able to name them for the operator to kill by hand."""
+        `run status` able to name them for the operator to kill by hand.
+
+        **The two CANCELLED runs are not alike, and the refusal keys on the
+        recorded cause rather than on the word.** `ACCEPTED` is terminal
+        because the run reached its declared outcome, and reopening it would
+        reopen an adjudicated result. A run whose every node was individually
+        abandoned is closer to that: each `abandon` was a decision about the
+        work. A run the operator stopped with `run cancel` is neither — the
+        machine was asked to stop, nothing was adjudicated, and there is no
+        result to protect. Refusing it discarded every merged, gate-verified,
+        reviewed node the run had already landed, which on a long multi-lane
+        plan is hours of work thrown away by the operator's only stop control.
+        So a `RUN_CANCEL` run resumes: its `MERGED` nodes stay `MERGED` and
+        are never re-executed, the nodes the stop took return to `PENDING`,
+        the frontier recomputes over them, and the integration branch is taken
+        back rather than re-created (the caller's job, and unchanged).
+
+        A `CANCELLED` carrying no cause at all — a ledger written before the
+        column — is refused with the abandoned case. The migration invents no
+        facts, and guessing that an unrecorded cancellation was merely a pause
+        is the guess that reopens an adjudicated run."""
         outcome = self.latest_outcome(run_id)
-        if outcome in (st.RunOutcome.ACCEPTED, st.RunOutcome.CANCELLED):
+        cause = self.run_cancel_cause(run_id)
+        if outcome is st.RunOutcome.ACCEPTED:
             raise ResumeRefused(
                 f"{run_id}: resume is refused against a declared "
                 f"{outcome.value} run (§7.3) — it is not reopenable")
+        if (outcome is st.RunOutcome.CANCELLED
+                and cause not in st.REOPENABLE_CANCEL_CAUSES):
+            why = ("was given up on node by node, and each of those nodes was "
+                   "adjudicated as work the run should finish without"
+                   if cause is st.CancelCause.ABANDONED else
+                   "records no cause at all — its ledger predates the column, "
+                   "and reading an unrecorded cancellation as a pause is the "
+                   "guess that reopens an adjudicated run")
+            raise ResumeRefused(
+                f"{run_id}: resume is refused against a run declared CANCELLED "
+                f"with cause {cause.value if cause else 'unrecorded'} (§7.3) — "
+                f"only a run stopped by an operator's `run cancel` is "
+                f"reopenable; this one {why}")
         self._write_resume_transition(run_id)
+        # Before the inherited attempts, and deliberately: these nodes hold no
+        # attempt this process could inherit -- `cancel_run` closed every one
+        # of them in the transaction that wrote the state -- so reopening them
+        # first keeps the two halves of a resume in the order an operator
+        # reads them, the stop undone and then the wreckage of the crash
+        # cleared. Empty on every resume that is not undoing a `run cancel`.
+        for node_id in self._run_cancelled_node_ids(run_id):
+            self._reopen_run_cancelled_node(run_id, node_id)
         reclaimed = []
         for node_id in self._running_node_ids(run_id):
             node = self.get_node(run_id, node_id)
@@ -1365,8 +1578,11 @@ class LifecycleStore:
 
     def abandon(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         """Any non-absolutely-terminal state -> CANCELLED (§7.3, §7.8, §11.3).
-        Absolutely terminal from here on; descendants become derived-unready
-        (§8.7) with no state written for them at all.
+        Absolutely terminal from here on — stamped `ABANDONED`, the cause a
+        resume never reopens (§7.8): the operator adjudicated this node as
+        work the run should finish without, which is a decision about the work
+        rather than a request to stop the machine. Descendants become
+        derived-unready (§8.7) with no state written for them at all.
 
         Closes the node's live attempt row in the same transaction, for the
         same reason `cancel_run` does: `abandon` is the node-level form of
@@ -1381,7 +1597,8 @@ class LifecycleStore:
                  st.NodeState.RUNNING.value))]
         return self._transition_node(
             run_id, node_id, st.NodeState.CANCELLED, actor="operator",
-            reason=st.Escape.ABANDON.value, extra_writes=extra)
+            reason=st.Escape.ABANDON.value,
+            cancel_cause=st.CancelCause.ABANDONED, extra_writes=extra)
 
 
 # ── the read-only projection the operator's read verbs use (§11.1) ───────────
@@ -1402,6 +1619,10 @@ class RunRecord:
     latest_outcome: Optional[st.RunOutcome]
     latest_outcome_at: Optional[str]
     cancel_requested: bool
+    #: Why `latest_outcome` was CANCELLED (§7.3), and `None` for every other
+    #: outcome and for a ledger written before the column. This is the fact an
+    #: operator needs to know whether `run resume` will take the run back.
+    cancel_cause: Optional[st.CancelCause] = None
     #: The scheduler process that last claimed the run, and the host whose pid
     #: namespace it belongs to. `None` on a ledger written before the columns
     #: existed, which is why `scheduler_liveness` answers `None` there rather
@@ -1615,6 +1836,9 @@ class LifecycleReader:
                                 if row["latest_outcome"] else None),
                 latest_outcome_at=row["latest_outcome_at"],
                 cancel_requested=bool(row["cancel_requested"]),
+                cancel_cause=(st.CancelCause(row["cancel_cause"])
+                              if "cancel_cause" in optional
+                              and row["cancel_cause"] else None),
                 scheduler_pid=(row["scheduler_pid"]
                                if "scheduler_pid" in optional else None),
                 scheduler_host=(row["scheduler_host"]
