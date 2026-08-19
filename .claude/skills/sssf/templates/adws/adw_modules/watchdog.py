@@ -75,8 +75,10 @@ know about itself.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import sys
 import threading
 import time
 from enum import Enum
@@ -190,6 +192,88 @@ def process_is_alive(pid: int) -> bool:
         return False
     return True
 
+
+def _darwin_process_start_epoch(pid: int) -> Optional[float]:
+    """Microsecond start from `proc_pidinfo`. `ps lstart` is whole seconds."""
+    PROC_PIDTBSDINFO = 3
+
+    class _ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        info = _ProcBsdInfo()
+        got = libc.proc_pidinfo(
+            ctypes.c_int(pid), ctypes.c_int(PROC_PIDTBSDINFO),
+            ctypes.c_uint64(0), ctypes.byref(info),
+            ctypes.c_int(ctypes.sizeof(info)))
+    except (OSError, AttributeError):
+        return None
+    if got != ctypes.sizeof(info) or int(info.pbi_pid) != int(pid):
+        return None
+    return float(info.pbi_start_tvsec) + (int(info.pbi_start_tvusec) / 1_000_000.0)
+
+
+def process_start_epoch(pid: int) -> Optional[float]:
+    """Wall-clock start of `pid`, or None if it cannot be said.
+
+    Used to distinguish the process that claimed a run from a later
+    occupant of the same pid. `os.kill(pid, 0)` cannot do that.
+    Whole-second clocks (`ps lstart`) cannot either: a reuse in the
+    same second reports the same start as the claim (#37).
+
+    Two platforms can answer. Linux reads `/proc/<pid>/stat`, which is
+    clock-tick resolution; Darwin reads `proc_pidinfo`, which is
+    microsecond. Anywhere else this refuses rather than guessing, and a
+    refusal is `None` -- which a caller must read as "identity
+    unproven", never as "the same process". Returning a coarse or
+    fabricated start off these two platforms would be worse than
+    refusing: it would let a reused pid pass for the original.
+    """
+    if pid <= 0:
+        return None
+    linux = Path("/proc/{0}/stat".format(pid))
+    if linux.is_file():
+        try:
+            body = linux.read_text().split(")", 1)[1].split()
+            start_ticks = int(body[19])
+            boot = None
+            for line in Path("/proc/stat").read_text().splitlines():
+                if line.startswith("btime "):
+                    boot = int(line.split()[1])
+                    break
+            hz = os.sysconf("SC_CLK_TCK")
+            if boot is None or hz <= 0:
+                return None
+            return float(boot) + (start_ticks / float(hz))
+        except (OSError, IndexError, ValueError):
+            return None
+    if sys.platform == "darwin":
+        return _darwin_process_start_epoch(pid)
+    return None
 
 def count_complete_transcript_records(path: Any) -> int:
     """Count complete JSONL records in a transcript file (§7.6, §17 item 82).
