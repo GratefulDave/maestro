@@ -717,6 +717,29 @@ class ReviewStageTests(SchedulerFixture):
         # an operator can act on, so the findings ride the report.
         self.assertIn("build", report.review_findings)
         self.assertIn("hardcoded", report.review_findings["build"])
+        # And how many findings each rejected attempt drew. Flat at 1 across
+        # all three: the reviewer was not converging, which is what says
+        # raising `review_ceiling` for this node would have bought nothing.
+        self.assertEqual(report.review_convergence["build"], (1, 1, 1))
+
+    def test_resume_reloads_review_convergence_from_attempt_rows(self):
+        """The series survives the process that observed it.
+
+        Rebuilt from the same review-rejected rows the budget is counted
+        from, so a run finished by a second process reports the whole run's
+        convergence rather than its own slice of it.
+        """
+        review = FakeReview([False, False, False])
+        self.written["build"] = {"build.py": "ok\n"}
+        self.schedule(
+            [self.agent("build")],
+            deps=self.deps(review_attempt=review)).run()
+        rebuilt = rp.review_convergence_from_attempts(
+            self.store.attempts_for("run1"))
+        self.assertEqual(rebuilt["build"], [1, 1, 1])
+        resumed = self.schedule([self.agent("build")])
+        resumed.project()
+        self.assertEqual(resumed._review_convergence["build"], [1, 1, 1])
 
     def test_the_ceiling_is_configurable_and_respected(self):
         review = FakeReview([False, False])

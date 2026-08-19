@@ -15,6 +15,17 @@ Two failures on the same path, one downstream of the other:
   not error — it compaction-loops and answers about something else — so the
   check must refuse before dispatch rather than truncate silently.
 
+A third arrived with guidance durability: the ledger now *appends* within a
+surface instead of replacing, so the rendered guidance grows with every retry
+rather than staying the size of one failure. That makes this file's bound
+load-bearing in a way it was not — an unbounded guidance section would be a
+handoff that grows itself over the limit across attempts, which is precisely
+the overflow B13 refuses. `AccumulatedGuidanceStaysBounded` states the bound
+as behaviour, including *which* entries survive it: `_fit` alone drops
+trailing lines, and history renders oldest-first, so truncating with `_fit`
+would have kept the oldest finding and dropped the one the next attempt has
+to fix.
+
 Run with:
     python -m pytest tests/test_prompt_size_preflight.py -o addopts= -q
 """
@@ -51,7 +62,7 @@ class BoundedOffendingPathRendering(unittest.TestCase):
             reason="the measured delta failed §8.3's permission check",
             offending_paths=_paths(count), failed_clause=4)
         rendered = rp.render_guidance(
-            _Node(), rp.GuidanceLedger(verification=guidance))
+            _Node(), rp.GuidanceLedger(verification=(guidance,)))
         self.assertIsNotNone(rendered)
         return rendered
 
@@ -84,8 +95,69 @@ class BoundedOffendingPathRendering(unittest.TestCase):
     def test_no_offending_paths_renders_no_paths_section(self):
         guidance = rp.VerificationGuidance(reason="clause 3", failed_clause=3)
         rendered = rp.render_guidance(
-            _Node(), rp.GuidanceLedger(verification=guidance))
+            _Node(), rp.GuidanceLedger(verification=(guidance,)))
         self.assertNotIn("Paths written outside", rendered)
+
+
+class AccumulatedGuidanceStaysBounded(unittest.TestCase):
+    """An accumulating ledger cannot grow a handoff past the budget."""
+
+    ENTRIES = 40
+
+    def _ledger(self, entries: int) -> "rp.GuidanceLedger":
+        ledger = rp.GuidanceLedger()
+        for i in range(1, entries + 1):
+            ledger = ledger.with_verification(rp.VerificationGuidance(
+                reason=f"attempt {i} failed the permission check",
+                offending_paths=tuple(
+                    f".venv/lib/python3.12/site-packages/pkg{i}_{j}/mod.py"
+                    for j in range(200)),
+                failed_clause=4))
+            ledger = ledger.with_review(rp.ReviewGuidance(
+                subject_digest=f"digest{i}",
+                findings=tuple(
+                    rp.ReviewFinding(f"check{i}_{k}", f"object{i}_{k}",
+                                     f"finding {i}-{k} " + "z" * 80, True)
+                    for k in range(20))))
+        return ledger
+
+    def test_the_rendered_size_plateaus_rather_than_growing_per_attempt(self):
+        """Forty attempts' history renders no larger than the budget.
+
+        The series also has to *stop* growing, not merely end up under the
+        cap: a size that still climbs with each entry is one attempt count
+        away from the same failure.
+        """
+        sizes = [len(rp.render_guidance(_Node(), self._ledger(n)))
+                 for n in (1, 2, 5, 10, 20, self.ENTRIES)]
+        for size in sizes:
+            self.assertLessEqual(size, rp.GUIDANCE_CHAR_BUDGET)
+        self.assertEqual(sizes[-1], sizes[-2])
+
+    def test_truncation_drops_the_oldest_entry_and_says_so(self):
+        """The newest finding is the last thing to go, and never silently."""
+        rendered = rp.render_guidance(_Node(), self._ledger(self.ENTRIES))
+        self.assertIn(f"pkg{self.ENTRIES}_0/mod.py", rendered)
+        self.assertIn(f"finding {self.ENTRIES}-0 ", rendered)
+        self.assertNotIn("pkg1_0/mod.py", rendered)
+        self.assertNotIn("finding 1-0 ", rendered)
+        self.assertIn("earlier findings from this surface dropped", rendered)
+
+    def test_a_bounded_ledger_cannot_be_what_overflows_a_handoff(self):
+        """The tie back to the preflight: guidance is a bounded contribution.
+
+        Rendered guidance costs at most `GUIDANCE_CHAR_BUDGET` characters
+        however many attempts precede it, so a prompt that fits before the
+        retries still fits after them — and the preflight is still the thing
+        that refuses when the *rest* of the handoff does not.
+        """
+        rendered = rp.render_guidance(_Node(), self._ledger(self.ENTRIES))
+        with _StubCatalog():
+            self.assertIsNotNone(
+                maestro._preflight_prompt(rendered, "omp", "x-ai/grok-4.6"))
+            with self.assertRaises(cr.HandoffTooLarge):
+                maestro._preflight_prompt(
+                    rendered + "x" * (3 * 500_000), "omp", "x-ai/grok-4.6")
 
 
 class _StubCatalog:
