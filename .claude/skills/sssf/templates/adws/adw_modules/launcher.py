@@ -206,6 +206,16 @@ class HarnessQuiescenceError(RuntimeError):
     """A harness-owned process group could not be proven absent."""
 
 
+class _WorkspaceGone(RuntimeError):
+    """The run's memoized workspace id no longer names a live workspace.
+
+    Internal to the launcher and never raised past it: `_tab_for` either
+    recovers by re-resolving, or restates this as a typed `LaunchRefused`. It
+    exists so the recovery path is selected by a raised type rather than by
+    re-parsing an error code at the call site (#79).
+    """
+
+
 class HerdrCallError(RuntimeError):
     """A refused `herdr` call, carrying Herdr's own structured error code.
 
@@ -1469,6 +1479,32 @@ class HerdrLauncher:
         except BaseException:
             return
 
+    def _tab_create(self, workspace_id: str, label: str, worktree: Path,
+                    env_flags: Sequence[str],
+                    environment: Mapping[str, str]) -> dict:
+        """One `tab create`, raising `_WorkspaceGone` when the id is dead.
+
+        Keyed on herdr's typed `error.code`, never on the message text: §1.2
+        forbids classifying on prose, and `herdr_error_code` returns `""`
+        rather than a guess for anything it does not recognise, so an
+        unrecognised refusal cannot be mistaken for this one.
+
+        Clearing the cache is done here, at the point the answer arrives,
+        rather than by the caller — a caller that forgot would re-ask with the
+        same dead id, which is the defect this exists to close.
+        """
+        try:
+            return self._herdr(
+                "tab", "create", "--workspace", workspace_id,
+                "--label", label, "--cwd", str(worktree), "--no-focus",
+                *env_flags, env=environment)
+        except HerdrCallError as exc:
+            if _herdr_error_code_of(exc) != "workspace_not_found":
+                raise
+            if self._workspace_id == workspace_id:
+                self._workspace_id = ""
+            raise _WorkspaceGone(str(exc)) from exc
+
     def _tab_for(self, spec: LaunchSpec, worktree: Path,
                  env_flags: Sequence[str],
                  environment: Mapping[str, str]) -> _TabLayout:
@@ -1503,10 +1539,32 @@ class HerdrLauncher:
             workspace_id = self._run_workspace(environment)
             label = display_name(group) if group else self.workspace_label
             try:
-                payload = self._herdr(
-                    "tab", "create", "--workspace", workspace_id,
-                    "--label", label, "--cwd", str(worktree), "--no-focus",
-                    *env_flags, env=environment)
+                payload = self._tab_create(
+                    workspace_id, label, worktree, env_flags, environment)
+            except _WorkspaceGone:
+                # The cached workspace no longer exists. Re-resolve once and
+                # ask again: `_run_workspace` creates a fresh one, so the
+                # retry is a different question rather than the same dead one
+                # (#79). The cache is cleared inside `_tab_create`, under this
+                # same reentrant lock, so a concurrent launch of another node
+                # resolves the new workspace rather than racing to make a
+                # third.
+                workspace_id = self._run_workspace(environment)
+                try:
+                    payload = self._tab_create(
+                        workspace_id, label, worktree, env_flags, environment)
+                except _WorkspaceGone as exc:
+                    # Twice in a row is not a stale cache. Something is
+                    # destroying workspaces as fast as this makes them, and a
+                    # third attempt re-asks a question that has now been
+                    # answered the same way twice.
+                    raise LaunchRefused(
+                        LaunchRefusal.TAB_UNRESOLVED,
+                        "workspace vanished twice: {0}".format(exc)) from exc
+                except BaseException as exc:
+                    raise LaunchRefused(
+                        LaunchRefusal.TAB_UNRESOLVED,
+                        "{0}: {1}".format(type(exc).__name__, exc)) from exc
             except BaseException as exc:
                 raise LaunchRefused(
                     LaunchRefusal.TAB_UNRESOLVED,
