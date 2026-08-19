@@ -8,6 +8,79 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A one-command launcher for the visualizer, `bin/maestro-viz`, reachable from any directory as
+  `just -g viz`. The only invocation that started a working visualizer was `bun run dev:all` from
+  the app's own directory; `bun run dev` — the obvious thing to type — is `vite` alone, which
+  serves the frontend on :4601 without the API on :4600, so every `/api` request fails
+  `ECONNREFUSED` and the UI sits on "loading sources…" while the startup output looks successful.
+  The launcher starts both halves, resolves its own paths so no environment variable is involved,
+  frees ports 4600 and 4601 first so a second run replaces the first rather than stacking a
+  duplicate server, and withholds success until `/api/sources` has answered 200 through the
+  frontend's proxy. Every other outcome exits non-zero with the failing half's log tail — a
+  missing `bun`, an uninstalled `vite`, a port that survives `SIGKILL`, a process that dies during
+  startup — and `vite` runs with `--strictPort` so the printed URL cannot lie about which port it
+  landed on. `maestro-viz stop` frees both ports, `status` reports what is listening, and
+  `maestro-viz <repo>` runs the API with that repository as its working directory so the
+  repository's own `adws/maestro.config.yaml` is discovered. The `just -g viz` recipe is a
+  one-line passthrough, which keeps the logic version-controlled here rather than in the user's
+  home directory; it reads `~/.config/just/justfile`, verified against just 1.46.0 and verified to
+  take precedence over `~/.justfile`, so nothing is added to `PATH` and no shell rc file is
+  edited.
+- The visualizer's run index is navigable on a Maestro-only server, and its run cards say how far
+  along a run is. A bare `#/` there renders the fallback ledger's run index, but the route named
+  no source, so the breadcrumb read "sessions" and linked to a tracer route that server does not
+  serve, and no tab was marked current while one was plainly on screen; the landing source is now
+  resolved once and every piece of navigation points at the view actually rendered. Run cards
+  carry the plan digest and their nodes counted by state, because on a fourteen-node plan the dots
+  showed the shape of a run without answering how much of it was done.
+- Node code review grades a finding's consequence, so a lane can converge on a merge.
+  §3.6 A9 forbids gating progress on a zero-finding LLM sweep with restart-on-any-finding, and
+  Maestro was doing exactly that: six of `CODE_RUBRIC`'s seven checks are BLOCKING and any
+  finding on one rejected the attempt, so acceptance needed an adversarial cross-vendor reviewer
+  to find zero defects in a real diff. Over the 27 review reports the production deployment had
+  written, `diff.introduces_no_obvious_defect` carried a finding in 25. A finding now carries a
+  reviewer-assigned `grade` (`error`/`warning`/`note`) and a `grade_rationale`; a cell rejects
+  only when its check is BLOCKING **and** its grade reaches `execution.review_reject_grade`, so
+  an ADVISORY check still cannot be escalated by grading it, the reviewer still cannot emit a
+  severity or a verdict, and code still derives the verdict (§6.5). The threshold is
+  configuration, validated at load, never plan content (§6.2). A finding without a grade, a
+  rationale, or a message does not parse (§3.6 B8). Sub-threshold findings are recorded rather
+  than discarded, in a ledger beside the receipt under the same subject digest. See §19 M17 and
+  §17 item 130.
+- A signed finalization receipt carries both halves of what derived its verdict:
+  `DerivedCell.grade` and `Receipt.reject_at`, each required by `Receipt.from_bytes`. Both are
+  `None` for plan finalization, whose reviewer has no grade to give and whose verdict runs under
+  no threshold. They land with the grading rather than after it because §3.6 B8's rule is that a
+  field added once receipts exist is optional forever, and a receipt recording a grade without
+  the bar it was measured against still records a conclusion nobody can re-derive from it. This
+  makes a replayed review whose ledger is missing report the grades and the threshold the
+  original review actually used, rather than falling back to severity and to today's
+  configuration — the ledger is still written after the receipt, per §1.2, and that ordering now
+  costs the rationales alone.
+- `maestro plan set-aside` gives a FAIL finalization receipt the operator escape §3.6 B10
+  requires, with `maestro plan set-aside-log` reading the escapes back. `ReceiptStore.set_aside`
+  retains the FAILed receipt and its original signature under an archival name, writes a signed
+  `SetAsideRecord` naming the invoker, the reason and the sha256 of the receipt bytes it
+  superseded, and frees the live slot, so the next `finalize` reviews those bytes afresh by the
+  same path a `FINALIZATION_STALLED` rerun takes — the absence of a receipt, never a decision
+  that reads the record. `finalize` and the replay key are unchanged. The escape needs the
+  finalizer's signing key, refuses a PASS, refuses a digest with no receipt, refuses a blank
+  invoker or reason, and is reachable only from the verb. Closes #38; discharges §16.3 item 56;
+  see §19 M16 and §17 item 132.
+- `run cancel` records why it cancelled, and `run resume` reopens the run it stopped.
+  `CancelCause` is stored typed at both levels — `runs.cancel_cause` as an attribute of the
+  declared outcome, `node_lifecycle.cancel_cause` as its node-level twin — because a run whose
+  operator abandoned one lane and then cancelled the run holds both causes at once. `resume_run`
+  refuses `ACCEPTED`, refuses a `CANCELLED` caused by `ABANDONED`, refuses a `CANCELLED` with no
+  recorded cause, and accepts one caused by `RUN_CANCEL`; on that resume MERGED nodes stay MERGED
+  and are never re-executed. Before this, `run cancel` — the operator's only stop control —
+  discarded every merged, gate-verified, reviewed node in the run; on the twelve-lane plan of
+  `run-75b96fd1f01e46989671771645ee6acc` the same keystroke that stopped the machine threw away
+  everything it had landed. Closes #29; see §19 M18 and §17 item 131.
+- The Maestro dashboard surfaces `cancel_cause` for a run and for each node, and says whether
+  `run resume` will take a cancelled run. The column is read through a schema probe, so a ledger
+  older than the migration answers `null` rather than failing the query.
+
 - Plan admission now refuses a plan whose lane cannot satisfy its own contract, and a plan whose
   requirement both prohibits and prescribes the same effect. Two obligations over the
   `plan-contract.v1` IR, evaluated at `plan_contract_ingress.project_draft` — the chokepoint both
@@ -35,8 +108,88 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   cases. An unusable runner refuses the run at preflight, with no attempt launched and no
   environmental budget spent. See §19 M8 and §17 item 121.
 
+### Fixed
+
+- Signed finalization receipts written before grading existed parse, verify and replay again.
+  `rubric_version` names the rubric, not the receipt schema, and the grading fields
+  (`Receipt.reject_at`, `DerivedCell.grade`) landed under `maestro-rubric.v2` without moving that
+  label, so v2 named two incompatible payload shapes at once. `Receipt.from_bytes` had been
+  discriminating on the label — v1 means no `reject_at`, anything else means both new keys are
+  required — and therefore refused every pre-grading v2 receipt as failing the frozen schema, with
+  its bytes untouched and its signature still verifying. The 110-cell PASS receipt for
+  `cmo-consolidation-l-r4` is one of those, and `run start` against its digest could no longer read
+  it. The discriminator is now the payload itself: `reject_at` present means the graded shape and
+  every cell must carry a `grade`; absent means the pre-grading shape, and both read `None` rather
+  than being defaulted. The two shapes cannot be mixed in one payload, so nothing written today can
+  omit either field. `maestro-rubric.v1` receipts replay by the same rule. See §19 M21.
+- `node retry`, `node skip` and `node abandon` reach a node left `RUNNING` by a scheduler that
+  died. All three required `BLOCKED`, and a scheduler that is killed or crashes declares nothing
+  and leaves its node `RUNNING`, so the operator's entire escape vocabulary refused the one state
+  a dead scheduler produces. The gate now reads the fact it was standing in for: `RUNNING` is
+  admitted only when `scheduler_liveness` returns `False`, and refuses `SCHEDULER_STILL_ALIVE`
+  when the scheduler is still a process or `SCHEDULER_LIVENESS_UNKNOWN` when liveness cannot be
+  said — unknown is not dead. `BLOCKED` is unchanged. The escape closes the node's live attempt
+  row in the same transaction as the transition, so the next attempt does not collide with §10.3's
+  partial unique index and a late arrival from the abandoned attempt adjudicates `SUPERSEDED`
+  rather than `ACCEPTED`. See §19 M19.
+- Scheduler liveness compares the short hostname, so a network change no longer strands a run.
+  `scheduler_host()` stored `socket.gethostname()` whole, and its domain suffix is a DHCP
+  assignment: the same machine recorded `Mac.attlocal.net` on one network and `Mac` on another.
+  Raw equality read those as different hosts, `scheduler_liveness` returned `None` permanently for
+  every run recorded under the old suffix, and — since an escape fails closed on unknown — those
+  runs could not be retried, skipped or abandoned on the only machine that could have recovered
+  them. Host identity is now the first DNS label, compared case-insensitively, so a ledger already
+  holding an FQDN matches its own short name with no migration. An empty identity still matches
+  nothing, and a genuinely different machine still reads unknown. See §19 M20.
+- Opening a ledger concurrently no longer fails the `cancel_cause` migration. Two openers could
+  each observe the column missing outside a serialized transaction, and the second `ALTER` died
+  with `duplicate column name` at `run start` or `run resume` against a ledger predating the
+  column. The check and the `ALTER` now share one `BEGIN IMMEDIATE`, and a duplicate-column error
+  is read as already-migrated.
+- A run whose every reopened node has merged reads `MERGED`, in `run status` and in the dashboard
+  alike, instead of a stale `CANCELLED`. `run resume` clears `cancel_requested` but leaves
+  `latest_outcome = CANCELLED` standing until the scheduler declares again; during the
+  final-acceptance window the live node rows contradict that leftover declaration, and preferring
+  the declaration recreated §19 M5 — a finished run reported as cancelled and offered as
+  resumable. All-`MERGED` with no live cancel request now derives `MERGED` and `resumable: false`.
+  A mix of `MERGED` and `CANCELLED` nodes still reads the declaration, so a run abandoned node by
+  node stays `CANCELLED`.
+- An interrupted `plan set-aside` resolves to either fully applied or fully absent, and a swapped
+  archive is refused. Publication recovers through `_recover_locked`: a complete, signed,
+  digest-bound archive and record pair finishes the unlink it was interrupted before; a partial
+  pair alongside a live receipt is discarded as an escape that did not happen, so a retry is
+  legal. `load_set_aside_receipt` compares the archived bytes against the record's
+  `superseded_receipt_sha256`, so an archive substituted after the fact does not read back as the
+  receipt the record names.
+- `run start` against a digest with no finalization receipt refuses `RUN_RECEIPT_ABSENT` with a
+  typed `cause` (`SET_ASIDE` or `NEVER_FINALIZED`) instead of `FILENOTFOUNDERROR`. That
+  pseudo-outcome came from `_refusal(type(exc).__name__.upper(), str(exc))`, a shape with four
+  operator-visible sites — `_run_start`, `_run_resume`, and `main`'s two last-chance arms — none
+  of whose names were declared anywhere or could be branched on. All four now name the condition:
+  `_RunRefused` carries a declared outcome plus any discriminator as a typed field,
+  `RUN_QUIESCENCE_UNPROVEN` carries the harness's own declared code, `RUN_EXECUTION_FAILED`
+  covers what has no better name with the class in `detail`, and `MAESTRO_INTERNAL_ERROR` is
+  `main`'s net for a non-workspace verb. `RUN_RECEIPT_NOT_PASS` and
+  `RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE` were declared names carried as `ValueError` messages and
+  are now printed as the outcome they always were. See §17 item 133.
+- The Maestro dashboard renders a finished cancellation as `CANCELLED` rather than `CANCELLING`
+  forever. `cancel_requested` is a request that only a resume clears, and the derived state
+  checked it before the node rows; the order now matches `lifecycle.derive_run_state` — a run
+  whose every node is absolutely terminal has stopped, whatever any flag says. Closes #39.
+- `lifecycle.derive_run_state` reads a declared `CANCELLED` outcome in that same settled branch,
+  so a run abandoned node by node — which sets no `cancel_requested` — reads `CANCELLED` rather
+  than `QUIESCENT`. That is the only branch where the declaration is read: a resume returns nodes
+  to PENDING and un-settles the run, so a superseded declaration can never win there. Without it
+  `run status` and the dashboard gave two answers to one question about the same run.
+
 ### Changed
 
+- The ADW template's suite runs in parallel by default. `pytest.ini` sets `-n auto`, because the
+  suite builds real git repositories and runs real pytest collection in subprocesses — §13.3's
+  launcher, worktree and merge negatives cannot be proven against fakes — and that cost is I/O
+  bound rather than CPU bound: 1559 collected cases take 22:17 serially and 10:40 under `-n auto`
+  at 55% CPU, with identical pass counts. Anything counting collected cases must still pass
+  `-o addopts=`, exactly as it already had to in order to clear a `-v` that would cancel `-q`.
 - `MAESTRO_architecture.md` records that `maestro plan review` dispatches no model.
   `maestro.py::_plan_review` runs exactly `planctl review` followed by
   `planctl validate --require-approved`, and stamps `reviewer.id` and `reviewer.vendor` from

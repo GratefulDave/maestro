@@ -78,6 +78,47 @@ class RunOutcome(str, Enum):
 RESIDUAL_OUTCOME = RunOutcome.BLOCKED
 
 
+class CancelCause(str, Enum):
+    """Why a `CANCELLED` was written — the same vocabulary at both levels.
+
+    `CANCELLED` was one word carrying two facts, exactly as "terminal" was
+    before §7.3 split it. A run, or a node, reaches `CANCELLED` down one of
+    two paths, and they are not alike:
+
+    * `RUN_CANCEL` — the operator ran `run cancel`. The machine was asked to
+      stop. Nothing was adjudicated, no result was reached, and there is no
+      outcome to protect from being reopened. `run cancel` is the operator's
+      only stop control, so this is also the cause written when an operator
+      wanted to pause and had no verb that said so.
+    * `ABANDONED` — the work itself was given up on, node by node, through
+      `abandon` (§11.3). At run level it is the shape §7.3 names "every node
+      is CANCELLED": a run stopped deliberately, just piecewise. Each node in
+      it was individually adjudicated as work the run should finish without,
+      which is a decision about the work and is closer to `ACCEPTED` than to
+      a stop request.
+
+    Stored typed, at both levels, because `run resume`'s legality keys on it
+    and §1.2 forbids a lifecycle transition keyed on prose. The run-level
+    value is an attribute of the *declared outcome* and is rewritten by every
+    `declare_outcome`; `runs.cancel_requested` is the separate, live fact that
+    a stop was *requested*, consumed by the outcome function as an input and
+    cleared by a resume. One is the question put to the scheduler, the other
+    is the answer it recorded.
+    """
+
+    RUN_CANCEL = "RUN_CANCEL"
+    ABANDONED = "ABANDONED"
+
+
+#: The causes a `CANCELLED` may be reopened from (§7.3, §7.8). `MERGED` and an
+#: `ABANDONED` `CANCELLED` remain absolutely terminal; a `RUN_CANCEL`
+#: `CANCELLED` is terminal only because the operator asked the machine to
+#: stop, and a resume of that same run is the operator withdrawing the
+#: request. Membership is data rather than a branch so that the guard, the
+#: resume predicate, and the tests read one list.
+REOPENABLE_CANCEL_CAUSES: Tuple[CancelCause, ...] = (CancelCause.RUN_CANCEL,)
+
+
 # ── §7.5 retry classes ──────────────────────────────────────────────────────
 
 class RetryClass(str, Enum):
@@ -110,6 +151,17 @@ class Escape(str, Enum):
     RETRY_FORCE = "retry --force"
     SKIP = "skip"
     ABANDON = "abandon"
+
+
+class EscapeRefusal(str, Enum):
+    """Why an escape against a RUNNING node failed closed.
+
+    The race these name is a run-level fact — is the scheduler still a
+    process — not a node-state fact. UNKNOWN is not dead.
+    """
+
+    SCHEDULER_STILL_ALIVE = "SCHEDULER_STILL_ALIVE"
+    SCHEDULER_LIVENESS_UNKNOWN = "SCHEDULER_LIVENESS_UNKNOWN"
 
 
 class BlockReason(str, Enum):

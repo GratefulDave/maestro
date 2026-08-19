@@ -73,6 +73,40 @@ class _PlanReceiptVerificationError(RuntimeError):
 class _RunPathConfigurationError(ValueError):
     """Run authority storage is located in a participant-writable boundary."""
 
+
+class _RunRefused(RuntimeError):
+    """A run verb's refusal, named by the refusal vocabulary rather than by
+    whatever Python class happened to carry it.
+
+    `_run_start` and `_run_resume` both ended in
+    `_refusal(type(exc).__name__.upper(), str(exc))`, which is not a
+    vocabulary: it prints `FILENOTFOUNDERROR`, `VALUEERROR` or `OSERROR` as an
+    operator-visible `outcome`, none of which is declared anywhere, none of
+    which an operator or a caller can branch on, and each of which changes
+    whenever an implementation detail changes what it raises. Two conditions on
+    the run path already *had* names — `RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE` and
+    `RUN_RECEIPT_NOT_PASS` — and were smuggled through `ValueError` messages, so
+    the name reached the operator as prose in `detail` while `outcome` read
+    `VALUEERROR`. §19 M16 quotes the intended one as the outcome; it was never
+    printed as one.
+
+    `fields` carries any additional *typed* discriminator, in the shape
+    `_typed_refusal` established: a fact a caller must branch on travels as a
+    field, never as a sentence (§1.2).
+    """
+
+    def __init__(self, outcome: str, detail: str, **fields: Any) -> None:
+        super().__init__(detail)
+        self.outcome = outcome
+        self.detail = detail
+        self.fields = fields
+
+    def emit(self) -> int:
+        if self.fields:
+            return _typed_refusal({"outcome": self.outcome, **self.fields},
+                                  self.detail)
+        return _refusal(self.outcome, self.detail)
+
 class _RunSelectionError(ValueError):
     """Nothing in the ledger matches the run the operator named.
 
@@ -197,6 +231,19 @@ def _config_nonnegative_integer(value, label):
         raise _MaestroConfigurationError(
             label + " must be a non-negative integer")
     return value
+
+
+def _config_reject_grade(value) -> "code_review.FindingGrade":
+    """§3.6 A9's rejection threshold, validated at load rather than at review.
+
+    A misspelt grade must refuse the installation now, not silently become a
+    threshold nothing matches on the night a lane is being reviewed.
+    """
+    try:
+        return code_review.parse_reject_grade(value)
+    except code_review.UnknownGrade as exc:
+        raise _MaestroConfigurationError(
+            "execution.review_reject_grade: " + str(exc)) from exc
 
 
 def _config_argv(value, label) -> Tuple[str, ...]:
@@ -517,8 +564,9 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         ("route", "model", "effort", "concurrency", "node_timeout_s",
          "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
          "semantic_ceiling"),
-        ("profile", "vendor", "review_ceiling", "provision",
-         "environmental_retries", "launcher_retries", "credential_retries"))
+        ("profile", "vendor", "review_ceiling", "review_reject_grade",
+         "provision", "environmental_retries", "launcher_retries",
+         "credential_retries"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -566,6 +614,15 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             _config_positive_integer(execution_raw["review_ceiling"],
                                      "execution.review_ceiling")
             if "review_ceiling" in execution_raw else 3),
+        # §3.6 A9's grading threshold, beside the ceiling because it answers
+        # the half of A9 the ceiling cannot: the ceiling decides how many
+        # rejections a node may collect, this decides what counts as one. A
+        # property of the installation, never of the plan (§6.2), so a plan
+        # cannot raise or lower its own bar.
+        "review_reject_grade": (
+            _config_reject_grade(execution_raw["review_reject_grade"])
+            if "review_reject_grade" in execution_raw
+            else code_review.DEFAULT_REJECT_GRADE),
         # §8.3/§9.3's provision step: the ecosystem's setup, run in every
         # attempt's fresh worktree after `git worktree add` and before the
         # pre-node gate and the baseline inventory. `npm ci` for a JavaScript
@@ -903,6 +960,26 @@ def _apply_repository_config(
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
         args.review_ceiling = execution["review_ceiling"]
+        # A9's other half, and the one `execution:` key that stops here.
+        #
+        # Every budget and bound around it continues into `SchedulerConfig`,
+        # and this one deliberately does not, because `SchedulerConfig` is the
+        # *scheduler's* contract — the fields it reads to decide readiness,
+        # concurrency, timeouts and retries. The reject threshold is read by
+        # `_code_review_runner`'s closure, which the scheduler is handed as a
+        # dependency and never inspects. Routing it through `SchedulerConfig`
+        # would add a field with zero readers, and §3.6 B15's rule is that a
+        # field with zero readers is a build failure, not a convenience: it
+        # looks checked and is not. `TheProjectionIsTotalTest` is keyed on
+        # `SchedulerConfig`'s fields for exactly that reason, so it cannot see
+        # this key — `TheRejectGradeReachesTheReviewerTest` covers this path
+        # end to end instead, and the coverage is not optional just because the
+        # destination differs.
+        #
+        # Set here rather than read with a default at the review site, so a run
+        # whose config never named it still carries an explicit threshold
+        # instead of one inferred from an absent attribute.
+        args.review_reject_grade = execution["review_reject_grade"]
         # §7.5's non-semantic budgets. Present in `SchedulerConfig` and in
         # `maestro.config.yaml` for as long as both existed, and connected by
         # nothing: a deployment that set them changed no run, because the
@@ -1042,6 +1119,28 @@ def _open_reader(database) -> "lc.LifecycleReader":
 def _refusal(outcome: str, detail: str) -> int:
     print(json.dumps({"detail": detail, "outcome": outcome}, sort_keys=True))
     return 3
+
+
+def _quiescence_refusal(exc: BaseException) -> int:
+    """`RUN_QUIESCENCE_UNPROVEN`, carrying the code the harness declared.
+
+    `HarnessQuiescenceError`'s message is not prose. Every raise site puts a
+    declared code first — `HARNESS_CONTEXT_QUIESCENCE_UNPROVEN`, or
+    `HERDR_QUIESCENCE_UNPROVEN:<handle token>` naming the handle that could not
+    be proven gone. Under the untyped arm the operator got that declared code
+    as `detail` and the *Python class name* as `outcome`, which is the two
+    halves exactly the wrong way round: the typed fact travelled as prose and
+    the implementation detail travelled as the field a caller branches on.
+
+    This is not a `RUN_EXECUTION_FAILED`. §8.3's quiesce is a correctness
+    obligation — an unproven-absent process group is why a settle must not
+    proceed — and an operator reading it needs to know that a process may
+    still be alive, which the generic name does not say.
+    """
+    text = str(exc)
+    code = text.partition(":")[0]
+    return _typed_refusal(
+        {"outcome": "RUN_QUIESCENCE_UNPROVEN", "quiescence_code": code}, text)
 
 
 def _typed_refusal(payload: Dict[str, Any], detail: str) -> int:
@@ -1236,7 +1335,7 @@ def _finalization_store(args: argparse.Namespace) -> finalization.ReceiptStore:
             or not args.signing_seed):
         raise _PlanReceiptConfigurationError(
             "--receipt-dir, --data-dir, --verify-key, and --signing-seed "
-            "are required to finalize a plan")
+            "are required to write to the receipt store")
     try:
         verify_keys = tuple(bytes.fromhex(value) for value in args.verify_key)
         signing_seed = bytes.fromhex(args.signing_seed)
@@ -1383,6 +1482,13 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         # receipt — B10's replay rather than a second opinion.
         subject_root = review_root / digest
         report_path = subject_root / "report.json"
+        # Every finding this review produced, rejecting and sub-threshold
+        # alike, beside the reviewer's own report and under the same subject
+        # digest as the receipt that admits the merge. This is where a merged
+        # node's advisories live: an operator reads
+        #   <state>/runs/<run_id>/review/<digest>/findings.json
+        # or `code_review.read_finding_ledger` on that path.
+        ledger_path = subject_root / code_review.FINDING_LEDGER_FILENAME
         prompt_path = subject_root / "prompt.md"
         session_dir = subject_root / "session"
         # §8.3 applies to the reviewer's pane exactly as it does to a node's.
@@ -1432,6 +1538,12 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     profile=args.reviewer_profile, session_dir=session_dir,
                     context_window_tokens=_route_context_window(
                         args.reviewer_route, args.reviewer_model),
+                    # Same tab as the builder whose output it is judging --
+                    # `_code_review_runner` is handed the run's own launcher,
+                    # so the group key resolves to the tab that node already
+                    # opened.
+                    pane_group=node.node_id, pane_role="reviewer",
+                    pane_group_size=2,
                     environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
@@ -1466,7 +1578,9 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                 subject_digest=digest, handoff=handoff, objects=objects,
                 rubric=code_review.CODE_RUBRIC, store=store,
                 window_factory=window_factory,
-                occupancy_reader=_reviewer_occupancy)
+                occupancy_reader=_reviewer_occupancy,
+                reject_at=args.review_reject_grade,
+                ledger_path=ledger_path)
         finally:
             # Unconditional. The pane is closed on the success path too, not
             # only when the window stalls and calls `kill` — a completed review
@@ -1846,6 +1960,67 @@ def _plan_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_set_aside(args: argparse.Namespace) -> int:
+    """`maestro plan set-aside` — §3.6 B10's operator escape.
+
+    A FAIL receipt is terminal for those bytes, and that is correct while
+    the FAIL is a fact about the plan. When it is a fact about Maestro —
+    a rubric, a projection, or a reviewer harness defect — the plan is
+    correct and unrunnable, and the only route back used to be a full
+    authoring cycle whose entire purpose was to change the digest (§19
+    M16). This verb sets the receipt aside instead, retaining it, and
+    records who did it and why.
+
+    Which of those two a given FAIL was is a judgment, so the verb makes
+    the judgment attributable rather than making it for the operator.
+    """
+    try:
+        store = _finalization_store(args)
+        record = store.set_aside(args.digest, invoked_by=args.invoked_by,
+                                 reason=args.reason)
+    except _PlanReceiptConfigurationError as exc:
+        return _refusal("SET_ASIDE_CONFIGURATION_REQUIRED", str(exc))
+    except finalization.SetAsideRefused as exc:
+        return _refusal("SET_ASIDE_REFUSED", str(exc))
+    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
+            finalization.SignatureInvalid, UnicodeError) as exc:
+        return _plan_receipt_verification_refusal(exc)
+    except (ValueError, KeyError, OSError) as exc:
+        return _refusal("SET_ASIDE_FAILED", str(exc))
+    print(record.to_bytes().decode("utf-8"))
+    return 0
+
+
+def _plan_set_aside_log(args: argparse.Namespace) -> int:
+    """Every escape ever invoked against a digest, with the receipt each
+    one superseded — the half of B10 that makes the escape auditable
+    rather than a hole."""
+    try:
+        store = _plan_receipt_store(
+            args,
+            missing_detail=(
+                "--receipt-dir, --data-dir, and at least one --verify-key "
+                "are required for receipt access"))
+        entries = [
+            {
+                "record": json.loads(record.to_bytes().decode("utf-8")),
+                "superseded_receipt": json.loads(
+                    store.load_set_aside_receipt(
+                        args.digest, record.sequence
+                    ).to_bytes().decode("utf-8")),
+            }
+            for record in store.set_aside_records(args.digest)
+        ]
+    except _PlanReceiptConfigurationError as exc:
+        return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
+    except (FileNotFoundError, finalization.ReceiptInvalid,
+            finalization.SignatureMissing, finalization.SignatureInvalid,
+            UnicodeError, ValueError, KeyError) as exc:
+        return _plan_receipt_verification_refusal(exc)
+    print(json.dumps(entries, sort_keys=True))
+    return 0
+
+
 def _plan_list(args: argparse.Namespace) -> int:
     try:
         store = _plan_receipt_store(
@@ -1881,6 +2056,10 @@ def _run_start(args: argparse.Namespace) -> int:
             "repository, finalized receipt, launcher roster, and liveness bounds are required")
     try:
         return _execute_run(args, resuming=False)
+    except _RunRefused as exc:
+        return exc.emit()
+    except launcher.HarnessQuiescenceError as exc:
+        return _quiescence_refusal(exc)
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RUN_CONFIGURATION_REQUIRED", str(exc))
     except _PlanReceiptVerificationError as exc:
@@ -1888,11 +2067,14 @@ def _run_start(args: argparse.Namespace) -> int:
     except (finalization.ReceiptInvalid, finalization.SignatureMissing,
             finalization.SignatureInvalid) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError,
-            lc.LifecycleError) as exc:
-        return _refusal(type(exc).__name__.upper(), str(exc))
     except Exception as exc:
-        return _refusal("RUN_EXECUTION_FAILED", str(exc))
+        # Everything with no better name, under the one it already had. The
+        # arm that used to sit above this printed `type(exc).__name__.upper()`
+        # and differed from it in nothing else, so the class name was the whole
+        # of what it added — and a class name is not a refusal vocabulary. It
+        # keeps its diagnostic value in `detail`, which is where prose belongs.
+        return _refusal("RUN_EXECUTION_FAILED",
+                        "{0}: {1}".format(type(exc).__name__, exc))
 
 
 def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerConfig:
@@ -2009,11 +2191,70 @@ def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
     validation = pv.validate_plan(
         stored, args.repo, receipts=receipts, collector=_plan_collector(args))
     if not validation.eligible or validation.digest != args.digest:
-        raise ValueError("RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE")
-    receipt = receipts._receipt_store().load(args.digest)
+        raise _RunRefused(
+            "RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE",
+            "the plan bytes are not canonical at {0}, or the plan is not "
+            "eligible to run".format(args.digest))
+    store = receipts._receipt_store()
+    try:
+        receipt = store.load(args.digest)
+    except FileNotFoundError as exc:
+        raise _receipt_absent(store, args.digest) from exc
     if receipt.verdict is not finalization.Verdict.PASS:
-        raise ValueError("RUN_RECEIPT_NOT_PASS")
+        raise _RunRefused(
+            "RUN_RECEIPT_NOT_PASS",
+            "the finalization receipt for {0} records {1}".format(
+                args.digest, receipt.verdict.value))
     return plan_model.parse_bytes(stored)
+
+
+def _receipt_absent(store: "finalization.ReceiptStore",
+                    plan_digest: str) -> _RunRefused:
+    """`RUN_RECEIPT_ABSENT`, and which of its two causes this is.
+
+    A run needs a PASS receipt, and there are two ways for the digest not to
+    have one. It was never finalized — the ordinary case, and the one an
+    operator meets by running a plan they have not shipped. Or `plan set-aside`
+    took it: §3.6 B10's escape retains the FAILed receipt under an archival
+    name and frees the live slot, so the *absence* is what admits a fresh
+    review, and the absence is therefore deliberate rather than an oversight.
+
+    The store can tell them apart — `set_aside_records` is non-empty for the
+    second — so the refusal says which, as a typed field rather than as prose,
+    because an operator staring at a set-aside digest and an operator staring
+    at an unfinalized one need to do different things. A store that cannot be
+    read at all answers `NEVER_FINALIZED`: the receipt is absent either way,
+    and inventing a set-aside from a failed read would be the defaulting
+    failure §19.2 names.
+    """
+    try:
+        records = store.set_aside_records(plan_digest)
+    except (OSError, ValueError, finalization.ReceiptInvalid,
+            finalization.SignatureMissing, finalization.SignatureInvalid):
+        records = ()
+    if records:
+        return _RunRefused(
+            "RUN_RECEIPT_ABSENT",
+            "the finalization receipt for {0} was set aside {1} time(s); "
+            "run `maestro plan finalize` to review those bytes afresh".format(
+                plan_digest, len(records)),
+            cause="SET_ASIDE", set_aside_count=len(records))
+    return _RunRefused(
+        "RUN_RECEIPT_ABSENT",
+        "no finalization receipt exists for {0}".format(plan_digest),
+        cause="NEVER_FINALIZED", set_aside_count=0)
+
+
+def _herdr_workspace_label(args: argparse.Namespace) -> str:
+    """The name of the herdr workspace this run's panes land in.
+
+    The plan's own name where there is one, because that is what the operator
+    calls the work and what the sidebar has room for; the run id otherwise, so
+    the workspace is still named after this run and not after whatever was in
+    front of it.
+    """
+    name = str(getattr(args, "plan_name", "") or "")
+    return name or str(getattr(args, "run_id", "") or "maestro")
 
 
 def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
@@ -2038,7 +2279,12 @@ def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
         # §9.3's sixth operation. The adapter has implemented it since it was
         # written; nothing had ever handed it the argv to run, so it returned
         # immediately for every attempt of every run.
-        provision_argv=tuple(getattr(args, "provision_argv", None) or ()))
+        provision_argv=tuple(getattr(args, "provision_argv", None) or ()),
+        # One workspace per run, created by the launcher and named for the
+        # plan. Every pane this run opens -- builders and the reviewers of the
+        # same `route_runner` alike -- lands in it, so an operator has one
+        # place to watch and an unrelated run's pane can never appear there.
+        workspace_label=_herdr_workspace_label(args))
 
 
 class _ConfiguredProvisioner:
@@ -2518,6 +2764,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 session_dir=attempt.scratch / "session",
                 context_window_tokens=_route_context_window(
                     args.agent_route, args.agent_model),
+                # This node's own tab, with room for the reviewer that will
+                # judge it: two panes side by side rather than a builder and a
+                # reviewer in unrelated corners of a flat tab.
+                pane_group=node.node_id, pane_role="builder",
+                pane_group_size=2,
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
@@ -2859,6 +3110,12 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
                              if record.latest_outcome else None),
         "declared_outcome_at": record.latest_outcome_at,
         "cancel_requested": record.cancel_requested,
+        # Which of §7.3's two cancellation shapes the declared CANCELLED was,
+        # and therefore whether `run resume` will take this run back. Reported
+        # rather than left to be inferred from the node states: the inference
+        # is exactly the heuristic the stored cause exists to replace.
+        "cancel_cause": (record.cancel_cause.value
+                         if record.cancel_cause else None),
         # The three facts the state above was derived from, reported so an
         # ABANDONED verdict can be checked rather than believed.
         "scheduler_pid": record.scheduler_pid,
@@ -2897,6 +3154,13 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         progress["last_transition_at"], _duration(progress["idle_s"])))
     if progress["cancel_requested"]:
         lines.append("  cancel       requested")
+    if progress["cancel_cause"]:
+        lines.append("  cancel cause {}{}".format(
+            progress["cancel_cause"],
+            "   (resumable)"
+            if progress["cancel_cause"]
+            == scheduler_types.CancelCause.RUN_CANCEL.value
+            else "   (not reopenable)"))
     if progress["scheduler_pid"]:
         alive = progress["scheduler_alive"]
         lines.append("  scheduler    pid {} on {} — {}".format(
@@ -3038,6 +3302,10 @@ def _run_resume(args: argparse.Namespace) -> int:
         args.run_id = args.selector
     try:
         return _execute_run(args, resuming=True)
+    except _RunRefused as exc:
+        return exc.emit()
+    except launcher.HarnessQuiescenceError as exc:
+        return _quiescence_refusal(exc)
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RUN_CONFIGURATION_REQUIRED", str(exc))
     except _PlanReceiptVerificationError as exc:
@@ -3045,11 +3313,9 @@ def _run_resume(args: argparse.Namespace) -> int:
     except (finalization.ReceiptInvalid, finalization.SignatureMissing,
             finalization.SignatureInvalid) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError,
-            lc.LifecycleError) as exc:
-        return _refusal(type(exc).__name__.upper(), str(exc))
     except Exception as exc:
-        return _refusal("RUN_EXECUTION_FAILED", str(exc))
+        return _refusal("RUN_EXECUTION_FAILED",
+                        "{0}: {1}".format(type(exc).__name__, exc))
 
 
 def _escape(args: argparse.Namespace) -> int:
@@ -4507,6 +4773,25 @@ def _workspace_internal_error(exc: Exception) -> int:
     return 3
 
 
+def _internal_error(exc: BaseException) -> int:
+    """`main`'s last-chance net, for every verb that is not `workspace`.
+
+    The workspace branch has said `INTERNAL_ERROR` here since it was written;
+    the branch beside it printed `type(exc).__name__.upper()`, so the same
+    condition reached an operator as `SQLITE3.DATABASEERROR`, `OSERROR` or
+    `VALUEERROR` depending on which library raised. That is the same defect the
+    run path carried (`_RunRefused`): a class name is an implementation detail
+    and an `outcome` is a vocabulary. The class name keeps its diagnostic value
+    in `detail`.
+
+    Exit 2 rather than 3 is preserved: 3 is a refusal Maestro decided on, 2 is
+    an error it did not, and collapsing the two would lose the distinction.
+    """
+    print(json.dumps({"detail": "{0}: {1}".format(type(exc).__name__, exc),
+                      "outcome": "MAESTRO_INTERNAL_ERROR"}, sort_keys=True))
+    return 2
+
+
 def _workspace_error_code(exc: BaseException) -> str:
     for error_type, code in _WORKSPACE_ERROR_CODES:
         if isinstance(exc, error_type):
@@ -4648,6 +4933,17 @@ def build_parser() -> argparse.ArgumentParser:
     listing = plan_sub.add_parser("list")
     _add_plan_receipt_access(listing)
     listing.set_defaults(handler=_plan_list)
+    set_aside = plan_sub.add_parser("set-aside")
+    set_aside.add_argument("digest")
+    set_aside.add_argument("--invoked-by", required=True)
+    set_aside.add_argument("--reason", required=True)
+    _add_plan_receipt_access(set_aside)
+    set_aside.add_argument("--signing-seed")
+    set_aside.set_defaults(handler=_plan_set_aside)
+    set_aside_log = plan_sub.add_parser("set-aside-log")
+    set_aside_log.add_argument("digest")
+    _add_plan_receipt_access(set_aside_log)
+    set_aside_log.set_defaults(handler=_plan_set_aside_log)
 
     # One verb from a source document to shipped, runnable plans. It prints the
     # `run start` commands and stops; it never starts one.
@@ -4808,16 +5104,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "workspace":
             return _workspace_refusal(_workspace_error_code(exc), str(exc))
         if isinstance(exc, (lc.LifecycleError, OSError, ValueError)):
-            print(json.dumps({"outcome": type(exc).__name__.upper(),
-                              "detail": str(exc)}, sort_keys=True))
-            return 2
+            return _internal_error(exc)
         raise
     except (lc.LifecycleError, OSError, ValueError, sqlite3.Error) as exc:
         if args.command == "workspace":
             return _workspace_internal_error(exc)
-        print(json.dumps({"outcome": type(exc).__name__.upper(),
-                          "detail": str(exc)}, sort_keys=True))
-        return 2
+        return _internal_error(exc)
     except Exception as exc:
         if args.command == "workspace":
             return _workspace_internal_error(exc)

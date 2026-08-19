@@ -77,6 +77,20 @@ def cell(check_id, object_id, status, severity, message="", canary=None):
                            canary=canary)
 
 
+def graded(check_id, object_id, status, severity, message="", canary=None,
+           grade=None, rationale="because"):
+    """A derived cell with A9's second axis on it.
+
+    `rationale` is defaulted here and nowhere in production: the invariant
+    under test is about a *missing* reason, so every case that is not about
+    that one must supply one, and repeating the same string in fifteen
+    constructors would bury the cases that deliberately omit it.
+    """
+    return cr.GradedCell(check_id=check_id, object_id=object_id, status=status,
+                         severity=severity, grade=grade, message=message,
+                         rationale=rationale, canary=canary)
+
+
 def a_node(node_id="build"):
     return st.PlanNode(node_id=node_id, kind=st.NodeKind.AGENT, depth=0,
                        outputs=(f"{node_id}.py",),
@@ -94,68 +108,104 @@ class LocatedFindingsTests(unittest.TestCase):
     invariant, because a field added later is optional forever. So the
     detector is tested against planted violations here, before any receipt for
     a subject can exist.
+
+    Since §3.6 A9's grading landed, "blocking" alone no longer decides: a
+    finding rejects when its check is BLOCKING **and** the reviewer graded it
+    at or above the installation's threshold. The invariant is otherwise
+    unchanged, and `tests/test_graded_findings.py` owns the grading itself.
     """
 
+    def _verdict(self, verdict, *cells, reject_at=cr.FindingGrade.ERROR):
+        return cr.GradedVerdict(verdict=verdict, cells=cells,
+                                reject_at=reject_at)
+
     def _fail_with_finding(self):
-        return fin.DerivedVerdict(
-            verdict=fin.Verdict.FAIL,
-            cells=(cell("diff.introduces_no_obvious_defect", "diff:abc",
-                        fin.CellStatus.FINDING, fin.Severity.BLOCKING,
-                        "inverted condition at line 42"),))
+        return self._verdict(
+            fin.Verdict.FAIL,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.FINDING, fin.Severity.BLOCKING,
+                   "inverted condition at line 42",
+                   grade=cr.FindingGrade.ERROR))
 
     def test_acquits_a_fail_that_carries_a_located_finding(self):
         cr.require_located_findings(self._fail_with_finding())
 
     def test_acquits_a_clean_pass(self):
-        cr.require_located_findings(fin.DerivedVerdict(
-            verdict=fin.Verdict.PASS,
-            cells=(cell("diff.introduces_no_obvious_defect", "diff:abc",
-                        fin.CellStatus.CLEAR, fin.Severity.BLOCKING),)))
+        cr.require_located_findings(self._verdict(
+            fin.Verdict.PASS,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.CLEAR, fin.Severity.BLOCKING)))
 
     def test_convicts_a_contentless_fail(self):
         """The exact B8 shape: a status word with nothing behind it."""
-        planted = fin.DerivedVerdict(
-            verdict=fin.Verdict.FAIL,
-            cells=(cell("diff.introduces_no_obvious_defect", "diff:abc",
-                        fin.CellStatus.CLEAR, fin.Severity.BLOCKING),))
+        planted = self._verdict(
+            fin.Verdict.FAIL,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.CLEAR, fin.Severity.BLOCKING))
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(planted)
 
     def test_convicts_a_finding_with_no_message(self):
         """A finding that names no place is not located, so it is not a
         finding — it cannot be handed to a builder as retry guidance."""
-        planted = fin.DerivedVerdict(
-            verdict=fin.Verdict.FAIL,
-            cells=(cell("diff.introduces_no_obvious_defect", "diff:abc",
-                        fin.CellStatus.FINDING, fin.Severity.BLOCKING, "   "),))
+        planted = self._verdict(
+            fin.Verdict.FAIL,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.FINDING, fin.Severity.BLOCKING, "   ",
+                   grade=cr.FindingGrade.ERROR))
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(planted)
 
-    def test_convicts_a_pass_that_carries_a_blocking_finding(self):
+    def test_convicts_a_rejecting_finding_with_no_reason_for_its_grade(self):
+        """A9's addition to the same invariant: the grade decides the merge, so
+        a grade nobody justified is the contentless verdict one level down."""
+        planted = self._verdict(
+            fin.Verdict.FAIL,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.FINDING, fin.Severity.BLOCKING,
+                   "inverted condition at line 42",
+                   grade=cr.FindingGrade.ERROR, rationale="  "))
+        with self.assertRaises(cr.VerdictNotLocated):
+            cr.require_located_findings(planted)
+
+    def test_convicts_a_pass_that_carries_a_rejecting_finding(self):
         """The inverted shape, which is the one that would silently merge."""
-        planted = fin.DerivedVerdict(
-            verdict=fin.Verdict.PASS,
-            cells=(cell("diff.introduces_no_obvious_defect", "diff:abc",
-                        fin.CellStatus.FINDING, fin.Severity.BLOCKING,
-                        "a real problem"),))
+        planted = self._verdict(
+            fin.Verdict.PASS,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.FINDING, fin.Severity.BLOCKING,
+                   "a real problem", grade=cr.FindingGrade.ERROR))
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(planted)
 
     def test_an_advisory_finding_does_not_force_a_fail(self):
-        cr.require_located_findings(fin.DerivedVerdict(
-            verdict=fin.Verdict.PASS,
-            cells=(cell("diff.is_coherent_with_its_surroundings", "diff:abc",
-                        fin.CellStatus.FINDING, fin.Severity.ADVISORY,
-                        "naming drifts from the module"),)))
+        cr.require_located_findings(self._verdict(
+            fin.Verdict.PASS,
+            graded("diff.is_coherent_with_its_surroundings", "diff:abc",
+                   fin.CellStatus.FINDING, fin.Severity.ADVISORY,
+                   "naming drifts from the module",
+                   grade=cr.FindingGrade.WARNING)))
+
+    def test_a_sub_threshold_blocking_finding_does_not_force_a_fail(self):
+        """A9, as an invariant rather than as a verdict: the whole point of
+        the grade is that a true finding on a blocking check can be recorded
+        instead of ending the lane."""
+        cr.require_located_findings(self._verdict(
+            fin.Verdict.PASS,
+            graded("diff.introduces_no_obvious_defect", "diff:abc",
+                   fin.CellStatus.FINDING, fin.Severity.BLOCKING,
+                   "a pre-existing robustness gap",
+                   grade=cr.FindingGrade.WARNING)))
 
     def test_the_known_bad_canary_never_forces_a_fail(self):
         """The known-bad control is answered `finding` by construction, so
         counting it would fail every diff ever reviewed."""
-        cr.require_located_findings(fin.DerivedVerdict(
-            verdict=fin.Verdict.PASS,
-            cells=(cell(fin.CANARY_CHECK_ID, fin.CANARY_KNOWN_BAD_OBJECT,
-                        fin.CellStatus.FINDING, fin.Severity.ADVISORY,
-                        "control", canary=fin.CanaryKind.KNOWN_BAD),)))
+        cr.require_located_findings(self._verdict(
+            fin.Verdict.PASS,
+            graded(fin.CANARY_CHECK_ID, fin.CANARY_KNOWN_BAD_OBJECT,
+                   fin.CellStatus.FINDING, fin.Severity.ADVISORY, "control",
+                   canary=fin.CanaryKind.KNOWN_BAD,
+                   grade=cr.FindingGrade.ERROR)))
 
 
 # ── B12: no actor reviews its own output ────────────────────────────────────
@@ -586,18 +636,23 @@ class FakeReview:
                                   base_sha=base_sha, output_sha=output_sha,
                                   rubric_version=cr.CODE_RUBRIC.version)
         findings = () if passed else (
-            fin.DerivedCell(
-                check_id="diff.gate_is_passed_on_the_merits",
-                object_id=f"diff:{output_sha}",
-                status=fin.CellStatus.FINDING, severity=fin.Severity.BLOCKING,
-                message="the gate passes because the value is hardcoded"),)
+            graded("diff.gate_is_passed_on_the_merits",
+                   f"diff:{output_sha}", fin.CellStatus.FINDING,
+                   fin.Severity.BLOCKING,
+                   "the gate passes because the value is hardcoded",
+                   grade=cr.FindingGrade.ERROR,
+                   rationale="the behaviour the gate witnesses is absent"),)
         return cr.ReviewOutcome(
             subject_digest=digest,
             verdict=fin.Verdict.PASS if passed else fin.Verdict.FAIL,
             receipt=fin.Receipt(
                 plan_digest=digest, rubric_version=cr.CODE_RUBRIC.version,
                 verdict=fin.Verdict.PASS if passed else fin.Verdict.FAIL,
-                cells=findings,
+                # The receipt's frozen schema carries severity and no grade,
+                # so the two shapes are built separately rather than one being
+                # passed where the other belongs.
+                cells=tuple(cell(c.check_id, c.object_id, c.status, c.severity,
+                                 c.message) for c in findings),
                 reviewer=fin.ReviewerIdentity(route="omp", model="m",
                                               session_id="pane"),
                 created_at_epoch=1.0),
@@ -860,7 +915,8 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 reviewer_effort="high", reviewer_profile="openai-performance",
                 reviewer_vendor="openai", execution_vendor="anthropic",
                 review_timeout_s=60.0, reviewer_turn_timeout_s=30.0,
-                reviewer_poll_interval_s=0.1)
+                reviewer_poll_interval_s=0.1,
+                review_reject_grade=cr.DEFAULT_REJECT_GRADE)
 
             captured = {}
 

@@ -33,6 +33,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import maestro
+from adw_modules import code_review as cr
 from adw_modules import retry_policy as rp
 from adw_modules import scheduler_types as st
 
@@ -236,6 +237,150 @@ class TheRunBranchWritesEveryExecutionKeyTest(unittest.TestCase):
         self.assertEqual(
             (config.environmental_retries, config.launcher_retries,
              config.credential_retries), (5, 4, 1))
+
+
+class TheRejectGradeReachesTheReviewerTest(unittest.TestCase):
+    """`execution.review_reject_grade`, end to end — and why its destination
+    is not `SchedulerConfig`.
+
+    Every other `execution:` key this file drives continues into
+    `SchedulerConfig`, and this one deliberately stops at `args`. That is not
+    an oversight and it is not a quieter version of the defect above.
+
+    `SchedulerConfig` is the **scheduler's** contract: the fields it reads to
+    decide readiness, concurrency, timeouts and retries. The reject threshold
+    is read by `_code_review_runner`'s closure, which the scheduler receives as
+    a dependency and never inspects. Carrying it through `SchedulerConfig`
+    would add a field with **zero readers**, and §3.6 B15 states why that is
+    worse than leaving it out rather than merely redundant: a field nothing
+    reads looks checked and is not — which is exactly how Strav shipped ten
+    quality gates whose fields survived on a model with no consumers.
+
+    So the asymmetry is correct, and the coverage is not optional because of
+    it. `TheProjectionIsTotalTest` below guards the class by enumerating
+    `SchedulerConfig`'s fields, and therefore structurally cannot see a key
+    that is not one. Until this class, `maestro.py`'s assignment and
+    `_code_review_runner`'s read were joined by nothing under test: typed at
+    both ends, unasserted in the middle, which is the shape this file exists to
+    convict.
+    """
+
+    def _configured_args(self, execution_extra: dict, root: Path):
+        repo, _path = _installation(root, execution_extra)
+        (repo / "plans" / "demo").mkdir(parents=True)
+        (repo / "plans" / "demo" / "maestro-plan.v1").write_text(
+            "{}", encoding="utf-8")
+        args = argparse.Namespace(command="run", run_command="start",
+                                  plan_name="demo")
+        environment = {
+            "MAESTRO_TEST_VERIFY_KEY": "11" * 32,
+            "MAESTRO_TEST_SIGNING_SEED": "22" * 32,
+            "MAESTRO_TEST_ROUTE_VERIFY_KEY": "33" * 32,
+        }
+        cwd = os.getcwd()
+        os.chdir(str(repo))
+        try:
+            with mock.patch.dict(os.environ, environment):
+                maestro._apply_repository_config(args, ())
+        finally:
+            os.chdir(cwd)
+        return args
+
+    def test_the_configured_grade_survives_the_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = _load({"review_reject_grade": "warning"},
+                           Path(tmp).resolve())
+        self.assertIs(cr.FindingGrade.WARNING,
+                      loaded["execution"]["review_reject_grade"])
+
+    def test_an_absent_key_takes_the_declared_default(self):
+        """The default is the module's constant rather than a literal repeated
+        at the loader, so there is one place the answer can be wrong."""
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = _load({}, Path(tmp).resolve())
+        self.assertIs(cr.DEFAULT_REJECT_GRADE,
+                      loaded["execution"]["review_reject_grade"])
+
+    def test_an_unknown_grade_is_refused_at_load(self):
+        """§6.2: configuration is validated where it is read. A threshold
+        nobody can name must not reach a run at all — and `blocking` is the
+        plausible wrong answer, because it is a `Severity` and severities are
+        stamped by code, never chosen by an installation (§6.5)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(
+                    maestro._MaestroConfigurationError) as caught:
+                _load({"review_reject_grade": "blocking"}, Path(tmp).resolve())
+        self.assertIn("execution.review_reject_grade", str(caught.exception))
+
+    def test_the_configured_grade_lands_on_the_run_arguments(self):
+        """The middle step, driven through the real `_apply_repository_config`
+        exactly as the budgets above are."""
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._configured_args({"review_reject_grade": "note"},
+                                         Path(tmp).resolve())
+        self.assertIs(cr.FindingGrade.NOTE, args.review_reject_grade)
+
+    def test_the_default_lands_there_too(self):
+        """A run whose configuration names nothing still carries an explicit
+        threshold, rather than one inferred at the review site from an absent
+        attribute."""
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self._configured_args({}, Path(tmp).resolve())
+        self.assertIs(cr.DEFAULT_REJECT_GRADE, args.review_reject_grade)
+
+    def test_the_review_stage_reads_it_from_those_arguments(self):
+        """The last step, read out of `_code_review_runner`'s own source.
+
+        `TheProjectionIsTotalTest` parses `_run_configuration` rather than
+        calling it for the same reason this parses rather than calls: the
+        defect is a *name* that stops being passed, and a test that supplied
+        the argument itself would prove nothing about the call site. Driving
+        the closure would need a real repository, a real diff, a resolved model
+        catalog and a launcher, none of which is this file's subject.
+        """
+        source = (ADWS / "maestro.py").read_text(encoding="utf-8")
+        runner = next(
+            node for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_code_review_runner")
+        calls = [
+            node for node in ast.walk(runner)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "review_attempt"]
+        self.assertEqual(1, len(calls), "expected one review dispatch")
+        passed = {kw.arg: kw.value for kw in calls[0].keywords}
+        self.assertIn("reject_at", passed,
+                      "the review dispatch names no threshold, so the "
+                      "installation's configuration decides nothing")
+        read = passed["reject_at"]
+        self.assertIsInstance(read, ast.Attribute)
+        self.assertEqual("review_reject_grade", read.attr)
+        self.assertIsInstance(read.value, ast.Name)
+        self.assertEqual("args", read.value.id)
+
+    def test_the_detector_convicts_a_dispatch_that_dropped_it(self):
+        """§13.4's pair: the check above must return non-zero on a planted
+        violation, or it is a grep nobody has shown to work."""
+        planted = ast.parse(
+            "def _code_review_runner(args, runner):\n"
+            "    def review(a, b, c, d, e):\n"
+            "        return code_review.review_attempt(store=None)\n")
+        runner = next(node for node in ast.walk(planted)
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == "_code_review_runner")
+        calls = [node for node in ast.walk(runner)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "review_attempt"]
+        self.assertNotIn("reject_at", {kw.arg for kw in calls[0].keywords})
+
+    def test_the_key_is_deliberately_not_a_scheduler_setting(self):
+        """The decision, pinned. Adding it to `SchedulerConfig` gives the
+        scheduler a field it never reads, which §3.6 B15 calls a build failure;
+        this fails first and points at the comment that says why."""
+        fields = {field.name for field in dataclasses.fields(st.SchedulerConfig)}
+        self.assertNotIn("review_reject_grade", fields)
 
 
 class TheProjectionIsTotalTest(unittest.TestCase):

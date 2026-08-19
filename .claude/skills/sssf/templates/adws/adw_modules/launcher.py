@@ -106,6 +106,33 @@ class LaunchRefusal(Enum):
     #: and the refusal states the reap -- and it is deterministic, because the
     #: route is a property of the spec and identical on every attempt.
     UNSUPPORTED_ROUTE = ("UNSUPPORTED_ROUTE", None, True)
+    #: herdr could not say which pane this launcher splits from. Raised
+    #: before any split, so no pane exists. **Non**-deterministic: the answer
+    #: is herdr's to give and the next attempt may get it, and the launcher
+    #: does not cache the failure, so a retry genuinely re-asks. This member
+    #: replaced a silent fall back to the `--current` selector: a selector is
+    #: mutable focus state, so splitting it lands the pane in whichever
+    #: workspace happens to hold focus — the scatter across w13F..w13K — and
+    #: §1.2 forbids keying a decision on ambient mutable state. Refusing is
+    #: honest; splitting into an unknown workspace is not.
+    SPLIT_PARENT_UNRESOLVED = ("SPLIT_PARENT_UNRESOLVED", False, False)
+    #: herdr refused to create the workspace this run's panes belong to.
+    #: Raised before any pane exists. **Non**-deterministic and not cached,
+    #: for the same reason `SPLIT_PARENT_UNRESOLVED` is not: the answer is
+    #: herdr's to give and the next attempt genuinely re-asks. Creating the
+    #: workspace rather than reading whichever one holds focus is what makes
+    #: a run's placement a property of the run instead of a property of where
+    #: the operator's cursor happened to be (§1.2).
+    WORKSPACE_UNRESOLVED = ("WORKSPACE_UNRESOLVED", False, False)
+    #: herdr refused to create the tab this node's panes belong to. Raised
+    #: before any pane of this launch exists; same non-deterministic,
+    #: uncached shape as the workspace refusal above.
+    TAB_UNRESOLVED = ("TAB_UNRESOLVED", False, False)
+    #: The split landed outside the workspace this run is bound to. The pane
+    #: exists by the time that is known, so it is reaped and the refusal
+    #: states the reap. Non-deterministic: a split of a fixed parent lands
+    #: beside it, so a drifting child is a fact about that split.
+    WORKSPACE_DRIFT = ("WORKSPACE_DRIFT", None, False)
     #: B13: the prompt file will not fit the window the spec declared. Raised
     #: before any herdr call, so no pane exists. Deterministic: the prompt's
     #: size and the model's window are both properties of the spec, identical
@@ -274,6 +301,85 @@ def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
     return tuple(flags)
 
 
+#: The prefix every lane node id carries in an authored plan
+#: (`lane-p2-s3-inventory`). Dropping it is the whole of the display
+#: transform: what is left is already `<depth>-<short-node-name>`.
+LANE_ID_PREFIX = "lane-p"
+
+
+def display_name(node_id: str) -> str:
+    """`lane-p2-s3-inventory` -> `2-s3-inventory`; anything else unchanged.
+
+    Herdr's sidebar is the operator's index into a running factory, and it is
+    one narrow column. `lane-p` is on every lane of every plan, so it
+    distinguishes nothing while costing six characters of the single line an
+    operator reads to find the node they are looking for. What remains is the
+    depth and the short name, which is what the entry is for.
+
+    A pure function of a typed field, applied once at launch and stored as the
+    item's label -- §9.7's rule that the human-visible label is built at
+    launch rather than derived at the display edge, which is the pattern that
+    needed five separate fixes the other way round.
+    """
+    text = str(node_id)
+    if text.startswith(LANE_ID_PREFIX):
+        return text[len(LANE_ID_PREFIX):]
+    return text
+
+
+#: The hard ceiling on one tab's grid, in both dimensions. Three columns of a
+#: 170-column terminal are 57 columns each, which is still a pane an operator
+#: can read; a fourth is not. Rows are capped with it so a tab degrades in
+#: both dimensions together rather than in one of them without limit.
+GRID_MAX = 3
+
+
+def grid_for(pane_count: int) -> Tuple[int, int]:
+    """`(rows, cols)` for `pane_count` panes in one tab, capped at 3x3.
+
+    Rows first, columns from the rows, so the sequence widens before it
+    stacks: 2 panes are two columns side by side, 3 are three columns, and
+    only at 4 does a second row appear.
+
+        1 -> 1x1    4 -> 2x2    7 -> 3x3
+        2 -> 1x2    5 -> 2x3    8 -> 3x3
+        3 -> 1x3    6 -> 2x3    9 -> 3x3
+
+    Beyond nine the grid does not grow: `split_plan` keeps filling columns
+    downward, so a tenth pane makes one column four cells tall rather than
+    making a fourth column nobody could read. A tab is meant to hold fewer
+    than six panes; nine is the ceiling, not the target.
+    """
+    count = max(1, int(pane_count))
+    rows = min(GRID_MAX, -(-count // GRID_MAX))
+    cols = min(GRID_MAX, -(-count // rows))
+    return rows, cols
+
+
+def split_plan(index: int, cols: int) -> Tuple[int, str]:
+    """Which existing pane the `index`-th pane of a tab splits, and how.
+
+    A grid is reachable by binary splits alone, with no pane ever moved, if
+    each new pane names the right parent: the first row is built left to
+    right by splitting the previous pane `right`, and every later pane splits
+    the pane exactly one row above it -- `index - cols` -- `down`. Herdr
+    rebalances the ratios itself, so an even grid needs no `--ratio`.
+
+    That is what makes an up-front grid compatible with dispatch arriving one
+    node at a time: the geometry is a pure function of the pane's ordinal and
+    the tab's column count, so pane *k* can be placed correctly without
+    knowing whether a pane *k+1* will ever exist. Only `cols` needs deciding
+    in advance, and `LaunchSpec.pane_group_size` is where the caller declares
+    it.
+    """
+    if index < 1:
+        raise ValueError("GRID_INDEX_HAS_NO_PARENT")
+    width = max(1, int(cols))
+    if index < width:
+        return index - 1, "right"
+    return index - width, "down"
+
+
 @dataclass(frozen=True)
 class LaunchSpec:
     correlation_token: str
@@ -302,6 +408,24 @@ class LaunchSpec:
     #: catalog means importing `agent_pi`, which `enforcement.py`'s
     #: `base-execution-import` forbids every module in this package to do.
     context_window_tokens: Optional[int] = None
+    #: The tab this pane belongs to, named by the node it serves. One tab per
+    #: node is what puts a node's builder and its reviewer side by side and
+    #: keeps an unrelated node out of the same rectangle, which is the whole
+    #: of the operator's complaint that a flat tab of scattered panes cannot
+    #: be read. Empty names this launcher's default group -- the lanes that
+    #: are not a node's, such as the plan author.
+    pane_group: str = ""
+    #: This agent's part in that node: `builder`, `reviewer`. Display only,
+    #: and part of the pane's stored label so a pane says what it is without
+    #: anyone reading its working directory.
+    pane_role: str = ""
+    #: How many agent panes the caller expects this tab to hold. The tab's
+    #: column count is computed from it and then only ever grows, so a
+    #: declared size is what makes the grid exact: a node declaring 2 gets one
+    #: row of two, one declaring 4 gets 2x2. Left at 0 the launcher learns the
+    #: count as panes arrive, which is correct for 1, 2 and 3 panes and merely
+    #: wider than the table for 4 and 5.
+    pane_group_size: int = 0
 
 
 @dataclass(frozen=True)
@@ -940,6 +1064,13 @@ def _wait_for_available_shell(
     a typed `error.code`, and the caller now turns that answer into a typed
     retryable refusal into a fresh pane. Returning at the deadline hands the
     decision to the side that can actually make it.
+
+    That demotion is still right and is deliberately not undone. What it left
+    open is what the caller does with the authority's first `no`, and the
+    answer was "throw the attempt away": see `_start_agent_when_free` below,
+    which re-offers the pane to the server-side check inside a bounded window
+    before the refusal is raised. The wait here stays advisory and cheap; the
+    decision stays with herdr; only the cost of losing the race changes.
     """
     deadline = time.monotonic() + timeout_s
     ready = 0
@@ -956,12 +1087,136 @@ def _wait_for_available_shell(
         time.sleep(0.1)
 
 
+#: How long `agent start` keeps re-offering a pane herdr itself calls busy,
+#: and how often. Finite by construction: at the deadline the refusal is
+#: raised exactly as it was before, so the attempt-level retry still gets its
+#: fresh pane and nothing here can wait or loop without end.
+AGENT_START_BUSY_WINDOW_S = 10.0
+AGENT_START_BUSY_POLL_S = 0.5
+
+
+def _start_agent_when_free(
+        start: Callable[[], dict], window_s: float = AGENT_START_BUSY_WINDOW_S,
+        poll_s: float = AGENT_START_BUSY_POLL_S,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+) -> dict:
+    """Offer the pane to `agent start` until herdr stops calling it busy.
+
+    The gap this closes is a timing accident, not a fault. A freshly split
+    pane can look like a lone interactive zsh in the moment before login hooks
+    (direnv, keychain lookups) spawn their own foreground processes, and
+    `agent start` arriving inside that gap is refused `agent_pane_busy`. On
+    run-2a44d226e75a4be391a14f02b78a6d25 that refusal cost node
+    `lane-p1-freeze-and-run-log` its fourth attempt at zero turns.
+
+    Retrying the *server-side* check rather than re-gating on the client's is
+    deliberate, and `_wait_for_available_shell` above records why the client
+    gate was demoted: a wall clock over a separate RPC cannot prove what it is
+    asked to prove, because the last snapshot is already stale when `agent
+    start` reaches the server. That reasoning still holds, so the advisory
+    wait stays advisory and the decision stays where it can actually be made —
+    herdr's own precondition, which answers with a typed `error.code`. This
+    just stops throwing away an attempt over the first `no` when herdr will
+    say `yes` a second later.
+
+    Only the codes herdr's own vocabulary marks survivable are re-offered
+    (`TRANSIENT_HERDR_ERROR_CODES`, read off the typed field and never matched
+    out of the message, §1.2). Everything else raises on the first refusal,
+    unchanged. Two bounds, and both are needed: the window here spends
+    seconds, and the refusal it eventually raises is retryable, so the
+    attempt-level budget spends launches — into a fresh pane, which is the
+    only remedy left if this pane is durably occupied.
+    """
+    deadline = monotonic() + max(0.0, window_s)
+    while True:
+        try:
+            return start()
+        except HerdrCallError as exc:
+            if (exc.code not in TRANSIENT_HERDR_ERROR_CODES
+                    or monotonic() >= deadline):
+                raise
+            sleep(poll_s)
+            # The poll is spent *inside* the window, not on top of it. Checking
+            # the deadline only before the sleep let the sleep carry the clock
+            # past it and buy one more `agent start` at `deadline + poll_s`, so
+            # the bound described an exit condition rather than the offers it
+            # authorised. Re-checking here makes every offer fall inside the
+            # window; the refusal raised is the same typed, retryable one.
+            if monotonic() >= deadline:
+                raise
+
+
+class _TabLayout:
+    """One tab's grid: the panes it holds, in slot order, and its width.
+
+    Not a dataclass with a lock bolted on afterwards but a small mutable
+    record that owns its own lock, because the reservation and the split have
+    to be one atomic step. Two launches into the same tab must take two
+    distinct slots *and* see the parent of the later slot already created --
+    reserving under a lock and splitting outside it would let pane 2 name a
+    pane 1 that does not exist yet. Splits are one CLI call, so holding the
+    lock across it serialises one tab and nothing else; two tabs still open
+    their panes concurrently.
+    """
+
+    __slots__ = ("tab_id", "panes", "claimed", "cols", "lock")
+
+    def __init__(self, tab_id: str, panes: List[Optional[str]],
+                 claimed: int) -> None:
+        self.tab_id = tab_id
+        #: Grid slot -> pane id, positional. A reaped pane leaves `None`
+        #: behind rather than shifting its neighbours, because the slots after
+        #: it name real panes whose geometry did not change.
+        self.panes: List[Optional[str]] = list(panes)
+        #: How many slots have been handed to an agent. Starts at 0 for a tab
+        #: this launcher created -- its root pane is an empty shell the first
+        #: agent takes over -- and at 1 for the legacy seed, which is the
+        #: *caller's own* pane and must never be handed to anything.
+        self.claimed = claimed
+        self.cols = 1
+        self.lock = threading.Lock()
+
+    def nearest_live(self, index: int) -> Optional[str]:
+        """The nearest surviving pane to `index`, searching back then forward.
+
+        The grid's chosen parent may have been reaped since it was created --
+        a node's builder pane is closed when its attempt settles, and its
+        reviewer arrives afterwards. Falling back to the nearest live pane
+        keeps the split inside this node's tab, which is the guarantee that
+        matters, and costs only the exactness of one cell. Backwards first
+        because an earlier slot is the parent the grid would have chosen next;
+        forwards after, because refusing a launch while a live pane sits one
+        slot later would be a refusal about bookkeeping rather than about
+        herdr.
+        """
+        last = len(self.panes) - 1
+        for slot in range(min(index, last), -1, -1):
+            pane = self.panes[slot]
+            if pane:
+                return pane
+        for slot in range(min(index, last) + 1, last + 1):
+            pane = self.panes[slot]
+            if pane:
+                return pane
+        return None
+
+    def forget(self, pane_id: str) -> bool:
+        for slot, pane in enumerate(self.panes):
+            if pane == pane_id:
+                self.panes[slot] = None
+                return True
+        return False
+
+    def empty(self) -> bool:
+        return not any(self.panes)
 
 
 class HerdrLauncher:
     def __init__(self, *, herdr_path: Path, omp_path: Path, claude_path: Path,
                  admitted_routes: AdmittedRouteSet,
-                 provision_argv: Sequence[str] = ()) -> None:
+                 provision_argv: Sequence[str] = (),
+                 workspace_label: str = "") -> None:
         if not isinstance(admitted_routes, AdmittedRouteSet):
             raise TypeError("VERIFIED_ADMITTED_ROUTES_REQUIRED")
         self.herdr_path = Path(herdr_path)
@@ -969,14 +1224,47 @@ class HerdrLauncher:
         self.claude_path = Path(claude_path)
         self.admitted_routes = admitted_routes
         self.provision_argv = tuple(provision_argv)
+        #: The label of the herdr workspace this launcher creates for its run,
+        #: named for the plan it is running. Naming it is what makes the
+        #: workspace *this run's*: every pane the run opens lands in it, and no
+        #: pane of an unrelated run does. Empty keeps the pre-workspace
+        #: behaviour -- panes split from the caller's own once-resolved pane,
+        #: with no tabs -- which is what the standalone reviewer and plan
+        #: author verbs get, since neither of those is a run.
+        self.workspace_label = str(workspace_label or "")
+        #: How long `agent start` re-offers a pane herdr calls busy. An
+        #: attribute rather than a constant read directly so a test can drive
+        #: the refusal path without spending the production window; nothing in
+        #: the runtime sets it.
+        self.agent_start_busy_window_s = AGENT_START_BUSY_WINDOW_S
         self._handles_lock = threading.RLock()
         self._handles: Dict[str, LaunchHandle] = {}
         self._tailers: Dict[str, TranscriptTailer] = {}
         self._proven_absent: Dict[str, LaunchHandle] = {}
         #: The pane every split is taken from, resolved once from herdr's
-        #: `--current` selector. `None` until first asked; `""` records that
-        #: herdr could not answer, so the selector is used unchanged.
+        #: `--current` selector and then never re-read. `None` until the first
+        #: launch asks. A failure to resolve is **not** recorded here: it is a
+        #: typed refusal (`SPLIT_PARENT_UNRESOLVED`) and the next launch
+        #: re-asks, because the alternative — falling back to the selector —
+        #: is the mutable read this field exists to remove.
         self._split_parent_id: Optional[str] = None
+        #: The workspace every pane of this run belongs to, taken from the
+        #: split parent's own id the moment it is resolved. A split of a fixed
+        #: parent lands beside that parent, so a child reporting a different
+        #: workspace is a split that escaped the run's workspace and is
+        #: refused rather than adopted.
+        self._workspace_id: str = ""
+        #: `pane_group` -> the tab that group's panes live in. One entry per
+        #: node, created on that node's first launch and reused by every later
+        #: agent of the same node, so a builder and its reviewer share a
+        #: rectangle. Guarded by `_handles_lock`; each tab's own lock guards
+        #: the slots inside it.
+        self._tabs: Dict[str, _TabLayout] = {}
+        #: The tab `workspace create` opens along with the workspace. It is an
+        #: empty shell nobody asked for, so it is closed once a real tab
+        #: exists to keep it from being the workspace's last tab -- a close
+        #: herdr refuses, correctly (§3.5 F2).
+        self._seed_tab_id: str = ""
 
     def _herdr(self, *args: str, env: Optional[Mapping[str, str]] = None,
                timeout: float = 30.0) -> dict:
@@ -1007,36 +1295,247 @@ class HerdrLauncher:
             raise RuntimeError("PROTOCOL_INVALID_RESPONSE")
         return payload
 
-    def _split_parent(self, environment: Mapping[str, str]) -> Tuple[str, ...]:
-        """The `pane split` argument naming which pane to split, resolved once.
+    def _split_parent(self, environment: Mapping[str, str]) -> str:
+        """The pane id every split of this run is taken from, resolved once.
 
         `--current` is not an identifier, it is a server-side selector over
         mutable state: whichever pane holds focus at the instant the split
         arrives. Two lanes splitting concurrently read that selector at two
         different instants, so the second can split a pane the first has just
         created — and did, on 2026-08-18, when one lane's agent landed in a
-        pane the sibling launch had opened 30ms earlier and herdr refused it
-        with `agent_pane_busy`. Resolving the selector once, to the pane id it
-        named at construction time, makes every subsequent split name a fixed
-        pane and removes the shared mutable read from the race entirely.
+        pane the sibling launch had opened 30ms earlier. Resolving the
+        selector once, to the pane id it named the first time it was asked,
+        makes every subsequent split name a fixed pane and removes the shared
+        mutable read from the race entirely.
 
         Cached deliberately: re-asking would reintroduce the moving target.
-        If herdr cannot answer, the selector is used unchanged rather than
-        guessed at — a degraded split is still a split, and inventing a pane
-        id would be worse than the race.
+
+        **An unanswerable selector is a refusal, not a fallback.** Using
+        `--current` unchanged used to be the answer here, and it was wrong
+        twice over: it reinstated exactly the race the caching removes, and
+        because focus can sit in any workspace, each such split landed
+        wherever focus happened to be — the run whose agents scattered across
+        w13F, w13G, w13H, w13J and w13K while its first pane was in w13A. A
+        lifecycle decision keyed on ambient mutable state is what §1.2
+        forbids, so this raises `SPLIT_PARENT_UNRESOLVED` and the failure is
+        not cached: the member is non-deterministic, the launcher budget is
+        spent, and the next attempt genuinely re-asks herdr.
+
+        Resolved on first use rather than in `__init__` because a constructor
+        that calls herdr cannot be built offline at all, and a launcher that
+        cannot exist while herdr is briefly unreachable is a worse failure
+        than a refused launch. It is still resolved once per launcher.
         """
         with self._handles_lock:
             if self._split_parent_id is None:
                 try:
                     payload = self._herdr("pane", "current", env=environment)
-                except BaseException:
-                    payload = {}
+                except BaseException as exc:
+                    raise LaunchRefused(
+                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED,
+                        "{0}: {1}".format(type(exc).__name__, exc)) from exc
                 pane = _extract(payload, "pane")
                 pane_id = (pane.get("pane_id")
                            if isinstance(pane, dict) else None)
-                self._split_parent_id = str(pane_id) if pane_id else ""
-            resolved = self._split_parent_id
-        return (resolved,) if resolved else ("--current",)
+                if not pane_id:
+                    raise LaunchRefused(
+                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED, "NO_PANE_ID")
+                self._split_parent_id = str(pane_id)
+                self._workspace_id = workspace_of(self._split_parent_id)
+            return self._split_parent_id
+
+    def _run_workspace(self, environment: Mapping[str, str]) -> str:
+        """The herdr workspace every pane of this run lands in, created once.
+
+        Creating a workspace rather than adopting one is the fix for the
+        complaint that a run's panes land wherever focus happens to be: a
+        workspace this launcher made is one no other run holds, so "the run's
+        panes" and "the panes in this workspace" are the same set and the
+        operator has one place to look. It is also strictly more determinate
+        than the selector read it replaces -- there is no ambient state to
+        read at all.
+
+        Created under `_handles_lock` so concurrent first launches make one
+        workspace between them, exactly as `_split_parent` resolves one
+        parent. A refusal is typed and **not** cached: the next launch
+        genuinely re-asks herdr.
+        """
+        with self._handles_lock:
+            if self._workspace_id:
+                return self._workspace_id
+            try:
+                payload = self._herdr("workspace", "create",
+                                      "--label", self.workspace_label,
+                                      "--no-focus", env=environment)
+            except BaseException as exc:
+                raise LaunchRefused(
+                    LaunchRefusal.WORKSPACE_UNRESOLVED,
+                    "{0}: {1}".format(type(exc).__name__, exc)) from exc
+            workspace = _extract(payload, "workspace")
+            workspace_id = (workspace.get("workspace_id")
+                            if isinstance(workspace, dict) else None)
+            if not workspace_id:
+                raise LaunchRefused(LaunchRefusal.WORKSPACE_UNRESOLVED,
+                                    "NO_WORKSPACE_ID")
+            self._workspace_id = str(workspace_id)
+            seed = _extract(payload, "tab")
+            if isinstance(seed, dict) and seed.get("tab_id"):
+                self._seed_tab_id = str(seed["tab_id"])
+            return self._workspace_id
+
+    def _close_seed_tab(self, environment: Mapping[str, str]) -> None:
+        """Drop the shell tab `workspace create` opens, once a real one exists.
+
+        Best-effort and display-only: a workspace carrying one extra empty tab
+        is untidy, not incorrect, so a refused close is dropped rather than
+        turned into a launch refusal. Called only after another tab exists,
+        because herdr refuses to close a workspace's last tab and is right to.
+        """
+        tab_id, self._seed_tab_id = self._seed_tab_id, ""
+        if not tab_id:
+            return
+        try:
+            self._herdr("tab", "close", tab_id, env=environment)
+        except BaseException:
+            return
+
+    def _tab_for(self, spec: LaunchSpec, worktree: Path,
+                 env_flags: Sequence[str],
+                 environment: Mapping[str, str]) -> _TabLayout:
+        """The tab this node's panes live in, created on its first launch.
+
+        One tab per node, labelled with the node's own display name, is what
+        S2 buys: the sidebar becomes an index of the nodes in flight instead
+        of a flat list of panes identifiable only by working directory, and a
+        node's builder and reviewer are neighbours rather than strangers.
+
+        The tab is created with the launch's `--cwd` and `--env`, so its root
+        pane is a usable shell for the first agent rather than a spare cell.
+
+        Held under `_handles_lock` across the herdr call for the same reason
+        `_split_parent` is: two concurrent launches of one node must produce
+        one tab, and a tab created twice is two rectangles for one node.
+        """
+        group = spec.pane_group or ""
+        with self._handles_lock:
+            existing = self._tabs.get(group)
+            if existing is not None and not existing.empty():
+                return existing
+            if not self.workspace_label:
+                # Pre-workspace placement, kept for the verbs that are not a
+                # run: every pane splits from the caller's own once-resolved
+                # pane. That pane belongs to whoever called, so it is claimed
+                # from the start and never handed to an agent.
+                seed = self._split_parent(environment)
+                layout = _TabLayout(tab_id="", panes=[seed], claimed=1)
+                self._tabs[group] = layout
+                return layout
+            workspace_id = self._run_workspace(environment)
+            label = display_name(group) if group else self.workspace_label
+            try:
+                payload = self._herdr(
+                    "tab", "create", "--workspace", workspace_id,
+                    "--label", label, "--cwd", str(worktree), "--no-focus",
+                    *env_flags, env=environment)
+            except BaseException as exc:
+                raise LaunchRefused(
+                    LaunchRefusal.TAB_UNRESOLVED,
+                    "{0}: {1}".format(type(exc).__name__, exc)) from exc
+            tab = _extract(payload, "tab")
+            root = _extract(payload, "root_pane")
+            tab_id = tab.get("tab_id") if isinstance(tab, dict) else None
+            root_id = root.get("pane_id") if isinstance(root, dict) else None
+            if not tab_id or not root_id:
+                raise LaunchRefused(LaunchRefusal.TAB_UNRESOLVED, "NO_TAB")
+            layout = _TabLayout(tab_id=str(tab_id), panes=[str(root_id)],
+                                claimed=0)
+            self._tabs[group] = layout
+            self._close_seed_tab(environment)
+            return layout
+
+    def _acquire_pane(self, spec: LaunchSpec, worktree: Path,
+                      env_flags: Sequence[str],
+                      environment: Mapping[str, str]) -> str:
+        """One pane for this launch, in this node's tab, at its grid slot.
+
+        The slot is reserved and the split taken under the tab's own lock, so
+        launch *k* into a tab always finds slot *k-1* already created. The
+        first agent of a tab takes the tab's root pane and splits nothing;
+        every later one splits the pane `split_plan` names.
+
+        Column count is decided here and only ever grows: the caller's
+        declared `pane_group_size` if it named one, otherwise the count
+        observed so far. Frozen-then-growing rather than recomputed, because a
+        column count that shrank would ask for a grid the existing panes are
+        not in.
+        """
+        layout = self._tab_for(spec, worktree, env_flags, environment)
+        with layout.lock:
+            index = layout.claimed
+            layout.claimed += 1
+            declared = max(int(spec.pane_group_size or 0), index + 1)
+            layout.cols = max(layout.cols, grid_for(declared)[1])
+            if index < len(layout.panes) and layout.panes[index]:
+                # The tab's own root pane, already opened with this launch's
+                # working directory and redirection. Nothing to split.
+                return str(layout.panes[index])
+            parent_index, direction = split_plan(index, layout.cols)
+            parent_id = layout.nearest_live(parent_index)
+            if parent_id is None:
+                raise LaunchRefused(LaunchRefusal.TAB_UNRESOLVED,
+                                    "NO_LIVE_PARENT")
+            split = self._herdr("pane", "split", parent_id,
+                                "--direction", direction,
+                                "--cwd", str(worktree), "--no-focus",
+                                *env_flags, env=environment)
+            pane = _extract(split, "pane")
+            if not isinstance(pane, dict) or not pane.get("pane_id"):
+                # No id means nothing to close: herdr may hold a pane it did
+                # not report, and an unreapable pane is exactly the case
+                # `pane_created` exists to keep honest.
+                raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
+            pane_id = str(pane["pane_id"])
+            while len(layout.panes) <= index:
+                layout.panes.append(None)
+            layout.panes[index] = pane_id
+            return pane_id
+
+    def _label_pane(self, pane_id: str, spec: LaunchSpec,
+                    environment: Mapping[str, str]) -> None:
+        """Name the pane after the node it runs, once, at launch.
+
+        `label` is herdr's own durable per-pane field and survives the agent
+        taking over the terminal -- verified against the real binary: a pane
+        renamed and then given a `claude` agent still reports its label while
+        `terminal_title` reads `Claude Code`. Without it a pane is identifiable
+        only by its working directory, which is how two panes were lost track
+        of in one session.
+
+        Display-only, so a refused rename is dropped rather than spent as a
+        launch refusal: a run that stops because a pane could not be named has
+        traded the work for the caption.
+        """
+        stem = display_name(spec.pane_group) if spec.pane_group else ""
+        role = str(spec.pane_role or "")
+        label = "-".join(part for part in (stem, role) if part)
+        if not label:
+            return
+        try:
+            self._herdr("pane", "rename", pane_id, label, env=environment)
+        except BaseException:
+            return
+
+    def _forget_pane(self, pane_id: str) -> None:
+        """Drop a closed pane from its tab's grid.
+
+        A closed pane cannot be split, so leaving it in the grid would let a
+        later launch name a dead parent. The slot is emptied rather than
+        removed, because the panes after it are still where they were.
+        """
+        with self._handles_lock:
+            for layout in self._tabs.values():
+                if layout.forget(pane_id):
+                    return
 
     def _reap_pane(self, pane_id: str,
                    environment: Mapping[str, str]) -> bool:
@@ -1053,6 +1552,7 @@ class HerdrLauncher:
             self._herdr("pane", "close", pane_id, env=environment)
         except BaseException:
             return False
+        self._forget_pane(pane_id)
         return True
 
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
@@ -1076,17 +1576,25 @@ class HerdrLauncher:
         # raised before herdr is called *at all*. Resolving the parent first
         # would make one herdr call before that refusal and falsify it.
         env_flags = pane_env_flags(environment)
-        split = self._herdr("pane", "split", *self._split_parent(environment),
-                            "--direction", "right",
-                            "--cwd", str(worktree), "--no-focus",
-                            *env_flags, env=environment)
-        pane = _extract(split, "pane")
-        if not isinstance(pane, dict) or not pane.get("pane_id"):
-            # No id means nothing to close: herdr may hold a pane it did not
-            # report, and an unreapable pane is exactly the case `pane_created`
-            # exists to keep honest.
-            raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
-        pane_id = str(pane["pane_id"])
+        # Placement, in three steps that are each a property of the run rather
+        # than of whatever holds focus: the run's own workspace, this node's
+        # own tab inside it, and this agent's own grid slot inside that tab.
+        pane_id = self._acquire_pane(spec, worktree, env_flags, environment)
+        # Every pane of one run belongs to one workspace. A split of a fixed
+        # parent lands beside that parent, so a child reporting a different
+        # workspace means the placement escaped — the shape that scattered one
+        # run's agents across w13F, w13G, w13H, w13J and w13K while its first
+        # pane sat in w13A, and an operator watching w13A then sees a factory
+        # that has stopped. Checked rather than assumed, because the guarantee
+        # is worth nothing if nothing measures it.
+        landed = workspace_of(pane_id)
+        if self._workspace_id and landed and landed != self._workspace_id:
+            closed = self._reap_pane(pane_id, environment)
+            raise LaunchRefused(
+                LaunchRefusal.WORKSPACE_DRIFT,
+                "{0}!={1}".format(landed, self._workspace_id),
+                pane_created=not closed)
+        self._label_pane(pane_id, spec, environment)
         name = _agent_name(spec.correlation_token)
         route_argv = (build_omp_argv(self.omp_path, spec) if spec.route == "omp"
                       else build_claude_argv(self.claude_path, spec)
@@ -1111,11 +1619,13 @@ class HerdrLauncher:
             _wait_for_available_shell(
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 pane_id)
-            started = self._herdr(
-                "agent", "start", name, "--kind", spec.route,
-                "--pane", pane_id, "--timeout", "180000",
-                "--", *route_argv[1:],
-                env=environment, timeout=185.0)
+            started = _start_agent_when_free(
+                lambda: self._herdr(
+                    "agent", "start", name, "--kind", spec.route,
+                    "--pane", pane_id, "--timeout", "180000",
+                    "--", *route_argv[1:],
+                    env=environment, timeout=185.0),
+                window_s=self.agent_start_busy_window_s)
         except BaseException as exc:
             # Reap first, then state what the reap achieved. Re-raising
             # herdr's own `HerdrCallError` from here was the 2026-08-18
@@ -1398,6 +1908,7 @@ class HerdrLauncher:
         except BaseException as exc:
             raise HarnessQuiescenceError(
                 "HERDR_QUIESCENCE_UNPROVEN:{}".format(token)) from exc
+        self._forget_pane(handle.pane_id)
         with self._handles_lock:
             if self._handles.get(token) is handle:
                 self._handles.pop(token)
@@ -1473,6 +1984,19 @@ class FakeLauncher:
 #: `EXECUTION` -> `STARTUP` and was budgeted as a broken launcher rather than
 #: as contention.
 TRANSIENT_HERDR_ERROR_CODES: frozenset = frozenset({"agent_pane_busy"})
+
+
+def workspace_of(pane_id: str) -> str:
+    """The workspace half of a herdr pane id (`w13A:p29` -> `w13A`).
+
+    Herdr's pane id is a structured identifier, not prose: the workspace and
+    the pane are two fields joined by a colon, and reading the first is
+    reading a field rather than matching a message (§1.2). An id without a
+    colon has no workspace to report and yields `""`, which callers treat as
+    "unknown" rather than as a match.
+    """
+    workspace, sep, _pane = str(pane_id).partition(":")
+    return workspace if sep else ""
 
 
 def _herdr_error_code_of(exc: BaseException) -> str:

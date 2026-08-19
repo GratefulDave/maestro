@@ -19,14 +19,65 @@ Maintain shared types across server/client. Verify UI behavior against the runni
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->
 
+## Starting it
+
+```sh
+just -g viz
+```
+
+`-g` is `just --global-justfile`, so the command works from any directory
+without a `cd` and without environment variables. The recipe is one line in
+`~/.config/just/justfile` and delegates to `bin/maestro-viz` in this repo,
+which is where the logic lives and is version-controlled:
+
+```just
+[doc("start the Maestro visualizer (stop | status | <repo>)")]
+viz *args:
+    @/path/to/maestro/.claude/skills/sssf/apps/visualizer/bin/maestro-viz {{args}}
+```
+
+The script starts *both* halves — the Bun API on :4600 and the Vite frontend on
+:4601. It frees both ports first, so running it twice leaves one instance
+rather than two, and it does not report success until `/api/sources` has
+answered 200 through the frontend's proxy. Any other outcome is a non-zero exit
+with the failing half's log tail: a missing `bun`, an uninstalled `vite`, a port
+that survives SIGKILL, or a process that dies during startup.
+
+`just -g viz stop` stops both halves and frees both ports; `just -g viz status`
+reports what is listening; `just -g viz <repo>` runs the API with `<repo>` as
+its working directory so that repository's own `adws/maestro.config.yaml` is
+discovered (see below). Logs are at `$TMPDIR/maestro-viz/{api,ui}.log`.
+
+Verified against just 1.46.0: `--global-justfile` reads
+`~/.config/just/justfile`, which takes precedence over `~/.justfile`. Nothing
+is placed on `PATH` and no shell rc file is involved; the recipe carries an
+absolute path, so moving this repository means editing that one line.
+
+Do not start the visualizer with `bun run dev`. That script is `vite` alone: it
+starts the frontend without the API, every `/api` request then fails with
+`ECONNREFUSED`, and the UI sits on `loading sources…` forever while the startup
+output looks entirely successful. `bun run dev:all` starts both but only from
+the visualizer's own directory.
+
 ## Running it against a Maestro DAG run
 
-From the target repository (the one holding `adws/maestro.config.yaml`), both
-its tracer database and its Maestro lifecycle ledger are discovered:
+`bun`'s `--cwd` is a flag of the `run` subcommand, so it goes AFTER `run`.
+Written the other way round bun prints its usage text and starts nothing:
+
+```sh
+bun run --cwd /path/to/maestro/.claude/skills/sssf/apps/visualizer dev:all
+```
+
+That form serves every installation recorded in `~/.maestro/registry.json` —
+which is most of them — but its working directory is the visualizer, so it
+cannot discover a repository's own `adws/maestro.config.yaml`. To have the
+target repository's databases discovered from the repository itself, run the
+API there and the Vite dev server with `--cwd`:
 
 ```sh
 cd /path/to/target-repo
-bun --cwd /path/to/maestro/.claude/skills/sssf/apps/visualizer run dev:all
+bun run /path/to/maestro/.claude/skills/sssf/apps/visualizer/server/index.ts &
+bun run --cwd /path/to/maestro/.claude/skills/sssf/apps/visualizer dev
 ```
 
 Or name the ledgers explicitly — `--db` is repeatable and each database is
@@ -41,6 +92,16 @@ bun run server/index.ts \
 With more than one database loaded the topbar grows a tab per source. A Maestro
 source shows its runs at `#/s/<source id>` and one run at
 `#/s/<source id>/<run id>`; the tracer's session view keeps the bare `#/` routes
-it always had.
+it always had. With no tracer database loaded the bare `#/` lands on the first
+Maestro ledger's run index instead, and the breadcrumb names that ledger rather
+than the tracer's sessions.
+
+Every run in the selected ledger is listed newest first, each card carrying the
+plan name (when the plan files are still installed at that digest), the plan
+digest, the run id, the live state derived from its node rows, the outcome the
+scheduler last declared — `nothing yet` while none has been — and its nodes
+counted by state. The list re-reads the ledger once a second, so a run started
+after the page loaded appears without a reload; clicking a card opens that run
+and the breadcrumb's `<ledger> runs` link returns to the list.
 
 Checks: `bun run typecheck`, `bun run lint`, `bun run test`, `bun run build`.

@@ -346,12 +346,20 @@ def verify_code_node(exit_code: int,
 # review predicate and was never called by production. Its clauses were already
 # enforced, each by the code that owns the observation:
 #
-#   1. report parsed          `fin.ReviewerReport.model_validate`
+#   1. report parsed          `cr.CodeReviewerReport.model_validate` — which
+#                             also refuses a finding carrying no grade, no
+#                             message, or no reason for its grade (§3.6 A9/B8)
 #   2. survived the matrix    `fin.verify_report`
 #   3. occupancy measured     `fin.check_occupancy` (NULL convicts, §6.5)
-#   4. code derived PASS      `fin.derive_verdict` + `cr.require_located_findings`
+#   4. code derived PASS      `cr.grade_verdict` + `cr.require_located_findings`
 #   5. signed receipt         `fin.ReceiptStore` verifies the Ed25519 signature
 #                             over the persisted bytes on load
+#
+# Clauses 1 and 4 name `code_review`'s own report model and derivation rather
+# than `finalization`'s. That is the isolation A9's grading is confined by:
+# plan finalization keeps `fin.ReviewerReport` and `fin.derive_verdict`, which
+# have no grade to read and no threshold to be handed, so grading a node's
+# findings cannot change a plan's verdict.
 #
 # all sequenced by `code_review.review_attempt`, whose `ReviewOutcome.passed` is
 # what the scheduler's review branch actually reads. Two expressions of one rule

@@ -31,6 +31,16 @@ Everything else follows from where authority sits:
   re-review unchanged bytes.
 * **A stall is not a receipt.** `FINALIZATION_STALLED` leaves no receipt
   for the digest, which is exactly what makes a rerun legal.
+* **A FAIL has an operator escape, and only an operator has it.** §3.6 B10
+  requires re-review of byte-identical input to be impossible *or
+  explicitly recorded, with an operator escape*. `ReceiptStore.set_aside`
+  is that escape: it retains the FAILed receipt and its signature under an
+  archival name, writes a signed `SetAsideRecord` naming who invoked it,
+  why, and exactly which receipt it superseded, and frees the live slot so
+  the next `finalize` reviews afresh. It refuses a PASS and it refuses a
+  digest with no receipt. Nothing calls it automatically and nothing reads
+  its `reason`; what admits the fresh review is the same absence of a
+  receipt that a stall leaves behind.
 
 **Boundaries this module does not cross.** The plan model, its canonical
 bytes, and its digest belong to §6.1–§6.4 and are another lane's: nothing
@@ -46,6 +56,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -506,12 +517,28 @@ def check_occupancy(occupancy: Optional[float], threshold: float = 0.8) -> None:
 
 @dataclass(frozen=True)
 class DerivedCell:
+    """One adjudicated cell of a receipt's matrix.
+
+    `grade` carries the reviewer's assessment of a *finding's consequence*
+    where the review family that produced it grades findings (node code
+    review, §19 M17). It is `None` for plan finalization, whose reviewer has
+    no grade to give, and for any cell that is not a finding.
+
+    It is optional because plan finalization's cells genuinely have no grade,
+    not because it may be omitted where one exists. It is written into the
+    receipt from the first version that grades anything, deliberately: §3.6
+    B8's rule is that a field added after receipts exist is optional forever,
+    and the grade is what decided the verdict, so a receipt without it records
+    a verdict whose derivation cannot be re-checked from the receipt alone.
+    """
+
     check_id: str
     object_id: str
     status: CellStatus
     severity: Severity
     message: str = ""
     canary: Optional[CanaryKind] = None
+    grade: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -575,12 +602,35 @@ def _require_created_at_epoch(value: object) -> None:
 
 @dataclass(frozen=True)
 class Receipt:
+    """One signed verdict about one digest, and everything that derived it.
+
+    `reject_at` is the grade threshold the review ran under, and it is the
+    other half of what `DerivedCell.grade` records. A grade decides nothing on
+    its own: a cell rejects when its check is BLOCKING **and** its grade
+    reaches the threshold, so a receipt carrying grades without the threshold
+    still records a verdict whose derivation cannot be re-checked from the
+    receipt alone — which is the exact argument that put the grade there, one
+    field short. It is `None` for plan finalization, whose verdict has no
+    threshold to run under, and for any receipt written before grading
+    existed. `rubric_version` names the rubric, not the receipt schema: the
+    graded fields were added under `maestro-rubric.v2` without moving that
+    version, so two incompatible v2 shapes exist. `from_bytes` discriminates
+    on whether `reject_at` is present, not on the rubric label. A pre-grading
+    v2 receipt — no `reject_at`, cells with no `grade` — replays with both
+    honestly `None`. A receipt that carries the graded keys must carry both.
+    The threshold is configuration (`execution.review_reject_grade`, §6.2), so
+    it can differ between the review and any later reading of it. That is
+    precisely why the receipt must carry the one the verdict was derived with
+    rather than let a reader supply today's.
+    """
+
     plan_digest: str
     rubric_version: str
     verdict: Verdict
     cells: Tuple[DerivedCell, ...]
     reviewer: ReviewerIdentity
     created_at_epoch: float
+    reject_at: Optional[str] = None
 
 
     def to_bytes(self) -> bytes:
@@ -601,7 +651,10 @@ class Receipt:
                 "model": self.reviewer.model,
                 "session_id": self.reviewer.session_id,
             },
-            "cells": [
+        }
+        if self.rubric_version != "maestro-rubric.v1":
+            payload["reject_at"] = self.reject_at
+        payload["cells"] = [
                 {
                     "check_id": cell.check_id,
                     "object_id": cell.object_id,
@@ -609,10 +662,10 @@ class Receipt:
                     "severity": cell.severity.value,
                     "message": cell.message,
                     "canary": None if cell.canary is None else cell.canary.value,
+                    "grade": cell.grade,
                 }
                 for cell in self.cells
-            ],
-        }
+            ]
         return json.dumps(payload, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False).encode("utf-8")
 
@@ -635,11 +688,22 @@ class Receipt:
                 data.decode("utf-8"), object_pairs_hook=object_without_duplicates)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ReceiptInvalid("receipt bytes are not UTF-8 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
+        rubric_version = payload.get("rubric_version")
+        if not isinstance(rubric_version, str):
+            raise ReceiptInvalid("rubric_version must be a string")
+        # `reject_at` present → graded schema. Absent → pre-grading (v1, or
+        # v2 written before the fields existed). The rubric label is not
+        # the discriminator: v2 names both shapes.
+        has_reject_at = "reject_at" in payload
         expected = {
             "plan_digest", "rubric_version", "verdict", "created_at_epoch",
             "reviewer", "cells",
         }
-        if not isinstance(payload, dict) or set(payload) != expected:
+        if has_reject_at:
+            expected = expected | {"reject_at"}
+        if set(payload) != expected:
             raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
         reviewer = payload["reviewer"]
         if (not isinstance(reviewer, dict) or
@@ -651,16 +715,37 @@ class Receipt:
             raise ReceiptInvalid("receipt cells must be an array")
         try:
             _require_plan_digest(payload["plan_digest"])
-            if not isinstance(payload["rubric_version"], str):
-                raise ReceiptInvalid("rubric_version must be a string")
             created_at_epoch = payload["created_at_epoch"]
             _require_created_at_epoch(created_at_epoch)
             verdict = Verdict(payload["verdict"])
+            if has_reject_at:
+                reject_at = payload["reject_at"]
+                if reject_at is not None and not isinstance(reject_at, str):
+                    raise ReceiptInvalid("receipt reject_at must be a string or null")
+            else:
+                reject_at = None
+            cell_base = {
+                "check_id", "object_id", "status", "severity",
+                "message", "canary",
+            }
+            cell_graded = cell_base | {"grade"}
             derived_cells = []
             for cell in cells:
-                if (not isinstance(cell, dict) or set(cell) != {
-                        "check_id", "object_id", "status", "severity",
-                        "message", "canary"}):
+                if not isinstance(cell, dict):
+                    raise ReceiptInvalid(
+                        "receipt cell fields do not match the frozen receipt schema")
+                keys = set(cell)
+                if keys == cell_graded:
+                    if not has_reject_at and rubric_version != "maestro-rubric.v1":
+                        raise ReceiptInvalid(
+                            "receipt fields do not match the frozen receipt schema")
+                    grade = cell["grade"]
+                elif keys == cell_base:
+                    if has_reject_at:
+                        raise ReceiptInvalid(
+                            "receipt cell fields do not match the frozen receipt schema")
+                    grade = None
+                else:
                     raise ReceiptInvalid(
                         "receipt cell fields do not match the frozen receipt schema")
                 if not all(isinstance(cell[field], str)
@@ -669,13 +754,16 @@ class Receipt:
                 canary = cell["canary"]
                 if canary is not None and not isinstance(canary, str):
                     raise ReceiptInvalid("receipt cell canary must be a string or null")
+                if grade is not None and not isinstance(grade, str):
+                    raise ReceiptInvalid("receipt cell grade must be a string or null")
                 derived_cells.append(DerivedCell(
                     check_id=cell["check_id"],
                     object_id=cell["object_id"],
                     status=CellStatus(cell["status"]),
                     severity=Severity(cell["severity"]),
                     message=cell["message"],
-                    canary=None if canary is None else CanaryKind(canary)))
+                    canary=None if canary is None else CanaryKind(canary),
+                    grade=grade))
         except (KeyError, TypeError, ValueError) as exc:
             raise ReceiptInvalid("receipt values do not match the frozen receipt schema") from exc
         return cls(
@@ -687,7 +775,8 @@ class Receipt:
                 route=reviewer["route"],
                 model=reviewer["model"],
                 session_id=reviewer["session_id"]),
-            created_at_epoch=created_at_epoch)
+            created_at_epoch=created_at_epoch,
+            reject_at=reject_at)
 
 
 _PLAN_DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -724,9 +813,182 @@ class SigningKeyUnavailable(RuntimeError):
     everywhere but the finalizer's own machine."""
 
 
+class SetAsideRefused(RuntimeError):
+    """The operator escape refused to run.
+
+    Three refusals, and each one is what keeps the escape from becoming a
+    way to re-roll a reviewer: there is no receipt to set aside, the
+    receipt is a PASS and there is nothing to escape from, or the operator
+    named no invoker or gave no reason.
+    """
+
+
 def _require_plan_digest(plan_digest: str) -> None:
     if not isinstance(plan_digest, str) or not _PLAN_DIGEST.fullmatch(plan_digest):
         raise ReceiptInvalid("plan_digest must be a 64-character lowercase hex digest")
+
+
+def _require_sha256_hex(value: object, field: str) -> None:
+    if not isinstance(value, str) or not _PLAN_DIGEST.fullmatch(value):
+        raise ReceiptInvalid(
+            f"{field} must be a 64-character lowercase hex digest")
+
+
+def _require_stated(value: object, field: str) -> str:
+    """An escape nobody signed and nobody explained is not deliberate.
+
+    Blank is refused rather than defaulted, because the whole value of the
+    record is that a human wrote something into it.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise SetAsideRefused(
+            f"{field} must be a non-empty statement; setting a receipt aside "
+            "is a deliberate, attributable operator act (§3.6 B10)")
+    return value
+
+
+def _require_sequence(sequence: object) -> int:
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise ReceiptInvalid("a set-aside sequence is a positive integer")
+    if sequence > _MAX_SET_ASIDE_SEQUENCE:
+        raise ReceiptInvalid(
+            f"a set-aside sequence is at most {_MAX_SET_ASIDE_SEQUENCE}")
+    return sequence
+
+
+#: The archival filename encodes the sequence in a fixed width, so the
+#: bound is a property of the layout rather than a policy about how often
+#: an operator may escape. Deliberately not a quota: B10 asks for an
+#: escape that is recorded, not one that is rationed.
+_MAX_SET_ASIDE_SEQUENCE = 9999
+_SET_ASIDE_SEQUENCE = re.compile(r"^\d{4}$")
+
+
+@dataclass(frozen=True)
+class SetAsideRecord:
+    """§3.6 B10's operator escape, as a typed durable record.
+
+    B10 requires that re-review of byte-identical input be impossible *or
+    explicitly recorded, with an operator escape*. Maestro shipped the
+    first half — receipts are create-once and replay is keyed on the
+    digest alone (§6.5) — and had no second half, so a FAIL that Maestro's
+    own defect produced condemned a correct plan at those bytes forever
+    (§19 M16, §16.3 item 56).
+
+    **`reason` is an audit field and nothing else.** §1.2 forbids any
+    lifecycle transition caused by free text, so no decision anywhere
+    reads it and none may be added that does. What admits a fresh review
+    is the *absence* of a live receipt — exactly the condition
+    `FINALIZATION_STALLED` already leaves behind (§6.5). This record
+    explains an escape that happened; it never causes one.
+
+    `superseded_receipt_sha256` binds the record to the exact bytes it set
+    aside, so the archived receipt and the record that explains it cannot
+    drift apart, and a record naming a receipt the store cannot produce is
+    detectable rather than merely doubtful.
+    """
+
+    plan_digest: str
+    sequence: int
+    invoked_by: str
+    reason: str
+    superseded_verdict: Verdict
+    superseded_rubric_version: str
+    superseded_reviewer: ReviewerIdentity
+    superseded_created_at_epoch: float
+    superseded_receipt_sha256: str
+    created_at_epoch: float
+
+    def to_bytes(self) -> bytes:
+        """The record's stored bytes — what its signature covers."""
+        _require_created_at_epoch(self.created_at_epoch)
+        _require_created_at_epoch(self.superseded_created_at_epoch)
+        payload = {
+            "plan_digest": self.plan_digest,
+            "sequence": self.sequence,
+            "invoked_by": self.invoked_by,
+            "reason": self.reason,
+            "superseded_verdict": self.superseded_verdict.value,
+            "superseded_rubric_version": self.superseded_rubric_version,
+            "superseded_reviewer": {
+                "route": self.superseded_reviewer.route,
+                "model": self.superseded_reviewer.model,
+                "session_id": self.superseded_reviewer.session_id,
+            },
+            "superseded_created_at_epoch": self.superseded_created_at_epoch,
+            "superseded_receipt_sha256": self.superseded_receipt_sha256,
+            "created_at_epoch": self.created_at_epoch,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SetAsideRecord":
+        if not isinstance(data, bytes):
+            raise ReceiptInvalid("set-aside record bytes must be bytes")
+
+        def object_without_duplicates(pairs):
+            payload = {}
+            for key, value in pairs:
+                if key in payload:
+                    raise ReceiptInvalid(
+                        "set-aside record JSON contains a duplicate object field")
+                payload[key] = value
+            return payload
+
+        try:
+            payload = json.loads(
+                data.decode("utf-8"), object_pairs_hook=object_without_duplicates)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReceiptInvalid(
+                "set-aside record bytes are not UTF-8 JSON") from exc
+        expected = {
+            "plan_digest", "sequence", "invoked_by", "reason",
+            "superseded_verdict", "superseded_rubric_version",
+            "superseded_reviewer", "superseded_created_at_epoch",
+            "superseded_receipt_sha256", "created_at_epoch",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ReceiptInvalid(
+                "set-aside record fields do not match the frozen record schema")
+        reviewer = payload["superseded_reviewer"]
+        if (not isinstance(reviewer, dict) or
+                set(reviewer) != {"route", "model", "session_id"} or
+                not all(isinstance(value, str) for value in reviewer.values())):
+            raise ReceiptInvalid(
+                "set-aside reviewer fields do not match the frozen record schema")
+        try:
+            _require_plan_digest(payload["plan_digest"])
+            _require_sequence(payload["sequence"])
+            _require_sha256_hex(payload["superseded_receipt_sha256"],
+                                "superseded_receipt_sha256")
+            if not all(isinstance(payload[field], str) and payload[field].strip()
+                       for field in ("invoked_by", "reason")):
+                raise ReceiptInvalid(
+                    "a set-aside record states its invoker and its reason")
+            if not isinstance(payload["superseded_rubric_version"], str):
+                raise ReceiptInvalid("superseded_rubric_version must be a string")
+            _require_created_at_epoch(payload["created_at_epoch"])
+            _require_created_at_epoch(payload["superseded_created_at_epoch"])
+            verdict = Verdict(payload["superseded_verdict"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReceiptInvalid(
+                "set-aside record values do not match the frozen record schema"
+            ) from exc
+        return cls(
+            plan_digest=payload["plan_digest"],
+            sequence=payload["sequence"],
+            invoked_by=payload["invoked_by"],
+            reason=payload["reason"],
+            superseded_verdict=verdict,
+            superseded_rubric_version=payload["superseded_rubric_version"],
+            superseded_reviewer=ReviewerIdentity(
+                route=reviewer["route"],
+                model=reviewer["model"],
+                session_id=reviewer["session_id"]),
+            superseded_created_at_epoch=payload["superseded_created_at_epoch"],
+            superseded_receipt_sha256=payload["superseded_receipt_sha256"],
+            created_at_epoch=payload["created_at_epoch"])
 
 
 class ReceiptStore:
@@ -841,32 +1103,37 @@ class ReceiptStore:
         return any(rc.verify(key, data, signature) for key in self._verify_keys)
 
     def _recover_locked(self, plan_digest: str) -> bool:
+        recovered = False
         path = self.path_for(plan_digest)
         signature_path = self.signature_path_for(plan_digest)
         pending_path = self._pending_path_for(plan_digest)
-        if not pending_path.is_file():
-            return False
-        signature = self._read_signature(pending_path, plan_digest)
-        if not path.is_file():
-            pending_path.unlink()
-            self._fsync_root()
-            return False
-        data = path.read_bytes()
-        if not self._signature_verifies(data, signature):
-            raise SignatureInvalid(
-                f"the pending receipt for {plan_digest} verifies under none of "
-                f"this store's {len(self._verify_keys)} public key(s)")
-        expected = signature.hex().encode("ascii") + b"\n"
-        if signature_path.is_file():
-            existing = self._read_signature(signature_path, plan_digest)
-            if existing != signature:
-                raise ReceiptExists(
-                    f"a conflicting receipt signature exists for {plan_digest}")
-        else:
-            self._stage(signature_path, expected)
-        pending_path.unlink()
-        self._fsync_root()
-        return True
+        if pending_path.is_file():
+            signature = self._read_signature(pending_path, plan_digest)
+            if not path.is_file():
+                pending_path.unlink()
+                self._fsync_root()
+            else:
+                data = path.read_bytes()
+                if not self._signature_verifies(data, signature):
+                    raise SignatureInvalid(
+                        f"the pending receipt for {plan_digest} verifies under "
+                        f"none of this store's {len(self._verify_keys)} public "
+                        f"key(s)")
+                expected = signature.hex().encode("ascii") + b"\n"
+                if signature_path.is_file():
+                    existing = self._read_signature(signature_path, plan_digest)
+                    if existing != signature:
+                        raise ReceiptExists(
+                            f"a conflicting receipt signature exists for "
+                            f"{plan_digest}")
+                else:
+                    self._stage(signature_path, expected)
+                pending_path.unlink()
+                self._fsync_root()
+                recovered = True
+        if self._recover_set_aside_locked(plan_digest):
+            recovered = True
+        return recovered
 
     def recover(self, plan_digest: str) -> bool:
         """Complete only an authenticated interrupted publication."""
@@ -909,27 +1176,285 @@ class ReceiptStore:
             self._fsync_root()
         return path
 
-    def load(self, plan_digest: str) -> Receipt:
-        """Verify before parsing or trusting receipt bytes."""
-        _require_plan_digest(plan_digest)
-        path = self.path_for(plan_digest)
+    def _verified_receipt_at(self, path: Path, signature_path: Path,
+                             plan_digest: str, label: str
+                             ) -> Tuple[bytes, Receipt]:
+        """Verify before parsing or trusting receipt bytes.
+
+        Returns the *stored* bytes alongside the parsed receipt, because a
+        signature covers exactly those bytes and anything binding itself to
+        a receipt — `set_aside`'s `superseded_receipt_sha256` — has to bind
+        to what was verified rather than to a re-serialisation of it.
+        """
         if not path.is_file():
-            raise FileNotFoundError(f"no receipt for {plan_digest}")
-        signature_path = self.signature_path_for(plan_digest)
+            raise FileNotFoundError(f"no {label} for {plan_digest}")
         if not signature_path.is_file():
             raise SignatureMissing(
-                f"the receipt for {plan_digest} has no signature beside it")
+                f"the {label} for {plan_digest} has no signature beside it")
         data = path.read_bytes()
         signature = self._read_signature(signature_path, plan_digest)
         if not self._signature_verifies(data, signature):
             raise SignatureInvalid(
-                f"the receipt for {plan_digest} verifies under none of this "
+                f"the {label} for {plan_digest} verifies under none of this "
                 f"store's {len(self._verify_keys)} public key(s)")
         receipt = Receipt.from_bytes(data)
         if receipt.plan_digest != plan_digest:
             raise ReceiptInvalid(
-                f"the receipt stored for {plan_digest} names {receipt.plan_digest}")
+                f"the {label} stored for {plan_digest} names {receipt.plan_digest}")
+        return data, receipt
+
+    def load(self, plan_digest: str) -> Receipt:
+        """Verify before parsing or trusting receipt bytes."""
+        _require_plan_digest(plan_digest)
+        return self._verified_receipt_at(
+            self.path_for(plan_digest), self.signature_path_for(plan_digest),
+            plan_digest, "receipt")[1]
+
+    # ── the operator escape (§3.6 B10) ──────────────────────────────────
+
+    def _set_aside_paths(self, plan_digest: str,
+                         sequence: int) -> Tuple[Path, Path, Path, Path]:
+        _require_plan_digest(plan_digest)
+        _require_sequence(sequence)
+        stem = f"{plan_digest}.set-aside.{sequence:04d}"
+        return (self._confined_path(f"{stem}.json"),
+                self._confined_path(f"{stem}.json.sig"),
+                self._confined_path(f"{stem}.record.json"),
+                self._confined_path(f"{stem}.record.json.sig"))
+
+    def _set_aside_sequences(self, plan_digest: str) -> List[int]:
+        prefix = f"{plan_digest}.set-aside."
+        sequences = set()
+        for path in self.root.glob(f"{prefix}*"):
+            rest = path.name[len(prefix):]
+            seq_part = rest.split(".", 1)[0]
+            if _SET_ASIDE_SEQUENCE.fullmatch(seq_part):
+                sequences.add(int(seq_part))
+        return sorted(sequences)
+
+    def _discard_set_aside_files(self, plan_digest: str, sequence: int) -> bool:
+        discarded = False
+        for path in self._set_aside_paths(plan_digest, sequence):
+            if path.is_file():
+                path.unlink()
+                discarded = True
+        if discarded:
+            self._fsync_root()
+        return discarded
+
+    def _recover_set_aside_locked(self, plan_digest: str) -> bool:
+        """Resolve an interrupted escape so it either fully took effect
+        or fully did not.
+
+        The four archive/record files are the commit. A complete, signed,
+        bound set whose sha256 still matches the live receipt means unlink
+        has not happened yet — finish it. A partial set while the live
+        receipt remains is an escape that did not happen — discard the
+        staging so retry is legal. An unsigned record is incomplete
+        staging, not corruption.
+        """
+        recovered = False
+        live = self.path_for(plan_digest)
+        live_sig = self.signature_path_for(plan_digest)
+        live_data = live.read_bytes() if live.is_file() else None
+        live_sha = (None if live_data is None
+                    else hashlib.sha256(live_data).hexdigest())
+        for sequence in self._set_aside_sequences(plan_digest):
+            archive, archive_sig, record_path, record_sig = (
+                self._set_aside_paths(plan_digest, sequence))
+            files = (archive, archive_sig, record_path, record_sig)
+            present = [path.is_file() for path in files]
+            if not any(present):
+                continue
+            if not all(present):
+                if live_sha is None:
+                    continue
+                if self._discard_set_aside_files(plan_digest, sequence):
+                    recovered = True
+                continue
+            archive_data, _receipt = self._verified_receipt_at(
+                archive, archive_sig, plan_digest,
+                f"set-aside receipt {sequence:04d}")
+            record = self._load_set_aside_record(plan_digest, sequence)
+            archive_sha = hashlib.sha256(archive_data).hexdigest()
+            if archive_sha != record.superseded_receipt_sha256:
+                continue
+            if live_sha == archive_sha:
+                if live.is_file():
+                    live.unlink()
+                if live_sig.is_file():
+                    live_sig.unlink()
+                self._fsync_root()
+                live_sha = None
+                recovered = True
+            elif live_sha is None and live_sig.is_file():
+                live_sig.unlink()
+                self._fsync_root()
+                recovered = True
+        return recovered
+
+    def load_set_aside_receipt(self, plan_digest: str, sequence: int) -> Receipt:
+        """The receipt a set-aside superseded, still signed, still verified.
+
+        The escape retains it rather than deleting it: `rm` would destroy
+        the store's whole audit value, which is that every verdict ever
+        reached about a digest is still there to read.
+
+        `SetAsideRecord.superseded_receipt_sha256` binds this archive to
+        the record that claims it. Two valid archive/signature pairs for
+        the same plan digest cannot be swapped between sequence numbers
+        without detection (§6.6, §3.6 B15).
+        """
+        _require_plan_digest(plan_digest)
+        path, signature_path, _, _ = self._set_aside_paths(plan_digest, sequence)
+        data, receipt = self._verified_receipt_at(
+            path, signature_path, plan_digest,
+            f"set-aside receipt {sequence:04d}")
+        record = self._load_set_aside_record(plan_digest, sequence)
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != record.superseded_receipt_sha256:
+            raise ReceiptInvalid(
+                f"the set-aside receipt {sequence:04d} for {plan_digest} "
+                f"does not match the record that claims it")
         return receipt
+
+    def _load_set_aside_record(self, plan_digest: str,
+                               sequence: int) -> SetAsideRecord:
+        _, _, path, signature_path = self._set_aside_paths(plan_digest, sequence)
+        label = f"set-aside record {sequence:04d}"
+        if not path.is_file():
+            raise FileNotFoundError(f"no {label} for {plan_digest}")
+        if not signature_path.is_file():
+            raise SignatureMissing(
+                f"the {label} for {plan_digest} has no signature beside it")
+        data = path.read_bytes()
+        signature = self._read_signature(signature_path, plan_digest)
+        if not self._signature_verifies(data, signature):
+            raise SignatureInvalid(
+                f"the {label} for {plan_digest} verifies under none of this "
+                f"store's {len(self._verify_keys)} public key(s)")
+        record = SetAsideRecord.from_bytes(data)
+        if record.plan_digest != plan_digest or record.sequence != sequence:
+            raise ReceiptInvalid(
+                f"the {label} stored for {plan_digest} names "
+                f"{record.plan_digest} sequence {record.sequence}")
+        return record
+
+    def set_aside_records(self, plan_digest: str) -> Tuple[SetAsideRecord, ...]:
+        """Every escape ever invoked against this digest, oldest first.
+
+        Append-only and permanent. An operator who reaches for the escape
+        repeatedly is leaving a growing, signed, attributable trail on the
+        digest they are reaching for — which is the whole reason a plan's
+        own FAIL does not become cheap to re-roll.
+
+        A staged unsigned record is incomplete publication, not a
+        finished escape, so it is skipped rather than raised as
+        corruption. `_recover_locked` discards that staging when the live
+        receipt is still present.
+        """
+        _require_plan_digest(plan_digest)
+        records = []
+        for sequence in self._set_aside_sequences(plan_digest):
+            archive, archive_sig, record_path, record_sig = (
+                self._set_aside_paths(plan_digest, sequence))
+            if not all(path.is_file() for path in (
+                    archive, archive_sig, record_path, record_sig)):
+                continue
+            records.append(self._load_set_aside_record(plan_digest, sequence))
+        return tuple(records)
+
+
+
+    def set_aside(self, plan_digest: str, *, invoked_by: str, reason: str,
+                  clock: Callable[[], float] = time.time) -> SetAsideRecord:
+        """§3.6 B10's operator escape: set a FAIL receipt aside.
+
+        The FAILed receipt and its signature are **retained** under an
+        archival name and the live slot is freed, so the next `finalize`
+        reviews these bytes afresh by exactly the path a
+        `FINALIZATION_STALLED` rerun takes — the absence of a receipt.
+        Replay is untouched: every digest whose receipt has not been set
+        aside still short-circuits on the digest alone, PASS or FAIL.
+
+        What keeps a *plan's* FAIL from becoming cheap, so review does not
+        turn into a slot machine (B10):
+
+        * it needs the finalizer's signing key, the same authority that
+          mints receipts — a read-only store cannot escape anything;
+        * it refuses a PASS, so it can only reopen a FAIL and never
+          overturn one;
+        * it refuses a blank invoker or a blank reason;
+        * every invocation is permanent, signed, and visible in the store
+          forever, so re-rolling a reviewer accumulates a public record of
+          exactly that; and
+        * nothing in Maestro calls it. It is reachable only from the
+          operator's verb.
+
+        Deciding whether a given FAIL was the plan's or the machine's is a
+        judgment, not a computation, which is why this is an operator act
+        that records itself rather than a rule that fires.
+
+        **Crash behaviour.** The four archive/record files are the commit.
+        `_recover_locked` finishes an interrupted unlink when that commit
+        is complete and bound to the live receipt, and discards a partial
+        commit so the live FAIL remains and retry is legal. A staged
+        unsigned record is incomplete, not corrupt.
+        """
+        if self._signing_seed is None:
+            raise SigningKeyUnavailable(
+                "this store holds no signing key; setting a receipt aside is "
+                "the finalizer's act, under the same key that mints receipts "
+                "(§6.6)")
+        if not self._create:
+            raise FileNotFoundError("receipt store is opened read-only")
+        _require_plan_digest(plan_digest)
+        invoked_by = _require_stated(invoked_by, "invoked_by")
+        reason = _require_stated(reason, "reason")
+        path = self.path_for(plan_digest)
+        signature_path = self.signature_path_for(plan_digest)
+        with self._locked(plan_digest):
+            self._recover_locked(plan_digest)
+            if not path.is_file():
+                raise SetAsideRefused(
+                    f"no receipt exists for {plan_digest}; there is nothing to "
+                    "set aside")
+            data, receipt = self._verified_receipt_at(
+                path, signature_path, plan_digest, "receipt")
+            if receipt.verdict is not Verdict.FAIL:
+                raise SetAsideRefused(
+                    f"the receipt for {plan_digest} is "
+                    f"{receipt.verdict.value}; the escape sets aside a FAIL "
+                    "and there is nothing to escape from a PASS")
+            signature = self._read_signature(signature_path, plan_digest)
+            sequence = _require_sequence(
+                len(self.set_aside_records(plan_digest)) + 1)
+            created_at_epoch = clock()
+            _require_created_at_epoch(created_at_epoch)
+            record = SetAsideRecord(
+                plan_digest=plan_digest,
+                sequence=sequence,
+                invoked_by=invoked_by,
+                reason=reason,
+                superseded_verdict=receipt.verdict,
+                superseded_rubric_version=receipt.rubric_version,
+                superseded_reviewer=receipt.reviewer,
+                superseded_created_at_epoch=receipt.created_at_epoch,
+                superseded_receipt_sha256=hashlib.sha256(data).hexdigest(),
+                created_at_epoch=created_at_epoch)
+            record_bytes = record.to_bytes()
+            record_signature = rc.sign(self._signing_seed, record_bytes)
+            (archive, archive_signature, record_path,
+             record_signature_path) = self._set_aside_paths(plan_digest, sequence)
+            self._stage(archive, data)
+            self._stage(archive_signature, signature.hex().encode("ascii") + b"\n")
+            self._stage(record_path, record_bytes)
+            self._stage(record_signature_path,
+                        record_signature.hex().encode("ascii") + b"\n")
+            path.unlink()
+            signature_path.unlink()
+            self._fsync_root()
+        return record
 
 
 def _is_inside(candidate: Path, boundary: Path) -> bool:

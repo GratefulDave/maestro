@@ -902,5 +902,151 @@ class FinalizeOrchestration(unittest.TestCase):
             self.assertFalse(store.has(DIGEST))
 
 
+
+class ALegacyV1ReceiptStillReplays(unittest.TestCase):
+    """`reject_at` is required for v2, not for receipts written before it.
+
+    §6.5 keys replay on the digest alone. A signed `maestro-rubric.v1`
+    receipt omits `reject_at`; requiring the field for every version
+    makes previously finalized identities unusable after the upgrade.
+    """
+
+    def _install_signed_v1(self, store, seed, receipt_bytes):
+        payload = json.loads(receipt_bytes.decode("utf-8"))
+        payload.pop("reject_at", None)
+        payload["rubric_version"] = "maestro-rubric.v1"
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+        store.path_for(DIGEST).write_bytes(data)
+        store.signature_path_for(DIGEST).write_text(
+            rc.sign(seed, data).hex() + "\n", encoding="ascii")
+        return data
+
+    def test_a_signed_v1_receipt_parses_and_replays_after_the_v2_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, seed = make_store(Path(tmp))
+            first = WindowFactory(report=clean_report(matrix_for()))
+            written = fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=first,
+                occupancy_reader=lambda session: 0.4, sleep=first.sleep,
+                clock=lambda: 1_760_000_000.0)
+            self.assertFalse(written.replayed)
+            historical = self._install_signed_v1(
+                store, seed, store.path_for(DIGEST).read_bytes())
+
+            parsed = fin.Receipt.from_bytes(historical)
+            self.assertEqual(parsed.rubric_version, "maestro-rubric.v1")
+            self.assertIsNone(parsed.reject_at)
+            self.assertEqual(parsed.verdict, fin.Verdict.PASS)
+            self.assertEqual(store.load(DIGEST), parsed)
+
+            replay = WindowFactory(report=clean_report(matrix_for()))
+            outcome = fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=replay,
+                occupancy_reader=lambda session: 0.4, sleep=replay.sleep,
+                clock=lambda: 1_760_000_000.0)
+            self.assertTrue(outcome.replayed)
+            self.assertEqual(replay.launches, 0)
+            self.assertEqual(outcome.receipt.rubric_version,
+                             "maestro-rubric.v1")
+            self.assertIsNone(outcome.receipt.reject_at)
+
+
+
+class APreGradingV2ReceiptStillReplays(unittest.TestCase):
+    """`maestro-rubric.v2` names two receipt schemas.
+
+    Graded findings added `reject_at` and `DerivedCell.grade` without
+    moving the rubric version. Receipts finalized before that change
+    have neither key. Requiring the keys for every v2 receipt makes
+    those identities unusable — §6.5 digest-only replay, the same
+    breakage as v1, one version later.
+    """
+
+    def _install_signed_pre_grading_v2(self, store, seed, receipt_bytes):
+        payload = json.loads(receipt_bytes.decode("utf-8"))
+        payload.pop("reject_at", None)
+        payload["rubric_version"] = "maestro-rubric.v2"
+        for cell in payload["cells"]:
+            cell.pop("grade", None)
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+        store.path_for(DIGEST).write_bytes(data)
+        store.signature_path_for(DIGEST).write_text(
+            rc.sign(seed, data).hex() + "\n", encoding="ascii")
+        return data
+
+    def test_a_signed_pre_grading_v2_receipt_parses_verifies_and_replays(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, seed = make_store(Path(tmp))
+            first = WindowFactory(report=clean_report(matrix_for()))
+            written = fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=first,
+                occupancy_reader=lambda session: 0.4, sleep=first.sleep,
+                clock=lambda: 1_760_000_000.0)
+            self.assertFalse(written.replayed)
+            historical = self._install_signed_pre_grading_v2(
+                store, seed, store.path_for(DIGEST).read_bytes())
+
+            parsed = fin.Receipt.from_bytes(historical)
+            self.assertEqual(parsed.rubric_version, "maestro-rubric.v2")
+            self.assertIsNone(parsed.reject_at)
+            self.assertTrue(parsed.cells)
+            for cell in parsed.cells:
+                self.assertIsNone(cell.grade)
+            self.assertEqual(parsed.verdict, fin.Verdict.PASS)
+            self.assertEqual(store.load(DIGEST), parsed)
+
+            replay = WindowFactory(report=clean_report(matrix_for()))
+            outcome = fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=replay,
+                occupancy_reader=lambda session: 0.4, sleep=replay.sleep,
+                clock=lambda: 1_760_000_000.0)
+            self.assertTrue(outcome.replayed)
+            self.assertEqual(replay.launches, 0)
+            self.assertEqual(outcome.receipt.rubric_version,
+                             "maestro-rubric.v2")
+            self.assertIsNone(outcome.receipt.reject_at)
+            for cell in outcome.receipt.cells:
+                self.assertIsNone(cell.grade)
+
+    def test_a_receipt_written_today_still_requires_reject_at_and_grade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            factory = WindowFactory(report=clean_report(matrix_for()))
+            fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=factory,
+                occupancy_reader=lambda session: 0.4, sleep=factory.sleep,
+                clock=lambda: 1_760_000_000.0)
+            payload = json.loads(store.path_for(DIGEST).read_bytes())
+            self.assertIn("reject_at", payload)
+            self.assertTrue(payload["cells"])
+            for cell in payload["cells"]:
+                self.assertIn("grade", cell)
+            missing_threshold = dict(payload)
+            del missing_threshold["reject_at"]
+            with self.assertRaises(fin.ReceiptInvalid):
+                fin.Receipt.from_bytes(json.dumps(
+                    missing_threshold, sort_keys=True,
+                    separators=(",", ":")).encode())
+            missing_grade = json.loads(json.dumps(payload))
+            del missing_grade["cells"][0]["grade"]
+            with self.assertRaises(fin.ReceiptInvalid):
+                fin.Receipt.from_bytes(json.dumps(
+                    missing_grade, sort_keys=True,
+                    separators=(",", ":")).encode())
+
+
+
 if __name__ == "__main__":
     unittest.main()
