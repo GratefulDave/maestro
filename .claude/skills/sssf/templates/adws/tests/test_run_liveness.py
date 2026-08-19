@@ -240,6 +240,24 @@ class ALiveRunIsNeverCalledDead(unittest.TestCase):
                    host=HOST),
             "RUNNING")
 
+    def test_an_fqdn_and_its_short_name_are_the_same_host(self):
+        """A DHCP suffix change is not a host change. Live ledgers already
+        store FQDNs written by older `gethostname()`; they must keep matching
+        without a migration."""
+        rec = record(pid=41022, host="Mac.attlocal.net")
+        self.assertIs(
+            lc.scheduler_liveness(rec, is_alive=lambda _pid: False, host="Mac"),
+            False)
+        self.assertIs(
+            lc.scheduler_liveness(rec, is_alive=lambda _pid: False,
+                                  host="MAC"),
+            False)
+
+    def test_a_different_short_name_is_still_unknown(self):
+        rec = record(pid=41022, host="Mac")
+        self.assertIsNone(lc.scheduler_liveness(rec, host="OtherBox"))
+
+
     def test_pid_reuse_errs_towards_reporting_the_run_as_it_is(self):
         """A recycled pid reads alive. Wrong, and wrong in the safe direction:
         the run is reported exactly as it was before this change."""

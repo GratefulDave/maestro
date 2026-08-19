@@ -260,6 +260,27 @@ _ADDED_COLUMNS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...] = (
 )
 
 
+def _host_label(name: str) -> str:
+    """The first DNS label. An FQDN's DHCP suffix is not machine identity."""
+    return name.strip().split(".", 1)[0]
+
+
+def _host_identity(name: str) -> str:
+    return _host_label(name).casefold()
+
+
+def _same_scheduler_host(recorded: str, current: str) -> bool:
+    """True only when both names share a nonempty short label.
+
+    `Mac.attlocal.net` and `Mac` are the same machine after a network
+    change rewrote the suffix. `Mac` and `OtherBox` are not. Empty
+    identities do not match: unknown is not same-host.
+    """
+    left = _host_identity(recorded)
+    right = _host_identity(current)
+    return bool(left) and left == right
+
+
 def scheduler_host() -> str:
     """The machine whose pid namespace `scheduler_pid` was taken from.
 
@@ -270,9 +291,14 @@ def scheduler_host() -> str:
     likely alive here, so a dead scheduler would read as live forever. Stored
     beside the pid so the liveness question can be *declined* rather than
     answered wrongly (`scheduler_liveness` returns `None`).
+
+    Stored as the short hostname. `socket.gethostname()` may return an FQDN
+    whose domain suffix is a DHCP assignment and changes with the network;
+    that suffix is not identity, and comparing it as one made every run
+    recorded under the old suffix unresumable on the same laptop.
     """
     try:
-        return socket.gethostname()
+        return _host_label(socket.gethostname())
     except OSError:
         return ""
 
@@ -1804,15 +1830,18 @@ def scheduler_liveness(
       pane (§1.2).
     * `None` — no pid was recorded (a ledger older than the column), or it was
       recorded on another host, whose pid namespace this machine cannot be
-      asked about. Callers must treat `None` as "unknown" and never as "dead":
-      declaring a live run dead is the failure that would strand working work.
+      asked about. Host identity is the short hostname, case-insensitive:
+      a recorded FQDN still matches its own first label, so a DHCP suffix
+      change does not turn this machine into a stranger. Callers must treat
+      `None` as "unknown" and never as "dead": declaring a live run dead is
+      the failure that would strand working work.
     """
     pid = record.scheduler_pid
     if not pid or pid <= 0:
         return None
     recorded_host = record.scheduler_host
-    if recorded_host and recorded_host != (host if host is not None
-                                           else scheduler_host()):
+    current_host = host if host is not None else scheduler_host()
+    if recorded_host and not _same_scheduler_host(recorded_host, current_host):
         return None
     return bool(is_alive(int(pid)))
 

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,6 +121,27 @@ class StrandedRunningRetryTests(unittest.TestCase):
                 store.retry(RUN_ID, NODE_ID)
             self.assertIs(caught.exception.refusal,
                           st.EscapeRefusal.SCHEDULER_STILL_ALIVE)
+            self.assertIs(store.get_node(RUN_ID, NODE_ID).state,
+                          st.NodeState.RUNNING)
+            store.close()
+
+    def test_retry_admits_when_recorded_fqdn_matches_current_short_name(self):
+        """Live ledger: recorded Mac.attlocal.net, gethostname now Mac."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = lc.LifecycleStore(Path(tmp) / "lifecycle.db")
+            _stranded_blocked(store, pid=DEAD_PID, host="Mac.attlocal.net")
+            with mock.patch.object(lc, "scheduler_host", return_value="Mac"):
+                row = store.retry(RUN_ID, NODE_ID)
+            self.assertIs(row.state, st.NodeState.PENDING)
+            store.close()
+
+    def test_retry_refuses_when_short_names_differ(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = lc.LifecycleStore(Path(tmp) / "lifecycle.db")
+            _stranded_blocked(store, pid=DEAD_PID, host="Mac")
+            with mock.patch.object(lc, "scheduler_host", return_value="OtherBox"):
+                with self.assertRaises(lc.SchedulerLivenessUnknown):
+                    store.retry(RUN_ID, NODE_ID)
             self.assertIs(store.get_node(RUN_ID, NODE_ID).state,
                           st.NodeState.RUNNING)
             store.close()
