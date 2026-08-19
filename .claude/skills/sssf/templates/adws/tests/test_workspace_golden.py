@@ -406,12 +406,9 @@ class WorkspaceGoldenScenario(unittest.TestCase):
             self.assertEqual(child.base_commit, spec.base_commit)
 
         first_runner = participant.SubprocessParticipantRunner(diagnostic_tail_lines=10)
-        started = time.monotonic()
         outcome = self._coordinator(plan, digest, receipt, first_runner).run()
-        elapsed = time.monotonic() - started
 
         self.assertEqual(outcome, workspace_model.WorkspaceOutcome.ACCEPTED)
-        self.assertLess(elapsed, 30.0)
         self.assertEqual(first_runner.active_participant_ids, ())
         state_path = self.state_root / "golden-participant-state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))

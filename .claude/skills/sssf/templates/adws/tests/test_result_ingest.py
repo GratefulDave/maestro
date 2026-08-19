@@ -175,6 +175,8 @@ class ResultRowsAreWrittenTests(SchedulerFixture):
         rows = self._results()
         self.assertTrue(rows, "a fenced attempt's declared result vanished")
         self.assertEqual(rows[0]["payload"], self.PAYLOAD)
+        self.assertEqual(rows[0]["adjudication"],
+                         st.Adjudication.SUPERSEDED.value)
 
 
 # ── the adjudicator is not re-implemented here ──────────────────────────────

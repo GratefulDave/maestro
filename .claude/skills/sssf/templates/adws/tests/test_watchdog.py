@@ -251,6 +251,36 @@ class ProcessAliveSignalTests(unittest.TestCase):
             proc.kill()
             proc.wait(timeout=10)
 
+    def test_an_armed_agent_attempt_without_a_pid_is_not_process_dead(self):
+        """Agent pid is `handle.process_group`, unset by design until a
+        §9.8 receipt. The process-alive branch never runs."""
+        attempt = make_attempt(started_at=0.0, launched_at=0.0, pid=None)
+        watchdog = self._watchdog([attempt])
+        self.clock.set(0.001)
+
+        watchdog.check_once()
+
+        self.assertEqual(self.kill.calls, [])
+        self.assertEqual(self.fail.calls, [])
+
+    def test_module_docstring_states_process_alive_is_unreachable_for_agents(self):
+        """#35 — the first thing a reader of watchdog.py sees must name
+        the agent-node gap, not call the missing signal authoritative."""
+        doc = wd.__doc__ or ""
+        lowered = doc.lower()
+        self.assertIn("agent", lowered)
+        self.assertIn("unreachable", lowered)
+        self.assertTrue(
+            "§9.8" in doc or "16.3" in doc or "process_group" in doc,
+            doc)
+        for line in doc.splitlines():
+            if "authoritative" in line.lower() and "process" in line.lower():
+                self.assertRegex(
+                    line, r"(?i)not authoritative|agent",
+                    "process-alive must not be called authoritative "
+                    "without the agent-node qualification")
+
+
 
 class TurnCountSignalTests(unittest.TestCase):
 
