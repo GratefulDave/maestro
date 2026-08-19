@@ -62,8 +62,8 @@ is checked out with its runtime directory missing fails.
 `lexgenius/adws/` is **not** covered by that test. A deployed instance carries its own
 `maestro.config.yaml` and legitimately runs ahead of the template, so it is reconciled by hand.
 Treat this repo's template as authoritative for what the factory *ships*, but **verify before
-assuming it is current against a deployment** — `diff -rq` against the instance rather than
-trusting this file, which can itself go stale. When landing a change, say explicitly which copies
+assuming it is current against a deployment** — run `runtime_sync.py check` against the instance
+rather than trusting this file, which can itself go stale. When landing a change, say explicitly which copies
 you touched, and mirror deliberately rather than assuming a mirror already happened.
 
 **State as of 2026-08-19, re-derived by running the test.** `tests/test_template_parity.py`
@@ -79,38 +79,52 @@ unmerged `issues/sweep` branch. They have since been carved onto `carve/sweep-pa
 is also closed: both copies' `maestro.config.yaml` now carries `execution.review_reject_grade`.
 
 Two qualifications outrank any such snapshot, this one included. **the-library's mirror can be
-uncommitted there** — the four files this carve mirrored (2 modified, 2 untracked under
-`skills/sssf/templates/adws/`) are on disk and not in a commit. A `diff -rq` or a green parity run
-says the bytes on disk agree; it says nothing about whether they are committed, and an agent that
-resets or checks out in that repository takes the mirror with it. And the differing set moves while
+uncommitted there.** It is committed as of 2026-08-19 — 189 tracked files under
+`skills/sssf/templates/adws/`, working tree clean, that branch 13 commits ahead of its remote — but
+it has been uncommitted before, and the check that would catch it is not the parity test. A green
+parity run or a `runtime_sync check` says the bytes on disk agree; it says nothing about whether
+they are committed, and an agent that resets or checks out in that repository takes an uncommitted
+mirror with it. Confirm with `git status` there, not with parity. And the differing set moves while
 it is being measured, because other lanes write into this template concurrently: an earlier
 observation watched `test_agent_start_busy_retry.py` go from clean to modified minutes apart. Any
 comparison between these copies is a reading of a moving tree — run the test, do not trust this
 paragraph.
 
-`lexgenius-pipeline/adws/` reports the same six differing files and the same two absent-here tests,
-plus deployment-only `adw_data/`, `adw_sssf_config/`, and a stray `maestro.py.orig`. Its
-`code_review.py` now answers `1` to the `_node_goal` check below, so the M1 reviewer-contract fix
-has reached it — that deployment was brought level by hand on 2026-08-18, after the divergence had
-already been paid for by run `run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told
-"Make the gate '…' pass over selector '…', changing only the declared outputs" verbatim while the
-plan it was running carried the correct instruction (§19 M13). Nothing holds it level: `adws/` is
-**entirely untracked** in that checkout (`?? adws/` on branch `parked/cmo-consolidation-l-run`), so
-git there would neither preserve nor notice a change to it. Nothing enforces the level state and
-nothing would notice it drifting again (§16.3 item 50), so re-derive it rather than trusting this
-paragraph. `lexgenius/adws/` was not touched and is far behind: its most recent `adws/` commit is
-the reviewer-report fix, so it is missing every launcher, worktree, run-state, and
-reviewer-contract fix that landed after it — its `adw_modules/code_review.py` exists but answers
-`0` to the `_node_goal` check, so every reviewer in that deployment is still judging against the
-placeholder — and it holds files the template does not (`adw_data/`, `adw_sssf_config/`, a stray
-`worktree.py.orig`).
+Both deployments were mirrored from this template on 2026-08-19 and both now **track** `adws/` in
+git — `lexgenius-pipeline` at 196 files on branch `parked/cmo-consolidation-l-run`, `lexgenius` at
+199 on `chore/mirror-adws-runtime`, each under a commit named "Mirror ADW runtime from maestro into
+…". That is new. The earlier reading here recorded `adws/` as *entirely untracked* in
+lexgenius-pipeline, which meant git would neither preserve nor notice a change to it; that hazard is
+closed for both, and a mirror there is now a reviewable diff rather than an invisible overwrite.
 
-Do not read "level" as covering `lexgenius/adws/`, do not read it as a state anything
-maintains, and do not read a `diff -rq` filename as a cost — `code_review.py` was reported as differing the whole time it was silently degrading
-every review in that deployment. Re-derive this paragraph with `diff -rq` before relying on it;
-it is a dated observation, not an invariant, and the only invariant here is the parity test
-between the two template copies. For the one divergence with a known behavioural cost there is a
-direct check, which is cheaper than reading a diff and states what it means:
+Re-derived 2026-08-19 with `runtime_sync.py check`, which is the tool to use — not `diff -rq`, which
+reports a filename without saying which side is ahead:
+
+| comparison | result |
+| --- | --- |
+| template ↔ the-library | level over 189 files |
+| template ↔ `lexgenius-pipeline/adws/` | level over 188 files (`maestro.config.yaml` held out) |
+| template ↔ `lexgenius/adws/` | 5 files differ |
+
+The five, with the direction that decides what to do about each: `lexgenius` is ahead on
+`adw_modules/deliver.py` (+7), `tests/test_deliver.py` (+26), and `tests/test_step10_cli.py` (+58) —
+content that exists only there, which a mirror would destroy, which is why `runtime_sync` refuses
+it; the template is ahead on `tests/test_route_admission.py` (+98) and `tests/test_step7_launcher.py`
+(+439), the ordinary case a mirror resolves. Issue #71 tracks the per-file decision.
+
+`_node_goal` now answers `1` in **both** deployments, so the M1 reviewer-contract fix has reached
+each and no deployment's reviewers are still judging against the placeholder. lexgenius-pipeline was
+brought level by hand on 2026-08-18, after the divergence had already been paid for by run
+`run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told "Make the gate '…' pass over
+selector '…', changing only the declared outputs" verbatim while the plan it was running carried the
+correct instruction (§19 M13).
+
+Nothing enforces any of this and nothing would notice it drifting again (§16.3 item 50). Do not read
+"level" as a state anything maintains, and do not read a differing filename as a cost — `code_review.py`
+was reported as differing the whole time it was silently degrading every review in that deployment.
+Re-derive the table above before relying on it; it is a dated observation, not an invariant, and the
+only invariant here is the parity test between the two template copies. For the divergence with a
+known behavioural cost there is a direct check, cheaper than reading a diff and stating what it means:
 
 ```bash
 grep -c "def _node_goal" <deployment>/adws/adw_modules/code_review.py   # 0 = reviewers are judging against a placeholder
