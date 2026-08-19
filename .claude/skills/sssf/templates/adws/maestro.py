@@ -1615,6 +1615,27 @@ def _close_reviewer_pane(runner: "launcher.HerdrLauncher",
         }, sort_keys=True), file=sys.stderr)
 
 
+#: How a builder should look things up, appended to every agent-node prompt.
+#:
+#: An agent that reads whole files and greps the tree to find them spends its
+#: context on bytes it does not need, and a builder that runs out of context
+#: mid-attempt produces a partial change rather than an error. The routing
+#: skill costs one line here and is measured in tokens the attempt does not
+#: spend.
+#:
+#: This is guidance about tooling, not a term the attempt is judged on: it
+#: names no path, no gate and no output, so nothing here can change what
+#: verification asks. It is appended last for the same reason -- an agent that
+#: stops reading early has already been told everything it is judged on.
+AGENT_DISCOVERY_ROUTING = (
+    "Use the code-intel-routing skill to decide how to look something up "
+    "before you search: codemap for a known file's structure, LSP for a "
+    "symbol's definitions and references, codebase-memory for \"where does "
+    "this happen\", and grep only for an exact literal in a known path. It is "
+    "faster than reading files whole, and it leaves you the context to finish."
+)
+
+
 def _agent_node_prompt(node: Any, envelope: Path,
                        retry_prompt: Optional[str]) -> str:
     """The instruction, plus every term the attempt is actually judged on.
@@ -1624,6 +1645,11 @@ def _agent_node_prompt(node: Any, envelope: Path,
     what it declared. An agent sent the instruction alone is told none of that,
     so it cannot satisfy terms it was never given: it works, stops, writes no
     envelope, and the attempt fails clause 1 with the work discarded.
+
+    The prompt ends with `AGENT_DISCOVERY_ROUTING`, which is guidance rather
+    than a term: nothing hashes this text -- `plan_digest` takes no prompt
+    input and B13 measures only its byte size -- so appending to it changes no
+    identity and invalidates no receipt.
     """
     lines = [node.instruction, ""]
     outputs = list(getattr(node, "outputs", ()) or ())
@@ -1651,6 +1677,8 @@ def _agent_node_prompt(node: Any, envelope: Path,
         "Use \"success\": false if you could not finish, with the reason in "
         "the summary. The attempt is not verified without this file, and "
         "nothing else ends it.",
+        "",
+        AGENT_DISCOVERY_ROUTING,
     ])
     return "\n".join(lines)
 
