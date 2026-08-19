@@ -16,6 +16,8 @@ once, here, and every one of its steps is asserted by a test:
     check_at_create                 # §8.3's four checks, first evaluation
     pre-node gate                   # §7.4 — must FAIL, or GATE_NOT_FALSIFIABLE
     take_baseline                   # §8.3 — the bracket opens
+    record_baseline                 # §8.3 — and is written down, because
+                                    #   the provisioned tree is in no commit
     run the node                    # the agent, or the code node's command
     inventory / delta               # §8.3 — the bracket closes
     permission_check                # §7.3 clause 4, at measurement
@@ -1082,6 +1084,15 @@ class Scheduler:
             return
 
         baseline = wt.take_baseline(attempt)
+        # The bracket's before-side, written down while it still exists.
+        # `take_baseline` walks the *provisioned* tree, which includes paths
+        # git does not track and no commit holds. Once this process is gone
+        # that walk is unreproducible: re-deriving the baseline from the base
+        # commit sees tracked paths only, so every provisioned untracked path
+        # reads as content the attempt added. Anything that measures this
+        # attempt after the fact — `attempt salvage` today — reads this row,
+        # and refuses when it is absent rather than reconstructing it.
+        store.record_baseline(self.run_id, node.node_id, attempt_no, baseline)
         self._require_running(record)
 
         def on_launch(pid: Optional[int] = None) -> None:

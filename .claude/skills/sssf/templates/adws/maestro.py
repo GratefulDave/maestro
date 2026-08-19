@@ -50,6 +50,8 @@ from adw_modules import scheduler
 from adw_modules import scheduler_types
 from adw_modules import watchdog
 from adw_modules import worktree
+from adw_modules import salvage
+
 from adw_modules import workspace_author
 from adw_modules import workspace_canonical
 from adw_modules import workspace_digest
@@ -3462,6 +3464,64 @@ def _escape(args: argparse.Namespace) -> int:
         store.close()
 
 
+def _parse_salvage_seed(value: object) -> bytes:
+    if not value:
+        raise salvage.SalvageRefused(
+            "SALVAGE_SIGNING_REQUIRED",
+            "--signing-seed is required")
+    try:
+        seed = bytes.fromhex(str(value))
+    except (TypeError, ValueError) as exc:
+        raise salvage.SalvageRefused(
+            "SALVAGE_SIGNING_REQUIRED",
+            "signing seed must be hexadecimal") from exc
+    if len(seed) != receipt_crypto.SEED_SIZE:
+        raise salvage.SalvageRefused(
+            "SALVAGE_SIGNING_REQUIRED",
+            "signing seed must be a 32-byte Ed25519 seed")
+    return seed
+
+
+def _attempt_salvage(args: argparse.Namespace) -> int:
+    store = _store(args)
+    if store is None:
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    try:
+        result = salvage.salvage_attempt(
+            store,
+            run_id=args.run_id,
+            node_id=args.node_id,
+            attempt_no=args.attempt_no,
+            repo=Path(args.repo),
+            worktrees_root=Path(args.worktrees_root),
+            scratch_root=Path(args.scratch_root),
+            invoked_by=args.invoked_by,
+            reason=args.reason,
+            signing_seed=_parse_salvage_seed(args.signing_seed),
+            record_dir=Path(args.record_dir),
+        )
+        print(json.dumps({
+            "outcome": "SALVAGED",
+            "run_id": result.run_id,
+            "node_id": result.node_id,
+            "attempt_no": result.attempt_no,
+            "base_sha": result.base_sha,
+            "output_sha": result.output_sha,
+            "record": str(result.record_path),
+            "files": list(result.files),
+        }, sort_keys=True))
+        return 0
+    except salvage.SalvageRefused as exc:
+        payload = {"outcome": exc.outcome}
+        payload.update(exc.fields)
+        return _typed_refusal(payload, exc.detail)
+    except lc.UnknownNode as exc:
+        return _refusal("SALVAGE_ATTEMPT_ABSENT", str(exc))
+    finally:
+        store.close()
+
+
+
 def _plan_contract_layout() -> Dict[str, Any]:
     """The repository layout the plan-contract pipeline derives every path from."""
     config_path = _installed_config_path()
@@ -5126,6 +5186,23 @@ def build_parser() -> argparse.ArgumentParser:
     abandon.add_argument("node_id")
     _add_db(abandon)
     abandon.set_defaults(handler=_escape)
+
+    attempt = root.add_parser("attempt")
+    attempt_sub = attempt.add_subparsers(dest="attempt_command", required=True)
+    salvage_cmd = attempt_sub.add_parser("salvage")
+    salvage_cmd.add_argument("run_id")
+    salvage_cmd.add_argument("node_id")
+    salvage_cmd.add_argument("attempt_no", type=int)
+    salvage_cmd.add_argument("--invoked-by", required=True)
+    salvage_cmd.add_argument("--reason", required=True)
+    salvage_cmd.add_argument("--repo", default=".")
+    salvage_cmd.add_argument("--worktrees-root", required=True)
+    salvage_cmd.add_argument("--scratch-root", required=True)
+    salvage_cmd.add_argument("--record-dir", required=True)
+    salvage_cmd.add_argument("--signing-seed", required=True)
+    _add_db(salvage_cmd)
+    salvage_cmd.set_defaults(handler=_attempt_salvage)
+
 
     workspace = root.add_parser("workspace")
     workspace_sub = workspace.add_subparsers(

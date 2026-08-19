@@ -23,7 +23,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and a replay must not answer a question that changed under it. Carried with
   `tests/test_review_scope_bounding.py`; §19 M22 records the incident.
 
-||||||| e2ed9d6
 - `node.writes_are_sufficient`, a BLOCKING plan-review rubric check asked of every node, and the
   rubric version `maestro-rubric.v3` that carries it. `node.reads_are_sufficient` already asked
   whether a node's agent can do the work from what it is allowed to *read*; nothing asked the same
@@ -188,6 +187,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   environmental budget spent. See §19 M8 and §17 item 121.
 
 ### Fixed
+
+- `attempt salvage` no longer signs a receipt for bytes no attempt produced. The verb measured a
+  stranded attempt against a baseline it rebuilt with `worktree.inventory_at_commit` — `git
+  ls-tree` of the recorded base commit, which is tracked paths only. The measurement bracket's
+  real before-side is `worktree.inventory` of the *provisioned* tree, which §8.3 deliberately
+  keeps untracked non-ignored content in, so every path an adapter's `provision` or the pre-node
+  gate left behind read as a path the attempt had added. Where one of them fell under the node's
+  declared outputs — an ordinary glob such as `src/<pkg>/cmo/*.py` covering a provisioned
+  `__init__.py` — the permission check passed, `commit_measured_delta` committed the file as the
+  attempt's measured delta, and the Ed25519 salvage record asserted its sha256. That is a
+  complete, verifiable evidence chain for work that never happened, which is the failure §1.1
+  item 4 exists to prevent. The same reconstruction also disabled conjunct (2): a provisioned
+  file the attempt rewrote read as `added` rather than `changed`, and a glob is allowed to
+  authorize an addition, so tampering with provisioned content was admitted instead of convicted.
+
+  The scheduler now persists the baseline the moment `take_baseline` returns, into a new
+  `attempt_baselines` table keyed by `(run_id, node_id, attempt_no)`, with its sha256 digest
+  stamped onto the attempt row so the two records must agree before either is believed. Salvage
+  reads that record and refuses `SALVAGE_BASELINE_UNRECORDED` when an attempt predates it, rather
+  than falling back to the reconstruction — failing open was the defect, not a mitigation of it —
+  and `SALVAGE_BASELINE_CORRUPT` when the stored inventory and the stamped digest disagree. The
+  refusals are taken before the worktree is reopened, so a refused salvage writes no commit and
+  no record. The signed record now also names the `baseline_digest` the delta was measured
+  against.
+
+  `worktree.reopen_attempt_worktree` no longer returns the reconstruction in `baseline` at all.
+  It leaves the field `None`, so the defect is gone rather than merely unreachable from the one
+  caller that overrode it. `tracked_at_base` keeps its derivation from the base commit, which is
+  correct — tracking is a property of the commit. `permission_check` and `commit_measured_delta`
+  already refused a `None` baseline and now have tests pinning that they fail closed rather than
+  reading it as an empty one, together with the control that says why: measured against `{}` the
+  delta claims the tracked file and the provisioned file as well as the deliverable, which is
+  strictly worse than the substitution it would replace.
 
 - `tests/test_coordinator.py` no longer fails one to six of its cases at random under `pytest -n
   auto`, which is this suite's default (issue #50). Six of its thirty-two cases drive the

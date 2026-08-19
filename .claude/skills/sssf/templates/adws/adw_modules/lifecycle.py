@@ -30,6 +30,7 @@ combinations can prove it never raises and never falls outside the four.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -92,6 +93,22 @@ class ResumeRefused(LifecycleError):
 class SkipAncestryRefused(LifecycleError):
     """`skip --accept-sha` named a SHA that is not an ancestor of HEAD (§11.3).
     Skip does not bypass the ancestry proof."""
+
+
+class BaselineUnrecorded(LifecycleError):
+    """No measurement baseline was ever recorded for this attempt.
+
+    The distinguishing case: an attempt row written before the baseline was
+    persisted at all. Nothing may reconstruct the baseline from the attempt's
+    base commit to cover the gap — `git ls-tree` sees tracked paths only, and
+    the baseline deliberately includes provisioned untracked ones, so the
+    reconstruction reports every provisioned path as work the attempt added
+    (§1.1 item 4).
+    """
+
+
+class BaselineCorrupt(LifecycleError):
+    """A baseline exists but does not verify against its recorded digest."""
 
 
 class LedgerUnavailable(LifecycleError):
@@ -172,6 +189,24 @@ CREATE TABLE IF NOT EXISTS attempts (
   turn_count  INTEGER NOT NULL DEFAULT 0,
   retry_class TEXT,
   extra_json  TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (run_id, node_id, attempt_no)
+);
+CREATE TABLE IF NOT EXISTS attempt_baselines (
+  run_id         TEXT NOT NULL,
+  node_id        TEXT NOT NULL,
+  attempt_no     INTEGER NOT NULL,
+  -- sha256 over the canonical serialization of `inventory_json`. Duplicated
+  -- into `attempts.extra_json` so the attempt row itself binds the baseline
+  -- it was measured against: editing this table without editing that row is
+  -- a detectable mismatch rather than a silent substitution.
+  digest         TEXT NOT NULL,
+  -- The provisioned baseline inventory as {relpath: "<mode> <blob>"}. Its own
+  -- table rather than a key in `attempts.extra_json` because the attempt row
+  -- is read on every watchdog poll and every heartbeat, and a repo-sized
+  -- inventory parsed on each of those is a cost the row does not otherwise
+  -- carry.
+  inventory_json TEXT NOT NULL,
+  recorded_at    TEXT NOT NULL,
   PRIMARY KEY (run_id, node_id, attempt_no)
 );
 CREATE TABLE IF NOT EXISTS transitions (
@@ -565,6 +600,48 @@ def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: s
 
 # ── the store ────────────────────────────────────────────────────────────────
 
+# ── the recorded measurement baseline ────────────────────────────────────────
+
+#: Where the attempt row carries the digest of its recorded baseline. The
+#: inventory itself lives in `attempt_baselines`; this key is what binds the
+#: two, so a baseline swapped in that table without the attempt row's consent
+#: fails to verify instead of quietly redefining what the attempt started from.
+ATTEMPT_BASELINE_DIGEST_KEY = "baseline_digest"
+
+
+def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
+    """The baseline inventory as a JSON-safe mapping of path to "mode blob"."""
+    encoded: Dict[str, str] = {}
+    for rel, tuple_ in baseline.items():
+        mode, blob = tuple_
+        encoded[rel] = "{0} {1}".format(mode, blob)
+    return encoded
+
+
+def decode_baseline(encoded: Mapping[str, Any]) -> Dict[str, Tuple[str, str]]:
+    """The inverse of `encode_baseline`. Raises on anything it cannot parse."""
+    inventory: Dict[str, Tuple[str, str]] = {}
+    for rel, value in encoded.items():
+        if not isinstance(value, str):
+            raise BaselineCorrupt(
+                "baseline entry for {0!r} is not a string".format(rel))
+        mode, sep, blob = value.partition(" ")
+        if not sep or not mode or not blob:
+            raise BaselineCorrupt(
+                "baseline entry for {0!r} is not '<mode> <blob>'".format(rel))
+        inventory[rel] = (mode, blob)
+    return inventory
+
+
+def _baseline_bytes(encoded: Mapping[str, str]) -> bytes:
+    return json.dumps(encoded, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def baseline_digest(encoded: Mapping[str, str]) -> str:
+    """sha256 over the canonical serialization of an encoded baseline."""
+    return hashlib.sha256(_baseline_bytes(encoded)).hexdigest()
+
+
 class LifecycleStore:
     """SQLite-backed ledger for two of §5.3's three tiers.
 
@@ -660,6 +737,152 @@ class LifecycleStore:
             pid=pid, turn_count=turn_count,
             retry_class=st.RetryClass(retry_class) if retry_class else None,
             extra=json.loads(extra_json))
+
+    @serialized
+    def node_outputs(self, run_id: str, node_id: str) -> Tuple[str, ...]:
+        """The node's declared outputs, as stored when the run was created."""
+        row = self.conn.execute(
+            "SELECT outputs_json FROM dag_nodes WHERE run_id=? AND node_id=?",
+            (run_id, node_id)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id} has no dag row")
+        return tuple(json.loads(row[0]))
+
+    @serialized
+    def record_baseline(self, run_id: str, node_id: str, attempt_no: int,
+                        baseline: Mapping[str, Sequence[str]]) -> str:
+        """Persist the measurement baseline the bracket just opened on.
+
+        Written the moment `take_baseline` returns, because that walk is the
+        only thing that ever sees the provisioned tree. It covers paths git
+        does not track — an ecosystem's install output, a fixture the pre-gate
+        materialized — and those paths exist in no commit, so once the attempt
+        process is gone the baseline is unreconstructable from git. Anything
+        that later needs the attempt's before-side reads this row; nothing may
+        re-derive it from the base commit, which would report every
+        provisioned untracked path as content the attempt produced.
+
+        The digest is returned and also stamped on the attempt row, so the two
+        records have to agree before either is believed.
+        """
+        row = self.conn.execute(
+            "SELECT extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise UnknownNode(
+                f"{run_id}/{node_id}#{attempt_no}: no attempt row to record a baseline on")
+        encoded = encode_baseline(baseline)
+        digest = baseline_digest(encoded)
+        existing = self.conn.execute(
+            "SELECT digest FROM attempt_baselines"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if existing is not None and existing[0] != digest:
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} already recorded baseline "
+                f"{existing[0]}; a second, different baseline would rewrite "
+                "what the attempt started from")
+        payload = json.loads(row[0] or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+        payload[ATTEMPT_BASELINE_DIGEST_KEY] = digest
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO attempt_baselines"
+                " (run_id, node_id, attempt_no, digest, inventory_json, recorded_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (run_id, node_id, attempt_no, digest,
+                 json.dumps(encoded, sort_keys=True, separators=(",", ":")),
+                 now_iso()))
+            self.conn.execute(
+                "UPDATE attempts SET extra_json=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (json.dumps(payload, sort_keys=True), run_id, node_id, attempt_no))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return digest
+
+    @serialized
+    def attempt_baseline(self, run_id: str, node_id: str,
+                         attempt_no: int) -> Dict[str, Tuple[str, str]]:
+        """The recorded baseline, or a refusal. Never a reconstruction.
+
+        Raises `BaselineUnrecorded` when the attempt predates the recording,
+        and `BaselineCorrupt` when the stored inventory and the digest the
+        attempt row carries disagree. Both are refusals on purpose: the
+        alternative — falling back to the base commit's tree — is what turns
+        provisioned untracked content into a measured delta the attempt never
+        produced.
+        """
+        row = self.conn.execute(
+            "SELECT digest, inventory_json FROM attempt_baselines"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        attempt_row = self.conn.execute(
+            "SELECT extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if attempt_row is None:
+            raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
+        extra = json.loads(attempt_row[0] or "{}")
+        stamped = extra.get(ATTEMPT_BASELINE_DIGEST_KEY) if isinstance(extra, dict) else None
+        if row is None:
+            raise BaselineUnrecorded(
+                f"{run_id}/{node_id}#{attempt_no} recorded no measurement baseline")
+        digest, inventory_json = row
+        if stamped != digest:
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} carries baseline digest "
+                f"{stamped!r} but the stored baseline digests to {digest!r}")
+        try:
+            encoded = json.loads(inventory_json)
+        except json.JSONDecodeError as exc:
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} baseline is not JSON: {exc}") from exc
+        if not isinstance(encoded, dict):
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} baseline is not an object")
+        if baseline_digest(encoded) != digest:
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} baseline does not match its "
+                f"recorded digest {digest}")
+        return decode_baseline(encoded)
+
+    @serialized
+    def record_salvage(self, run_id: str, node_id: str, attempt_no: int,
+                       extra: Mapping[str, Any]) -> None:
+        """Merge salvage facts into the attempt row and close it if live.
+
+        Salvage does not transition the node: the post-gate never ran, so
+        VERIFIED/MERGED would launder an unmeasured predicate. The attempt
+        that produced the files is no longer live once those files have a
+        commit, so a RUNNING row is closed here the same way the other
+        escapes close it.
+        """
+        row = self.conn.execute(
+            "SELECT extra_json, state FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
+        try:
+            merged = json.loads(row[0] or "{}")
+        except json.JSONDecodeError:
+            merged = {}
+        if not isinstance(merged, dict):
+            merged = {}
+        merged.update(extra)
+        self.conn.execute(
+            "UPDATE attempts SET extra_json=?, state=CASE WHEN state=? THEN ? ELSE state END"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (json.dumps(merged, sort_keys=True),
+             st.NodeState.RUNNING.value, CLOSED_ATTEMPT_STATE.value,
+             run_id, node_id, attempt_no))
+
 
     @serialized
     def last_transition_at(self, run_id: str) -> float:
