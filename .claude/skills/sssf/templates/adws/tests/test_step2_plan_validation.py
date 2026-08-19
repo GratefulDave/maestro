@@ -466,6 +466,74 @@ class GateExecutability(ValidationTestCase):
         with self.assertRaises(pv.CollectorUnavailable):
             self.validate(collector=Missing())
 
+    def test_a_mixed_selector_is_admitted_when_its_existing_subset_collects(self):
+        """A selector spanning merged and unmerged work is the ordinary shape
+        of a lane's integration gate, and `all(path in produced ...)` refused
+        every one of them: one absent path makes the runner report zero for
+        the whole selector, which was then compared against a post-merge
+        `min_cases`. Measured on the plan that found this: 13 produced paths,
+        1 already merged, 0 collected, min_cases 116, GATE_EXECUTABLE."""
+        data = self.mapping()
+        data["nodes"][0]["gate"]["argv"] = ["tests/test_existing.py",
+                                            "tests/test_greeting.py"]
+        data["nodes"][0]["gate"]["min_cases"] = 116
+        result = self.validate(data)
+        self.assertEqual([b.message for b in result.blockers
+                          if b.obligation is pv.Obligation.GATE_EXECUTABLE], [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
+        # The subset that exists at base is what was collected, and the
+        # selector as authored never was.
+        self.assertIn("tests/test_existing.py", self.collector.calls)
+        self.assertNotIn("tests/test_existing.py tests/test_greeting.py",
+                         self.collector.calls)
+
+    def test_a_mixed_selector_whose_existing_subset_collects_nothing_blocks(self):
+        """The partition is not a waiver. A path that exists at base and
+        collects no case names nothing executable, and that is refusable
+        without `min_cases` entering into it."""
+        data = self.mapping()
+        data["nodes"][0]["gate"]["argv"] = ["README.md",
+                                            "tests/test_greeting.py"]
+        data["nodes"][0]["gate"]["min_cases"] = 116
+        found = self.assertBlocked(self.validate(data),
+                                   pv.Obligation.GATE_EXECUTABLE)
+        message = "\n".join(b.message for b in found)
+        self.assertIn("README.md", message)
+        self.assertIn("min_cases", message)
+        self.assertIn("collect 0 case(s)", message)
+
+    def test_an_all_produced_multi_path_selector_is_not_collected_against(self):
+        """The produced arm survives the partition, and is not a single-path
+        special case: every path being produced is what the arm asks."""
+        data = self.mapping()
+        data["nodes"][0]["outputs"] = ["src/greeting.py",
+                                       "tests/test_greeting.py",
+                                       "tests/test_more.py"]
+        data["nodes"][0]["gate"]["argv"] = ["tests/test_greeting.py",
+                                            "tests/test_more.py"]
+        data["nodes"][0]["gate"]["min_cases"] = 40
+        result = self.validate(data)
+        self.assertEqual([b.message for b in result.blockers
+                          if b.obligation is pv.Obligation.GATE_EXECUTABLE], [])
+        self.assertEqual(
+            [call for call in self.collector.calls
+             if call and "test_greeting" in call], [])
+
+    def test_an_all_existing_selector_below_min_cases_keeps_its_original_message(self):
+        """The regression guard on the arm that was already correct: with no
+        produced path in the selector, `min_cases` *is* a base quantity, and
+        both the comparison and its wording are unchanged."""
+        data = self.mapping()
+        data["nodes"][1]["gate"]["min_cases"] = 5
+        found = self.assertBlocked(self.validate(data),
+                                   pv.Obligation.GATE_EXECUTABLE)
+        self.assertEqual(
+            [b.message for b in found],
+            ["n-cover's selector collects 2 case(s) at base, below the "
+             "declared min_cases of 5"])
+        self.assertEqual([b.pointer for b in found],
+                         ["/nodes/1/gate/min_cases"])
+
 
 class BaseCommitAndBranches(ValidationTestCase):
     def test_a_base_commit_that_does_not_exist_blocks(self):

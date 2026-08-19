@@ -53,8 +53,8 @@ from __future__ import annotations
 
 import json
 import posixpath
-from typing import (Annotated, Any, Dict, List, Literal, Mapping, Optional,
-                    Sequence, Tuple, Type, Union)
+from typing import (Annotated, Any, Dict, Iterable, List, Literal, Mapping,
+                    Optional, Sequence, Tuple, Type, Union)
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -209,18 +209,93 @@ def selector_of(gate: Gate) -> Optional[str]:
     return " ".join(groups) if groups else None
 
 
+def _selector_path_tokens(tokens: Sequence[str]) -> Tuple[str, ...]:
+    """The path-shaped tokens of a selector, verbatim and in argv order.
+
+    One walk, three callers: `selector_paths` normalizes it,
+    `selector_string_paths` re-derives it from a projected selector string,
+    and `restrict_selector` uses the same walk to decide which tokens survive.
+    A second walk would be a second answer to "which token is a path", and
+    the selector is exactly where an all-or-nothing reading of that question
+    has already cost a run (§6.4).
+    """
+    ordered = tuple(tokens)
+    paths: List[str] = []
+    index = 0
+    while index < len(ordered):
+        token = ordered[index]
+        if token in SELECTOR_FLAGS and index + 1 < len(ordered):
+            index += 2
+            continue
+        if token in VALUE_FLAGS and index + 1 < len(ordered):
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        paths.append(token)
+        index += 1
+    return tuple(paths)
+
+
+def _normalized_selector_path(token: str) -> str:
+    """One selector token as a comparable path: `::` test id stripped."""
+    return posixpath.normpath(token.split("::", 1)[0])
+
+
 def selector_paths(gate: Gate) -> Tuple[str, ...]:
     """The selector's path-shaped groups, with any `::` test id stripped.
 
-    Used by §6.4's two-armed executability check to ask whether a selector
-    resolves entirely within paths the plan declares as produced.
+    Used by §6.4's executability check to partition a selector into the paths
+    the plan declares as produced and the paths that already exist at base.
     """
-    paths: List[str] = []
-    for group in _selector_groups(gate):
-        if group.startswith("-"):
+    return tuple(_normalized_selector_path(token)
+                 for token in _selector_path_tokens(gate.argv))
+
+
+def selector_string_paths(selector: str) -> Tuple[str, ...]:
+    """The same paths, from `selector_of`'s joined string rather than a gate.
+
+    `st.PlanNode` carries the selector as that string and no `Gate`, so the
+    scheduler cannot call `selector_paths`. It asked instead whether the
+    whole string equalled one declared output, which is true only of a
+    single-path selector: a two-path selector never matched, its pre-gate
+    exited 4 with no counts, and the attempt retried an identically absent
+    file until the ENVIRONMENTAL budget was gone.
+    """
+    return tuple(_normalized_selector_path(token)
+                 for token in _selector_path_tokens(selector.split()))
+
+
+def restrict_selector(gate: Gate, keep: Iterable[str]) -> Gate:
+    """`gate` with its selector narrowed to `keep`, everything else intact.
+
+    Flags, flag values, and `-k`-style selector flags travel unchanged; only
+    path-shaped tokens are filtered, and they are matched by the same
+    normalization `selector_paths` returns. The result is an ordinary `Gate`,
+    so it reaches the runner through `ResolvedRunner.collect_argv` like any
+    other gate — there is still exactly one place that turns a gate into a
+    collection invocation (`runner_resolution`, "one producer, one carrier").
+    """
+    wanted = {_normalized_selector_path(path) for path in keep}
+    ordered = tuple(gate.argv)
+    argv: List[str] = []
+    index = 0
+    while index < len(ordered):
+        token = ordered[index]
+        if ((token in SELECTOR_FLAGS or token in VALUE_FLAGS)
+                and index + 1 < len(ordered)):
+            argv.extend(ordered[index:index + 2])
+            index += 2
             continue
-        paths.append(posixpath.normpath(group.split("::", 1)[0]))
-    return tuple(paths)
+        if token.startswith("-"):
+            argv.append(token)
+            index += 1
+            continue
+        if _normalized_selector_path(token) in wanted:
+            argv.append(token)
+        index += 1
+    return gate.model_copy(update={"argv": tuple(argv)})
 
 
 def _is_noise(token: str) -> bool:

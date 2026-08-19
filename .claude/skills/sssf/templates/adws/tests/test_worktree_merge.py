@@ -607,6 +607,20 @@ class GateScope(WorktreeTestCase):
             cancel_requested=lambda: False, label="post-gate")
         self.assertTrue(post.green)
 
+    def test_a_multi_path_selector_reaches_the_runner_as_separate_paths(self):
+        """A selector is a set of paths. Appended as one argv element it named
+        a path that does not exist, so a two-path node gate exited 4 having
+        collected nothing -- and the path the caller already passed in `argv`
+        was repeated. The invoked process reports its own argv here, so this
+        is its answer rather than ours."""
+        attempt = _attempt(self.repo, self.root)
+        script = "import json, sys; print(json.dumps(sys.argv[1:]))"
+        gate = wt.run_node_gate(
+            attempt, _runner(sys.executable), ("-c", script, "tests/a.py"),
+            selector="tests/a.py tests/b.py", cancel_requested=lambda: False)
+        self.assertEqual(json.loads(gate.tail[-1]),
+                         ["tests/a.py", "tests/b.py"])
+
 
 
     def test_cancellation_at_any_gate_scope_is_a_typed_non_result(self):

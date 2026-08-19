@@ -923,7 +923,17 @@ def run_node_gate(attempt: AttemptWorktree, runner: "rr.ResolvedRunner",
         raise ValueError(
             "a node gate needs the node's own selector; whole-suite execution is "
             "run_integration_gate (§8.8), never an unscoped node gate")
-    return _run_gate(attempt.path, runner, list(argv) + [selector],
+    # The selector is appended token by token, and only where `argv` does not
+    # already carry it. Appended whole, as one argv element, it worked for a
+    # single-path selector by accident -- the caller in `maestro` passes the
+    # gate's own argv, which already contains the selector, and the runner
+    # deduplicated the repeat. A two-path selector appended the same way is
+    # one argv element reading "tests/a.py tests/b.py", a path that does not
+    # exist, and the gate exits 4 having collected nothing. Same shape as the
+    # validator's `all(path in produced ...)`: a selector is a set of paths,
+    # and treating it as one opaque string is only ever right for one path.
+    extra = [token for token in str(selector).split() if token not in argv]
+    return _run_gate(attempt.path, runner, list(argv) + extra,
                      attempt.scratch, label, "node", selector,
                      cancel_requested)
 

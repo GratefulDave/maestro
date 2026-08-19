@@ -37,6 +37,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `MAESTRO_architecture.md` records that `maestro plan review` dispatches no model.
+  `maestro.py::_plan_review` runs exactly `planctl review` followed by
+  `planctl validate --require-approved`, and stamps `reviewer.id` and `reviewer.vendor` from
+  configuration into the receipt it writes; the `reviewer:` configuration block's model, profile
+  and timeouts drive the node reviewer during a run, not this verb. The receipt is real, signed,
+  and bound to the IR bytes by `ir_sha256`. What it does not contain is a model's reading of the
+  plan, which contradicts §16.3 item 48's premise that `requirements[].surface` and
+  `requirements[].effects` get one independent read before a run, and contradicts what
+  `docs/plan-authoring.md`'s instruction to direct the plan reviewer's attention implies to a
+  reader. Registered as §16.3 item 55, with item 48 amended to point at it. No code changed.
+
 - **Plans authored before the admission obligations no longer validate, and their approvals are no
   longer reproducible.** `requirements[].surface`, `requirements[].effects` and
   `extensions.maestro.prohibited_effects` are required from their first version rather than
@@ -115,6 +126,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   against.
 
 ### Fixed
+
+- A gate selector is a set of paths, and three checks read it as a single opaque string.
+  `plan_validate._gate_executable` decided the produced arm of `MAESTRO_architecture.md` §6.4 with
+  `all(path in produced for path in paths)`, so a selector *mixing* test files an earlier plan had
+  already merged with files this run would create matched neither arm and was collected whole at
+  its base — where one absent path makes the runner refuse and report zero for the entire
+  selector. Measured with `pytest` 9.1.1: an already-merged test file collects 11 cases on its
+  own, and 0 when a single not-yet-written path is added to the same invocation. The consolidation
+  plan's integration gate — fourteen paths, thirteen produced by its own lanes, one merged
+  earlier — was therefore refused at ship with `GATE_EXECUTABLE`, "the integration gate's selector
+  collects 0 case(s) at base, below the declared min_cases of 116", and the only repairs available
+  to the author were to drop the merged test from the gate or to misdeclare `min_cases`: both
+  weaken the evidence the gate exists to produce. The check now partitions rather than choosing
+  between two arms. An all-produced selector is still not collected against; an all-existing
+  selector is still compared to `min_cases`, with its original message preserved byte for byte;
+  and a mixed selector collects only the paths that exist at base and must yield at least one
+  case, never comparing a partial base-time count to `min_cases`, which counts what the gate must
+  pass *after* merge. Two further instances of the same shape were found by searching for it
+  rather than waiting for it, and are fixed in the same change. `scheduler.py` decided whether a
+  selector named a path the node produces by testing the *joined* selector string against
+  `node.outputs`, which is true only of a single-path selector, so a multi-path node gate whose
+  declared output was absent at base classified ENVIRONMENTAL and retried an identically missing
+  file until its budget was gone. `worktree.run_node_gate` appended the selector as one argv
+  element, so a two-path selector reached the runner as the single path `tests/a.py tests/b.py`,
+  which exists nowhere; it had worked for single-path selectors only because the caller's argv
+  already carried the selector and the runner deduplicated the repeat. Neither sibling could fire
+  on any plan in use, whose node gates all name one path, so both were latent. `plan_model` gains
+  `_selector_path_tokens`, `selector_string_paths` and `restrict_selector`; the restricted
+  selector is an ordinary `Gate`, so collection still reaches the runner through the single
+  `runner_resolution` carrier. Recorded as §19 M14 with the lesson it binds (§17 item 127).
 
 - The reviewer is given the node's contract instead of a placeholder. `PlanNode` carried no
   `instruction` field and `Plan.to_plan_nodes` projected the node field by field, so the
