@@ -140,6 +140,9 @@ function dotClass(state: string): string {
           <span class="dim small">{{ fmtDate(run.created_at) }} · {{ span(run) }}</span>
           <span class="declared small" :class="{ none: !run.declared_outcome }">
             declared {{ run.declared_outcome ?? 'nothing yet' }}
+            <template v-if="run.declared_outcome === 'CANCELLED'">
+              · {{ run.cancel_cause ?? 'cause not recorded' }}{{ run.resumable ? ' · resumable' : '' }}
+            </template>
           </span>
         </div>
       </a>

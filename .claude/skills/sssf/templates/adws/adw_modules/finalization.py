@@ -602,12 +602,32 @@ def _require_created_at_epoch(value: object) -> None:
 
 @dataclass(frozen=True)
 class Receipt:
+    """One signed verdict about one digest, and everything that derived it.
+
+    `reject_at` is the grade threshold the review ran under, and it is the
+    other half of what `DerivedCell.grade` records. A grade decides nothing on
+    its own: a cell rejects when its check is BLOCKING **and** its grade
+    reaches the threshold, so a receipt carrying grades without the threshold
+    still records a verdict whose derivation cannot be re-checked from the
+    receipt alone — which is the exact argument that put the grade there, one
+    field short. It is `None` for plan finalization, whose verdict has no
+    threshold to run under, and it is written from the first version that
+    grades anything for §3.6 B8's reason: a field added after receipts exist is
+    optional forever.
+
+    The threshold is configuration (`execution.review_reject_grade`, §6.2), so
+    it can differ between the review and any later reading of it. That is
+    precisely why the receipt must carry the one the verdict was derived with
+    rather than let a reader supply today's.
+    """
+
     plan_digest: str
     rubric_version: str
     verdict: Verdict
     cells: Tuple[DerivedCell, ...]
     reviewer: ReviewerIdentity
     created_at_epoch: float
+    reject_at: Optional[str] = None
 
 
     def to_bytes(self) -> bytes:
@@ -623,6 +643,7 @@ class Receipt:
             "rubric_version": self.rubric_version,
             "verdict": self.verdict.value,
             "created_at_epoch": self.created_at_epoch,
+            "reject_at": self.reject_at,
             "reviewer": {
                 "route": self.reviewer.route,
                 "model": self.reviewer.model,
@@ -665,7 +686,7 @@ class Receipt:
             raise ReceiptInvalid("receipt bytes are not UTF-8 JSON") from exc
         expected = {
             "plan_digest", "rubric_version", "verdict", "created_at_epoch",
-            "reviewer", "cells",
+            "reject_at", "reviewer", "cells",
         }
         if not isinstance(payload, dict) or set(payload) != expected:
             raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
@@ -684,6 +705,9 @@ class Receipt:
             created_at_epoch = payload["created_at_epoch"]
             _require_created_at_epoch(created_at_epoch)
             verdict = Verdict(payload["verdict"])
+            reject_at = payload["reject_at"]
+            if reject_at is not None and not isinstance(reject_at, str):
+                raise ReceiptInvalid("receipt reject_at must be a string or null")
             derived_cells = []
             for cell in cells:
                 if (not isinstance(cell, dict) or set(cell) != {
@@ -719,7 +743,8 @@ class Receipt:
                 route=reviewer["route"],
                 model=reviewer["model"],
                 session_id=reviewer["session_id"]),
-            created_at_epoch=created_at_epoch)
+            created_at_epoch=created_at_epoch,
+            reject_at=reject_at)
 
 
 _PLAN_DIGEST = re.compile(r"^[0-9a-f]{64}$")

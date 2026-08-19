@@ -56,6 +56,7 @@ function insertRun(
     created_at: string;
     last_transition_at: string;
     latest_outcome: string | null;
+    cancel_cause: string | null;
     cancel_requested: number;
   }> = {},
 ) {
@@ -64,13 +65,15 @@ function insertRun(
     created_at: "2026-08-17T06:00:00+00:00",
     last_transition_at: "2026-08-17T06:05:00+00:00",
     latest_outcome: null,
+    cancel_cause: null as string | null,
     cancel_requested: 0,
     ...overrides,
   };
   db.query(
     `INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,
-                       latest_outcome, latest_outcome_at, cancel_requested)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                       latest_outcome, latest_outcome_at, cancel_cause,
+                       cancel_requested)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     runId,
     row.plan_digest,
@@ -78,6 +81,7 @@ function insertRun(
     row.last_transition_at,
     row.latest_outcome,
     row.latest_outcome === null ? null : row.last_transition_at,
+    row.cancel_cause,
     row.cancel_requested,
   );
 }
@@ -92,6 +96,7 @@ function insertNode(
     needs: string[];
     attempt_no: number;
     block_reason: string | null;
+    cancel_cause: string | null;
     output_sha: string | null;
     plan_digest: string;
   }> = {},
@@ -101,6 +106,7 @@ function insertNode(
     needs: [] as string[],
     attempt_no: 0,
     block_reason: null as string | null,
+    cancel_cause: null as string | null,
     output_sha: null as string | null,
     plan_digest: "d".repeat(64),
     ...opts,
@@ -112,9 +118,11 @@ function insertNode(
   ).run(runId, nodeId, o.plan_digest, o.depth, JSON.stringify(o.needs));
   db.query(
     `INSERT INTO node_lifecycle (run_id, node_id, state, attempt_no, block_reason,
-                                 output_sha, granted_extra_attempts, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, '2026-08-17T06:05:00+00:00')`,
-  ).run(runId, nodeId, state, o.attempt_no, o.block_reason, o.output_sha);
+                                 cancel_cause, output_sha,
+                                 granted_extra_attempts, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, '2026-08-17T06:05:00+00:00')`,
+  ).run(runId, nodeId, state, o.attempt_no, o.block_reason, o.cancel_cause,
+        o.output_sha);
 }
 
 function insertAttempt(
@@ -269,6 +277,183 @@ describe("run state", () => {
       }),
     );
     expect(db.run("run-x")?.state).toBe("CANCELLING");
+    db.close();
+  });
+
+  test("a cancellation that reached every node reads CANCELLED, not CANCELLING", () => {
+    // Issue #39. `cancel_requested` is a REQUEST and only a resume clears it,
+    // so checking it first made a finished cancellation render CANCELLING
+    // forever — both cancelled runs in the live ledger did exactly that. The
+    // node rows already say the run has stopped; that check has to come first,
+    // which is the order `lifecycle.derive_run_state` uses.
+    const db = new MaestroDb(
+      ledger("cancelled", (seed) => {
+        insertRun(seed, "run-done", {
+          latest_outcome: "CANCELLED",
+          cancel_cause: "RUN_CANCEL",
+          cancel_requested: 1,
+        });
+        insertNode(seed, "run-done", "merged-one", "MERGED");
+        insertNode(seed, "run-done", "stopped-one", "CANCELLED", {
+          cancel_cause: "RUN_CANCEL",
+        });
+      }),
+    );
+    const run = db.run("run-done");
+    expect(run?.state).toBe("CANCELLED");
+    expect(run?.declared_outcome).toBe("CANCELLED");
+    db.close();
+  });
+
+  test("a run abandoned node by node reads CANCELLED without the flag", () => {
+    // `abandon` writes no `cancel_requested`; the scheduler declares CANCELLED
+    // at quiescence. The declared outcome is the only thing that says so, and
+    // it is trustworthy HERE — a settled run cannot have moved past it.
+    const db = new MaestroDb(
+      ledger("abandoned", (seed) => {
+        insertRun(seed, "run-given-up", {
+          latest_outcome: "CANCELLED",
+          cancel_cause: "ABANDONED",
+        });
+        insertNode(seed, "run-given-up", "a", "CANCELLED", {
+          cancel_cause: "ABANDONED",
+        });
+        insertNode(seed, "run-given-up", "b", "CANCELLED", {
+          cancel_cause: "ABANDONED",
+        });
+      }),
+    );
+    expect(db.run("run-given-up")?.state).toBe("CANCELLED");
+    db.close();
+  });
+
+  test("a resumed run reads its node states, never its superseded outcome", () => {
+    // The control for the case above. Outside the settled branch the declared
+    // outcome describes a life the run has moved past, so it must not win.
+    const db = new MaestroDb(
+      ledger("resumed", (seed) => {
+        insertRun(seed, "run-back", {
+          latest_outcome: "CANCELLED",
+          cancel_cause: "RUN_CANCEL",
+          cancel_requested: 0,
+        });
+        insertNode(seed, "run-back", "merged-one", "MERGED");
+        insertNode(seed, "run-back", "working-one", "RUNNING");
+      }),
+    );
+    expect(db.run("run-back")?.state).toBe("RUNNING");
+    db.close();
+  });
+});
+
+describe("whether a cancelled run can be resumed", () => {
+  test("a RUN_CANCEL run says so, and an ABANDONED one says it cannot", () => {
+    const db = new MaestroDb(
+      ledger("resumable", (seed) => {
+        insertRun(seed, "run-stopped", {
+          latest_outcome: "CANCELLED",
+          cancel_cause: "RUN_CANCEL",
+          cancel_requested: 1,
+        });
+        insertNode(seed, "run-stopped", "a", "CANCELLED", {
+          cancel_cause: "RUN_CANCEL",
+        });
+        insertRun(seed, "run-given-up", {
+          latest_outcome: "CANCELLED",
+          cancel_cause: "ABANDONED",
+        });
+        insertNode(seed, "run-given-up", "a", "CANCELLED", {
+          cancel_cause: "ABANDONED",
+        });
+      }),
+    );
+
+    const stopped = db.run("run-stopped");
+    expect(stopped?.cancel_cause).toBe("RUN_CANCEL");
+    expect(stopped?.resumable).toBe(true);
+    expect(stopped?.nodes[0]?.cancel_cause).toBe("RUN_CANCEL");
+
+    const givenUp = db.run("run-given-up");
+    expect(givenUp?.cancel_cause).toBe("ABANDONED");
+    expect(givenUp?.resumable).toBe(false);
+    expect(givenUp?.nodes[0]?.cancel_cause).toBe("ABANDONED");
+    db.close();
+  });
+
+  test("an unrecorded cause is refused rather than read as a pause", () => {
+    // A ledger older than the migration. `resume_run` refuses it, so the
+    // dashboard must not offer a resume the CLI will decline.
+    const db = new MaestroDb(
+      ledger("uncaused", (seed) => {
+        insertRun(seed, "run-old", { latest_outcome: "CANCELLED" });
+        insertNode(seed, "run-old", "a", "CANCELLED");
+      }),
+    );
+    const run = db.run("run-old");
+    expect(run?.cancel_cause).toBeNull();
+    expect(run?.resumable).toBe(false);
+    db.close();
+  });
+
+  test("an ACCEPTED run is not resumable and a BLOCKED one is", () => {
+    const db = new MaestroDb(
+      ledger("outcomes", (seed) => {
+        insertRun(seed, "run-accepted", { latest_outcome: "ACCEPTED" });
+        insertNode(seed, "run-accepted", "a", "MERGED");
+        insertRun(seed, "run-blocked-2", { latest_outcome: "BLOCKED" });
+        insertNode(seed, "run-blocked-2", "a", "BLOCKED", {
+          block_reason: "SEMANTIC_BUDGET_EXHAUSTED",
+        });
+        insertRun(seed, "run-undeclared");
+        insertNode(seed, "run-undeclared", "a", "PENDING");
+      }),
+    );
+    expect(db.run("run-accepted")?.resumable).toBe(false);
+    expect(db.run("run-blocked-2")?.resumable).toBe(true);
+    // A NULL outcome means no scheduler ever declared quiescence, and a rule
+    // that refused it would make crash recovery unreachable (§7.3).
+    expect(db.run("run-undeclared")?.resumable).toBe(true);
+    db.close();
+  });
+
+  test("a ledger without the column answers null rather than failing", () => {
+    // The deployment ledger this dashboard actually points at has not run the
+    // migration. Naming an absent column in a SELECT is an error, not a null,
+    // so the query is built against the columns the file has.
+    const path = ledger("premigration", (seed) => {
+      seed.exec("ALTER TABLE runs DROP COLUMN cancel_cause");
+      seed.exec("ALTER TABLE node_lifecycle DROP COLUMN cancel_cause");
+      seed
+        .query(
+          `INSERT INTO runs (run_id, plan_digest, created_at,
+                             last_transition_at, latest_outcome,
+                             latest_outcome_at, cancel_requested)
+           VALUES (?, ?, '2026-08-17T06:00:00+00:00',
+                   '2026-08-17T06:05:00+00:00', 'CANCELLED',
+                   '2026-08-17T06:05:00+00:00', 1)`,
+        )
+        .run("run-old-schema", "d".repeat(64));
+      seed
+        .query(
+          `INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind, depth,
+                                  needs_json, outputs_json, specs_json)
+           VALUES (?, 'a', ?, 'agent', 0, '[]', '[]', '[]')`,
+        )
+        .run("run-old-schema", "d".repeat(64));
+      seed
+        .query(
+          `INSERT INTO node_lifecycle (run_id, node_id, state, attempt_no,
+                                       granted_extra_attempts, updated_at)
+           VALUES (?, 'a', 'CANCELLED', 1, 0, '2026-08-17T06:05:00+00:00')`,
+        )
+        .run("run-old-schema");
+    });
+    const db = new MaestroDb(path);
+    const run = db.run("run-old-schema");
+    expect(run?.state).toBe("CANCELLED");
+    expect(run?.cancel_cause).toBeNull();
+    expect(run?.resumable).toBe(false);
+    expect(run?.nodes[0]?.cancel_cause).toBeNull();
     db.close();
   });
 

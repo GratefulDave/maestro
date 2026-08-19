@@ -97,6 +97,7 @@ interface RunRow {
   last_transition_at: string | null;
   latest_outcome: string | null;
   latest_outcome_at: string | null;
+  cancel_cause: string | null;
   cancel_requested: number | null;
 }
 
@@ -109,6 +110,7 @@ interface NodeRow {
   state: string;
   attempt_no: number | null;
   block_reason: string | null;
+  cancel_cause: string | null;
   output_sha: string | null;
   granted_extra_attempts: number | null;
   updated_at: string | null;
@@ -220,7 +222,46 @@ export class MaestroDb {
     this.immutable = opened.immutable;
     this.dbStamp = stamp;
     this.db.exec("PRAGMA busy_timeout = 5000");
+    // A reopened file may be a different schema version from the one this
+    // object booted against, so the column map goes with the connection.
+    this.columnCache.clear();
     return this.db;
+  }
+
+  /**
+   * The columns a table actually has, per connection.
+   *
+   * `cancel_cause` arrived by migration, and a ledger written before it — or
+   * by a deployment copy that has not caught up — simply does not have it.
+   * Naming an absent column in a SELECT is an error, not a null, so the query
+   * is built against what is there. This is a *schema* probe, never a value
+   * default: an absent column yields `null`, which the dashboard renders as
+   * "not recorded" rather than as a cause it invented (§19.2).
+   */
+  private columnCache = new Map<string, Set<string>>();
+
+  private columns(db: Database, table: string): Set<string> {
+    const cached = this.columnCache.get(table);
+    if (cached) return cached;
+    const rows = db
+      .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+      .all();
+    const names = new Set(rows.map((row) => row.name));
+    this.columnCache.set(table, names);
+    return names;
+  }
+
+  /** `<alias>.<column>` when the table has it, else a typed NULL under the
+   * same name, so every row shape is the same whatever the ledger's age. */
+  private optionalColumn(
+    db: Database,
+    table: string,
+    alias: string,
+    column: string,
+  ): string {
+    return this.columns(db, table).has(column)
+      ? `${alias}.${column}`
+      : `NULL AS ${column}`;
   }
 
   runCount(): number {
@@ -259,9 +300,10 @@ export class MaestroDb {
 
   private runRows(runId?: string): RunRow[] {
     const db = this.freshDb();
+    const cause = this.optionalColumn(db, "runs", "runs", "cancel_cause");
     const sql =
       `SELECT run_id, plan_digest, created_at, last_transition_at,
-              latest_outcome, latest_outcome_at, cancel_requested
+              latest_outcome, latest_outcome_at, ${cause}, cancel_requested
          FROM runs`;
     return runId
       ? db.query<RunRow, [string]>(`${sql} WHERE run_id = ?`).all(runId)
@@ -269,10 +311,13 @@ export class MaestroDb {
   }
 
   private nodeRows(runId: string): NodeRow[] {
-    return this.freshDb()
+    const db = this.freshDb();
+    const cause = this.optionalColumn(
+      db, "node_lifecycle", "l", "cancel_cause");
+    return db
       .query<NodeRow, [string]>(
         `SELECT d.node_id, d.kind, d.depth, d.needs_json, d.outputs_json,
-                l.state, l.attempt_no, l.block_reason, l.output_sha,
+                l.state, l.attempt_no, l.block_reason, ${cause}, l.output_sha,
                 l.granted_extra_attempts, l.updated_at
            FROM dag_nodes d
            JOIN node_lifecycle l
@@ -297,6 +342,8 @@ export class MaestroDb {
         state: liveState(row, nodes),
         declared_outcome: row.latest_outcome,
         declared_outcome_at: row.latest_outcome_at,
+        cancel_cause: row.cancel_cause,
+        resumable: isResumable(row),
         cancel_requested: Boolean(row.cancel_requested),
         created_at: row.created_at,
         last_transition_at: row.last_transition_at,
@@ -377,6 +424,7 @@ export class MaestroDb {
       state: node.state,
       attempt_no: node.attempt_no ?? 0,
       block_reason: node.block_reason,
+      cancel_cause: node.cancel_cause,
       output_sha: node.output_sha,
       granted_extra_attempts: node.granted_extra_attempts ?? 0,
       updated_at: node.updated_at,
@@ -390,6 +438,8 @@ export class MaestroDb {
       state: liveState(row, nodeRows),
       declared_outcome: row.latest_outcome,
       declared_outcome_at: row.latest_outcome_at,
+      cancel_cause: row.cancel_cause,
+      resumable: isResumable(row),
       cancel_requested: Boolean(row.cancel_requested),
       created_at: row.created_at,
       last_transition_at: row.last_transition_at,
@@ -488,23 +538,68 @@ function firstVerdict(entries: MaestroTransition[]): string | null {
   return null;
 }
 
+/** §7.3's absolutely-terminal node states: nothing automatic leaves them. */
+const ABSOLUTELY_TERMINAL = new Set(["MERGED", "CANCELLED"]);
+
 /**
- * What a run is doing NOW, which is not what it last declared.
+ * What a run is doing NOW, which is usually not what it last declared.
  *
  * `runs.latest_outcome` is the last quiescence a scheduler declared and it
  * survives a resume, so a run that blocked, was rescued and is working again
  * still reads BLOCKED there. The dashboard shows both, and this is the one
  * that answers "is it moving".
+ *
+ * The order below is `lifecycle.derive_run_state`'s and must stay that way —
+ * the two are one rule in two languages, and the reason this reads `settled`
+ * before `cancel_requested` is the defect that made a finished cancellation
+ * render `CANCELLING` forever (issue #39). `cancel_requested` is a *request*,
+ * cleared only by a resume and by nothing else, so it says a stop was asked
+ * for and never that the stop is still in progress. The node rows say that,
+ * and once every one of them is absolutely terminal the run has stopped
+ * whatever any flag or any process is doing.
+ *
+ * The declared outcome is consulted in exactly one place: the settled branch,
+ * where it is the scheduler's own typed statement about a run that has already
+ * stopped and cannot be stale. Outside that branch it is deliberately ignored,
+ * because a resumed run's declaration describes a life the run has moved past.
  */
 function liveState(row: RunRow, nodes: { state: string }[]): string {
-  if (row.cancel_requested) return "CANCELLING";
   if (nodes.length === 0) return "EMPTY";
   const states = nodes.map((node) => node.state);
+  if (states.every((state) => ABSOLUTELY_TERMINAL.has(state))) {
+    if (row.cancel_requested || row.latest_outcome === "CANCELLED") {
+      return "CANCELLED";
+    }
+    if (states.every((state) => state === "MERGED")) return "MERGED";
+    return "QUIESCENT";
+  }
+  if (row.cancel_requested) return "CANCELLING";
   if (states.includes("RUNNING")) return "RUNNING";
-  if (states.every((state) => state === "MERGED")) return "MERGED";
   if (states.includes("BLOCKED")) return "BLOCKED";
   if (states.includes("PENDING")) return "PENDING";
   return "QUIESCENT";
+}
+
+/**
+ * Whether `run resume` will take this run.
+ *
+ * `resume_run` refuses ACCEPTED, refuses a CANCELLED whose cause is
+ * ABANDONED, refuses a CANCELLED with no recorded cause — a ledger older than
+ * the column, where reading an unrecorded cancellation as a pause is the guess
+ * that reopens an adjudicated run — and accepts a CANCELLED caused by
+ * RUN_CANCEL. An operator looking at a cancelled run could not tell those
+ * apart, which is what this answers.
+ *
+ * Everything else is resumable, including the run that declared nothing: a
+ * NULL latest outcome means no scheduler ever declared quiescence, and a
+ * legality rule that refused it would make crash recovery unreachable (§7.3).
+ */
+function isResumable(row: RunRow): boolean {
+  if (row.latest_outcome === "ACCEPTED") return false;
+  if (row.latest_outcome === "CANCELLED") {
+    return row.cancel_cause === "RUN_CANCEL";
+  }
+  return true;
 }
 
 /**

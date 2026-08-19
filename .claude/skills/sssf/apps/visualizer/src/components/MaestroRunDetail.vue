@@ -13,7 +13,7 @@
  * negative or inflated in-flight duration.
  */
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
-import { ChevronRight, GitBranch, TriangleAlert } from 'lucide-vue-next'
+import { Ban, ChevronRight, GitBranch, TriangleAlert } from 'lucide-vue-next'
 import type { MaestroAttempt, MaestroNode, MaestroRunDetail } from '../lib/types'
 import { ApiHttpError, fetchRun } from '../lib/api'
 import { fmtDate, fmtDuration, ts } from '../lib/format'
@@ -92,6 +92,21 @@ const serverNow = computed(() => nowMs.value - skewMs.value)
 
 const isLive = computed(
   () => run.value?.state === 'RUNNING' || run.value?.state === 'CANCELLING',
+)
+
+/**
+ * Why `run resume` will not take this cancelled run.
+ *
+ * The two refusals are not alike and an operator needs to know which they are
+ * looking at: an ABANDONED run gave every node up deliberately and nothing
+ * reopens it, while a run with no recorded cause is refused because the ledger
+ * predates the column and reading an unrecorded cancellation as a pause is the
+ * guess that reopens an adjudicated run.
+ */
+const notResumableWhy = computed(() =>
+  run.value?.cancel_cause === 'ABANDONED'
+    ? 'given up node by node — `run resume` is refused'
+    : 'cause unrecorded in this ledger — `run resume` is refused',
 )
 
 const elapsed = computed(() => {
@@ -189,6 +204,16 @@ function expanded(node: MaestroNode): boolean {
               </template>
             </span>
           </div>
+          <div v-if="run.declared_outcome === 'CANCELLED'" class="fact">
+            <span class="k">cancel cause</span>
+            <span class="v" :class="{ none: !run.cancel_cause }">
+              {{ run.cancel_cause ?? 'not recorded' }} ·
+              <template v-if="run.resumable">
+                <code>maestro run resume</code> will take it
+              </template>
+              <template v-else>{{ notResumableWhy }}</template>
+            </span>
+          </div>
           <div class="fact">
             <span class="k">started</span>
             <span class="v">
@@ -274,6 +299,13 @@ function expanded(node: MaestroNode): boolean {
 
             <div v-if="node.block_reason" class="blocked-why">
               <TriangleAlert :size="15" /> {{ node.block_reason }}
+            </div>
+
+            <div v-if="node.cancel_cause" class="blocked-why">
+              <Ban :size="15" /> cancelled · {{ node.cancel_cause }}
+              <template v-if="node.cancel_cause === 'ABANDONED'">
+                — the operator gave this node up; a resume does not reopen it
+              </template>
             </div>
 
             <div v-if="expanded(node)" class="attempts">

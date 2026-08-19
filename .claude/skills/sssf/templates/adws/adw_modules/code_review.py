@@ -205,10 +205,10 @@ def grade_at_or_above(grade: Optional[FindingGrade],
     """Whether `grade` reaches the rejection threshold.
 
     An absent grade is **not** at or above anything. Absent means "no grade is
-    recorded for this cell", which is reachable only from a receipt whose
-    ledger is missing (see `GradedCell.from_receipt_cell`). It is unreachable
-    from a report, because a report whose finding carries no grade does not
-    parse.
+    recorded for this cell", which since `DerivedCell.grade` is reachable only
+    from a receipt written before that field existed, or from a review family
+    that grades nothing (plan finalization). It is unreachable from a report,
+    because a report whose finding carries no grade does not parse.
     """
     if grade is None:
         return False
@@ -298,9 +298,10 @@ class CodeReviewerReport(fin.ReviewerReport):
 class GradedCell:
     """One answered cell, carrying both axes.
 
-    `severity` is stamped from the rubric by code. `grade` is the reviewer's,
-    and is `None` only for a cell reconstructed from a receipt, whose frozen
-    schema (§6.6) has no grade column.
+    `severity` is stamped from the rubric by code. `grade` is the reviewer's.
+    It is `None` only where no grade was ever assigned: a cell that is not a
+    finding, a review family that grades nothing, or a cell reconstructed from
+    a receipt written before `DerivedCell.grade` existed (§6.6).
     """
 
     check_id: str
@@ -330,18 +331,29 @@ class GradedCell:
 
     @classmethod
     def from_receipt_cell(cls, cell: fin.DerivedCell) -> "GradedCell":
-        """A stored receipt's cell, which does not predate a grade — it *has*
-        none.
+        """A stored receipt's cell, carrying the grade the receipt recorded.
 
-        The receipt schema is frozen and enumerated in both directions (§6.6),
-        so a grade cannot live in it and the grades live in the ledger written
-        beside it. This reconstruction is the fallback for a receipt whose
-        ledger is absent, and it reports `grade=None` rather than inventing
-        one: the verdict on that path comes from the signed receipt, never from
-        a re-derivation over guessed grades.
+        The receipt's frozen schema (§6.6) carries `grade` from the first
+        version that graded anything, so a receipt is a complete source for the
+        grades its verdict was derived from and this reconstruction reads them
+        rather than dropping them. It is the fallback for a receipt whose
+        ledger is absent, and the grade it reports is the signed one.
+
+        `grade=None` survives for the two cases where no grade was ever
+        assigned — a non-finding cell, and plan finalization, whose reviewer
+        has none to give — and for a receipt written before the field existed.
+        An unparseable grade string is read as absent rather than raised: the
+        verdict on this path is the receipt's signed one and is never
+        re-derived here, so a grade this version cannot name may change how a
+        finding is presented and must not be able to fail a replay.
         """
+        grade: Optional[FindingGrade]
+        try:
+            grade = None if cell.grade is None else FindingGrade(cell.grade)
+        except ValueError:
+            grade = None
         return cls(check_id=cell.check_id, object_id=cell.object_id,
-                   status=cell.status, severity=cell.severity, grade=None,
+                   status=cell.status, severity=cell.severity, grade=grade,
                    message=cell.message, canary=cell.canary)
 
 
@@ -576,23 +588,40 @@ def require_located_findings(graded: GradedVerdict) -> None:
             "{1} (B8)".format(len(rejecting), graded.reject_at.value))
 
 
-def receipt_findings(derived: fin.DerivedVerdict,
+def receipt_findings(derived: fin.DerivedVerdict, reject_at: FindingGrade,
                      ) -> Tuple[Tuple[GradedCell, ...], Tuple[GradedCell, ...]]:
-    """A stored receipt's findings, partitioned without its grades.
+    """A stored receipt's findings, partitioned by the grades it carries.
 
-    The fallback for a replayed receipt whose ledger is absent. The receipt's
-    frozen schema carries severity but not grade, so the only honest partition
-    available is the pre-grading one: a BLOCKING finding is reported as
-    rejecting, an ADVISORY one as recorded. It never re-derives the verdict —
-    the replayed verdict is the receipt's signed one — so a wider rejecting
-    list here changes what a retry prompt says and nothing else.
+    The fallback for a replayed receipt whose ledger is absent, and the reason
+    that fallback is no longer lossy. The ledger is written *after* the
+    receipt, deliberately — an unsigned file claiming a verdict must never
+    precede the signed record — so a crash in that window leaves a receipt with
+    no ledger, and before `DerivedCell.grade` that review's grades were gone
+    with it. They are not: the receipt carries the grade that decided each
+    cell, under the same signature as the verdict, so the partition here is the
+    one the original review derived rather than a severity-shaped
+    approximation of it.
+
+    A cell with no grade is partitioned on severity alone, which is the honest
+    answer for the two cases that produce one — a receipt written before the
+    field existed, and a review family that grades nothing — and is the old
+    behaviour, kept exactly where it is still the truth.
+
+    It never re-derives the verdict: the replayed verdict is the receipt's
+    signed one, and this partition decides only what a retry prompt says.
     """
-    cells = tuple(GradedCell.from_receipt_cell(cell) for cell in derived.cells
-                  if cell.canary is None
-                  and cell.status is fin.CellStatus.FINDING)
-    blocking = tuple(c for c in cells if c.severity is fin.Severity.BLOCKING)
-    advisory = tuple(c for c in cells if c.severity is not fin.Severity.BLOCKING)
-    return blocking, advisory
+    rejecting: List[GradedCell] = []
+    recorded: List[GradedCell] = []
+    for cell in derived.cells:
+        if cell.canary is not None or cell.status is not fin.CellStatus.FINDING:
+            continue
+        graded = GradedCell.from_receipt_cell(cell)
+        if (graded.rejects(reject_at) if graded.grade is not None
+                else graded.severity is fin.Severity.BLOCKING):
+            rejecting.append(graded)
+        else:
+            recorded.append(graded)
+    return tuple(rejecting), tuple(recorded)
 
 
 # ── B12: no actor reviews its own output ────────────────────────────────────
@@ -1155,7 +1184,13 @@ def review_attempt(
         reviewer=fin.ReviewerIdentity(route=outcome.session.route,
                                       model=outcome.session.model,
                                       session_id=outcome.session.session_id),
-        created_at_epoch=created_at_epoch)
+        created_at_epoch=created_at_epoch,
+        # The threshold beside the grades, because neither decides anything
+        # alone. Written from the first version that grades, for the same B8
+        # reason the grade itself is: a receipt that recorded the grades and
+        # not the bar they were measured against would still be a verdict
+        # nobody could re-derive from the signed record.
+        reject_at=graded.reject_at.value)
     replayed = False
     findings, advisories = graded.rejecting, graded.recorded
     try:
@@ -1171,9 +1206,10 @@ def review_attempt(
     else:
         # After the receipt, never before it: the receipt is the record the
         # merge turns on and must not be preceded by an unsigned file claiming
-        # a verdict it does not yet have. A crash in this window therefore
-        # leaves a receipt with no ledger, which `_replayed_findings` handles
-        # by falling back to the receipt's own severities.
+        # a verdict it does not yet have. A crash in this window leaves a
+        # receipt with no ledger; since `DerivedCell.grade` that costs the
+        # rationales and the recorded threshold, not the grades, because
+        # `_replayed_findings` reads those from the signed receipt.
         if ledger_path is not None:
             write_finding_ledger(
                 ledger_path, run_id=handoff.run_id, node_id=handoff.node_id,
@@ -1187,21 +1223,53 @@ def review_attempt(
 def _replayed_findings(receipt: fin.Receipt, ledger_path: Optional[Path],
                        reject_at: FindingGrade,
                        ) -> Tuple[Tuple[GradedCell, ...], Tuple[GradedCell, ...]]:
-    """A stored receipt's findings, with their grades where the ledger has them.
+    """A stored receipt's findings, partitioned by the grades that decided it.
 
-    The receipt is the authority for the verdict — signed, and already loaded
-    by the caller. The ledger beside it is the only place the grades exist, so
-    it is consulted for how to *present* those findings and for nothing else.
-    Absent or malformed, the partition falls back to the receipt's severities.
+    The receipt is the authority for the verdict — signed, already loaded by
+    the caller, and since `DerivedCell.grade` a complete record of the grades
+    that verdict was derived from. So both branches below report the grades the
+    original review actually derived, and neither invents one.
+
+    The ledger is preferred where it exists because it carries what the receipt
+    does not: each grade's `rationale`, and the threshold the review ran under.
+    Absent or malformed it costs those two fields and nothing else, which is
+    what makes the receipt-then-ledger write order (§1.2) free rather than paid
+    for in lost grades. It is consulted for how to *present* findings and for
+    nothing else — it is unsigned, so it can never be why a review fails.
     """
+    threshold = _recorded_threshold(receipt, reject_at)
     derived = fin.DerivedVerdict(verdict=receipt.verdict, cells=receipt.cells)
     if ledger_path is None:
-        return receipt_findings(derived)
+        return receipt_findings(derived, threshold)
     recorded = read_finding_ledger(ledger_path)
     if not recorded:
-        return receipt_findings(derived)
-    return (tuple(c for c in recorded if c.rejects(reject_at)),
-            tuple(c for c in recorded if not c.rejects(reject_at)))
+        return receipt_findings(derived, threshold)
+    return (tuple(c for c in recorded if c.rejects(threshold)),
+            tuple(c for c in recorded if not c.rejects(threshold)))
+
+
+def _recorded_threshold(receipt: fin.Receipt,
+                        configured: FindingGrade) -> FindingGrade:
+    """The threshold the stored verdict was derived under, not today's.
+
+    `reject_at` is configuration (§6.2) and an installation may raise or lower
+    it between a review and any later reading of it. Partitioning a replayed
+    receipt against the *current* value would report a finding as rejecting
+    that the signed verdict recorded as merged, or the reverse — a presentation
+    that contradicts the record it is presenting.
+
+    A receipt written before the field existed falls back to the configured
+    value, which is the only number available and is the old behaviour. So does
+    a threshold this version cannot name, for `from_receipt_cell`'s reason: the
+    verdict here is the receipt's signed one and is never re-derived, so an
+    unrecognised threshold must not be able to fail a replay.
+    """
+    if receipt.reject_at is None:
+        return configured
+    try:
+        return FindingGrade(receipt.reject_at)
+    except ValueError:
+        return configured
 
 
 def build_handoff(
