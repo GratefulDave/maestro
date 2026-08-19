@@ -375,15 +375,23 @@ class GradedVerdict:
     def derived(self) -> fin.DerivedVerdict:
         """The projection onto the receipt's cell shape.
 
-        Total over every field the receipt has: each graded cell yields exactly
-        one derived cell, and the only field with no counterpart is the grade,
-        which the frozen receipt schema cannot hold (§19, residual).
+        Total over every field the receipt has, the grade included: the grade
+        is what decided the verdict, so a receipt carrying the verdict without
+        it would record a conclusion whose derivation cannot be re-checked
+        from the receipt alone. `DerivedCell.grade` exists for that reason and
+        is written here from the first version that grades anything, because
+        §3.6 B8's rule is that a field added after receipts exist is optional
+        forever.
+
+        A cell that is not a finding has no grade to carry, and `None` is the
+        honest value rather than a default standing in for one.
         """
         return fin.DerivedVerdict(
             verdict=self.verdict,
             cells=tuple(fin.DerivedCell(
                 check_id=c.check_id, object_id=c.object_id, status=c.status,
-                severity=c.severity, message=c.message, canary=c.canary)
+                severity=c.severity, message=c.message, canary=c.canary,
+                grade=(c.grade.value if c.grade is not None else None))
                 for c in self.cells))
 
 

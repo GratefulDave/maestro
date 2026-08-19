@@ -517,12 +517,28 @@ def check_occupancy(occupancy: Optional[float], threshold: float = 0.8) -> None:
 
 @dataclass(frozen=True)
 class DerivedCell:
+    """One adjudicated cell of a receipt's matrix.
+
+    `grade` carries the reviewer's assessment of a *finding's consequence*
+    where the review family that produced it grades findings (node code
+    review, §19 M17). It is `None` for plan finalization, whose reviewer has
+    no grade to give, and for any cell that is not a finding.
+
+    It is optional because plan finalization's cells genuinely have no grade,
+    not because it may be omitted where one exists. It is written into the
+    receipt from the first version that grades anything, deliberately: §3.6
+    B8's rule is that a field added after receipts exist is optional forever,
+    and the grade is what decided the verdict, so a receipt without it records
+    a verdict whose derivation cannot be re-checked from the receipt alone.
+    """
+
     check_id: str
     object_id: str
     status: CellStatus
     severity: Severity
     message: str = ""
     canary: Optional[CanaryKind] = None
+    grade: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +636,7 @@ class Receipt:
                     "severity": cell.severity.value,
                     "message": cell.message,
                     "canary": None if cell.canary is None else cell.canary.value,
+                    "grade": cell.grade,
                 }
                 for cell in self.cells
             ],
@@ -671,7 +688,7 @@ class Receipt:
             for cell in cells:
                 if (not isinstance(cell, dict) or set(cell) != {
                         "check_id", "object_id", "status", "severity",
-                        "message", "canary"}):
+                        "message", "canary", "grade"}):
                     raise ReceiptInvalid(
                         "receipt cell fields do not match the frozen receipt schema")
                 if not all(isinstance(cell[field], str)
@@ -680,13 +697,17 @@ class Receipt:
                 canary = cell["canary"]
                 if canary is not None and not isinstance(canary, str):
                     raise ReceiptInvalid("receipt cell canary must be a string or null")
+                grade = cell["grade"]
+                if grade is not None and not isinstance(grade, str):
+                    raise ReceiptInvalid("receipt cell grade must be a string or null")
                 derived_cells.append(DerivedCell(
                     check_id=cell["check_id"],
                     object_id=cell["object_id"],
                     status=CellStatus(cell["status"]),
                     severity=Severity(cell["severity"]),
                     message=cell["message"],
-                    canary=None if canary is None else CanaryKind(canary)))
+                    canary=None if canary is None else CanaryKind(canary),
+                    grade=grade))
         except (KeyError, TypeError, ValueError) as exc:
             raise ReceiptInvalid("receipt values do not match the frozen receipt schema") from exc
         return cls(

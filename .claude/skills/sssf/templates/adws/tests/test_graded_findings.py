@@ -754,3 +754,53 @@ class PlanFinalizationVerdictsAreUnchangedTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class GradeSurvivesTheReceipt(unittest.TestCase):
+    """The grade that decided the verdict is inside the signed receipt.
+
+    Without this the receipt records a conclusion whose derivation cannot be
+    re-checked from the receipt alone: an auditor reading a FAIL could not
+    tell whether it was an ERROR that rejected or a WARNING that should not
+    have. §3.6 B8 is why it is here from the first version that grades
+    anything rather than added later as an optional field.
+    """
+
+    def _cell(self, grade):
+        return fin.DerivedCell(
+            check_id="diff.introduces_no_obvious_defect",
+            object_id="diff:abc", status=fin.CellStatus.FINDING,
+            severity=fin.Severity.BLOCKING, message="a located defect",
+            grade=grade)
+
+    def test_a_graded_cell_round_trips_through_the_receipt_bytes(self):
+        receipt = fin.Receipt(
+            plan_digest="d" * 64, rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.FAIL, cells=(self._cell("error"),),
+            reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
+            created_at_epoch=1)
+        restored = fin.Receipt.from_bytes(receipt.to_bytes())
+        self.assertEqual(restored.cells[0].grade, "error")
+        self.assertEqual(restored.verdict, fin.Verdict.FAIL)
+
+    def test_an_ungraded_cell_round_trips_as_none(self):
+        receipt = fin.Receipt(
+            plan_digest="e" * 64, rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.PASS, cells=(self._cell(None),),
+            reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
+            created_at_epoch=1)
+        self.assertIsNone(fin.Receipt.from_bytes(receipt.to_bytes()).cells[0].grade)
+
+    def test_a_receipt_without_the_grade_field_is_refused(self):
+        """The frozen schema requires the key, so an old-shaped cell fails
+        closed rather than silently deriving `None` for a grade that existed."""
+        receipt = fin.Receipt(
+            plan_digest="f" * 64, rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.FAIL, cells=(self._cell("error"),),
+            reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
+            created_at_epoch=1)
+        payload = json.loads(receipt.to_bytes())
+        del payload["cells"][0]["grade"]
+        with self.assertRaises(fin.ReceiptInvalid):
+            fin.Receipt.from_bytes(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
