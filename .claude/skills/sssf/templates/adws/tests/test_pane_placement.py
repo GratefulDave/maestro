@@ -199,7 +199,8 @@ class PanePlacementTest(unittest.TestCase):
             pane_group=group, pane_role=role, pane_group_size=size,
             environment=worktree_module.launch_env(self.scratch))
 
-    def build(self, *, workspace_label: str = "", **kwargs):
+    def build(self, *, workspace_label: str = "", factory=None,
+              factory_kwargs=None, **kwargs):
         harness = lch.HerdrLauncher(
             herdr_path=self.root / "herdr", omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"), admitted_routes=self.admitted,
@@ -207,9 +208,15 @@ class PanePlacementTest(unittest.TestCase):
         # These cases are about placement, not about the busy window; zero so
         # a refusal here would surface at once rather than after ten seconds.
         harness.agent_start_busy_window_s = 0.0
-        factory = _WorkspaceHerdr if workspace_label else _PlacementHerdr
+        if factory is None:
+            # `factory_kwargs` selects the vanishing-workspace fake without
+            # every existing caller having to know it exists.
+            factory = (_VanishingWorkspaceHerdr if factory_kwargs
+                       else (_WorkspaceHerdr if workspace_label
+                             else _PlacementHerdr))
         fake = factory(worktree=self.worktree,
-                       transcript=self.root / "session.jsonl", **kwargs)
+                       transcript=self.root / "session.jsonl",
+                       **(factory_kwargs or {}), **kwargs)
         harness._herdr = fake
         return harness, fake
 
@@ -647,6 +654,80 @@ class LayoutWiringTest(unittest.TestCase):
         # Exactly the run's launcher. The standalone reviewer and the plan
         # author are not runs and deliberately keep the pre-workspace path.
         self.assertEqual(labelled.count(True), 1)
+
+
+class _VanishingWorkspaceHerdr(_WorkspaceHerdr):
+    """A herdr whose workspace is destroyed under the run.
+
+    `tab create` answers `workspace_not_found` for the first `vanish_times`
+    calls, exactly as the real server did when a run's workspace was closed
+    mid-run, and succeeds afterwards.
+    """
+
+    def __init__(self, *, vanish_times: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.vanish_times = vanish_times
+        self.refused_workspaces = []
+
+    def __call__(self, *args, env=None, timeout=30.0):
+        if tuple(args[:2]) == ("tab", "create") and self.vanish_times > 0:
+            self.vanish_times -= 1
+            named = args[args.index("--workspace") + 1]
+            self.refused_workspaces.append(named)
+            self.calls.append(list(args))
+            raise lch.HerdrCallError(
+                'LAUNCH_REFUSED:{"error":{"code":"workspace_not_found",'
+                '"message":"workspace %s not found"},"id":"cli:tab:create"}'
+                % named,
+                "workspace_not_found")
+        return super().__call__(*args, env=env, timeout=timeout)
+
+
+class DestroyedWorkspaceTest(PanePlacementTest):
+    """#79. A run's workspace id is memoized, and nothing invalidated it when
+    herdr answered `workspace_not_found` — so every relaunch named the same
+    dead id, got the same refusal, and the node blocked
+    LAUNCHER_BUDGET_EXHAUSTED after spending attempts that could not have
+    succeeded. The operator is told a counter ran out; nothing was retryable.
+    """
+
+    def test_a_vanished_workspace_is_re_resolved_and_the_launch_succeeds(self):
+        harness, fake = self.build(workspace_label="run-1",
+                                   factory_kwargs={"vanish_times": 1})
+        handle = harness.launch(self.spec(group="node_a", role="builder",
+                                          size=2))
+        self.assertTrue(handle.pane_id)
+        created = fake.argv_for(("workspace", "create"))
+        self.assertEqual(len(created), 2,
+                         "the dead workspace must be replaced, not reused")
+        tabs = fake.argv_for(("tab", "create"))
+        first = tabs[0][tabs[0].index("--workspace") + 1]
+        last = tabs[-1][tabs[-1].index("--workspace") + 1]
+        self.assertNotEqual(first, last,
+                            "the retry must ask a different question")
+        self.assertEqual(fake.refused_workspaces, [first])
+
+    def test_the_cache_holds_the_new_workspace_afterwards(self):
+        """One re-resolution per vanishing, not one per launch: the next node
+        must not pay for it again."""
+        harness, fake = self.build(workspace_label="run-1",
+                                   factory_kwargs={"vanish_times": 1})
+        harness.launch(self.spec("run1-node_a-1", group="node_a", role="builder"))
+        before = len(fake.argv_for(("workspace", "create")))
+        harness.launch(self.spec("run1-node_b-1", group="node_b", role="builder"))
+        self.assertEqual(len(fake.argv_for(("workspace", "create"))), before,
+                         "the second node reused the re-resolved workspace")
+
+    def test_a_workspace_that_vanishes_twice_is_refused_rather_than_looped(self):
+        """Twice is not a stale cache. Something is destroying workspaces as
+        fast as this makes them, and a third ask re-poses a question already
+        answered the same way twice."""
+        harness, _fake = self.build(workspace_label="run-1",
+                                    factory_kwargs={"vanish_times": 2})
+        with self.assertRaises(lch.LaunchRefused) as caught:
+            harness.launch(self.spec(group="node_a", role="builder"))
+        self.assertIs(caught.exception.refusal, lch.LaunchRefusal.TAB_UNRESOLVED)
+        self.assertIn("vanished twice", str(caught.exception))
 
 
 def fake_env():

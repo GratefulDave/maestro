@@ -407,6 +407,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A destroyed Herdr workspace no longer burns the launcher budget on relaunches that cannot
+  succeed (issue #79). `HerdrLauncher` memoizes the run's workspace id — deliberately, since that
+  is what makes a run's placement a property of the run rather than of wherever focus happens to
+  sit — and nothing invalidated it when herdr answered `workspace_not_found`. Once the workspace
+  was destroyed mid-run, every subsequent `tab create` named the same dead id and got the same
+  refusal, the node spent its LAUNCHER_TRANSIENT budget on relaunches that re-asked a dead
+  question, and it blocked `LAUNCHER_BUDGET_EXHAUSTED` — telling an operator a counter ran out when
+  nothing was ever retryable. That is verbatim the failure `retry_policy.LauncherFailure`'s own
+  docstring describes `DETERMINISTIC_REFUSAL` as existing to prevent; the machinery was built and
+  wired, and this refusal simply never reached it.
+
+  The cache is now invalidated at the point the answer arrives. `_tab_create` raises on herdr's
+  typed `error.code` — never on message text, per §1.2 — clears the memo when the dead id is the
+  one it holds, and `_tab_for` re-resolves once and asks again. The retry is a *different*
+  question: `_run_workspace` creates a fresh workspace, so the run continues having spent nothing.
+
+  A workspace that vanishes twice in one launch is refused `TAB_UNRESOLVED` rather than retried
+  again. Twice is not a stale cache — something is destroying workspaces as fast as the launcher
+  makes them, and a third ask re-poses a question already answered the same way twice.
+
+  `TAB_UNRESOLVED` keeps its non-deterministic classification, which is right for what it names: a
+  tab herdr declines to create in a live workspace genuinely may succeed next time. The determinism
+  here was never a property of the refusal kind — it was a property of the cache, which is where it
+  is now fixed.
+
 - `skip --accept-sha` names an abbreviated SHA as a shape defect instead of reporting it as an
   ancestry failure (issue #78). `worktree.is_valid_output_commit` folds shape, existence and
   ancestry into one boolean — correct for a predicate, useless for a diagnostic — so a SHA that
