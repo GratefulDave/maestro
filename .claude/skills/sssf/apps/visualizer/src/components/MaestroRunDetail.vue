@@ -339,10 +339,28 @@ function expanded(node: MaestroNode): boolean {
 
       <section v-if="run.results.length" class="results">
         <h2>results</h2>
+        <!--
+          `adjudication` says the agent's declared envelope was accepted as
+          well-formed. It is not the reviewer's verdict on the work, and a
+          bare ACCEPTED badge here read as one: in
+          run-9e9ac412669140039ae078601048f6c7 all nine result rows showed
+          ACCEPTED, including `lane-p2-s3-inventory` a2, which was settled
+          retry:SEMANTIC on the blocking check
+          `diff.implements_the_stated_instruction` at the same time. The
+          review verdict lives in the transition's detail_json, not here.
+        -->
+        <p class="results-note">
+          envelope adjudication only — whether the agent's declared result
+          parsed and bound to this attempt. The reviewer's verdict is on the
+          node's transitions, not here.
+        </p>
         <div v-for="(result, i) in run.results" :key="i" class="result">
           <div class="result-head">
             <code>{{ result.node_id }}#{{ result.attempt_no }}</code>
-            <span class="adjudication">{{ result.adjudication ?? 'unadjudicated' }}</span>
+            <span
+              class="adjudication"
+              title="Envelope adjudication: the agent's declared result was accepted as well-formed and bound to this attempt. Not the code reviewer's verdict."
+            >envelope {{ result.adjudication ?? 'unadjudicated' }}</span>
             <span class="dim">{{ fmtDate(result.created_at) }}</span>
           </div>
           <pre>{{ JSON.stringify(result.payload, null, 2) }}</pre>
@@ -719,6 +737,15 @@ function expanded(node: MaestroNode): boolean {
 
 .adjudication {
   color: var(--cyan);
+}
+
+/* Deliberately dim rather than a warning colour: the note is orientation, not
+   an alert. What it must not be is invisible, since its whole job is to stop
+   the badge beside it being read as the reviewer's verdict. */
+.results-note {
+  margin: 0 0 10px;
+  color: var(--dim);
+  max-width: 70ch;
 }
 
 .dim {
