@@ -41,6 +41,7 @@ sys.path.insert(0, str(ADWS))
 
 from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import watchdog as wd  # noqa: E402
 
 
 HOST = "test-host"
@@ -574,6 +575,20 @@ class AResumedAcceptanceWindowIsMerged(unittest.TestCase):
                  "stopped": st.NodeState.MERGED,
                  "given-up": st.NodeState.CANCELLED})
             self.assertEqual(lc.derive_run_state(rec, nodes), "CANCELLED")
+
+
+class SignalPidIdentity(unittest.TestCase):
+    """#37 -- a pid alone is not proof of process identity, so the start
+    epoch that identifies a process has to be finer than the second a
+    pid can be reused within."""
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "a process start epoch is only derivable on Darwin and Linux")
+    def test_darwin_start_is_not_whole_second_only(self):
+        started = wd.process_start_epoch(os.getpid())
+        self.assertIsNotNone(started)
+        self.assertNotEqual(started, float(int(started)))
 
 
 if __name__ == "__main__":

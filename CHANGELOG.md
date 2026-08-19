@@ -8,6 +8,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `code_review.FindingScope`: the reviewer's third axis, required on every finding from v1 —
+  `in_scope` when the fix is an edit to a path the node declared, `out_of_scope` when the only
+  edit that answers it writes a path the node was forbidden to write. A blocking, at-threshold
+  finding cannot refuse a merge on a forbidden remedy (`GradedCell.rejects`), because a rejection
+  whose repair the permission check convicts is a retry loop with no exit; it is recorded instead,
+  in `GradedVerdict.unreachable`, `ReviewOutcome.unreachable`, the finding ledger's `scope` and
+  `unreachable` columns, and a retry-guidance section that tells the builder not to attempt it.
+  `CODE_RUBRIC`'s two unbounded questions —
+  `diff.implements_the_stated_instruction` and `diff.gate_is_passed_on_the_merits` — now name the
+  declared write scope in the question text, and `ReviewHandoff.render` states the bound directly
+  under the paths it bounds. Rubric version moves to `maestro-code-rubric.v2` and the finding
+  ledger to `maestro-code-review-findings.v2`, because `review_digest` binds the rubric version
+  and a replay must not answer a question that changed under it. Carried with
+  `tests/test_review_scope_bounding.py`; §19 M22 records the incident.
+
+||||||| e2ed9d6
+- `node.writes_are_sufficient`, a BLOCKING plan-review rubric check asked of every node, and the
+  rubric version `maestro-rubric.v3` that carries it. `node.reads_are_sufficient` already asked
+  whether a node's agent can do the work from what it is allowed to *read*; nothing asked the same
+  question of what it is allowed to *write*. A node's `outputs` are its entire write permission —
+  single-producer ownership gives each path to exactly one node and the attempt permission check
+  convicts any diff touching an undeclared path — so a node whose instruction can only be
+  discharged by editing another node's output is unsatisfiable from its first attempt: the reviewer
+  rejects every diff that does not wire production and the permission check would reject every diff
+  that does. In run `run-2a44d226e75a4be391a14f02b78a6d25` that cost node
+  `lane-p4-enrichment-ordering` eight attempts, six reviews, six builder sessions, a launcher
+  failure and a turn timeout before `BLOCKED`/`REVIEW_BUDGET_EXHAUSTED`, on a property of the
+  authored bytes that one plan-review cell now settles. The question is phrased over the
+  instruction, not over the shape of `outputs`: a node that creates a module nothing at base yet
+  imports is the ordinary case and passes whenever a downstream node owns the wiring. Carried with
+  `tests/test_node_write_scope.py`, whose control half asserts the legitimate new-module node still
+  finalizes PASS.
+
+  No mechanical refusal accompanies it, deliberately. Both structurally decidable signals were
+  tested against the incident plan and refuted by it: "a node whose outputs contain no path
+  existing at `base_commit`" fires on ten of that plan's twelve nodes and on every legitimate
+  new-module node, and "a plan in which no node declares a pre-existing file" does not fire on the
+  incident plan at all, because two of its nodes did. `plan_validate.py` is unchanged and the
+  twelve obligations are still twelve.
+
+  The version bump adds no receipt key and requires none. `Receipt.from_bytes` still discriminates
+  the graded payload shape on the presence of `reject_at` rather than on the rubric label (§19
+  M21), so every signed `maestro-rubric.v1` and pre-grading `maestro-rubric.v2` receipt still
+  parses, still verifies against its original signature, and still replays with zero reviewer
+  launches — asserted directly rather than assumed. The new question is nonetheless mandatory from
+  v3 onward rather than optional forever (§3.6 B8): it is a matrix cell, and `verify_report`
+  refuses a report that leaves any cell unanswered.
+
 - `maestro._validate_review_clocks`: refuses a review window the remaining live bound cannot hold.
   `reviewer.turn_timeout_s` must be under `reviewer.finalization_timeout_s`, or one silent turn
   consumes the whole review window; `finalization_timeout_s` and `node_timeout_s +
@@ -24,6 +72,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   integration branch pointed at and never compared the two (#32). Identity is the resolved commit
   object, so an abbreviated SHA or a tag that names the same commit is admitted. Carried with
   `tests/test_base_commit_enforcement.py`.
+
+- `watchdog.process_start_epoch`, the wall-clock start of a pid, with a Darwin implementation
+  reading `proc_pidinfo`'s `PROC_PIDTBSDINFO` at microsecond resolution. A pid is not proof of
+  process identity: `os.kill(pid, 0)` answers only that *something* holds the pid, and the
+  whole-second clock `ps lstart` exposes cannot separate a process from a reuse of its pid within
+  the same second (#37) - so anything that signals or convicts on a recorded pid alone can reach a
+  different process than the one it recorded. Linux answers from `/proc/<pid>/stat` at clock-tick
+  resolution. On any other platform it refuses, returning `None`, which a caller must read as
+  "identity unproven" rather than as "the same process"; returning a coarse or fabricated start
+  there would let a reused pid pass for the original, which is the failure the probe exists to
+  prevent. Carried with `SignalPidIdentity` in `tests/test_run_liveness.py`. The probe has no
+  production caller yet - the scheduler-pid identity check that consumes it has not landed - so it
+  is recorded as a named `DEFERRED` row in `tests/test_no_dead_seams.py` rather than left as a
+  silent dead seam; landing that caller means deleting the row.
 
 - A one-command launcher for the visualizer, `bin/maestro-viz`, reachable from any directory as
   `just -g viz`. The only invocation that started a working visualizer was `bun run dev:all` from

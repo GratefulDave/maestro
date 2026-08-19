@@ -153,6 +153,51 @@ def test_mdl_cases_carries_a_docket_number():
   zero or several verifiers is refused with `maestro.lane_gate`. When a lane genuinely needs two
   independent checks, either widen one command's selector to cover both or split the lane.
 
+## What a lane's outputs must cover
+
+A lane's `outputs` are not a summary of what it will touch. They are its entire write permission.
+Exactly one lane may own a path — a second lane declaring it is refused with
+`SINGLE_OUTPUT_OWNER` — and the attempt's permission check convicts any diff that touches a path
+the lane did not declare. Nothing in between exists: a file is yours to write or it is not.
+
+So a lane's instruction has to be dischargeable inside that permission. Write the instruction and
+the outputs together, and ask one question before shipping: **could an agent satisfy this sentence
+by changing only these files?**
+
+An instruction that fails that question is unsatisfiable from its first attempt, and the failure is
+silent. The reviewer correctly rejects every diff that does not do what the instruction says; the
+permission check would correctly reject every diff that does. The lane then spends its whole review
+budget alternating between the two before ending `BLOCKED` with `REVIEW_BUDGET_EXHAUSTED` — with a
+green gate and a rising case count every attempt, because the work it *was* permitted to do was
+fine. The finalization reviewer — `maestro plan finalize`, which `maestro plan ship` runs — now
+asks this of every lane as `node.writes_are_sufficient`, BLOCKING, so the answer costs one review
+cell instead of a run, and a lane that fails it is fixed in the next authoring round.
+
+The shape that trips it is an end-to-end behavioural claim over code the lane does not own:
+
+```
+# refused — the property is about src/dispatch.py, which another lane owns
+lane: enrichment-ordering
+outputs: [src/enrichment_gate.py, tests/test_enrichment_gate.py]
+instruction: "run enrichment only after binary and identity validation"
+```
+
+Two ways to fix it, and the choice is a real one:
+
+- **Give the lane the wiring.** Add the production file to its `outputs`, which means no other lane
+  may own it. Use this when the ordering *is* the work.
+- **Split it, and make the wiring a lane.** One lane produces the module and says so — "add
+  `src/enrichment_gate.py` exposing `enrich_after_validation`; wiring it into dispatch belongs to
+  `lane-dispatch-wiring`" — and a downstream lane owns `src/dispatch.py` and calls it. Both lanes
+  pass, because each instruction stops at the files its lane may write.
+
+A lane whose outputs are all new files is not itself suspect; it is the ordinary case, and most
+lanes in a greenfield package look like that. What is suspect is a lane whose *sentence* only comes
+true once some file it may not write changes. If nothing in the plan ever wires the new module into
+the codebase, that is a different defect and a different check —
+`plan.intent_is_accomplished_by_the_graph`, which asks whether the lanes taken together leave
+anything load-bearing unowned.
+
 ## Several repositories
 
 There is no multi-repository Plan IR. Each repository runs the whole single-repository sequence to
