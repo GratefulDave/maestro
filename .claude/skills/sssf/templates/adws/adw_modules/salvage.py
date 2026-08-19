@@ -60,6 +60,11 @@ class SalvageResult:
     record_path: Path
     signature_path: Path
     files: Tuple[Dict[str, Any], ...]
+    #: Declared outputs on disk that git will not commit, so `output_sha` does
+    #: not carry them. `None` means the question could not be asked — this
+    #: attempt's baseline predates the recorded ignored-at-base map — and is
+    #: not the same as the empty tuple, which is a measured "none" (#67).
+    uncommittable_outputs: Optional[Tuple[str, ...]] = None
 
 
 def _require_stated(value: object, field: str) -> str:
@@ -202,6 +207,34 @@ def _recorded_baseline(store: lc.LifecycleStore, run_id: str, node_id: str,
             run_id=run_id, node_id=node_id, attempt_no=attempt_no) from exc
 
 
+def _recorded_ignored_at_base(store: lc.LifecycleStore, run_id: str,
+                              node_id: str,
+                              attempt_no: int) -> Optional[Dict[str, str]]:
+    """The attempt's ignored-at-base map, or `None` for "nobody looked".
+
+    Deliberately not a refusal, and deliberately not `{}`. Salvage exists so
+    an operator with stranded work has a verb instead of hand-rolled git, and
+    refusing every attempt whose baseline predates `ignored_json` would take
+    that verb away from exactly the runs most likely to need it. `{}` is not
+    available either: it claims the tree held no ignored files when the
+    bracket opened, and measuring against that claim reports a whole
+    provisioned dependency tree as content the attempt wrote.
+
+    So the third answer is the honest one — the map is unknown, the
+    uncommittable-output question cannot be asked of this attempt, and the
+    signed record says which of the two it was (#67).
+
+    A *corrupt* map is still a refusal, because that is a ledger that
+    disagrees with itself rather than one that predates a column.
+    """
+    try:
+        return store.attempt_ignored_at_base(run_id, node_id, attempt_no)
+    except lc.BaselineCorrupt as exc:
+        raise SalvageRefused(
+            "SALVAGE_BASELINE_CORRUPT", str(exc),
+            run_id=run_id, node_id=node_id, attempt_no=attempt_no) from exc
+
+
 def _refuse_if_live(store: lc.LifecycleStore, attempt: st.AttemptRecord) -> None:
     if attempt.state is not st.NodeState.RUNNING:
         return
@@ -261,6 +294,8 @@ def salvage_attempt(
     # Read before the worktree is reopened, so an attempt whose before-side
     # was never recorded costs nothing and leaves no commit and no record.
     recorded_baseline = _recorded_baseline(store, run_id, node_id, attempt_no)
+    recorded_ignored = _recorded_ignored_at_base(
+        store, run_id, node_id, attempt_no)
 
 
     worktree_path = (
@@ -308,6 +343,27 @@ def salvage_attempt(
             conjunct1=list(permission.conjunct1_violations),
             conjunct2=list(permission.conjunct2_violations))
 
+    # A declared output git will not commit. The scheduler blocks this at
+    # attempt settle (`DECLARED_OUTPUT_UNCOMMITTABLE`) and a run refuses it at
+    # start, and salvage took neither path: the same node could have its
+    # stranded work salvaged into a commit that does not carry the output,
+    # under a signed record asserting a digest over what *was* committed.
+    #
+    # Recorded rather than refused, on this verb's own purpose. A refusal here
+    # leaves the operator with stranded work and no verb, which is the state
+    # salvage exists to end -- and the work is real either way; what was
+    # missing is a statement of what the commit could not hold. So the commit
+    # is written, and the signed record carries the gap beside it. The
+    # operator learns it from the receipt rather than from a silence.
+    uncommittable: Tuple[str, ...] = ()
+    if recorded_ignored is not None:
+        try:
+            uncommittable = wt.existing_ignored_outputs(
+                attempt.path, declared, after, recorded_ignored)
+        except wt.WorktreeError as exc:
+            raise SalvageRefused(
+                "SALVAGE_BRACKET_UNPROVEN", str(exc)) from exc
+
     files = _file_records(attempt, measured)
     try:
         output_sha = wt.commit_measured_delta(
@@ -333,6 +389,17 @@ def salvage_attempt(
         "reason": reason,
         "created_at_epoch": clock(),
         "files": list(files),
+        # Declared outputs that exist on disk and that git will not commit, so
+        # the `output_sha` above does not carry them. Three states, and they
+        # are not interchangeable: a list names the paths the commit is
+        # missing; `[]` says the question was asked and the answer was none;
+        # `null` says it could not be asked, because this attempt's baseline
+        # predates the ignored-at-base map and no before-side exists to
+        # measure against. A reader that collapses `null` into `[]` turns
+        # "unknown" into "clean", which is the reading this field was added to
+        # make impossible (#67).
+        "uncommittable_outputs": (
+            None if recorded_ignored is None else list(uncommittable)),
     }
     record_path, signature_path = _write_signed_record(
         Path(record_dir), run_id, node_id, attempt_no, payload, seed)
@@ -353,4 +420,6 @@ def salvage_attempt(
         run_id=run_id, node_id=node_id, attempt_no=attempt_no,
         base_sha=attempt.base, output_sha=output_sha,
         record_path=record_path, signature_path=signature_path,
-        files=files)
+        files=files,
+        uncommittable_outputs=(
+            None if recorded_ignored is None else uncommittable))

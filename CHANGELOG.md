@@ -407,6 +407,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `attempt salvage` reports a declared output git will not commit, instead of committing around it
+  in silence (issue #67). A run refuses this at start with `DECLARED_OUTPUT_UNCOMMITTABLE` and the
+  scheduler blocks it again at attempt settle; salvage took neither path, so the same node could
+  have its stranded work committed under a signed record asserting a digest over what *was*
+  committed, while a declared output sat on disk unmentioned.
+
+  **Recorded, not refused**, on the verb's own purpose: a refusal leaves the operator with stranded
+  work and no verb, which is the state salvage exists to end. The work is real either way; what was
+  missing was a statement of what the commit could not hold. The commit is written and the signed
+  record carries `uncommittable_outputs` beside it, printed by the CLI on every salvage.
+
+  The field has **three** states and they are not interchangeable: a list names the paths the commit
+  is missing, `[]` says the question was asked and the answer was none, and `null` says it could not
+  be asked. A reader that collapses `null` into `[]` turns "unknown" into "clean", which is what the
+  field exists to make impossible.
+
+  That third state is why this was not the one-line change the issue proposed. The issue expected
+  the before-side to be derivable from the baseline `94cbafb` already records. It is not: the
+  baseline's universe is `git ls-files --cached --others --exclude-standard`, and the ignored-at-base
+  map is *exactly what that command excludes* — disjoint sets, so no amount of the first
+  reconstructs the second. `attempt_baselines` therefore gains a nullable `ignored_json` column,
+  written by the scheduler from `attempt.ignored_at_base` at the moment `take_baseline` walks the
+  provisioned tree, which is the only moment that walk is possible. The column is additive and
+  nullable rather than required, per §19 M21; a ledger written before it existed reads `NULL` —
+  "nobody looked" — and never `'{}'`, because reading a missing before-side as empty attributes a
+  whole provisioned dependency tree to the node, the false positive `existing_ignored_outputs` was
+  built to avoid.
+
 - §7.6's PROCESS_DEAD signal can convict an agent attempt (issue #20). It could not before, and the
   branch had never run for an agent node in the project's history: `watchdog.py` guards it on
   `attempt.pid is not None`, and `attempts.pid` was written from `LaunchHandle.process_group`, which

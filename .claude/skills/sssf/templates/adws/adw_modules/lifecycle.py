@@ -217,6 +217,20 @@ CREATE TABLE IF NOT EXISTS attempt_baselines (
   -- inventory parsed on each of those is a cost the row does not otherwise
   -- carry.
   inventory_json TEXT NOT NULL,
+  -- The gitignored files present at `take_baseline`, as {relpath: sha256}.
+  -- A *disjoint* universe from `inventory_json` by construction: the
+  -- inventory's universe is `git ls-files --cached --others
+  -- --exclude-standard`, and this holds exactly what that excludes, so the
+  -- baseline can never answer a question about it (§8.3).
+  --
+  -- Nullable, and the difference between NULL and '{}' is load-bearing.
+  -- '{}' says the tree had no ignored files when the bracket opened. NULL
+  -- says nobody looked -- an attempt written before this column existed --
+  -- and a reader must say "unknown" rather than "none", because reading a
+  -- missing before-side as empty attributes a whole provisioned dependency
+  -- tree to the node, which is the false positive `existing_ignored_outputs`
+  -- exists to avoid.
+  ignored_json   TEXT,
   recorded_at    TEXT NOT NULL,
   PRIMARY KEY (run_id, node_id, attempt_no)
 );
@@ -301,9 +315,17 @@ _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
 
 #: Every table an older ledger may be missing a column from, in one place so
 #: `_migrate` cannot silently cover one table and not the other.
+#: The same, for `attempt_baselines`. Nullable with no default, so a ledger
+#: written before the column existed reads NULL — "nobody looked" — rather
+#: than `'{}'`, which would claim the tree had no ignored files at base.
+_ATTEMPT_BASELINE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("ignored_json", "TEXT"),
+)
+
 _ADDED_COLUMNS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...] = (
     ("runs", _RUNS_ADDED_COLUMNS),
     ("node_lifecycle", _NODE_LIFECYCLE_ADDED_COLUMNS),
+    ("attempt_baselines", _ATTEMPT_BASELINE_ADDED_COLUMNS),
 )
 
 
@@ -773,7 +795,9 @@ class LifecycleStore:
 
     @serialized
     def record_baseline(self, run_id: str, node_id: str, attempt_no: int,
-                        baseline: Mapping[str, Sequence[str]]) -> str:
+                        baseline: Mapping[str, Sequence[str]],
+                        ignored_at_base: Optional[Mapping[str, str]] = None
+                        ) -> str:
         """Persist the measurement baseline the bracket just opened on.
 
         Written the moment `take_baseline` returns, because that walk is the
@@ -814,10 +838,14 @@ class LifecycleStore:
         try:
             self.conn.execute(
                 "INSERT OR REPLACE INTO attempt_baselines"
-                " (run_id, node_id, attempt_no, digest, inventory_json, recorded_at)"
-                " VALUES (?,?,?,?,?,?)",
+                " (run_id, node_id, attempt_no, digest, inventory_json,"
+                "  ignored_json, recorded_at)"
+                " VALUES (?,?,?,?,?,?,?)",
                 (run_id, node_id, attempt_no, digest,
                  json.dumps(encoded, sort_keys=True, separators=(",", ":")),
+                 None if ignored_at_base is None else json.dumps(
+                     dict(ignored_at_base), sort_keys=True,
+                     separators=(",", ":")),
                  now_iso()))
             self.conn.execute(
                 "UPDATE attempts SET extra_json=?"
@@ -874,6 +902,48 @@ class LifecycleStore:
                 f"{run_id}/{node_id}#{attempt_no} baseline does not match its "
                 f"recorded digest {digest}")
         return decode_baseline(encoded)
+
+    @serialized
+    def attempt_ignored_at_base(self, run_id: str, node_id: str,
+                                attempt_no: int) -> Optional[Dict[str, str]]:
+        """The gitignored files present when this attempt's bracket opened.
+
+        `None` means **nobody looked** — an attempt whose baseline was
+        recorded before `ignored_json` existed — and every caller must carry
+        that distinction rather than collapsing it. An empty dict means the
+        walk ran and found nothing ignored, which is a real answer and is
+        safe to measure against. Reading `None` as `{}` would report a whole
+        provisioned dependency tree as content the attempt wrote, which is
+        the false positive `worktree.existing_ignored_outputs` was built to
+        avoid and the reason it refuses a `None` before-side outright.
+
+        This is a separate read from `attempt_baseline` because the two
+        answer questions about disjoint universes: the baseline inventory is
+        `git ls-files --cached --others --exclude-standard`, and this is
+        exactly what that command excludes. No amount of the first can
+        reconstruct the second, which is why salvage could not simply derive
+        it from the recorded baseline (#67).
+        """
+        row = self.conn.execute(
+            "SELECT ignored_json FROM attempt_baselines"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise BaselineUnrecorded(
+                f"{run_id}/{node_id}#{attempt_no} recorded no measurement baseline")
+        if row[0] is None:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except json.JSONDecodeError as exc:
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} ignored-at-base map is not "
+                f"JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise BaselineCorrupt(
+                f"{run_id}/{node_id}#{attempt_no} ignored-at-base map is not "
+                "an object")
+        return {str(key): str(value) for key, value in payload.items()}
 
     @serialized
     def record_salvage(self, run_id: str, node_id: str, attempt_no: int,

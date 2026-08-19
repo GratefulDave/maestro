@@ -142,15 +142,32 @@ class _Harness:
     """
 
     def __init__(self, node: st.PlanNode = None, provision=None,
-                 record_baseline: bool = True):
+                 record_baseline: bool = True, record_ignored: bool = True,
+                 ignore_globs: str = ""):
         self._node = node or _node()
         self._provision = provision
         self._record_baseline = record_baseline
+        # Committed into the base *before* the attempt worktree is created, so
+        # `.gitignore` is part of what the attempt started from. Writing it
+        # into the worktree afterwards would make the file itself an
+        # undeclared write and the permission check would refuse the salvage
+        # for the wrong reason.
+        self._ignore_globs = ignore_globs
+        # Defaults to True because that is what `Scheduler._attempt` does:
+        # `record_baseline` is called with `ignored_at_base=attempt.
+        # ignored_at_base` on the real path. Setting it False models a ledger
+        # written before the column existed, which is the case salvage must
+        # answer "unknown" to rather than "none" (#67).
+        self._record_ignored = record_ignored
 
     def __enter__(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name).resolve()
         self.repo = _make_repo(self.root)
+        if self._ignore_globs:
+            (self.repo / ".gitignore").write_text(self._ignore_globs)
+            _git(self.repo, "add", ".gitignore")
+            _git(self.repo, "commit", "-qm", "ignore generated sources")
         self.base = _git(self.repo, "rev-parse", "HEAD")
         self.worktrees = self.root / "worktrees"
         self.scratch = self.root / "scratch"
@@ -167,7 +184,9 @@ class _Harness:
         self.baseline = wt.take_baseline(self.attempt)
         if self._record_baseline:
             self.baseline_digest = self.store.record_baseline(
-                RUN_ID, NODE_ID, 1, self.baseline)
+                RUN_ID, NODE_ID, 1, self.baseline,
+                ignored_at_base=(self.attempt.ignored_at_base
+                                 if self._record_ignored else None))
         self.hashes = _write_deliverables(self.attempt.path)
         _strand(self.store)
         self.seed = rc.generate_seed()
@@ -481,6 +500,123 @@ class SalvageCliTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertEqual(payload["outcome"], "ESCAPE_REFUSED")
             h.store = lc.LifecycleStore(h.db)
+
+
+#: A declared output the repository's own `.gitignore` excludes. Inventory's
+#: universe is `git ls-files --cached --others --exclude-standard`, so a file
+#: matching this is invisible to the delta, the permission check and the
+#: commit: the node lands an empty commit while the file sits on disk.
+IGNORED_OUTPUT = "src/lexgenius_pipeline/ingestion/judicial/cmo/generated.py"
+
+
+IGNORE_GLOBS = "**/generated.py\n"
+
+
+def _node_declaring_the_ignored_output() -> st.PlanNode:
+    return st.PlanNode(
+        node_id=NODE_ID, kind=st.NodeKind.CODE, depth=0,
+        outputs=(FILE_A, FILE_B, IGNORED_OUTPUT), command=("true",))
+
+
+class SalvageReportsAnOutputGitWillNotCommit(unittest.TestCase):
+    """#67. The scheduler blocks this at settle and a run refuses it at start;
+    salvage took neither path, so the same node could have its stranded work
+    committed under a signed record asserting a digest over what was committed
+    while a declared output sat on disk, unmentioned.
+
+    Recorded rather than refused, on this verb's own purpose: a refusal leaves
+    the operator with stranded work and no verb, which is the state salvage
+    exists to end. The commit is written and the record carries the gap.
+    """
+
+    @staticmethod
+    def _salvage(write_ignored_output: bool, **harness_kwargs):
+        """Returns `(result, record)`, both read before the tmpdir is gone."""
+        harness = _Harness(node=_node_declaring_the_ignored_output(),
+                           ignore_globs=IGNORE_GLOBS, **harness_kwargs)
+        with harness as h:
+            if write_ignored_output:
+                # Written after the baseline, so it is the attempt's own work
+                # rather than provisioned content -- the distinction
+                # `existing_ignored_outputs` draws, and the reason an
+                # unchanged provisioned file stays silent.
+                (h.attempt.path / IGNORED_OUTPUT).write_text(
+                    "GENERATED = True\n")
+            result = h.salvage()
+            return result, json.loads(Path(result.record_path).read_text())
+
+    def test_the_record_names_the_output_the_commit_cannot_hold(self):
+        result, record = self._salvage(True)
+        self.assertEqual(result.uncommittable_outputs, (IGNORED_OUTPUT,))
+        self.assertEqual(record["uncommittable_outputs"], [IGNORED_OUTPUT])
+
+    def test_the_salvage_still_happens(self):
+        """The whole point of recording rather than refusing: the operator's
+        other work reaches a commit instead of staying stranded."""
+        result, _record = self._salvage(True)
+        self.assertTrue(result.output_sha)
+        committed = {entry["path"] for entry in result.files}
+        self.assertIn(FILE_A, committed)
+        self.assertNotIn(IGNORED_OUTPUT, committed)
+
+    def test_a_clean_salvage_measures_none_rather_than_staying_silent(self):
+        """`[]` is an answer and must be distinguishable from `null` below.
+
+        Same node and same `.gitignore`; the attempt simply never wrote the
+        ignored path, so the question was asked and answered.
+        """
+        result, record = self._salvage(False)
+        self.assertEqual(result.uncommittable_outputs, ())
+        self.assertEqual(record["uncommittable_outputs"], [])
+
+    def test_an_attempt_predating_the_map_records_unknown_not_none(self):
+        """A ledger written before `ignored_json` existed cannot answer.
+
+        `null` rather than `[]`, and not a refusal: reading a missing
+        before-side as empty attributes a provisioned dependency tree to the
+        node, and refusing takes the verb away from exactly the runs most
+        likely to need it. The attempt here *did* write the ignored output,
+        so `[]` would be wrong as well as unknowable.
+        """
+        result, record = self._salvage(True, record_ignored=False)
+        self.assertIsNone(result.uncommittable_outputs)
+        self.assertIsNone(record["uncommittable_outputs"])
+        self.assertTrue(result.output_sha, "the salvage must still happen")
+
+
+class TheIgnoredAtBaseMapIsItsOwnFact(unittest.TestCase):
+    """It cannot be derived from the recorded baseline, which is why #67 could
+    not be closed by reading the row salvage already had."""
+
+    def test_the_baseline_and_the_ignored_map_hold_disjoint_universes(self):
+        with _Harness(provision=_provision_untracked) as h:
+            baseline = h.store.attempt_baseline(RUN_ID, NODE_ID, 1)
+            ignored = h.store.attempt_ignored_at_base(RUN_ID, NODE_ID, 1)
+        self.assertIsNotNone(ignored)
+        self.assertEqual(set(baseline) & set(ignored or {}), set())
+
+    def test_an_unrecorded_map_reads_as_unknown_not_empty(self):
+        with _Harness(record_ignored=False) as h:
+            self.assertIsNone(
+                h.store.attempt_ignored_at_base(RUN_ID, NODE_ID, 1))
+
+    def test_a_recorded_map_is_a_dict_rather_than_unknown(self):
+        """Recorded is recorded, even when nothing the node cares about is in
+        it. The map is whatever `take_baseline` walked -- in a linked worktree
+        that includes the `.git` pointer file, which is absent from the
+        inventory and therefore in this universe by construction. It never
+        matches a declared output glob, so it never reaches a finding; what
+        matters here is that the value is a dict and not `None`.
+        """
+        with _Harness() as h:
+            recorded = h.store.attempt_ignored_at_base(RUN_ID, NODE_ID, 1)
+        self.assertIsInstance(recorded, dict)
+        self.assertNotIn(IGNORED_OUTPUT, recorded or {})
+
+    def test_no_baseline_at_all_is_still_a_refusal(self):
+        with _Harness(record_baseline=False) as h:
+            with self.assertRaises(lc.BaselineUnrecorded):
+                h.store.attempt_ignored_at_base(RUN_ID, NODE_ID, 1)
 
 
 if __name__ == "__main__":

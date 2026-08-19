@@ -3695,6 +3695,13 @@ def _attempt_salvage(args: argparse.Namespace) -> int:
             "output_sha": result.output_sha,
             "record": str(result.record_path),
             "files": list(result.files),
+            # Printed on every salvage, including the empty and the unknown
+            # case, because an operator reading only the happy path is what
+            # this field exists to prevent: `[]` says no declared output was
+            # left behind, `null` says nobody could tell (#67).
+            "uncommittable_outputs": (
+                None if result.uncommittable_outputs is None
+                else list(result.uncommittable_outputs)),
         }, sort_keys=True))
         return 0
     except salvage.SalvageRefused as exc:
