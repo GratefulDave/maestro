@@ -25,6 +25,11 @@ compares them without a special case.
 Skips only when no checkout carrying the schema is present at all. A checkout
 that is present but missing the schema fails: that is the silent-deletion mode
 the parity module exists to catch, one artifact over.
+
+The peer checkout is resolved through `checkout_layout`, from the repository
+rather than from this file's path, because every lane authors inside a linked
+worktree and a peer has never existed beside one. Resolving it from the
+filesystem meant this module skipped through exactly the edits it guards.
 """
 
 from __future__ import annotations
@@ -32,21 +37,18 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import sys
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import checkout_layout  # noqa: E402  (needs the path above)
 
 # Where the published Plan IR schema lives inside a checkout that carries it,
 # keyed by repository directory name. Only the-library publishes it; maestro
 # reaches across to that checkout.
 SCHEMA_LOCATIONS = (
     ("the-library", pathlib.PurePosixPath("skills/plan-contract/schemas/plan-ir-v1.schema.json")),
-)
-
-# Every known template checkout: repository directory name, and the path of the
-# ADW runtime inside it. Longest path first so that the-library's layout, which
-# is a suffix of maestro's, cannot claim a maestro checkout.
-TEMPLATE_LOCATIONS = (
-    ("maestro", pathlib.PurePosixPath(".claude/skills/sssf/templates/adws")),
-    ("the-library", pathlib.PurePosixPath("skills/sssf/templates/adws")),
 )
 
 PLAN_VALIDATE = pathlib.Path(__file__).resolve().parent.parent / "adw_modules" / "plan_validate.py"
@@ -73,37 +75,21 @@ PINNED = (
 )
 
 
-def _sorted_locations():
-    return sorted(TEMPLATE_LOCATIONS, key=lambda item: len(item[1].parts), reverse=True)
-
-
-def _identify_self():
-    """Return (repo_name, repo_root) for the checkout holding this file, or None."""
-    adws_root = pathlib.Path(__file__).resolve().parent.parent
-    for repo_name, layout in _sorted_locations():
-        parts = layout.parts
-        if adws_root.parts[-len(parts) :] == parts:
-            return repo_name, adws_root.parents[len(parts) - 1]
-    return None
-
-
 def _resolve_schema():
     """Return the published schema path, or raise SkipTest / AssertionError."""
-    identity = _identify_self()
-    if identity is None:
-        raise unittest.SkipTest(
+    checkout = checkout_layout.identify_template_checkout(
+        pathlib.Path(__file__).resolve().parent.parent
+    )
+    if checkout is None:
+        checkout_layout.skip_visibly(
             "this ADW runtime is a deployed instance, not a template checkout, "
             "so it has no published schema to be pinned to; the check runs in "
             "the maestro and the-library repositories"
         )
-    self_name, self_repo_root = identity
 
     reasons = []
     for repo_name, relative in SCHEMA_LOCATIONS:
-        if repo_name == self_name:
-            repo_root = self_repo_root
-        else:
-            repo_root = self_repo_root.parent / repo_name
+        repo_root = checkout_layout.checkout_root(checkout, repo_name)
         schema = repo_root / relative
         if schema.is_file():
             return schema
@@ -115,18 +101,24 @@ def _resolve_schema():
                 "{repo} is checked out at {root} but the published Plan IR "
                 "schema {schema} is missing, so this runtime's vocabularies are "
                 "pinned to nothing. Restore the schema before landing anything "
-                "that touches EFFECTS, DISPOSITIONS, or MUTATIONS.".format(
-                    repo=repo_name, root=repo_root, schema=schema
+                "that touches EFFECTS, DISPOSITIONS, or MUTATIONS. "
+                "({provenance})".format(
+                    repo=repo_name,
+                    root=repo_root,
+                    schema=schema,
+                    provenance=checkout.provenance,
                 )
             )
         reasons.append(
             "{name} is not checked out at {path}".format(name=repo_name, path=repo_root)
         )
 
-    raise unittest.SkipTest(
+    checkout_layout.skip_visibly(
         "no checkout publishing the Plan IR schema is present on this machine "
         "({reasons}); vocabulary parity cannot be checked from this checkout "
-        "alone".format(reasons="; ".join(reasons))
+        "alone. {provenance}".format(
+            reasons="; ".join(reasons), provenance=checkout.provenance
+        )
     )
 
 
