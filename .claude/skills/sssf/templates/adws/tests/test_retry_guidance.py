@@ -8,20 +8,27 @@ recent failure, so every attempt fixed exactly what the last prompt named and
 silently regressed the constraint the prompt no longer mentioned. Each
 individual fix was correct; the two constraints were never held simultaneously.
 
-The fix is `retry_policy.GuidanceLedger`: the latest typed evidence from each
-acceptance surface, all of it rendered into every retry prompt. These tests
-prove three things:
+The fix is `retry_policy.GuidanceLedger`: every typed entry from each
+acceptance surface, *including* the earlier entries from the same surface,
+all of it rendered into every retry prompt and all of it durable on the
+attempt rows. These tests prove four things:
 
-* the ledger's replacement semantics — a review rejection cannot erase what
-  verification said, and vice versa; within one surface, newer evidence
-  replaces older (which is how a fixed finding retires);
+* the ledger's accumulation semantics — a review rejection cannot erase what
+  verification said, and vice versa; and within one surface a second finding
+  appends rather than overwriting, because the slot held exactly one entry
+  and a builder that had failed twice was told about one of the failures;
 * the rendering bound — B13's overflow mode is refused by deterministic
   truncation that never silently drops a surface;
 * **convergence through the real scheduler** — a node that fails clause 4,
   then review, then clause 4 again receives every standing constraint in each
-  subsequent prompt, and merges once an attempt satisfies all of them at once.
-  A test that only checked the dataclasses would not prove that; the scheduler
-  is where the overwrite bug lived.
+  subsequent prompt, including the earlier same-surface one, and merges once
+  an attempt satisfies all of them at once. A test that only checked the
+  dataclasses would not prove that; the scheduler is where the overwrite bug
+  lived;
+* **durability** — the ledger was process-local and rebuilt from nothing, so
+  a resumed run dispatched a builder with no idea why the earlier attempts
+  were rejected. It is rebuilt from the store, and the tests drive that
+  through the store rather than through the in-process object.
 """
 
 from __future__ import annotations
@@ -77,7 +84,7 @@ class _Node:
 
 
 class LedgerSemanticsTests(unittest.TestCase):
-    """Replacement per surface is both the accumulation and the retirement."""
+    """Accumulation across surfaces, and history within one."""
 
     def test_review_does_not_erase_verification_and_vice_versa(self):
         ledger = rp.GuidanceLedger()
@@ -87,26 +94,29 @@ class LedgerSemanticsTests(unittest.TestCase):
             subject_digest="d1",
             findings=(rp.ReviewFinding("diff.introduces_no_obvious_defect",
                                        "app.py", "naive datetime", True),)))
-        self.assertIsNotNone(ledger.verification)
-        self.assertIsNotNone(ledger.review)
+        self.assertEqual(len(ledger.verification), 1)
+        self.assertEqual(len(ledger.review), 1)
         # And the other direction: a later verification failure keeps review.
         ledger = ledger.with_verification(rp.VerificationGuidance(
             reason="clause 4 again", offending_paths=("rogue2.py",),
             failed_clause=4))
-        self.assertEqual(ledger.verification.offending_paths, ("rogue2.py",))
-        self.assertIsNotNone(ledger.review)
+        self.assertEqual(
+            [item.offending_paths for item in ledger.verification],
+            [("rogue.py",), ("rogue2.py",)])
+        self.assertEqual(len(ledger.review), 1)
 
-    def test_newer_evidence_replaces_older_within_a_surface(self):
-        """A fixed finding retires because its surface's re-evaluation of a
-        newer diff no longer reports it — replacement, not deletion."""
+    def test_same_surface_history_is_appended_not_replaced(self):
+        """The bug this replaced: the slot held one entry, so a second
+        finding from the same surface erased the first and the next prompt
+        named only the newer one. Both must survive."""
         ledger = rp.GuidanceLedger().with_review(rp.ReviewGuidance(
             subject_digest="d1",
             findings=(rp.ReviewFinding("c1", "o1", "old finding", True),)))
         ledger = ledger.with_review(rp.ReviewGuidance(
             subject_digest="d2",
             findings=(rp.ReviewFinding("c2", "o2", "new finding", True),)))
-        messages = [f.message for f in ledger.review.findings]
-        self.assertEqual(messages, ["new finding"])
+        messages = [f.message for g in ledger.review for f in g.findings]
+        self.assertEqual(messages, ["old finding", "new finding"])
 
     def test_empty_ledger_renders_to_none(self):
         self.assertIsNone(rp.render_guidance(_Node(), rp.GuidanceLedger()))
@@ -158,10 +168,11 @@ class ConvergenceTests(SchedulerFixture):
 
     clause 4 → review → clause 4 again, then an attempt that satisfies
     everything at once. Every retry prompt after the second failure must carry
-    the standing constraints of BOTH surfaces, and the verification constraint
-    must be the *latest* one — the earlier offending path has retired by
-    replacement, because restating a path the node no longer writes would be
-    resurrecting evidence its surface has already superseded.
+    the standing constraints of BOTH surfaces, and the verification
+    constraint must carry its full same-surface history: an offending path
+    absent from the latest evaluation may be absent because the attempt
+    stopped writing that file rather than because the constraint was
+    satisfied, and the two are indistinguishable from the surface's output.
     """
 
     def test_constraints_accumulate_across_surfaces_until_the_node_converges(self):
@@ -207,12 +218,12 @@ class ConvergenceTests(SchedulerFixture):
         self.assertIn("rogue1.py", prompts[2])
         self.assertIn("WrittenOpinionsStage reads the wall clock", prompts[2])
 
-        # After a3's second clause-4 conviction: the review constraint is still
-        # standing, and the verification constraint is the latest evidence —
-        # rogue1.py has retired by replacement.
+        # After a3's second clause-4 conviction: the review constraint is
+        # still standing, and the verification surface carries both of its
+        # own entries rather than only the newer one.
         self.assertIn("rogue3.py", prompts[3])
         self.assertIn("WrittenOpinionsStage reads the wall clock", prompts[3])
-        self.assertNotIn("rogue1.py", prompts[3])
+        self.assertIn("rogue1.py", prompts[3])
 
     def test_a_pure_verification_history_still_mutates_the_prompt(self):
         """The pre-ledger behaviour §7.5 requires is unchanged: a clause-4
@@ -232,6 +243,82 @@ class ConvergenceTests(SchedulerFixture):
         self.assertIn("rogue.py", self.prompts["a"][1])
         self.assertIs(self.store.get_node("run1", "a").state,
                       st.NodeState.MERGED)
+
+    def test_resume_reloads_guidance_into_the_next_prompt(self):
+        """The durability half, driven through the store.
+
+        A second scheduler object is constructed over the same store — the
+        shape a resume actually takes — and the assertion is that its ledger
+        came back from `attempts_for`, not from anything the first object
+        held. The in-process ledger was the only copy, so before this the
+        resumed builder was dispatched with no guidance at all.
+        """
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
+            files = ({"a.py": "A\n", "rogue.py": "X\n"}
+                     if record.attempt_no < 3 else {"a.py": "A\n"})
+            for rel, content in files.items():
+                (attempt.path / rel).write_text(content)
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        first = self.schedule(
+            [self.agent("a")],
+            config=self.config(semantic_ceiling=2),
+            deps=self.deps(run_node=run_node)).run()
+        self.assertIs(first.outcome, st.RunOutcome.BLOCKED)
+        rebuilt = rp.guidance_from_attempts(self.store.attempts_for("run1"))
+        self.assertTrue(any(not ledger.empty for ledger in rebuilt.values()))
+        self.store.retry("run1", "a", force=True)
+        resumed = self.schedule(
+            [self.agent("a")],
+            config=self.config(semantic_ceiling=2),
+            deps=self.deps(run_node=run_node))
+        resumed.project()
+        self.assertEqual(set(resumed._guidance), set(rebuilt))
+        resumed.run()
+        self.assertIn("rogue.py", self.prompts["a"][-1])
+
+    def test_the_capped_semantic_failure_persists_its_guidance(self):
+        """Both failures reach the resumed prompt, including the capped one.
+
+        The attempt that hits the semantic ceiling takes `mark_blocked`
+        rather than `fail_attempt`, so its guidance rides a different write.
+        A node blocked on the ceiling is also the one most likely to be
+        resumed, which makes it the worst entry to lose. Two distinct
+        offending paths go in; both come back out of the store.
+        """
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
+            files = {"a.py": "A\n"}
+            if record.attempt_no == 1:
+                files["rogue1.py"] = "X\n"
+            elif record.attempt_no == 2:
+                files["rogue2.py"] = "X\n"
+            for rel, content in files.items():
+                (attempt.path / rel).write_text(content)
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        first = self.schedule(
+            [self.agent("a")],
+            config=self.config(semantic_ceiling=2),
+            deps=self.deps(run_node=run_node)).run()
+        self.assertIs(first.outcome, st.RunOutcome.BLOCKED)
+        capped = next(item for item in self.store.attempts_for("run1")
+                      if item.attempt_no == 2)
+        self.assertIn("rogue2.py",
+                      (capped.extra or {}).get(rp.GUIDANCE_KEY, {})
+                      .get("offending_paths") or [])
+        self.store.retry("run1", "a", force=True)
+        self.schedule(
+            [self.agent("a")],
+            config=self.config(semantic_ceiling=2),
+            deps=self.deps(run_node=run_node)).run()
+        self.assertIn("rogue1.py", self.prompts["a"][-1])
+        self.assertIn("rogue2.py", self.prompts["a"][-1])
 
 
 class ReviewStalledClassificationTests(SchedulerFixture):

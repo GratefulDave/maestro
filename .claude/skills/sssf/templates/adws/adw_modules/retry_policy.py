@@ -30,7 +30,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
+                    Tuple)
 
 from .scheduler_types import (
     AttemptRecord,
@@ -296,6 +297,14 @@ def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> 
 #: system is written against exactly those three.
 REVIEW_REJECTED_KEY = "review_rejected"
 
+#: Findings-per-attempt, stored on the same review-rejected extra row the
+#: budget already counts. A rejected diff is only half the operator's
+#: question — the other half is whether the reviewer is finding *less* each
+#: time, which is what says another attempt would land and a flat series says
+#: it would not. The count lives on the durable row rather than in process
+#: memory so a resumed run reports the same series the original would have.
+REVIEW_FINDINGS_COUNT_KEY = "review_findings_count"
+
 
 def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
     """`COUNT(*)` over this node's review-rejected attempt rows.
@@ -315,6 +324,114 @@ def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> in
     return sum(1 for a in attempts
                if a.node_id == node_id
                and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
+
+
+def review_convergence_from_attempts(
+        attempts: Iterable[AttemptRecord]) -> Dict[str, List[int]]:
+    """Rebuild findings-per-attempt per node from durable review-rejected rows.
+
+    Ordered by `attempt_no` so a resumed process reports the same series the
+    original process appended in memory. A row written before this key
+    existed carries no count and is skipped rather than counted as zero — a
+    zero would read as "the reviewer found nothing", which is the one thing a
+    review-rejected row cannot mean.
+    """
+    by_node: Dict[str, List[Tuple[int, int]]] = {}
+    for attempt in attempts:
+        extra = attempt.extra or {}
+        if not extra.get(REVIEW_REJECTED_KEY):
+            continue
+        count = extra.get(REVIEW_FINDINGS_COUNT_KEY)
+        if count is None:
+            continue
+        by_node.setdefault(attempt.node_id, []).append(
+            (attempt.attempt_no, int(count)))
+    return {
+        node_id: [count for _no, count in sorted(items)]
+        for node_id, items in by_node.items()
+    }
+
+
+# ── guidance, made durable ───────────────────────────────────────
+
+#: The extra key each entry is stored under on the attempt that produced it.
+#: The ledger was process-local, so every standing constraint died with the
+#: scheduler process and a resumed run told its builder nothing about why the
+#: previous attempts were rejected. Writing the entry onto the row that
+#: already records the failure keeps one representation of it, not two.
+GUIDANCE_KEY = "guidance"
+
+
+def guidance_extra_verification(detail: Optional[dict]) -> Dict[str, Any]:
+    """The typed VERIFICATION entry, as the attempt row stores it."""
+    guidance = verification_guidance(detail)
+    return {GUIDANCE_KEY: {
+        "surface": "verification",
+        "reason": guidance.reason,
+        "offending_paths": list(guidance.offending_paths),
+        "failed_clause": guidance.failed_clause,
+    }}
+
+
+def guidance_extra_review(review: object) -> Dict[str, Any]:
+    """The typed REVIEW entry, as the attempt row stores it."""
+    guidance = review_guidance(review)
+    return {GUIDANCE_KEY: {
+        "surface": "review",
+        "subject_digest": guidance.subject_digest,
+        "findings": [
+            {"check_id": finding.check_id, "object_id": finding.object_id,
+             "message": finding.message, "blocking": finding.blocking}
+            for finding in guidance.findings
+        ],
+    }}
+
+
+def guidance_from_attempts(
+        attempts: Iterable[AttemptRecord]
+        ) -> Dict[Tuple[str, str], "GuidanceLedger"]:
+    """Rebuild every node's ledger from the durable attempt extras.
+
+    Keyed by `AttemptRecord.guidance_key` — `(node_id, base_sha)` — because
+    that is the scope the guidance itself is valid within: a finding about a
+    diff taken against one base says nothing about a diff taken against
+    another. Replayed in attempt order so the reconstructed history reads the
+    same way the in-process one accumulated, and empty ledgers are dropped so
+    a resumed scheduler's map contains exactly the nodes that have standing
+    constraints.
+    """
+    ledgers: Dict[Tuple[str, str], GuidanceLedger] = {}
+    for attempt in sorted(attempts,
+                          key=lambda item: (item.node_id, item.attempt_no)):
+        payload = (attempt.extra or {}).get(GUIDANCE_KEY)
+        if not isinstance(payload, dict):
+            continue
+        key = attempt.guidance_key
+        ledger = ledgers.get(key, GuidanceLedger())
+        surface = payload.get("surface")
+        if surface == "verification":
+            ledger = ledger.with_verification(VerificationGuidance(
+                reason=str(payload.get("reason") or ""),
+                offending_paths=tuple(payload.get("offending_paths") or ()),
+                failed_clause=payload.get("failed_clause")))
+        elif surface == "review":
+            findings = tuple(
+                ReviewFinding(
+                    check_id=str(item.get("check_id") or ""),
+                    object_id=str(item.get("object_id") or ""),
+                    message=str(item.get("message") or ""),
+                    blocking=bool(item.get("blocking")),
+                )
+                for item in (payload.get("findings") or [])
+                if isinstance(item, dict)
+            )
+            ledger = ledger.with_review(ReviewGuidance(
+                subject_digest=str(payload.get("subject_digest") or ""),
+                findings=findings))
+        else:
+            continue
+        ledgers[key] = ledger
+    return {key: ledger for key, ledger in ledgers.items() if not ledger.empty}
 
 
 # ── §7.5 launcher budgets — credential is the zero-retry exception ──────────
@@ -424,26 +541,39 @@ class ReviewGuidance:
 
 @dataclass(frozen=True)
 class GuidanceLedger:
-    """Latest typed evidence per acceptance surface, for one node.
+    """Every typed entry per acceptance surface, for one node, in order.
 
-    Immutable; `with_*` returns a new ledger with that surface's slot
-    replaced and every other slot carried forward — which is the entire fix:
-    a review rejection can no longer erase what verification said, and vice
-    versa.
+    Immutable; `with_*` returns a new ledger that *appends* to that surface
+    and carries every other surface forward. Carrying the other surface
+    forward is what stopped a review rejection from erasing what verification
+    said. Appending within a surface is the rest of the same fix: the slot
+    held one entry, so a second finding from the same surface overwrote the
+    first, and a builder that had failed twice was told about one of the two
+    failures. "Newer evidence supersedes older" was the stated justification
+    and it does not hold — the surfaces re-evaluate a *different diff* each
+    attempt, so a constraint absent from the latest evaluation may be absent
+    because the attempt stopped writing the file it was about, not because it
+    was satisfied. History is kept and `render_guidance` bounds it; the
+    truncation there is deterministic and visible, which an overwrite was
+    not.
     """
 
-    verification: Optional[VerificationGuidance] = None
-    review: Optional[ReviewGuidance] = None
+    verification: Tuple[VerificationGuidance, ...] = ()
+    review: Tuple[ReviewGuidance, ...] = ()
 
     def with_verification(self, guidance: VerificationGuidance) -> "GuidanceLedger":
-        return GuidanceLedger(verification=guidance, review=self.review)
+        return GuidanceLedger(
+            verification=self.verification + (guidance,),
+            review=self.review)
 
     def with_review(self, guidance: ReviewGuidance) -> "GuidanceLedger":
-        return GuidanceLedger(verification=self.verification, review=guidance)
+        return GuidanceLedger(
+            verification=self.verification,
+            review=self.review + (guidance,))
 
     @property
     def empty(self) -> bool:
-        return self.verification is None and self.review is None
+        return not self.verification and not self.review
 
 
 def verification_guidance(detail: Optional[dict]) -> VerificationGuidance:
@@ -498,6 +628,13 @@ GUIDANCE_CHAR_BUDGET = 12_000
 _TRUNCATION_MARKER = (
     "  [guidance truncated to fit the prompt budget; every constraint named "
     "above still binds in full]")
+
+#: Written in place of the entries an accumulating ledger could not afford.
+#: A surface's history is dropped oldest-first, so what this marker replaces
+#: is always older than what survives it.
+_HISTORY_MARKER = (
+    "  [earlier findings from this surface dropped to fit the prompt budget; "
+    "the entries below are the most recent]")
 
 
 #: How many offending paths the retry prompt names individually.
@@ -590,20 +727,63 @@ def _fit(lines: List[str], share: int) -> List[str]:
     return kept + [_TRUNCATION_MARKER]
 
 
+def _join(blocks: List[List[str]]) -> List[str]:
+    """One surface's per-attempt blocks, blank-line separated, oldest first."""
+    lines: List[str] = []
+    for block in blocks:
+        if lines:
+            lines.append("")
+        lines.extend(block)
+    return lines
+
+
+def _fit_surface(blocks: List[List[str]], share: int) -> List[str]:
+    """Fit one surface's accumulated history into that surface's share.
+
+    `_fit` alone is the wrong tool once a surface carries more than one
+    entry: it drops trailing lines, and with history rendered oldest-first
+    the trailing lines are the *newest* finding — the one the next attempt
+    has to fix. So whole entries are dropped from the front first, newest
+    always last to go, and the drop is announced rather than silent. Only
+    when a single entry still overflows does `_fit` truncate within it,
+    which is the pre-history behaviour and keeps the surface's header.
+    """
+    def size(lines: List[str]) -> int:
+        return sum(len(l) + 1 for l in lines)
+
+    kept = list(blocks)
+    dropped = 0
+    reserve = len(_HISTORY_MARKER) + 1
+    while len(kept) > 1 and size(_join(kept)) + reserve > share:
+        kept.pop(0)
+        dropped += 1
+    lines = _fit(_join(kept), share - (reserve if dropped else 0))
+    return ([_HISTORY_MARKER, ""] + lines) if dropped else lines
+
+
 def render_guidance(node: object, ledger: Optional[GuidanceLedger],
                     char_budget: int = GUIDANCE_CHAR_BUDGET) -> Optional[str]:
     """Every surface's standing constraints, rendered for the retry prompt.
 
     This string is the one place the ledger is ever read. It mutates the
     prompt — which is what makes a SEMANTIC retry genuinely new instructions
-    (§7.5) — and nothing transitions on it (§10.1/§1.2)."""
+    (§7.5) — and nothing transitions on it (§10.1/§1.2).
+
+    Same-surface history renders oldest-first inside that surface's section,
+    so a later attempt still reads every prior finding from it. The per-
+    section budget is unchanged, which is what keeps an accumulating ledger
+    from growing the prompt without bound: `_fit` truncates within a section
+    and marks that it did, so history is what gets dropped under pressure and
+    a whole surface never silently disappears (B13).
+    """
     if ledger is None or ledger.empty:
         return None
-    sections: List[List[str]] = []
-    if ledger.verification is not None:
-        sections.append(_verification_lines(node, ledger.verification))
-    if ledger.review is not None:
-        sections.append(_review_lines(ledger.review))
+    sections: List[List[List[str]]] = []
+    if ledger.verification:
+        sections.append([_verification_lines(node, item)
+                         for item in ledger.verification])
+    if ledger.review:
+        sections.append([_review_lines(item) for item in ledger.review])
     preamble = [
         "Every constraint below is binding at the same time. Earlier attempts "
         "were rejected for fixing one surface while regressing another; a "
@@ -613,7 +793,7 @@ def render_guidance(node: object, ledger: Optional[GuidanceLedger],
     rendered: List[str] = list(preamble)
     for section in sections:
         rendered.append("")
-        rendered.extend(_fit(section, share))
+        rendered.extend(_fit_surface(section, share))
     return "\n".join(rendered)
 
 

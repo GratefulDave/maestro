@@ -355,6 +355,15 @@ class RunReport:
     #: fix, and a lane that spent three attempts on review deserves to say what
     #: the reviewer objected to without the operator re-running it.
     review_findings: Dict[str, str] = field(default_factory=dict)
+    #: `node_id -> findings-per-attempt`, one entry per review-rejected
+    #: attempt in order. `review_findings` says what the last reviewer
+    #: objected to; this says whether the objections were shrinking. A
+    #: descending series is a node the review ceiling cut off early, a flat
+    #: one is a node more attempts would not have saved, and that is the
+    #: difference an operator needs to size `review_ceiling` from a run
+    #: rather than by hand. Rebuilt from the attempt rows on resume, so it
+    #: reports the whole run rather than whichever process finished it.
+    review_convergence: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
 
     @property
     def integration_untested(self) -> bool:
@@ -438,6 +447,9 @@ class Scheduler:
         #: Findings from the review that exhausted a node's budget, kept so the
         #: run report can surface *why* rather than only that a count ran out.
         self._review_findings: Dict[str, str] = {}
+        #: Findings-per-attempt per node, appended on every review rejection
+        #: and rebuilt from the store by `project`.
+        self._review_convergence: Dict[str, List[int]] = {}
         #: `node_id -> every harness-hygiene fact observed about that node`.
         #: Two surfaces write here — §8.3's pre-merge residue report and
         #: §8.8's cleanup refusal — and they **accumulate** rather than
@@ -510,6 +522,17 @@ class Scheduler:
                 raise DurableOutputIdentityError(
                     f"{self.run_id}/{node_id}: MERGED output identity is invalid")
             self._output_shas[node_id] = output_sha
+        # The ledger and the convergence series are both derived state, and
+        # both used to be built only by the process that observed the
+        # failures. A resumed run therefore told its builder nothing about
+        # why the earlier attempts were rejected and reported a convergence
+        # series starting from whichever attempt this process happened to
+        # see. Both are rebuilt from the durable attempt rows here, which is
+        # the only place a resumed scheduler learns anything at all.
+        self._guidance = rp.guidance_from_attempts(
+            self.deps.store.attempts_for(self.run_id))
+        self._review_convergence = rp.review_convergence_from_attempts(
+            self.deps.store.attempts_for(self.run_id))
         self._projected = True
 
     def cancel(self) -> None:
@@ -1511,25 +1534,33 @@ class Scheduler:
             # twice, once as that predicate and once as this branch, and two
             # representations of one rule is the RC1 shape this design
             # convicts. The predicate owns the rule; this owns acting on it.
+            extra = None
             if st.mutates_prompt(retry_class):
-                lifecycle = store.get_node(self.run_id, node.node_id)
-                if self._semantic_ceiling_reached(
-                        node.node_id, lifecycle.granted_extra_attempts):
-                    store.mark_blocked(
-                        self.run_id, node.node_id,
-                        st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
-                        detail=detail or None, retry_class=retry_class)
-                    return
-                # Only SEMANTIC mutates the prompt, and the offending paths are
-                # named in it — which is what makes the retry genuinely new
-                # instructions rather than the same request repeated (§7.5).
-                # The entry consumes the same typed `detail` record the store
-                # rows get — one representation of the failure, not two — and
-                # replaces only this surface's slot: the reviewer's standing
-                # findings, if any, survive into the next prompt.
+                # Only SEMANTIC mutates the prompt, and the offending paths
+                # are named in it — which is what makes the retry genuinely
+                # new instructions rather than the same request repeated
+                # (§7.5). The entry consumes the same typed `detail` record
+                # the store rows get — one representation of the failure, not
+                # two — and is written to the attempt row as well as to
+                # memory, because memory does not survive the process and the
+                # next attempt may be dispatched by a different one.
+                extra = rp.guidance_extra_verification(detail)
                 self._guidance[record.guidance_key] = self._guidance.get(
                     record.guidance_key, rp.GuidanceLedger()).with_verification(
                         rp.verification_guidance(detail))
+                lifecycle = store.get_node(self.run_id, node.node_id)
+                if self._semantic_ceiling_reached(
+                        node.node_id, lifecycle.granted_extra_attempts):
+                    # The capped attempt persists its guidance too. A node
+                    # blocked on the ceiling is the one most likely to be
+                    # resumed after an operator grants it more attempts, and
+                    # it is exactly the finding that would have been lost.
+                    store.mark_blocked(
+                        self.run_id, node.node_id,
+                        st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                        detail=detail or None, retry_class=retry_class,
+                        attempt_extra=extra)
+                    return
             else:
                 # LAUNCHER_TRANSIENT's budget is a property of the member, not
                 # the class: §7.5 gives CREDENTIAL zero and the rest one or
@@ -1552,7 +1583,7 @@ class Scheduler:
                     return
 
             store.fail_attempt(self.run_id, node.node_id, retry_class,
-                               detail=detail or None)
+                               detail=detail or None, attempt_extra=extra)
 
     def _settle_review_rejection(self, node: st.PlanNode, review: Any,
                                  record: st.AttemptRecord) -> None:
@@ -1573,8 +1604,14 @@ class Scheduler:
                     or record.key in self._watchdog_fences):
                 return
 
+            # Three facts on the row the budget already counts: that the
+            # reviewer rejected, how many findings it raised, and the typed
+            # findings themselves. The count is what the convergence series
+            # is rebuilt from; the entry is what the ledger is rebuilt from.
             marker = {rp.REVIEW_REJECTED_KEY: True,
+                      rp.REVIEW_FINDINGS_COUNT_KEY: len(review.findings),
                       "review_subject_digest": review.subject_digest}
+            marker.update(rp.guidance_extra_review(review))
             detail = {
                 "reason": "code review rejected the diff",
                 "subject_digest": review.subject_digest,
@@ -1585,6 +1622,8 @@ class Scheduler:
                 # convicts, and §10.1 forbids any guard reading it back.
                 "blocking_checks": [c.check_id for c in review.findings],
             }
+            self._review_convergence.setdefault(node.node_id, []).append(
+                len(review.findings))
 
             lifecycle = store.get_node(self.run_id, node.node_id)
             if self._review_ceiling_reached(
@@ -1814,7 +1853,10 @@ class Scheduler:
             review_findings={
                 node_id: findings
                 for node_id, findings in self._review_findings.items()
-                if any(n == node_id for n, _ in blocked)})
+                if any(n == node_id for n, _ in blocked)},
+            review_convergence={
+                node_id: tuple(counts)
+                for node_id, counts in self._review_convergence.items()})
 
     def _is_candidate_accepted(self, states: Mapping[str, str]) -> bool:
         """§8.8 — at least one node MERGED and every other MERGED or

@@ -304,6 +304,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   cases. An unusable runner refuses the run at preflight, with no attempt launched and no
   environmental budget spent. See §19 M8 and §17 item 121.
 
+- `RunReport.review_convergence` — `node_id -> findings-per-attempt`, one count per
+  review-rejected attempt in order, surfaced in `maestro run`'s JSON under the same key.
+  `review_findings` already said *what* the last reviewer objected to; nothing said whether the
+  objections were shrinking, which is the question behind `review_ceiling`. A descending series is
+  a node the ceiling cut off early; a flat one is a node more attempts would not have saved. The
+  count rides `attempts.extra_json` under `retry_policy.REVIEW_FINDINGS_COUNT_KEY`, on the same
+  review-rejected row the budget is already counted from, so `review_convergence_from_attempts`
+  rebuilds the series on resume and a run finished by a second process reports the whole run
+  rather than its own slice. Nothing transitions on it — it is a count of typed findings under a
+  typed key, read only by the report and the JSON (§1.2, §10.1).
+
 ### Changed
 
 - Bare `maestro run cancel` now **pauses** instead of discarding the run. It was the operator's
@@ -318,6 +329,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   backstop's domain is still the run's stopping point rather than quiescence.
 
 ### Fixed
+
+- Retry guidance survives both a second failure from the same surface and the death of the
+  scheduler process. `GuidanceLedger` held **one** entry per acceptance surface and `with_*`
+  *replaced* it, so a node that failed verification twice carried only the second failure into its
+  next prompt; and `Scheduler._guidance` was process-local and rebuilt from nothing, so a resumed
+  run dispatched its builder with no guidance at all. Each surface now holds a tuple and `with_*`
+  appends; every entry is written to the attempt row that produced it under
+  `retry_policy.GUIDANCE_KEY` — by `fail_attempt` on a recycled attempt and by `mark_blocked` on
+  the one that hits the semantic ceiling, which is the entry most likely to be wanted, since a
+  node blocked on the ceiling is the one an operator resumes — and `guidance_from_attempts`
+  rebuilds every node's ledger in `project()`, keyed by `(node_id, base_sha)` as
+  `AttemptRecord.guidance_key` defines it. See §19 M23.
+
+  The stated justification for replacement — "newer evidence supersedes older, which is how a
+  fixed finding retires" — does not hold. Each surface re-evaluates a *different diff* every
+  attempt, so a constraint absent from the latest evaluation may be absent because the attempt
+  stopped writing the file it concerned rather than because it was satisfied, and the two are
+  indistinguishable from the surface's output.
+
+- `render_guidance` drops a surface's **oldest** entries under budget pressure, not its newest.
+  Accumulation makes the rendered guidance grow across retries, which puts B13's overflow mode
+  back in play, and `_fit` alone truncates from the end — with history rendered oldest-first that
+  would have dropped the finding the next attempt has to fix and kept the one it had already
+  addressed. `_fit_surface` drops whole entries from the front, announces the drop, and falls back
+  to `_fit` only inside a single oversized entry. The total stays inside
+  `GUIDANCE_CHAR_BUDGET`: forty accumulated entries per surface render 11,259 characters against
+  the 12,000 cap and the size plateaus rather than climbing, so an accumulating ledger cannot be
+  what pushes a handoff past `_preflight_prompt`.
 
 - `docs/plan-authoring.md` no longer implies that `maestro plan review` reads the plan. The step
   described "a second person … reviews the mutated IR", which reads as a semantic review the verb

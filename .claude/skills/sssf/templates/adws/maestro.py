@@ -3054,7 +3054,18 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                       # exit status must not depend on a stand-in carrying
                       # every field of the real report.
                       "review_findings": dict(
-                          getattr(report, "review_findings", {}) or {})},
+                          getattr(report, "review_findings", {}) or {}),
+                      # Findings-per-attempt for every reviewed node, in
+                      # order. `review_findings` answers "what did the
+                      # reviewer object to"; this answers "was it objecting
+                      # less each time", which is the question behind
+                      # `review_ceiling` and the one nothing in the run
+                      # could answer once the process exited.
+                      "review_convergence": {
+                          node_id: list(counts)
+                          for node_id, counts in dict(
+                              getattr(report, "review_convergence", {})
+                              or {}).items()}},
                      sort_keys=True))
     return 0
 
