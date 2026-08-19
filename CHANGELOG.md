@@ -209,6 +209,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   case and in `test_workspace_runtime.py`'s global-gate cancellation case; the siblings left behind
   are what the issue reported.
 
+- Cross-checkout tests resolve their peer repository from git rather than from their own file
+  path, so they run inside a linked worktree instead of skipping. `tests/test_template_parity.py`,
+  `tests/test_schema_vocabulary_parity.py` and `tests/test_plan_admission.py` each walked up from
+  `__file__` to the enclosing repository root and looked for the peer checkout beside it. In a
+  linked worktree that root is `.claude/worktrees/<lane>`, so the peer was looked for at
+  `.claude/worktrees/the-library`, which exists on no machine, and all twelve tests skipped.
+  Every lane authors its template changes in a worktree, which means the parity invariant — the
+  only mechanical thing holding the two template copies together — had never once examined lane
+  work, and reported nothing while not examining it. The new `tests/checkout_layout.py` asks
+  `git rev-parse --git-common-dir` for the main working tree and looks for peers beside that,
+  falling back to the old filesystem derivation only when git cannot answer. `test_plan_admission`
+  additionally spelled maestro's layout depth into its arithmetic, so it also skipped when the
+  runtime under test was the-library's own; it now resolves the-library's checkout by name from
+  either side. Skips are no longer silent: each carries the path searched and how that path was
+  chosen, and is raised as a `PeerCheckoutMissing` warning so it appears in a default `-q` run
+  rather than as an unexplained `s`. The one legitimate skip is unchanged — the peer repository
+  not being checked out at all — and a peer that is checked out with its runtime or schema missing
+  still fails.
+
 - `docs/plan-authoring.md`: removed the "Not built yet" blockquote over `maestro plan gate`,
   `review`, and `ship`. Those verbs shipped in commit 6707e50 (PR #8) and are registered on the
   `plan` subparser; the binding runbook was still directing plan authors to hand-run the `planctl`
