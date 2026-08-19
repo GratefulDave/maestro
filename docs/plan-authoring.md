@@ -58,7 +58,13 @@ Run these in the repository the plan will change.
    finished plan.
 3. `maestro plan gate <plan-name>` — the author renders, validates, and mutates the IR.
 4. `maestro plan review <plan-name>` — a second person, holding the reviewer's key rather than the
-   author's, reviews the mutated IR and re-validates it against the approved-receipt requirement.
+   author's, reviews the mutated IR and re-validates it against the approved-receipt requirement:
+   `planctl review` followed by `planctl validate --require-approved`. **No model is dispatched.**
+   The verb takes the reviewer's configured identity and vendor as strings and signs a receipt
+   bound to the IR bytes by `ir_sha256`; it does not contain a semantic reading of `surface` or
+   `effects`. Those two fields have no independent reader before a run begins (#31). Whatever
+   judgement the review represents is the reviewer's own, made before they run the verb — the verb
+   records that it happened and to which exact bytes, and nothing more.
 5. `maestro plan ship <plan-name>` — projects the reviewed IR into a `maestro-plan.v1` plan,
    validates the projection, and finalizes it. Finalizing is required before the plan can run, and
    before it can participate in a workspace.
