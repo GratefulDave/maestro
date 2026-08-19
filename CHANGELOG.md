@@ -210,6 +210,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `docs/plan-authoring.md` no longer implies that `maestro plan review` reads the plan. The step
+  described "a second person … reviews the mutated IR", which reads as a semantic review the verb
+  performs. It does not: `_plan_review` runs `planctl review` followed by `planctl validate
+  --require-approved`, taking the reviewer's configured id and vendor as identity strings, and
+  signs a receipt bound to the IR bytes by `ir_sha256`. No model is dispatched, and the receipt
+  holds no reading of `surface` or `effects` — those two fields have no independent reader before a
+  run begins (#31). The judgement is the reviewer's own, made before they type the command; the
+  verb records that it happened and to which exact bytes. Carved from the unmergeable
+  `issues/sweep` branch, which had the correction but could not be merged.
+
 - `attempt salvage` no longer signs a receipt for bytes no attempt produced. The verb measured a
   stranded attempt against a baseline it rebuilt with `worktree.inventory_at_commit` — `git
   ls-tree` of the recorded base commit, which is tracked paths only. The measurement bracket's
