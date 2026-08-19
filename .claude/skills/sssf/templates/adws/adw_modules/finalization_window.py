@@ -413,9 +413,31 @@ class FinalizationWindow:
         return None
 
     def run(self, sleep: Callable[[float], None] = time.sleep) -> WindowOutcome:
-        """Open if needed, then poll until the window converts."""
+        """Open, arm the recorded launch, then poll until the window converts.
+
+        The arming step is not optional bookkeeping. `poll` returns early on
+        `not session.armed`, so a `run` that never calls `report_launched`
+        leaves PROCESS_DEAD, ACTOR_ABANDONED and TURN_TIMEOUT unreachable and
+        the span bound as the *only* detector — which is precisely the state
+        B14 was recorded against, a reviewer idle at its prompt having written
+        nothing while the verb waited out a wall clock. §6.5 requires the
+        structural signals to be the working detector and the span bound to be
+        the last resort; without this the order is inverted.
+
+        It arms from what `open`'s launch already recorded rather than from
+        anything a caller passes, so the stamp remains this window's own
+        (§1.2: a launch reports, it does not assert a lifecycle transition).
+        A launcher that captured no pid arms anyway — `launched_at` is what
+        the turn clock and the quiescence latch need, and a `None` pid simply
+        leaves PROCESS_DEAD inapplicable rather than leaving the window blind.
+        """
         if self._session is None:
             self.open()
+        session = self._require_open()
+        if not session.armed:
+            self.report_launched(
+                pid=session.pid,
+                session_path=session.extra.get(SESSION_PATH_KEY))
         while True:
             outcome = self.poll()
             if outcome is not None:

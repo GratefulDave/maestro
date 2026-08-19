@@ -1008,6 +1008,13 @@ def _apply_repository_config(
         run_root = config["repository_state"] / "runs" / run_id
         args.digest = plan_digest.digest_of(plan_file.read_bytes())
         args.db = str(config["database"])
+        # The `runners:` block binds here or it binds nowhere. Only
+        # `_bind_layout_executables` used to set it, and no run-execution verb
+        # goes through that function, so `_resolve_run_runners` saw an empty
+        # declaration on every `run start` and `run resume` and fell through to
+        # discovery -- printing the adoption notice for a runner the repository
+        # had already declared, and pinning nothing.
+        args.runners = dict(config.get("runners") or {})
         args.run_id = run_id
         args.integration_path = str(run_root / "integration")
         args.worktrees_root = str(run_root / "worktrees")
@@ -1485,8 +1492,14 @@ def _reviewer_window_factory(args: argparse.Namespace):
             return finalization_window.ReviewerSession(
                 route=args.reviewer_route, model=args.reviewer_model,
                 session_id=handle.pane_id, session_dir=str(session_dir),
+                # `harness_owned_group` stays keyed on `process_group` alone
+                # and must not learn about the fallback: it is what decides
+                # whether the stall path SIGKILLs, and §8.3 conditions that on
+                # a receipt §9.8 records as only partly executed. `pid` may
+                # take the fallback, because its only consumer is the window's
+                # `process_alive` read (#20).
                 harness_owned_group=handle.process_group is not None,
-                pid=handle.process_group)
+                pid=handle.process_group or handle.liveness_pid)
 
         def poll_report():
             return _poll_reviewer_report(report_path)
@@ -1609,8 +1622,10 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                 return finalization_window.ReviewerSession(
                     route=args.reviewer_route, model=args.reviewer_model,
                     session_id=handle.pane_id, session_dir=str(session_dir),
+                    # As above: the kill stays gated on `process_group`, the
+                    # liveness read may use the fallback (#20).
                     harness_owned_group=handle.process_group is not None,
-                    pid=handle.process_group)
+                    pid=handle.process_group or handle.liveness_pid)
 
             def poll_report():
                 return _poll_reviewer_report(report_path)
@@ -2952,11 +2967,22 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 handles[key] = handle
                 proven_absent.discard(key)
             _require_session_path(handle, node.node_id, record.attempt_no)
+            # `process_group` first because a harness-spawned launch owns its
+            # group outright; `liveness_pid` is the herdr-spawned fallback that
+            # makes §7.6's PROCESS_DEAD signal reachable for an agent node at
+            # all (#20). Both land in `attempts.pid`, which has exactly one
+            # reader — the watchdog's `process_is_alive` check — while the kill
+            # path below reads `handle.process_group` from `handles` and is
+            # deliberately not given the fallback: see `LaunchHandle`, §8.3 and
+            # §16.3 items 17 and 30.
+            liveness_pid = handle.process_group
+            if liveness_pid is None:
+                liveness_pid = handle.liveness_pid
             store.mark_launched(
                 args.run_id, node.node_id, record.attempt_no,
-                handle.process_group,
+                liveness_pid,
                 extra={watchdog.SESSION_PATH_KEY: str(handle.transcript_path)})
-            on_launch(handle.process_group)
+            on_launch(liveness_pid)
             return _poll_agent_execution(
                 route_runner, handle, envelope, record, cancel_requested,
                 quiesce_attempt)

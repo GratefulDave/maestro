@@ -70,7 +70,9 @@ class Harness:
 
     def __init__(self, *, config=None, report_after_polls=None,
                  harness_owned_group=True, monotonic_start=0.0,
-                 epoch_start=1_760_000_000.0, alive=True, records=0):
+                 epoch_start=1_760_000_000.0, alive=True, records=0,
+                 pid=None):
+        self.pid = pid
         self.calls = []
         self.killed = []
         self.sessions = []
@@ -102,7 +104,8 @@ class Harness:
         return fw.ReviewerSession(
             route="omp", model="opus", session_id="sess-7",
             session_dir="/tmp/finalize/sess-7",
-            harness_owned_group=self.harness_owned_group)
+            harness_owned_group=self.harness_owned_group,
+            pid=self.pid)
 
     def _poll_report(self):
         self._polls += 1
@@ -179,6 +182,35 @@ class TheWindowOpensWithADurableRecord(unittest.TestCase):
         self.assertEqual(session.route, "omp")
         self.assertEqual(session.model, "opus")
         self.assertEqual(session.session_id, "sess-7")
+
+    def test_run_arms_a_launched_session_before_its_first_poll(self):
+        """A launch that returned a pid must reach the process liveness check.
+
+        `poll` returns early on `not session.armed`, so a `run` that never
+        arms leaves PROCESS_DEAD, ACTOR_ABANDONED and TURN_TIMEOUT all
+        unreachable and the span bound as the only detector — B14's recorded
+        failure with §6.5's structural signals switched off. Asserting the
+        *signal* rather than merely `armed` is what makes this test notice a
+        regression that arms the session but arms it too late to matter.
+        """
+        h = Harness(alive=False, pid=17)
+        outcome = h.window.run(sleep=lambda _seconds: h.monotonic.advance(601.0))
+
+        self.assertTrue(outcome.session.armed)
+        self.assertIs(outcome.signal, fw.FinalizationSignal.PROCESS_DEAD)
+
+    def test_run_arms_a_session_whose_launch_captured_no_pid(self):
+        """No pid is not a reason to leave the other two signals switched off.
+
+        A herdr-spawned reviewer may legitimately have no pid; the turn clock
+        and the quiescence latch still need `launched_at`, and only the
+        liveness check is inapplicable.
+        """
+        h = Harness(records=0)
+        outcome = h.window.run(sleep=lambda _seconds: h.monotonic.advance(11.0))
+
+        self.assertTrue(outcome.session.armed)
+        self.assertIs(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
 
     def test_the_row_is_written_before_the_first_poll(self):
         """§6.5: a stall is diagnosable from the store even though no run

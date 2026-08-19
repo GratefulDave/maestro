@@ -407,6 +407,74 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- §7.6's PROCESS_DEAD signal can convict an agent attempt (issue #20). It could not before, and the
+  branch had never run for an agent node in the project's history: `watchdog.py` guards it on
+  `attempt.pid is not None`, and `attempts.pid` was written from `LaunchHandle.process_group`, which
+  is absent for every herdr-spawned agent. Two of the three signals §7.6 names carried the whole
+  burden, so an agent whose process died silently waited out the node clock before anything noticed
+  — half an hour of a run doing nothing, unattended, with no indication that anything was wrong.
+
+  `herdr pane process-info` reports a foreground process group. `launcher.pane_liveness_pid` reads
+  it after the prompt is submitted — earlier and the foreground is still the pane's own shell — and
+  the launcher records it on the new `LaunchHandle.liveness_pid`, from where it reaches
+  `attempts.pid` and the watchdog's `process_is_alive` check.
+
+  **It is a separate field from `process_group` on purpose, and merging them would be a defect.**
+  `process_group` is §8.3's kill target, and §8.3 conditions writing it on an executed §9.8 receipt
+  proving the group excludes the pane shell and every sibling attempt. That receipt is now
+  registered in §9.8 with its five acceptance criteria (discharging §16.3 item 30, which recorded
+  that four sections cited a receipt with no owner) and recorded as **partially executed**: a group
+  exists and is distinguishable from the pane shell; sibling exclusion under concurrency and a
+  planted survivor the kill terminates are still unrun. Reading whether a group exists and sending
+  it SIGKILL fail in opposite directions — a wrong answer on the read path reports a live attempt
+  dead, a wrong answer on the kill path terminates the operator's shell — so only the read is
+  adopted. §16.3 item 17 stays open, and its budget and attribution costs are unchanged.
+
+  Making the branch reachable also made a question real that could not arise while it was dead, so
+  `declared_result_observed` now joins its guard — the same §9.7 rule already applied to the two
+  clock signals. A code node was always spared by `exit_status_observed` and an agent node had no
+  pid, so no *finished* attempt could ever lose its process here. The measured cost of getting that
+  wrong is on record for the code path: a command that exited between two polls was convicted
+  PROCESS_DEAD, retried twice into the same race and blocked ENVIRONMENTAL_BUDGET_EXHAUSTED,
+  roughly one run in three, for a node that had already succeeded. It is a belt rather than the
+  braces — a herdr-spawned agent returns to its composer and idles rather than exiting when it
+  finishes a turn, so its foreground group survives and absence really is death for this launch
+  path — but it costs one ledger read on an attempt whose process is already gone, and it means no
+  route whose agent *does* exit on completion can have accepted work convicted for finishing.
+
+  The same gap had a second and third instance, found by looking for them rather than by waiting:
+  both reviewer launch sites in `maestro.py` built their `ReviewerSession` with
+  `pid=handle.process_group`, which is `None` for every herdr-spawned reviewer, so the finalization
+  window's own liveness check was dead for the same reason. Both now take the fallback.
+  `harness_owned_group` deliberately still reads `process_group` alone, because that is the flag
+  deciding whether the stall path sends a signal.
+
+  The resolver declines rather than guesses whenever the foreground cannot be told apart from the
+  pane's shell — `_available_shell` is true, the group equals `shell_pid`, the group is absent or
+  non-positive, or the call fails. Recording the shell's group would make PROCESS_DEAD permanently
+  satisfied and never convicting, which is worse than the gap it replaces because it would look
+  fixed. A declined group leaves the attempt with exactly the two clocks it had.
+
+- The finalization window arms the reviewer session before its first poll, so §6.5's structural
+  signals are the working detector rather than dead code. This is the second instance of the defect
+  above and was found by looking for it: `FinalizationWindow.run` opened the window and polled, and
+  never called `report_launched`. `poll` returns early on `not session.armed`, so PROCESS_DEAD,
+  ACTOR_ABANDONED and TURN_TIMEOUT were all unreachable in production and the span wall clock was
+  the **only** detector a stalled reviewer could ever meet — B14's recorded failure exactly, with
+  the mechanism written to prevent it switched off. `report_launched` was allowlisted in
+  `test_no_dead_seams.py` as having no production caller, which is where the defect had been
+  recorded rather than fixed; that entry is now deleted, and the sweep fails if it comes back.
+
+  `test_finalization.py`'s stall assertion changes from `WINDOW_TIMEOUT` to `TURN_TIMEOUT` as a
+  direct consequence: an armed reviewer that stops without declaring is now convicted by the signal
+  that names what happened, instead of waiting out a clock that names the wrong cause.
+
+  The fix already existed in the `lexgenius` deployment and had never been carried upstream. It is
+  one of the eight files tracked in #71, and it was recorded there as an unresolved *semantic
+  disagreement* between the copies — the deployment asserting `TURN_TIMEOUT` where the template
+  asserted `WINDOW_TIMEOUT`. It was not a disagreement. It was one fix and its test, split across
+  two copies, with each half looking arbitrary without the other.
+
 - Precondition waits in `test_participant.py`, `test_scheduler.py` and `test_workspace_runtime.py`
   are hang detectors rather than tuned wall clocks, closing the last residual instances of the
   class `#50` fixed in `test_coordinator.py` (issue #57). Each file now derives every arrival wait

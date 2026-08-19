@@ -113,6 +113,25 @@ ALLOWED: Dict[str, str] = {
                                   "record for an agent node until the quiesce "
                                   "receipt lands. Deliberate, not deferred.",
 
+    # The sibling field, and a different reason: this one HAS a production
+    # writer -- `HerdrLauncher.launch` sets it once the prompt is submitted --
+    # but sets it through `object.__setattr__`, which this module's own header
+    # lists among the dynamic writers it cannot see. Allowlisting it here says
+    # "the sweep cannot see this write", not "there is no write", and the
+    # difference is checked by a reader rather than asserted: the write is
+    # driven end to end through the real launch path in
+    # `test_agent_liveness_pid.py::LaunchRecordsTheLivenessPidTests`, which
+    # fails if `launch` stops populating it or stops calling herdr at all.
+    # It is NOT written as a constructor keyword, because the value cannot
+    # exist at construction time -- before the prompt is submitted the pane's
+    # foreground group is still its own shell -- and passing `liveness_pid=None`
+    # there to satisfy this sweep would be exactly the "field written only with
+    # its own default" that the header names as semantic deadness.
+    "LaunchHandle.liveness_pid": "written by HerdrLauncher.launch via "
+                                 "object.__setattr__, which this sweep "
+                                 "documents as invisible; covered by "
+                                 "test_agent_liveness_pid.py",
+
     # D10. Does not reach the scheduler from maestro.py's SchedulerDeps
     # construction. (D11 stood here too and is fixed: a gate's threshold now
     # travels on `PlanNode.gate_min_cases`, the one integration gate's on
@@ -161,8 +180,6 @@ ALLOWED: Dict[str, str] = {
                                    "production caller",
     "lifecycle.audit_transitions": "DEFERRED: diagnostics reader over the "
                                    "transitions table, no production caller",
-    "finalization_window.report_launched": "DEFERRED: finalization-path, no "
-                                           "production caller",
     "finalization_window.require_fresh_session_dir": "DEFERRED: "
                                                      "finalization-path, no "
                                                      "production caller",

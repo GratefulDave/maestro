@@ -862,8 +862,17 @@ class FinalizeOrchestration(unittest.TestCase):
             self.assertEqual(stalled.route, "omp")
             self.assertEqual(stalled.model, "opus")
             self.assertEqual(stalled.session_id, "sess-1")
+            # TURN_TIMEOUT, not WINDOW_TIMEOUT, and the difference is §6.5's
+            # whole ordering claim rather than a detail of this fixture. The
+            # window now arms the session in `run` before its first poll, so
+            # a reviewer that stops without declaring is convicted by the
+            # structural signal that names what actually happened. It read
+            # WINDOW_TIMEOUT for as long as `run` never armed — with the
+            # session unarmed, `poll` returned early and the span bound was
+            # the only detector left, which is B14's recorded failure and the
+            # inversion §6.5 exists to forbid.
             self.assertEqual(stalled.signal,
-                             fw.FinalizationSignal.WINDOW_TIMEOUT)
+                             fw.FinalizationSignal.TURN_TIMEOUT)
             self.assertFalse(store.has(DIGEST))
             self.assertEqual(len(stalling.stalls), 1)
 
