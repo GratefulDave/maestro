@@ -410,13 +410,23 @@ class Watchdog:
         #
         # §9.7 moves this bound for an attempt that has already declared a
         # result; it does not remove it, and the difference is the whole of
-        # the judgement here. This is the LAST bound an agent attempt has --
-        # PROCESS_DEAD is unreachable for one (`attempt.pid` is
-        # `handle.process_group`, which herdr never populates, §16.3 item 17)
-        # and the turn clock below is disarmed by the same result row -- so an
-        # unconditional exemption would trade a false kill for a hang, and the
-        # only thing left watching would be §11.2's run-level backstop, which
-        # a sibling node's transitions keep refreshing indefinitely.
+        # the judgement here. This is the last bound an agent attempt is
+        # GUARANTEED -- the turn clock below is disarmed by the same result
+        # row, so an unconditional exemption would trade a false kill for a
+        # hang, and the only thing left watching would be §11.2's run-level
+        # backstop, which a sibling node's transitions keep refreshing
+        # indefinitely.
+        #
+        # PROCESS_DEAD is no longer structurally unreachable for an agent
+        # node: `attempt.pid` now takes `LaunchHandle.liveness_pid` -- the
+        # pane's foreground process group, read from `herdr pane
+        # process-info` -- where it used to take only `handle.process_group`,
+        # which herdr never populates (#20, §9.8's group-membership receipt).
+        # It is still not guaranteed: the launcher declines the group whenever
+        # it cannot be told apart from the pane's own shell, and answers
+        # `None`, which is exactly this state. So the reasoning above stands
+        # as written; what changed is that an agent attempt now usually has a
+        # third signal rather than never having one.
         #
         # `backstop_t_s` is the deferred bound because it is the one number
         # already proven to be both finite and strictly greater:
@@ -474,8 +484,27 @@ class Watchdog:
         # an agent the herdr server spawned, whose handle Maestro does not
         # hold and whose exit nothing else can see, where absence genuinely is
         # the only signal there is.
+        # `declared_result_observed` joins the guard for #20, and it is the
+        # same §9.7 rule as the two above rather than a new one. Until #20 this
+        # branch could not fire at all -- a code node is spared by
+        # `exit_status_observed` and an agent node had no pid -- so the
+        # question of a *finished* attempt losing its process never arose here.
+        # It does now. The measured cost of getting this wrong is on record for
+        # the code path: a command that exited between two polls was convicted
+        # PROCESS_DEAD, retried twice into the same race and blocked
+        # ENVIRONMENTAL_BUDGET_EXHAUSTED, roughly one run in three, for a node
+        # that had already succeeded.
+        #
+        # It is a belt, not the braces: a herdr-spawned agent does not exit
+        # when it finishes a turn -- it returns to its composer and idles, and
+        # the pane's foreground group survives with it -- so absence really is
+        # death for this launch path, which is what §7.6 wrote the signal for.
+        # The guard costs one ledger read on an attempt whose process is
+        # already gone, and it means no route whose agent *does* exit on
+        # completion can have its accepted work convicted for finishing.
         if (attempt.pid is not None
                 and not self._exit_status_observed(attempt)
+                and not self._declared_result_observed(attempt)
                 and not self._process_alive(attempt.pid)):
             self._heartbeats.pop(key, None)
             self._stall(attempt, StallReason.PROCESS_DEAD)

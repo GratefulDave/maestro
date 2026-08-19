@@ -451,6 +451,17 @@ class LaunchHandle:
     #: would delete the seam the receipt is meant to fill; the dead-seam sweep
     #: therefore carries it as deliberate rather than deferred.
     process_group: Optional[int] = None
+    #: The pane's foreground process group, resolved once the agent is running,
+    #: for **liveness only** — `kill(pid, 0)`, never a signal. It is a separate
+    #: field from `process_group` above rather than a way of finally filling it
+    #: in, because the two are gated on different evidence: reading whether a
+    #: group exists is safe under the recorded herdr surface, while §8.3's kill
+    #: is conditional on a §9.8 receipt proving the group excludes the pane
+    #: shell and every sibling attempt (§16.3 items 17 and 30). Merging them
+    #: would let a fix for #20's read path silently arm a kill path no receipt
+    #: covers. `None` means the group could not be told apart from the pane's
+    #: own shell, and the attempt keeps exactly the two clocks it has today.
+    liveness_pid: Optional[int] = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -768,6 +779,65 @@ def _available_shell(payload: Mapping[str, object]) -> bool:
         token = token or str(argv[0] or "")
     base = token.rsplit("/", 1)[-1].lstrip("-").lower()
     return base in ("zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh")
+
+
+def pane_liveness_pid(herdr_call: Callable[..., dict],
+                      pane_id: str) -> Optional[int]:
+    """The pane's foreground process group, for asking whether it still exists.
+
+    §7.6 names three liveness signals and §16.3 item 17 records that one of
+    them, PROCESS_DEAD, cannot convict an agent attempt: `attempt.pid` was
+    only ever `handle.process_group`, which is absent for a herdr-spawned
+    agent, so `watchdog.py`'s `attempt.pid is not None` branch never ran and
+    TURN_TIMEOUT and NODE_TIMEOUT carried the whole burden alone (#20).
+
+    `herdr pane process-info` does report a group — the same payload
+    `_available_shell` already reads for its `shell_pid` / `pgid` /
+    `foreground_processes` triple. What it reports is the pane's *foreground*
+    group, which is the agent while the agent is running and the pane's own
+    shell when nothing is.
+
+    **This value is for `kill(pid, 0)` and nothing else.** It is deliberately
+    not written to `LaunchHandle.process_group`, and the difference is the
+    whole of the judgement here. That field is §8.3's kill target, and §8.3
+    conditions writing it on an executed §9.8 receipt proving the group
+    excludes the pane shell and every sibling attempt (§16.3 items 17 and 30).
+    No such receipt exists. Asking whether a group is alive and sending it
+    SIGKILL fail in opposite directions: a wrong answer here reports a live
+    attempt dead or a dead one live, and the design already survives the
+    latter because it is today's behaviour; a wrong answer on the kill path
+    terminates the operator's shell.
+
+    Returns `None` rather than guessing whenever the payload does not show a
+    foreground group distinct from the pane's shell:
+
+    * `_available_shell` is true — the foreground is a lone interactive shell,
+      so the agent has not started or has already exited. Recording the
+      shell's group would make PROCESS_DEAD permanently unreachable *and*
+      permanently silent, which is worse than the gap it replaces because it
+      would look fixed.
+    * the group equals `shell_pid`, the same case reached without the
+      process-name evidence `_available_shell` needs.
+    * the call fails, or the payload carries no group.
+
+    A `None` return leaves the attempt exactly where it is today: convicted by
+    the turn clock and the node clock, never by absence.
+    """
+    try:
+        payload = herdr_call("pane", "process-info", "--pane", pane_id)
+    except RuntimeError:
+        return None
+    info = _extract(payload, "process_info")
+    if not isinstance(info, dict):
+        return None
+    pgid = _optional_int(info.get("foreground_process_group_id"))
+    if pgid is None or pgid <= 0:
+        return None
+    if pgid == _optional_int(info.get("shell_pid")):
+        return None
+    if _available_shell(payload):
+        return None
+    return pgid
 
 
 def _is_text_read(args: Sequence[str]) -> bool:
@@ -1707,6 +1777,20 @@ class HerdrLauncher:
                 timeout_s=60.0, until=("working", "idle"))
         # The omp route carries its prompt in argv (`build_omp_argv`), so there
         # is nothing to type and no composer to stall.
+
+        # Resolved here, last, and deliberately not earlier: before the prompt
+        # is submitted the pane's foreground group is still its own shell, and
+        # `pane_liveness_pid` would decline. Same frozen-field assignment the
+        # transcript path above uses, so `_handles` and the caller keep naming
+        # one object. A `None` is the normal case on any route that does not
+        # report a distinct foreground group, not a failure: it leaves the
+        # attempt with the turn clock and the node clock it already had.
+        liveness_pid = pane_liveness_pid(
+            lambda *args, **kwargs: self._herdr(*args, env=environment,
+                                                **kwargs),
+            pane_id)
+        if liveness_pid is not None:
+            object.__setattr__(handle, "liveness_pid", liveness_pid)
         return handle
 
     def agent_status(self, handle: LaunchHandle) -> Optional[str]:
