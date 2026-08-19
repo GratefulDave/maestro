@@ -305,6 +305,63 @@ def create_attempt_worktree(repo: Path, run_id: str, node_id: str, attempt_no: i
     )
 
 
+def inventory_at_commit(repo: Path, sha: str) -> Inventory:
+    """The recorded base tree as inventory tuples — a1's before-side.
+
+    `take_baseline` walks a live worktree. After the attempt process dies
+    that walk is gone. The recorded base commit is the durable half of the
+    same bracket: every path git tracked at `sha`, with the mode and blob
+    git stored. Provision leftovers git would not commit are out of this
+    universe the same way `inventory` excludes them.
+    """
+    result = _git(Path(repo), "ls-tree", "-r", "-z", sha, check=False)
+    if result.returncode != 0:
+        raise WorktreeError(
+            f"recorded base {sha} cannot be read as a tree: {result.stderr.strip()}")
+    inv: Inventory = {}
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        meta, _, rel = record.partition("\t")
+        parts = meta.split()
+        if len(parts) != 3:
+            raise WorktreeError(f"ls-tree record is not mode/type/blob: {record!r}")
+        mode, kind, blob = parts
+        if kind != "blob":
+            continue
+        if mode not in (MODE_REGULAR, MODE_EXECUTABLE, MODE_SYMLINK):
+            continue
+        inv[rel] = (mode, blob)
+    return inv
+
+
+def reopen_attempt_worktree(
+        repo: Path, run_id: str, node_id: str, attempt_no: int, base: str,
+        worktrees_root: Path, scratch_root: Path) -> AttemptWorktree:
+    """Rebuild the attempt handle from durable identity. Does not create.
+
+    Salvage has to measure in a1's own worktree against a1's own recorded
+    base. Creating a new worktree would mint attempt 2's bracket.
+    """
+    repo = Path(repo).resolve()
+    worktrees_root = Path(worktrees_root).resolve()
+    path = worktrees_root / worktree_dirname(run_id, node_id, attempt_no)
+    if not path.is_dir():
+        raise WorktreeError(f"attempt worktree {path} is gone")
+    branch = branch_name(run_id, node_id, attempt_no)
+    scratch = Path(scratch_root).resolve() / worktree_dirname(run_id, node_id, attempt_no)
+    scratch.mkdir(parents=True, exist_ok=True)
+    private_index = worktrees_root / f".index-{worktree_dirname(run_id, node_id, attempt_no)}"
+    baseline = inventory_at_commit(repo, base)
+    return AttemptWorktree(
+        repo=repo, path=path.resolve(), branch=branch, base=base,
+        scratch=scratch, private_index=private_index,
+        run_id=run_id, node_id=node_id, attempt_no=attempt_no,
+        tracked_at_base=frozenset(baseline), baseline=baseline,
+    )
+
+
+
 # ── §8.3 the inventory tuple ────────────────────────────────────────────────
 
 def _mode_class(path: Path) -> str:

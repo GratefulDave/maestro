@@ -662,6 +662,48 @@ class LifecycleStore:
             extra=json.loads(extra_json))
 
     @serialized
+    def node_outputs(self, run_id: str, node_id: str) -> Tuple[str, ...]:
+        """The node's declared outputs, as stored when the run was created."""
+        row = self.conn.execute(
+            "SELECT outputs_json FROM dag_nodes WHERE run_id=? AND node_id=?",
+            (run_id, node_id)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id} has no dag row")
+        return tuple(json.loads(row[0]))
+
+    @serialized
+    def record_salvage(self, run_id: str, node_id: str, attempt_no: int,
+                       extra: Mapping[str, Any]) -> None:
+        """Merge salvage facts into the attempt row and close it if live.
+
+        Salvage does not transition the node: the post-gate never ran, so
+        VERIFIED/MERGED would launder an unmeasured predicate. The attempt
+        that produced the files is no longer live once those files have a
+        commit, so a RUNNING row is closed here the same way the other
+        escapes close it.
+        """
+        row = self.conn.execute(
+            "SELECT extra_json, state FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
+        try:
+            merged = json.loads(row[0] or "{}")
+        except json.JSONDecodeError:
+            merged = {}
+        if not isinstance(merged, dict):
+            merged = {}
+        merged.update(extra)
+        self.conn.execute(
+            "UPDATE attempts SET extra_json=?, state=CASE WHEN state=? THEN ? ELSE state END"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (json.dumps(merged, sort_keys=True),
+             st.NodeState.RUNNING.value, CLOSED_ATTEMPT_STATE.value,
+             run_id, node_id, attempt_no))
+
+
+    @serialized
     def last_transition_at(self, run_id: str) -> float:
         """The run row's `last_transition_at`, **as epoch seconds** — §11.2's
         backstop input.

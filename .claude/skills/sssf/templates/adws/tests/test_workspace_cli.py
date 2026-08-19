@@ -154,6 +154,7 @@ class WorkspaceCliContract(unittest.TestCase):
             "deliver",
             "run start", "run status", "run list", "run cancel", "run resume",
             "retry", "skip", "abandon",
+            "attempt salvage",
             "workspace author", "workspace validate", "workspace finalize",
             "workspace start",
             "workspace status", "workspace cancel", "workspace resume",
