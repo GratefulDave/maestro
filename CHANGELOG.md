@@ -8,6 +8,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `maestro run pause` — the non-terminal operator stop (§7.3, §7.8). It SIGINTs the process that
+  claimed the run; `Scheduler` installs a handler for the duration of its loop that latches a pause,
+  stops dispatching, quiesces every in-flight worker, and raises `scheduler.RunPaused` instead of
+  declaring. `_execute_run` catches it and prints `{"outcome": "PAUSED", …}`. **No lifecycle
+  transition occurs**: no outcome is declared, no node row is rewritten, `cancel_requested` stays
+  clear, and `latest_outcome` stays NULL — which is the crashed-scheduler shape `run resume` is
+  already legal against, so a paused run resumes. That is what makes an OS signal a legal trigger
+  under §1.2: the signal starts a process stopping, and the ledger records the same nothing it
+  would have recorded had the machine lost power.
+
+  The pid is signalled only when `lifecycle.scheduler_signal_pid` proves identity — the recorded
+  `runs.scheduler_start_epoch` compared for equality against the live process's start epoch.
+  `scheduler_liveness` alone is a weak witness, because the kernel reuses pids and a stranger
+  occupying the number answers alive; an unproven pid is refused with `PAUSE_PID_UNPROVEN` rather
+  than signalled. This is that function's first production caller, and its `DEFERRED` row in
+  `tests/test_no_dead_seams.py` is deleted with it.
+
+- `maestro run cancel --discard`, and `CancelCause.DISCARDED` behind it. `--discard` is the
+  destructive verb and is terminal: it stamps every non-terminal node `DISCARDED` and declares
+  `CANCELLED` with that cause, which is deliberately not in `REOPENABLE_CANCEL_CAUSES`, so
+  `resume_run` refuses it and `_guard_transition` refuses each node individually. A distinct member
+  rather than a reuse of `ABANDONED`, because the two are different facts — every node individually
+  adjudicated as work the run should finish without, versus a run thrown away with nothing
+  adjudicated — and §1.2 wants that distinction stored rather than inferred. Adding an enum member
+  is additive, so ledgers and receipts written before it carry one of the two older values and
+  parse unchanged (unlike §19 M21, a field made unconditionally required after the fact).
+
+- `LifecycleStore.adoptable_attempts`, and the unreachable-work warning `--discard` prints from it.
+  It names `VERIFIED` nodes and nodes whose latest result was adjudicated `ACCEPTED` without
+  merging — work that reached a measured predicate and would simply stop being reachable through
+  Maestro. Review-rejected attempts are excluded, filtered on `retry_policy.REVIEW_REJECTED_KEY`
+  rather than on anything a reviewer wrote in prose.
+
 - `BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE`, and the two checks that raise it: a declared output
   git will not commit is now a refusal instead of a silent empty success. `inventory()`'s universe
   is `git ls-files --cached --others --exclude-standard`, so a **gitignored** declared output is
@@ -270,6 +303,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   interpreter from a selector the lane has not built yet, since both report a usage error and zero
   cases. An unusable runner refuses the run at preflight, with no attempt launched and no
   environmental budget spent. See §19 M8 and §17 item 121.
+
+### Changed
+
+- Bare `maestro run cancel` now **pauses** instead of discarding the run. It was the operator's
+  only stop control and served two intents — end this run, and stop this run because I am about to
+  resume it — with the destructive reading always winning (§19 M18). Ending a run for good is now
+  spelled `run cancel --discard`.
+
+- §11.2's liveness backstop quiesces its in-flight workers before it stops. `Future.cancel` cannot
+  stop a running worker, and the run loop's `finally` already waits on the pool, so cancelling only
+  the futures left the run blocked in `shutdown(wait=True)` until each worker reached its own node
+  timeout — the backstop fired and nothing stopped. The declared outcome is `STUCK` either way; the
+  backstop's domain is still the run's stopping point rather than quiescence.
 
 ### Fixed
 

@@ -52,6 +52,7 @@ both were forced by reading the code rather than the document:
 from __future__ import annotations
 
 import posixpath
+import signal
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -169,6 +170,19 @@ class AttemptOwnershipLost(RuntimeError):
 
 class AttemptCancelled(RuntimeError):
     """Cancellation was requested while the attempt still held RUNNING."""
+
+
+class RunPaused(RuntimeError):
+    """SIGINT or `request_pause` stopped the run without making it terminal.
+
+    Raised instead of returning a `RunReport` because there is no outcome to
+    report: a pause writes none, and a `RunReport` carrying one would be the
+    lie. Nothing about the run's lifecycle moves — `latest_outcome` stays
+    NULL, no node row is rewritten, `cancel_requested` is never set — so a
+    paused run is indistinguishable in the ledger from one whose scheduler
+    process simply stopped, and `run resume` is legal against it for exactly
+    that reason (§1.2, §7.8).
+    """
 
 
 class LaunchFailed(RuntimeError):
@@ -368,6 +382,12 @@ class Scheduler:
         self.plan_digest = plan_digest
 
         self._cancelled = threading.Event()
+        #: Set beside `_cancelled`, never instead of it. The run loop's whole
+        #: stopping machinery keys on `_cancelled`, so a pause reuses it to
+        #: stop new work and quiesce the workers; this second flag is what
+        #: tells the loop not to write `cancel_run` on the way out, and the
+        #: exit to raise `RunPaused` rather than declare.
+        self._paused = threading.Event()
         self._lock = threading.RLock()
         # A watchdog timeout revokes a generation before quiescence can
         # complete and release its retry. The durable row remains RUNNING
@@ -496,6 +516,29 @@ class Scheduler:
         """Latch cancellation; the run loop owns its quiescent completion."""
         with self._lock:
             self._cancelled.set()
+
+    def request_pause(self) -> None:
+        """Stop new work and quiesce workers without declaring an outcome.
+
+        `_cancelled` is set too, because it is the flag every stopping path in
+        the run loop already reads; `_paused` is what makes the difference
+        between the two stops. Nothing durable is written here or by the loop
+        it stops — that is the property `run resume` depends on.
+        """
+        with self._lock:
+            self._paused.set()
+            self._cancelled.set()
+
+    def _handle_sigint(self, signum, frame) -> None:
+        """SIGINT is a pause request, not a kill.
+
+        `run pause` signals the claiming process rather than writing a row,
+        because the process is the thing that has to stop — its `finally`
+        releases the integration checkout, and a row could not have done that.
+        The handler latches and returns; the loop is what quiesces, so no
+        durable state is touched from inside a signal handler.
+        """
+        self.request_pause()
 
     def shutdown(self) -> None:
         pool, self._pool = self._pool, None
@@ -634,6 +677,16 @@ class Scheduler:
             if node is not None:
                 self._block_quiescence(node, record, exc)
 
+    def _interrupt_in_flight(
+            self, in_flight: Dict[str, "Future"],
+            cancellation_requested: set) -> None:
+        """`Future.cancel` cannot stop a running worker. Quiesce it first."""
+        for node_id, future in list(in_flight.items()):
+            future.cancel()
+            if node_id not in cancellation_requested:
+                self._request_cancel(node_id)
+                cancellation_requested.add(node_id)
+
     # ── the main loop ───────────────────────────────────────────────────────
 
     def run(self) -> RunReport:
@@ -642,11 +695,28 @@ class Scheduler:
         Quiescence is "nothing in flight and no node can progress" — not "no
         pending nodes", because a node stranded behind a blocked ancestor
         stays PENDING forever and is exactly the shape the run must stop on.
+
+        One exit does not declare: a pause. `run pause` SIGINTs this process,
+        `_handle_sigint` latches `_paused`, and the loop stops the same way a
+        cancel stops it — except that nothing durable is written and the exit
+        raises `RunPaused` instead. The handler is installed for the duration
+        of the loop and the previous one restored on every path out, including
+        the exceptional ones, so a scheduler embedded in a longer-lived
+        process does not leave its SIGINT behind. Installing it can fail
+        outright off the main thread, and that is not an error — a scheduler
+        that cannot receive the signal simply cannot be paused by it.
         """
+        previous_sigint = None
+        try:
+            previous_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
+        except ValueError:
+            previous_sigint = None
         self.project()
+        if self._paused.is_set():
+            return self._finish_paused(previous_sigint)
         if self._cancelled.is_set():
             self.deps.store.cancel_run(self.run_id)
-            return self._declare()
+            return self._finish(self._declare(), previous_sigint)
 
         self._pool = ThreadPoolExecutor(max_workers=self.config.concurrency)
         in_flight: Dict[str, "Future"] = {}
@@ -660,27 +730,40 @@ class Scheduler:
                     # owned execution first, then wait for the worker to stop
                     # observing its RUNNING lease before cancelling durable
                     # state. Otherwise a late worker could commit into a retry.
-                    for node_id, future in list(in_flight.items()):
-                        future.cancel()
-                        if node_id not in cancellation_requested:
-                            self._request_cancel(node_id)
-                            cancellation_requested.add(node_id)
+                    self._interrupt_in_flight(in_flight, cancellation_requested)
                     if in_flight:
                         done, _ = _wait_any(list(in_flight.items()))
                         for node_id in done:
                             in_flight.pop(node_id, None)
                         continue
-                    self.deps.store.cancel_run(self.run_id)
+                    # A pause takes this same path to quiesce, and writes
+                    # nothing on the way out: `cancel_run` is a lifecycle
+                    # transition, and a pause makes none (§1.2).
+                    if not self._paused.is_set():
+                        self.deps.store.cancel_run(self.run_id)
                     break
 
                 if backstop.check():
-                    # §11.2 — declared with work still in flight, deliberately:
-                    # the backstop's domain is the run's stopping point, not
-                    # quiescence, because both hang shapes it exists for have
-                    # something in flight and nothing transitioning.
+                    # §11.2 — the backstop's domain is the run's stopping
+                    # point, not quiescence: both hang shapes it exists for
+                    # have something in flight and nothing transitioning, so
+                    # STUCK is declared about a run that still has workers.
+                    #
+                    # It still has to *stop* those workers, and `Future.cancel`
+                    # does not: a running worker is not cancellable, and the
+                    # `finally` below already waits on the pool. Cancelling
+                    # only the futures therefore left the run blocked in
+                    # `shutdown(wait=True)` until each worker reached its own
+                    # node timeout — the backstop fired and nothing stopped.
+                    # Quiescing owned execution first is what makes the
+                    # workers return; the outcome is STUCK either way.
                     self._stuck = True
-                    for future in list(in_flight.values()):
-                        future.cancel()
+                    self._interrupt_in_flight(in_flight, cancellation_requested)
+                    if in_flight:
+                        done, _ = _wait_any(list(in_flight.items()))
+                        for node_id in done:
+                            in_flight.pop(node_id, None)
+                        continue
                     break
 
                 self._merge_frontier()
@@ -730,8 +813,28 @@ class Scheduler:
         finally:
             watchdog.stop()
             self.shutdown()
+            if previous_sigint is not None:
+                signal.signal(signal.SIGINT, previous_sigint)
 
+        if self._paused.is_set():
+            raise RunPaused(self.run_id)
         return self._declare()
+
+    def _finish(self, report: RunReport, previous_sigint) -> RunReport:
+        """Restore the caller's SIGINT handler, then hand back the report.
+
+        The two early returns above leave before the `try`/`finally` that
+        restores it, so they restore it here instead.
+        """
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
+        return report
+
+    def _finish_paused(self, previous_sigint) -> RunReport:
+        """The same, for the early exit that has no report to hand back."""
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
+        raise RunPaused(self.run_id)
 
     def _start_liveness(self):
         """Start §7.6's single watchdog thread and §11.2's run-level timer.

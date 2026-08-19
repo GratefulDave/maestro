@@ -31,6 +31,7 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import lifecycle as lc  # noqa: E402
+from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import watchdog as wd  # noqa: E402
 
@@ -43,6 +44,15 @@ def make_node(node_id: str, depth: int, needs=()) -> st.PlanNode:
 
 def new_store(tmp_root: Path) -> lc.LifecycleStore:
     return lc.LifecycleStore(tmp_root / "lifecycle.db")
+
+
+def _node_cancel_cause(store: lc.LifecycleStore, run_id: str, node_id: str):
+    """The stored cause on a node row. Read from the column, not from a
+    projection — the column is what `_guard_transition` reads."""
+    row = store.conn.execute(
+        "SELECT cancel_cause FROM node_lifecycle WHERE run_id=? AND node_id=?",
+        (run_id, node_id)).fetchone()
+    return row[0] if row else None
 
 
 def _init_git_repo(root: Path) -> str:
@@ -527,6 +537,78 @@ class CancellationTests(unittest.TestCase):
             store.cancel_run("run1")
             report = store.declare_outcome("run1")
             self.assertEqual(report.outcome, st.RunOutcome.CANCELLED)
+
+    def test_a_plain_run_cancel_stays_reopenable(self):
+        """The default cause is what makes `run resume` legal (§7.8)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.cancel_run("run1")
+            report = store.declare_outcome("run1")
+            self.assertIs(report.cancel_cause, st.CancelCause.RUN_CANCEL)
+            self.assertEqual(_node_cancel_cause(store, "run1", "a"),
+                             st.CancelCause.RUN_CANCEL.value)
+            store.resume_run("run1")
+            self.assertIs(store.get_node("run1", "a").state,
+                          st.NodeState.PENDING)
+
+    def test_a_discarding_cancel_is_absolutely_terminal(self):
+        """`run cancel --discard` records DISCARDED at both levels, and that
+        cause is what refuses the resume — not the verb's name, and not
+        anything an operator wrote down (§1.2, §7.3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.cancel_run("run1", cause=st.CancelCause.DISCARDED)
+            report = store.declare_outcome(
+                "run1", cancel_cause=st.CancelCause.DISCARDED)
+            self.assertIs(report.outcome, st.RunOutcome.CANCELLED)
+            self.assertIs(report.cancel_cause, st.CancelCause.DISCARDED)
+            self.assertEqual(store.run_cancel_cause("run1"),
+                             st.CancelCause.DISCARDED)
+            self.assertEqual(_node_cancel_cause(store, "run1", "a"),
+                             st.CancelCause.DISCARDED.value)
+            self.assertNotIn(st.CancelCause.DISCARDED,
+                             st.REOPENABLE_CANCEL_CAUSES)
+            with self.assertRaises(lc.ResumeRefused):
+                store.resume_run("run1")
+
+    def test_a_discarded_node_is_not_individually_reopenable(self):
+        """Even reached node by node, the guard refuses it (§7.3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.cancel_run("run1", cause=st.CancelCause.DISCARDED)
+            with self.assertRaises(lc.IllegalTransition):
+                store._reopen_run_cancelled_node("run1", "a")
+
+    def test_adoptable_attempts_name_verified_unmerged_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [
+                make_node("a", 0), make_node("b", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.mark_verified("run1", "a", output_sha="sha_a")
+            store.start_attempt("run1", "b", base_sha="s1")
+            found = store.adoptable_attempts("run1")
+            self.assertEqual([row["node_id"] for row in found], ["a"])
+            self.assertEqual(found[0]["why"], "verified")
+
+    def test_adoptable_attempts_omit_review_rejected_accepted_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.record_result("run1", st.ResultRecord(
+                node_id="a", attempt_no=1, subject_sha="s1",
+                payload={"status": "success"},
+                adjudication=st.Adjudication.ACCEPTED))
+            self.assertEqual(store.adoptable_attempts("run1")[0]["why"],
+                             "accepted-unmerged")
+            store.fail_attempt(
+                "run1", "a", st.RetryClass.SEMANTIC,
+                attempt_extra={rp.REVIEW_REJECTED_KEY: True})
+            self.assertEqual(store.adoptable_attempts("run1"), ())
 
     def test_abandon_cancels_a_single_node_absolutely_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:

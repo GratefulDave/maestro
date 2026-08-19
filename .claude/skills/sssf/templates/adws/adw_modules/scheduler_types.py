@@ -89,7 +89,22 @@ class CancelCause(str, Enum):
       stop. Nothing was adjudicated, no result was reached, and there is no
       outcome to protect from being reopened. `run cancel` is the operator's
       only stop control, so this is also the cause written when an operator
-      wanted to pause and had no verb that said so.
+      wanted to pause and had no verb that said so. `run pause` is that verb
+      now, and it writes nothing at all: a pause is not a lifecycle
+      transition, so a run stopped that way has no cause because it has no
+      declared outcome to attach one to.
+    * `DISCARDED` — the operator ran `run cancel --discard`, which is the
+      destructive verb: it exists to end a run for good, and a resume that
+      reopened it would defeat the only thing it does. It is a separate
+      member rather than a reuse of `ABANDONED` because the two are different
+      facts — `ABANDONED` says every node was individually adjudicated as
+      work the run should finish without, and `DISCARDED` says the operator
+      threw the run away without adjudicating anything. §1.2 wants that
+      distinction structural, in the stored value, not inferred from which
+      verb an operator is remembered to have typed. Adding a member is
+      additive: a receipt or ledger written before it exists carries one of
+      the two older values and parses unchanged, unlike a field made
+      unconditionally required after the fact (§19 M21).
     * `ABANDONED` — the work itself was given up on, node by node, through
       `abandon` (§11.3). At run level it is the shape §7.3 names "every node
       is CANCELLED": a run stopped deliberately, just piecewise. Each node in
@@ -107,15 +122,18 @@ class CancelCause(str, Enum):
     """
 
     RUN_CANCEL = "RUN_CANCEL"
+    DISCARDED = "DISCARDED"
     ABANDONED = "ABANDONED"
 
 
-#: The causes a `CANCELLED` may be reopened from (§7.3, §7.8). `MERGED` and an
-#: `ABANDONED` `CANCELLED` remain absolutely terminal; a `RUN_CANCEL`
-#: `CANCELLED` is terminal only because the operator asked the machine to
-#: stop, and a resume of that same run is the operator withdrawing the
-#: request. Membership is data rather than a branch so that the guard, the
-#: resume predicate, and the tests read one list.
+#: The causes a `CANCELLED` may be reopened from (§7.3, §7.8). `MERGED`, an
+#: `ABANDONED` `CANCELLED`, and a `DISCARDED` one remain absolutely terminal;
+#: a `RUN_CANCEL` `CANCELLED` is terminal only because the operator asked the
+#: machine to stop, and a resume of that same run is the operator withdrawing
+#: the request. `DISCARDED` is not withdrawable in that sense: the operator
+#: asked for the run to end, not to stop, and `run pause` is the verb for the
+#: other intent. Membership is data rather than a branch so that the guard,
+#: the resume predicate, and the tests read one list.
 REOPENABLE_CANCEL_CAUSES: Tuple[CancelCause, ...] = (CancelCause.RUN_CANCEL,)
 
 

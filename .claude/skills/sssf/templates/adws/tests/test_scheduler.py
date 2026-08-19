@@ -40,6 +40,7 @@ Run with:  uv run adws/adw_test.py        (the whole suite; `-k` filters on
 
 from __future__ import annotations
 
+import signal
 import subprocess
 import sys
 import tempfile
@@ -918,6 +919,56 @@ class CancellationTests(SchedulerFixture):
         self.assertEqual(set(self.states().values()), {"CANCELLED"})
         self.assertIs(report.outcome, st.RunOutcome.CANCELLED)
 
+    def test_pause_quiesces_without_declaring_an_outcome(self):
+        """§1.2 — a pause is not a lifecycle transition, so nothing durable
+        may move: no outcome, no node rewritten, no cancellation requested.
+        That is precisely what leaves the run resumable afterwards."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            on_launch(None)
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            (attempt.path / "a.py").write_text("A\n")
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        scheduler = self.schedule(
+            [self.agent("a")], deps=self.deps(run_node=run_node))
+
+        def pause_when_running():
+            self.assertTrue(started.wait(timeout=5))
+            scheduler.request_pause()
+            release.set()
+
+        waiter = threading.Thread(target=pause_when_running)
+        waiter.start()
+        with self.assertRaises(sch.RunPaused):
+            scheduler.run()
+        waiter.join(timeout=5)
+
+        self.assertIsNone(self.store.latest_outcome("run1"))
+        self.assertIsNot(self.store.get_node("run1", "a").state,
+                         st.NodeState.CANCELLED)
+        self.assertFalse(self.store.conn.execute(
+            "SELECT cancel_requested FROM runs WHERE run_id=?",
+            ("run1",)).fetchone()[0])
+        # And the whole point of writing nothing: the run is still resumable.
+        self.store.resume_run("run1")
+        self.assertIsNone(self.store.latest_outcome("run1"))
+
+    def test_a_pause_restores_the_callers_sigint_handler(self):
+        """The handler is installed for the loop's duration only — a
+        scheduler embedded in a longer-lived process must not keep the
+        signal after it stops."""
+        previous = signal.getsignal(signal.SIGINT)
+        scheduler = self.schedule([self.agent("a")])
+        scheduler.request_pause()
+        with self.assertRaises(sch.RunPaused):
+            scheduler.run()
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
+
 
 
     def test_cancellation_during_the_pre_node_gate_cannot_run_the_node(self):
@@ -1206,6 +1257,45 @@ class LivenessWiringTests(SchedulerFixture):
         report = scheduler.run()
         self.assertIs(report.outcome, st.RunOutcome.STUCK)
         self.assertIn("no lifecycle transition within", scheduler.status_diagnostic())
+
+    def test_the_backstop_quiesces_in_flight_workers(self):
+        """§11.2 — STUCK is declared about a run that still has workers, and
+        the backstop still has to stop them. `Future.cancel` cannot: a running
+        worker is not cancellable, so cancelling the futures alone left the
+        run waiting on the pool until each worker hit its own node timeout."""
+        started = threading.Event()
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            on_launch(None)
+            started.set()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if any(phase == "cancel" for _, phase in self.quiesce_calls):
+                    (attempt.path / "a.py").write_text("A\n")
+                    return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+                time.sleep(0.01)
+            self.fail("backstop did not quiesce the in-flight worker")
+
+        scheduler = self.schedule(
+            [self.agent("a")],
+            config=self.config(backstop_t_s=61.0, node_timeout_s=60.0,
+                               final_acceptance_timeout_s=60.0),
+            deps=self.deps(run_node=run_node))
+        scheduler.project()
+
+        def fire_after_launch():
+            self.assertTrue(started.wait(timeout=5))
+            self.store.conn.execute(
+                "UPDATE runs SET last_transition_at=? WHERE run_id=?",
+                ("1990-01-01T00:00:00.000+00:00", "run1"))
+
+        waiter = threading.Thread(target=fire_after_launch)
+        waiter.start()
+        report = scheduler.run()
+        waiter.join(timeout=5)
+        self.assertIs(report.outcome, st.RunOutcome.STUCK)
+        self.assertIn("cancel", [phase for _, phase in self.quiesce_calls])
 
     def test_the_diagnostic_says_why_each_node_is_not_ready(self):
         """§11.2 — `run status` must answer "why is nothing happening"
