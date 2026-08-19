@@ -65,7 +65,7 @@ gh issue list --state open --limit 100 --json number,title,body
 As of writing there are 21, and they are not one kind of work. Group them before starting:
 
 - **Runtime defects** — #18, #20, #22, #26, #28, #29, #30, #31, #32, #34, #35, #37, #38.
-  These live in the ADW runtime and are subject to the mirroring rule in §4.
+  These live in the ADW runtime template, which is the only copy this sweep edits — see §4.
 - **Visualizer** — #19, #27, #33, #39. These live in `.claude/skills/sssf/apps/visualizer/`,
   which exists only in this repo and has no mirror copies.
 - **Copy drift** — #23, #24, #25, #21. These are about the runtime existing in four places.
@@ -107,26 +107,36 @@ fails. Reviewer panes are not named `maestro-*`; identify them by agent kind, cw
 
 These are not style preferences. Each one has a production failure behind it.
 
-**The ADW runtime exists in three copies and nothing but a test holds two of them together.**
+**The ADW runtime exists in three copies. This sweep edits exactly one of them.**
 
 | Copy | Role |
 | --- | --- |
-| `.claude/skills/sssf/templates/adws/` | The template. Edit **only** here. |
-| `the-library/skills/sssf/templates/adws/` | Install source. Mirror target. |
-| `lexgenius-pipeline/adws/` | Deployed instance. Mirror target. Not covered by any parity test. |
+| `.claude/skills/sssf/templates/adws/` | The template. Edit **only** here, inside `$WT`. |
+| `the-library/skills/sssf/templates/adws/` | Install source. Live shared checkout. Never write to it. |
+| `lexgenius-pipeline/adws/` | Deployed instance. Live shared checkout. Never write to it. |
 
-Edit the template, then mirror each changed file with python `shutil.copy2` followed by an
-asserted `sha256(dst) == sha256(src)` **in the same script**. Never hand-edit a mirror.
-Never use `git apply` — it silently no-ops in this environment and reports success.
+**The sweep never mirrors.** Mirroring happens exactly once, at landing time, performed by the
+operator in the main-thread session, after review has passed. The builder edits the template
+inside its own worktree and stops there.
+
+`the-library` and `lexgenius-pipeline` are live shared checkouts that other agents are working
+in concurrently. They are not worktrees of this sweep. Writing into them from here defeats the
+worktree isolation the sweep was given: the edits land on whatever branch those repos happen to
+have checked out, collide with other agents' work, and leave those repos dirty on a shared
+branch. That has already happened once, and the writes had to be reverted.
+
+Never hand-edit any copy other than the template. Never use `git apply` — it silently no-ops in
+this environment and reports success.
 
 Never copy `maestro.config.yaml` between copies. It is deployment-specific by design.
 
-After mirroring, run the parity test from both sides:
-
-```
-cd .claude/skills/sssf/templates/adws && <venv>/python -m pytest tests/test_template_parity.py -o addopts= -q
-cd /Users/davidandrews/PycharmProjects/the-library && <venv>/python -m pytest tests/test_sssf_adws_copy_parity.py -o addopts= -q
-```
+**The parity tests are expected to fail inside this worktree.**
+`tests/test_template_parity.py` here, and `tests/test_sssf_adws_copy_parity.py` in
+`the-library`, compare the template against the-library's copy. Editing the template without
+mirroring makes them red by construction, and they stay red until the operator mirrors at
+landing time. A red parity test is not a finding for this sweep, is not a blocker, and must
+never be "fixed" by copying files into another repository. Do not run them and do not report
+them.
 
 **Environment hazards, all of which have cost time here:**
 
@@ -193,9 +203,7 @@ Both directions are files. Neither actor reads the other's pane to decide anythi
   "blocked": [],
   "base_sha": "<sha the round started from>",
   "head_sha": "<sha the round ended at>",
-  "mirrored": [{"file": "adw_modules/watchdog.py", "sha256": "<hex>", "copies": 3}],
-  "suite": {"passed": 1551, "failed": 0, "subtests": 165},
-  "parity": {"maestro_side": "passed", "library_side": "passed"}
+  "suite": {"passed": 1551, "failed": 0, "subtests": 165}
 }
 ```
 
