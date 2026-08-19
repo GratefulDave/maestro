@@ -35,6 +35,28 @@ from adw_modules import worktree as wt  # noqa: E402
 from adw_modules.plan_model import Gate  # noqa: E402
 
 
+# How long to wait for the coordinator to *reach* a state, as opposed to how
+# long it is allowed to take once there. Every wait in this module expressed in
+# terms of this constant is a precondition: overrunning it means "the
+# coordinator has not got here yet", never "the coordinator is wrong". Reaching
+# a participant dispatch or a global gate costs real `git` subprocess work --
+# repository binding, branch creation, candidate worktree creation -- and this
+# suite's default is `-n auto` (see pytest.ini), so on an 18-core machine
+# eighteen workers fork `git` against one disk while the operator's other work
+# runs alongside. The pre-dispatch phase measures 0.735s to 1.154s on an idle
+# machine, and the 3.0s bounds these replaced sat close enough to that
+# distribution that `-n auto` failed one to six of these cases per run under
+# load while `-n 0` passed every time (issue #50). A bound placed at roughly
+# the duration it measures is a coin toss, so this one is a hang detector
+# instead: generous enough that only a genuine deadlock reaches it, bounded so
+# a deadlock still reports rather than hanging the suite.
+#
+# The one wall-clock bound this module genuinely asserts -- the 0.5s
+# cancellation bound in
+# test_stuck_participant_cancellation_returns_with_blocked_cleanup_evidence --
+# is a property under test and is deliberately not expressed in terms of this
+# constant. Do not fold it in.
+ARRIVAL_TIMEOUT_S = float(os.environ.get("MAESTRO_TEST_ARRIVAL_TIMEOUT_S", "60.0"))
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -187,7 +209,8 @@ class FakeParticipantRunner:
         with self._lock:
             return tuple(sorted(self._active))
 
-    def wait_started(self, repository_id: str, timeout: float = 3.0) -> bool:
+    def wait_started(self, repository_id: str,
+                     timeout: float = ARRIVAL_TIMEOUT_S) -> bool:
         deadline = time.monotonic() + timeout
         with self._started_condition:
             while repository_id not in self.started:
@@ -311,7 +334,7 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         runner.release("api")
         self.assertTrue(runner.wait_started("web"))
         runner.release("worker")
-        thread.join(timeout=3.0)
+        thread.join(timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [wm.WorkspaceOutcome.ACCEPTED])
@@ -408,7 +431,7 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
 
         self.assertTrue(runner.wait_started("api"))
         self.store.request_cancellation("workspace-run")
-        thread.join(timeout=3.0)
+        thread.join(timeout=ARRIVAL_TIMEOUT_S)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [wm.WorkspaceOutcome.CANCELLED])
@@ -635,7 +658,7 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
 
         def blocking_gate(acceptance, gates, **kwargs):
             started.set()
-            self.assertTrue(release.wait(3.0))
+            self.assertTrue(release.wait(ARRIVAL_TIMEOUT_S))
             return (wt.GateResult("gate", "integration", None, ("pytest",), 0,
                                   True, {"passed": 1}),)
 
@@ -652,14 +675,14 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
                 mock.patch.object(co, "cleanup_acceptance"):
             thread = threading.Thread(target=lambda: outcome.append(coordinator.run()))
             thread.start()
-            self.assertTrue(started.wait(3.0))
+            self.assertTrue(started.wait(ARRIVAL_TIMEOUT_S))
             now[0] = 0.5
             watch[0] = True
-            self.assertTrue(observed.wait(3.0))
+            self.assertTrue(observed.wait(ARRIVAL_TIMEOUT_S))
             self.assertFalse(self.store.acquire_lease(
                 "workspace-run", "other", 1.0, 1.0))
             release.set()
-            thread.join(timeout=3.0)
+            thread.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertFalse(thread.is_alive())
         self.assertEqual(outcome, [wm.WorkspaceOutcome.ACCEPTED])
 
@@ -698,13 +721,13 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
             thread = threading.Thread(target=lambda: outcome.append(coordinator.run()))
             thread.start()
             self.assertTrue(runner.wait_started("api"))
-            self.assertTrue(polls.wait(3.0))
+            self.assertTrue(polls.wait(ARRIVAL_TIMEOUT_S))
             self.assertEqual(heartbeat_calls, [])
             now[0] = 1.0 / 3.0
-            self.assertTrue(heartbeated.wait(3.0))
+            self.assertTrue(heartbeated.wait(ARRIVAL_TIMEOUT_S))
             self.assertEqual(len(heartbeat_calls), 1)
             self.store.request_cancellation("workspace-run")
-            thread.join(timeout=3.0)
+            thread.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertFalse(thread.is_alive())
         self.assertEqual(outcome, [wm.WorkspaceOutcome.CANCELLED])
 
@@ -739,7 +762,7 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         def blocking_gate(acceptance, gates, **kwargs):
             started.set()
             cancel_requested = kwargs["cancel_requested"]
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
             while not cancel_requested() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(cancel_requested())
@@ -752,9 +775,9 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
             thread = threading.Thread(target=lambda: outcome.append(
                 self.coordinator(plan, FakeParticipantRunner()).run()))
             thread.start()
-            self.assertTrue(started.wait(3.0))
+            self.assertTrue(started.wait(ARRIVAL_TIMEOUT_S))
             self.store.request_cancellation("workspace-run")
-            thread.join(timeout=3.0)
+            thread.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertFalse(thread.is_alive())
         self.assertEqual(outcome, [wm.WorkspaceOutcome.CANCELLED])
 
@@ -786,13 +809,13 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
 
             def run(self, context, *, timeout):
                 self.started.set()
-                self.release_worker.wait(timeout=2.0)
+                self.release_worker.wait(timeout=ARRIVAL_TIMEOUT_S)
                 self.worker_finished.set()
                 return _ChildResult("blocked", None, "child did not quiesce")
 
             def cancel(self, workspace_run_id, repository_id, deadline):
                 self.cancel_started.set()
-                self.release_cancel.wait(timeout=2.0)
+                self.release_cancel.wait(timeout=ARRIVAL_TIMEOUT_S)
                 return False
 
         runner = StuckCancellationRunner()
@@ -805,14 +828,14 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         outcomes = []
         thread = threading.Thread(target=lambda: outcomes.append(coordinator.run()))
         thread.start()
-        # A generous bound, because reaching the first dispatch is a
-        # precondition of this test rather than anything it asserts. Measured
-        # over 15 runs on an idle machine, the coordinator takes 0.735s to
-        # 1.154s to get here — real git subprocess work in its pre-dispatch
-        # phase, not a lease wait and not a hang — so the previous 1.0s bound
-        # sat at the mean of the distribution it was measuring and failed
-        # roughly 8 runs in 20. What this test is actually for is the
-        # cancellation bound below, and that one is deliberately unchanged.
+        # Reaching the first dispatch is a precondition of this test rather
+        # than anything it asserts, so it takes the module's shared arrival
+        # bound; the measurement behind that bound is recorded beside the
+        # constant. This test was the first instance of that shape to be
+        # diagnosed, and for a while the only one fixed — the six siblings that
+        # kept their 1-in-a-coin-toss 3.0s bounds are what issue #50 reported.
+        # What this test is actually for is the cancellation bound below, and
+        # that one is deliberately unchanged.
         #
         # Released and joined in the `finally`, whatever happens here. When
         # this assertion fired mid-flight the coordinator thread was left
@@ -821,7 +844,7 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         # database` — a consequence of the timeout that read like a database
         # defect.
         try:
-            self.assertTrue(runner.started.wait(timeout=20.0))
+            self.assertTrue(runner.started.wait(timeout=ARRIVAL_TIMEOUT_S))
             self.store.request_cancellation("workspace-run")
             started = time.monotonic()
             thread.join(timeout=0.5)
@@ -838,10 +861,10 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
             runner.release_worker.set()
             # Still asserted — it is the leak check, not cleanup: the worker
             # must actually finish rather than be abandoned. Only the bound is
-            # relaxed, and the join after it is what keeps `tearDown` from
-            # closing the store under a thread that is still running.
-            self.assertTrue(runner.worker_finished.wait(timeout=5.0))
-            thread.join(timeout=5.0)
+            # an arrival bound, and the join after it is what keeps `tearDown`
+            # from closing the store under a thread that is still running.
+            self.assertTrue(runner.worker_finished.wait(timeout=ARRIVAL_TIMEOUT_S))
+            thread.join(timeout=ARRIVAL_TIMEOUT_S)
 
 
     def test_failed_participant_retries_unproven_cleanup_before_blocking(self):
@@ -942,7 +965,7 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
             self.coordinator(plan, FakeParticipantRunner(), config=config).run()
 
         runner.release("api")
-        thread.join(timeout=3.0)
+        thread.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertFalse(thread.is_alive())
 
     def test_failed_global_gate_blocks_once_and_cleanup_runs(self):
