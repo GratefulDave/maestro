@@ -23,6 +23,39 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and a replay must not answer a question that changed under it. Carried with
   `tests/test_review_scope_bounding.py`; §19 M22 records the incident.
 
+||||||| e2ed9d6
+- `node.writes_are_sufficient`, a BLOCKING plan-review rubric check asked of every node, and the
+  rubric version `maestro-rubric.v3` that carries it. `node.reads_are_sufficient` already asked
+  whether a node's agent can do the work from what it is allowed to *read*; nothing asked the same
+  question of what it is allowed to *write*. A node's `outputs` are its entire write permission —
+  single-producer ownership gives each path to exactly one node and the attempt permission check
+  convicts any diff touching an undeclared path — so a node whose instruction can only be
+  discharged by editing another node's output is unsatisfiable from its first attempt: the reviewer
+  rejects every diff that does not wire production and the permission check would reject every diff
+  that does. In run `run-2a44d226e75a4be391a14f02b78a6d25` that cost node
+  `lane-p4-enrichment-ordering` eight attempts, six reviews, six builder sessions, a launcher
+  failure and a turn timeout before `BLOCKED`/`REVIEW_BUDGET_EXHAUSTED`, on a property of the
+  authored bytes that one plan-review cell now settles. The question is phrased over the
+  instruction, not over the shape of `outputs`: a node that creates a module nothing at base yet
+  imports is the ordinary case and passes whenever a downstream node owns the wiring. Carried with
+  `tests/test_node_write_scope.py`, whose control half asserts the legitimate new-module node still
+  finalizes PASS.
+
+  No mechanical refusal accompanies it, deliberately. Both structurally decidable signals were
+  tested against the incident plan and refuted by it: "a node whose outputs contain no path
+  existing at `base_commit`" fires on ten of that plan's twelve nodes and on every legitimate
+  new-module node, and "a plan in which no node declares a pre-existing file" does not fire on the
+  incident plan at all, because two of its nodes did. `plan_validate.py` is unchanged and the
+  twelve obligations are still twelve.
+
+  The version bump adds no receipt key and requires none. `Receipt.from_bytes` still discriminates
+  the graded payload shape on the presence of `reject_at` rather than on the rubric label (§19
+  M21), so every signed `maestro-rubric.v1` and pre-grading `maestro-rubric.v2` receipt still
+  parses, still verifies against its original signature, and still replays with zero reviewer
+  launches — asserted directly rather than assumed. The new question is nonetheless mandatory from
+  v3 onward rather than optional forever (§3.6 B8): it is a matrix cell, and `verify_report`
+  refuses a report that leaves any cell unanswered.
+
 - `maestro._validate_review_clocks`: refuses a review window the remaining live bound cannot hold.
   `reviewer.turn_timeout_s` must be under `reviewer.finalization_timeout_s`, or one silent turn
   consumes the whole review window; `finalization_timeout_s` and `node_timeout_s +
@@ -141,6 +174,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   environmental budget spent. See §19 M8 and §17 item 121.
 
 ### Fixed
+
+- `tests/test_coordinator.py` no longer fails one to six of its cases at random under `pytest -n
+  auto`, which is this suite's default (issue #50). Six of its thirty-two cases drive the
+  coordinator from a thread and then wait for it to reach a participant dispatch or a global gate.
+  Reaching either costs real `git` subprocess work — repository binding, branch creation, candidate
+  worktree creation — measured at 0.735s to 1.154s on an idle machine, and each of those waits was
+  bounded at 3.0s. Under `-n auto` eighteen workers fork `git` against one disk, that distribution
+  moves past the bound, and the precondition reports as a failure: observed here at 8 of 12
+  consecutive runs, failing 1, 3, 3, 4, 4, 5, 5 and 6 cases, while `-n 0` passed every time. The
+  failing set is not random — it is exactly the six threaded cases, entering in the order of how
+  much pre-dispatch work precedes their wait, which is what a load-scaled distribution crossing a
+  fixed threshold looks like rather than a race on a shared resource. Every such bound in the file
+  now derives from one `ARRIVAL_TIMEOUT_S` constant (60s, `MAESTRO_TEST_ARRIVAL_TIMEOUT_S`
+  overrides) documented as a hang detector rather than a latency gate. Nothing the file asserts
+  changed: the one wall-clock bound that is a property under test — the 0.5s cancellation bound in
+  `test_stuck_participant_cancellation_returns_with_blocked_cleanup_evidence` — is deliberately
+  left alone and deliberately not expressed in terms of the constant. This shape had already been
+  diagnosed twice in this suite and fixed at one instance each time, in that same stuck-cancellation
+  case and in `test_workspace_runtime.py`'s global-gate cancellation case; the siblings left behind
+  are what the issue reported.
 
 - `docs/plan-authoring.md`: removed the "Not built yet" blockquote over `maestro plan gate`,
   `review`, and `ship`. Those verbs shipped in commit 6707e50 (PR #8) and are registered on the

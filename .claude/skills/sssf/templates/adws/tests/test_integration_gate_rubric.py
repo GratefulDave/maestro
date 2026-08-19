@@ -99,8 +99,18 @@ class IntegrationGateRubricTest(unittest.TestCase):
     def test_rubric_version_records_the_applicability_change(self):
         """The matrix a receipt persists is only interpretable against the
         rubric that produced it, so a changed applicability matrix is a new
-        rubric version."""
-        self.assertEqual(fin.DEFAULT_RUBRIC.version, "maestro-rubric.v2")
+        rubric version.
+
+        `v2` is the version this file's own change earned — moving the two
+        node-scoped gate checks off the integration gate. It is history now:
+        `v3` added `node.writes_are_sufficient` to every node, which is
+        another changed matrix and so another version. What this asserts is
+        the rule rather than either number — the label must have moved past
+        the version whose matrix omitted that check.
+        """
+        self.assertEqual(fin.DEFAULT_RUBRIC.version, "maestro-rubric.v3")
+        self.assertNotIn(fin.DEFAULT_RUBRIC.version,
+                         {"maestro-rubric.v1", "maestro-rubric.v2"})
 
     def test_every_projected_kind_carries_at_least_one_check(self):
         """B15's rule turned on the rubric itself: a kind the projection emits
