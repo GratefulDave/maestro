@@ -61,7 +61,11 @@ class FakeHerdr:
         self.worktree = worktree
         self.transcript = transcript
         self.current_pane_id = "w0:p0"
-        self.split_pane_id = "w1:p2"
+        #: A real `pane split` puts the child beside its parent, so the child
+        #: carries the parent's workspace. Kept faithful because the launcher
+        #: now refuses a child that landed in another workspace, and a fake
+        #: that splits `w0:p0` into `w1:p2` models a split that escaped.
+        self.split_pane_id = "w0:p2"
         #: cwd `pane get` reports, per call index, falling back to the last.
         self.get_cwds = [str(worktree)]
         self.start_error = None
@@ -158,6 +162,10 @@ class RefusalCleanupTest(unittest.TestCase):
             admitted_routes=admitted or self.admitted_routes)
         fake = FakeHerdr(worktree=self.worktree, transcript=self.transcript)
         harness._herdr = fake
+        # These cases drive the refusal `agent start` raises, not the window in
+        # which it is re-offered. Zero here so a busy pane refuses at once;
+        # `test_agent_start_busy_retry.py` owns the window's own behaviour.
+        harness.agent_start_busy_window_s = 0.0
         return harness, fake
 
     @staticmethod
@@ -182,7 +190,7 @@ class RefusalCleanupTest(unittest.TestCase):
             harness.launch(self.spec())
         refusal = caught.exception
         self.assertIs(refusal.refusal, lch.LaunchRefusal.AGENT_START_REFUSED)
-        self.assertEqual(fake.closed, ["w1:p2"])
+        self.assertEqual(fake.closed, ["w0:p2"])
         # herdr accepted the close, so the pane is gone and the refusal says
         # so. This is the field §8.3's quiesce step reads.
         self.assertFalse(refusal.pane_created)
@@ -252,7 +260,7 @@ class RefusalCleanupTest(unittest.TestCase):
                       lch.LaunchRefusal.UNSUPPORTED_ROUTE)
         # The pane leak this exit used to be: it raised `ValueError` with the
         # split's pane still open and nothing tracking it.
-        self.assertEqual(fake.closed, ["w1:p2"])
+        self.assertEqual(fake.closed, ["w0:p2"])
         self.assertFalse(caught.exception.pane_created)
 
     def test_binding_mismatch_before_the_agent_is_a_typed_refusal(self):
@@ -263,7 +271,7 @@ class RefusalCleanupTest(unittest.TestCase):
         self.assertIs(caught.exception.refusal,
                       lch.LaunchRefusal.BINDING_MISMATCH)
         self.assertEqual(fake.argv_for(("agent", "start")), [])
-        self.assertEqual(fake.closed, ["w1:p2"])
+        self.assertEqual(fake.closed, ["w0:p2"])
         self.assertFalse(caught.exception.pane_created)
 
     def test_binding_mismatch_after_the_agent_is_a_typed_refusal(self):
@@ -275,7 +283,7 @@ class RefusalCleanupTest(unittest.TestCase):
                       lch.LaunchRefusal.BINDING_MISMATCH)
         # `cancel` reaped it: the pane held a started agent, so the process
         # group goes first and the pane close is proved by `_agent_absent`.
-        self.assertEqual(fake.closed, ["w1:p2"])
+        self.assertEqual(fake.closed, ["w0:p2"])
         self.assertFalse(caught.exception.pane_created)
 
     def test_no_pane_id_reported_still_demands_the_proof(self):
@@ -305,16 +313,43 @@ class RefusalCleanupTest(unittest.TestCase):
         # Resolved once. Re-asking would reintroduce the moving target.
         self.assertEqual(len(fake.argv_for(("pane", "current"))), 1)
 
-    def test_an_unanswerable_selector_falls_back_rather_than_guessing(self):
+    def test_an_unanswerable_selector_refuses_instead_of_falling_back(self):
+        """Falling back to `--current` was the answer here until 2026-08-19.
+
+        It reinstated the very race the caching removes, and because focus can
+        sit in any workspace it also put panes wherever focus happened to be —
+        one run's agents scattered across w13F..w13K while its first pane was
+        in w13A. §1.2 forbids keying a decision on ambient mutable state, so
+        an unresolvable parent is now a typed refusal that splits nothing.
+        """
         harness, fake = self.build()
         fake.current_pane_id = None
+        with self.assertRaises(lch.LaunchRefused) as caught:
+            harness.launch(self.spec())
+        self.assertIs(caught.exception.refusal,
+                      lch.LaunchRefusal.SPLIT_PARENT_UNRESOLVED)
+        # Nothing was split, so there is nothing to reap and the refusal says
+        # so — and it is retryable, because herdr may answer the next ask.
+        self.assertEqual(fake.argv_for(("pane", "split")), [])
+        self.assertFalse(caught.exception.pane_created)
+        self.assertFalse(caught.exception.deterministic)
+        # The failure is not cached: a second launch re-asks rather than
+        # inheriting one bad instant for the rest of the run.
+        fake.current_pane_id = "w0:p0"
         harness.launch(self.spec())
-        self.assertEqual(fake.argv_for(("pane", "split"))[0][2], "--current")
+        self.assertEqual(fake.argv_for(("pane", "split"))[0][2], "w0:p0")
 
     def test_the_readiness_wait_is_advisory_and_no_longer_refuses(self):
         """A wall clock over a separate RPC cannot prove a pane is free when
         `agent start` reaches the server. herdr's own precondition check is
-        the authority, and it now arrives as a typed retryable refusal."""
+        the authority, and it now arrives as a typed retryable refusal.
+
+        Kept unchanged on 2026-08-19 when the busy race was fixed, and kept
+        deliberately: re-gating here would restore the stale-snapshot fallacy
+        this test exists to prevent. The remedy went where the authority is —
+        `_start_agent_when_free` re-offers the pane to herdr's own check
+        inside a bounded window (`test_agent_start_busy_retry.py`).
+        """
         calls = []
 
         def busy(*args, **kwargs):
@@ -324,7 +359,7 @@ class RefusalCleanupTest(unittest.TestCase):
                     {"name": "python", "argv0": "python", "argv": ["python"]}]}}}
 
         self.assertIsNone(
-            lch._wait_for_available_shell(busy, "w1:p2", timeout_s=0.05))
+            lch._wait_for_available_shell(busy, "w0:p2", timeout_s=0.05))
         self.assertTrue(calls)
 
 

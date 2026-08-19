@@ -106,6 +106,21 @@ class LaunchRefusal(Enum):
     #: and the refusal states the reap -- and it is deterministic, because the
     #: route is a property of the spec and identical on every attempt.
     UNSUPPORTED_ROUTE = ("UNSUPPORTED_ROUTE", None, True)
+    #: herdr could not say which pane this launcher splits from. Raised
+    #: before any split, so no pane exists. **Non**-deterministic: the answer
+    #: is herdr's to give and the next attempt may get it, and the launcher
+    #: does not cache the failure, so a retry genuinely re-asks. This member
+    #: replaced a silent fall back to the `--current` selector: a selector is
+    #: mutable focus state, so splitting it lands the pane in whichever
+    #: workspace happens to hold focus — the scatter across w13F..w13K — and
+    #: §1.2 forbids keying a decision on ambient mutable state. Refusing is
+    #: honest; splitting into an unknown workspace is not.
+    SPLIT_PARENT_UNRESOLVED = ("SPLIT_PARENT_UNRESOLVED", False, False)
+    #: The split landed outside the workspace this run is bound to. The pane
+    #: exists by the time that is known, so it is reaped and the refusal
+    #: states the reap. Non-deterministic: a split of a fixed parent lands
+    #: beside it, so a drifting child is a fact about that split.
+    WORKSPACE_DRIFT = ("WORKSPACE_DRIFT", None, False)
     #: B13: the prompt file will not fit the window the spec declared. Raised
     #: before any herdr call, so no pane exists. Deterministic: the prompt's
     #: size and the model's window are both properties of the spec, identical
@@ -940,6 +955,13 @@ def _wait_for_available_shell(
     a typed `error.code`, and the caller now turns that answer into a typed
     retryable refusal into a fresh pane. Returning at the deadline hands the
     decision to the side that can actually make it.
+
+    That demotion is still right and is deliberately not undone. What it left
+    open is what the caller does with the authority's first `no`, and the
+    answer was "throw the attempt away": see `_start_agent_when_free` below,
+    which re-offers the pane to the server-side check inside a bounded window
+    before the refusal is raised. The wait here stays advisory and cheap; the
+    decision stays with herdr; only the cost of losing the race changes.
     """
     deadline = time.monotonic() + timeout_s
     ready = 0
@@ -956,6 +978,56 @@ def _wait_for_available_shell(
         time.sleep(0.1)
 
 
+#: How long `agent start` keeps re-offering a pane herdr itself calls busy,
+#: and how often. Finite by construction: at the deadline the refusal is
+#: raised exactly as it was before, so the attempt-level retry still gets its
+#: fresh pane and nothing here can wait or loop without end.
+AGENT_START_BUSY_WINDOW_S = 10.0
+AGENT_START_BUSY_POLL_S = 0.5
+
+
+def _start_agent_when_free(
+        start: Callable[[], dict], window_s: float = AGENT_START_BUSY_WINDOW_S,
+        poll_s: float = AGENT_START_BUSY_POLL_S,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+) -> dict:
+    """Offer the pane to `agent start` until herdr stops calling it busy.
+
+    The gap this closes is a timing accident, not a fault. A freshly split
+    pane can look like a lone interactive zsh in the moment before login hooks
+    (direnv, keychain lookups) spawn their own foreground processes, and
+    `agent start` arriving inside that gap is refused `agent_pane_busy`. On
+    run-2a44d226e75a4be391a14f02b78a6d25 that refusal cost node
+    `lane-p1-freeze-and-run-log` its fourth attempt at zero turns.
+
+    Retrying the *server-side* check rather than re-gating on the client's is
+    deliberate, and `_wait_for_available_shell` above records why the client
+    gate was demoted: a wall clock over a separate RPC cannot prove what it is
+    asked to prove, because the last snapshot is already stale when `agent
+    start` reaches the server. That reasoning still holds, so the advisory
+    wait stays advisory and the decision stays where it can actually be made —
+    herdr's own precondition, which answers with a typed `error.code`. This
+    just stops throwing away an attempt over the first `no` when herdr will
+    say `yes` a second later.
+
+    Only the codes herdr's own vocabulary marks survivable are re-offered
+    (`TRANSIENT_HERDR_ERROR_CODES`, read off the typed field and never matched
+    out of the message, §1.2). Everything else raises on the first refusal,
+    unchanged. Two bounds, and both are needed: the window here spends
+    seconds, and the refusal it eventually raises is retryable, so the
+    attempt-level budget spends launches — into a fresh pane, which is the
+    only remedy left if this pane is durably occupied.
+    """
+    deadline = monotonic() + max(0.0, window_s)
+    while True:
+        try:
+            return start()
+        except HerdrCallError as exc:
+            if (exc.code not in TRANSIENT_HERDR_ERROR_CODES
+                    or monotonic() >= deadline):
+                raise
+        sleep(poll_s)
 
 
 class HerdrLauncher:
@@ -969,14 +1041,35 @@ class HerdrLauncher:
         self.claude_path = Path(claude_path)
         self.admitted_routes = admitted_routes
         self.provision_argv = tuple(provision_argv)
+        #: How long `agent start` re-offers a pane herdr calls busy. An
+        #: attribute rather than a constant read directly so a test can drive
+        #: the refusal path without spending the production window; nothing in
+        #: the runtime sets it.
+        self.agent_start_busy_window_s = AGENT_START_BUSY_WINDOW_S
         self._handles_lock = threading.RLock()
         self._handles: Dict[str, LaunchHandle] = {}
         self._tailers: Dict[str, TranscriptTailer] = {}
         self._proven_absent: Dict[str, LaunchHandle] = {}
         #: The pane every split is taken from, resolved once from herdr's
-        #: `--current` selector. `None` until first asked; `""` records that
-        #: herdr could not answer, so the selector is used unchanged.
+        #: `--current` selector and then never re-read. `None` until the first
+        #: launch asks. A failure to resolve is **not** recorded here: it is a
+        #: typed refusal (`SPLIT_PARENT_UNRESOLVED`) and the next launch
+        #: re-asks, because the alternative — falling back to the selector —
+        #: is the mutable read this field exists to remove.
         self._split_parent_id: Optional[str] = None
+        #: The workspace every pane of this run belongs to, taken from the
+        #: split parent's own id the moment it is resolved. A split of a fixed
+        #: parent lands beside that parent, so a child reporting a different
+        #: workspace is a split that escaped the run's workspace and is
+        #: refused rather than adopted.
+        self._workspace_id: str = ""
+        #: How many panes this launcher has already split, which is the only
+        #: input to the next split's direction. Read and incremented under
+        #: `_handles_lock` so two concurrent launches take two distinct
+        #: numbers and therefore two distinct, predictable placements — never
+        #: from focus or any other state a concurrent launch could read
+        #: differently.
+        self._splits_taken: int = 0
 
     def _herdr(self, *args: str, env: Optional[Mapping[str, str]] = None,
                timeout: float = 30.0) -> dict:
@@ -1007,36 +1100,80 @@ class HerdrLauncher:
             raise RuntimeError("PROTOCOL_INVALID_RESPONSE")
         return payload
 
-    def _split_parent(self, environment: Mapping[str, str]) -> Tuple[str, ...]:
-        """The `pane split` argument naming which pane to split, resolved once.
+    def _split_parent(self, environment: Mapping[str, str]) -> str:
+        """The pane id every split of this run is taken from, resolved once.
 
         `--current` is not an identifier, it is a server-side selector over
         mutable state: whichever pane holds focus at the instant the split
         arrives. Two lanes splitting concurrently read that selector at two
         different instants, so the second can split a pane the first has just
         created — and did, on 2026-08-18, when one lane's agent landed in a
-        pane the sibling launch had opened 30ms earlier and herdr refused it
-        with `agent_pane_busy`. Resolving the selector once, to the pane id it
-        named at construction time, makes every subsequent split name a fixed
-        pane and removes the shared mutable read from the race entirely.
+        pane the sibling launch had opened 30ms earlier. Resolving the
+        selector once, to the pane id it named the first time it was asked,
+        makes every subsequent split name a fixed pane and removes the shared
+        mutable read from the race entirely.
 
         Cached deliberately: re-asking would reintroduce the moving target.
-        If herdr cannot answer, the selector is used unchanged rather than
-        guessed at — a degraded split is still a split, and inventing a pane
-        id would be worse than the race.
+
+        **An unanswerable selector is a refusal, not a fallback.** Using
+        `--current` unchanged used to be the answer here, and it was wrong
+        twice over: it reinstated exactly the race the caching removes, and
+        because focus can sit in any workspace, each such split landed
+        wherever focus happened to be — the run whose agents scattered across
+        w13F, w13G, w13H, w13J and w13K while its first pane was in w13A. A
+        lifecycle decision keyed on ambient mutable state is what §1.2
+        forbids, so this raises `SPLIT_PARENT_UNRESOLVED` and the failure is
+        not cached: the member is non-deterministic, the launcher budget is
+        spent, and the next attempt genuinely re-asks herdr.
+
+        Resolved on first use rather than in `__init__` because a constructor
+        that calls herdr cannot be built offline at all, and a launcher that
+        cannot exist while herdr is briefly unreachable is a worse failure
+        than a refused launch. It is still resolved once per launcher.
         """
         with self._handles_lock:
             if self._split_parent_id is None:
                 try:
                     payload = self._herdr("pane", "current", env=environment)
-                except BaseException:
-                    payload = {}
+                except BaseException as exc:
+                    raise LaunchRefused(
+                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED,
+                        "{0}: {1}".format(type(exc).__name__, exc)) from exc
                 pane = _extract(payload, "pane")
                 pane_id = (pane.get("pane_id")
                            if isinstance(pane, dict) else None)
-                self._split_parent_id = str(pane_id) if pane_id else ""
-            resolved = self._split_parent_id
-        return (resolved,) if resolved else ("--current",)
+                if not pane_id:
+                    raise LaunchRefused(
+                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED, "NO_PANE_ID")
+                self._split_parent_id = str(pane_id)
+                self._workspace_id = workspace_of(self._split_parent_id)
+            return self._split_parent_id
+
+    def _split_direction(self) -> str:
+        """`right, right, down, down, right, ...` — a pure function of a count.
+
+        Every split names the same fixed parent, so a constant `right` halved
+        that parent's width again on every launch and six concurrent lanes
+        produced six slivers nobody could read. The operator watches these
+        panes to see what the factory is doing, so an unreadable pane makes
+        the visible-pane guarantee buy nothing.
+
+        Alternating in pairs bounds the aspect ratio instead of the width:
+        two splits go side by side, the next two stack, and the cycle repeats,
+        so a growing pane count degrades both dimensions together rather than
+        one of them without limit. `ratio` is deliberately left at herdr's
+        default — an even split is what keeps the two halves comparable, and a
+        second knob would only move the same problem.
+
+        The input is `self._splits_taken`, incremented under the handles lock,
+        so launch K's direction is a pure function of K and two concurrent
+        launches take two distinct numbers. Never focus, never a wall clock,
+        never anything a concurrent launch could read differently.
+        """
+        with self._handles_lock:
+            index = self._splits_taken
+            self._splits_taken += 1
+        return "right" if (index // 2) % 2 == 0 else "down"
 
     def _reap_pane(self, pane_id: str,
                    environment: Mapping[str, str]) -> bool:
@@ -1076,8 +1213,9 @@ class HerdrLauncher:
         # raised before herdr is called *at all*. Resolving the parent first
         # would make one herdr call before that refusal and falsify it.
         env_flags = pane_env_flags(environment)
-        split = self._herdr("pane", "split", *self._split_parent(environment),
-                            "--direction", "right",
+        parent_id = self._split_parent(environment)
+        split = self._herdr("pane", "split", parent_id,
+                            "--direction", self._split_direction(),
                             "--cwd", str(worktree), "--no-focus",
                             *env_flags, env=environment)
         pane = _extract(split, "pane")
@@ -1087,6 +1225,20 @@ class HerdrLauncher:
             # exists to keep honest.
             raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
         pane_id = str(pane["pane_id"])
+        # Every pane of one run belongs to one workspace. A split of a fixed
+        # parent lands beside that parent, so a child reporting a different
+        # workspace means the placement escaped — the shape that scattered one
+        # run's agents across w13F, w13G, w13H, w13J and w13K while its first
+        # pane sat in w13A, and an operator watching w13A then sees a factory
+        # that has stopped. Checked rather than assumed, because the guarantee
+        # is worth nothing if nothing measures it.
+        landed = workspace_of(pane_id)
+        if self._workspace_id and landed and landed != self._workspace_id:
+            closed = self._reap_pane(pane_id, environment)
+            raise LaunchRefused(
+                LaunchRefusal.WORKSPACE_DRIFT,
+                "{0}!={1}".format(landed, self._workspace_id),
+                pane_created=not closed)
         name = _agent_name(spec.correlation_token)
         route_argv = (build_omp_argv(self.omp_path, spec) if spec.route == "omp"
                       else build_claude_argv(self.claude_path, spec)
@@ -1111,11 +1263,13 @@ class HerdrLauncher:
             _wait_for_available_shell(
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 pane_id)
-            started = self._herdr(
-                "agent", "start", name, "--kind", spec.route,
-                "--pane", pane_id, "--timeout", "180000",
-                "--", *route_argv[1:],
-                env=environment, timeout=185.0)
+            started = _start_agent_when_free(
+                lambda: self._herdr(
+                    "agent", "start", name, "--kind", spec.route,
+                    "--pane", pane_id, "--timeout", "180000",
+                    "--", *route_argv[1:],
+                    env=environment, timeout=185.0),
+                window_s=self.agent_start_busy_window_s)
         except BaseException as exc:
             # Reap first, then state what the reap achieved. Re-raising
             # herdr's own `HerdrCallError` from here was the 2026-08-18
@@ -1473,6 +1627,19 @@ class FakeLauncher:
 #: `EXECUTION` -> `STARTUP` and was budgeted as a broken launcher rather than
 #: as contention.
 TRANSIENT_HERDR_ERROR_CODES: frozenset = frozenset({"agent_pane_busy"})
+
+
+def workspace_of(pane_id: str) -> str:
+    """The workspace half of a herdr pane id (`w13A:p29` -> `w13A`).
+
+    Herdr's pane id is a structured identifier, not prose: the workspace and
+    the pane are two fields joined by a colon, and reading the first is
+    reading a field rather than matching a message (§1.2). An id without a
+    colon has no workspace to report and yields `""`, which callers treat as
+    "unknown" rather than as a match.
+    """
+    workspace, sep, _pane = str(pane_id).partition(":")
+    return workspace if sep else ""
 
 
 def _herdr_error_code_of(exc: BaseException) -> str:

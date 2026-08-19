@@ -372,6 +372,31 @@ class Scheduler:
         # during that proof, so its state alone cannot stop a provisioner
         # unblocked by the watchdog from entering a gate or runner.
         self._watchdog_fences: Dict[Tuple[str, str, int], None] = {}
+        #: `(node_id, attempt_no) -> whether the runner was ever entered`.
+        #:
+        #: §8.3's settle proves the attempt's **dispatched** execution absent:
+        #: the pane or the process `run_node` opened. An attempt this scheduler
+        #: leased and never dispatched has none, and by the time any settle is
+        #: reached the pre-dispatch execution contexts have already been
+        #: accounted for — `check_at_create` fails before provision or the pre
+        #: gate has started, and every later pre-dispatch exit leaves through
+        #: the `finally` that takes the `pre-baseline` proof. So a settle there
+        #: is a question about nothing, and the runtime's quiescer answers a
+        #: question about nothing with `PROCESS_GROUP_UNTRACKED` — which reads
+        #: as "absence unproven" and blocks the node terminally, burying the
+        #: verdict the attempt had actually reached.
+        #:
+        #: Deliberately **not** consulted by `pre-baseline`, `cancel`,
+        #: `watchdog`, or the watchdog's kill. Those meet an attempt whose
+        #: provision or pre-gate subprocess may be alive right now — §7.6's
+        #: window opens before the worktree exists — and a live harness process
+        #: is exactly what those proofs are for, dispatched or not.
+        #:
+        #: A key absent from this map is an attempt **this scheduler did not
+        #: lease** — an inherited RUNNING row from another process, whose owned
+        #: execution this scheduler cannot account for. It keeps demanding the
+        #: proof: the exemption is knowledge, never a default.
+        self._attempt_dispatch: Dict[Tuple[str, int], bool] = {}
         self._output_shas: Dict[str, str] = {}
         #: The latest attempt worktree per node, so §8.8's cleanup has
         #: something to remove. Replaced on every attempt: an earlier attempt's
@@ -496,7 +521,33 @@ class Scheduler:
                 raise AttemptOwnershipLost(
                     f"{record.node_id}#{record.attempt_no} no longer owns RUNNING")
 
-    def _quiesce(self, record: st.AttemptRecord, phase: str) -> None:
+    def _attempt_dispatched(self, record: st.AttemptRecord) -> bool:
+        """Whether `run_node` was ever entered for this attempt.
+
+        Structural, and recorded by the frame that knew, at the moment it
+        became true (§7.5 permits a classifier a typed fact and forbids it a
+        message). `run_node` is the sole opener of the pane or process a
+        settle exists to prove absent, so a `False` here is absence by
+        construction rather than absence asserted. An attempt this scheduler
+        never leased is unknown, not absent, and answers `True`.
+        """
+        with self._lock:
+            return self._attempt_dispatch.get(
+                (record.node_id, record.attempt_no), True)
+
+    def _quiesce(self, record: st.AttemptRecord, phase: str,
+                 in_flight: Optional[BaseException] = None) -> None:
+        """Prove this attempt's owned execution absent, when it could have any.
+
+        `in_flight` is the exception this quiesce is cleaning up after, when
+        there is one. It is read for one structural fact and never for its
+        message: a launch failure that has *stated* it left nothing to reap
+        makes the proof a question about a process group that never existed,
+        and the answer to that question must not outrank the failure that
+        caused it (§19 M3).
+        """
+        if _launch_left_nothing_to_reap(in_flight):
+            return
         try:
             self.deps.quiesce_attempt(record, phase)
         except BaseException as exc:
@@ -514,10 +565,28 @@ class Scheduler:
         return any(record.state == st.NodeState.RUNNING.value
                    for record in self.deps.store.node_records(self.run_id))
 
-    def _settle_context(self, context: _AttemptContext) -> None:
-        if context.record is not None and not context.settled:
-            self._quiesce(context.record, "settle")
-            context.settled = True
+    def _settle_context(self, context: _AttemptContext,
+                        in_flight: Optional[BaseException] = None) -> None:
+        """§8.3's settle, taken over the execution this attempt dispatched.
+
+        An attempt that never entered `run_node` dispatched none, and every
+        pre-dispatch exit has already accounted for the contexts it did use:
+        a failed `check_at_create` precedes provision and the pre gate
+        entirely, and everything after it leaves through the `finally` that
+        takes the `pre-baseline` proof. So the settle there is a question
+        about nothing, and the runtime's answer for nothing —
+        `PROCESS_GROUP_UNTRACKED` — is terminal, which is how it replaced
+        GATE_NOT_FALSIFIABLE, a failed worktree check, and a refused launch
+        with QUIESCENCE_UNPROVEN.
+
+        `in_flight` covers the dispatched half of the same shape: a launch
+        that failed having stated it left nothing to reap (§19 M3).
+        """
+        if context.record is None or context.settled:
+            return
+        if self._attempt_dispatched(context.record):
+            self._quiesce(context.record, "settle", in_flight)
+        context.settled = True
 
     def _block_quiescence(self, node: st.PlanNode,
                           record: Optional[st.AttemptRecord],
@@ -875,7 +944,17 @@ class Scheduler:
                 node, context.record, QuiescenceFailure("harness-gate", exc))
         except BaseException as exc:  # noqa: BLE001 — containment is the point
             try:
-                self._settle_context(context)
+                # `exc` is handed to the settle, not merely caught around it.
+                # §19 M3's shape one frame up: a launch that failed having
+                # stated it left nothing to reap must not then be asked to
+                # prove a process group absent, because the quiescer answers
+                # `PROCESS_GROUP_UNTRACKED` about a group that never existed
+                # and that answer is terminal. Fixed at the `pre-inventory`
+                # site and not here, so the same refusal crossed a second,
+                # unguarded proof on its way out and blocked
+                # QUIESCENCE_UNPROVEN anyway — run-2a44d226e75a4be391a14f02b78a6d25,
+                # `lane-p1-freeze-and-run-log#4`, at zero turns.
+                self._settle_context(context, in_flight=exc)
             except QuiescenceFailure as quiescence:
                 self._block_quiescence(node, context.record, quiescence)
                 return
@@ -928,6 +1007,13 @@ class Scheduler:
         # §7.6 — the window opens BEFORE the worktree exists, so a hung
         # `git worktree add` is inside it rather than outside.
         attempt_no = store.start_attempt(self.run_id, node.node_id, head)
+        with self._lock:
+            # Recorded against the durable row as soon as it exists, and
+            # before anything can observe the attempt RUNNING: leased by this
+            # scheduler and not yet dispatched, so every quiescer this attempt
+            # meets from here until `run_node` is entered has an owned
+            # execution to account for, and that execution is none.
+            self._attempt_dispatch.setdefault((node.node_id, attempt_no), False)
         record = store.get_attempt(self.run_id, node.node_id, attempt_no)
         context.record = record
         self._require_running(record)
@@ -1005,6 +1091,12 @@ class Scheduler:
                 store.mark_launched(self.run_id, node.node_id, attempt_no, pid)
 
         self._require_running(record)
+        with self._lock:
+            # The one call that can open a pane or start a process for this
+            # attempt. Marked before it is entered, never after: a launch that
+            # raises still leaves whatever it created behind, and the quiescer
+            # must go on demanding a measured absence for it.
+            self._attempt_dispatch[(record.node_id, record.attempt_no)] = True
         try:
             execution = self.deps.run_node(
                 attempt, node, record,
@@ -1028,8 +1120,13 @@ class Scheduler:
             # before, and when that quiesce genuinely fails the resulting
             # QuiescenceFailure carries this exception as its chained context,
             # so `_block_quiescence`'s cause chain records both.
-            if not _launch_left_nothing_to_reap(exc):
-                self._quiesce(record, "pre-inventory")
+            #
+            # Handed to `_quiesce` rather than branched on here: the decision
+            # is owed by *every* quiesce a failed launch crosses, and this site
+            # owning it privately is why the settle one frame up went on
+            # converting the same refusal into a terminal block (§19 M3 again,
+            # one attempt boundary later).
+            self._quiesce(record, "pre-inventory", in_flight=exc)
             raise
         else:
             # Classification cannot release or block the attempt until its
@@ -1719,8 +1816,11 @@ def _budget_reason(retry_class: st.RetryClass,
 _SETTLING_POLL_S = 0.05
 
 
-def _launch_left_nothing_to_reap(exc: BaseException) -> bool:
+def _launch_left_nothing_to_reap(exc: Optional[BaseException]) -> bool:
     """Whether a failed launch typed itself as having created no pane.
+
+    `None` — no exception in flight at all — is not such a statement, so it
+    answers `False` and the caller proves absence exactly as it would have.
 
     Structural on both counts: the exception's *type*, which §7.5 names among
     the facts a classifier may read, and a typed boolean the launcher set. No
