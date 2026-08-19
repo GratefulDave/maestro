@@ -93,8 +93,16 @@ class ResumeRefused(LifecycleError):
 
 
 class SkipAncestryRefused(LifecycleError):
-    """`skip --accept-sha` named a SHA that is not an ancestor of HEAD (§11.3).
-    Skip does not bypass the ancestry proof."""
+    """`skip --accept-sha` could not prove the identity it was handed (§11.3).
+
+    Named for the ancestry proof because that is the check operators reach for
+    it with, but it is the refusal channel for every identity check `skip`
+    makes and always has been: no attempt base, no checked-out branch, a SHA
+    that is not the current HEAD, an unclean worktree, and — since #78 — a SHA
+    that is not a full object digest. Skip bypasses none of them. The *message*
+    is what distinguishes them, which is why a check whose message described a
+    different failure was a defect worth fixing rather than a wording nit.
+    """
 
 
 class BaselineUnrecorded(LifecycleError):
@@ -2086,6 +2094,21 @@ class LifecycleStore:
             raise SkipAncestryRefused(
                 f"{node_id}: {repo_path} has no checked-out branch; "
                 "skip does not bypass worktree identity (§11.3)")
+        # Checked before the predicate below, which folds shape, existence and
+        # ancestry into one boolean and so can only be reported as the last of
+        # the three. An abbreviated SHA fails on shape and was told it did not
+        # descend from its base -- about a commit that descended from it
+        # perfectly well, in a repository where `git merge-base --is-ancestor`
+        # agreed (#78). The requirement itself is not relaxed: a canonical
+        # digest is what makes the recorded identity durable, and an
+        # abbreviation is ambiguous by construction. What changes is that the
+        # refusal names the actual defect and the one-line remedy.
+        if not wt.is_object_digest(accept_sha):
+            raise SkipAncestryRefused(
+                f"{node_id}: {accept_sha} is not a full object digest; skip "
+                "records a durable identity and an abbreviated SHA is "
+                "ambiguous by construction. Pass the full 40- or 64-hex "
+                f"digest: git -C {repo_path} rev-parse {accept_sha}")
         if not wt.is_valid_output_commit(
                 repo, accept_sha, expected_base=str(latest_attempt[0])):
             raise SkipAncestryRefused(

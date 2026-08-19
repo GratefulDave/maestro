@@ -201,6 +201,19 @@ def resolve_commit(repo: Path, spec: str) -> str:
 _OBJECT_DIGEST = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
+def is_object_digest(value: str) -> bool:
+    """Whether a string has the canonical git object shape — sha1 or sha256.
+
+    Public because a caller that refuses a SHA needs to say *which* thing was
+    wrong with it. `is_valid_output_commit` collapses shape, existence and
+    ancestry into one boolean, which is right for a predicate and useless for
+    a diagnostic: an abbreviated SHA failed the shape test and was reported to
+    the operator as an ancestry failure, about a commit that descended from
+    the named base perfectly well (#78).
+    """
+    return _OBJECT_DIGEST.fullmatch(value) is not None
+
+
 def is_valid_output_commit(repo: Path, output_sha: str,
                            expected_base: Optional[str] = None) -> bool:
     """Whether a durable output identity names the recorded commit.
