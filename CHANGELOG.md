@@ -8,6 +8,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `code_review.FindingScope`: the reviewer's third axis, required on every finding from v1 —
+  `in_scope` when the fix is an edit to a path the node declared, `out_of_scope` when the only
+  edit that answers it writes a path the node was forbidden to write. A blocking, at-threshold
+  finding cannot refuse a merge on a forbidden remedy (`GradedCell.rejects`), because a rejection
+  whose repair the permission check convicts is a retry loop with no exit; it is recorded instead,
+  in `GradedVerdict.unreachable`, `ReviewOutcome.unreachable`, the finding ledger's `scope` and
+  `unreachable` columns, and a retry-guidance section that tells the builder not to attempt it.
+  `CODE_RUBRIC`'s two unbounded questions —
+  `diff.implements_the_stated_instruction` and `diff.gate_is_passed_on_the_merits` — now name the
+  declared write scope in the question text, and `ReviewHandoff.render` states the bound directly
+  under the paths it bounds. Rubric version moves to `maestro-code-rubric.v2` and the finding
+  ledger to `maestro-code-review-findings.v2`, because `review_digest` binds the rubric version
+  and a replay must not answer a question that changed under it. Carried with
+  `tests/test_review_scope_bounding.py`; §19 M22 records the incident.
+
+||||||| e2ed9d6
 - `node.writes_are_sufficient`, a BLOCKING plan-review rubric check asked of every node, and the
   rubric version `maestro-rubric.v3` that carries it. `node.reads_are_sufficient` already asked
   whether a node's agent can do the work from what it is allowed to *read*; nothing asked the same
