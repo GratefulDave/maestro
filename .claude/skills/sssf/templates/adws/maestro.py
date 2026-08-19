@@ -199,6 +199,19 @@ def _config_nonnegative_integer(value, label):
     return value
 
 
+def _config_reject_grade(value) -> "code_review.FindingGrade":
+    """§3.6 A9's rejection threshold, validated at load rather than at review.
+
+    A misspelt grade must refuse the installation now, not silently become a
+    threshold nothing matches on the night a lane is being reviewed.
+    """
+    try:
+        return code_review.parse_reject_grade(value)
+    except code_review.UnknownGrade as exc:
+        raise _MaestroConfigurationError(
+            "execution.review_reject_grade: " + str(exc)) from exc
+
+
 def _config_argv(value, label) -> Tuple[str, ...]:
     """A command as a real argv list, never a shell string.
 
@@ -517,8 +530,9 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         ("route", "model", "effort", "concurrency", "node_timeout_s",
          "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
          "semantic_ceiling"),
-        ("profile", "vendor", "review_ceiling", "provision",
-         "environmental_retries", "launcher_retries", "credential_retries"))
+        ("profile", "vendor", "review_ceiling", "review_reject_grade",
+         "provision", "environmental_retries", "launcher_retries",
+         "credential_retries"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -566,6 +580,15 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             _config_positive_integer(execution_raw["review_ceiling"],
                                      "execution.review_ceiling")
             if "review_ceiling" in execution_raw else 3),
+        # §3.6 A9's grading threshold, beside the ceiling because it answers
+        # the half of A9 the ceiling cannot: the ceiling decides how many
+        # rejections a node may collect, this decides what counts as one. A
+        # property of the installation, never of the plan (§6.2), so a plan
+        # cannot raise or lower its own bar.
+        "review_reject_grade": (
+            _config_reject_grade(execution_raw["review_reject_grade"])
+            if "review_reject_grade" in execution_raw
+            else code_review.DEFAULT_REJECT_GRADE),
         # §8.3/§9.3's provision step: the ecosystem's setup, run in every
         # attempt's fresh worktree after `git worktree add` and before the
         # pre-node gate and the baseline inventory. `npm ci` for a JavaScript
@@ -903,6 +926,10 @@ def _apply_repository_config(
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
         args.review_ceiling = execution["review_ceiling"]
+        # A9's other half. Set here rather than read with a default at the
+        # review site, so a run whose config never named it still carries an
+        # explicit threshold instead of one inferred from an absent attribute.
+        args.review_reject_grade = execution["review_reject_grade"]
         # §7.5's non-semantic budgets. Present in `SchedulerConfig` and in
         # `maestro.config.yaml` for as long as both existed, and connected by
         # nothing: a deployment that set them changed no run, because the
@@ -1383,6 +1410,13 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
         # receipt — B10's replay rather than a second opinion.
         subject_root = review_root / digest
         report_path = subject_root / "report.json"
+        # Every finding this review produced, rejecting and sub-threshold
+        # alike, beside the reviewer's own report and under the same subject
+        # digest as the receipt that admits the merge. This is where a merged
+        # node's advisories live: an operator reads
+        #   <state>/runs/<run_id>/review/<digest>/findings.json
+        # or `code_review.read_finding_ledger` on that path.
+        ledger_path = subject_root / code_review.FINDING_LEDGER_FILENAME
         prompt_path = subject_root / "prompt.md"
         session_dir = subject_root / "session"
         # §8.3 applies to the reviewer's pane exactly as it does to a node's.
@@ -1466,7 +1500,9 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                 subject_digest=digest, handoff=handoff, objects=objects,
                 rubric=code_review.CODE_RUBRIC, store=store,
                 window_factory=window_factory,
-                occupancy_reader=_reviewer_occupancy)
+                occupancy_reader=_reviewer_occupancy,
+                reject_at=args.review_reject_grade,
+                ledger_path=ledger_path)
         finally:
             # Unconditional. The pane is closed on the success path too, not
             # only when the window stalls and calls `kill` — a completed review
