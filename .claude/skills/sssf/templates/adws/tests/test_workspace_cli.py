@@ -150,6 +150,7 @@ class WorkspaceCliContract(unittest.TestCase):
             "plan validate", "plan finalize",
             "plan gate", "plan review", "plan ship",
             "plan show", "plan list",
+            "plan set-aside", "plan set-aside-log",
             "deliver",
             "run start", "run status", "run list", "run cancel", "run resume",
             "retry", "skip", "abandon",

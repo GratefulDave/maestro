@@ -1236,7 +1236,7 @@ def _finalization_store(args: argparse.Namespace) -> finalization.ReceiptStore:
             or not args.signing_seed):
         raise _PlanReceiptConfigurationError(
             "--receipt-dir, --data-dir, --verify-key, and --signing-seed "
-            "are required to finalize a plan")
+            "are required to write to the receipt store")
     try:
         verify_keys = tuple(bytes.fromhex(value) for value in args.verify_key)
         signing_seed = bytes.fromhex(args.signing_seed)
@@ -1843,6 +1843,67 @@ def _plan_show(args: argparse.Namespace) -> int:
             KeyError) as exc:
         return _plan_receipt_verification_refusal(exc)
     print(receipt.to_bytes().decode("utf-8"))
+    return 0
+
+
+def _plan_set_aside(args: argparse.Namespace) -> int:
+    """`maestro plan set-aside` — §3.6 B10's operator escape.
+
+    A FAIL receipt is terminal for those bytes, and that is correct while
+    the FAIL is a fact about the plan. When it is a fact about Maestro —
+    a rubric, a projection, or a reviewer harness defect — the plan is
+    correct and unrunnable, and the only route back used to be a full
+    authoring cycle whose entire purpose was to change the digest (§19
+    M16). This verb sets the receipt aside instead, retaining it, and
+    records who did it and why.
+
+    Which of those two a given FAIL was is a judgment, so the verb makes
+    the judgment attributable rather than making it for the operator.
+    """
+    try:
+        store = _finalization_store(args)
+        record = store.set_aside(args.digest, invoked_by=args.invoked_by,
+                                 reason=args.reason)
+    except _PlanReceiptConfigurationError as exc:
+        return _refusal("SET_ASIDE_CONFIGURATION_REQUIRED", str(exc))
+    except finalization.SetAsideRefused as exc:
+        return _refusal("SET_ASIDE_REFUSED", str(exc))
+    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
+            finalization.SignatureInvalid, UnicodeError) as exc:
+        return _plan_receipt_verification_refusal(exc)
+    except (ValueError, KeyError, OSError) as exc:
+        return _refusal("SET_ASIDE_FAILED", str(exc))
+    print(record.to_bytes().decode("utf-8"))
+    return 0
+
+
+def _plan_set_aside_log(args: argparse.Namespace) -> int:
+    """Every escape ever invoked against a digest, with the receipt each
+    one superseded — the half of B10 that makes the escape auditable
+    rather than a hole."""
+    try:
+        store = _plan_receipt_store(
+            args,
+            missing_detail=(
+                "--receipt-dir, --data-dir, and at least one --verify-key "
+                "are required for receipt access"))
+        entries = [
+            {
+                "record": json.loads(record.to_bytes().decode("utf-8")),
+                "superseded_receipt": json.loads(
+                    store.load_set_aside_receipt(
+                        args.digest, record.sequence
+                    ).to_bytes().decode("utf-8")),
+            }
+            for record in store.set_aside_records(args.digest)
+        ]
+    except _PlanReceiptConfigurationError as exc:
+        return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
+    except (FileNotFoundError, finalization.ReceiptInvalid,
+            finalization.SignatureMissing, finalization.SignatureInvalid,
+            UnicodeError, ValueError, KeyError) as exc:
+        return _plan_receipt_verification_refusal(exc)
+    print(json.dumps(entries, sort_keys=True))
     return 0
 
 
@@ -4648,6 +4709,17 @@ def build_parser() -> argparse.ArgumentParser:
     listing = plan_sub.add_parser("list")
     _add_plan_receipt_access(listing)
     listing.set_defaults(handler=_plan_list)
+    set_aside = plan_sub.add_parser("set-aside")
+    set_aside.add_argument("digest")
+    set_aside.add_argument("--invoked-by", required=True)
+    set_aside.add_argument("--reason", required=True)
+    _add_plan_receipt_access(set_aside)
+    set_aside.add_argument("--signing-seed")
+    set_aside.set_defaults(handler=_plan_set_aside)
+    set_aside_log = plan_sub.add_parser("set-aside-log")
+    set_aside_log.add_argument("digest")
+    _add_plan_receipt_access(set_aside_log)
+    set_aside_log.set_defaults(handler=_plan_set_aside_log)
 
     # One verb from a source document to shipped, runnable plans. It prints the
     # `run start` commands and stops; it never starts one.
