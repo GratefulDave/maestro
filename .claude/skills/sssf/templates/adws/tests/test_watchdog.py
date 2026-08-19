@@ -350,6 +350,197 @@ class TurnCountSignalTests(unittest.TestCase):
         self.assertEqual(fail_args[2], wd.StallReason.NODE_TIMEOUT.value)
 
 
+# ── §9.7 a declared result outranks both of the watchdog's clocks ───────────
+
+class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
+    """§9.7 at the two clock signals: an artifact a worker wrote outranks
+    any status a supervisor observes about that worker.
+
+    Measured on run-9e9ac412669140039ae078601048f6c7. The worker quiesces
+    the builder BEFORE it commits the work, runs the post gate, and
+    dispatches the cross-vendor reviewer, so from that moment the builder's
+    transcript can never grow again -- by construction, not by fault --
+    while the watchdog goes on measuring exactly that file. Review latency
+    tracks reviewer turn count at roughly 7s/turn over 15-64 turns: of ten
+    reviews, latency ran 46s to 461s, and exactly the two that exceeded
+    `turn_timeout_s=300` (461s and 368s) were killed ENVIRONMENTAL after
+    their attempt had already written a success envelope, been committed by
+    the scheduler, and had an adjudicated result row written. Not a race, a
+    threshold -- so it recurs on any plan, and it billed an infra retry for
+    a review rejection the reviewer returned seconds later, discarded the
+    reviewer's findings, and burned a full review.
+
+    It fell entirely on this branch because PROCESS_DEAD cannot convict an
+    agent attempt at all: `attempt.pid` is `handle.process_group`, which
+    herdr never populates (§16.3 item 17), so the two clocks are the only
+    signals that reach an agent node.
+
+    `declared_result_observed` is what closes it, and like
+    `exit_status_observed` beside it the fact is structural: whether a
+    typed `results` row exists for this exact `(run_id, node_id,
+    attempt_no)` and what its `adjudication` enum says. Never the payload's
+    prose, which §1.2 forbids any transition from keying on.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock(0.0)
+        self.kill = Recorder()
+        self.fail = Recorder()
+        self.heartbeat = Recorder()
+        self.config = make_config(
+            node_timeout_s=1000.0, turn_timeout_s=10.0, backstop_t_s=5000.0)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.transcript = Path(self.tmpdir.name) / "session.jsonl"
+
+    def _watchdog(self, attempts, declared, config=None):
+        watchdog = wd.Watchdog(
+            config=config or self.config,
+            attempts_provider=lambda: attempts,
+            write_heartbeat=self.heartbeat,
+            kill=self.kill,
+            fail_attempt=self.fail,
+            declared_result_observed=lambda attempt: declared,
+            time_source=self.clock,
+        )
+        watchdog._process_alive = lambda pid: True  # isolate the clock signals
+        return watchdog
+
+    def _attempt(self):
+        return make_attempt(
+            started_at=0.0, launched_at=0.0, pid=None,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+
+    # ── the turn clock ──────────────────────────────────────────────────────
+
+    def test_result_holding_attempt_flatlined_past_the_turn_timeout_is_not_stalled(self):
+        """The production failure, reduced: the transcript stopped growing
+        because the worker quiesced the builder, and the attempt is sitting
+        in review with its result already adjudicated."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        watchdog = self._watchdog([self._attempt()], declared=True)
+
+        watchdog.check_once()   # observes record 1, arms the heartbeat
+        self.clock.set(500.0)   # 50x turn_timeout_s, transcript unchanged
+        watchdog.check_once()
+
+        self.assertEqual(self.kill.calls, [])
+        self.assertEqual(self.fail.calls, [])
+
+    def test_no_result_row_flatlined_past_the_turn_timeout_is_still_convicted(self):
+        """The inverse, and the reason the guard reads a typed row rather
+        than assuming completion. Real fixture: lane-p2-s3-inventory a1 had
+        no envelope, no results row, and a worktree HEAD equal to its
+        `base_sha` -- nothing was ever committed. An attempt in that shape
+        must still be convicted or the guard has only turned a false kill
+        into a missed one."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        watchdog = self._watchdog([self._attempt()], declared=False)
+
+        watchdog.check_once()
+        self.clock.set(500.0)
+        watchdog.check_once()
+
+        self.assertEqual(len(self.kill.calls), 1)
+        self.assertEqual(len(self.fail.calls), 1)
+        (fail_args, _) = self.fail.calls[0]
+        self.assertIs(fail_args[1], st.RetryClass.ENVIRONMENTAL)
+        self.assertEqual(fail_args[2], wd.StallReason.TURN_TIMEOUT.value)
+
+    # ── the wall clock: deferred to a proven-larger bound, never removed ────
+
+    def test_result_holding_attempt_is_not_timed_out_at_the_ordinary_node_bound(self):
+        """S3 is the same shape at the outer bound: a long review can push a
+        completed, committed, adjudicated attempt past `node_timeout_s` and
+        its committed work is discarded on a clock."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        watchdog = self._watchdog([self._attempt()], declared=True)
+
+        watchdog.check_once()
+        self.clock.set(self.config.node_timeout_s + 1.0)
+        watchdog.check_once()
+
+        self.assertEqual(self.kill.calls, [])
+        self.assertEqual(self.fail.calls, [])
+
+    def test_a_hung_result_holding_attempt_still_terminates(self):
+        """Bounded termination. The clock that still convicts is
+        `config.backstop_t_s`, the run-level backstop's horizon --
+        `SchedulerConfig.__post_init__` refuses to construct a config where
+        it does not exceed `greatest_run_window_s`, so it is strictly later
+        than `node_timeout_s` and always finite. The declared result defers
+        the wall clock to that bound; it never removes it."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        watchdog = self._watchdog([self._attempt()], declared=True)
+
+        watchdog.check_once()
+        self.clock.set(self.config.backstop_t_s + 1.0)
+        watchdog.check_once()
+
+        self.assertEqual(len(self.kill.calls), 1)
+        self.assertEqual(len(self.fail.calls), 1)
+        (fail_args, _) = self.fail.calls[0]
+        self.assertIs(fail_args[1], st.RetryClass.ENVIRONMENTAL)
+        self.assertEqual(fail_args[2], wd.StallReason.NODE_TIMEOUT.value)
+
+    def test_no_result_row_still_times_out_at_the_ordinary_node_bound(self):
+        """The deferral is conditional on the row, so the ordinary bound is
+        untouched for every attempt that has not declared a result."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        watchdog = self._watchdog([self._attempt()], declared=False)
+
+        watchdog.check_once()
+        self.clock.set(self.config.node_timeout_s + 1.0)
+        watchdog.check_once()
+
+        self.assertEqual(len(self.fail.calls), 1)
+        (fail_args, _) = self.fail.calls[0]
+        self.assertEqual(fail_args[2], wd.StallReason.NODE_TIMEOUT.value)
+
+    def test_the_deferred_bound_is_structurally_later_than_the_ordinary_one(self):
+        """What makes the deferral bounded rather than a hang: a config
+        whose backstop does not exceed the greatest run window cannot be
+        constructed at all (§11.2), so `backstop_t_s > node_timeout_s`
+        holds for every config the watchdog can ever be handed."""
+        with self.assertRaises(st.LivenessBoundUnsatisfied):
+            make_config(node_timeout_s=100.0, final_acceptance_timeout_s=50.0,
+                        backstop_t_s=100.0)
+        self.assertGreater(self.config.backstop_t_s, self.config.node_timeout_s)
+
+    # ── §1.2: the guard is a predicate, not a reader of prose ───────────────
+
+    def test_the_predicate_is_consulted_only_when_a_clock_would_otherwise_fire(self):
+        """A healthy attempt must not pay for the guard on every poll: the
+        predicate reaches the ledger, and the watchdog polls once a second
+        for every RUNNING attempt."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        asked = []
+
+        def declared(attempt):
+            asked.append(attempt.key)
+            return True
+
+        watchdog = wd.Watchdog(
+            config=self.config,
+            attempts_provider=lambda: [self._attempt()],
+            write_heartbeat=self.heartbeat,
+            kill=self.kill,
+            fail_attempt=self.fail,
+            declared_result_observed=declared,
+            time_source=self.clock,
+        )
+        watchdog._process_alive = lambda pid: True
+
+        watchdog.check_once()
+        self.clock.set(5.0)   # inside both clocks
+        watchdog.check_once()
+        self.assertEqual(asked, [])
+
+        self.clock.set(500.0)  # past the turn timeout
+        watchdog.check_once()
+        self.assertEqual(len(asked), 1)
+
+
 class TranscriptRecordCountingTests(unittest.TestCase):
     """§17 item 82 -- count complete records, never observe byte size."""
 

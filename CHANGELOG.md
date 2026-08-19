@@ -127,6 +127,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A liveness clock no longer convicts an attempt that has already declared a result. The worker
+  quiesces the builder agent before it commits the work, runs the post gate, and dispatches the
+  cross-vendor reviewer, so from that moment the builder's session transcript cannot grow again by
+  construction — while `Watchdog._check_attempt` went on measuring exactly that file and stalled the
+  attempt once it had been static for `execution.turn_timeout_s`. An attempt that had written a
+  success envelope, been committed by the scheduler, had an adjudicated `results` row written, and
+  was sitting legitimately in review was therefore killed and classified `ENVIRONMENTAL`. Measured
+  on `run-9e9ac412669140039ae078601048f6c7`: ten reviews, dispatch-to-report latency 46s to 461s,
+  and exactly the two that exceeded `turn_timeout_s=300` were killed, while the 260s review survived
+  by forty seconds. Latency tracks reviewer turn count at roughly 7s/turn across 15–64 turns, so it
+  is unbounded model behaviour rather than a property of those two diffs.
+
+  All three convicting sites now consult the attempt's own declared result first, through a single
+  injected `declared_result_observed` predicate that mirrors the existing `exit_status_observed`:
+  the turn clock, the node wall clock, and `resume_run`, whose docstring previously described
+  discarding an inherited RUNNING attempt as intended design. The predicate reads a new
+  `LifecycleStore.result_adjudication` keyed on `(run_id, node_id, attempt_no)`, which projects the
+  typed `adjudication` and deliberately omits `payload_json` — §1.2 is enforced by the shape of the
+  SELECT rather than by discipline. Only `ACCEPTED` spares an attempt; `SUPERSEDED`,
+  `UNKNOWN_ATTEMPT`, and `SHA_MISMATCH` each say the row does not describe the live generation.
+
+  Sparing is not unbounding. A result-holding attempt's wall clock defers to `backstop_t_s` rather
+  than being removed, which `SchedulerConfig.__post_init__` already guarantees is finite and
+  strictly greater than `node_timeout_s`, so a genuinely hung attempt is still convicted — late, by
+  design. The predicate is consulted only once a bound would otherwise fire, so polling a healthy
+  attempt costs no ledger read.
+
+  The misclassification also distorted budget accounting in both directions: `ENVIRONMENTAL` and
+  `SEMANTIC` debit different budgets, and a discarded rejection never reaches
+  `_settle_review_rejection`, so it was never debited against `review_ceiling`. In that run
+  `attempts.extra_json.review_rejected` is present on all six correctly-settled rejections and
+  absent on all three killed attempts, and `lane-p1-canonical-object-key` merged only because the
+  defect silently refunded it a review credit. Correcting the classification makes review budgets
+  bite sooner, not later. See `MAESTRO_architecture.md` §19 M15 and §16.3 item 128.
+
 - A gate selector is a set of paths, and three checks read it as a single opaque string.
   `plan_validate._gate_executable` decided the produced arm of `MAESTRO_architecture.md` §6.4 with
   `all(path in produced for path in paths)`, so a selector *mixing* test files an earlier plan had

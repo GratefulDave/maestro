@@ -758,6 +758,42 @@ class Scheduler:
             node = self.nodes.get(attempt.node_id)
             return node is not None and node.kind is st.NodeKind.CODE
 
+        def declared_result_observed(attempt: st.AttemptRecord) -> bool:
+            """Whether this exact attempt already landed an adjudicated result.
+
+            §9.7 again, at the two clock signals rather than the process one,
+            and for the failure `exit_status_observed` does not cover: the
+            attempt is not gone, it is *finished*. `_attempt` quiesces the
+            builder at `pre-inventory` — before it commits the work, before
+            the post gate, before the cross-vendor reviewer is dispatched —
+            so the builder's transcript cannot grow again from that point by
+            construction. The watchdog goes on measuring exactly that file for
+            the whole of the review, and review latency tracks reviewer turn
+            count, so it is unbounded.
+
+            Measured on run-9e9ac412669140039ae078601048f6c7: of ten reviews
+            spanning 46s to 461s, both that exceeded `turn_timeout_s=300` were
+            failed ENVIRONMENTAL while holding committed work and an
+            adjudicated result row — an infra retry debited for what came back
+            as a review rejection seconds later, the reviewer's findings
+            discarded, the relaunch blind, the review burned.
+
+            The fact is structural and among those §7.5 permits: whether a
+            typed `results` row exists for `(run_id, node_id, attempt_no)` and
+            what its `adjudication` enum says. `result_adjudication` does not
+            select the payload, so §1.2 holds by projection rather than by
+            restraint — no transition here can be caused by envelope prose.
+
+            ACCEPTED alone, because that is the verdict `adjudicate_result`
+            reaches only when the result names *this* attempt, at *this* base,
+            while it was still the live one (§7.7). The other three each say
+            the row describes some other generation's work and must not spare
+            this one.
+            """
+            return self.deps.store.result_adjudication(
+                self.run_id, attempt.node_id,
+                attempt.attempt_no) is st.Adjudication.ACCEPTED
+
         watchdog = wd.Watchdog(
             config=self.config,
             attempts_provider=running_attempts,
@@ -765,6 +801,7 @@ class Scheduler:
             kill=kill,
             fail_attempt=fail,
             exit_status_observed=exit_status_observed,
+            declared_result_observed=declared_result_observed,
             time_source=time.time)
 
         backstop = wd.RunBackstop(
