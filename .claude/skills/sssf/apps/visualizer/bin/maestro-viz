@@ -2,11 +2,11 @@
 #
 # Start the Maestro visualizer — both halves of it — from any working directory.
 #
-# `bun run dev` starts only the Vite frontend on :4601. The API is a separate
-# process on :4600, and without it every /api request 500s while the startup
-# output still looks entirely successful. This script starts both, then refuses
-# to report success until /api/sources has actually answered 200 through the
-# frontend's proxy.
+# `bun run dev` refuses: it used to start only the Vite frontend on :4601.
+# The API is a separate process on :4600, and without it every /api request
+# 500s while a Vite-only startup still looks successful. This script starts
+# both, then refuses to report success until /api/sources has actually
+# answered 200 through the frontend's proxy.
 #
 # Invoked through the global justfile recipe, so it is reachable from anywhere:
 #
