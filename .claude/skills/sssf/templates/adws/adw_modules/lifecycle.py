@@ -146,7 +146,16 @@ CREATE TABLE IF NOT EXISTS runs (
   -- that matters -- the process that did *not* exit cleanly.
   scheduler_pid       INTEGER,
   scheduler_host      TEXT,
-  scheduler_claimed_at TEXT
+  scheduler_claimed_at TEXT,
+  -- The start time of that process, as epoch seconds at whatever resolution
+  -- the platform records it. A pid is not an identity: the kernel reuses it,
+  -- and a later occupant of the same number reads as "alive" to any check
+  -- that asks only whether the pid exists. Recorded here so identity can be
+  -- *proven* by comparing this against the live process's start time, which
+  -- is what separates authority to signal a process from a guess that it is
+  -- the same one (#37). NULL on a ledger written before this column, and on
+  -- a platform that cannot answer -- both read as unproven, never as proven.
+  scheduler_start_epoch REAL
 );
 CREATE TABLE IF NOT EXISTS dag_nodes (
   run_id       TEXT NOT NULL REFERENCES runs(run_id),
@@ -278,6 +287,7 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("scheduler_host", "TEXT"),
     ("scheduler_claimed_at", "TEXT"),
     ("cancel_cause", "TEXT"),
+    ("scheduler_start_epoch", "REAL"),
 )
 
 #: The same, for `node_lifecycle`. Kept as a second list rather than folded
@@ -685,10 +695,12 @@ class LifecycleStore:
             self.conn.execute(
                 "INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,"
                 " latest_outcome, latest_outcome_at, cancel_requested,"
-                " scheduler_pid, scheduler_host, scheduler_claimed_at)"
-                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?)",
+                " scheduler_pid, scheduler_host, scheduler_claimed_at,"
+                " scheduler_start_epoch)"
+                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?,?)",
                 (run_id, plan_digest, now, now,
-                 os.getpid(), scheduler_host(), now))
+                 os.getpid(), scheduler_host(), now,
+                 wd.process_start_epoch(os.getpid())))
             for node in nodes:
                 self.conn.execute(
                     "INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind, depth,"
@@ -1556,8 +1568,10 @@ class LifecycleStore:
         try:
             self.conn.execute(
                 "UPDATE runs SET scheduler_pid=?, scheduler_host=?,"
-                " scheduler_claimed_at=? WHERE run_id=?",
-                (os.getpid(), scheduler_host(), now, run_id))
+                " scheduler_claimed_at=?, scheduler_start_epoch=?"
+                " WHERE run_id=?",
+                (os.getpid(), scheduler_host(), now,
+                 wd.process_start_epoch(os.getpid()), run_id))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -1587,9 +1601,10 @@ class LifecycleStore:
             now = now_iso()
             self.conn.execute(
                 "UPDATE runs SET last_transition_at=?, cancel_requested=0,"
-                " scheduler_pid=?, scheduler_host=?, scheduler_claimed_at=?"
-                " WHERE run_id=?",
-                (now, os.getpid(), scheduler_host(), now, run_id))
+                " scheduler_pid=?, scheduler_host=?, scheduler_claimed_at=?,"
+                " scheduler_start_epoch=? WHERE run_id=?",
+                (now, os.getpid(), scheduler_host(), now,
+                 wd.process_start_epoch(os.getpid()), run_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -1998,6 +2013,12 @@ class RunRecord:
     scheduler_pid: Optional[int] = None
     scheduler_host: Optional[str] = None
     scheduler_claimed_at: Optional[str] = None
+    #: The start time of the claiming process, recorded beside its pid so the
+    #: two together are an identity rather than a number the kernel may hand
+    #: to somebody else. `None` on a ledger written before the column and on a
+    #: platform that cannot answer; `scheduler_signal_pid` reads both as
+    #: unproven, which is the only safe direction (#37).
+    scheduler_start_epoch: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -2067,6 +2088,48 @@ def scheduler_liveness(
     if recorded_host and not _same_scheduler_host(recorded_host, current_host):
         return None
     return bool(is_alive(int(pid)))
+
+
+def scheduler_signal_pid(
+        record: RunRecord, *,
+        is_alive: Callable[[int], bool] = wd.process_is_alive,
+        start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
+        host: Optional[str] = None) -> Optional[int]:
+    """The pid it is legal to signal, or `None` when identity is unproven.
+
+    `scheduler_liveness` answers "is there a process with this number?", and
+    that is a weak witness for anything that intends to *act* on the process.
+    The kernel reuses pids; a pid the scheduler released and an unrelated
+    program then acquired answers `True` to that question, and signalling it
+    would deliver a SIGINT to a stranger. Liveness is a precondition here, not
+    the proof.
+
+    Identity is the recorded start epoch compared against the live process's
+    start epoch — a float equality over two recorded numbers, not a judgement
+    about text. `watchdog.process_start_epoch` resolves finer than a second,
+    so a pid reused within the same second the original process started still
+    reports a different start and reads as unproven (#37). A whole-second
+    `started <= scheduler_claimed_at` comparison would not distinguish that
+    case, which is why the epoch is recorded rather than derived from the
+    claim timestamp.
+
+    Three ways to be unproven, and all of them return `None` rather than the
+    pid: liveness is not `True`; no start epoch was recorded (a ledger written
+    before the column, or a platform that cannot answer); the live process's
+    start does not equal the recorded one. Unproven is never authority.
+    """
+    if scheduler_liveness(record, is_alive=is_alive, host=host) is not True:
+        return None
+    pid = int(record.scheduler_pid)
+    recorded = record.scheduler_start_epoch
+    if recorded is None:
+        return None
+    started = start_epoch(pid)
+    if started is None:
+        return None
+    if started != recorded:
+        return None
+    return pid
 
 
 def derive_run_state(
@@ -2231,7 +2294,10 @@ class LifecycleReader:
                                 if "scheduler_host" in optional else None),
                 scheduler_claimed_at=(row["scheduler_claimed_at"]
                                       if "scheduler_claimed_at" in optional
-                                      else None))
+                                      else None),
+                scheduler_start_epoch=(row["scheduler_start_epoch"]
+                                       if "scheduler_start_epoch" in optional
+                                       else None))
             for row in self._rows(sql + " ORDER BY created_at DESC, run_id DESC",
                                   params))
 

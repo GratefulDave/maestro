@@ -8,6 +8,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `runs.scheduler_start_epoch`, and `lifecycle.scheduler_signal_pid` which reads it: recorded
+  process identity for the scheduler that claimed a run. `scheduler_liveness` answers only "is
+  there a process with this number?", and the kernel reuses pid numbers, so a stranger that
+  acquired the pid the scheduler released answers `True` to that question. That is a safe enough
+  witness for *reporting* a run — being wrong there only reports the run as it already reads — and
+  it is not authority to send the process a signal. The new column records
+  `watchdog.process_start_epoch(os.getpid())` beside the pid on all three writes that take
+  ownership (`create_run`, `claim_run`, and the resume transition), and `scheduler_signal_pid`
+  returns the pid only when liveness holds *and* the live process's start epoch equals the
+  recorded one. Because that probe resolves finer than a second, a pid reused inside the same
+  second the original process started still reports a different start and reads as unproven; a
+  whole-second `started <= scheduler_claimed_at` comparison would have called it proven. Every
+  other case returns `None`: no recorded epoch, a platform that cannot answer, a mismatch.
+  Unproven is never authority.
+
+  The column is nullable and migrates by `ALTER TABLE`, so existing ledgers keep loading. A `runs`
+  row written before it reads `scheduler_start_epoch = None`, still reads live, still derives the
+  same run state, and reads as *unproven* rather than proven — the direction that hands no signal
+  to whatever now holds the pid. It adds no table and no view, so §10.6's ledger table-set guard is
+  unchanged. Carried with the `SignalPidIdentity` cases in `tests/test_run_liveness.py` and two
+  backward-compatibility cases over a pre-column ledger.
+
+  This lands the recording and identity half only. The consumer that needs it — a `run pause` verb
+  that SIGINTs the claiming process — is not on `main` yet, so `lifecycle.scheduler_signal_pid`
+  carries a named `DEFERRED` row in `tests/test_no_dead_seams.py` until it arrives. The row that
+  stood there for `watchdog.process_start_epoch` is deleted: that probe now has three production
+  callers.
+
 - `tools/runtime_sync.py`, shipped inside the template so it reaches every deployment: the
   supported way to move ADW runtime bytes between checkouts, in place of a hand-run `cp`. `check`
   returns a structured drift report in which **absence is its own field**, separate from a content
