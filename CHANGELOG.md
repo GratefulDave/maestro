@@ -127,6 +127,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `tests/test_coordinator.py` no longer fails one to six of its cases at random under `pytest -n
+  auto`, which is this suite's default (issue #50). Six of its thirty-two cases drive the
+  coordinator from a thread and then wait for it to reach a participant dispatch or a global gate.
+  Reaching either costs real `git` subprocess work — repository binding, branch creation, candidate
+  worktree creation — measured at 0.735s to 1.154s on an idle machine, and each of those waits was
+  bounded at 3.0s. Under `-n auto` eighteen workers fork `git` against one disk, that distribution
+  moves past the bound, and the precondition reports as a failure: observed here at 8 of 12
+  consecutive runs, failing 1, 3, 3, 4, 4, 5, 5 and 6 cases, while `-n 0` passed every time. The
+  failing set is not random — it is exactly the six threaded cases, entering in the order of how
+  much pre-dispatch work precedes their wait, which is what a load-scaled distribution crossing a
+  fixed threshold looks like rather than a race on a shared resource. Every such bound in the file
+  now derives from one `ARRIVAL_TIMEOUT_S` constant (60s, `MAESTRO_TEST_ARRIVAL_TIMEOUT_S`
+  overrides) documented as a hang detector rather than a latency gate. Nothing the file asserts
+  changed: the one wall-clock bound that is a property under test — the 0.5s cancellation bound in
+  `test_stuck_participant_cancellation_returns_with_blocked_cleanup_evidence` — is deliberately
+  left alone and deliberately not expressed in terms of the constant. This shape had already been
+  diagnosed twice in this suite and fixed at one instance each time, in that same stuck-cancellation
+  case and in `test_workspace_runtime.py`'s global-gate cancellation case; the siblings left behind
+  are what the issue reported.
+
 - `docs/plan-authoring.md`: removed the "Not built yet" blockquote over `maestro plan gate`,
   `review`, and `ship`. Those verbs shipped in commit 6707e50 (PR #8) and are registered on the
   `plan` subparser; the binding runbook was still directing plan authors to hand-run the `planctl`
