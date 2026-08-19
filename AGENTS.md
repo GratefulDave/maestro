@@ -58,3 +58,10 @@ same check from its own side. It skips only when the peer repository is not chec
 all. `lexgenius/adws/` is a deployed instance, is not covered by that test, and is reconciled
 by hand — see `CLAUDE.md`.
 
+Do the mirroring with `.claude/skills/sssf/templates/adws/tools/runtime_sync.py`, not with
+`cp`, `rsync`, or `git apply`. `check <source> <destination>` reports the drift and exits
+non-zero when the copies disagree; `mirror <source> <destination> --apply` copies with a
+sha256 assertion per file, never deletes, refuses a destination that looks ahead of the
+source, and holds `maestro.config.yaml` back whenever either endpoint is a deployment. The
+parity test above uses the same comparison, so what it fails on is what the mirror repairs.
+

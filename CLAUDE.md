@@ -33,10 +33,22 @@ The ADW runtime exists in three copies:
 | `lexgenius/adws/` | A deployed instance, and in practice where fixes have landed first. |
 | `the-library/skills/sssf/templates/adws/` | The install source for `skills/sssf`. |
 
-**There is still no script that copies one to another.** They drift silently, and until
-2026-08-17 the drift was only discovered when something broke. That day the template copy was
-found to be ~750 lines behind in `maestro.py` alone, missing every plan verb in daily use, and a
-revert in a consuming repo silently deleted 6009 lines of runtime from another copy.
+**There is now one script that copies one to another, and it is the only one you may use.**
+`.claude/skills/sssf/templates/adws/tools/runtime_sync.py` — `check <source> <destination>`
+answers "are these level?" structurally (which files differ and in which direction, and,
+separately, which exist in one copy and not the other, because that is a deletion rather than
+an edit); `mirror <source> <destination>` plans and `--apply` writes, with a sha256 assertion
+per file. It never deletes, it refuses a destination that looks ahead of the source unless you
+pass `--overwrite-ahead`, and it holds `maestro.config.yaml` back whenever either endpoint is
+a deployment. `tests/test_template_parity.py` calls the same comparison, so the test's failure
+and the mirror's repair are the same definition of level. Do not use `cp`, `rsync`, or
+`git apply` — `git apply` reports success and changes nothing on this machine.
+
+Before it existed there was nothing, and the drift was only discovered when something broke: on
+2026-08-17 the template copy was found ~750 lines behind in `maestro.py` alone, missing every
+plan verb in daily use, and a revert in a consuming repo silently deleted 6009 lines of runtime
+from another copy. Nothing *schedules* the new script either. It makes a reconciliation provable
+and refusable; it does not make one happen.
 
 The two **template** copies are now held together by a test rather than by discipline:
 `.claude/skills/sssf/templates/adws/tests/test_template_parity.py` compares this repo's template
