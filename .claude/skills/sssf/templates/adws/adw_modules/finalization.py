@@ -612,9 +612,10 @@ class Receipt:
     receipt alone — which is the exact argument that put the grade there, one
     field short. It is `None` for plan finalization, whose verdict has no
     threshold to run under, and it is written from the first version that
-    grades anything for §3.6 B8's reason: a field added after receipts exist is
-    optional forever.
-
+    grades anything for §3.6 B8's reason: a field added after receipts exist
+    is optional forever. `maestro-rubric.v1` receipts omit the key — they
+    predate the field — and `from_bytes` requires it only after that
+    version, so a signed v1 receipt still replays after the upgrade.
     The threshold is configuration (`execution.review_reject_grade`, §6.2), so
     it can differ between the review and any later reading of it. That is
     precisely why the receipt must carry the one the verdict was derived with
@@ -643,13 +644,15 @@ class Receipt:
             "rubric_version": self.rubric_version,
             "verdict": self.verdict.value,
             "created_at_epoch": self.created_at_epoch,
-            "reject_at": self.reject_at,
             "reviewer": {
                 "route": self.reviewer.route,
                 "model": self.reviewer.model,
                 "session_id": self.reviewer.session_id,
             },
-            "cells": [
+        }
+        if self.rubric_version != "maestro-rubric.v1":
+            payload["reject_at"] = self.reject_at
+        payload["cells"] = [
                 {
                     "check_id": cell.check_id,
                     "object_id": cell.object_id,
@@ -660,8 +663,7 @@ class Receipt:
                     "grade": cell.grade,
                 }
                 for cell in self.cells
-            ],
-        }
+            ]
         return json.dumps(payload, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False).encode("utf-8")
 
@@ -684,11 +686,18 @@ class Receipt:
                 data.decode("utf-8"), object_pairs_hook=object_without_duplicates)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ReceiptInvalid("receipt bytes are not UTF-8 JSON") from exc
+        if not isinstance(payload, dict):
+            raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
+        rubric_version = payload.get("rubric_version")
+        if not isinstance(rubric_version, str):
+            raise ReceiptInvalid("rubric_version must be a string")
         expected = {
             "plan_digest", "rubric_version", "verdict", "created_at_epoch",
-            "reject_at", "reviewer", "cells",
+            "reviewer", "cells",
         }
-        if not isinstance(payload, dict) or set(payload) != expected:
+        if rubric_version != "maestro-rubric.v1":
+            expected = expected | {"reject_at"}
+        if set(payload) != expected:
             raise ReceiptInvalid("receipt fields do not match the frozen receipt schema")
         reviewer = payload["reviewer"]
         if (not isinstance(reviewer, dict) or
@@ -700,14 +709,15 @@ class Receipt:
             raise ReceiptInvalid("receipt cells must be an array")
         try:
             _require_plan_digest(payload["plan_digest"])
-            if not isinstance(payload["rubric_version"], str):
-                raise ReceiptInvalid("rubric_version must be a string")
             created_at_epoch = payload["created_at_epoch"]
             _require_created_at_epoch(created_at_epoch)
             verdict = Verdict(payload["verdict"])
-            reject_at = payload["reject_at"]
-            if reject_at is not None and not isinstance(reject_at, str):
-                raise ReceiptInvalid("receipt reject_at must be a string or null")
+            if rubric_version == "maestro-rubric.v1":
+                reject_at = None
+            else:
+                reject_at = payload["reject_at"]
+                if reject_at is not None and not isinstance(reject_at, str):
+                    raise ReceiptInvalid("receipt reject_at must be a string or null")
             derived_cells = []
             for cell in cells:
                 if (not isinstance(cell, dict) or set(cell) != {
@@ -1071,32 +1081,37 @@ class ReceiptStore:
         return any(rc.verify(key, data, signature) for key in self._verify_keys)
 
     def _recover_locked(self, plan_digest: str) -> bool:
+        recovered = False
         path = self.path_for(plan_digest)
         signature_path = self.signature_path_for(plan_digest)
         pending_path = self._pending_path_for(plan_digest)
-        if not pending_path.is_file():
-            return False
-        signature = self._read_signature(pending_path, plan_digest)
-        if not path.is_file():
-            pending_path.unlink()
-            self._fsync_root()
-            return False
-        data = path.read_bytes()
-        if not self._signature_verifies(data, signature):
-            raise SignatureInvalid(
-                f"the pending receipt for {plan_digest} verifies under none of "
-                f"this store's {len(self._verify_keys)} public key(s)")
-        expected = signature.hex().encode("ascii") + b"\n"
-        if signature_path.is_file():
-            existing = self._read_signature(signature_path, plan_digest)
-            if existing != signature:
-                raise ReceiptExists(
-                    f"a conflicting receipt signature exists for {plan_digest}")
-        else:
-            self._stage(signature_path, expected)
-        pending_path.unlink()
-        self._fsync_root()
-        return True
+        if pending_path.is_file():
+            signature = self._read_signature(pending_path, plan_digest)
+            if not path.is_file():
+                pending_path.unlink()
+                self._fsync_root()
+            else:
+                data = path.read_bytes()
+                if not self._signature_verifies(data, signature):
+                    raise SignatureInvalid(
+                        f"the pending receipt for {plan_digest} verifies under "
+                        f"none of this store's {len(self._verify_keys)} public "
+                        f"key(s)")
+                expected = signature.hex().encode("ascii") + b"\n"
+                if signature_path.is_file():
+                    existing = self._read_signature(signature_path, plan_digest)
+                    if existing != signature:
+                        raise ReceiptExists(
+                            f"a conflicting receipt signature exists for "
+                            f"{plan_digest}")
+                else:
+                    self._stage(signature_path, expected)
+                pending_path.unlink()
+                self._fsync_root()
+                recovered = True
+        if self._recover_set_aside_locked(plan_digest):
+            recovered = True
+        return recovered
 
     def recover(self, plan_digest: str) -> bool:
         """Complete only an authenticated interrupted publication."""
@@ -1185,18 +1200,101 @@ class ReceiptStore:
                 self._confined_path(f"{stem}.record.json"),
                 self._confined_path(f"{stem}.record.json.sig"))
 
+    def _set_aside_sequences(self, plan_digest: str) -> List[int]:
+        prefix = f"{plan_digest}.set-aside."
+        sequences = set()
+        for path in self.root.glob(f"{prefix}*"):
+            rest = path.name[len(prefix):]
+            seq_part = rest.split(".", 1)[0]
+            if _SET_ASIDE_SEQUENCE.fullmatch(seq_part):
+                sequences.add(int(seq_part))
+        return sorted(sequences)
+
+    def _discard_set_aside_files(self, plan_digest: str, sequence: int) -> bool:
+        discarded = False
+        for path in self._set_aside_paths(plan_digest, sequence):
+            if path.is_file():
+                path.unlink()
+                discarded = True
+        if discarded:
+            self._fsync_root()
+        return discarded
+
+    def _recover_set_aside_locked(self, plan_digest: str) -> bool:
+        """Resolve an interrupted escape so it either fully took effect
+        or fully did not.
+
+        The four archive/record files are the commit. A complete, signed,
+        bound set whose sha256 still matches the live receipt means unlink
+        has not happened yet — finish it. A partial set while the live
+        receipt remains is an escape that did not happen — discard the
+        staging so retry is legal. An unsigned record is incomplete
+        staging, not corruption.
+        """
+        recovered = False
+        live = self.path_for(plan_digest)
+        live_sig = self.signature_path_for(plan_digest)
+        live_data = live.read_bytes() if live.is_file() else None
+        live_sha = (None if live_data is None
+                    else hashlib.sha256(live_data).hexdigest())
+        for sequence in self._set_aside_sequences(plan_digest):
+            archive, archive_sig, record_path, record_sig = (
+                self._set_aside_paths(plan_digest, sequence))
+            files = (archive, archive_sig, record_path, record_sig)
+            present = [path.is_file() for path in files]
+            if not any(present):
+                continue
+            if not all(present):
+                if live_sha is None:
+                    continue
+                if self._discard_set_aside_files(plan_digest, sequence):
+                    recovered = True
+                continue
+            archive_data, _receipt = self._verified_receipt_at(
+                archive, archive_sig, plan_digest,
+                f"set-aside receipt {sequence:04d}")
+            record = self._load_set_aside_record(plan_digest, sequence)
+            archive_sha = hashlib.sha256(archive_data).hexdigest()
+            if archive_sha != record.superseded_receipt_sha256:
+                continue
+            if live_sha == archive_sha:
+                if live.is_file():
+                    live.unlink()
+                if live_sig.is_file():
+                    live_sig.unlink()
+                self._fsync_root()
+                live_sha = None
+                recovered = True
+            elif live_sha is None and live_sig.is_file():
+                live_sig.unlink()
+                self._fsync_root()
+                recovered = True
+        return recovered
+
     def load_set_aside_receipt(self, plan_digest: str, sequence: int) -> Receipt:
         """The receipt a set-aside superseded, still signed, still verified.
 
         The escape retains it rather than deleting it: `rm` would destroy
         the store's whole audit value, which is that every verdict ever
         reached about a digest is still there to read.
+
+        `SetAsideRecord.superseded_receipt_sha256` binds this archive to
+        the record that claims it. Two valid archive/signature pairs for
+        the same plan digest cannot be swapped between sequence numbers
+        without detection (§6.6, §3.6 B15).
         """
         _require_plan_digest(plan_digest)
         path, signature_path, _, _ = self._set_aside_paths(plan_digest, sequence)
-        return self._verified_receipt_at(
+        data, receipt = self._verified_receipt_at(
             path, signature_path, plan_digest,
-            f"set-aside receipt {sequence:04d}")[1]
+            f"set-aside receipt {sequence:04d}")
+        record = self._load_set_aside_record(plan_digest, sequence)
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != record.superseded_receipt_sha256:
+            raise ReceiptInvalid(
+                f"the set-aside receipt {sequence:04d} for {plan_digest} "
+                f"does not match the record that claims it")
+        return receipt
 
     def _load_set_aside_record(self, plan_digest: str,
                                sequence: int) -> SetAsideRecord:
@@ -1227,17 +1325,24 @@ class ReceiptStore:
         repeatedly is leaving a growing, signed, attributable trail on the
         digest they are reaching for — which is the whole reason a plan's
         own FAIL does not become cheap to re-roll.
+
+        A staged unsigned record is incomplete publication, not a
+        finished escape, so it is skipped rather than raised as
+        corruption. `_recover_locked` discards that staging when the live
+        receipt is still present.
         """
         _require_plan_digest(plan_digest)
-        prefix = f"{plan_digest}.set-aside."
-        suffix = ".record.json"
-        sequences = []
-        for path in self.root.glob(f"{prefix}*{suffix}"):
-            middle = path.name[len(prefix):-len(suffix)]
-            if _SET_ASIDE_SEQUENCE.fullmatch(middle):
-                sequences.append(int(middle))
-        return tuple(self._load_set_aside_record(plan_digest, sequence)
-                     for sequence in sorted(sequences))
+        records = []
+        for sequence in self._set_aside_sequences(plan_digest):
+            archive, archive_sig, record_path, record_sig = (
+                self._set_aside_paths(plan_digest, sequence))
+            if not all(path.is_file() for path in (
+                    archive, archive_sig, record_path, record_sig)):
+                continue
+            records.append(self._load_set_aside_record(plan_digest, sequence))
+        return tuple(records)
+
+
 
     def set_aside(self, plan_digest: str, *, invoked_by: str, reason: str,
                   clock: Callable[[], float] = time.time) -> SetAsideRecord:
@@ -1268,12 +1373,11 @@ class ReceiptStore:
         judgment, not a computation, which is why this is an operator act
         that records itself rather than a rule that fires.
 
-        **Crash behaviour.** The archival copies and the record are staged
-        before the live receipt is unlinked, so an interrupted escape
-        leaves the live receipt intact and the escape simply did not
-        happen. It never leaves a receipt that only the archive can
-        produce, and it never frees the live slot without a record
-        explaining why.
+        **Crash behaviour.** The four archive/record files are the commit.
+        `_recover_locked` finishes an interrupted unlink when that commit
+        is complete and bound to the live receipt, and discards a partial
+        commit so the live FAIL remains and retry is legal. A staged
+        unsigned record is incomplete, not corrupt.
         """
         if self._signing_seed is None:
             raise SigningKeyUnavailable(

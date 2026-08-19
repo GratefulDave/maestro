@@ -461,5 +461,165 @@ class TheOperatorVerb(unittest.TestCase):
             self.assertEqual(digests, [])
 
 
+
+def _crash_after_n_set_aside_ops(store, n):
+    """Drive the real `set_aside` publication and raise after `n` durable
+    ops: each `_stage` of the four archive/record files, then each unlink
+    of the live receipt pair."""
+    seen = {"k": 0}
+    orig_stage = store._stage
+    live = store.path_for(DIGEST)
+    live_sig = store.signature_path_for(DIGEST)
+    orig_unlink = Path.unlink
+
+    def stage(destination, data):
+        orig_stage(destination, data)
+        seen["k"] += 1
+        if seen["k"] >= n:
+            raise OSError("injected crash after publication step {0}".format(
+                seen["k"]))
+
+    def unlink(self, *args, **kwargs):
+        orig_unlink(self, *args, **kwargs)
+        try:
+            resolved = self.resolve()
+        except OSError:
+            return
+        if resolved in {live.resolve(), live_sig.resolve()}:
+            seen["k"] += 1
+            if seen["k"] >= n:
+                raise OSError(
+                    "injected crash after publication step {0}".format(
+                        seen["k"]))
+
+    store._stage = stage
+    Path.unlink = unlink
+    return orig_stage, orig_unlink
+
+
+def _restore_set_aside_ops(store, orig_stage, orig_unlink):
+    store._stage = orig_stage
+    Path.unlink = orig_unlink
+
+
+def _count_set_aside_ops(store):
+    seen = {"k": 0}
+    orig_stage = store._stage
+    live = store.path_for(DIGEST)
+    live_sig = store.signature_path_for(DIGEST)
+    orig_unlink = Path.unlink
+
+    def stage(destination, data):
+        orig_stage(destination, data)
+        seen["k"] += 1
+
+    def unlink(self, *args, **kwargs):
+        orig_unlink(self, *args, **kwargs)
+        try:
+            resolved = self.resolve()
+        except OSError:
+            return
+        if resolved in {live.resolve(), live_sig.resolve()}:
+            seen["k"] += 1
+
+    store._stage = stage
+    Path.unlink = unlink
+    try:
+        store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
+    finally:
+        _restore_set_aside_ops(store, orig_stage, orig_unlink)
+    return seen["k"]
+
+
+class SetAsidePublicationIsCrashRecoverable(unittest.TestCase):
+    """A crash at any publication step leaves a state that either fully
+    took effect or did not. Drive the real function; do not reimplement
+    its publication order in the test."""
+
+    def _assert_resolvable(self, store, original_bytes):
+        store.recover(DIGEST)
+        records = store.set_aside_records(DIGEST)
+        live = store.has(DIGEST)
+        if live:
+            self.assertEqual(store.load(DIGEST).verdict, fin.Verdict.FAIL)
+            self.assertEqual(store.path_for(DIGEST).read_bytes(),
+                             original_bytes)
+            self.assertEqual(records, ())
+            retried = store.set_aside(DIGEST, invoked_by=INVOKER,
+                                      reason=REASON)
+            self.assertEqual(retried.sequence, 1)
+            self.assertFalse(store.has(DIGEST))
+            self.assertEqual(len(store.set_aside_records(DIGEST)), 1)
+            self.assertEqual(
+                store.load_set_aside_receipt(DIGEST, 1).verdict,
+                fin.Verdict.FAIL)
+        else:
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].superseded_receipt_sha256,
+                             hashlib.sha256(original_bytes).hexdigest())
+            self.assertEqual(
+                store.load_set_aside_receipt(DIGEST, 1).verdict,
+                fin.Verdict.FAIL)
+            with self.assertRaises(fin.SetAsideRefused):
+                store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
+
+    def test_a_crash_at_each_publication_step_leaves_a_resolvable_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe, _repo, _data, _seed = make_store(Path(tmp))
+            finalize(probe, WindowFactory(report=failing_report()))
+            steps = _count_set_aside_ops(probe)
+        self.assertGreaterEqual(steps, 4)
+
+        for step in range(1, steps + 1):
+            with self.subTest(crash_after=step):
+                with tempfile.TemporaryDirectory() as tmp:
+                    store, _repo, _data, _seed = make_store(Path(tmp))
+                    finalize(store, WindowFactory(report=failing_report()))
+                    original = store.path_for(DIGEST).read_bytes()
+                    orig_stage, orig_unlink = _crash_after_n_set_aside_ops(
+                        store, step)
+                    try:
+                        with self.assertRaises(OSError):
+                            store.set_aside(DIGEST, invoked_by=INVOKER,
+                                            reason=REASON)
+                    finally:
+                        _restore_set_aside_ops(store, orig_stage,
+                                               orig_unlink)
+                    self._assert_resolvable(store, original)
+
+
+class TheArchivedReceiptIsBoundToTheRecord(unittest.TestCase):
+    """`superseded_receipt_sha256` is not an unused field. Swapping two
+    valid archive/signature pairs for one plan digest must be refused."""
+
+    def test_a_swapped_archive_signature_pair_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, _seed = make_store(Path(tmp))
+            finalize(store, WindowFactory(report=failing_report(),
+                                          session_id="sess-1"))
+            store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
+            finalize(store, WindowFactory(report=failing_report(),
+                                          session_id="sess-2"),
+                     clock=lambda: 1_760_000_500.0)
+            store.set_aside(DIGEST, invoked_by=INVOKER, reason="and again")
+
+            first = store._set_aside_paths(DIGEST, 1)
+            second = store._set_aside_paths(DIGEST, 2)
+            first_archive = first[0].read_bytes()
+            first_sig = first[1].read_bytes()
+            second_archive = second[0].read_bytes()
+            second_sig = second[1].read_bytes()
+            self.assertNotEqual(first_archive, second_archive)
+            first[0].write_bytes(second_archive)
+            first[1].write_bytes(second_sig)
+            second[0].write_bytes(first_archive)
+            second[1].write_bytes(first_sig)
+
+            with self.assertRaises(fin.ReceiptInvalid):
+                store.load_set_aside_receipt(DIGEST, 1)
+            with self.assertRaises(fin.ReceiptInvalid):
+                store.load_set_aside_receipt(DIGEST, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

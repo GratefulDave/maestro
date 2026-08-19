@@ -902,5 +902,60 @@ class FinalizeOrchestration(unittest.TestCase):
             self.assertFalse(store.has(DIGEST))
 
 
+
+class ALegacyV1ReceiptStillReplays(unittest.TestCase):
+    """`reject_at` is required for v2, not for receipts written before it.
+
+    §6.5 keys replay on the digest alone. A signed `maestro-rubric.v1`
+    receipt omits `reject_at`; requiring the field for every version
+    makes previously finalized identities unusable after the upgrade.
+    """
+
+    def _install_signed_v1(self, store, seed, receipt_bytes):
+        payload = json.loads(receipt_bytes.decode("utf-8"))
+        payload.pop("reject_at", None)
+        payload["rubric_version"] = "maestro-rubric.v1"
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+        store.path_for(DIGEST).write_bytes(data)
+        store.signature_path_for(DIGEST).write_text(
+            rc.sign(seed, data).hex() + "\n", encoding="ascii")
+        return data
+
+    def test_a_signed_v1_receipt_parses_and_replays_after_the_v2_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _repo, _data, seed = make_store(Path(tmp))
+            first = WindowFactory(report=clean_report(matrix_for()))
+            written = fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=first,
+                occupancy_reader=lambda session: 0.4, sleep=first.sleep,
+                clock=lambda: 1_760_000_000.0)
+            self.assertFalse(written.replayed)
+            historical = self._install_signed_v1(
+                store, seed, store.path_for(DIGEST).read_bytes())
+
+            parsed = fin.Receipt.from_bytes(historical)
+            self.assertEqual(parsed.rubric_version, "maestro-rubric.v1")
+            self.assertIsNone(parsed.reject_at)
+            self.assertEqual(parsed.verdict, fin.Verdict.PASS)
+            self.assertEqual(store.load(DIGEST), parsed)
+
+            replay = WindowFactory(report=clean_report(matrix_for()))
+            outcome = fin.finalize(
+                plan_digest=DIGEST, objects=OBJECTS,
+                rubric=fin.DEFAULT_RUBRIC, store=store,
+                validate=lambda: (), window_factory=replay,
+                occupancy_reader=lambda session: 0.4, sleep=replay.sleep,
+                clock=lambda: 1_760_000_000.0)
+            self.assertTrue(outcome.replayed)
+            self.assertEqual(replay.launches, 0)
+            self.assertEqual(outcome.receipt.rubric_version,
+                             "maestro-rubric.v1")
+            self.assertIsNone(outcome.receipt.reject_at)
+
+
+
 if __name__ == "__main__":
     unittest.main()
