@@ -8,6 +8,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `maestro._validate_review_clocks`: refuses a review window the remaining live bound cannot hold.
+  `reviewer.turn_timeout_s` must be under `reviewer.finalization_timeout_s`, or one silent turn
+  consumes the whole review window; `finalization_timeout_s` and `node_timeout_s +
+  finalization_timeout_s` must both sit under `execution.backstop_t_s`, or the run-level backstop
+  fires inside a healthy review or a healthy sequential node-and-review path. It deliberately does
+  not compare `execution.turn_timeout_s` to the review window: after §19 M15 the builder turn clock
+  is disarmed once an attempt holds an ACCEPTED result, so the old inequality would have refused
+  the shipping template for a closed bug. Carried with `tests/test_review_clock_siblings.py`.
+- `maestro._refuse_base_commit_divergence` plus `worktree.resolve_commit`: the single-repo twin of
+  `workspace_runtime.prepare_candidate`'s SHA check. At run start — not on resume, where merges are
+  supposed to move the head — the integration branch must still resolve to the same commit object
+  as the plan's recorded `base_commit`, and an unresolvable recorded base is a refusal rather than
+  a fall-through. The single-repo path previously created attempt worktrees against whatever the
+  integration branch pointed at and never compared the two (#32). Identity is the resolved commit
+  object, so an abbreviated SHA or a tag that names the same commit is admitted. Carried with
+  `tests/test_base_commit_enforcement.py`.
+
 - A one-command launcher for the visualizer, `bin/maestro-viz`, reachable from any directory as
   `just -g viz`. The only invocation that started a working visualizer was `bun run dev:all` from
   the app's own directory; `bun run dev` — the obvious thing to type — is `vite` alone, which
@@ -109,6 +126,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   environmental budget spent. See §19 M8 and §17 item 121.
 
 ### Fixed
+
+- `docs/plan-authoring.md`: removed the "Not built yet" blockquote over `maestro plan gate`,
+  `review`, and `ship`. Those verbs shipped in commit 6707e50 (PR #8) and are registered on the
+  `plan` subparser; the binding runbook was still directing plan authors to hand-run the `planctl`
+  calls each verb wraps. The earlier release note that recorded the same claim while it was true
+  is left as written.
 
 - Signed finalization receipts written before grading existed parse, verify and replay again.
   `rubric_version` names the rubric, not the receipt schema, and the grading fields
