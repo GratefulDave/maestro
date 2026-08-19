@@ -1218,7 +1218,16 @@ class Scheduler:
         # reads as content the attempt added. Anything that measures this
         # attempt after the fact — `attempt salvage` today — reads this row,
         # and refuses when it is absent rather than reconstructing it.
-        store.record_baseline(self.run_id, node.node_id, attempt_no, baseline)
+        #
+        # `ignored_at_base` travels with it for the same reason and is not the
+        # same fact: the baseline's universe is `git ls-files --cached --others
+        # --exclude-standard`, and this map is exactly what that command
+        # excludes, so no amount of the baseline reconstructs it. Without it
+        # `existing_ignored_outputs` has no before-side after the attempt dies,
+        # and salvage could commit a node whose declared output is gitignored
+        # while the receipt asserts a digest over what was committed (#67).
+        store.record_baseline(self.run_id, node.node_id, attempt_no, baseline,
+                              ignored_at_base=attempt.ignored_at_base)
         self._require_running(record)
 
         def on_launch(pid: Optional[int] = None) -> None:
