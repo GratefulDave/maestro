@@ -191,9 +191,14 @@ class BlockReason(str, Enum):
     MERGE_CONFLICT = "MERGE_CONFLICT"
     QUIESCENCE_UNPROVEN = "QUIESCENCE_UNPROVEN"
     OUTPUT_IDENTITY_INVALID = "OUTPUT_IDENTITY_INVALID"
+    #: A declared output exists on disk but git will not commit it — gitignored,
+    #: excluded, or otherwise outside inventory's universe. Re-running the
+    #: agent cannot make git carry the path; the declaration or the ignore
+    #: rule has to change.
+    DECLARED_OUTPUT_UNCOMMITTABLE = "DECLARED_OUTPUT_UNCOMMITTABLE"
 
 
-#: The three failures that fit no retry class, because re-running a
+#: The failures that fit no retry class, because re-running a
 #: deterministic thing against an unchanged base cannot produce a different
 #: answer (§7.5). Without a dedicated reason each of these falls to the
 #: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
@@ -201,7 +206,7 @@ class BlockReason(str, Enum):
 #: Named as a set rather than behind a predicate. An `is_retryable(reason)`
 #: helper stood here and had no production caller for as long as it existed:
 #: production decides retryability from the `RetryClass` at classification
-#: time — `classify` returns a `block_reason` for exactly these three and a
+#: time — `classify` returns a `block_reason` for exactly these and a
 #: `retry_class` for everything else, so by the time a `BlockReason` exists
 #: the decision is already made and asking it again is a second representation
 #: of one fact (RC1). The tuple stays because §7.5's membership rule is a
@@ -210,6 +215,7 @@ NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.GATE_NOT_FALSIFIABLE,
     BlockReason.CODE_NODE_NO_EFFECT,
     BlockReason.PERMISSION_SCOPE_VIOLATION,
+    BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE,
 )
 
 
@@ -225,6 +231,7 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     BlockReason.GATE_NOT_FALSIFIABLE: (Escape.SKIP, Escape.ABANDON),
     BlockReason.CODE_NODE_NO_EFFECT: (Escape.SKIP, Escape.ABANDON),
     BlockReason.PERMISSION_SCOPE_VIOLATION: (Escape.SKIP, Escape.ABANDON),
+    BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE: (Escape.SKIP, Escape.ABANDON),
     # K is a ceiling on a spend, not a verdict, so the forced grant is the
     # designed exit — one attempt per invocation, never a raised cap (§7.5).
     BlockReason.SEMANTIC_BUDGET_EXHAUSTED: (

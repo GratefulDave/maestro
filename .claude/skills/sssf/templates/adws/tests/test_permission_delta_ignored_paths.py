@@ -25,17 +25,26 @@ Run with:
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
+import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
+import maestro  # noqa: E402
+from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import verification as vf  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
+from test_scheduler import SchedulerFixture  # noqa: E402
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -267,6 +276,250 @@ class CommittedOutputAndCleanliness(IgnoredPathsTestCase):
         verdict = wt.compare_to_expected(attempt.path, expected, "convict")
         self.assertFalse(verdict.clean)
         self.assertEqual([d.path for d in verdict.divergences], ["stray.txt"])
+
+
+class DeclaredIgnoredOutput(IgnoredPathsTestCase):
+    """#26 — a declared output that git will not commit is a failure.
+
+    The narrowing above is what makes this shape possible: a gitignored path is
+    outside the bracket's universe, so a node that declares one writes the file,
+    passes the permission check with nothing measured, and commits nothing.
+    """
+
+    def test_the_undetected_shape_is_a_silent_empty_commit(self):
+        """The before state, stated as an assertion rather than a claim.
+
+        The node did its work, the file is on disk, the permission check has
+        nothing to convict on — and the measured delta, which *is* the commit
+        set, is empty. Without the detector below that attempt would settle
+        VERIFIED over an empty commit.
+        """
+        attempt = self._attempt()
+        baseline = wt.take_baseline(attempt)
+        _write(attempt.path / "build.log", "the node's entire output\n")
+
+        after = wt.inventory(attempt.path)
+        measured = wt.delta(baseline, after)
+        self.assertTrue((attempt.path / "build.log").is_file())
+        self.assertTrue(measured.is_empty, measured.touched)
+        self.assertTrue(
+            wt.permission_check(attempt, measured, ("build.log",)).passes)
+
+        # The detector is the only thing between that state and a signed
+        # empty success.
+        self.assertEqual(
+            wt.existing_ignored_outputs(attempt.path, ("build.log",), after,
+                                        attempt.ignored_at_base),
+            ("build.log",))
+
+    def test_check_ignore_names_a_concrete_ignored_output(self):
+        ignored = wt.outputs_ignored_in_repo(self.repo, ("build.log", "src/app.py"))
+        self.assertEqual(ignored, ("build.log",))
+
+    def test_check_ignore_is_not_asked_about_a_glob(self):
+        """`git check-ignore` names paths, not patterns; the glob case belongs
+        to `existing_ignored_outputs` at attempt settle."""
+        self.assertEqual(wt.outputs_ignored_in_repo(self.repo, ("*.log",)), ())
+
+    def test_existing_ignored_output_is_detected_after_inventory(self):
+        attempt = self._attempt()
+        wt.take_baseline(attempt)
+        _write(attempt.path / "build.log", "secret log\n")
+        _write(attempt.path / "src" / "app.py", "VALUE = 2\n")
+        after = wt.inventory(attempt.path)
+        self.assertNotIn("build.log", after)
+        ignored = wt.existing_ignored_outputs(
+            attempt.path, ("build.log", "src/app.py"), after,
+            attempt.ignored_at_base)
+        self.assertEqual(ignored, ("build.log",))
+
+    def test_provisioned_ignored_files_are_not_attributed_to_the_node(self):
+        attempt = self._attempt()
+        self._install_dependency_tree(attempt.path)
+        wt.take_baseline(attempt)
+        _write(attempt.path / "src" / "app.py", "VALUE = 2\n")
+        after = wt.inventory(attempt.path)
+        ignored = wt.existing_ignored_outputs(
+            attempt.path, ("*.py",), after, attempt.ignored_at_base)
+        self.assertEqual(ignored, ())
+
+    def test_a_new_ignored_write_matching_a_broad_glob_still_convicts(self):
+        attempt = self._attempt()
+        self._install_dependency_tree(attempt.path)
+        wt.take_baseline(attempt)
+        _write(attempt.path / ".venv" / "lib" / "pkg0" / "new_write.py",
+               "# written by the node\n")
+        after = wt.inventory(attempt.path)
+        ignored = wt.existing_ignored_outputs(
+            attempt.path, ("*.py",), after, attempt.ignored_at_base)
+        self.assertEqual(ignored, (".venv/lib/pkg0/new_write.py",))
+
+    def test_modifying_a_provisioned_ignored_declared_file_convicts(self):
+        attempt = self._attempt()
+        self._install_dependency_tree(attempt.path)
+        wt.take_baseline(attempt)
+        _write(attempt.path / ".venv" / "lib" / "pkg0" / "__init__.py",
+               "# mutated by the node\n")
+        after = wt.inventory(attempt.path)
+        ignored = wt.existing_ignored_outputs(
+            attempt.path, ("*.py",), after, attempt.ignored_at_base)
+        self.assertEqual(ignored, (".venv/lib/pkg0/__init__.py",))
+
+    def test_a_missing_before_side_is_refused_rather_than_read_as_empty(self):
+        """`reopen_attempt_worktree` hands back `ignored_at_base=None` for the
+        same reason it hands back `baseline=None`. Reading that as an empty map
+        would attribute a whole provisioned dependency tree to the node — the
+        exact false positive this feature must not create."""
+        attempt = self._attempt()
+        self._install_dependency_tree(attempt.path)
+        wt.take_baseline(attempt)
+        after = wt.inventory(attempt.path)
+        with self.assertRaises(wt.WorktreeError):
+            wt.existing_ignored_outputs(attempt.path, ("*.py",), after, None)
+
+
+class IgnoredDeclaredOutputThroughScheduler(SchedulerFixture):
+    """The same shape end to end: a node settles BLOCKED, not silently VERIFIED."""
+
+    def test_an_ignored_declared_output_blocks(self):
+        (self.integration / ".gitignore").write_text("secret.log\n")
+        _git(self.integration, "add", ".gitignore")
+        _git(self.integration, "commit", "-qm", "ignore secret.log")
+        self.written["build"] = {"secret.log": "cannot commit\n"}
+        report = self.schedule(
+            [self.agent("build", outputs=("secret.log",))]
+        ).run()
+        node = self.store.get_node("run1", "build")
+        self.assertIs(node.block_reason,
+                      st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+    def test_provisioned_venv_does_not_block_a_committable_py_write(self):
+        """The false-positive guard: a provisioned `.venv` is ignored *and*
+        legitimately present, and must not convict a node that declared `*.py`
+        and wrote one perfectly committable file."""
+        (self.integration / ".gitignore").write_text(".venv/\n")
+        _git(self.integration, "add", ".gitignore")
+        _git(self.integration, "commit", "-qm", "ignore .venv")
+
+        def provision(path):
+            _write(path / ".venv" / "lib" / "pkg" / "__init__.py", "# dep\n")
+
+        self.written["build"] = {"build.py": "ok\n"}
+        report = self.schedule(
+            [self.agent("build", outputs=("*.py",))],
+            deps=self.deps(provision=provision)).run()
+        self.assertIsNone(self.store.get_node("run1", "build").block_reason)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_modifying_a_provisioned_ignored_declared_file_blocks(self):
+        (self.integration / ".gitignore").write_text(".venv/\n")
+        _git(self.integration, "add", ".gitignore")
+        _git(self.integration, "commit", "-qm", "ignore .venv")
+
+        def provision(path):
+            _write(path / ".venv" / "lib" / "pkg" / "__init__.py", "# dep\n")
+
+        self.written["build"] = {
+            ".venv/lib/pkg/__init__.py": "# mutated\n",
+        }
+        report = self.schedule(
+            [self.agent("build", outputs=("*.py",))],
+            deps=self.deps(provision=provision)).run()
+        self.assertIs(self.store.get_node("run1", "build").block_reason,
+                      st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+
+
+class RunStartRefusal(IgnoredPathsTestCase):
+    """Cheaper than one attempt: `git check-ignore` answers from the plan alone.
+
+    Placed beside `_refuse_base_commit_divergence` and, like it, guarded by
+    `if resuming: ... else:` — both are preflights over the plan as authored,
+    and a run whose plan cannot be edited must not be stranded on resume by a
+    condition an operator introduced mid-run. The resumed case still reaches
+    `existing_ignored_outputs` at attempt settle.
+    """
+
+    @staticmethod
+    def _plan(outputs, base):
+        return SimpleNamespace(
+            base_commit=base,
+            merge_policy=SimpleNamespace(integration_branch="main"),
+            nodes=[SimpleNamespace(node_id="build", outputs=tuple(outputs))],
+        )
+
+    def _args(self):
+        return argparse.Namespace(repo=str(self.repo))
+
+    def _head(self):
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def test_a_gitignored_declared_output_refuses(self):
+        refused = maestro._refuse_uncommittable_outputs(
+            self._args(), self._plan(("build.log",), self._head()))
+        self.assertEqual(refused, 3)
+
+    def test_a_committable_declared_output_is_admitted(self):
+        self.assertIsNone(maestro._refuse_uncommittable_outputs(
+            self._args(), self._plan(("src/app.py",), self._head())))
+
+    def test_a_glob_is_left_to_the_attempt_settle_detector(self):
+        self.assertIsNone(maestro._refuse_uncommittable_outputs(
+            self._args(), self._plan(("*.log",), self._head())))
+
+    def test_the_refusal_reaches_the_operator_as_a_typed_outcome(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            maestro._refuse_uncommittable_outputs(
+                self._args(), self._plan(("build.log",), self._head()))
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["outcome"], "DECLARED_OUTPUT_UNCOMMITTABLE")
+        self.assertIn("build.log", payload["detail"])
+
+    def test_the_run_refuses_before_any_attempt_is_launched(self):
+        """The whole point of paying at run start: no worktree, no pane, no
+        attempt row. A scheduler constructed here fails the test."""
+
+        class NoSchedulerAllowed:
+            def __init__(self, *_a, **_kw):
+                raise AssertionError(
+                    "a run refused for DECLARED_OUTPUT_UNCOMMITTABLE built a "
+                    "scheduler, so an attempt could still launch")
+
+        integration = self.root / "integration"
+        args = argparse.Namespace(
+            plan_file=str(self.root / "plan.json"),
+            db=str(self.root / "state.db"), run_id="run-1",
+            integration_path=str(integration), repo=str(self.repo),
+            data_dir=str(self.root / "data"),
+            receipt_dir=str(self.root / "receipts"),
+            worktrees_root=str(self.root / "worktrees"),
+            scratch_root=str(self.root / "scratch"), digest="a" * 64)
+        plan = SimpleNamespace(
+            base_commit=self._head(),
+            agent_nodes=(),
+            merge_policy=SimpleNamespace(integration_branch="main"),
+            nodes=[SimpleNamespace(node_id="build", outputs=("build.log",))],
+            to_plan_nodes=lambda: ())
+
+        output = io.StringIO()
+        with mock.patch.object(maestro, "_run_configuration", return_value=mock.Mock()), \
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan), \
+                mock.patch.object(maestro, "_validate_run_paths"), \
+                mock.patch.object(maestro, "_resolve_run_runners", return_value={}), \
+                mock.patch.object(maestro.lc, "LifecycleStore"), \
+                mock.patch.object(maestro.scheduler, "Scheduler", NoSchedulerAllowed), \
+                contextlib.redirect_stdout(output):
+            code = maestro._execute_run(args, resuming=False)
+
+        self.assertEqual(code, 3)
+        self.assertEqual(
+            json.loads(output.getvalue())["outcome"],
+            "DECLARED_OUTPUT_UNCOMMITTABLE")
+        self.assertFalse(integration.exists(), "an integration checkout was created")
+        self.assertFalse((self.root / "worktrees").exists(),
+                         "an attempt worktree root was created")
 
 
 if __name__ == "__main__":

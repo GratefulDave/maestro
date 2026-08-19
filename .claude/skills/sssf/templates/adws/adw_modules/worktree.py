@@ -54,6 +54,7 @@ The two corrections below are executed findings from the composition probe of
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import re
 import subprocess
@@ -271,6 +272,13 @@ class AttemptWorktree:
     attempt_no: int
     tracked_at_base: frozenset
     baseline: Optional[Inventory] = None
+    #: Content digests of the on-disk paths `inventory()` cannot see at the
+    #: moment the bracket opened — the provisioned gitignored tree. It is the
+    #: before-side `existing_ignored_outputs` needs to tell a node's ignored
+    #: write apart from a dependency install's, and like `baseline` it is
+    #: recorded by `take_baseline` and left `None` by `reopen_attempt_worktree`,
+    #: because a commit cannot rebuild content no commit holds.
+    ignored_at_base: Optional[Dict[str, str]] = None
 
     @property
     def ref(self) -> str:
@@ -546,6 +554,10 @@ def take_baseline(attempt: AttemptWorktree) -> Inventory:
     they were is what convicted diligent agents in the earlier design.
     """
     attempt.baseline = inventory(attempt.path)
+    attempt.ignored_at_base = {
+        rel: _disk_digest(attempt.path, rel)
+        for rel in _files_absent_from_inventory(attempt.path, attempt.baseline)
+    }
     return attempt.baseline
 
 
@@ -686,6 +698,107 @@ def permission_check(attempt: AttemptWorktree, measured: InventoryDelta,
     return PermissionVerdict(passes=not c1 and not c2,
                              conjunct1_violations=c1,
                              conjunct2_violations=tuple(c2))
+
+
+# ── a declared output git will not commit ───────────────────────────────────
+
+def _disk_digest(worktree: Path, rel: str) -> str:
+    """Content identity of one on-disk path, or 'missing' if it cannot be read."""
+    path = Path(worktree) / rel
+    try:
+        if path.is_symlink():
+            return "symlink:" + os.readlink(path)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
+
+
+def _files_absent_from_inventory(worktree: Path, present: Inventory) -> Tuple[str, ...]:
+    """Regular files on disk that `inventory()` cannot see.
+
+    Inventory's universe is `git ls-files --cached --others --exclude-standard`,
+    so gitignored writes are invisible to the delta. This walk is how the
+    harness names those files without reimplementing exclude rules.
+    """
+    root = Path(worktree)
+    found: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == ".git" or rel_dir.startswith(".git" + os.sep):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        for name in filenames:
+            rel = name if rel_dir == "." else f"{rel_dir}/{name}"
+            rel = rel.replace(os.sep, "/")
+            if rel not in present:
+                found.append(rel)
+    return tuple(found)
+
+
+def existing_ignored_outputs(worktree: Path, declared: Sequence[str],
+                             after: Inventory,
+                             before: Optional[Mapping[str, str]]
+                             ) -> Tuple[str, ...]:
+    """Declared outputs the attempt created or changed that git will not commit.
+
+    Inventory's universe is `git ls-files --cached --others --exclude-standard`,
+    so a gitignored write is invisible to the delta, the permission check, and
+    the commit. A node that declared such a path then produces an empty commit
+    while the file sits on disk — a silent success. This is the detector for
+    that shape: the path matches a declared glob, is absent from the
+    after-inventory, and either was not on disk at `take_baseline` or its
+    bytes changed since then. Unchanged provision files stay silent, which is
+    what keeps a provisioned `.venv` from convicting a node that declared
+    `*.py` and wrote one perfectly committable file.
+
+    `before` is required and may not be `None`, for the same reason
+    `permission_check` refuses a `None` baseline: `reopen_attempt_worktree`
+    hands back a handle whose before-side was never recorded, and reading a
+    missing before-side as an empty one would attribute the whole provisioned
+    ignored tree to the node. A caller without the recorded map has no
+    before-side, and must say so rather than be given a wrong one.
+    """
+    if before is None:
+        raise WorktreeError(
+            "existing_ignored_outputs without the ignored-at-base map — the "
+            "bracket never opened, and an empty before-side reads a provisioned "
+            "dependency tree as the node's own writes")
+    root = Path(worktree)
+    prior = dict(before)
+    after_ignored = {
+        rel: _disk_digest(root, rel)
+        for rel in _files_absent_from_inventory(root, after)
+    }
+    ignored: List[str] = []
+    for rel, digest in after_ignored.items():
+        if not _matches_any(rel, declared):
+            continue
+        if rel not in prior or prior[rel] != digest:
+            ignored.append(rel)
+    return tuple(sorted(ignored))
+
+
+def outputs_ignored_in_repo(repo: Path, declared: Sequence[str]) -> Tuple[str, ...]:
+    """Concrete declared outputs `git check-ignore` would exclude at `repo`.
+
+    Globs are skipped: check-ignore names paths, not patterns. A glob that
+    happens to match ignored files is caught at attempt settle by
+    `existing_ignored_outputs`.
+    """
+    concrete = [path for path in declared if not _is_glob(path)]
+    if not concrete:
+        return ()
+    result = _git(repo, "check-ignore", "--stdin", check=False,
+                  stdin="\n".join(concrete) + "\n")
+    if result.returncode not in (0, 1):
+        raise WorktreeError(
+            f"git check-ignore failed in {repo}: {(result.stderr or result.stdout).strip()}")
+    return tuple(line.replace(os.sep, "/") for line in result.stdout.splitlines() if line)
+
+
+def _is_glob(pattern: str) -> bool:
+    return any(char in pattern for char in "*?[]")
 
 
 # ── §8.4 the scheduler-side commit ──────────────────────────────────────────
