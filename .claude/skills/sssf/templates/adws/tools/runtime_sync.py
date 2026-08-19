@@ -79,9 +79,13 @@ TEMPLATE = "template"
 DEPLOYMENT = "deployment"
 
 #: Every known template checkout, as (repository directory name, runtime path
-#: inside it). Kept identical to `tests/test_template_parity.py`'s table, which
-#: imports this one so the two cannot drift apart — which would be this module's
-#: own defect class turned on itself.
+#: inside it). This is the single owner of that table.
+#:
+#: `tests/checkout_layout.py` re-exports it as `TEMPLATE_LOCATIONS` and adds what
+#: only a test needs — resolving the peer checkout from git so a linked worktree
+#: finds its sibling — but the table itself lives here, because this module is
+#: production, ships to every deployment, and must not import out of `tests/`.
+#: Two copies of it would be this module's own defect class turned on itself.
 TEMPLATE_LAYOUTS: Tuple[Tuple[str, pathlib.PurePosixPath], ...] = (
     ("maestro", pathlib.PurePosixPath(".claude/skills/sssf/templates/adws")),
     ("the-library", pathlib.PurePosixPath("skills/sssf/templates/adws")),

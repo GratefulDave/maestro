@@ -73,6 +73,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   object, so an abbreviated SHA or a tag that names the same commit is admitted. Carried with
   `tests/test_base_commit_enforcement.py`.
 
+- `watchdog.process_start_epoch`, the wall-clock start of a pid, with a Darwin implementation
+  reading `proc_pidinfo`'s `PROC_PIDTBSDINFO` at microsecond resolution. A pid is not proof of
+  process identity: `os.kill(pid, 0)` answers only that *something* holds the pid, and the
+  whole-second clock `ps lstart` exposes cannot separate a process from a reuse of its pid within
+  the same second (#37) - so anything that signals or convicts on a recorded pid alone can reach a
+  different process than the one it recorded. Linux answers from `/proc/<pid>/stat` at clock-tick
+  resolution. On any other platform it refuses, returning `None`, which a caller must read as
+  "identity unproven" rather than as "the same process"; returning a coarse or fabricated start
+  there would let a reused pid pass for the original, which is the failure the probe exists to
+  prevent. Carried with `SignalPidIdentity` in `tests/test_run_liveness.py`. The probe has no
+  production caller yet - the scheduler-pid identity check that consumes it has not landed - so it
+  is recorded as a named `DEFERRED` row in `tests/test_no_dead_seams.py` rather than left as a
+  silent dead seam; landing that caller means deleting the row.
+
 - A one-command launcher for the visualizer, `bin/maestro-viz`, reachable from any directory as
   `just -g viz`. The only invocation that started a working visualizer was `bun run dev:all` from
   the app's own directory; `bun run dev` — the obvious thing to type — is `vite` alone, which
@@ -194,6 +208,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   diagnosed twice in this suite and fixed at one instance each time, in that same stuck-cancellation
   case and in `test_workspace_runtime.py`'s global-gate cancellation case; the siblings left behind
   are what the issue reported.
+
+- Cross-checkout tests resolve their peer repository from git rather than from their own file
+  path, so they run inside a linked worktree instead of skipping. `tests/test_template_parity.py`,
+  `tests/test_schema_vocabulary_parity.py` and `tests/test_plan_admission.py` each walked up from
+  `__file__` to the enclosing repository root and looked for the peer checkout beside it. In a
+  linked worktree that root is `.claude/worktrees/<lane>`, so the peer was looked for at
+  `.claude/worktrees/the-library`, which exists on no machine, and all twelve tests skipped.
+  Every lane authors its template changes in a worktree, which means the parity invariant — the
+  only mechanical thing holding the two template copies together — had never once examined lane
+  work, and reported nothing while not examining it. The new `tests/checkout_layout.py` asks
+  `git rev-parse --git-common-dir` for the main working tree and looks for peers beside that,
+  falling back to the old filesystem derivation only when git cannot answer. `test_plan_admission`
+  additionally spelled maestro's layout depth into its arithmetic, so it also skipped when the
+  runtime under test was the-library's own; it now resolves the-library's checkout by name from
+  either side. Skips are no longer silent: each carries the path searched and how that path was
+  chosen, and is raised as a `PeerCheckoutMissing` warning so it appears in a default `-q` run
+  rather than as an unexplained `s`. The one legitimate skip is unchanged — the peer repository
+  not being checked out at all — and a peer that is checked out with its runtime or schema missing
+  still fails.
 
 - `docs/plan-authoring.md`: removed the "Not built yet" blockquote over `maestro plan gate`,
   `review`, and `ship`. Those verbs shipped in commit 6707e50 (PR #8) and are registered on the

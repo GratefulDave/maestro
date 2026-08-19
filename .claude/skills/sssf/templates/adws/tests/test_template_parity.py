@@ -12,11 +12,16 @@ checkouts file by file and report exactly which files differ and in which
 direction, so the failure names the repair rather than merely announcing that
 the copies disagree.
 
-The comparison itself is not implemented here. It lives in
-`tools/runtime_sync.py`, which is also what the mirror uses to move bytes, so
-the definition of "level" a repair is measured against is the same definition
-this test fails on. Two implementations of that would be this module's own
-defect class — a second, uninstrumented copy path — turned on itself.
+Two modules own the parts of that, and neither owns the other's part:
+
+* `checkout_layout` answers *where the other checkout is*, from git rather than
+  from this file's path.
+* `tools/runtime_sync` answers *whether two given trees are level*, and is also
+  what moves the bytes when they are not. The comparison is not reimplemented
+  here, so the definition of "level" this test fails on is the definition its
+  `mirror` verb repairs. Two implementations of that would be the very defect
+  class the mirror exists to close — a second, uninstrumented copy path — turned
+  on this test.
 
 Scope and limits, stated plainly:
 
@@ -24,11 +29,19 @@ Scope and limits, stated plainly:
   the factory holds a deployed instance which is expected to carry its own
   configuration and may legitimately run ahead of the template, so it is not a
   parity peer and this module skips itself there.
-* A peer is located by repository directory name next to the current checkout.
-  Renaming or relocating a checkout makes the peer undiscoverable, and the test
-  then skips with the path it looked for. It does not silently pass: when the
-  peer repository is present but its runtime directory is missing, that is
+* A peer is located by repository directory name beside the *main* working
+  tree of this repository, which `checkout_layout` resolves from git rather
+  than from this file's path. Every lane authors its changes in a linked
+  worktree, where the enclosing directory is `.claude/worktrees/<lane>` and no
+  peer has ever been found beside it; resolving the peer from the filesystem
+  alone meant this module skipped through every lane it was supposed to guard.
+  Renaming or relocating a checkout still makes the peer undiscoverable, and
+  the test then skips, naming the path it looked for and how it chose it, and
+  warning so the skip appears in a default run. It does not silently pass: when
+  the peer repository is present but its runtime directory is missing, that is
   treated as the deletion this module exists to catch, and it fails.
+* The files compared on this side are the ones in the working tree the test
+  runs from, so a lane's uncommitted template edits are the bytes checked.
 * Bytes agreeing on disk is not bytes agreeing in git. A peer whose runtime is
   uncommitted passes here and is still one `git checkout` from losing it.
 """
@@ -39,71 +52,47 @@ import pathlib
 import sys
 import unittest
 
-ADWS = pathlib.Path(__file__).resolve().parents[1]
-TOOLS = ADWS / "tools"
-for _path in (str(ADWS), str(TOOLS)):
+ADWS = pathlib.Path(__file__).resolve().parent.parent
+for _path in (str(ADWS / "tests"), str(ADWS / "tools")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+import checkout_layout                                       # noqa: E402
 import runtime_sync                                          # noqa: E402
 
-# Every known template checkout: the repository directory name, and the path of
-# the ADW runtime inside it. Owned by `runtime_sync` so the mirror and this
-# check cannot disagree about where a template lives.
-TEMPLATE_LOCATIONS = runtime_sync.TEMPLATE_LAYOUTS
-
 _REPAIR = (
-    "Reconcile the checkouts before landing anything else: run "
-    "`python3 tools/runtime_sync.py check <source> <destination>` to see the "
-    "drift, then `... mirror <source> <destination> --apply` to copy the newer "
-    "runtime across with a sha256 proof per file, and re-run this test."
+    "Reconcile the checkouts before landing anything else: "
+    "`python3 tools/runtime_sync.py check <source> <destination>` shows the "
+    "drift, and `... mirror <source> <destination> --apply` copies the newer "
+    "runtime across with a sha256 assertion per file, refusing any destination "
+    "file that looks ahead of the source. Then re-run this test."
 )
 
 
-def _sorted_locations():
-    return sorted(TEMPLATE_LOCATIONS, key=lambda item: len(item[1].parts), reverse=True)
-
-
-def _identify_self():
-    """Return (repo_name, repo_root, adws_root) for the checkout holding this file.
-
-    Returns None when this file is not sitting in a known template layout, which
-    is the case in a repository that has installed the factory.
-    """
-    adws_root = ADWS
-    for repo_name, layout in _sorted_locations():
-        parts = layout.parts
-        if adws_root.parts[-len(parts) :] == parts:
-            repo_root = adws_root.parents[len(parts) - 1]
-            return repo_name, repo_root, adws_root
-    return None
-
-
-def _peer_locations(self_repo_name, self_repo_root):
+def _peer_locations(checkout):
     """Return (repo_name, repo_root, adws_root) for every other known checkout."""
-    siblings = self_repo_root.parent
     peers = []
-    for repo_name, layout in _sorted_locations():
-        if repo_name == self_repo_name:
+    for repo_name, layout in checkout_layout.sorted_template_locations():
+        if repo_name == checkout.repo_name:
             continue
-        peer_repo_root = siblings / repo_name
+        peer_repo_root = checkout_layout.checkout_root(checkout, repo_name)
         peers.append((repo_name, peer_repo_root, peer_repo_root / layout))
     return peers
 
 
 def _resolve_pair():
     """Return (self_name, self_root, peer_name, peer_root) or raise SkipTest."""
-    identity = _identify_self()
-    if identity is None:
-        raise unittest.SkipTest(
+    checkout = checkout_layout.identify_template_checkout(ADWS)
+    if checkout is None:
+        checkout_layout.skip_visibly(
             "this ADW runtime is a deployed instance, not a template checkout, "
             "so it has no parity peer; the check runs in the maestro and "
             "the-library repositories"
         )
-    self_name, self_repo_root, self_adws = identity
+    self_name, self_adws = checkout.repo_name, checkout.adws_root
 
     reasons = []
-    for peer_name, peer_repo_root, peer_adws in _peer_locations(self_name, self_repo_root):
+    for peer_name, peer_repo_root, peer_adws in _peer_locations(checkout):
         if peer_adws.is_dir():
             return self_name, self_adws, peer_name, peer_adws
         if peer_repo_root.is_dir():
@@ -112,19 +101,20 @@ def _resolve_pair():
             # must fail rather than skip.
             raise AssertionError(
                 "{peer} is checked out at {repo} but its ADW runtime directory "
-                "{adws} is missing entirely. {repair}".format(
+                "{adws} is missing entirely. {repair} ({provenance})".format(
                     peer=peer_name,
                     repo=peer_repo_root,
                     adws=peer_adws,
                     repair=_REPAIR,
+                    provenance=checkout.provenance,
                 )
             )
         reasons.append("{name} is not checked out at {path}".format(name=peer_name, path=peer_repo_root))
 
-    raise unittest.SkipTest(
+    checkout_layout.skip_visibly(
         "no peer template checkout is present on this machine ({reasons}); "
-        "parity cannot be checked from a single checkout".format(
-            reasons="; ".join(reasons)
+        "parity cannot be checked from a single checkout. {provenance}".format(
+            reasons="; ".join(reasons), provenance=checkout.provenance
         )
     )
 
@@ -135,6 +125,16 @@ class TemplateParityTests(unittest.TestCase):
         self.report = runtime_sync.compare(
             runtime_sync.describe_copy(self.self_root, self.self_name),
             runtime_sync.describe_copy(self.peer_root, self.peer_name),
+        )
+        # Both endpoints are template checkouts, so nothing is held back --
+        # including `maestro.config.yaml`, which is deployment-owned only when a
+        # deployment is one of the two. If that ever stops being true here the
+        # exclusion has widened past its reason, and this check is where it
+        # would otherwise go unnoticed.
+        self.assertEqual(
+            (), self.report.excluded,
+            "two template checkouts compare every file; nothing is deployment-owned "
+            "between them",
         )
 
     def test_both_template_checkouts_hold_the_same_runtime_files(self):

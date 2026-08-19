@@ -169,6 +169,16 @@ ALLOWED: Dict[str, str] = {
     "publication.prepare": "DEFERRED: WorkspacePublisher.prepare, publication "
                            "path, no production caller",
 
+    # The pid-identity probe (#37) landed ahead of the caller that needs it.
+    "watchdog.process_start_epoch": "DEFERRED: #37's pid-identity probe. A pid "
+                                    "alone cannot distinguish the process that "
+                                    "claimed a run from a later occupant of the "
+                                    "same pid, and this answers that at "
+                                    "microsecond resolution. Its production "
+                                    "caller is the scheduler-pid identity check "
+                                    "in lifecycle, which has not landed; delete "
+                                    "this line when it does.",
+
     # Config keys whose only writer is a test, so the dataclass default is the
     # production value in every run. Not broken branches — constants wearing a
     # config key's clothes — but recorded so that "configurable" is not
