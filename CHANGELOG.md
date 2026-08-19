@@ -8,6 +8,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `node.writes_are_sufficient`, a BLOCKING plan-review rubric check asked of every node, and the
+  rubric version `maestro-rubric.v3` that carries it. `node.reads_are_sufficient` already asked
+  whether a node's agent can do the work from what it is allowed to *read*; nothing asked the same
+  question of what it is allowed to *write*. A node's `outputs` are its entire write permission —
+  single-producer ownership gives each path to exactly one node and the attempt permission check
+  convicts any diff touching an undeclared path — so a node whose instruction can only be
+  discharged by editing another node's output is unsatisfiable from its first attempt: the reviewer
+  rejects every diff that does not wire production and the permission check would reject every diff
+  that does. In run `run-2a44d226e75a4be391a14f02b78a6d25` that cost node
+  `lane-p4-enrichment-ordering` eight attempts, six reviews, six builder sessions, a launcher
+  failure and a turn timeout before `BLOCKED`/`REVIEW_BUDGET_EXHAUSTED`, on a property of the
+  authored bytes that one plan-review cell now settles. The question is phrased over the
+  instruction, not over the shape of `outputs`: a node that creates a module nothing at base yet
+  imports is the ordinary case and passes whenever a downstream node owns the wiring. Carried with
+  `tests/test_node_write_scope.py`, whose control half asserts the legitimate new-module node still
+  finalizes PASS.
+
+  No mechanical refusal accompanies it, deliberately. Both structurally decidable signals were
+  tested against the incident plan and refuted by it: "a node whose outputs contain no path
+  existing at `base_commit`" fires on ten of that plan's twelve nodes and on every legitimate
+  new-module node, and "a plan in which no node declares a pre-existing file" does not fire on the
+  incident plan at all, because two of its nodes did. `plan_validate.py` is unchanged and the
+  twelve obligations are still twelve.
+
+  The version bump adds no receipt key and requires none. `Receipt.from_bytes` still discriminates
+  the graded payload shape on the presence of `reject_at` rather than on the rubric label (§19
+  M21), so every signed `maestro-rubric.v1` and pre-grading `maestro-rubric.v2` receipt still
+  parses, still verifies against its original signature, and still replays with zero reviewer
+  launches — asserted directly rather than assumed. The new question is nonetheless mandatory from
+  v3 onward rather than optional forever (§3.6 B8): it is a matrix cell, and `verify_report`
+  refuses a report that leaves any cell unanswered.
+
 - `maestro._validate_review_clocks`: refuses a review window the remaining live bound cannot hold.
   `reviewer.turn_timeout_s` must be under `reviewer.finalization_timeout_s`, or one silent turn
   consumes the whole review window; `finalization_timeout_s` and `node_timeout_s +
