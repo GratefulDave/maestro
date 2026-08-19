@@ -27,10 +27,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ADWS = Path(__file__).resolve().parents[1]
 TOOLS = ADWS / "tools"
@@ -62,6 +64,7 @@ class RuntimeSyncFixture(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         world = Path(self._tmp.name)
+        self.world = world
         self.template = world / "maestro" / MAESTRO_LAYOUT
         self.peer = world / "the-library" / LIBRARY_LAYOUT
         self.deployment = world / "lexgenius" / DEPLOYMENT_LAYOUT
@@ -777,6 +780,456 @@ class IgnoredPathTests(RuntimeSyncFixture):
         found = rs.scan_runtime(self.template)
 
         self.assertEqual({"maestro.py"}, set(found))
+
+
+class RecordingFixture(RuntimeSyncFixture):
+    """A world whose template and deployment are real git working trees.
+
+    Real repositories rather than a patched `subprocess`, because every property
+    below is a property of what git actually did — which paths ended up in the
+    commit, what stayed dirty, whether a remote received anything — and a mock
+    of git can only confirm the arguments this module chose to pass.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Isolate from whatever git configuration this machine has: a global
+        # `commit.gpgsign`, `core.hooksPath`, or template directory would
+        # otherwise decide whether these tests pass.
+        isolated = mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+        isolated.start()
+        self.addCleanup(isolated.stop)
+        self.source_repo = self.world / "maestro"
+        self.destination_repo = self.world / "lexgenius"
+        for repo in (self.source_repo, self.destination_repo):
+            self.init_repo(repo)
+
+    def git(self, repo: Path, *args: str, check: bool = True) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True
+        )
+        if check and result.returncode != 0:
+            self.fail(
+                "git {args} failed in {repo}: {err}".format(
+                    args=" ".join(args), repo=repo, err=result.stderr
+                )
+            )
+        return result.stdout
+
+    def init_repo(self, repo: Path) -> None:
+        repo.mkdir(parents=True, exist_ok=True)
+        self.git(repo, "init", "-q", "-b", "main")
+        self.git(repo, "config", "user.name", "Runtime Sync Test")
+        self.git(repo, "config", "user.email", "runtime-sync@example.invalid")
+
+    def commit_everything(self, repo: Path, message: str) -> str:
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", message)
+        return self.git(repo, "rev-parse", "--short", "HEAD").strip()
+
+    def committed_paths(self, repo: Path) -> set:
+        listed = self.git(repo, "show", "--name-only", "--pretty=", "HEAD")
+        return {line.strip() for line in listed.splitlines() if line.strip()}
+
+    def porcelain(self, repo: Path) -> set:
+        return {
+            line.strip()
+            for line in self.git(repo, "status", "--porcelain").splitlines()
+            if line.strip()
+        }
+
+    def commits(self, repo: Path) -> list:
+        return [
+            line
+            for line in self.git(repo, "log", "--oneline", check=False).splitlines()
+            if line.strip()
+        ]
+
+    def mirror_and_record(self, **kwargs):
+        source, destination = self.copies(self.template, self.deployment)
+        return rs.mirror(source, destination, apply=True, commit=True, **kwargs)
+
+
+class RecordedMirrorTests(RecordingFixture):
+    """`mirror --apply --commit`: the copy and the record are one command.
+
+    Before this existed, bringing a deployment level was a mirror followed by a
+    hand-written `git add` and `git commit`, and the hand step is where the
+    evidence went missing: `lexgenius-pipeline` carried 184 files of runtime
+    entirely untracked, so it changed with no diff and no history and was
+    silently rewritten with stale bytes.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _write(self.template, "adw_modules/launcher.py", "one\ntwo\nthree\n")
+        _write(self.template, "maestro.py", "template\nruntime\n", mtime=2_000_000)
+        self.source_sha = self.commit_everything(self.source_repo, "template runtime")
+
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        # Outside the runtime directory: somebody else's file, in the same live
+        # checkout, which no mirror has any business touching.
+        (self.destination_repo / "README.md").write_text(
+            "deployment readme\n", encoding="utf-8"
+        )
+        self.commit_everything(self.destination_repo, "deployment baseline")
+
+    def test_a_recorded_mirror_copies_and_commits_exactly_the_paths_it_wrote(self):
+        result = self.mirror_and_record()
+
+        self.assertTrue(result.applied)
+        self.assertEqual(rs.COMMIT_RECORDED, result.commit.reason)
+        self.assertEqual(
+            ("adw_modules/launcher.py", "maestro.py"), result.copied
+        )
+        self.assertEqual(result.copied, result.commit.staged)
+        self.assertEqual(
+            "one\ntwo\nthree\n",
+            (self.deployment / "adw_modules/launcher.py").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            {"adws/adw_modules/launcher.py", "adws/maestro.py"},
+            self.committed_paths(self.destination_repo),
+        )
+        self.assertEqual(2, len(self.commits(self.destination_repo)))
+
+    def test_the_commit_message_names_the_source_revision_and_the_counts(self):
+        result = self.mirror_and_record()
+
+        message = self.git(self.destination_repo, "log", "-1", "--pretty=%B")
+        self.assertIn(self.source_sha, message)
+        self.assertIn("Copied 2 file(s)", message)
+        self.assertIn("Mirror ADW runtime from maestro into lexgenius", message)
+        self.assertEqual(message.strip(), result.commit.message.strip())
+
+    def test_an_unrelated_dirty_file_elsewhere_is_not_swept_into_the_commit(self):
+        (self.destination_repo / "README.md").write_text(
+            "somebody else's in-flight work\n", encoding="utf-8"
+        )
+        (self.destination_repo / "scratch.txt").write_text("untracked\n", encoding="utf-8")
+
+        self.mirror_and_record()
+
+        self.assertEqual(
+            {"adws/adw_modules/launcher.py", "adws/maestro.py"},
+            self.committed_paths(self.destination_repo),
+        )
+        self.assertEqual(
+            {"M README.md", "?? scratch.txt"}, self.porcelain(self.destination_repo)
+        )
+
+    def test_a_change_the_operator_had_already_staged_stays_staged(self):
+        (self.destination_repo / "README.md").write_text("staged by hand\n", encoding="utf-8")
+        self.git(self.destination_repo, "add", "--", "README.md")
+
+        self.mirror_and_record()
+
+        self.assertNotIn("README.md", self.committed_paths(self.destination_repo))
+        self.assertEqual({"M  README.md"}, self.porcelain(self.destination_repo))
+
+    def test_a_mirror_that_copies_nothing_records_nothing(self):
+        self.mirror_and_record()
+        before = self.commits(self.destination_repo)
+
+        again = self.mirror_and_record()
+
+        self.assertEqual(rs.COMMIT_NOTHING_TO_COMMIT, again.commit.reason)
+        self.assertEqual((), again.copied)
+        self.assertEqual(before, self.commits(self.destination_repo))
+
+    def test_the_cli_records_the_mirror_and_exits_zero(self):
+        self.assertEqual(
+            0,
+            rs.main([
+                "mirror",
+                str(self.template),
+                str(self.deployment),
+                "--apply",
+                "--commit",
+            ]),
+        )
+        self.assertEqual(2, len(self.commits(self.destination_repo)))
+
+
+class UnrecordedWorkIsRefusedTests(RecordingFixture):
+    """A mirror that would overwrite work git does not have copies nothing.
+
+    This is the case where a mirror destroys the only copy of something, and a
+    content comparison cannot see it: bytes on disk say nothing about whether
+    those bytes were ever recorded anywhere. The refusal names the file and
+    tells the operator what to do, rather than overwriting silently or burying
+    the loss inside a commit that claims to be a mirror.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _write(self.template, "maestro.py", "template\nruntime\n", mtime=2_000_000)
+        self.commit_everything(self.source_repo, "template runtime")
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        self.commit_everything(self.destination_repo, "deployment baseline")
+        self.baseline = self.commits(self.destination_repo)
+
+    def test_an_uncommitted_change_to_an_overwritten_file_refuses_the_whole_mirror(self):
+        _write(self.deployment, "maestro.py", "precious uncommitted work\n", mtime=1_500_000)
+
+        result = self.mirror_and_record()
+
+        self.assertEqual(rs.COMMIT_DESTINATION_DIRTY, result.commit.reason)
+        self.assertEqual(("maestro.py",), result.commit.modified)
+        self.assertFalse(result.applied)
+        self.assertFalse(result.is_clean)
+        self.assertEqual(
+            "precious uncommitted work\n",
+            (self.deployment / "maestro.py").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(self.baseline, self.commits(self.destination_repo))
+        self.assertIn("maestro.py", result.describe())
+        self.assertIn("NOTHING WAS COPIED", result.describe())
+
+    def test_a_file_git_has_never_seen_refuses_the_whole_mirror(self):
+        _write(self.template, "adw_modules/deliver.py", "template version\n", mtime=2_000_000)
+        _write(self.deployment, "adw_modules/deliver.py", "exists nowhere else\n", mtime=1_000_000)
+
+        result = self.mirror_and_record()
+
+        self.assertEqual(rs.COMMIT_DESTINATION_DIRTY, result.commit.reason)
+        self.assertEqual(("adw_modules/deliver.py",), result.commit.never_committed)
+        self.assertEqual((), result.commit.modified)
+        self.assertEqual(
+            "exists nowhere else\n",
+            (self.deployment / "adw_modules/deliver.py").read_text(encoding="utf-8"),
+        )
+        self.assertEqual("old\n", (self.deployment / "maestro.py").read_text(encoding="utf-8"))
+        self.assertEqual(self.baseline, self.commits(self.destination_repo))
+        self.assertIn("never committed", result.describe())
+
+    def test_the_refusal_does_not_fire_on_a_file_the_mirror_merely_creates(self):
+        _write(self.template, "adw_modules/new.py", "brand new\n", mtime=2_000_000)
+
+        result = self.mirror_and_record()
+
+        self.assertEqual(rs.COMMIT_RECORDED, result.commit.reason)
+        self.assertIn("adw_modules/new.py", result.copied)
+
+    def test_the_cli_exits_nonzero_and_writes_nothing_when_the_destination_is_dirty(self):
+        _write(self.deployment, "maestro.py", "precious uncommitted work\n", mtime=1_500_000)
+
+        exit_code = rs.main([
+            "mirror",
+            str(self.template),
+            str(self.deployment),
+            "--apply",
+            "--commit",
+        ])
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual(
+            "precious uncommitted work\n",
+            (self.deployment / "maestro.py").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(self.baseline, self.commits(self.destination_repo))
+
+    def test_without_commit_the_same_mirror_still_overwrites(self):
+        """The gate belongs to `--commit`, and is not smuggled into every mirror.
+
+        Stated so that widening it later is a deliberate change with a failing
+        test, rather than something that happens by accident.
+        """
+        _write(self.deployment, "maestro.py", "precious uncommitted work\n", mtime=1_500_000)
+        source, destination = self.copies(self.template, self.deployment)
+
+        rs.mirror(source, destination, apply=True, overwrite_ahead=True)
+
+        self.assertEqual(
+            "template\nruntime\n",
+            (self.deployment / "maestro.py").read_text(encoding="utf-8"),
+        )
+
+
+class RecordingBoundaryTests(RecordingFixture):
+    """Where the recording declines to act, and says so instead of failing."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _write(self.template, "maestro.py", "template\nruntime\n", mtime=2_000_000)
+        self.commit_everything(self.source_repo, "template runtime")
+
+    def test_a_destination_outside_git_is_mirrored_and_the_absence_is_stated(self):
+        plain = self.world / "unversioned" / DEPLOYMENT_LAYOUT
+        plain.mkdir(parents=True)
+        source, destination = self.copies(self.template, plain)
+
+        result = rs.mirror(source, destination, apply=True, commit=True)
+
+        self.assertTrue(result.applied)
+        self.assertEqual(rs.COMMIT_NO_REPOSITORY, result.commit.reason)
+        self.assertTrue(result.is_clean)
+        self.assertEqual(
+            "template\nruntime\n", (plain / "maestro.py").read_text(encoding="utf-8")
+        )
+        self.assertIn("not inside a git working tree", result.describe())
+
+    def test_commit_without_apply_writes_nothing_and_commits_nothing(self):
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        self.commit_everything(self.destination_repo, "deployment baseline")
+        baseline = self.commits(self.destination_repo)
+        source, destination = self.copies(self.template, self.deployment)
+
+        result = rs.mirror(source, destination, commit=True)
+
+        self.assertEqual(rs.COMMIT_NOT_APPLIED, result.commit.reason)
+        self.assertFalse(result.applied)
+        self.assertEqual("old\n", (self.deployment / "maestro.py").read_text(encoding="utf-8"))
+        self.assertEqual(baseline, self.commits(self.destination_repo))
+
+    def test_the_cli_commit_flag_without_apply_commits_nothing(self):
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        self.commit_everything(self.destination_repo, "deployment baseline")
+        baseline = self.commits(self.destination_repo)
+
+        rs.main([
+            "mirror",
+            str(self.template),
+            str(self.deployment),
+            "--commit",
+        ])
+
+        self.assertEqual("old\n", (self.deployment / "maestro.py").read_text(encoding="utf-8"))
+        self.assertEqual(baseline, self.commits(self.destination_repo))
+
+    def test_a_mirror_without_commit_says_nothing_about_git_at_all(self):
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        self.commit_everything(self.destination_repo, "deployment baseline")
+        source, destination = self.copies(self.template, self.deployment)
+
+        result = rs.mirror(source, destination, apply=True)
+
+        self.assertEqual(rs.COMMIT_NOT_REQUESTED, result.commit.reason)
+        self.assertEqual([], result.commit.describe())
+        self.assertNotIn("commit", result.describe())
+
+
+class NothingIsPushedTests(RecordingFixture):
+    """Recording is local. Publishing is not this tool's decision to make."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _write(self.template, "maestro.py", "template\nruntime\n", mtime=2_000_000)
+        self.commit_everything(self.source_repo, "template runtime")
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        self.commit_everything(self.destination_repo, "deployment baseline")
+
+        self.origin = self.world / "origin.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True
+        )
+        self.git(self.destination_repo, "remote", "add", "origin", str(self.origin))
+        self.git(self.destination_repo, "push", "-q", "origin", "main")
+        self.published = self.git(self.origin, "rev-parse", "main").strip()
+
+    def test_a_recorded_mirror_leaves_the_remote_exactly_where_it_was(self):
+        result = self.mirror_and_record()
+
+        self.assertEqual(rs.COMMIT_RECORDED, result.commit.reason)
+        self.assertEqual(self.published, self.git(self.origin, "rev-parse", "main").strip())
+        self.assertNotEqual(
+            self.published,
+            self.git(self.destination_repo, "rev-parse", "HEAD").strip(),
+        )
+        self.assertEqual(
+            ["1"],
+            self.git(
+                self.destination_repo, "rev-list", "--count", "origin/main..HEAD"
+            ).split(),
+        )
+
+    def test_the_module_contains_no_push_at_all(self):
+        source = (TOOLS / "runtime_sync.py").read_text(encoding="utf-8")
+        self.assertNotIn('"push"', source)
+        self.assertNotIn("'push'", source)
+
+
+class TheRecordDoesNotOverstateTests(RecordingFixture):
+    """A commit message that claims more than the mirror did is a false record.
+
+    The subject of this whole project is records that do not lie, so the first
+    place not to lie is its own commit message: a mirror that held eight files
+    out did not make the trees level, and the message has to say which eight.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _write(self.template, "maestro.py", "template\nruntime\n", mtime=2_000_000)
+        _write(self.template, "maestro.config.yaml", "template config\n", mtime=2_000_000)
+        _write(self.template, "adw_modules/deliver.py", "template deliver\n", mtime=2_000_000)
+        _write(self.template, "adw_modules/launcher.py", "short\n", mtime=2_000_000)
+        self.commit_everything(self.source_repo, "template runtime")
+
+        _write(self.deployment, "maestro.py", "old\n", mtime=1_000_000)
+        _write(self.deployment, "maestro.config.yaml", "deployment config\n", mtime=1_000_000)
+        _write(self.deployment, "adw_modules/deliver.py", "deployment deliver\n", mtime=1_000_000)
+        _write(
+            self.deployment,
+            "adw_modules/launcher.py",
+            "one\ntwo\nthree\nfour\n",
+            mtime=1_000_000,
+        )
+        _write(self.deployment, "adw_modules/local_only.py", "only here\n", mtime=1_000_000)
+        self.commit_everything(self.destination_repo, "deployment baseline")
+
+    def test_a_mirror_with_held_out_and_refused_files_says_so(self):
+        source = rs.describe_copy(self.template)
+        destination = rs.describe_copy(
+            self.deployment, pinned=["adw_modules/deliver.py"]
+        )
+
+        result = rs.mirror(source, destination, apply=True, commit=True)
+
+        self.assertEqual(rs.COMMIT_RECORDED, result.commit.reason)
+        self.assertFalse(result.is_level)
+        message = self.git(self.destination_repo, "log", "-1", "--pretty=%B")
+        self.assertIn("NOT byte-identical", message)
+        self.assertIn("Held out, deployment-owned: maestro.config.yaml", message)
+        self.assertIn("Held out, declared by lexgenius: adw_modules/deliver.py", message)
+        self.assertIn("REFUSED", message)
+        self.assertIn("adw_modules/launcher.py", message)
+        self.assertIn("DESTINATION_LONGER", message)
+        self.assertIn("adw_modules/local_only.py", message)
+        self.assertNotIn("are now byte-identical", message)
+
+    def test_a_discarded_destination_version_is_named_in_the_record(self):
+        source, destination = self.copies(self.template, self.deployment)
+
+        rs.mirror(source, destination, apply=True, commit=True, overwrite_ahead=True)
+
+        message = self.git(self.destination_repo, "log", "-1", "--pretty=%B")
+        self.assertIn("--overwrite-ahead", message)
+        self.assertIn("discarding its version of:", message)
+        self.assertIn("adw_modules/launcher.py", message)
+
+    def test_a_mirror_that_leaves_the_copies_identical_may_say_so(self):
+        peer_repo = self.world / "the-library"
+        self.init_repo(peer_repo)
+        for relative in ("maestro.py", "maestro.config.yaml", "adw_modules/deliver.py"):
+            _write(self.peer, relative, "placeholder\n", mtime=1_000_000)
+        _write(self.peer, "adw_modules/launcher.py", "old\n", mtime=1_000_000)
+        self.commit_everything(peer_repo, "peer baseline")
+        source, destination = self.copies(self.template, self.peer)
+
+        result = rs.mirror(source, destination, apply=True, commit=True)
+
+        self.assertTrue(result.is_level)
+        message = self.git(peer_repo, "log", "-1", "--pretty=%B")
+        self.assertIn("are now byte-identical over 4 file(s)", message)
+        self.assertNotIn("NOT byte-identical", message)
+        self.assertNotIn("Held out", message)
 
 
 if __name__ == "__main__":
