@@ -26,8 +26,15 @@ used, because it is right in the ordinary case and this module must not turn a
 working check into an error. The reason is carried out in ``provenance`` either
 way, so a caller that ends up skipping can say what it looked for and why.
 
+A fourth caller, `test_deployment_parity`, needs something adjacent: not a peer
+*template* but the list of deployed instances a person has asked to be watched.
+That list cannot be derived from the filesystem at all — a deployment lives
+wherever it was installed, and no arithmetic finds it — so it is declared in a
+registry and this module only resolves where that registry is. Its absence is
+the ordinary case and skips; its presence and malformation is an error.
+
 Nothing here decides whether to skip. Each caller owns that: what it needs from
-a peer, and which absences are legitimate, differ between the three.
+a peer, and which absences are legitimate, differ between the four.
 """
 
 from __future__ import annotations
@@ -204,6 +211,64 @@ def identify_template_checkout(adws_root):
             provenance=provenance,
         )
     return None
+
+
+#: What resolving the deployment registry produced.
+#:
+#: ``entries``   the declared deployments, or None when no registry was found
+#: ``path``      the registry that was read, or None
+#: ``searched``  every path looked at, in order, so a skip can name them
+RegistryResolution = collections.namedtuple(
+    "RegistryResolution", "entries path searched"
+)
+
+
+def deployment_registry_roots(checkout):
+    """Repositories a deployment registry is looked for in, main tree first.
+
+    Two, and the order is the point. A registry names deployment roots relative
+    to itself, and a linked worktree sits two directories below the repository,
+    so the same registry read from a worktree resolves `../../lexgenius/adws`
+    to `.claude/worktrees/lexgenius/adws` — a path no machine has. Reading the
+    main working tree's copy first makes a registry that is committed, and so
+    present in every worktree, resolve to the same deployments from all of them.
+    The worktree is still searched, second, so a lane can point the check at
+    something of its own; that copy wins only when the main tree has none.
+
+    This is the same asymmetry that made `identify_template_checkout` resolve
+    its peer from git rather than from ``__file__``: arithmetic on a worktree
+    path lands somewhere plausible and wrong, and the failure is a skip nobody
+    reads.
+    """
+    roots = []
+    main_root = checkout.neighbourhood / checkout.repo_name
+    if main_root != checkout.root:
+        roots.append(main_root)
+    roots.append(checkout.root)
+    return tuple(roots)
+
+
+def resolve_deployment_registry(checkout):
+    """Find and read the deployment registry for ``checkout``.
+
+    Returns a :data:`RegistryResolution` whose ``entries`` is None when no
+    registry exists on this machine — the ordinary case, and the one that must
+    skip rather than fail. A registry that exists and cannot be parsed raises
+    ``runtime_sync.RegistryError``, because a malformed registry that degraded
+    to "no deployments" would watch nothing and say so nowhere.
+
+    Nothing here decides whether to skip; the caller owns that, exactly as it
+    does for a missing peer checkout.
+    """
+    searched = runtime_sync.registry_search_paths(deployment_registry_roots(checkout))
+    for candidate in searched:
+        if candidate.is_file():
+            return RegistryResolution(
+                entries=runtime_sync.load_deployment_registry(candidate),
+                path=candidate,
+                searched=searched,
+            )
+    return RegistryResolution(entries=None, path=None, searched=searched)
 
 
 def checkout_root(checkout, repo_name):
