@@ -22,7 +22,11 @@ def review_objects(plan: Plan) -> Tuple[ReviewObject, ...]:
         if isinstance(node, AgentNode):
             objects.append(ReviewObject("node:{}#gate".format(node.node_id),
                                         ObjectKind.GATE))
-    objects.append(ReviewObject("plan#integration-gate", ObjectKind.GATE))
+    # Not `GATE`: the node kind's rubric asks whether the selector is scoped
+    # to one node's outputs and whether it is red before that node runs, and
+    # neither is a fact about the plan's integration gate (§8.8, §19 M14).
+    objects.append(ReviewObject("plan#integration-gate",
+                                ObjectKind.INTEGRATION_GATE))
     objects.extend(ReviewObject("evidence:{}".format(item.evidence_id),
                                 ObjectKind.EVIDENCE)
                    for item in plan.evidence)

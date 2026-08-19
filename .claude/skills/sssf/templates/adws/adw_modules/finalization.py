@@ -70,17 +70,29 @@ from .finalization_window import (FinalizationSignal, ReviewerSession,
 class ObjectKind(str, Enum):
     """What a reviewable object is. §6.2's model, from the reviewer's side.
 
-    The first four are plan-finalization's objects. `DIFF` and `CHANGED_FILE`
+    The first five are plan-finalization's objects. `DIFF` and `CHANGED_FILE`
     are code review's (`code_review.py`), and they live here rather than in a
     parallel enum so that `compute_matrix`, `verify_report`, `derive_verdict`,
     `Receipt`, and `ReceiptStore` serve both reviews unchanged. A rubric only
     ever emits cells for the kinds its own checks declare, so the two review
     families never produce each other's cells.
+
+    `GATE` and `INTEGRATION_GATE` are separate kinds because the two objects
+    have opposite scope rules, not merely different ones. A node's gate is
+    scoped to that node's own work and is red before it runs (§7.4); the
+    plan's integration gate is the only gate in this design that runs the
+    whole suite, at the final head where every merged node's work is present
+    at once (§8.8), and its selector legitimately spans tests an earlier plan
+    already merged alongside tests this run's lanes will write (§6.4's third
+    executability arm, §19 M14). One kind serving both would ask the
+    integration gate whether its selector is narrow, which is the question
+    whose correct answer the architecture states as "no".
     """
 
     PLAN = "plan"
     NODE = "node"
     GATE = "gate"
+    INTEGRATION_GATE = "integration_gate"
     EVIDENCE = "evidence"
     DIFF = "diff"
     CHANGED_FILE = "changed_file"
@@ -155,11 +167,19 @@ class Rubric:
 
 #: The rubric's questions are §6.2's judgments that no git object can
 #: settle: whether the graph accomplishes the stated intent, whether a
-#: gate's selector is scoped to its own node's work, whether a hypothesis
-#: is dischargeable, whether evidence supports the claim made from it.
-#: Severity is a property of the question, fixed here in code.
+#: node gate's selector is scoped to its own node's work and whether the
+#: integration gate's covers the merged surface instead, whether a
+#: hypothesis is dischargeable, whether evidence supports the claim made
+#: from it. Severity is a property of the question, fixed here in code.
+#:
+#: The version names the applicability matrix as much as the questions. A
+#: receipt persists its full per-cell matrix (§6.5) and that matrix is only
+#: interpretable against the rubric that produced it, so moving a check
+#: between object kinds is a new version even when no question's text
+#: changes. `v2` moved the two node-scoped gate checks off the plan's
+#: integration gate.
 DEFAULT_RUBRIC = Rubric(
-    version="maestro-rubric.v1",
+    version="maestro-rubric.v2",
     checks=(
         RubricCheck(
             check_id="plan.intent_is_accomplished_by_the_graph",
@@ -199,9 +219,16 @@ DEFAULT_RUBRIC = Rubric(
             applies_to=(ObjectKind.GATE,),
             severity=Severity.BLOCKING),
         RubricCheck(
+            check_id="gate.selector_covers_the_merged_surface",
+            question=("Does the selector name the whole surface this plan "
+                      "produces — every lane's declared test output — rather "
+                      "than a subset of the lanes it must integrate?"),
+            applies_to=(ObjectKind.INTEGRATION_GATE,),
+            severity=Severity.BLOCKING),
+        RubricCheck(
             check_id="gate.min_cases_is_meaningful",
             question="Is `min_cases` more than a formality for this gate?",
-            applies_to=(ObjectKind.GATE,),
+            applies_to=(ObjectKind.GATE, ObjectKind.INTEGRATION_GATE),
             severity=Severity.ADVISORY),
         RubricCheck(
             check_id="evidence.supports_the_claim_made_from_it",

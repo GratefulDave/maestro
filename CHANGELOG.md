@@ -127,6 +127,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The plan's integration gate is no longer reviewed as though it were a node's gate. `plan_finalization.review_objects` projected it as `ObjectKind.GATE`, so finalization asked it the two node-scoped rubric questions — whether its gate asserts the post-state of "this node's own work" and, BLOCKING, whether its selector "names only what this node's outputs supply". The integration gate has no node and is the one gate in this design that runs the whole suite at the final head (§7.4, §8.8), and its selector legitimately spans tests an earlier plan already merged (§6.4's third executability arm, §19 M14), so the correct answer to the BLOCKING question was the one that fails the plan. `ObjectKind.INTEGRATION_GATE` now carries its own checks: `gate.selector_covers_the_merged_surface` (BLOCKING) asks the inverse question, and `gate.min_cases_is_meaningful` applies to both kinds. Because moving a check between object kinds changes the applicability matrix each receipt persists, the rubric is `maestro-rubric.v2`. See §19 M16 and §17 item 129. Related, and not fixed: a FAIL receipt remains terminal with no operator escape (§16.3 item 56, issue #38).
+
 - A liveness clock no longer convicts an attempt that has already declared a result. The worker
   quiesces the builder agent before it commits the work, runs the post gate, and dispatches the
   cross-vendor reviewer, so from that moment the builder's session transcript cannot grow again by

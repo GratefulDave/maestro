@@ -40,7 +40,8 @@ class PlanFinalizationAdapterTest(unittest.TestCase):
             fin.ReviewObject("node:build", fin.ObjectKind.NODE),
             fin.ReviewObject("node:build#gate", fin.ObjectKind.GATE),
             fin.ReviewObject("node:check", fin.ObjectKind.NODE),
-            fin.ReviewObject("plan#integration-gate", fin.ObjectKind.GATE),
+            fin.ReviewObject("plan#integration-gate",
+                             fin.ObjectKind.INTEGRATION_GATE),
             fin.ReviewObject("evidence:h1", fin.ObjectKind.EVIDENCE),
         ))
 
