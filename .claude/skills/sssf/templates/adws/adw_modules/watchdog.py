@@ -21,14 +21,34 @@ query of its own — the store lives in lane w1's lifecycle module, wired in
 by the caller.
 
 Three signals feed the watchdog, each answering a different question
-(§7.6):
+(§7.6). They are not interchangeable across node kinds:
 
-  process alive        -- is the agent still there?    (the launched
-                           process, polled directly -- authoritative,
-                           and never pane text, per §9.7)
-  turn count advancing  -- is it completing turns?      (complete records
-                           in the session file, never byte size)
-  wall clock elapsed    -- has it run too long anyway?  (the attempt row)
+  process alive        -- is the launched process still there?
+                           Polled via `attempt.pid`, never pane text
+                           (§9.7). A code node's pid is the harness-
+                           spawned process, so this branch can fire;
+                           `exit_status_observed` then outranks it
+                           when the harness already holds the handle.
+                           An agent node's pid is
+                           `LaunchHandle.process_group`. herdr 0.8.0
+                           exposes no pid and no process group
+                           (§8.3, §16.3 item 17), so the field is
+                           unset by design — a reserved seam pending
+                           a §9.8 receipt, not a missed wire.
+                           Process-alive is therefore unreachable for
+                           agent nodes and is not authoritative for
+                           them.
+
+  turn count advancing  -- is it completing turns?      (complete
+                           records in the session file, never byte
+                           size). One of the two signals that
+                           actually guard an agent node.
+
+  wall clock elapsed    -- has it run too long anyway?  (the attempt
+                           row). Applies to every node kind, pre-
+                           launch and post-launch. The other signal
+                           that reaches an agent node; after a
+                           declared result it is the last bound left.
 
 Arming (§7.6). `PENDING->RUNNING` is written before worktree creation,
 provision, the pre-gate, and the baseline inventory, so the attempt window
