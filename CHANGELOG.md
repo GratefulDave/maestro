@@ -407,6 +407,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Precondition waits in `test_participant.py`, `test_scheduler.py` and `test_workspace_runtime.py`
+  are hang detectors rather than tuned wall clocks, closing the last residual instances of the
+  class `#50` fixed in `test_coordinator.py` (issue #57). Each file now derives every arrival wait
+  from one `ARRIVAL_TIMEOUT_S` constant — 60s, overridable with `MAESTRO_TEST_ARRIVAL_TIMEOUT_S` —
+  that carries the measurement and the reasoning beside it.
+
+  The distinction the constant enforces is between a wait that is a *precondition* and a bound that
+  is a *property under test*. Overrunning a precondition means "the subsystem has not got there
+  yet", never "the subsystem is wrong", and its duration is set by real `git` and `pytest`
+  subprocess work under contention — this suite's default is `-n auto`, so eighteen workers fork
+  subprocesses against one disk while the operator's other work runs alongside. A bound placed at
+  roughly the duration it measures is a coin toss whoever measures it, which is why two of the
+  bounds replaced here had *already been raised once* by someone who measured, and failed anyway.
+
+  What that cost was not obvious from the failures. `test_simultaneous_repositories_and_targeted_
+  cancellation` surfaced as `AttributeError: 'ParticipantExecutionError' has no attribute
+  'outcome'` — a participant's 0.8s sleep overrunning a 2.0s run timeout and returning an error
+  object where the test expected a result. It reads as a defect in the code under test, and it is
+  not one.
+
+  Bounds that assert a property keep their literal values and say so: the
+  `assertFalse(cancel_completed.wait(timeout=0.05))` that proves cancellation does *not* complete
+  while a launch is held, and the `timeout=0.01` that proves the participant timeout path fires,
+  are both deliberately not folded in — expressing either in terms of a hang detector would invert
+  it into a sixty-second sleep asserting nothing.
+
 - Retry guidance survives both a second failure from the same surface and the death of the
   scheduler process. `GuidanceLedger` held **one** entry per acceptance surface and `with_*`
   *replaced* it, so a node that failed verification twice carried only the second failure into its
