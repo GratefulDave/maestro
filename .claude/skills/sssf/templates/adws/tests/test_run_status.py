@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -335,7 +336,7 @@ class RunMutationSelectionTest(RunStatusFixture):
     def test_cancel_resolves_the_named_plans_newest_run(self):
         self._accepted_run("run-first")
         newest = self._live_run("run-third")
-        code, output = self._run(["run", "cancel", "named"])
+        code, output = self._run(["run", "cancel", "named", "--discard"])
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["run_id"], newest)
         with self._store() as store:
@@ -347,7 +348,8 @@ class RunMutationSelectionTest(RunStatusFixture):
     def test_cancel_reaches_an_older_run_by_id(self):
         older = self._live_run("run-first")
         self._live_run("run-third")
-        code, output = self._run(["run", "cancel", "named", "--run-id", older])
+        code, output = self._run(["run", "cancel", "named", "--discard",
+                                  "--run-id", older])
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["run_id"], older)
         with self._store() as store:
@@ -538,6 +540,144 @@ class RunListStopsReportingDeadRunsAsLive(RunStatusFixture):
         self.assertEqual(code, 0, output)
         row = [r for r in json.loads(output) if r["run_id"] == run_id][0]
         self.assertEqual(row["state"], "BLOCKED")
+
+
+class PauseAndDiscardCancelTest(RunStatusFixture):
+    """§7.3's two operator stops: one reversible, one not.
+
+    `_live_run` creates the run from *this* process, so the ledger's
+    `scheduler_pid` and `scheduler_start_epoch` are this process's own — which
+    is what makes the identity proof below a real comparison of recorded
+    numbers rather than a stub.
+    """
+
+    def _forget_the_scheduler(self, run_id, pid=424242):
+        """Point the run's recorded owner at a pid that is not a process."""
+        with self._store() as store:
+            store.conn.execute(
+                "UPDATE runs SET scheduler_pid=?, scheduler_host=?"
+                " WHERE run_id=?", (pid, lc.scheduler_host(), run_id))
+
+    def _misrecord_the_start_epoch(self, run_id, epoch=1.0):
+        """Leave the pid alive and correct; falsify only its start epoch.
+
+        Exactly the reused-pid shape `scheduler_signal_pid` exists for: the
+        number still names a live process, and that process is no longer the
+        one that claimed the run.
+        """
+        with self._store() as store:
+            store.conn.execute(
+                "UPDATE runs SET scheduler_start_epoch=? WHERE run_id=?",
+                (epoch, run_id))
+
+    def test_run_pause_is_the_named_non_terminal_stop(self):
+        run_id = self._live_run()
+        with mock.patch.object(maestro.os, "kill") as killed:
+            code, output = self._run(["run", "pause", "named"])
+        self.assertEqual(code, 0, output)
+        payload = json.loads(output)
+        self.assertEqual(payload["outcome"], "PAUSE_REQUESTED")
+        self.assertEqual(payload["run_id"], run_id)
+        self.assertEqual(
+            [call.args for call in killed.call_args_list
+             if call.args[1] == signal.SIGINT],
+            [(os.getpid(), signal.SIGINT)])
+        with self._store() as store:
+            # Nothing moved. That is the whole property (§1.2).
+            self.assertIsNone(store.latest_outcome(run_id))
+            self.assertIs(store.get_node(run_id, "lane-one").state,
+                          st.NodeState.RUNNING)
+            self.assertFalse(store.conn.execute(
+                "SELECT cancel_requested FROM runs WHERE run_id=?",
+                (run_id,)).fetchone()[0])
+
+    def test_pause_refuses_to_signal_an_unproven_pid(self):
+        """The recorded pid is alive and is this process; only the recorded
+        start epoch disagrees. `scheduler_liveness` would still say True, and
+        that is exactly why it is not the authority to signal (#37)."""
+        run_id = self._live_run()
+        self._misrecord_the_start_epoch(run_id)
+        reader = maestro._open_reader(str(self.database))
+        try:
+            self.assertIs(lc.scheduler_liveness(reader.run(run_id)), True)
+        finally:
+            reader.close()
+        with mock.patch.object(maestro.os, "kill") as killed:
+            code, output = self._run(["run", "pause", "named"])
+        self.assertEqual(code, 3, output)
+        self.assertEqual(json.loads(output)["outcome"], "PAUSE_PID_UNPROVEN")
+        self.assertEqual([call.args for call in killed.call_args_list
+                          if call.args[1] == signal.SIGINT], [])
+
+    def test_pause_reports_an_already_stopped_scheduler_without_signalling(self):
+        run_id = self._live_run()
+        self._forget_the_scheduler(run_id)
+        code, output = self._run(["run", "pause", "named"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["outcome"], "ALREADY_STOPPED")
+
+    def test_cancel_without_discard_pauses_instead_of_discarding(self):
+        run_id = self._live_run()
+        with mock.patch.object(maestro.os, "kill") as killed:
+            code, output = self._run(["run", "cancel", "named"])
+        self.assertEqual(code, 0, output)
+        payload = json.loads(output)
+        self.assertEqual(payload["outcome"], "PAUSE_REQUESTED")
+        self.assertEqual(payload["run_id"], run_id)
+        self.assertEqual(
+            [call.args for call in killed.call_args_list
+             if call.args[1] == signal.SIGINT],
+            [(os.getpid(), signal.SIGINT)])
+        with self._store() as store:
+            self.assertIs(store.get_node(run_id, "lane-one").state,
+                          st.NodeState.RUNNING)
+            self.assertIsNone(store.latest_outcome(run_id))
+
+    def test_discard_declares_cancelled_and_refuses_resume(self):
+        run_id = self._live_run()
+        code, output = self._run(["run", "cancel", run_id, "--discard"])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["outcome"], "CANCELLED")
+        with self._store() as store:
+            self.assertIs(store.latest_outcome(run_id),
+                          st.RunOutcome.CANCELLED)
+            self.assertIs(store.run_cancel_cause(run_id),
+                          st.CancelCause.DISCARDED)
+            with self.assertRaises(lc.ResumeRefused):
+                store.resume_run(run_id)
+
+    def test_discard_warns_about_verified_unmerged_work(self):
+        run_id = "run-verified"
+        with self._store() as store:
+            store.create_run(run_id, self.digest, [AGENT_NODE])
+            store.start_attempt(run_id, "lane-one", "a" * 40)
+            store.mark_verified(run_id, "lane-one", "c" * 40)
+        err = io.StringIO()
+        output = io.StringIO()
+        previous = Path.cwd()
+        os.chdir(self.repo)
+        try:
+            with mock.patch.dict(os.environ, self.environment, clear=False), \
+                    contextlib.redirect_stdout(output), \
+                    contextlib.redirect_stderr(err):
+                code = maestro.main(["run", "cancel", run_id, "--discard"])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("lane-one", err.getvalue())
+        self.assertIn("verified", err.getvalue())
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["outcome"], "CANCELLED")
+        self.assertEqual(payload["unreachable"][0]["node_id"], "lane-one")
+
+    def test_discard_refuses_to_rewrite_an_accepted_run(self):
+        run_id = self._accepted_run()
+        code, output = self._run(["run", "cancel", run_id, "--discard"])
+        self.assertEqual(code, 3, output)
+        self.assertEqual(json.loads(output)["outcome"], "RUN_ALREADY_TERMINAL")
+        with self._store() as store:
+            self.assertIs(store.latest_outcome(run_id),
+                          st.RunOutcome.ACCEPTED)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from contextlib import redirect_stdout as _redirect_stdout
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -864,12 +865,14 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 #: receipt or launches anything, so none of them needs key material — asking
 #: `run status` for a signing seed is how a read verb becomes unusable on a
 #: machine that merely wants to watch a run.
-_RUN_LEDGER_COMMANDS = ("status", "list", "cancel")
+_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel")
 
 #: Flags that select *which* run to read and how to print it. They are the only
 #: flags a configured run verb accepts, because they override no derived path;
-#: any other flag means the operator is driving every path by hand.
-_RUN_SELECTION_OPTIONS = frozenset({"--run-id", "--json"})
+#: any other flag means the operator is driving every path by hand. `--discard`
+#: belongs here for the same reason: it selects which of `run cancel`'s two
+#: behaviours the operator meant, and derives no path at all.
+_RUN_SELECTION_OPTIONS = frozenset({"--run-id", "--json", "--discard"})
 
 #: Plan verbs whose positional argument is overloaded — a plan *name* the
 #: installed configuration resolves, or a filesystem path to the plan bytes.
@@ -3018,9 +3021,17 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             provision=_run_provisioner(args, route_runner),
             kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
             review_attempt=review_attempt)
-        report = scheduler.Scheduler(
-            args.run_id, plan.to_plan_nodes(), config, deps,
-            plan_digest=args.digest).run()
+        try:
+            report = scheduler.Scheduler(
+                args.run_id, plan.to_plan_nodes(), config, deps,
+                plan_digest=args.digest).run()
+        except scheduler.RunPaused:
+            # Not an outcome, and deliberately not printed as one: nothing was
+            # declared, no node moved, and `run resume` is legal from here.
+            print(json.dumps({
+                "outcome": "PAUSED", "run_id": args.run_id,
+            }, sort_keys=True))
+            return 0
     finally:
         # Nested so that a failing close still releases the checkout, and a
         # failing release still leaves the store closed. Neither may become the
@@ -3453,9 +3464,77 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_cancel(args: argparse.Namespace) -> int:
+def _run_pause(args: argparse.Namespace) -> int:
+    """Stop the scheduler without making the run terminal (§7.3).
+
+    SIGINT the claiming process. `KeyboardInterrupt` — or, once the scheduler
+    has installed its handler, the latched pause — unwinds `_execute_run`'s
+    `finally`, so the integration checkout is released. Nodes stay where they
+    are, no outcome is declared, `latest_outcome` stays NULL, and `run resume`
+    is legal against the run afterwards. A pause is therefore not a lifecycle
+    transition at all, which is why it may be triggered by a signal (§1.2).
+
+    The pid is signalled only when `scheduler_signal_pid` proves it is still
+    the process that claimed the run — a float comparison of the recorded
+    start epoch against the live process's. `scheduler_liveness` is a weak
+    witness: the kernel reuses pids, so "a process with this number exists"
+    is not authority to interrupt it, and a run whose identity cannot be
+    proven is refused rather than signalled (#37).
+    """
     if not getattr(args, "db", None):
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        record = _select_run(reader, args)
+        run_id = record.run_id
+        pid = record.scheduler_pid
+        alive = lc.scheduler_liveness(record)
+        target = lc.scheduler_signal_pid(record)
+    finally:
+        reader.close()
+    if not pid or alive is not True:
+        print(json.dumps({
+            "outcome": "ALREADY_STOPPED", "run_id": run_id,
+            "scheduler_pid": pid, "scheduler_alive": alive,
+        }, sort_keys=True))
+        return 0
+    if target is None:
+        return _refusal(
+            "PAUSE_PID_UNPROVEN",
+            "recorded scheduler pid {0} exists but is not proven to be "
+            "the process that claimed this run".format(pid))
+    try:
+        os.kill(target, signal.SIGINT)
+    except ProcessLookupError:
+        print(json.dumps({
+            "outcome": "ALREADY_STOPPED", "run_id": run_id,
+            "scheduler_pid": pid, "scheduler_alive": False,
+        }, sort_keys=True))
+        return 0
+    except OSError as exc:
+        return _refusal("PAUSE_SIGNAL_FAILED", str(exc))
+    print(json.dumps({
+        "outcome": "PAUSE_REQUESTED", "run_id": run_id,
+        "scheduler_pid": target,
+    }, sort_keys=True))
+    return 0
+
+
+def _run_cancel(args: argparse.Namespace) -> int:
+    """Two verbs behind one word, and the safe one is the default.
+
+    Without `--discard` this pauses. `run cancel` was the operator's only
+    stop control, so it was reached for both to stop a run for good and to
+    stop one that was about to be resumed; making the destructive reading the
+    default meant the second intent silently took the first. `--discard` is
+    what now says "end it", and it is terminal: the nodes it takes are
+    stamped `DISCARDED`, the declared outcome carries that cause, and
+    `resume_run` refuses it.
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    if not getattr(args, "discard", False):
+        return _run_pause(args)
     reader = _open_reader(args.db)
     try:
         run_id = _select_run(reader, args).run_id
@@ -3463,8 +3542,31 @@ def _run_cancel(args: argparse.Namespace) -> int:
         reader.close()
     store = lc.LifecycleStore(args.db)
     try:
-        store.cancel_run(run_id)
-        print(json.dumps({"outcome": "CANCELLED", "run_id": run_id}))
+        outcome = store.latest_outcome(run_id)
+        if outcome in (scheduler_types.RunOutcome.ACCEPTED,
+                       scheduler_types.RunOutcome.CANCELLED):
+            return _refusal(
+                "RUN_ALREADY_TERMINAL",
+                "{0} already declared {1}".format(run_id, outcome.value))
+        # Named before the discard, not after: this is work that reached a
+        # measured predicate and is about to stop being reachable, and the
+        # operator is the only one who can decide that is acceptable.
+        adoptable = store.adoptable_attempts(run_id)
+        if adoptable:
+            print(
+                "cancel --discard will make these completed attempts "
+                "unreachable through Maestro (§7.3): "
+                + ", ".join(
+                    "{0} ({1})".format(row["node_id"], row["why"])
+                    for row in adoptable),
+                file=sys.stderr)
+        store.cancel_run(run_id, cause=scheduler_types.CancelCause.DISCARDED)
+        store.declare_outcome(
+            run_id, cancel_cause=scheduler_types.CancelCause.DISCARDED)
+        print(json.dumps({
+            "outcome": "CANCELLED", "run_id": run_id,
+            "unreachable": list(adoptable),
+        }, sort_keys=True))
         return 0
     finally:
         store.close()
@@ -5204,9 +5306,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_listing.add_argument("--json", action="store_true", dest="as_json")
     _add_db(run_listing)
     run_listing.set_defaults(handler=_run_list)
+    pause = run_sub.add_parser("pause")
+    pause.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    pause.add_argument("--run-id")
+    _add_db(pause)
+    pause.set_defaults(handler=_run_pause)
     cancel = run_sub.add_parser("cancel")
     cancel.add_argument("selector", metavar="PLAN_OR_RUN_ID")
     cancel.add_argument("--run-id")
+    cancel.add_argument(
+        "--discard", action="store_true",
+        help="make the run terminal; without this flag, cancel pauses")
     _add_db(cancel)
     cancel.set_defaults(handler=_run_cancel)
     resume = run_sub.add_parser("resume")

@@ -169,22 +169,6 @@ ALLOWED: Dict[str, str] = {
     "publication.prepare": "DEFERRED: WorkspacePublisher.prepare, publication "
                            "path, no production caller",
 
-    # #37's other half. `watchdog.process_start_epoch` stood here until its
-    # production caller landed: `LifecycleStore` now calls it on every write
-    # that claims a run (create_run, claim_run, the resume transition), so the
-    # recorded identity exists. The *reader* of that identity is
-    # `scheduler_signal_pid`, and its production caller is `run pause` in
-    # maestro.py, which has not landed yet: pausing a run means SIGINT to the
-    # claiming process, and that is the one operation for which "the pid
-    # exists" is not good enough. Delete this line with that verb.
-    "lifecycle.scheduler_signal_pid": "DEFERRED: #37's identity check. The "
-                                      "recording half is wired (create_run, "
-                                      "claim_run, resume all persist "
-                                      "runs.scheduler_start_epoch); the "
-                                      "consumer is maestro.py's `run pause`, "
-                                      "which signals the scheduler and must "
-                                      "prove the pid before it does.",
-
     # Config keys whose only writer is a test, so the dataclass default is the
     # production value in every run. Not broken branches — constants wearing a
     # config key's clothes — but recorded so that "configurable" is not

@@ -41,8 +41,10 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple)
+from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
+                    Tuple)
 
+from . import retry_policy as rp
 from . import scheduler_types as st
 from . import watchdog as wd
 from . import worktree as wt
@@ -526,6 +528,7 @@ def total_run_outcome(
     stuck: bool,
     cancel_requested: bool,
     acceptance_result: Optional[bool],
+    requested_cause: Optional[st.CancelCause] = None,
 ) -> OutcomeReport:
     """The total function of §7.3 — never raises, never returns a fifth value.
 
@@ -537,6 +540,14 @@ def total_run_outcome(
     every node has finished reacting to that stop. `BLOCKED` is the residual
     class — the `else` arm — so a combination nobody designed for lands there
     with a report, never outside the set.
+
+    `requested_cause` is the cause the verb that asked for the stop named for
+    itself, and it is honoured only inside the `CANCELLED` arm. It exists
+    because the two stop requests this function can see are indistinguishable
+    from `cancel_requested` alone: `run cancel --discard` and a plain
+    `run cancel` both set it, and only the first must be terminal. Left
+    `None` — every scheduler-side declaration — the derivation below is
+    exactly what it was.
     """
     if stuck:
         return OutcomeReport(outcome=st.RunOutcome.STUCK)
@@ -553,8 +564,8 @@ def total_run_outcome(
         # work the run should finish without. `run resume` reopens the first
         # and refuses the second (§7.8), and the precedence here is the same
         # precedence the arm above it already had.
-        cause = (st.CancelCause.RUN_CANCEL if cancel_requested
-                 else st.CancelCause.ABANDONED)
+        cause = requested_cause or (st.CancelCause.RUN_CANCEL if cancel_requested
+                                    else st.CancelCause.ABANDONED)
         return OutcomeReport(outcome=st.RunOutcome.CANCELLED,
                              abandoned_nodes=cancelled, cancel_cause=cause)
 
@@ -1444,13 +1455,74 @@ class LifecycleStore:
     # ── run-level: cancellation, outcome, resume ────────────────────────────
 
     @serialized
-    def cancel_run(self, run_id: str) -> Tuple[str, ...]:
+    def adoptable_attempts(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
+        """Completed, non-rejected, unmerged work a discard would lose (§7.3).
+
+        `VERIFIED` nodes, and nodes whose latest result was adjudicated
+        `ACCEPTED` and which have not merged. Both are work that reached a
+        measured predicate and would simply stop being reachable through
+        Maestro once the run is terminal — which is the one cost of
+        `run cancel --discard` that the operator cannot see from the run's
+        state, because a node in either shape reports as neither finished nor
+        failed.
+
+        Rejected attempts are deliberately not listed: losing those is the
+        correct outcome, not a cost. Review is recorded *after* result
+        acceptance, so an `ACCEPTED` row whose attempt carries
+        `retry_policy.REVIEW_REJECTED_KEY` is rejected work wearing an
+        accepted result, and is filtered on that typed key rather than on
+        anything a reviewer wrote in prose (§1.2).
+        """
+        nodes = self.conn.execute(
+            "SELECT node_id, state, attempt_no FROM node_lifecycle WHERE run_id=?",
+            (run_id,)).fetchall()
+        found: List[Dict[str, Any]] = []
+        for node_id, state, attempt_no in nodes:
+            current = st.NodeState(state)
+            if current in st.ABSOLUTELY_TERMINAL:
+                continue
+            if current is st.NodeState.VERIFIED:
+                found.append({"node_id": node_id, "state": current.value,
+                              "attempt_no": attempt_no, "why": "verified"})
+                continue
+            row = self.conn.execute(
+                "SELECT adjudication FROM results"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?"
+                " ORDER BY id DESC LIMIT 1",
+                (run_id, node_id, attempt_no)).fetchone()
+            if not row or row[0] != st.Adjudication.ACCEPTED.value:
+                continue
+            extra_row = self.conn.execute(
+                "SELECT extra_json FROM attempts"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (run_id, node_id, attempt_no)).fetchone()
+            try:
+                extra = json.loads(extra_row[0]) if extra_row and extra_row[0] else {}
+            except (TypeError, ValueError):
+                extra = {}
+            if not isinstance(extra, dict) or extra.get(rp.REVIEW_REJECTED_KEY):
+                continue
+            found.append({"node_id": node_id, "state": current.value,
+                          "attempt_no": attempt_no,
+                          "why": "accepted-unmerged"})
+        return tuple(found)
+
+    @serialized
+    def cancel_run(self, run_id: str, *,
+                   cause: st.CancelCause = st.CancelCause.RUN_CANCEL
+                   ) -> Tuple[str, ...]:
         """Write CANCELLED for every non-terminal node in ONE transaction (§7.8).
         Never blocks on a kill — that is the adapter's problem, not this store's.
 
-        Every node it takes is stamped `RUN_CANCEL`, which is what makes the
-        stop reversible: a resume reopens exactly these nodes and leaves a
-        node the operator had separately abandoned where it is (§7.8).
+        Every node it takes is stamped with `cause`, which by default is
+        `RUN_CANCEL` and is what makes the stop reversible: a resume reopens
+        exactly those nodes and leaves a node the operator had separately
+        abandoned where it is (§7.8). `run cancel --discard` passes
+        `DISCARDED` instead, and the same stamp is then what makes the stop
+        irreversible — `_run_cancelled_node_ids` selects on the value, so a
+        discarded node is not among the nodes a resume would reopen, and
+        `_guard_transition` refuses it individually as well.
+
         `MERGED` nodes are absolutely terminal and are skipped, so the merged,
         gate-verified, reviewed work a long run has already landed survives
         the stop and is not re-executed by the resume."""
@@ -1470,7 +1542,7 @@ class LifecycleStore:
                     " cancel_cause=?, updated_at=?"
                     " WHERE run_id=? AND node_id=?",
                     (st.NodeState.CANCELLED.value,
-                     st.CancelCause.RUN_CANCEL.value, now, run_id, node_id))
+                     cause.value, now, run_id, node_id))
                 self.conn.execute(
                     "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                     " reason, actor, detail_json, created_at)"
@@ -1501,10 +1573,18 @@ class LifecycleStore:
 
     @serialized
     def declare_outcome(self, run_id: str, *, stuck: bool = False,
-                         acceptance_result: Optional[bool] = None) -> OutcomeReport:
+                         acceptance_result: Optional[bool] = None,
+                         cancel_cause: Optional[st.CancelCause] = None
+                         ) -> OutcomeReport:
         """Compute and record the run's outcome (§7.3) — a record, not a
         tombstone: `runs` keeps only the latest value; the ordered history is
-        the `transitions` row this same transaction appends."""
+        the `transitions` row this same transaction appends.
+
+        `cancel_cause` names the cause the caller's stop request carries, and
+        reaches the outcome function as `requested_cause` — honoured in the
+        `CANCELLED` arm and ignored everywhere else. Only `run cancel
+        --discard` passes it; a scheduler declaring its own quiescence never
+        does, and the cause it gets is derived exactly as before."""
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             run_row = self.conn.execute(
@@ -1519,7 +1599,8 @@ class LifecycleStore:
                 for node_id, state, reason in rows]
             report = total_run_outcome(
                 node_states, stuck=stuck, cancel_requested=bool(run_row[0]),
-                acceptance_result=acceptance_result)
+                acceptance_result=acceptance_result,
+                requested_cause=cancel_cause)
             now = now_iso()
             # `cancel_cause` is written on every declaration, including the
             # ones that clear it. A run that was cancelled, resumed, and then
@@ -1717,6 +1798,12 @@ class LifecycleStore:
         the frontier recomputes over them, and the integration branch is taken
         back rather than re-created (the caller's job, and unchanged).
 
+        A `DISCARDED` run is refused for a third reason, and the reason is the
+        verb's whole purpose: `run cancel --discard` is destructive by
+        request, and a resume that reopened it would leave the operator with
+        no way to end a run. The non-destructive stop is `run pause`, which
+        declares no outcome and therefore never reaches this predicate.
+
         A `CANCELLED` carrying no cause at all — a ledger written before the
         column — is refused with the abandoned case. The migration invents no
         facts, and guessing that an unrecorded cancellation was merely a pause
@@ -1729,12 +1816,17 @@ class LifecycleStore:
                 f"{outcome.value} run (§7.3) — it is not reopenable")
         if (outcome is st.RunOutcome.CANCELLED
                 and cause not in st.REOPENABLE_CANCEL_CAUSES):
-            why = ("was given up on node by node, and each of those nodes was "
-                   "adjudicated as work the run should finish without"
-                   if cause is st.CancelCause.ABANDONED else
-                   "records no cause at all — its ledger predates the column, "
-                   "and reading an unrecorded cancellation as a pause is the "
-                   "guess that reopens an adjudicated run")
+            if cause is st.CancelCause.ABANDONED:
+                why = ("was given up on node by node, and each of those nodes "
+                       "was adjudicated as work the run should finish without")
+            elif cause is st.CancelCause.DISCARDED:
+                why = ("was discarded — `run cancel --discard` is the verb "
+                       "that ends a run for good, and `run pause` is the one "
+                       "that stops a run you mean to come back to")
+            else:
+                why = ("records no cause at all — its ledger predates the "
+                       "column, and reading an unrecorded cancellation as a "
+                       "pause is the guess that reopens an adjudicated run")
             raise ResumeRefused(
                 f"{run_id}: resume is refused against a run declared CANCELLED "
                 f"with cause {cause.value if cause else 'unrecorded'} (§7.3) — "
