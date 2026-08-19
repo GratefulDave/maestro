@@ -1157,6 +1157,21 @@ class Scheduler:
         self._require_running(record)
         measured = wt.delta(baseline, after)
         permission = wt.permission_check(attempt, measured, node.outputs)
+        ignored = wt.existing_ignored_outputs(
+            attempt.path, node.outputs, after, attempt.ignored_at_base)
+        if ignored:
+            # The file is on disk and matches a declared output, but git
+            # will not carry it. An empty commit here is a silent success.
+            verdict = vf.VerificationVerdict(
+                verified=False, failed_clause=4,
+                reason=("declared output exists on disk but is gitignored "
+                        "and cannot reach the commit: "
+                        + ", ".join(ignored)),
+                block_reason=st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE,
+                offending_paths=ignored)
+            self._settle_context(context)
+            self._settle_verdict(node, verdict, execution, record)
+            return
 
         if node.kind is st.NodeKind.CODE:
             verdict = vf.verify_code_node(

@@ -114,14 +114,15 @@ class RetryClassTests(unittest.TestCase):
             {c for c in st.RetryClass if st.mutates_prompt(c)},
             {st.RetryClass.SEMANTIC})
 
-    def test_three_reasons_classify_to_no_retry_class(self):
+    def test_deterministic_reasons_classify_to_no_retry_class(self):
         """§7.5 — retry cannot change a deterministic fact about the plan
         evaluated against an unchanged base."""
         self.assertEqual(
             set(st.NON_RETRYABLE),
             {st.BlockReason.GATE_NOT_FALSIFIABLE,
              st.BlockReason.CODE_NODE_NO_EFFECT,
-             st.BlockReason.PERMISSION_SCOPE_VIOLATION})
+             st.BlockReason.PERMISSION_SCOPE_VIOLATION,
+             st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE})
         # The `is_retryable(reason)` predicate that stood here was deleted: it
         # had no production caller, because `classify` already decides
         # retryability from the RetryClass at classification time and a

@@ -2275,6 +2275,50 @@ def _refuse_base_commit_divergence(args: argparse.Namespace,
     return None
 
 
+def _refuse_uncommittable_outputs(args: argparse.Namespace,
+                                  plan: plan_model.Plan) -> Optional[int]:
+    """Fail closed when a node declares an output git will not commit.
+
+    A gitignored path is outside `git ls-files --cached --others
+    --exclude-standard`, so it is outside the measured delta, outside §8.3's
+    permission check, and outside §8.4's commit. The node writes the file, the
+    gate may even pass over it, and the attempt commits nothing — a silent
+    empty success that costs a whole attempt to discover. `git check-ignore`
+    answers the question from the plan alone, before any worktree is created.
+
+    Placed beside `_refuse_base_commit_divergence` and, like it, at run start
+    only. Both are preflights over the plan as authored, and the answer here
+    is a function of the plan's declared outputs and the repository's ignore
+    rules — neither of which the run itself writes, so re-asking on resume
+    could only change its answer if an operator edited `.gitignore` mid-run.
+    Refusing a resume for that would strand a run whose plan cannot be edited
+    (the plan hash is checked at resume), with no repair but abandon. The
+    resumed case is not left unguarded: `worktree.existing_ignored_outputs`
+    runs at every attempt settle regardless of resume and blocks with the same
+    `DECLARED_OUTPUT_UNCOMMITTABLE`, paying one attempt for the discovery
+    instead of none.
+
+    Globs are not asked about here — `check-ignore` names paths, not patterns
+    — so a glob that happens to cover ignored files is caught at settle.
+    """
+    nodes = getattr(plan, "nodes", None) or ()
+    ignored = []
+    try:
+        for node in nodes:
+            outputs = getattr(node, "outputs", None) or ()
+            hits = worktree.outputs_ignored_in_repo(Path(args.repo), outputs)
+            for path in hits:
+                ignored.append((getattr(node, "node_id", "?"), path))
+    except worktree.WorktreeError:
+        return None
+    if not ignored:
+        return None
+    detail = "; ".join(
+        "{0} declares {1}, which git check-ignore excludes".format(nid, path)
+        for nid, path in ignored)
+    return _refusal("DECLARED_OUTPUT_UNCOMMITTABLE", detail)
+
+
 def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> None:
     """Refuse lifecycle authority writable through a run participant boundary.
 
@@ -2813,6 +2857,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             store.resume_run(args.run_id)
         else:
             refused = _refuse_base_commit_divergence(args, plan)
+            if refused is not None:
+                return refused
+            refused = _refuse_uncommittable_outputs(args, plan)
             if refused is not None:
                 return refused
         # Not `elif`: a resumed run whose predecessor released the checkout has

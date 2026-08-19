@@ -8,6 +8,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE`, and the two checks that raise it: a declared output
+  git will not commit is now a refusal instead of a silent empty success. `inventory()`'s universe
+  is `git ls-files --cached --others --exclude-standard`, so a **gitignored** declared output is
+  invisible to the measured delta, to §8.3's permission check, and to §8.4's commit at once. The
+  node writes the file, the gate can pass over it, the permission check finds nothing to convict
+  on, and the attempt commits nothing — the run reports ACCEPTED over an output that never reached
+  the tree. Two structural checks close it, and neither reads prose or an agent's claim about its
+  own work (§1.2): `worktree.outputs_ignored_in_repo` asks `git check-ignore` about the plan's
+  concrete declared outputs at run start, and `worktree.existing_ignored_outputs` compares sha256
+  digests of the on-disk paths absent from the after-inventory against the ones recorded when the
+  bracket opened.
+
+  The run-start refusal sits beside `_refuse_base_commit_divergence` in `_execute_run`, under the
+  same `if resuming: … else:` guard and for the same reason: both are preflights over the plan as
+  authored, and the answer here is a function of the declared outputs and the repository's ignore
+  rules, neither of which the run itself writes. Refusing on resume could only fire where an
+  operator edited `.gitignore` mid-run, and would strand a run whose plan cannot be edited — the
+  plan hash is checked at resume — with no repair but abandon. The resumed case is not left
+  unguarded: the attempt-settle detector runs regardless of resume and blocks with the same reason,
+  paying one attempt for the discovery instead of none. Globs are not put to `check-ignore`, which
+  names paths rather than patterns, so a glob that happens to cover ignored files is caught at
+  settle.
+
+  The false-positive that made this hard to get right is a provisioned `.venv`: it is gitignored
+  *and* legitimately present, and must not convict a node that declared `*.py` and wrote one
+  perfectly committable file. `AttemptWorktree.ignored_at_base` — recorded by `take_baseline`
+  alongside the baseline itself — is the before-side that separates the two, so only a path the
+  attempt created, or whose bytes it changed, is named. Like `baseline`, it is left `None` by
+  `reopen_attempt_worktree`, and `existing_ignored_outputs` refuses a `None` before-side rather
+  than reading it as an empty one, because an empty before-side attributes an entire provisioned
+  dependency tree to the node. Carried with `tests/test_permission_delta_ignored_paths.py`, whose
+  new cases include the pre-fix state asserted directly — file on disk, empty measured delta,
+  permission check passing — the `.venv` guard end to end through the scheduler, and a run that
+  refuses before any scheduler is constructed.
+
 - `runs.scheduler_start_epoch`, and `lifecycle.scheduler_signal_pid` which reads it: recorded
   process identity for the scheduler that claimed a run. `scheduler_liveness` answers only "is
   there a process with this number?", and the kernel reuses pid numbers, so a stranger that
