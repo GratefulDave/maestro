@@ -371,7 +371,12 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
             store.declare_outcome("run1")
             store.resume_run("run1")  # BLOCKED
 
-    def test_resume_is_refused_against_accepted_and_cancelled(self):
+    def test_resume_is_refused_against_accepted_and_against_abandonment(self):
+        """The two runs that reached a result. `ACCEPTED` reached the run's
+        declared outcome; a run abandoned node by node had every node
+        individually adjudicated as work it should finish without. A run
+        stopped by `run cancel` adjudicated nothing and is resumable —
+        tests/test_run_cancel_resume.py owns that half."""
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))
             store.create_run("run1", "d", [make_node("a", 0)])
@@ -384,8 +389,13 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
 
             store2 = new_store(Path(tmp) / "second")
             store2.create_run("run1", "d", [make_node("a", 0)])
-            store2.cancel_run("run1")
+            store2.start_attempt("run1", "a", base_sha="s1")
+            store2.mark_blocked("run1", "a", st.BlockReason.CREDENTIAL_REFUSED)
             store2.declare_outcome("run1")
+            store2.abandon("run1", "a")
+            store2.declare_outcome("run1")
+            self.assertEqual(store2.latest_outcome("run1"),
+                             st.RunOutcome.CANCELLED)
             with self.assertRaises(lc.LifecycleError):
                 store2.resume_run("run1")
 
