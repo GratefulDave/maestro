@@ -53,6 +53,32 @@ function span(run: MaestroRunSummary): string {
   return fmtDuration((Number.isFinite(to) ? to : nowMs.value) - from)
 }
 
+/**
+ * How many nodes are in each state, ordered by how much they demand attention.
+ *
+ * The dots show the SHAPE of a run; on a fourteen-node plan they stop
+ * answering "how far along is it". The counts are the same rows, totalled, so
+ * a run's progress is readable without opening it or counting squares.
+ * Unrecognised states sort last rather than being dropped — a state this file
+ * has not heard of is exactly the one worth seeing.
+ */
+const STATE_ORDER = ['RUNNING', 'BLOCKED', 'PENDING', 'READY', 'VERIFIED', 'MERGED', 'CANCELLED']
+
+function stateCounts(run: MaestroRunSummary): { state: string; n: number }[] {
+  const counts = new Map<string, number>()
+  for (const node of run.node_states) counts.set(node.state, (counts.get(node.state) ?? 0) + 1)
+  const ordered: { state: string; n: number }[] = []
+  for (const state of STATE_ORDER) {
+    const n = counts.get(state)
+    if (n) {
+      ordered.push({ state, n })
+      counts.delete(state)
+    }
+  }
+  for (const [state, n] of counts) ordered.push({ state, n })
+  return ordered
+}
+
 /** One dot per node, so the shape of the run is legible from the index. */
 function dotClass(state: string): string {
   if (state === 'MERGED' || state === 'VERIFIED') return 'good'
@@ -81,8 +107,12 @@ function dotClass(state: string): string {
           <MaestroStateChip :state="run.state" />
         </div>
 
+        <!-- The digest is the plan's identity in the ledger; the name only
+             exists when the plan files are still installed and unchanged, so
+             it is shown alongside rather than instead. -->
         <div class="row">
           <code class="run-id">{{ run.run_id }}</code>
+          <code class="digest" :title="run.plan_digest">{{ run.plan_digest.slice(0, 12) }}</code>
         </div>
 
         <div class="dots" :title="`${run.node_count} nodes`">
@@ -94,6 +124,16 @@ function dotClass(state: string): string {
             :title="`${node.node_id} — ${node.state}`"
           />
           <span v-if="!run.node_states.length" class="dim small">no nodes projected</span>
+        </div>
+
+        <div v-if="run.node_states.length" class="row counts">
+          <span class="dim small">{{ run.node_count }} nodes</span>
+          <span class="tallies">
+            <span v-for="tally in stateCounts(run)" :key="tally.state" class="tally small">
+              <span class="dot" :class="dotClass(tally.state)" />
+              {{ tally.state.toLowerCase() }} {{ tally.n }}
+            </span>
+          </span>
         </div>
 
         <div class="row foot">
@@ -205,6 +245,40 @@ function dotClass(state: string): string {
   background: var(--blue);
   box-shadow: 0 0 9px rgba(108, 182, 255, 0.8);
   animation: pulse 1.6s ease-in-out infinite;
+}
+
+.counts {
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  justify-content: flex-start;
+}
+
+.tallies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+}
+
+.tally {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  color: var(--dim);
+}
+
+.tally .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.digest {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--faint);
+  flex: none;
 }
 
 .small {

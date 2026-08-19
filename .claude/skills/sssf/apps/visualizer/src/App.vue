@@ -62,6 +62,21 @@ const fallbackMaestro = computed(() =>
   !tracerSource.value ? (sources.value.find((s) => s.kind === 'maestro') ?? null) : null,
 )
 
+/**
+ * The source the breadcrumb and the tab strip describe, which is not always
+ * the one the route names.
+ *
+ * A bare `#/` on a Maestro-only server renders `fallbackMaestro`'s run index,
+ * but the route names no source — so the crumb read "sessions" and linked to
+ * the tracer route, a view that server does not serve, and no tab was marked
+ * current while one of them was plainly on screen. Resolving the landing
+ * source once here keeps every piece of navigation pointing at the view that
+ * is actually rendered.
+ */
+const shownSource = computed(
+  () => activeSource.value ?? (route.value.adwId ? null : fallbackMaestro.value),
+)
+
 const showTabs = computed(() => sources.value.length > 1)
 </script>
 
@@ -77,12 +92,12 @@ const showTabs = computed(() => sources.value.length > 1)
           <rect x="4" y="21" width="13" height="5" rx="2.5" fill="#5ad2dd" />
         </svg>
         <span class="brand">Maestro</span>
-        <template v-if="activeSource">
+        <template v-if="shownSource">
           <span class="sep">›</span>
           <a
-            :href="hrefForSource(activeSource.id)"
+            :href="hrefForSource(shownSource.id)"
             :class="{ current: !route.runId }"
-            >{{ activeSource.label }} runs</a
+            >{{ shownSource.label }} runs</a
           >
           <template v-if="route.runId">
             <span class="sep">›</span>
@@ -114,7 +129,9 @@ const showTabs = computed(() => sources.value.length > 1)
         v-for="source in sources"
         :key="source.id"
         class="tab"
-        :class="{ current: source.kind === 'sssf' ? !route.sourceId : route.sourceId === source.id }"
+        :class="{
+          current: source.kind === 'sssf' ? !route.sourceId : shownSource?.id === source.id,
+        }"
         :href="source.kind === 'sssf' ? hrefFor() : hrefForSource(source.id)"
       >
         <span class="tab-kind">{{ source.kind }}</span>
