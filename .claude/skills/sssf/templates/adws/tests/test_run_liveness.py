@@ -32,6 +32,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -81,12 +82,12 @@ class ACancelThatFinishedIsCancelled(unittest.TestCase):
 
     def test_a_run_abandoned_node_by_node_reads_cancelled_too(self):
         """`abandon` sets no `cancel_requested`; §7.3's outcome function still
-        declares the run CANCELLED at quiescence. Reading that declaration is
-        safe in exactly this branch, because a settled run cannot have moved
-        past it — a resume returns nodes to PENDING and un-settles it. Without
-        it this function answered QUIESCENT about a run the scheduler called
-        CANCELLED, and the dashboard's copy of this rule answered CANCELLED:
-        two answers to one question."""
+        declares the run CANCELLED at quiescence. Mixes of MERGED and
+        CANCELLED still read that declaration — the leftover-declaration
+        rule must not swallow abandon-by-node. Without it this function
+        answered QUIESCENT about a run the scheduler called CANCELLED, and
+        the dashboard's copy of this rule answered CANCELLED: two answers
+        to one question."""
         nodes = [node_row("a", st.NodeState.CANCELLED),
                  node_row("b", st.NodeState.CANCELLED)]
         self.assertEqual(
@@ -112,6 +113,27 @@ class ACancelThatFinishedIsCancelled(unittest.TestCase):
             derive(record(pid=os.getpid(), outcome=st.RunOutcome.CANCELLED),
                    nodes, alive=True),
             "PENDING")
+
+    def test_a_resumed_run_whose_nodes_have_all_merged_is_merged_not_cancelled(self):
+        """Resume clears `cancel_requested` and leaves `latest_outcome=CANCELLED`
+        until the scheduler declares again. Once every reopened node is MERGED
+        the live rows contradict that leftover declaration — this is the
+        final-acceptance window, and projecting CANCELLED here is §19 M5's
+        stale-outcome defect (issue #39's sibling)."""
+        nodes = [node_row("a", st.NodeState.MERGED),
+                 node_row("b", st.NodeState.MERGED)]
+        rec = record(outcome=st.RunOutcome.CANCELLED, cancel=False)
+        self.assertFalse(rec.cancel_requested)
+        self.assertIs(rec.latest_outcome, st.RunOutcome.CANCELLED)
+        self.assertEqual(derive(rec, nodes, alive=False), "MERGED")
+
+    def test_a_mix_of_merged_and_cancelled_still_reads_the_declaration(self):
+        """Abandon-by-node: the outcome function declares CANCELLED and sets
+        no `cancel_requested`. All-MERGED must not steal that case."""
+        nodes = [node_row("a", st.NodeState.MERGED),
+                 node_row("b", st.NodeState.CANCELLED)]
+        rec = record(outcome=st.RunOutcome.CANCELLED, cancel=False)
+        self.assertEqual(derive(rec, nodes, alive=False), "CANCELLED")
 
     def test_it_is_cancelled_even_while_the_scheduler_is_still_alive(self):
         """`cancel_run` writes every node in one transaction, so a live
@@ -379,6 +401,161 @@ class TheOwnerIsWrittenToTheLedger(unittest.TestCase):
             reader.close()
         self.assertTrue(rec.cancel_requested)
         self.assertIsNone(rec.scheduler_pid)
+
+
+def _write_pre_migration_ledger(db: Path) -> None:
+    """A ledger that predates `_ADDED_COLUMNS` on both tables the migration
+    covers. `SCHEMA` is `CREATE TABLE IF NOT EXISTS`, so opening this path
+    is what actually runs the ALTER."""
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY,"
+            " plan_digest TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " last_transition_at TEXT NOT NULL, latest_outcome TEXT,"
+            " latest_outcome_at TEXT,"
+            " cancel_requested INTEGER NOT NULL DEFAULT 0)")
+        conn.execute(
+            "CREATE TABLE node_lifecycle ("
+            " run_id TEXT NOT NULL, node_id TEXT NOT NULL,"
+            " state TEXT NOT NULL, attempt_no INTEGER NOT NULL DEFAULT 0,"
+            " block_reason TEXT, output_sha TEXT,"
+            " granted_extra_attempts INTEGER NOT NULL DEFAULT 0,"
+            " updated_at TEXT NOT NULL,"
+            " PRIMARY KEY (run_id, node_id))")
+        conn.execute(
+            "INSERT INTO runs VALUES ('old','d','t','t',NULL,NULL,0)")
+
+
+class ConcurrentCancelCauseMigration(unittest.TestCase):
+    """Two processes first-opening one pre-migration ledger must both
+    succeed. The check-then-ALTER used to race: both saw the column
+    missing, the second died with `duplicate column name`."""
+
+    def test_two_openers_on_a_pre_migration_ledger_both_succeed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "lifecycle.sqlite3"
+            _write_pre_migration_ledger(db)
+            opener_count = 8
+            start = threading.Barrier(opener_count)
+            errors: list[str] = []
+            stores: list[lc.LifecycleStore] = []
+            lock = threading.Lock()
+
+            def open_it() -> None:
+                start.wait()
+                try:
+                    store = lc.LifecycleStore(db)
+                except BaseException as error:  # noqa: BLE001
+                    errors.append(f"{type(error).__name__}: {error}")
+                    return
+                with lock:
+                    stores.append(store)
+
+            threads = [threading.Thread(target=open_it)
+                       for _ in range(opener_count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(
+                errors, [],
+                "opening a pre-migration ledger must not fail on contention")
+            self.assertEqual(len(stores), opener_count)
+            try:
+                run_columns = lc._table_columns(stores[0].conn, "runs")
+                node_columns = lc._table_columns(
+                    stores[0].conn, "node_lifecycle")
+            finally:
+                for store in stores:
+                    store.close()
+            for name, _kind in lc._RUNS_ADDED_COLUMNS:
+                self.assertEqual(run_columns.count(name), 1, name)
+            for name, _kind in lc._NODE_LIFECYCLE_ADDED_COLUMNS:
+                self.assertEqual(node_columns.count(name), 1, name)
+
+
+class AResumedAcceptanceWindowIsMerged(unittest.TestCase):
+    """Drive resume itself, then derive from the rows it left behind."""
+
+    @staticmethod
+    def _node(node_id: str) -> st.PlanNode:
+        return st.PlanNode(node_id=node_id, kind=st.NodeKind.CODE, depth=0,
+                           needs=(), command=("true",))
+
+    @staticmethod
+    def _merge(store: lc.LifecycleStore, run_id: str, node_id: str,
+               sha: str) -> None:
+        store.start_attempt(run_id, node_id, base_sha="base")
+        store.mark_verified(run_id, node_id, output_sha=sha)
+        store.mark_merged(run_id, node_id)
+
+    def test_resume_then_every_node_merged_reads_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "lifecycle.sqlite3"
+            store = lc.LifecycleStore(db)
+            try:
+                store.create_run("run1", "d" * 64,
+                                 [self._node("a"), self._node("b")])
+                store.cancel_run("run1")
+                store.declare_outcome("run1")
+                store.resume_run("run1")
+                self._merge(store, "run1", "a", "sha_a")
+                self._merge(store, "run1", "b", "sha_b")
+            finally:
+                store.close()
+            reader = lc.LifecycleReader.open(db)
+            try:
+                rec = reader.run("run1")
+                nodes = reader.nodes("run1")
+            finally:
+                reader.close()
+            self.assertFalse(rec.cancel_requested)
+            self.assertIs(rec.latest_outcome, st.RunOutcome.CANCELLED)
+            self.assertEqual(
+                {node.node_id: node.state for node in nodes},
+                {"a": st.NodeState.MERGED, "b": st.NodeState.MERGED})
+            self.assertEqual(lc.derive_run_state(rec, nodes), "MERGED")
+
+    def test_abandon_by_node_still_reads_cancelled_after_a_merge(self):
+        """A run holding both causes: resume reopens RUN_CANCEL nodes and
+        leaves the abandoned one CANCELLED. After the reopened work merges,
+        the leftover declaration must still win — that mix is not the
+        all-MERGED final-acceptance window."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "lifecycle.sqlite3"
+            store = lc.LifecycleStore(db)
+            try:
+                store.create_run(
+                    "run1", "d" * 64,
+                    [self._node("merged"), self._node("stopped"),
+                     self._node("given-up")])
+                self._merge(store, "run1", "merged", "sha_merged")
+                store.start_attempt("run1", "given-up", base_sha="base")
+                store.mark_blocked(
+                    "run1", "given-up", st.BlockReason.CREDENTIAL_REFUSED)
+                store.declare_outcome("run1")
+                store.abandon("run1", "given-up")
+                store.cancel_run("run1")
+                store.declare_outcome("run1")
+                store.resume_run("run1")
+                self._merge(store, "run1", "stopped", "sha_stopped")
+            finally:
+                store.close()
+            reader = lc.LifecycleReader.open(db)
+            try:
+                rec = reader.run("run1")
+                nodes = reader.nodes("run1")
+            finally:
+                reader.close()
+            self.assertFalse(rec.cancel_requested)
+            self.assertIs(rec.latest_outcome, st.RunOutcome.CANCELLED)
+            self.assertEqual(
+                {node.node_id: node.state for node in nodes},
+                {"merged": st.NodeState.MERGED,
+                 "stopped": st.NodeState.MERGED,
+                 "given-up": st.NodeState.CANCELLED})
+            self.assertEqual(lc.derive_run_state(rec, nodes), "CANCELLED")
 
 
 if __name__ == "__main__":

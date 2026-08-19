@@ -281,18 +281,37 @@ def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
     safe direction, since the alternative is guessing that a run nobody
     recorded a cause for was merely paused.
 
+    Concurrent openers are a supported case — `_enable_wal` says so
+    explicitly. The `PRAGMA table_info` check and the `ALTER TABLE` that
+    follows therefore have to be one serialized transaction: two processes
+    that both observe a missing column would otherwise both issue ALTER, and
+    the second dies with `duplicate column name` at the first run or resume
+    that touches a pre-migration ledger.
+
     Returns `table.column` for each addition, so a caller cannot mistake two
     same-named columns on different tables for one.
     """
     added = []
-    for table, columns in _ADDED_COLUMNS:
-        present = set(_table_columns(conn, table))
-        for name, kind in columns:
-            if name in present:
-                continue
-            conn.execute(
-                "ALTER TABLE {0} ADD COLUMN {1} {2}".format(table, name, kind))
-            added.append("{0}.{1}".format(table, name))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, columns in _ADDED_COLUMNS:
+            present = set(_table_columns(conn, table))
+            for name, kind in columns:
+                if name in present:
+                    continue
+                try:
+                    conn.execute(
+                        "ALTER TABLE {0} ADD COLUMN {1} {2}".format(
+                            table, name, kind))
+                except sqlite3.OperationalError as error:
+                    if "duplicate column name" not in str(error).lower():
+                        raise
+                    continue
+                added.append("{0}.{1}".format(table, name))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     return tuple(added)
 
 
@@ -1720,15 +1739,20 @@ def derive_run_state(
     2. A run whose every node is absolutely terminal is *settled*, whatever any
        process is doing. Cancellation that reached every node is CANCELLED, not
        CANCELLING — this is the second observed defect, and it needs no
-       liveness check at all because the node rows already say it. This is
-       also the one branch that reads `latest_outcome`, and the only branch
-       where reading it is safe: a settled run cannot have moved past its
-       declaration, because a resume returns nodes to PENDING and un-settles
-       it. That matters for the run abandoned node by node, which §7.3's
-       outcome function declares CANCELLED and which sets no
-       `cancel_requested` — without it this function answers QUIESCENT about
-       a run the scheduler called CANCELLED, which is two answers to one
-       question (RC1).
+       liveness check at all because the node rows already say it.
+
+       This is also the one branch that reads `latest_outcome`. Live node
+       rows that already contradict a leftover declaration win. `run resume`
+       clears `cancel_requested` but deliberately retains
+       `latest_outcome=CANCELLED` until the scheduler declares again. Once
+       every reopened node is MERGED the rows say MERGED; treating the
+       leftover declaration as the live state is §19 M5's stale-outcome
+       projection during the final-acceptance window. Mixes of MERGED and
+       CANCELLED still read the declaration so an abandon-by-node run stays
+       CANCELLED — §7.3's outcome function declares CANCELLED and sets no
+       `cancel_requested`, and the declaration is the typed statement that
+       it is. A resume still in flight returns nodes to PENDING and leaves
+       this branch entirely.
     3. Otherwise there is work left. Work left with a provably dead scheduler
        is ABANDONED, but only where the death matters: a run with a node still
        RUNNING (nothing can finish it), or one that never declared an outcome
@@ -1741,11 +1765,12 @@ def derive_run_state(
     if not states:
         return "EMPTY"
     if all(state in st.ABSOLUTELY_TERMINAL for state in states):
+        all_merged = all(state is st.NodeState.MERGED for state in states)
+        if all_merged and not record.cancel_requested:
+            return "MERGED"
         if (record.cancel_requested
                 or record.latest_outcome is st.RunOutcome.CANCELLED):
             return "CANCELLED"
-        if all(state is st.NodeState.MERGED for state in states):
-            return "MERGED"
         return "QUIESCENT"
     running = any(state is st.NodeState.RUNNING for state in states)
     alive = scheduler_liveness(record, is_alive=is_alive, host=host)
