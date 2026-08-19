@@ -56,20 +56,25 @@ you touched, and mirror deliberately rather than assuming a mirror already happe
 
 **State as of 2026-08-18.** The two template copies were reconciled that day and are identical
 for every tracked file — `tests/test_template_parity.py` passes from this repo, and its mirror
-passes from the-library. Neither deployment was brought level, and the cost of that is now
-measured rather than assumed. `lexgenius-pipeline/adws/` still differs from the template in
-twelve modules and seventeen test modules, and is missing `handoff_budget.py` outright. The
-divergence that matters is in `code_review.py`: the deployed copy has **no `_node_goal`
-function**, so the M1 reviewer-contract fix has never reached it, and run
+passes from the-library. `lexgenius-pipeline/adws/` **was** brought level by hand later the same
+day: `diff -rq` against the template reports exactly one differing tracked file,
+`maestro.config.yaml`, which is deployment-specific by design, plus deployment-only directories
+and a stray `maestro.py.orig`. What that reconciliation cost is measured rather than assumed,
+because it was made after the divergence had already been paid for. Beforehand the deployment
+differed in twelve modules and seventeen test modules, was missing `handoff_budget.py` outright,
+and — the divergence that had a cost — its `code_review.py` carried **no `_node_goal`
+function**, so the M1 reviewer-contract fix had never reached it, and run
 `run-0120c32064d144c2aa55c344087e0b0a` had every reviewer told "Make the gate '…' pass over
 selector '…', changing only the declared outputs" — verbatim, while the plan it was running
-carried the correct instruction. See §19 M13. `lexgenius/adws/` is behind by at least as much:
-its most recent `adws/` commit is the reviewer-report fix, so it is missing every launcher,
-worktree, run-state, and reviewer-contract fix that landed after it, and it holds files the
-template does not (`adw_data/`, `adw_sssf_config/`, a stray `worktree.py.orig`).
+carried the correct instruction. See §19 M13. Nothing enforces the level state and nothing would
+notice it drifting again (§16.3 item 50), so re-derive it rather than trusting this paragraph.
+`lexgenius/adws/` was not touched and is far behind: its most recent `adws/` commit is the
+reviewer-report fix, so it is missing every launcher, worktree, run-state, and reviewer-contract
+fix that landed after it — `adw_modules/code_review.py` does not exist there at all — and it
+holds files the template does not (`adw_data/`, `adw_sssf_config/`, a stray `worktree.py.orig`).
 
-Do not read "reconciled" as covering either deployment, and do not read a `diff -rq` filename as
-a cost — `code_review.py` was reported as differing the whole time it was silently degrading
+Do not read "reconciled" as covering `lexgenius/adws/`, do not read it as a state anything
+maintains, and do not read a `diff -rq` filename as a cost — `code_review.py` was reported as differing the whole time it was silently degrading
 every review in that deployment. Re-derive this paragraph with `diff -rq` before relying on it;
 it is a dated observation, not an invariant, and the only invariant here is the parity test
 between the two template copies. For the one divergence with a known behavioural cost there is a

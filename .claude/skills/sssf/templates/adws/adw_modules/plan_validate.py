@@ -584,10 +584,43 @@ def _gate_executable(plan: "pm.Plan", repo: Path,
                 "{0}'s working directory leaves the repository: {1}".format(
                     label, gate.cwd)))
             return
-        if paths and all(path in produced for path in paths):
-            # The produced arm: a collection count here would have to be zero,
-            # because the node exists to create what the selector names.
-            return
+        if paths:
+            unproduced = tuple(path for path in paths if path not in produced)
+            if not unproduced:
+                # The produced arm: a collection count here would have to be
+                # zero, because the node exists to create what the selector
+                # names.
+                return
+            if len(unproduced) < len(paths):
+                # The mixed arm. `all(...)` used to decide this, so a selector
+                # naming one already-merged test file alongside files the run
+                # will create missed the produced arm entirely and was
+                # collected whole at base — where one absent path makes the
+                # runner refuse and report zero for the entire selector.
+                # Measured: 11 cases collected from a pre-existing file, 0
+                # from the same file plus one not-yet-written path.
+                #
+                # So collect the unproduced subset alone, and compare it
+                # against one, not against `min_cases`. `min_cases` counts
+                # what the gate must pass *after* merge, when the produced
+                # paths exist; a base-time count over part of the selector is
+                # not that quantity, and asserting it is refuses every plan
+                # whose gate spans merged and unmerged work.
+                restricted = pm.restrict_selector(gate, unproduced)
+                collected = collector.collect(restricted, repo)
+                if collected < 1:
+                    blockers.append(Blocker(
+                        Obligation.GATE_EXECUTABLE, pointer + "/argv",
+                        "{0}'s selector mixes {1} path(s) the plan produces "
+                        "with {2} that exist at base; those {2} collect {3} "
+                        "case(s), so the part of the selector that could be "
+                        "executable now names nothing. min_cases ({4}) is not "
+                        "the comparand for a base-time count over part of a "
+                        "selector: {5}".format(
+                            label, len(paths) - len(unproduced),
+                            len(unproduced), collected, gate.min_cases,
+                            ", ".join(unproduced))))
+                return
         collected = collector.collect(gate, repo)
         if collected < gate.min_cases:
             blockers.append(Blocker(

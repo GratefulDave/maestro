@@ -49,6 +49,7 @@ both were forced by reading the code rather than the document:
 
 from __future__ import annotations
 
+import posixpath
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -60,6 +61,7 @@ from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
 from . import code_review as cr
 from . import launcher as lch
 from . import lifecycle as lc
+from . import plan_model as pm
 from . import retry_policy as rp
 from . import scheduler_types as st
 from . import verification as vf
@@ -926,12 +928,20 @@ class Scheduler:
                 self._require_running(record)
                 pre = self.deps.run_gate(
                     attempt, node, "pre", self._cancelled.is_set)
-                # A selector this node is declared to produce, absent at its
-                # base, is the red clause 2 asks for -- not a broken runner.
-                selector = (node.gate_selector or "").strip()
-                unbuilt = bool(
-                    selector and selector in node.outputs
-                    and not (attempt.path / selector).exists())
+                # A selector path this node is declared to produce, absent
+                # at its base, is the red clause 2 asks for -- not a broken
+                # runner. Asked per path, because the runner refuses to
+                # collect the *whole* selector when any one path is missing:
+                # a two-path selector whose first file already exists still
+                # exits 4 with no counts. Asked of the joined string, as it
+                # was, the test could only ever match a single-path selector,
+                # so every multi-path node read as ENVIRONMENTAL and retried
+                # an identically absent file until its budget was gone.
+                declared = {posixpath.normpath(path) for path in node.outputs}
+                unbuilt = any(
+                    path in declared and not (attempt.path / path).exists()
+                    for path in pm.selector_string_paths(
+                        node.gate_selector or ""))
                 pre_verdict = vf.adjudicate_pre_gate(
                     pre, node.gate_min_cases, selector_unbuilt=unbuilt)
         finally:
