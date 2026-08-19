@@ -94,7 +94,9 @@ For each deployment-ahead file, one of three answers:
    with test evidence, after which the deployment mirrors clean.
 2. It is local divergence that should not survive → discard it explicitly with
    `tools/runtime_sync.py mirror … --overwrite-ahead`, having first confirmed by
-   digest what is being discarded.
+   digest what is being discarded. The commit `--commit` writes names every file
+   that flag discarded, so the discard is in the history rather than only in a
+   terminal somebody has since closed.
 3. The deployment owns it → add it to that entry's `pinned` list. It then stops
    being compared and starts being *named* in every report, instead of being
    refused on every future mirror. A refusal nobody can clear is a refusal
@@ -123,7 +125,10 @@ python3 tools/runtime_sync.py check-deployments <template> [--registry FILE]
 
 # one pair
 python3 tools/runtime_sync.py check  <template> <deployment> [--pin PATH ...]
-python3 tools/runtime_sync.py mirror <template> <deployment> [--pin PATH ...] --apply
+
+# copy and record, in one command
+python3 tools/runtime_sync.py mirror <template> <deployment> [--pin PATH ...] \
+    --apply --commit
 ```
 
 `check-deployments` reads the same registry the suite does and prints the same
@@ -133,3 +138,48 @@ against that exit code.
 
 `--pin` is the flag form of a registry entry's `pinned` list, so a failure the
 check reported can be reproduced verbatim rather than approximately.
+
+## Bringing a deployment level: one command
+
+`--apply --commit` is the whole procedure. Drop `--commit` only for a
+destination you deliberately want to leave unrecorded.
+
+```bash
+python3 tools/runtime_sync.py mirror <template> <deployment> --apply --commit
+```
+
+It copies with a sha256 assertion per file, then stages **only the paths it
+wrote** and commits them. Four properties, each of which is a thing that has
+gone wrong:
+
+* **It stages by name, never `git add -A` and never the runtime directory.** A
+  deployment is a live shared checkout: while this template's runtime was being
+  mirrored, the-library held 24 modified and 11 untracked files elsewhere in its
+  tree, none of them anything to do with the runtime. Sweeping those into a
+  commit that claims to be a mirror would be its own incident. Anything the
+  operator had already staged is left staged and uncommitted.
+* **It refuses to copy at all if the destination holds uncommitted work in a
+  file the mirror would overwrite** — whether the file is modified since its
+  last commit, or has never been committed at all. That is the case where a
+  mirror destroys the only copy of something, and a content comparison cannot
+  see it: bytes on disk say nothing about whether those bytes were ever recorded
+  anywhere. `lexgenius-pipeline` carried its entire 184-file runtime untracked,
+  which is how it was rewritten with stale bytes on 2026-08-19 with no diff for
+  anyone to read. The refusal names the file and asks you to commit or stash it;
+  nothing is copied and nothing is committed until you do.
+* **The commit message states what did *not* happen.** It names the source
+  revision the bytes came from, the counts, and every file held out
+  (deployment-owned or `pinned`), refused, discarded by `--overwrite-ahead`, or
+  present only in the deployment. A message claiming the copies were brought
+  level when eight files were held out is a false record, and records that do
+  not lie are this project's entire subject.
+* **It never pushes.** A local commit is recoverable; publishing one is not the
+  mirror's decision.
+
+If the destination is not inside a git working tree, the files are still
+mirrored and the report says plainly that the copy could not be recorded. Its
+arrival is then proved by digest and by nothing else — which is the state
+`--commit` exists to get a deployment out of.
+
+`--commit` requires `--apply`. Without it the run is a plan, and a plan has
+nothing to record.

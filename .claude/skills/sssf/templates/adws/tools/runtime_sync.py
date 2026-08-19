@@ -58,6 +58,17 @@ the answer to that sentence, and every design decision below is one clause of it
 6. **Nothing is ever deleted.** Files present only in the destination are
    reported as `left_in_destination` and left where they are. A mirror that
    prunes is the loss mode this module exists to prevent, so it does not prune.
+7. **A mirror can record itself, and a mirror that would destroy unrecorded work
+   refuses instead.** `mirror(apply=True, commit=True)` — `--apply --commit` —
+   stages *only the paths it wrote*, by name, and commits them with a message
+   saying which source revision the bytes came from, how many moved, and every
+   file held out or refused. It never pushes. Before it copies anything it asks
+   git what the destination already holds: a file with uncommitted changes, or
+   one git has never seen, stops the whole mirror by name rather than being
+   overwritten. Copying without recording is what made the 2026-08-19 loss
+   invisible — `lexgenius-pipeline`'s runtime was untracked across 184 files, so
+   it was rewritten with stale bytes and produced no diff for anyone to read —
+   and overwriting unrecorded work is the same loss from the other side.
 
 ## What it does not do
 
@@ -77,9 +88,17 @@ had happened to reach the object store minutes earlier. An unprompted write into
 such a repository is that incident with a larger blast radius. Detection is
 automatic; the write stays a command a person types.
 
-It also says nothing about whether a copy is committed:
-bytes agreeing on disk is not bytes agreeing in git, and a checkout whose runtime
-is untracked can be rewritten without leaving history no matter what this reports.
+`--commit` does not weaken that. It is not automation: it is the same explicit
+invocation doing its whole job, so that bringing a deployment level is one command
+instead of a mirror followed by a hand-written `git add` and `git commit`. It runs
+only when a person types it, it stages only what it wrote, and it never pushes —
+recording locally is recoverable, publishing is not this module's decision.
+
+`check` still says nothing about whether a copy is committed: bytes agreeing on
+disk is not bytes agreeing in git, and a checkout whose runtime is untracked can
+be rewritten without leaving history no matter what a comparison reports. That is
+the hole `--commit` closes on the write path, and the reason it refuses to write
+over a file git has never seen.
 
 Run:  uv run adw_test.py -k runtime_sync
 """
@@ -92,6 +111,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -195,6 +215,28 @@ DESTINATION_NEWER = "DESTINATION_NEWER"
 #: deletion, and bulk deletion is exactly what "the destination is longer" looks
 #: like from the source's side.
 DESTINATION_LONGER = "DESTINATION_LONGER"
+
+#: Outcomes of the optional recording step (`mirror --apply --commit`). Every
+#: one of them is a named value rather than a log line, because "did this mirror
+#: get written down?" is the question the 2026-08-19 loss turned on and an
+#: answer nobody can assert on is the state this module exists to leave behind.
+#:
+#:   COMMIT_NOT_REQUESTED    no --commit; the mirror said nothing about git
+#:   COMMIT_NOT_APPLIED      --commit without --apply; a plan commits nothing
+#:   COMMIT_NO_REPOSITORY    the destination is not inside a git repository
+#:   COMMIT_DESTINATION_DIRTY  the destination holds uncommitted work in files
+#:                           this mirror would overwrite; nothing was copied
+#:   COMMIT_NOTHING_TO_COMMIT  the mirror copied no file, so there is no record
+#:                           to make
+#:   COMMIT_RECORDED         a commit exists, and its sha is in the result
+#:   COMMIT_FAILED           git refused; its own words are in the result
+COMMIT_NOT_REQUESTED = "COMMIT_NOT_REQUESTED"
+COMMIT_NOT_APPLIED = "COMMIT_NOT_APPLIED"
+COMMIT_NO_REPOSITORY = "COMMIT_NO_REPOSITORY"
+COMMIT_DESTINATION_DIRTY = "COMMIT_DESTINATION_DIRTY"
+COMMIT_NOTHING_TO_COMMIT = "COMMIT_NOTHING_TO_COMMIT"
+COMMIT_RECORDED = "COMMIT_RECORDED"
+COMMIT_FAILED = "COMMIT_FAILED"
 
 
 class VerificationError(RuntimeError):
@@ -793,6 +835,119 @@ def copy_verified(source: os.PathLike | str, destination: os.PathLike | str) -> 
     return want
 
 
+def _git(repo: os.PathLike | str, *args: str) -> subprocess.CompletedProcess:
+    """Run one git command in ``repo`` and hand back the whole result.
+
+    Never raises on a non-zero exit: every caller here treats git's refusal as a
+    value to report by name, because a traceback out of a mirror says nothing
+    about which repository refused what.
+    """
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def git_repository_of(path: os.PathLike | str) -> Optional[pathlib.Path]:
+    """The working tree holding ``path``, or None when there is not one.
+
+    A checkout with no git at all is the ordinary case for a freshly unpacked
+    deployment, and it is not an error: the bytes still have to move. It only
+    means the copy cannot be recorded, which the caller says out loud.
+    """
+    resolved = pathlib.Path(path)
+    if not resolved.is_dir():
+        resolved = resolved.parent
+    result = _git(resolved, "rev-parse", "--show-toplevel")
+    if result.returncode != 0:
+        return None
+    top = result.stdout.strip()
+    return pathlib.Path(top) if top else None
+
+
+def source_revision(root: os.PathLike | str) -> str:
+    """A human-readable statement of which bytes a mirror is about to move.
+
+    Returned as prose rather than a bare sha because the honest answer has two
+    parts: the commit, and whether the working tree it was read from actually
+    matches that commit. A mirror out of a dirty tree copies bytes that are in
+    no commit anywhere, and a message naming only the sha would be a record that
+    cannot be resolved back to the bytes it describes.
+    """
+    resolved = pathlib.Path(root)
+    repository = git_repository_of(resolved)
+    if repository is None:
+        return "not a git checkout, so the revision of these bytes is unknown"
+    described = _git(resolved, "rev-parse", "--short", "HEAD")
+    if described.returncode != 0:
+        return "{repo}, which has no commits yet".format(repo=repository)
+    revision = described.stdout.strip()
+    dirty = _git(resolved, "status", "--porcelain", "--", str(resolved))
+    if dirty.returncode == 0 and dirty.stdout.strip():
+        return "{rev} plus uncommitted working-tree changes".format(rev=revision)
+    return revision
+
+
+def uncommitted_paths(
+    root: pathlib.Path, relatives: Iterable[str]
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Which of ``relatives`` under ``root`` hold work git does not have.
+
+    Returns ``(modified, never_committed)`` as runtime-relative paths — two
+    tuples rather than one, because they are two different losses. A *modified*
+    tracked file can be recovered from HEAD after a bad overwrite; a file git has
+    never seen exists nowhere else at all, which is exactly the state
+    `lexgenius-pipeline`'s 184-file runtime was in when it was rewritten with
+    stale bytes and no diff appeared anywhere.
+
+    Only paths that exist right now are considered. A planned copy that creates a
+    file destroys nothing, and a tracked file already deleted from the working
+    tree is still in HEAD.
+    """
+    repository = git_repository_of(root)
+    if repository is None:
+        return ((), ())
+    present = [rel for rel in relatives if (root / rel).exists()]
+    if not present:
+        return ((), ())
+    absolute = [str(root / rel) for rel in present]
+
+    def _relative_to_runtime(lines: str) -> List[str]:
+        found: List[str] = []
+        for name in lines.split("\0"):
+            if not name:
+                continue
+            candidate = (repository / name).resolve()
+            try:
+                found.append(candidate.relative_to(root).as_posix())
+            except ValueError:  # pragma: no cover - outside the runtime
+                continue
+        return found
+
+    # Both commands run from the working tree's top level, because `ls-files`
+    # reports paths relative to the *current directory* while `diff` reports
+    # them relative to the repository root. Run from the runtime directory the
+    # two disagree, and every untracked file silently failed to resolve back —
+    # which let precisely the bytes-that-exist-nowhere-else case through the
+    # gate it was written for.
+    modified: List[str] = []
+    if _git(repository, "rev-parse", "--verify", "--quiet", "HEAD").returncode == 0:
+        diffed = _git(repository, "diff", "--name-only", "-z", "HEAD", "--", *absolute)
+        if diffed.returncode == 0:
+            modified = _relative_to_runtime(diffed.stdout)
+
+    untracked: List[str] = []
+    listed = _git(
+        repository, "ls-files", "--others", "--exclude-standard", "-z", "--", *absolute
+    )
+    if listed.returncode == 0:
+        untracked = _relative_to_runtime(listed.stdout)
+
+    return tuple(sorted(set(modified))), tuple(sorted(set(untracked)))
+
+
 @dataclass(frozen=True)
 class Refusal:
     """One file the mirror declined to overwrite, and every signal that said so.
@@ -831,6 +986,88 @@ class Refusal:
 
 
 @dataclass(frozen=True)
+class CommitOutcome:
+    """Whether a mirror was written down, and if not, exactly why not.
+
+    A mirror that copies without recording leaves a checkout whose bytes changed
+    with no diff and no history — which is how `lexgenius-pipeline`'s runtime,
+    untracked in git across 184 files, was silently rewritten with stale bytes
+    and nobody could tell. So the recording is part of the operation, and its
+    outcome is a value with a named ``reason`` rather than something printed.
+
+    ``refused`` marks the two outcomes an operator must act on: a destination
+    holding uncommitted work in files this mirror would overwrite, and a commit
+    git would not make. Everything else is a legitimate resting state.
+    """
+
+    reason: str = COMMIT_NOT_REQUESTED
+    repository: Optional[pathlib.Path] = None
+    staged: Tuple[str, ...] = ()
+    modified: Tuple[str, ...] = ()
+    never_committed: Tuple[str, ...] = ()
+    revision: str = ""
+    message: str = ""
+    detail: str = ""
+
+    @property
+    def recorded(self) -> bool:
+        return self.reason == COMMIT_RECORDED
+
+    @property
+    def refused(self) -> bool:
+        return self.reason in (COMMIT_DESTINATION_DIRTY, COMMIT_FAILED)
+
+    def describe(self) -> List[str]:
+        if self.reason == COMMIT_NOT_REQUESTED:
+            return []
+        if self.reason == COMMIT_NOT_APPLIED:
+            return [
+                "  not committed: --commit records a mirror, and without --apply "
+                "there was no mirror to record."
+            ]
+        if self.reason == COMMIT_NO_REPOSITORY:
+            return [
+                "  not committed: this destination is not inside a git working "
+                "tree, so the copy cannot be recorded there. The files were "
+                "mirrored; their arrival is proved by digest and by nothing else."
+            ]
+        if self.reason == COMMIT_NOTHING_TO_COMMIT:
+            return ["  not committed: no file was copied, so there is nothing to record."]
+        if self.reason == COMMIT_DESTINATION_DIRTY:
+            lines = [
+                "  NOTHING WAS COPIED. The destination holds work git does not "
+                "have, in file(s) this mirror would have overwritten:",
+            ]
+            lines.extend(
+                "    {rel}: modified since the last commit".format(rel=rel)
+                for rel in self.modified
+            )
+            lines.extend(
+                "    {rel}: never committed — these bytes exist nowhere else".format(
+                    rel=rel
+                )
+                for rel in self.never_committed
+            )
+            lines.append(
+                "  Commit or stash them in {repo}, then re-run. Overwriting them "
+                "would destroy the only copy.".format(repo=self.repository)
+            )
+            return lines
+        if self.reason == COMMIT_FAILED:
+            return [
+                "  COMMIT_FAILED in {repo}: the files were mirrored and git would "
+                "not record them.".format(repo=self.repository),
+                "  " + self.detail.strip().replace("\n", "\n  "),
+            ]
+        return [
+            "  committed {rev} in {repo}, staging {n} named path(s). "
+            "Nothing was pushed.".format(
+                rev=self.revision, repo=self.repository, n=len(self.staged)
+            )
+        ]
+
+
+@dataclass(frozen=True)
 class MirrorResult:
     """What a mirror did, or — when ``applied`` is false — what it would do."""
 
@@ -845,11 +1082,23 @@ class MirrorResult:
     declared_excluded: Tuple[str, ...] = ()
     left_in_destination: Tuple[str, ...] = ()
     digests: Dict[str, str] = field(default_factory=dict)
+    commit: CommitOutcome = field(default_factory=CommitOutcome)
 
     @property
     def is_clean(self) -> bool:
         """True when nothing was refused. A refusal is a result, not a warning."""
-        return not self.refused
+        return not self.refused and not self.commit.refused
+
+    @property
+    def is_level(self) -> bool:
+        """True when this mirror leaves the two copies byte-identical.
+
+        False whenever a file was refused or held out, and it is what stops the
+        commit message claiming "brought level" over a mirror that was not. A
+        record that overstates what it did is the failure this module is about,
+        turned on the module itself.
+        """
+        return not self.refused and not self.excluded and not self.left_in_destination
 
     def describe(self) -> str:
         verb = "mirrored" if self.applied else "would mirror"
@@ -892,7 +1141,144 @@ class MirrorResult:
                 "  Reconcile those files by hand, or re-run with "
                 "--overwrite-ahead to discard the destination's version."
             )
+        lines.extend(self.commit.describe())
         return "\n".join(lines)
+
+
+def build_commit_message(result: MirrorResult, revision: str) -> str:
+    """The record a mirror leaves behind: what moved, and what did not.
+
+    Three things have to survive in it, and the third is the one that makes it
+    worth writing. The revision says which bytes these are. The counts say how
+    much moved. And **every file held out or refused is named**, because a mirror
+    that refused a file did not make the trees level, and a commit whose message
+    says "brought level" over eight held-out files is a false record. This
+    project's whole subject is records that do not lie; the first place to not
+    lie is its own.
+    """
+    compared = len(result.copied) + len(result.unchanged)
+    lines = [
+        "Mirror ADW runtime from {a} into {b}".format(
+            a=result.source.name, b=result.destination.name
+        ),
+        "",
+        "Source: {a} at {rev}".format(a=result.source.name, rev=revision),
+        "Copied {n} file(s); {same} already identical; {compared} compared.".format(
+            n=len(result.copied), same=len(result.unchanged), compared=compared
+        ),
+    ]
+
+    declared = set(result.declared_excluded)
+    implicit = tuple(rel for rel in result.excluded if rel not in declared)
+    held_out: List[str] = []
+    if implicit:
+        held_out.append(
+            "Held out, deployment-owned: " + ", ".join(implicit)
+        )
+    if result.declared_excluded:
+        held_out.append(
+            "Held out, declared by {b}: {paths}".format(
+                b=result.destination.name, paths=", ".join(result.declared_excluded)
+            )
+        )
+    if result.refused:
+        held_out.append(
+            "REFUSED, the destination looked ahead and was not overwritten:"
+        )
+        held_out.extend("  " + item.describe() for item in result.refused)
+    if result.overridden:
+        held_out.append(
+            "Overwrote a destination that looked ahead (--overwrite-ahead), "
+            "discarding its version of:"
+        )
+        held_out.extend("  " + item.describe() for item in result.overridden)
+    if result.left_in_destination:
+        held_out.append(
+            "Present only in {b} and left untouched ({n}): {paths}".format(
+                b=result.destination.name,
+                n=len(result.left_in_destination),
+                paths=", ".join(result.left_in_destination),
+            )
+        )
+    if held_out:
+        lines.append("")
+        lines.extend(held_out)
+
+    lines.append("")
+    if result.is_level:
+        lines.append(
+            "These two copies are now byte-identical over {n} file(s).".format(
+                n=compared
+            )
+        )
+    else:
+        lines.append(
+            "These two copies are NOT byte-identical: {refused} file(s) refused, "
+            "{held} held out, {only} present only in {b}. The listing above is "
+            "the whole of what did not move.".format(
+                refused=len(result.refused),
+                held=len(result.excluded),
+                only=len(result.left_in_destination),
+                b=result.destination.name,
+            )
+        )
+    lines.append("")
+    lines.append(
+        "Recorded by tools/runtime_sync.py mirror --apply --commit, which stages "
+        "only the paths it wrote and never pushes."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _record(result: MirrorResult, revision: str) -> CommitOutcome:
+    """Stage exactly what the mirror wrote and commit it. Never pushes.
+
+    Staging is by named path and nothing else. These are live shared checkouts:
+    while this template's runtime was being mirrored, the-library held 24
+    modified and 11 untracked files elsewhere in its tree, none of them anything
+    to do with the runtime. A `git add -A`, or a `git add` of the runtime
+    directory, would sweep somebody else's in-flight work into a commit that
+    claims to be a mirror — its own incident. So each path this mirror copied is
+    named to `git add`, and the commit itself carries the same pathspec, which
+    also leaves anything the operator had already staged exactly where it was.
+
+    Pushing is not this tool's decision. A local commit is recoverable;
+    publishing one is not.
+    """
+    repository = git_repository_of(result.destination.root)
+    if repository is None:
+        return CommitOutcome(reason=COMMIT_NO_REPOSITORY)
+    if not result.copied:
+        return CommitOutcome(reason=COMMIT_NOTHING_TO_COMMIT, repository=repository)
+
+    paths = [str(result.destination.root / rel) for rel in result.copied]
+    message = build_commit_message(result, revision)
+    staged = _git(result.destination.root, "add", "--", *paths)
+    if staged.returncode != 0:
+        return CommitOutcome(
+            reason=COMMIT_FAILED,
+            repository=repository,
+            detail=(staged.stderr or staged.stdout).strip(),
+            message=message,
+        )
+    committed = _git(
+        result.destination.root, "commit", "-m", message, "--", *paths
+    )
+    if committed.returncode != 0:
+        return CommitOutcome(
+            reason=COMMIT_FAILED,
+            repository=repository,
+            detail=(committed.stderr or committed.stdout).strip(),
+            message=message,
+        )
+    described = _git(result.destination.root, "rev-parse", "--short", "HEAD")
+    return CommitOutcome(
+        reason=COMMIT_RECORDED,
+        repository=repository,
+        staged=result.copied,
+        revision=described.stdout.strip(),
+        message=message,
+    )
 
 
 def mirror(
@@ -901,6 +1287,7 @@ def mirror(
     *,
     apply: bool = False,
     overwrite_ahead: bool = False,
+    commit: bool = False,
 ) -> MirrorResult:
     """Bring ``destination`` level with ``source``. Plans unless ``apply``.
 
@@ -911,6 +1298,14 @@ def mirror(
     longer by line count — is refused rather than replaced, unless
     ``overwrite_ahead`` names the discard. Neither signal is proof; between them
     they cover the two shapes the loss has actually taken.
+
+    ``commit`` records the mirror in the destination's git working tree, staging
+    only the paths this mirror wrote. It requires ``apply`` — a plan has nothing
+    to record — and it turns the copy into a **pre-flight gate**: if the
+    destination holds uncommitted work in any file this mirror would overwrite,
+    nothing is copied at all and the file is named. That is the case where a
+    mirror destroys the only copy of something, and the answer to it is a
+    refusal, not a commit that buries it. Nothing is ever pushed.
     """
     excluded = excluded_relative_paths(source, destination)
     mine = scan_runtime(source.root, excluded)
@@ -921,6 +1316,7 @@ def mirror(
     refused: List[Refusal] = []
     overridden: List[Refusal] = []
     digests: Dict[str, str] = {}
+    planned: List[Tuple[str, pathlib.Path, pathlib.Path]] = []
 
     for relative in sorted(mine):
         src = mine[relative]
@@ -951,23 +1347,49 @@ def mirror(
                     refused.append(refusal)
                     continue
                 overridden.append(refusal)
-        if apply:
-            digests[relative] = copy_verified(src, dst)
+        planned.append((relative, src, dst))
         copied.append(relative)
 
-    return MirrorResult(
-        source=source,
-        destination=destination,
-        applied=apply,
-        copied=tuple(copied),
-        unchanged=tuple(unchanged),
-        refused=tuple(refused),
-        overridden=tuple(overridden),
-        excluded=tuple(sorted(excluded)),
-        declared_excluded=tuple(sorted(declared_exclusions(source, destination))),
-        left_in_destination=tuple(sorted(set(theirs) - set(mine))),
-        digests=digests,
-    )
+    def _result(applied: bool, outcome: CommitOutcome) -> MirrorResult:
+        return MirrorResult(
+            source=source,
+            destination=destination,
+            applied=applied,
+            copied=tuple(copied),
+            unchanged=tuple(unchanged),
+            refused=tuple(refused),
+            overridden=tuple(overridden),
+            excluded=tuple(sorted(excluded)),
+            declared_excluded=tuple(sorted(declared_exclusions(source, destination))),
+            left_in_destination=tuple(sorted(set(theirs) - set(mine))),
+            digests=digests,
+            commit=outcome,
+        )
+
+    if commit and not apply:
+        return _result(False, CommitOutcome(reason=COMMIT_NOT_APPLIED))
+
+    if commit:
+        modified, never_committed = uncommitted_paths(destination.root, copied)
+        if modified or never_committed:
+            return _result(
+                False,
+                CommitOutcome(
+                    reason=COMMIT_DESTINATION_DIRTY,
+                    repository=git_repository_of(destination.root),
+                    modified=modified,
+                    never_committed=never_committed,
+                ),
+            )
+
+    if apply:
+        for relative, src, dst in planned:
+            digests[relative] = copy_verified(src, dst)
+
+    result = _result(apply, CommitOutcome())
+    if not commit:
+        return result
+    return _result(apply, _record(result, source_revision(source.root)))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1022,6 +1444,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discard destination files that look ahead of the source "
              "(newer by mtime, or longer by line count)",
+    )
+    push.add_argument(
+        "--commit",
+        action="store_true",
+        help="record the mirror in the destination's git working tree, staging "
+             "only the paths written and never pushing. Requires --apply. "
+             "Refuses to copy anything at all if the destination holds "
+             "uncommitted work in a file this mirror would overwrite.",
     )
     return parser
 
@@ -1133,6 +1563,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         destination,
         apply=args.apply,
         overwrite_ahead=args.overwrite_ahead,
+        commit=args.commit,
     )
     print(result.describe())
     return 0 if result.is_clean else 1

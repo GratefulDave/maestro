@@ -8,6 +8,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `runtime_sync.py mirror … --apply --commit` — a mirror now copies *and* records itself, so
+  bringing a deployment level is one command instead of a mirror followed by a hand-written
+  `git add` and `git commit`. The recording is not decoration: `lexgenius-pipeline` carried its
+  entire 184-file runtime **untracked** in git, so it changed with no diff and no history, which
+  is how it was silently rewritten with stale bytes on 2026-08-19 and nobody could tell.
+
+  It stages **only the paths it wrote**, by name — never `git add -A`, never the runtime
+  directory. These are live shared checkouts: while this template's runtime was being mirrored,
+  the-library held 24 modified and 11 untracked files elsewhere in its tree, and sweeping those
+  into a commit that claims to be a mirror would be its own incident. Anything the operator had
+  already staged stays staged and uncommitted, because the commit carries the same pathspec.
+
+  It is also a pre-flight gate. If the destination holds uncommitted work in any file the mirror
+  would overwrite — modified since its last commit, or never committed at all — **nothing is
+  copied and nothing is committed**, and the refusal names the file and asks for a commit or a
+  stash first. That is the case where a mirror destroys the only copy of something, and a
+  content comparison cannot see it: bytes on disk say nothing about whether those bytes were
+  ever recorded anywhere. A destination that is not a git working tree is mirrored anyway and
+  told so plainly, rather than failing the copy.
+
+  The commit message states what did *not* happen: the source revision the bytes came from, the
+  counts, and every file held out (deployment-owned or `pinned`), refused, discarded by
+  `--overwrite-ahead`, or present only in the destination. A mirror that refused a file did not
+  make the trees level, and a message claiming it did would be a false record — which is the one
+  thing this project cannot ship. `--commit` requires `--apply`; a plan has nothing to record.
+  Nothing is ever pushed: recording locally is recoverable, publishing is not the mirror's
+  decision. Still no hook, no post-merge action, no CI job — this makes an explicit invocation
+  do its whole job, it does not remove the invocation. Documented in `docs/deployment-drift.md`.
+
 - Deployment drift reports itself. `tests/test_deployment_parity.py` compares this template
   against every deployment declared in `<repository>/.maestro/deployments.json` (or wherever
   `MAESTRO_DEPLOYMENT_REGISTRY` points) on every suite run, closing the half of #70 that a
