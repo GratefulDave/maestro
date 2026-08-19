@@ -8,6 +8,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Deployment drift reports itself. `tests/test_deployment_parity.py` compares this template
+  against every deployment declared in `<repository>/.maestro/deployments.json` (or wherever
+  `MAESTRO_DEPLOYMENT_REGISTRY` points) on every suite run, closing the half of #70 that a
+  person still had to remember. Watching is opt-in by writing that file — no path is hardcoded,
+  because the suite runs in CI and on machines that never installed the factory — and a missing
+  registry, or a declared deployment that is not on this machine, skips *visibly* through
+  `checkout_layout.skip_visibly`, naming the exact path it looked for and how it chose it. A
+  registry that is present and malformed fails rather than degrading to "no deployments
+  declared": an unknown key is refused by name, because a misspelled `pinned` reading as "no
+  exclusions" is precisely the quiet failure this closes. The registry is read from the main
+  working tree before the linked worktree, since a registry names roots relative to itself and
+  a lane would otherwise resolve `../../lexgenius/adws` to a path no machine has.
+
+  Three findings, kept separate because they call for three different actions: a file present
+  in one copy and absent from the other is a deletion (the shape in which 6,009 lines were once
+  lost) and keeps its own field; the template being ahead means the deployment is running older
+  runtime, and the failure prints the mirror command; the deployment being ahead means work
+  exists in one copy only — issue #71 — and the failure offers no command, because reconciling
+  in either direction without reading both copies either destroys the only copy or imports one
+  installation's local decisions into the shipped runtime. Differences with equal line counts
+  are reported with the deployment-ahead finding: "we cannot show the template is newer" is a
+  reason to look, never a licence to overwrite. Measured today, `lexgenius-pipeline` is level
+  over 185 files and `lexgenius` reports 7 template-ahead and 5 deployment-ahead with nothing
+  absent in either direction. Documented in `docs/deployment-drift.md`.
+
+  Nothing mirrors automatically, and deliberately so — no hook, no post-merge action, no CI
+  job. A deployment is a live checkout holding other people's in-flight work, and an unprompted
+  write into one is the 2026-08-19 `git restore --staged --worktree` incident with a larger
+  blast radius. Detection is what is automatic; the write stays a command a person types.
+
+- `runtime_sync.py check-deployments <template> [--registry FILE]` — the on-demand half of the
+  same report, for an operator asking rather than a suite failing. It reads the same registry,
+  prints the same three findings with the direction split named, exits non-zero when an
+  installed deployment has drifted, and never writes. A declared deployment that is not
+  installed on this machine is reported and does not count against that exit code.
+
+- `runtime_sync` can be told a path is deployment-owned. `RuntimeCopy.pinned`, populated from a
+  registry entry's `pinned` list or the new repeatable `--pin` flag, holds a path out of a
+  comparison or mirror in both directions — issue #71's third option, and previously
+  inexpressible, so a file a deployment legitimately owns was refused on every future mirror
+  and a refusal nobody can clear is a refusal people learn to ignore. Every held-out path comes
+  back out in `DriftReport.declared_excluded` and is printed by `describe()` **including on a
+  level report**, where it would otherwise be the one case an exclusion never appeared. The
+  hardcoded `maestro.config.yaml` exclusion stays distinguishable from a declared one in the
+  output. `DriftReport` also now splits its content differences by direction —
+  `source_ahead`, `destination_ahead`, `undetermined_direction` — which is what lets the two
+  directions fail as different findings instead of one undirected "these files differ".
+
 - `maestro run pause` — the non-terminal operator stop (§7.3, §7.8). It SIGINTs the process that
   claimed the run; `Scheduler` installs a handler for the duration of its loop that latches a pause,
   stops dispatching, quiesces every in-flight worker, and raises `scheduler.RunPaused` instead of
