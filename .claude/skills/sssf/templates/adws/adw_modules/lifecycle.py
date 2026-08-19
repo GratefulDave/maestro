@@ -1720,7 +1720,15 @@ def derive_run_state(
     2. A run whose every node is absolutely terminal is *settled*, whatever any
        process is doing. Cancellation that reached every node is CANCELLED, not
        CANCELLING — this is the second observed defect, and it needs no
-       liveness check at all because the node rows already say it.
+       liveness check at all because the node rows already say it. This is
+       also the one branch that reads `latest_outcome`, and the only branch
+       where reading it is safe: a settled run cannot have moved past its
+       declaration, because a resume returns nodes to PENDING and un-settles
+       it. That matters for the run abandoned node by node, which §7.3's
+       outcome function declares CANCELLED and which sets no
+       `cancel_requested` — without it this function answers QUIESCENT about
+       a run the scheduler called CANCELLED, which is two answers to one
+       question (RC1).
     3. Otherwise there is work left. Work left with a provably dead scheduler
        is ABANDONED, but only where the death matters: a run with a node still
        RUNNING (nothing can finish it), or one that never declared an outcome
@@ -1733,7 +1741,8 @@ def derive_run_state(
     if not states:
         return "EMPTY"
     if all(state in st.ABSOLUTELY_TERMINAL for state in states):
-        if record.cancel_requested:
+        if (record.cancel_requested
+                or record.latest_outcome is st.RunOutcome.CANCELLED):
             return "CANCELLED"
         if all(state is st.NodeState.MERGED for state in states):
             return "MERGED"

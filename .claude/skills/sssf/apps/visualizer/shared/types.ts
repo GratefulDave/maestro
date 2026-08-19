@@ -331,9 +331,21 @@ export type MaestroRunOutcome = string;
 
 /**
  * What the run is doing now, derived from its node states — never stored.
- * RUNNING · CANCELLING · BLOCKED · PENDING · MERGED · QUIESCENT · EMPTY.
+ * RUNNING · CANCELLING · CANCELLED · BLOCKED · PENDING · MERGED · QUIESCENT ·
+ * EMPTY.
  */
 export type MaestroLiveState = string;
+
+/**
+ * `cancel_cause` — why a CANCELLED run or node is cancelled.
+ *
+ * `RUN_CANCEL` is an operator's stop request, which `run resume` withdraws;
+ * `ABANDONED` is a node the operator gave up on, which nothing reopens. `null`
+ * means the ledger predates the column, and a resume refuses an unrecorded
+ * cause rather than guessing at one — so the dashboard must show the three
+ * apart rather than collapsing them into "cancelled".
+ */
+export type MaestroCancelCause = string;
 
 /** One transition row, with its `detail_json` already parsed. */
 export interface MaestroTransition {
@@ -381,6 +393,11 @@ export interface MaestroNode {
   attempt_no: number;
   /** Why the node stopped, when it stopped: SEMANTIC_BUDGET_EXHAUSTED, … */
   block_reason: string | null;
+  /**
+   * Why this node is CANCELLED, and null in every other state. `RUN_CANCEL`
+   * comes back on `run resume`; `ABANDONED` does not.
+   */
+  cancel_cause: MaestroCancelCause | null;
   output_sha: string | null;
   granted_extra_attempts: number;
   updated_at: string | null;
@@ -412,6 +429,10 @@ export interface MaestroRunSummary {
   state: MaestroLiveState;
   declared_outcome: MaestroRunOutcome | null;
   declared_outcome_at: string | null;
+  /** Why the declared outcome was CANCELLED; null for every other outcome. */
+  cancel_cause: MaestroCancelCause | null;
+  /** Whether `run resume` will take this run, decided by `cancel_cause`. */
+  resumable: boolean;
   cancel_requested: boolean;
   created_at: string | null;
   last_transition_at: string | null;
@@ -428,6 +449,10 @@ export interface MaestroRunDetail {
   state: MaestroLiveState;
   declared_outcome: MaestroRunOutcome | null;
   declared_outcome_at: string | null;
+  /** Why the declared outcome was CANCELLED; null for every other outcome. */
+  cancel_cause: MaestroCancelCause | null;
+  /** Whether `run resume` will take this run, decided by `cancel_cause`. */
+  resumable: boolean;
   cancel_requested: boolean;
   created_at: string | null;
   last_transition_at: string | null;

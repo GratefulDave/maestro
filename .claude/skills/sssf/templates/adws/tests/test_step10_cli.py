@@ -874,8 +874,13 @@ class OperatorCliTest(unittest.TestCase):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 3)
-        self.assertEqual(json.loads(output.getvalue())["outcome"],
-                         "HARNESSQUIESCENCEERROR")
+        # The quiescence proof has a declared code and the class name never
+        # was one: `HERDR_QUIESCENCE_UNPROVEN` used to arrive as `detail` under
+        # an `outcome` of `HARNESSQUIESCENCEERROR`, which is the typed fact and
+        # the implementation detail exactly the wrong way round.
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["outcome"], "RUN_QUIESCENCE_UNPROVEN")
+        self.assertEqual(payload["quiescence_code"], "HERDR_QUIESCENCE_UNPROVEN")
         self.assertEqual(route.cancel_calls, 2)
         self.assertEqual(route.reclaim(token), (handle,))
 
@@ -950,8 +955,12 @@ class OperatorCliTest(unittest.TestCase):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 3)
-        self.assertEqual(json.loads(output.getvalue())["outcome"],
-                         "RUNTIMEERROR")
+        # `RUN_EXECUTION_FAILED`, not `RUNTIMEERROR`: the outcome field is a
+        # refusal vocabulary and a Python class name is not in it. The class
+        # name is still in `detail`, which is where a diagnosis belongs.
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["outcome"], "RUN_EXECUTION_FAILED")
+        self.assertIn("RuntimeError", payload["detail"])
         self.assertEqual(quiesce.call_count, 2)
 
     def test_run_path_preflight_refuses_data_directory_aliases_and_hardlinks(self):
@@ -1345,8 +1354,11 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(code, 2)
         payload = json.loads(output.getvalue())
         self.assertEqual(set(payload), {"detail", "outcome"})
-        self.assertTrue(payload["outcome"].endswith("ERROR")
-                        or "DATABASE" in payload["outcome"])
+        # This used to assert only the *shape* of the class name it printed,
+        # which is what let `DATABASEERROR` read as typed. `main`'s net now
+        # names the condition it is: an error Maestro did not decide on.
+        self.assertEqual(payload["outcome"], "MAESTRO_INTERNAL_ERROR")
+        self.assertIn("DatabaseError", payload["detail"])
 
 
 if __name__ == "__main__":

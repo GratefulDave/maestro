@@ -79,6 +79,40 @@ class ACancelThatFinishedIsCancelled(unittest.TestCase):
             derive(record(pid=os.getpid(), cancel=True), nodes, alive=False),
             "CANCELLED")
 
+    def test_a_run_abandoned_node_by_node_reads_cancelled_too(self):
+        """`abandon` sets no `cancel_requested`; §7.3's outcome function still
+        declares the run CANCELLED at quiescence. Reading that declaration is
+        safe in exactly this branch, because a settled run cannot have moved
+        past it — a resume returns nodes to PENDING and un-settles it. Without
+        it this function answered QUIESCENT about a run the scheduler called
+        CANCELLED, and the dashboard's copy of this rule answered CANCELLED:
+        two answers to one question."""
+        nodes = [node_row("a", st.NodeState.CANCELLED),
+                 node_row("b", st.NodeState.CANCELLED)]
+        self.assertEqual(
+            derive(record(outcome=st.RunOutcome.CANCELLED), nodes,
+                   alive=False),
+            "CANCELLED")
+
+    def test_a_settled_run_that_declared_something_else_is_unaffected(self):
+        """The control. Only the CANCELLED declaration is read here, and only
+        to answer the question `cancel_requested` was answering badly."""
+        nodes = [node_row("a", st.NodeState.MERGED),
+                 node_row("b", st.NodeState.MERGED)]
+        self.assertEqual(
+            derive(record(outcome=st.RunOutcome.ACCEPTED), nodes, alive=False),
+            "MERGED")
+
+    def test_a_resumed_run_is_not_settled_and_ignores_its_declaration(self):
+        """The reason the read is confined to the settled branch: a resumed
+        run's declaration describes a life it has moved past."""
+        nodes = [node_row("a", st.NodeState.MERGED),
+                 node_row("b", st.NodeState.PENDING)]
+        self.assertEqual(
+            derive(record(pid=os.getpid(), outcome=st.RunOutcome.CANCELLED),
+                   nodes, alive=True),
+            "PENDING")
+
     def test_it_is_cancelled_even_while_the_scheduler_is_still_alive(self):
         """`cancel_run` writes every node in one transaction, so a live
         scheduler shutting down is looking at a finished cancellation too."""

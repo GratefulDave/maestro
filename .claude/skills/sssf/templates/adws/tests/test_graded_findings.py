@@ -43,6 +43,7 @@ grading leaks across that boundary this file fails.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -306,6 +307,165 @@ class SubThresholdFindingsAreRecordedNotRejectedTest(unittest.TestCase):
         self.assertEqual((), second.findings)
         self.assertEqual([cr.FindingGrade.WARNING],
                          [c.grade for c in second.advisories])
+
+
+class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
+    """The crash window between the signed receipt and the unsigned ledger.
+
+    `review_attempt` writes the receipt first and the ledger second, and that
+    order is not negotiable: an unsigned file claiming a verdict must never
+    precede the signed record §1.2 keys the merge on. A crash lands in that
+    window, and it leaves a receipt with no ledger.
+
+    Before `DerivedCell.grade` that cost the review's grades outright — the
+    replay fell back to severity, so every BLOCKING finding read as rejecting
+    and a node that had merged with a recorded WARNING replayed as a node that
+    had been refused. The receipt now carries the grade that decided each cell
+    under the same signature as the verdict, so the fallback reports what the
+    original review derived. The write order is unchanged; what changed is that
+    it no longer costs anything.
+    """
+
+    def _replay(self, store, ledger_path):
+        """A second review of byte-identical bytes, which must not launch."""
+        def must_not_launch(_matrix):
+            raise AssertionError("a byte-identical subject re-reviewed")
+
+        subjects = cr.review_objects(("inventory.py",), OUTPUT_SHA)
+        matrix = fin.compute_matrix(cr.CODE_RUBRIC, "a" * 64, subjects)
+        return cr.review_attempt(
+            subject_digest="a" * 64, handoff=a_handoff("a" * 64, matrix),
+            objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
+            window_factory=must_not_launch, occupancy_reader=lambda _s: 0.1,
+            ledger_path=ledger_path)
+
+    def test_a_replay_with_no_ledger_still_reports_the_real_grades(self):
+        """The defect this closes. A WARNING on a BLOCKING check merged; with
+        the ledger gone the replay must still say so, not re-partition it into
+        a rejection on severity alone."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = make_store(root)
+            ledger = root / "findings.json"
+            first = run_review(root, ScriptedReviewer({
+                "diff.introduces_no_obvious_defect": (
+                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
+                ledger_path=ledger, store=store)
+            self.assertTrue(first.passed)
+            self.assertTrue(ledger.exists())
+
+            os.remove(ledger)  # the crash, after the receipt and before this
+            replayed = self._replay(store, ledger)
+
+        self.assertTrue(replayed.replayed)
+        self.assertTrue(replayed.passed)
+        self.assertEqual((), replayed.findings,
+                         "a recorded WARNING replayed as a rejection")
+        self.assertEqual([cr.FindingGrade.WARNING],
+                         [c.grade for c in replayed.advisories])
+
+    def test_a_replay_with_no_ledger_still_reports_a_rejection(self):
+        """The other direction, because a fallback that reported everything as
+        sub-threshold would pass this suite's first half and be worse."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = make_store(root)
+            ledger = root / "findings.json"
+            first = run_review(root, ScriptedReviewer({
+                "diff.introduces_no_obvious_defect": (
+                    "error", REAL_MESSAGE, "the node's stated work is absent")}),
+                ledger_path=ledger, store=store)
+            self.assertFalse(first.passed)
+
+            os.remove(ledger)
+            replayed = self._replay(store, ledger)
+
+        self.assertTrue(replayed.replayed)
+        self.assertFalse(replayed.passed)
+        self.assertEqual([cr.FindingGrade.ERROR],
+                         [c.grade for c in replayed.findings])
+        self.assertEqual((), replayed.advisories)
+
+    def test_the_grade_is_in_the_receipt_that_was_signed(self):
+        """Not merely recoverable — recoverable *from the signed record*, which
+        is what makes the fallback trustworthy rather than convenient."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = make_store(root)
+            run_review(root, ScriptedReviewer({
+                "diff.introduces_no_obvious_defect": (
+                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
+                store=store)
+            reloaded = store.load("a" * 64)
+
+        graded = {c.check_id: c.grade for c in reloaded.cells
+                  if c.status is fin.CellStatus.FINDING and c.canary is None}
+        self.assertEqual({"diff.introduces_no_obvious_defect": "warning"},
+                         graded)
+
+    def test_an_ungraded_receipt_cell_falls_back_to_its_severity(self):
+        """A receipt written before the field existed, and plan finalization's
+        cells, genuinely carry no grade. Severity is the honest partition there
+        and the old behaviour is kept exactly where it is still the truth."""
+        blocking = fin.DerivedCell(
+            check_id="diff.introduces_no_obvious_defect", object_id="o1",
+            status=fin.CellStatus.FINDING, severity=fin.Severity.BLOCKING,
+            message=REAL_MESSAGE, grade=None)
+        advisory = fin.DerivedCell(
+            check_id="diff.is_coherent_with_its_surroundings", object_id="o1",
+            status=fin.CellStatus.FINDING, severity=fin.Severity.ADVISORY,
+            message="naming drifts", grade=None)
+        derived = fin.DerivedVerdict(verdict=fin.Verdict.FAIL,
+                                     cells=(blocking, advisory))
+
+        rejecting, recorded = cr.receipt_findings(derived,
+                                                  cr.DEFAULT_REJECT_GRADE)
+
+        self.assertEqual(["diff.introduces_no_obvious_defect"],
+                         [c.check_id for c in rejecting])
+        self.assertEqual(["diff.is_coherent_with_its_surroundings"],
+                         [c.check_id for c in recorded])
+        self.assertEqual([None, None],
+                         [c.grade for c in rejecting + recorded])
+
+    def test_a_grade_this_version_cannot_name_is_read_as_absent(self):
+        """The verdict on the replay path is the receipt's signed one and is
+        never re-derived here, so an unrecognised grade may change how a
+        finding is presented and must not be able to fail the replay."""
+        cell = fin.DerivedCell(
+            check_id="diff.introduces_no_obvious_defect", object_id="o1",
+            status=fin.CellStatus.FINDING, severity=fin.Severity.BLOCKING,
+            message=REAL_MESSAGE, grade="catastrophe")
+        derived = fin.DerivedVerdict(verdict=fin.Verdict.FAIL, cells=(cell,))
+
+        rejecting, recorded = cr.receipt_findings(derived,
+                                                  cr.DEFAULT_REJECT_GRADE)
+
+        self.assertEqual(1, len(rejecting))
+        self.assertEqual((), recorded)
+        self.assertIsNone(rejecting[0].grade)
+
+    def test_the_ledger_is_still_preferred_for_what_it_alone_carries(self):
+        """The ledger is not made redundant: it carries each grade's rationale
+        and the threshold the review ran under, neither of which the receipt's
+        frozen schema has a column for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = make_store(root)
+            ledger = root / "findings.json"
+            run_review(root, ScriptedReviewer({
+                "diff.introduces_no_obvious_defect": (
+                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
+                ledger_path=ledger, store=store)
+            with_ledger = self._replay(store, ledger)
+            os.remove(ledger)
+            without_ledger = self._replay(store, ledger)
+
+        self.assertEqual("delivered work is unaffected",
+                         with_ledger.advisories[0].rationale)
+        self.assertEqual("", without_ledger.advisories[0].rationale)
+        self.assertEqual([c.grade for c in with_ledger.advisories],
+                         [c.grade for c in without_ledger.advisories])
 
 
 class SubThresholdFindingsStillMergeTest(SchedulerFixture):
@@ -804,3 +964,121 @@ class GradeSurvivesTheReceipt(unittest.TestCase):
         with self.assertRaises(fin.ReceiptInvalid):
             fin.Receipt.from_bytes(
                 json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+
+
+class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
+    """The grade's other half, and the sibling the grade fix was one short of.
+
+    A grade decides nothing on its own. A cell rejects when its check is
+    BLOCKING **and** its grade reaches `reject_at`, so a receipt carrying
+    grades without the threshold still records a verdict whose derivation
+    cannot be re-checked from the signed record — which is verbatim the
+    argument that put the grade in the receipt.
+
+    The threshold is configuration (§6.2) and an installation may change it
+    between a review and any later reading of it, which is what makes this
+    load-bearing rather than tidy: a replay partitioned against *today's*
+    threshold reports a finding as rejecting that the signed verdict recorded
+    as merged.
+    """
+
+    def _receipt(self, reject_at, *, digest="1"):
+        return fin.Receipt(
+            plan_digest=digest * 64, rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.PASS,
+            cells=(fin.DerivedCell(
+                check_id="diff.introduces_no_obvious_defect",
+                object_id="diff:abc", status=fin.CellStatus.FINDING,
+                severity=fin.Severity.BLOCKING, message="a located defect",
+                grade="warning"),),
+            reviewer=fin.ReviewerIdentity(route="omp", model="m",
+                                          session_id="s"),
+            created_at_epoch=1, reject_at=reject_at)
+
+    def test_the_threshold_round_trips_through_the_receipt_bytes(self):
+        restored = fin.Receipt.from_bytes(self._receipt("warning").to_bytes())
+        self.assertEqual("warning", restored.reject_at)
+
+    def test_plan_finalizations_receipt_carries_none(self):
+        """Plan finalization's verdict runs under no threshold, and `None` is
+        the honest value rather than a default standing in for one."""
+        restored = fin.Receipt.from_bytes(
+            self._receipt(None, digest="2").to_bytes())
+        self.assertIsNone(restored.reject_at)
+
+    def test_a_receipt_without_the_threshold_field_is_refused(self):
+        payload = json.loads(self._receipt("error", digest="3").to_bytes())
+        del payload["reject_at"]
+        with self.assertRaises(fin.ReceiptInvalid):
+            fin.Receipt.from_bytes(json.dumps(
+                payload, sort_keys=True, separators=(",", ":")).encode())
+
+    def test_a_node_review_records_the_threshold_it_ran_under(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = make_store(root)
+            run_review(root, ScriptedReviewer({
+                "diff.introduces_no_obvious_defect": (
+                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
+                reject_at=cr.FindingGrade.ERROR, store=store)
+            self.assertEqual("error", store.load("a" * 64).reject_at)
+
+    def test_a_replay_partitions_against_the_recorded_threshold(self):
+        """The defect this closes. The review ran at `error`, so its WARNING
+        merged and the signed verdict is PASS. An installation that later
+        tightens to `warning` must not have the replay report that finding as
+        having rejected an attempt the receipt says it did not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = make_store(root)
+            ledger = root / "findings.json"
+            first = run_review(root, ScriptedReviewer({
+                "diff.introduces_no_obvious_defect": (
+                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
+                reject_at=cr.FindingGrade.ERROR, ledger_path=ledger,
+                store=store)
+            self.assertTrue(first.passed)
+
+            def must_not_launch(_matrix):
+                raise AssertionError("a byte-identical subject re-reviewed")
+
+            subjects = cr.review_objects(("inventory.py",), OUTPUT_SHA)
+            matrix = fin.compute_matrix(cr.CODE_RUBRIC, "a" * 64, subjects)
+            tightened = cr.review_attempt(
+                subject_digest="a" * 64, handoff=a_handoff("a" * 64, matrix),
+                objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
+                window_factory=must_not_launch,
+                occupancy_reader=lambda _s: 0.1,
+                reject_at=cr.FindingGrade.WARNING, ledger_path=ledger)
+            os.remove(ledger)
+            no_ledger = cr.review_attempt(
+                subject_digest="a" * 64, handoff=a_handoff("a" * 64, matrix),
+                objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
+                window_factory=must_not_launch,
+                occupancy_reader=lambda _s: 0.1,
+                reject_at=cr.FindingGrade.WARNING, ledger_path=ledger)
+
+        for outcome in (tightened, no_ledger):
+            self.assertTrue(outcome.replayed)
+            self.assertTrue(outcome.passed)
+            self.assertEqual((), outcome.findings,
+                             "a merged finding replayed as a rejection under a "
+                             "threshold the review never ran under")
+            self.assertEqual([cr.FindingGrade.WARNING],
+                             [c.grade for c in outcome.advisories])
+
+    def test_a_receipt_predating_the_field_falls_back_to_the_configured_one(self):
+        """The only number available for a receipt written before the field
+        existed, and the old behaviour, kept where it is still the truth."""
+        receipt = self._receipt(None, digest="4")
+        findings, advisories = cr._replayed_findings(
+            receipt, None, cr.FindingGrade.WARNING)
+        self.assertEqual(1, len(findings))
+        self.assertEqual((), advisories)
+
+    def test_a_threshold_this_version_cannot_name_does_not_fail_the_replay(self):
+        receipt = self._receipt("catastrophe", digest="5")
+        findings, advisories = cr._replayed_findings(
+            receipt, None, cr.FindingGrade.ERROR)
+        self.assertEqual((), findings)
+        self.assertEqual(1, len(advisories))
