@@ -132,6 +132,32 @@ class ReOfferTests(unittest.TestCase):
         self.assertLessEqual(clock.now, 2.0 + 0.5)
         self.assertGreater(len(calls), 1)
 
+    def test_no_start_is_offered_at_or_past_the_deadline(self):
+        """The bound is on the offers, not merely on the loop's exit.
+
+        The deadline was read only *before* the poll, so the poll carried the
+        clock past it and bought one more `agent start` at `deadline +
+        poll_s`. A window that authorises an offer outside itself is a window
+        in name only: the point of bounding this loop is that the attempt-level
+        retry gets its fresh pane on schedule, and a launch that keeps talking
+        to a pane herdr has already called busy past its own budget is the
+        cost the bound exists to cap.
+        """
+        clock = _Clock()
+        offered = []
+
+        def start():
+            offered.append(clock.now)
+            raise busy()
+
+        with self.assertRaises(lch.HerdrCallError):
+            lch._start_agent_when_free(
+                start, window_s=2.0, poll_s=0.5,
+                sleep=clock.sleep, monotonic=clock.monotonic)
+
+        self.assertTrue(offered)
+        self.assertTrue(all(at < 2.0 for at in offered), offered)
+
     def test_a_refusal_herdr_does_not_call_survivable_raises_at_once(self):
         """Only herdr's own transient vocabulary is re-offered. Everything
         else is a refusal about this launch and is raised on the first no."""

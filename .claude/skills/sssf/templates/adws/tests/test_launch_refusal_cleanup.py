@@ -301,14 +301,21 @@ class RefusalCleanupTest(unittest.TestCase):
     def test_the_split_names_a_pane_instead_of_the_shared_selector(self):
         """`--current` is a server-side selector over mutable focus state, so
         two concurrent launches can resolve it to two different panes — and
-        one of them to a pane the other has just created."""
+        one of them to a pane the other has just created.
+
+        Every split names a pane id this launcher already holds: the resolved
+        seed for the first, and the pane the first created for the second,
+        which is the grid placing slot 2 beside slot 1. Both are ids, neither
+        is the selector, and `pane current` is still asked exactly once.
+        """
         harness, fake = self.build()
         harness.launch(self.spec())
         harness.launch(replace(self.spec(), correlation_token="run1-node_b-1"))
         splits = fake.argv_for(("pane", "split"))
         self.assertEqual(len(splits), 2)
+        # This fake hands out one fixed child id, so slot 1 is `w0:p2`.
+        self.assertEqual([split[2] for split in splits], ["w0:p0", "w0:p2"])
         for split in splits:
-            self.assertEqual(split[2], "w0:p0")
             self.assertNotIn("--current", split)
         # Resolved once. Re-asking would reintroduce the moving target.
         self.assertEqual(len(fake.argv_for(("pane", "current"))), 1)

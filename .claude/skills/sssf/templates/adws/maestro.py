@@ -1538,6 +1538,12 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     profile=args.reviewer_profile, session_dir=session_dir,
                     context_window_tokens=_route_context_window(
                         args.reviewer_route, args.reviewer_model),
+                    # Same tab as the builder whose output it is judging --
+                    # `_code_review_runner` is handed the run's own launcher,
+                    # so the group key resolves to the tab that node already
+                    # opened.
+                    pane_group=node.node_id, pane_role="reviewer",
+                    pane_group_size=2,
                     environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
@@ -2239,6 +2245,18 @@ def _receipt_absent(store: "finalization.ReceiptStore",
         cause="NEVER_FINALIZED", set_aside_count=0)
 
 
+def _herdr_workspace_label(args: argparse.Namespace) -> str:
+    """The name of the herdr workspace this run's panes land in.
+
+    The plan's own name where there is one, because that is what the operator
+    calls the work and what the sidebar has room for; the run id otherwise, so
+    the workspace is still named after this run and not after whatever was in
+    front of it.
+    """
+    name = str(getattr(args, "plan_name", "") or "")
+    return name or str(getattr(args, "run_id", "") or "maestro")
+
+
 def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
     required = (args.herdr, args.omp, args.claude, args.agent_route,
                 args.agent_model, args.agent_effort, args.route_receipt,
@@ -2261,7 +2279,12 @@ def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
         # §9.3's sixth operation. The adapter has implemented it since it was
         # written; nothing had ever handed it the argv to run, so it returned
         # immediately for every attempt of every run.
-        provision_argv=tuple(getattr(args, "provision_argv", None) or ()))
+        provision_argv=tuple(getattr(args, "provision_argv", None) or ()),
+        # One workspace per run, created by the launcher and named for the
+        # plan. Every pane this run opens -- builders and the reviewers of the
+        # same `route_runner` alike -- lands in it, so an operator has one
+        # place to watch and an unrelated run's pane can never appear there.
+        workspace_label=_herdr_workspace_label(args))
 
 
 class _ConfiguredProvisioner:
@@ -2741,6 +2764,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 session_dir=attempt.scratch / "session",
                 context_window_tokens=_route_context_window(
                     args.agent_route, args.agent_model),
+                # This node's own tab, with room for the reviewer that will
+                # judge it: two panes side by side rather than a builder and a
+                # reviewer in unrelated corners of a flat tab.
+                pane_group=node.node_id, pane_role="builder",
+                pane_group_size=2,
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
