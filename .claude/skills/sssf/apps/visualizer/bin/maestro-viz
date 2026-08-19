@@ -8,10 +8,12 @@
 # to report success until /api/sources has actually answered 200 through the
 # frontend's proxy.
 #
-#   maestro-viz              serve every installation in ~/.maestro/registry.json
-#   maestro-viz <repo>       additionally discover <repo>'s own adws/maestro.config.yaml
-#   maestro-viz stop         stop both halves and free both ports
-#   maestro-viz status       report what is currently listening
+# Invoked through the global justfile recipe, so it is reachable from anywhere:
+#
+#   just -g viz              serve every installation in ~/.maestro/registry.json
+#   just -g viz <repo>       additionally discover <repo>'s own adws/maestro.config.yaml
+#   just -g viz stop         stop both halves and free both ports
+#   just -g viz status       report what is currently listening
 #
 set -uo pipefail
 
@@ -96,7 +98,7 @@ wait_for_http() {
 assert_single_listener() {
   local port=$1 n
   n=$(listeners "$port" | wc -l | tr -d ' ')
-  [ "$n" = "1" ] || die "expected exactly 1 listener on port $port, found $n. Run 'maestro-viz stop' and try again."
+  [ "$n" = "1" ] || die "expected exactly 1 listener on port $port, found $n. Run 'just -g viz stop' and try again."
 }
 
 cmd_status() {
@@ -147,14 +149,14 @@ cmd_start() {
   [ "$api_cwd" != "$VIZ_DIR" ] && say "sources discovered from $api_cwd"
   grep -E '^\[sssf\] (maestro|sssf|tracer)' "$API_LOG" | sed 's/^/maestro-viz: /'
   say "$PROBE_PATH answered 200 — open $UI_URL"
-  say "stop it with: maestro-viz stop"
+  say "stop it with: just -g viz stop"
 }
 
 case "${1-}" in
   stop|--stop)      cmd_stop ;;
   status|--status)  cmd_status ;;
   -h|--help)
-    sed -n '3,14p' "$self" | sed 's/^# \{0,1\}//'
+    sed -n '3,16p' "$self" | sed 's/^# \{0,1\}//'
     ;;
   "")               cmd_start "$VIZ_DIR" ;;
   *)

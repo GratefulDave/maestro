@@ -22,27 +22,36 @@ Maintain shared types across server/client. Verify UI behavior against the runni
 ## Starting it
 
 ```sh
-viz
+just -g viz
 ```
 
-`viz` is `bin/maestro-viz`, symlinked into `~/.local/bin`. It runs from any
-working directory, needs no environment variables, and starts *both* halves —
-the Bun API on :4600 and the Vite frontend on :4601. It frees both ports first,
-so running it twice leaves one instance rather than two, and it does not report
-success until `/api/sources` has answered 200 through the frontend's proxy. Any
-other outcome is a non-zero exit with the failing half's log tail.
+`-g` is `just --global-justfile`, so the command works from any directory
+without a `cd` and without environment variables. The recipe is one line in
+`~/.config/just/justfile` and delegates to `bin/maestro-viz` in this repo,
+which is where the logic lives and is version-controlled:
 
-`viz stop` stops both halves and frees both ports; `viz status` reports what is
-listening; `viz <repo>` runs the API with `<repo>` as its working directory so
-that repository's own `adws/maestro.config.yaml` is discovered (see below).
-Logs are at `$TMPDIR/maestro-viz/{api,ui}.log`.
-
-The symlink is the only part of this that lives outside the repository,
-and it is one command — no shell rc file is edited:
-
-```sh
-ln -sfn "$PWD/bin/maestro-viz" ~/.local/bin/viz
+```just
+[doc("start the Maestro visualizer (stop | status | <repo>)")]
+viz *args:
+    @/path/to/maestro/.claude/skills/sssf/apps/visualizer/bin/maestro-viz {{args}}
 ```
+
+The script starts *both* halves — the Bun API on :4600 and the Vite frontend on
+:4601. It frees both ports first, so running it twice leaves one instance
+rather than two, and it does not report success until `/api/sources` has
+answered 200 through the frontend's proxy. Any other outcome is a non-zero exit
+with the failing half's log tail: a missing `bun`, an uninstalled `vite`, a port
+that survives SIGKILL, or a process that dies during startup.
+
+`just -g viz stop` stops both halves and frees both ports; `just -g viz status`
+reports what is listening; `just -g viz <repo>` runs the API with `<repo>` as
+its working directory so that repository's own `adws/maestro.config.yaml` is
+discovered (see below). Logs are at `$TMPDIR/maestro-viz/{api,ui}.log`.
+
+Verified against just 1.46.0: `--global-justfile` reads
+`~/.config/just/justfile`, which takes precedence over `~/.justfile`. Nothing
+is placed on `PATH` and no shell rc file is involved; the recipe carries an
+absolute path, so moving this repository means editing that one line.
 
 Do not start the visualizer with `bun run dev`. That script is `vite` alone: it
 starts the frontend without the API, every `/api` request then fails with
