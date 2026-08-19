@@ -1,0 +1,24 @@
+{
+  "deployments": [
+    {
+      "name": "lexgenius-pipeline",
+      "root": "../../lexgenius-pipeline/adws",
+      "note": "Deployed instance. Level with the template; nothing declared."
+    },
+    {
+      "name": "lexgenius",
+      "root": "../../lexgenius/adws",
+      "note": "Deployed instance. The eight paths below are unresolved divergence tracked in issue #71, not settled deployment-owned surface. Five hold content the template does not; three match no revision in the template's history for their path, so despite being shorter they cannot be assumed stale. Each needs both versions read. Remove the entry as each is decided.",
+      "pinned": [
+        "adw_modules/deliver.py",
+        "adw_modules/finalization_window.py",
+        "tests/test_deliver.py",
+        "tests/test_finalization_window.py",
+        "tests/test_step10_cli.py",
+        "tests/test_finalization.py",
+        "tests/test_route_admission.py",
+        "tests/test_step7_launcher.py"
+      ]
+    }
+  ]
+}
