@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+#
+# Start the Maestro visualizer — both halves of it — from any working directory.
+#
+# `bun run dev` starts only the Vite frontend on :4601. The API is a separate
+# process on :4600, and without it every /api request 500s while the startup
+# output still looks entirely successful. This script starts both, then refuses
+# to report success until /api/sources has actually answered 200 through the
+# frontend's proxy.
+#
+#   maestro-viz              serve every installation in ~/.maestro/registry.json
+#   maestro-viz <repo>       additionally discover <repo>'s own adws/maestro.config.yaml
+#   maestro-viz stop         stop both halves and free both ports
+#   maestro-viz status       report what is currently listening
+#
+set -uo pipefail
+
+API_PORT=4600
+UI_PORT=4601
+UI_URL="http://localhost:${UI_PORT}/"
+PROBE_PATH="/api/sources"
+STARTUP_TIMEOUT=45   # quarter-seconds are counted, see wait_for_http
+
+self=${BASH_SOURCE[0]}
+self=$(readlink -f "$self" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$self")
+VIZ_DIR=$(cd "$(dirname "$self")/.." && pwd)
+
+RUN_DIR="${TMPDIR:-/tmp}"
+RUN_DIR="${RUN_DIR%/}/maestro-viz"
+API_LOG="$RUN_DIR/api.log"
+UI_LOG="$RUN_DIR/ui.log"
+
+say()  { printf '%s\n' "maestro-viz: $*"; }
+warn() { printf '%s\n' "maestro-viz: $*" >&2; }
+die()  { printf '%s\n' "maestro-viz: error: $*" >&2; exit 1; }
+
+# Every PID holding a LISTEN socket on a port, deduplicated: lsof reports the
+# same process once per address family.
+listeners() {
+  lsof -tnP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | sort -u
+}
+
+# SIGTERM, then SIGKILL, then verify. A port that cannot be freed is fatal —
+# a second server on one port is exactly the failure this script exists to
+# prevent, and continuing would hide it.
+free_port() {
+  local port=$1 pids
+  pids=$(listeners "$port")
+  [ -z "$pids" ] && return 0
+
+  say "port $port held by pid(s) $(echo "$pids" | tr '\n' ' ')— stopping"
+  # shellcheck disable=SC2086 # deliberate word splitting: kill takes many pids
+  kill $pids 2>/dev/null
+
+  local i
+  for i in $(seq 1 20); do
+    sleep 0.25
+    pids=$(listeners "$port")
+    [ -z "$pids" ] && return 0
+  done
+
+  # shellcheck disable=SC2086
+  kill -9 $pids 2>/dev/null
+  for i in $(seq 1 12); do
+    sleep 0.25
+    pids=$(listeners "$port")
+    [ -z "$pids" ] && return 0
+  done
+
+  die "could not free port $port; pid(s) $(echo "$pids" | tr '\n' ' ')survived SIGKILL. Investigate with: lsof -nP -i :$port"
+}
+
+http_code() {
+  curl -s -o /dev/null -m 3 -w '%{http_code}' "$1" 2>/dev/null
+}
+
+# Poll until the URL answers 200, failing the moment the process backing it
+# dies rather than waiting out the whole timeout on a corpse.
+wait_for_http() {
+  local url=$1 pid=$2 label=$3 log=$4 i code
+  for i in $(seq 1 $((STARTUP_TIMEOUT * 4))); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      warn "$label exited during startup. Last lines of $log:"
+      tail -n 20 "$log" >&2
+      die "$label died before it served $url"
+    fi
+    code=$(http_code "$url")
+    [ "$code" = "200" ] && return 0
+    sleep 0.25
+  done
+  warn "$label never answered 200 at $url (last status: ${code:-none}). Last lines of $log:"
+  tail -n 20 "$log" >&2
+  die "$label did not come up within ${STARTUP_TIMEOUT}s"
+}
+
+assert_single_listener() {
+  local port=$1 n
+  n=$(listeners "$port" | wc -l | tr -d ' ')
+  [ "$n" = "1" ] || die "expected exactly 1 listener on port $port, found $n. Run 'maestro-viz stop' and try again."
+}
+
+cmd_status() {
+  local api ui
+  api=$(listeners "$API_PORT"); ui=$(listeners "$UI_PORT")
+  say "api  :$API_PORT  ${api:-not running}"
+  say "ui   :$UI_PORT  ${ui:-not running}"
+  [ -n "$api" ] && [ -n "$ui" ] && say "probe $(http_code "http://localhost:${UI_PORT}${PROBE_PATH}") $UI_URL"
+  return 0
+}
+
+cmd_stop() {
+  free_port "$UI_PORT"
+  free_port "$API_PORT"
+  say "stopped; ports $API_PORT and $UI_PORT are free"
+}
+
+cmd_start() {
+  local api_cwd=$1
+
+  command -v bun >/dev/null 2>&1 || die "bun is not on PATH. Install it: https://bun.sh"
+  [ -f "$VIZ_DIR/server/index.ts" ] || die "no server/index.ts under $VIZ_DIR — this script was moved out of the visualizer's bin/ directory"
+  [ -x "$VIZ_DIR/node_modules/.bin/vite" ] || die "vite is not installed in $VIZ_DIR. Run: bun install --cwd $VIZ_DIR"
+
+  # Idempotence: whatever is listening now is replaced, so a second run leaves
+  # one instance rather than two.
+  free_port "$UI_PORT"
+  free_port "$API_PORT"
+
+  mkdir -p "$RUN_DIR"
+  : > "$API_LOG"; : > "$UI_LOG"
+
+  ( cd "$api_cwd" && exec nohup bun run "$VIZ_DIR/server/index.ts" ) >"$API_LOG" 2>&1 &
+  local api_pid=$!
+  wait_for_http "http://127.0.0.1:${API_PORT}${PROBE_PATH}" "$api_pid" "api" "$API_LOG"
+
+  # --strictPort: without it Vite silently moves to the next free port and the
+  # printed URL would be a lie.
+  ( cd "$VIZ_DIR" && exec nohup ./node_modules/.bin/vite --strictPort --port "$UI_PORT" ) >"$UI_LOG" 2>&1 &
+  local ui_pid=$!
+  wait_for_http "http://localhost:${UI_PORT}${PROBE_PATH}" "$ui_pid" "ui" "$UI_LOG"
+
+  assert_single_listener "$API_PORT"
+  assert_single_listener "$UI_PORT"
+
+  say "api  :$API_PORT  pid $api_pid  log $API_LOG"
+  say "ui   :$UI_PORT  pid $ui_pid  log $UI_LOG"
+  [ "$api_cwd" != "$VIZ_DIR" ] && say "sources discovered from $api_cwd"
+  grep -E '^\[sssf\] (maestro|sssf|tracer)' "$API_LOG" | sed 's/^/maestro-viz: /'
+  say "$PROBE_PATH answered 200 — open $UI_URL"
+  say "stop it with: maestro-viz stop"
+}
+
+case "${1-}" in
+  stop|--stop)      cmd_stop ;;
+  status|--status)  cmd_status ;;
+  -h|--help)
+    sed -n '3,14p' "$self" | sed 's/^# \{0,1\}//'
+    ;;
+  "")               cmd_start "$VIZ_DIR" ;;
+  *)
+    [ -d "$1" ] || die "not a directory: $1 (expected a repository to discover sources from, or 'stop' / 'status')"
+    cmd_start "$(cd "$1" && pwd)"
+    ;;
+esac
