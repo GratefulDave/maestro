@@ -347,6 +347,24 @@ export type MaestroLiveState = string;
  */
 export type MaestroCancelCause = string;
 
+/**
+ * `merge_cause` — how a node reached MERGED.
+ *
+ * `SCHEDULER` is a node the run merged: it passed verification, went
+ * VERIFIED, and merged with the ancestry proof, so the evidence chain §1.1
+ * item 4 requires exists. `OPERATOR_ACCEPTED` is `maestro skip` — the
+ * operator supplied the work by hand and proved its identity five ways, and
+ * the rest of the chain is absent. `UNRECORDED` is a MERGED row written
+ * before the column existed, where nothing can be said either way.
+ *
+ * `null` means the node is not MERGED at all and the question does not
+ * arise. The three non-null values must be shown apart: a run-merged lane
+ * and an operator-accepted one rendered identically here, which left the
+ * integration branch's git log as the only place the difference was visible
+ * (#93).
+ */
+export type MaestroMergeCause = string;
+
 /** One transition row, with its `detail_json` already parsed. */
 export interface MaestroTransition {
   node_id: string | null;
@@ -398,6 +416,8 @@ export interface MaestroNode {
    * comes back on `run resume`; `ABANDONED` does not.
    */
   cancel_cause: MaestroCancelCause | null;
+  /** How this node reached MERGED, and null in every other state. */
+  merge_cause: MaestroMergeCause | null;
   output_sha: string | null;
   granted_extra_attempts: number;
   updated_at: string | null;

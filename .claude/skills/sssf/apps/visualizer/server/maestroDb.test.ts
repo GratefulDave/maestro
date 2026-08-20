@@ -11,7 +11,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { MaestroDb, discoverMaestroLedger } from "./maestroDb.ts";
+import { MaestroDb, discoverMaestroLedger, mergeProvenance } from "./maestroDb.ts";
 import { probeKind, resolveSources } from "./sources.ts";
 
 /** `<visualizer>/../../templates/adws/adw_modules/lifecycle.py`. */
@@ -97,6 +97,7 @@ function insertNode(
     attempt_no: number;
     block_reason: string | null;
     cancel_cause: string | null;
+    merge_cause: string | null;
     output_sha: string | null;
     plan_digest: string;
   }> = {},
@@ -107,6 +108,7 @@ function insertNode(
     attempt_no: 0,
     block_reason: null as string | null,
     cancel_cause: null as string | null,
+    merge_cause: null as string | null,
     output_sha: null as string | null,
     plan_digest: "d".repeat(64),
     ...opts,
@@ -118,11 +120,11 @@ function insertNode(
   ).run(runId, nodeId, o.plan_digest, o.depth, JSON.stringify(o.needs));
   db.query(
     `INSERT INTO node_lifecycle (run_id, node_id, state, attempt_no, block_reason,
-                                 cancel_cause, output_sha,
+                                 cancel_cause, merge_cause, output_sha,
                                  granted_extra_attempts, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0, '2026-08-17T06:05:00+00:00')`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '2026-08-17T06:05:00+00:00')`,
   ).run(runId, nodeId, state, o.attempt_no, o.block_reason, o.cancel_cause,
-        o.output_sha);
+        o.merge_cause, o.output_sha);
 }
 
 function insertAttempt(
@@ -724,5 +726,86 @@ describe("source discovery", () => {
     const sources = resolveSources(["--db", junk, "--db", good], root);
     expect(sources.map((s) => s.path)).toEqual([good]);
     for (const source of sources) source.close();
+  });
+});
+
+/**
+ * A node an operator accepted by hand must not render as one the run merged.
+ *
+ * The dashboard drew `lane-p5-gap-policy` as MERGED with an output SHA over
+ * three attempts reading CANCELLED, CANCELLED, BLOCKED and no verdict on any
+ * of them (#93). The display was the honest shape of a skip; nothing on it
+ * said an operator had asserted the work, so the reasonable reading was that
+ * the run merged it and the attempt list was stale.
+ */
+describe("merge provenance", () => {
+  test("a run-merged node and an operator-accepted one read apart", () => {
+    const path = ledger("run-provenance", (seed) => {
+      insertRun(seed, "run-prov");
+      insertNode(seed, "run-prov", "lane-merged", "MERGED", {
+        merge_cause: "SCHEDULER",
+        output_sha: "a".repeat(40),
+      });
+      insertNode(seed, "run-prov", "lane-skipped", "MERGED", {
+        merge_cause: "OPERATOR_ACCEPTED",
+        output_sha: "b".repeat(40),
+      });
+    });
+    const db = new MaestroDb(path);
+    const nodes = db.run("run-prov")?.nodes ?? [];
+    const byId = new Map(nodes.map((n) => [n.node_id, n]));
+    expect(byId.get("lane-merged")?.state).toBe("MERGED");
+    expect(byId.get("lane-skipped")?.state).toBe("MERGED");
+    expect(byId.get("lane-merged")?.merge_cause).toBe("SCHEDULER");
+    expect(byId.get("lane-skipped")?.merge_cause).toBe("OPERATOR_ACCEPTED");
+    db.close();
+  });
+
+  test("a MERGED row with no recorded cause reads UNRECORDED, not SCHEDULER", () => {
+    const path = ledger("run-unrecorded", (seed) => {
+      insertRun(seed, "run-old");
+      insertNode(seed, "run-old", "lane", "MERGED", {
+        output_sha: "c".repeat(40),
+      });
+    });
+    const db = new MaestroDb(path);
+    const node = db.run("run-old")?.nodes?.[0];
+    expect(node?.merge_cause).toBe("UNRECORDED");
+    expect(node?.merge_cause).not.toBe("SCHEDULER");
+    db.close();
+  });
+
+  test("a ledger written before the column is read, not refused", () => {
+    const path = ledger("run-pre-column", (seed) => {
+      insertRun(seed, "run-pre");
+      insertNode(seed, "run-pre", "lane", "MERGED", {
+        output_sha: "d".repeat(40),
+      });
+      seed.exec("ALTER TABLE node_lifecycle DROP COLUMN merge_cause");
+    });
+    const db = new MaestroDb(path);
+    const node = db.run("run-pre")?.nodes?.[0];
+    expect(node?.merge_cause).toBe("UNRECORDED");
+    db.close();
+  });
+
+  test("a node that is not MERGED carries no provenance at all", () => {
+    const path = ledger("run-not-merged", (seed) => {
+      insertRun(seed, "run-live");
+      insertNode(seed, "run-live", "lane", "BLOCKED", {
+        block_reason: "SEMANTIC_BUDGET_EXHAUSTED",
+      });
+    });
+    const db = new MaestroDb(path);
+    expect(db.run("run-live")?.nodes?.[0]?.merge_cause).toBeNull();
+    db.close();
+  });
+
+  test("mergeProvenance is the one derivation and has four answers", () => {
+    expect(mergeProvenance("MERGED", "SCHEDULER")).toBe("SCHEDULER");
+    expect(mergeProvenance("MERGED", "OPERATOR_ACCEPTED")).toBe("OPERATOR_ACCEPTED");
+    expect(mergeProvenance("MERGED", null)).toBe("UNRECORDED");
+    expect(mergeProvenance("BLOCKED", null)).toBeNull();
+    expect(mergeProvenance("VERIFIED", null)).toBeNull();
   });
 });

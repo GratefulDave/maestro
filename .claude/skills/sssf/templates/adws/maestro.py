@@ -3573,6 +3573,81 @@ def _attempt_verdict(entries: Sequence[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _merge_cause_prefix(merge_cause: Optional[str]) -> str:
+    """What precedes the output SHA in `run status`'s DETAIL column.
+
+    `MERGED` stays the state, because it *is* the state: the frontier, the
+    readiness predicate, and the run outcome all key on it, and renaming it
+    for one provenance would be a display inventing a seventh state (§7.3).
+    What changes is that the operator is told which of the two things
+    happened, in the one column that had room for it, rather than being left
+    to read the integration branch's git log for the difference (#93).
+    """
+    if merge_cause == scheduler_types.MergeCause.OPERATOR_ACCEPTED.value:
+        return "operator-accepted "
+    if merge_cause == scheduler_types.MERGE_CAUSE_UNRECORDED:
+        return "unrecorded merge, output "
+    return "output "
+
+
+def _merge_evidence_lines(node: Mapping[str, Any]) -> List[str]:
+    """The evidence-chain reading for a node an operator accepted.
+
+    Printed beside `BLOCKED:` and in the same shape, because it answers the
+    same question — why does this node read the way it does — and because
+    §1.1 item 4's chain being absent is exactly as worth an operator's
+    attention as the reason a node stopped. Says what the ledger counted and
+    stops there: no line here asserts that the work is wrong, only that the
+    run did not establish it.
+    """
+    evidence = node.get("merge_evidence")
+    if not isinstance(evidence, Mapping):
+        return []
+    if evidence.get("verified_ever"):
+        chain = "node reached VERIFIED {} time(s) before it was accepted".format(
+            evidence.get("verified_transitions"))
+    else:
+        chain = ("node never reached VERIFIED: no post-node gate pass and no "
+                 "reviewer verdict is recorded for it")
+    return [
+        "    OPERATOR-ACCEPTED: {} — evidence chain not established by this run"
+        .format(node["output_sha"][:12] if node["output_sha"] else "?"),
+        "      {}".format(chain),
+        "      {} review rejection(s) over {} attempt(s); blocked as {}".format(
+            evidence.get("review_rejections"),
+            evidence.get("attempts_recorded"),
+            evidence.get("block_reason") or "no stored reason"),
+    ]
+
+
+def _merge_evidence_by_node(transitions: Sequence[Dict[str, Any]]
+                            ) -> Dict[str, Dict[str, Any]]:
+    """The evidence record `skip` wrote, per node it accepted (§1.1 item 4).
+
+    `node_lifecycle.merge_cause` says *that* an operator accepted the node,
+    which is the fact a reader must key on and the fact §1.2 requires to be
+    typed and stored. What the evidence chain held at that moment is the
+    audit half of the same write, and it lives on the transition — the shape
+    §11.3 settled for `retry --grant`'s magnitude, where the column carries
+    what a guard reads and the transition carries what an operator reads.
+
+    Read directly rather than through `_attempt_history`, which files a
+    transition under the attempt that was open when it happened. A skip is
+    not about an attempt: it is about the node, and the operator asking why a
+    node reads operator-accepted should not have to know which attempt was
+    open when they typed the command.
+    """
+    found: Dict[str, Dict[str, Any]] = {}
+    for row in transitions:
+        node_id = row.get("node_id")
+        if node_id is None or row.get("reason") != scheduler_types.Escape.SKIP.value:
+            continue
+        evidence = (row.get("detail") or {}).get(lc.MERGE_EVIDENCE_KEY)
+        if isinstance(evidence, dict):
+            found[node_id] = evidence
+    return found
+
+
 def _live_state(record: "lc.RunRecord",
                 nodes: Sequence["lc.NodeRow"]) -> str:
     """What the run is doing now, which is not what it last *declared*.
@@ -3598,7 +3673,9 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
     now = time.time()
     nodes = reader.nodes(record.run_id)
     attempts = reader.attempts(record.run_id)
-    history = _attempt_history(reader.transitions(record.run_id))
+    transitions = reader.transitions(record.run_id)
+    history = _attempt_history(transitions)
+    merge_evidence = _merge_evidence_by_node(transitions)
     results = reader.results(record.run_id)
     names = {digest: name for name, digest
              in (getattr(args, "plan_digests", None) or {}).items()}
@@ -3647,6 +3724,16 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             "attempt_no": node.attempt_no,
             "attempts_recorded": len(node_attempts),
             "granted_extra_attempts": node.granted_extra_attempts,
+            # How the node reached MERGED, as one key with three values and a
+            # null: `SCHEDULER`, `OPERATOR_ACCEPTED`, `UNRECORDED` for a row
+            # written before the column, and `null` where the node is not
+            # MERGED and the question does not arise. Both `MERGED` shapes
+            # used to render identically here, which is what left the git log
+            # as the only place the difference was visible (#93).
+            "merge_cause": node.merge_provenance,
+            # What the ledger could show about the evidence chain when the
+            # operator accepted it — present only on a node `skip` wrote.
+            "merge_evidence": merge_evidence.get(node.node_id),
             "output_sha": node.output_sha,
             "updated_at": node.updated_at,
             "idle_s": _since(node.updated_at, now),
@@ -3745,7 +3832,8 @@ def _render_progress(progress: Dict[str, Any]) -> str:
             detail = "in flight {}, {} turns".format(
                 _duration(live[0]["elapsed_s"]), live[0]["turn_count"])
         elif node["output_sha"]:
-            detail = "output {}".format(node["output_sha"][:12])
+            detail = "{}{}".format(_merge_cause_prefix(node["merge_cause"]),
+                                   node["output_sha"][:12])
         lines.append("  {:<44} {:<10} {:>8}  {}".format(
             node["node_id"][:44], node["state"], node["attempt_no"], detail))
 
@@ -3767,6 +3855,8 @@ def _render_progress(progress: Dict[str, Any]) -> str:
                     attempt["session_path"]))
         if node["block_reason"]:
             lines.append("    BLOCKED: {}".format(node["block_reason"]))
+        for line in _merge_evidence_lines(node):
+            lines.append(line)
 
     for row in progress["results"]:
         lines.append("")
