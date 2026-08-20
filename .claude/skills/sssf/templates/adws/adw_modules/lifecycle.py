@@ -131,6 +131,12 @@ class LedgerUnavailable(LifecycleError):
     """
 
 
+#: The transition `reason` an operator's `--allow-exhausted-node` leaves
+#: behind. Declared once so the writer and every reader name the same string,
+#: rather than each spelling a literal that drifts.
+NODE_BUDGET_ALLOWANCE_REASON = "allow-exhausted-node"
+
+
 # ── schema ───────────────────────────────────────────────────────────────────
 
 SCHEMA = """
@@ -1221,6 +1227,51 @@ class LifecycleStore:
                 " reason, actor, detail_json, created_at)"
                 " VALUES (?,NULL,'run',NULL,NULL,'acceptance-start','scheduler','{}',?)",
                 (run_id, now))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def record_budget_allowance(
+            self, run_id: str, node_id: str, *,
+            cumulative_review_rejections: int, effective_ceiling: int,
+            run_ids: Sequence[str]) -> None:
+        """Record that an operator admitted a node whose cross-run review
+        budget was already spent (§3.6 B10).
+
+        B10 requires the escape from a refusal to exist; §1.2 requires the
+        escape to leave a stored record rather than a memory of a flag
+        somebody typed. Without this row the whole of "the operator allowed
+        it" lives in the argv of a process that has exited, and the run's
+        ledger records a node that quietly had more attempts than the ceiling
+        allows with nothing saying why.
+
+        A transition rather than a column, and the same division §11.3 settled
+        for `retry --grant`: the column carries what a guard reads, the
+        transition carries what an operator reads. The guard here reads the
+        prior runs' attempt rows, so there is nothing to store for it; the
+        magnitude it was overridden by is exactly what an operator later needs.
+
+        Written before the run row exists, because the refusal it escapes is
+        decided before anything else in the run is. The `transitions` table
+        carries no foreign key for that reason among others, and the row is
+        keyed on the run id the invocation is about to use, so it joins the
+        rest of that run's audit trail the moment the projection lands.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT INTO transitions (run_id, node_id, kind, from_state,"
+                " to_state, reason, actor, detail_json, created_at)"
+                " VALUES (?,?,'node',NULL,NULL,?,'operator',?,?)",
+                (run_id, node_id, NODE_BUDGET_ALLOWANCE_REASON,
+                 json.dumps({
+                     "cumulative_review_rejections":
+                         cumulative_review_rejections,
+                     "effective_ceiling": effective_ceiling,
+                     "run_ids": list(run_ids)}, sort_keys=True),
+                 now_iso()))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -2999,6 +3050,56 @@ class LifecycleReader:
                              if row["retry_class"] else None),
                 extra=json.loads(row["extra_json"]))
             for row in rows)
+
+    def attempts_by_run_for_plan(
+            self, plan_digest: str,
+            exclude_run_id: Optional[str] = None
+            ) -> Dict[str, Tuple[st.AttemptRecord, ...]]:
+        """Every run of one plan, and the attempt rows each of them holds.
+
+        A node's identity across runs is `(plan_digest, node_id)` and nothing
+        else. The ledger has never heard of a plan *name* — `runs.plan_digest`
+        and `dag_nodes.plan_digest` are the whole of what it stores (§7.1) — so
+        scoping by digest is what makes "the same node" a fact rather than a
+        guess about two runs that happened to reuse a lane id. Re-shipping a
+        plan mints a new digest and legitimately starts the count again: the
+        bytes the node is judged against changed.
+
+        `exclude_run_id` is always the run about to execute. On `run start`
+        that id is fresh and excludes nothing; on `run resume` it is the run
+        being re-entered, whose own review spend `Scheduler._review_ceiling_
+        reached` already owns, and counting it here as well would charge the
+        same rejection to two budgets.
+
+        Read-only by construction: this reader opens `mode=ro`, and the
+        cross-run budget is decided before the run's own ledger exists.
+        """
+        return {record.run_id: self.attempts(record.run_id)
+                for record in self.runs(plan_digest)
+                if record.run_id != exclude_run_id}
+
+    def granted_extra_attempts_for_plan(
+            self, plan_digest: str,
+            exclude_run_id: Optional[str] = None) -> Dict[str, int]:
+        """Per node, the operator grants standing on this plan's prior runs.
+
+        `retry --force` and `retry --grant N` raise
+        `node_lifecycle.granted_extra_attempts`, which is keyed
+        `(run_id, node_id)` — so a new run mints a row at zero and an operator
+        who deliberately widened a node's allowance in run A would find the
+        node refused at the start of run B, by a rule reading the very
+        rejections that grant was given to absorb. Summing them here is what
+        keeps a deliberate operator act from being silently revoked by the
+        next `run start`.
+        """
+        granted: Dict[str, int] = {}
+        for record in self.runs(plan_digest):
+            if record.run_id == exclude_run_id:
+                continue
+            for row in self.nodes(record.run_id):
+                granted[row.node_id] = (granted.get(row.node_id, 0)
+                                        + (row.granted_extra_attempts or 0))
+        return granted
 
     def transitions(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
         return tuple(_audit_dict(row) for row in self._rows(

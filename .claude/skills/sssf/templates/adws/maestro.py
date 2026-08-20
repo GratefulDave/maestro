@@ -926,6 +926,18 @@ _RUN_TUNING_OPTIONS: Dict[str, str] = {
 _RUN_TUNING_EXAMPLES = ("--concurrency", "--environmental-retries",
                         "--launcher-retries", "--review-ceiling")
 
+#: Run-execution flags that name neither a path nor a setting, but an operator
+#: *decision* about this one invocation. `--allow-exhausted-node` names a node
+#: in the plan configuration already resolved, derives nothing, and is
+#: compared against nothing, so it cannot produce the half-configured
+#: disagreement the all-or-nothing rule exists to refuse. Without this it
+#: would be classified as a runtime flag: on `run start` the invocation would
+#: be refused outright, and on `run resume` it would silently switch
+#: configuration binding off and demand the other fifteen paths by hand (#91)
+#: -- which is to say the escape §3.6 B10 requires would not have been
+#: reachable on a configured repository at all.
+_RUN_ESCAPE_OPTIONS = frozenset({"--allow-exhausted-node"})
+
 #: Plan verbs whose positional argument is overloaded — a plan *name* the
 #: installed configuration resolves, or a filesystem path to the plan bytes.
 #: `author` is excluded because it also binds executables and *writes* the
@@ -998,7 +1010,8 @@ def _apply_repository_config(
     tuning: Dict[str, Any] = {}
     if args.command == "run" and args.run_command != "start":
         manual = tuple(sorted(
-            supplied - _RUN_SELECTION_OPTIONS - frozenset(_RUN_TUNING_OPTIONS)))
+            supplied - _RUN_SELECTION_OPTIONS - frozenset(_RUN_TUNING_OPTIONS)
+            - _RUN_ESCAPE_OPTIONS))
         if manual:
             # A fully manual invocation. Every path it works on came from a
             # flag, and binding the other half from configuration is exactly
@@ -1027,9 +1040,17 @@ def _apply_repository_config(
         # broke it. Quote the flags: an operator reading "do not accept
         # runtime flags" beside a command line of their own has to guess which
         # of them counted as runtime.
-        raise _MaestroConfigurationError(
-            "configured named-plan commands do not accept runtime flags: "
-            + ", ".join(sorted(supplied)))
+        #
+        # The escape options are exempt on the run verbs and nowhere else: a
+        # `plan` verb has no run to admit a node into, so an escape flag there
+        # is as much a mistake as any other runtime flag.
+        runtime = sorted(supplied - (_RUN_ESCAPE_OPTIONS
+                                     if args.command == "run"
+                                     else frozenset()))
+        if runtime:
+            raise _MaestroConfigurationError(
+                "configured named-plan commands do not accept runtime flags: "
+                + ", ".join(runtime))
 
     repo = config_path.parent.parent.resolve()
     if args.command == "bootstrap" or (
@@ -2875,6 +2896,143 @@ def _receipt_absent(store: "finalization.ReceiptStore",
         cause="NEVER_FINALIZED", set_aside_count=0)
 
 
+def _refuse_cross_run_node_budget(args: argparse.Namespace,
+                                 plan: plan_model.Plan) -> None:
+    """Refuse a run whose nodes have already spent their review budget in
+    earlier runs of the same plan.
+
+    **The hole this closes.** `review_ceiling` is enforced by
+    `Scheduler._review_ceiling_reached`, which counts
+    `retry_policy.review_attempts_total` over `(run_id, node_id)`. That scope
+    is deliberate and correct *within* a run — but a fresh `run start` mints a
+    new `run_id`, `create_run` seeds a `node_lifecycle` row with an empty
+    history, and the same node against the same plan bytes is handed a whole
+    new ceiling. A node no reviewer will pass can therefore be re-attempted
+    without limit, one run at a time, and no budget in the system ever says
+    so. That is #92's shape: a debt no amount of spending pays off, and no
+    counter that can see it.
+
+    **What it counts, and where the count comes from.** The cumulative total
+    is `retry_policy.review_attempts_across_runs`, which sums
+    `review_attempts_total` per prior run rather than restating its predicate
+    (RC1: the second copy of this rule that had no caller disagreed with the
+    enforced one by exactly one attempt). Prior runs are every `runs` row
+    carrying this plan's digest except the one this invocation is about to
+    execute — fresh on `run start`, and on `run resume` the run being
+    re-entered, whose own spend the scheduler's in-run ceiling already owns.
+
+    **Grants are honoured.** `retry --force` / `retry --grant N` raise
+    `node_lifecycle.granted_extra_attempts` on the run they were typed
+    against, so a node an operator deliberately widened in run A would
+    otherwise be refused at the start of run B by a rule reading the very
+    rejections the grant absorbed. The effective ceiling is the configured one
+    plus every grant standing on the prior runs' rows for that node.
+
+    **The escape (§3.6 B10).** A budget with no operator exit would be the
+    first in this system, and B10 makes the exit a requirement rather than a
+    convenience. `--allow-exhausted-node <node_id>` admits the node it names,
+    and its use is recorded as a typed transition on the run — never as a flag
+    remembered only by a process that has exited (§1.2).
+
+    **Where it sits.** In `_execute_run`, immediately after
+    `_load_runnable_plan` and before any `LifecycleStore` write, worktree
+    creation or launch — so a refused run leaves the ledger and the filesystem
+    exactly as it found them. `_execute_run` is entered by `run start`, by
+    `run resume`, and by the workspace coordinator's participant subprocess,
+    so the coverage claim is a property of the call graph rather than of a
+    list of verbs somebody has to keep updating (§19 M6).
+    """
+    # `to_plan_nodes()` rather than `node_by_id()`: these are the node ids
+    # `create_run` is about to project, which is the same set the prior runs'
+    # `dag_nodes` rows were projected from, so the two sides of the comparison
+    # are derived from one definition rather than two.
+    known = tuple(node.node_id for node in plan.to_plan_nodes())
+    allowed = tuple(getattr(args, "allow_exhausted_nodes", None) or ())
+    unknown = sorted(set(allowed) - set(known))
+    if unknown:
+        raise _RunRefused(
+            "ALLOW_EXHAUSTED_NODE_UNKNOWN",
+            "--allow-exhausted-node named {0}, which {1} does not contain. "
+            "The plan's nodes are {2}. A misspelled node id would admit "
+            "nothing and refuse nothing, so it is refused here rather than "
+            "silently ignored.".format(
+                ", ".join(unknown), args.plan_file, ", ".join(sorted(known))),
+            unknown_node_ids=unknown, plan_node_ids=sorted(known))
+    database = getattr(args, "db", None)
+    ceiling = getattr(args, "review_ceiling", None)
+    digest = getattr(args, "digest", None)
+    if (not database or not digest or ceiling is None
+            or not Path(database).is_file()):
+        # No ledger means no prior run, which is the ordinary first start.
+        # The reader would refuse an absent database, and creating one to
+        # discover it is empty is exactly the side effect `LedgerUnavailable`
+        # exists to prevent.
+        #
+        # An absent digest declines the question rather than widening it: the
+        # digest is what scopes "the same node" to one plan, and `runs(None)`
+        # would count every run of every plan in the repository against a lane
+        # id that merely matches by name.
+        return
+    reader = _open_reader(database)
+    try:
+        excluded = getattr(args, "run_id", None)
+        attempts_by_run = reader.attempts_by_run_for_plan(
+            digest, exclude_run_id=excluded)
+        granted = reader.granted_extra_attempts_for_plan(
+            digest, exclude_run_id=excluded)
+    finally:
+        reader.close()
+
+    exhausted: List[Dict[str, Any]] = []
+    admitted: List[Dict[str, Any]] = []
+    for node_id in sorted(known):
+        total, run_ids = retry_policy.review_attempts_across_runs(
+            attempts_by_run, node_id)
+        effective = int(ceiling) + int(granted.get(node_id, 0))
+        if total <= effective:
+            continue
+        record = {"node_id": node_id,
+                  "cumulative_review_rejections": total,
+                  "effective_ceiling": effective,
+                  "run_ids": list(run_ids)}
+        (admitted if node_id in allowed else exhausted).append(record)
+
+    if exhausted:
+        raise _RunRefused(
+            "NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
+            "the review budget for {0} is already spent across earlier runs "
+            "of {1}: {2}. `review_ceiling` is {3}, and a fresh run would hand "
+            "each of these nodes the whole ceiling again, which is how a node "
+            "no reviewer will pass is re-attempted without limit. Read the "
+            "series with `maestro run convergence <run_id>` and re-author the "
+            "node's instruction, or admit it deliberately with "
+            "`--allow-exhausted-node <node_id>`.".format(
+                ", ".join(record["node_id"] for record in exhausted),
+                digest,
+                "; ".join(
+                    "{0} rejected {1} time(s) over {2}".format(
+                        record["node_id"],
+                        record["cumulative_review_rejections"],
+                        ", ".join(record["run_ids"]))
+                    for record in exhausted),
+                ceiling),
+            plan_digest=digest, review_ceiling=int(ceiling),
+            nodes=exhausted)
+
+    if admitted:
+        store = lc.LifecycleStore(database)
+        try:
+            for record in admitted:
+                store.record_budget_allowance(
+                    args.run_id, record["node_id"],
+                    cumulative_review_rejections=record[
+                        "cumulative_review_rejections"],
+                    effective_ceiling=record["effective_ceiling"],
+                    run_ids=record["run_ids"])
+        finally:
+            store.close()
+
+
 def _herdr_workspace_label(args: argparse.Namespace) -> str:
     """The name of the herdr workspace this run's panes land in.
 
@@ -3285,6 +3443,10 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
 
     config = _run_configuration(args)
     plan = _load_runnable_plan(args)
+    # Before the ledger is opened for writing and before any worktree exists,
+    # because a run refused for a spent cross-run review budget must leave
+    # nothing behind (§3.6 B10's escape is the only way past it).
+    _refuse_cross_run_node_budget(args, plan)
     _validate_run_paths(args, plan)
     # A run precondition, in the same family as the integration branch already
     # being checked out: decided before the scheduler exists, so an unusable
@@ -5890,6 +6052,12 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backstop-t-s", type=float)
     parser.add_argument("--semantic-ceiling", type=int)
     parser.add_argument("--review-ceiling", type=int)
+    # §3.6 B10's escape from `NODE_BUDGET_EXHAUSTED_ACROSS_RUNS`, repeatable
+    # so a run with two spent nodes needs one invocation rather than two. One
+    # node id per flag, for the reason `--provision` takes one argv word per
+    # flag: a comma-separated list is a parser nobody wrote.
+    parser.add_argument("--allow-exhausted-node", action="append",
+                        dest="allow_exhausted_nodes", metavar="NODE_ID")
     parser.add_argument("--environmental-retries", type=int)
     parser.add_argument("--launcher-retries", type=int)
     parser.add_argument("--credential-retries", type=int)
