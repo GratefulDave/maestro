@@ -988,6 +988,83 @@ def commit_measured_delta(attempt: AttemptWorktree, measured: InventoryDelta,
     return output_sha
 
 
+# ── §7.4's post-work falsification: take the subject back out ───────────────
+
+
+def _tracked_at(worktree: Path, sha: str, relpath: str) -> bool:
+    """Is `relpath` in the tree of `sha`?"""
+    return _git(worktree, "cat-file", "-e", "{0}:{1}".format(sha, relpath),
+                check=False).returncode == 0
+
+
+def paths_written_since(attempt: AttemptWorktree, base: str) -> Tuple[str, ...]:
+    """Paths this node added, modified, copied or renamed between `base` and HEAD.
+
+    HEAD is the sealed output commit. `base` is the node's **falsifiability**
+    base — the integration head the chain root branched from — which is
+    `attempt.base` for an ordinary attempt and the chain root's head for a
+    repair (§7.4). The distinction is the whole reason this reads git rather
+    than the attempt's own measured delta: a repair attempt that edits only its
+    test file has a measured delta of one path, and asking the falsification
+    question over that delta would find nothing to revert and pass vacuously,
+    which is the exact escape the check exists to close.
+
+    Deletions are excluded. Restoring a file the node deleted cannot make its
+    gate go red, so a deleted path is not a subject this question has.
+    """
+    listed = _out(attempt.path, "diff", "--name-only", "--diff-filter=ACMR",
+                  base, "HEAD")
+    return tuple(line for line in listed.splitlines() if line.strip())
+
+
+def revert_paths_to(attempt: AttemptWorktree, base: str,
+                    relpaths: Sequence[str]) -> Tuple[str, ...]:
+    """Put `relpaths` back to their content at `base`.
+
+    Called only after `commit_measured_delta` has sealed the output commit, so
+    nothing done here can reach the integration branch: the merge consumes the
+    committed object and this touches the working tree the commit was taken
+    from. That is the same argument §8.4 already makes about running the
+    post-node gate after the commit rather than before it.
+
+    A path `base` does not hold is removed rather than checked out — it is new
+    in this node's work, and "revert" for a new file is its absence. The
+    removal is `os.remove` and not a shell `rm`, because this module never
+    shells out to anything but git.
+
+    Returns the paths actually reverted, which is what the caller records.
+    """
+    reverted: List[str] = []
+    for rel in relpaths:
+        if _tracked_at(attempt.path, base, rel):
+            _git(attempt.path, "checkout", base, "--", rel)
+        else:
+            target = attempt.path / rel
+            if target.is_symlink() or target.exists():
+                os.remove(target)
+            _git(attempt.path, "rm", "--cached", "-q", "--", rel, check=False)
+        reverted.append(rel)
+    return tuple(reverted)
+
+
+def restore_paths_from_head(attempt: AttemptWorktree,
+                            relpaths: Sequence[str]) -> None:
+    """Undo `revert_paths_to`, from the attempt's own output commit.
+
+    HEAD is the sealed output commit by the time this runs — `commit_measured_
+    delta` advanced the ref the worktree is checked out on — so restoring from
+    it returns index and working tree to exactly the state the commit records.
+
+    Correctness of the restore is not asserted here and deliberately gets no
+    check of its own. Nothing downstream reads this tree: the merge consumes
+    the committed object, so a path left reverted would be a stale worktree
+    about to be removed, not a wrong merge. A checker here would be a check on
+    a check with no failure to catch.
+    """
+    for rel in relpaths:
+        _git(attempt.path, "checkout", "HEAD", "--", rel, check=False)
+
+
 # ── §8.3 the four checks ────────────────────────────────────────────────────
 
 @dataclass(frozen=True)

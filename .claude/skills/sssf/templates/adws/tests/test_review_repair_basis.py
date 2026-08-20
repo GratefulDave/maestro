@@ -1,4 +1,4 @@
-"""A rejected diff is repaired, not re-implemented.
+"""A refused diff is repaired, not re-implemented.
 
 `lane-p5-gap-policy` of run fb9973646d344400a9e4f4d7818d00f2 was rejected by
 code review four times and produced 2, 2, 1, 3 findings across those four
@@ -18,8 +18,10 @@ sent back to that same surviving commit rather than to an empty tree.
 
 These tests hold that in place:
 
-* a SEMANTIC **review rejection** opens the next attempt on the rejected
-  attempt's output commit, and the node still merges;
+* a SEMANTIC failure that arrives **with a proven output commit** — since
+  §19 M35 that is §7.4's post-work falsification refusal, and before it was a
+  review rejection — opens the next attempt on that commit, and the node
+  still merges;
 * a SEMANTIC failure that is *not* a rejection — a red post-gate, a clause-4
   conviction — still restarts from the node's base, because that tree never
   passed its own gate and there is nothing to repair;
@@ -97,6 +99,21 @@ class RepairFixture(SchedulerFixture):
     """One agent node, a scripted reviewer, and a builder that writes a
     distinguishable file on every attempt so a real delta exists each time."""
 
+    def refuse_falsification(self, times: int, node_id: str = "a"):
+        """Make §7.4's post-work falsification refuse the next `times` attempts.
+
+        Since §19 M35 a reviewer's rejection recycles nothing, so the failure
+        that opens a repair chain is this one: the node's own gate stays green
+        with everything the gate's argv does not name reverted to the chain
+        root's base, which says the tests never observed the code. It arrives
+        with a sealed, provable output commit, which is what `decide_repair`
+        bases on.
+
+        A green falsify gate is the fixture form of that, exactly as a red
+        pre-gate is the fixture form of clause 2.
+        """
+        self.gate_script[(node_id, "falsify")] = [green()] * times
+
     def scripted_reviewer(self, reviews):
         """Pops one scripted verdict per dispatch and records its subject."""
         self.reviewed = []
@@ -140,7 +157,7 @@ class RepairFixture(SchedulerFixture):
 
 class RepairBaseSelectionTests(RepairFixture):
 
-    def test_a_review_rejection_bases_the_next_attempt_on_the_rejected_diff(self):
+    def test_a_falsification_refusal_bases_the_next_attempt_on_that_diff(self):
         """The regression itself.
 
         Before the repair, attempts 1 and 2 carried the same `base_sha` and
@@ -148,6 +165,7 @@ class RepairBaseSelectionTests(RepairFixture):
         rejection ever again discards a committed builder attempt.
         """
         reviews = [reject(2, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
         report = self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),
@@ -179,6 +197,7 @@ class RepairBaseSelectionTests(RepairFixture):
         """
         seen = {}
         reviews = [reject(1, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
 
         def run_node(attempt, node, record, retry_prompt, on_launch,
                      cancel_requested):
@@ -207,6 +226,7 @@ class RepairBaseSelectionTests(RepairFixture):
         handed `rejected..output` would judge only the repair delta and could
         not see the node's work as a whole."""
         reviews = [reject(1, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
         self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),
@@ -224,6 +244,7 @@ class RepairBaseSelectionTests(RepairFixture):
         fresh-base attempt indistinguishable from any other. The audit tier is
         where the reason lands, and `transitions()` is its reader."""
         reviews = [reject(1, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
         self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),
@@ -244,6 +265,7 @@ class RepairBaseSelectionTests(RepairFixture):
         """`base_sha` can no longer carry the integration head, so the row
         carries it explicitly — and `AttemptRecord.integration_head` reads it."""
         reviews = [reject(1, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
         self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),
@@ -336,6 +358,7 @@ class SiblingMergeTests(RepairFixture):
         the new head, and the sibling's file is present in its worktree.
         """
         reviews = [reject(1, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
         trees = {}
         moved = {}
 
@@ -384,10 +407,13 @@ class SiblingMergeTests(RepairFixture):
 
 class ChainBreakTests(RepairFixture):
 
-    def _run_rejections(self, verdicts, review_ceiling=8):
+    def _run_rejections(self, verdicts, semantic_ceiling=8):
+        refusals = sum(1 for verdict in verdicts if not verdict.passed)
+        self.refuse_falsification(refusals)
         self.schedule(
             [self.agent("a")],
-            config=self.config(review_ceiling=review_ceiling),
+            config=self.config(review_ceiling=8,
+                               semantic_ceiling=semantic_ceiling),
             deps=self.deps(run_node=self.per_attempt_builder(),
                            review_attempt=self.scripted_reviewer(list(verdicts)))
         ).run()
@@ -427,7 +453,7 @@ class ChainBreakTests(RepairFixture):
         """Termination. `chain_length` strictly increases with every admitted
         repair and is compared against a constant, so no chain outlives the
         limit; a broken chain restarts at zero and the number of chains is
-        bounded by the untouched `review_ceiling`."""
+        bounded by the untouched `semantic_ceiling`."""
         self.assertEqual(rp.REPAIR_CHAIN_LIMIT, 3)
         rows = self._run_rejections([
             reject(2, "d1"), reject(2, "d2"), reject(2, "d3"), reject(2, "d4"),
@@ -441,17 +467,17 @@ class ChainBreakTests(RepairFixture):
         self.assertIs(self.store.get_node("run1", "a").state,
                       st.NodeState.MERGED)
 
-    def test_the_review_ceiling_still_ends_the_node(self):
-        """The repair loop adds no attempts. Exhausting the review budget
-        blocks exactly where it blocked before."""
+    def test_the_fix_loop_ceiling_still_ends_the_node(self):
+        """The repair loop adds no attempts. Exhausting `semantic_ceiling`
+        blocks exactly where the review ceiling used to (§19 M35)."""
         rows = self._run_rejections(
             [reject(2, "d{0}".format(i)) for i in range(1, 5)],
-            review_ceiling=3)
+            semantic_ceiling=3)
         self.assertEqual(len(rows), 3)
         node = self.store.get_node("run1", "a")
         self.assertIs(node.state, st.NodeState.BLOCKED)
         self.assertIs(node.block_reason,
-                      st.BlockReason.REVIEW_BUDGET_EXHAUSTED)
+                      st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
 
 
 # ── the repair prompt ───────────────────────────────────────────────────────
@@ -468,6 +494,7 @@ class RepairPromptTests(RepairFixture):
         of the two the agent is being asked to do.
         """
         reviews = [reject(2, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
         self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),
@@ -579,11 +606,14 @@ class DecideRepairTests(unittest.TestCase):
         self.assertEqual(rp.decide_repair(_facts(prior)).reason,
                          rp.REPAIR_NO_PRIOR_REJECTION)
 
-    def test_the_class_without_the_marker_is_refused(self):
+    def test_the_class_without_the_review_marker_is_admitted(self):
+        """§19 M35: the predicate is the stored commit, not which stage
+        objected. A falsification refusal carries no rejection marker and is
+        exactly the failure the chain now exists to repair."""
         prior = _rejected()
         del prior.extra[rp.REVIEW_REJECTED_KEY]
         self.assertEqual(rp.decide_repair(_facts(prior)).reason,
-                         rp.REPAIR_NO_PRIOR_REJECTION)
+                         rp.REPAIR_ADMITTED)
 
     def test_a_moved_ref_is_refused(self):
         prior = _rejected()
@@ -598,11 +628,14 @@ class DecideRepairTests(unittest.TestCase):
             rp.REPAIR_OUTPUT_UNPROVEN)
 
     def test_a_row_with_no_stored_output_commit_is_refused(self):
-        """Every row written before `REVIEW_OUTPUT_SHA_KEY` existed."""
+        """Every row written before `REVIEW_OUTPUT_SHA_KEY` existed, and every
+        failure that never produced a commit. It is clause 1's predicate since
+        §19 M35, so the reason names the absent commit rather than an
+        unprovable one."""
         prior = _rejected()
         del prior.extra[rp.REVIEW_OUTPUT_SHA_KEY]
         self.assertEqual(rp.decide_repair(_facts(prior)).reason,
-                         rp.REPAIR_OUTPUT_UNPROVEN)
+                         rp.REPAIR_NO_PRIOR_REJECTION)
 
     def test_a_moved_integration_head_is_refused(self):
         prior = _rejected()
@@ -735,6 +768,7 @@ class RepairFalsifiabilityTests(RepairFixture):
         block the node just the same, and this node would not be MERGED.
         """
         self.gate_script[("a", "pre")] = [red(), green()]
+        self.refuse_falsification(1)
         report = self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),
@@ -793,6 +827,7 @@ class RepairFalsifiabilityTests(RepairFixture):
         attempt, and nothing about it changes. `repairing` widens what clause
         2 accepts; it never narrows what it demands."""
         self.gate_script[("a", "pre")] = [red(), red()]
+        self.refuse_falsification(1)
         report = self.schedule(
             [self.agent("a")],
             config=self.config(review_ceiling=4),

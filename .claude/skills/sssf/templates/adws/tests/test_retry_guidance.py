@@ -44,7 +44,7 @@ from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
-from test_scheduler import SchedulerFixture  # noqa: E402
+from test_scheduler import SchedulerFixture, green  # noqa: E402
 
 
 class _Cell:
@@ -166,8 +166,11 @@ class RenderingTests(unittest.TestCase):
 class ConvergenceTests(SchedulerFixture):
     """The incident, reproduced and closed, through the real scheduler.
 
-    clause 4 → review → clause 4 again, then an attempt that satisfies
-    everything at once. Every retry prompt after the second failure must carry
+    clause 4 → review-plus-falsification → clause 4 again, then an attempt
+    that satisfies everything at once. The middle failure used to be the
+    review rejection by itself; since §19 M35 a rejection recycles nothing, so
+    the middle attempt is recycled by §7.4's falsification refusal with the
+    reviewer's finding recorded first and riding the same prompt. Every retry prompt after the second failure must carry
     the standing constraints of BOTH surfaces, and the verification
     constraint must carry its full same-surface history: an offending path
     absent from the latest evaluation may be absent because the attempt
@@ -182,6 +185,14 @@ class ConvergenceTests(SchedulerFixture):
 
         def review_attempt(attempt, node, record, base_sha, output_sha):
             return reviews.pop(0)
+
+        # §19 M35: the reviewer's rejection is advisory and recycles nothing on
+        # its own, so what sends attempt 2 back is §7.4's post-work
+        # falsification refusal — a green falsify gate, meaning the node's own
+        # gate did not need the code it shipped. The review constraint is
+        # recorded first and rides the same retry prompt, which is the
+        # accumulation this test is about.
+        self.gate_script[("a", "falsify")] = [green()]
 
         def run_node(attempt, node, record, retry_prompt, on_launch,
                      cancel_requested):
@@ -198,7 +209,11 @@ class ConvergenceTests(SchedulerFixture):
 
         report = self.schedule(
             [self.agent("a")],
-            config=self.config(semantic_ceiling=3),
+            # Four, not three. §19 M35 merged the review budget into this one,
+            # so the three content failures this scenario spends — clause 4,
+            # falsification, clause 4 again — all count here, where the middle
+            # one used to be charged to `review_ceiling` instead.
+            config=self.config(semantic_ceiling=4),
             deps=self.deps(run_node=run_node,
                            review_attempt=review_attempt)).run()
 

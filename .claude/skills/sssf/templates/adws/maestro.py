@@ -2811,28 +2811,36 @@ def _receipt_absent(store: "finalization.ReceiptStore",
 
 def _refuse_cross_run_node_budget(args: argparse.Namespace,
                                  plan: plan_model.Plan) -> None:
-    """Refuse a run whose nodes have already spent their review budget in
+    """Refuse a run whose nodes have already spent their fix-loop budget in
     earlier runs of the same plan.
 
-    **The hole this closes.** `review_ceiling` is enforced by
-    `Scheduler._review_ceiling_reached`, which counts
-    `retry_policy.review_attempts_total` over `(run_id, node_id)`. That scope
+    **The hole this closes.** `semantic_ceiling` is enforced by
+    `Scheduler._semantic_ceiling_reached`, which counts
+    `retry_policy.semantic_attempts_total` over `(run_id, node_id)`. That scope
     is deliberate and correct *within* a run — but a fresh `run start` mints a
     new `run_id`, `create_run` seeds a `node_lifecycle` row with an empty
     history, and the same node against the same plan bytes is handed a whole
-    new ceiling. A node no reviewer will pass can therefore be re-attempted
-    without limit, one run at a time, and no budget in the system ever says
-    so. That is #92's shape: a debt no amount of spending pays off, and no
-    counter that can see it.
+    new ceiling. A node that cannot be made to pass can therefore be
+    re-attempted without limit, one run at a time, and no budget in the system
+    ever says so. That is #92's shape: a debt no amount of spending pays off,
+    and no counter that can see it. It is also the measured shape of
+    `lane-p5-gap-policy` — 39 attempts over four `run_id`s, no run of which
+    exceeded its own in-run budget.
 
     **What it counts, and where the count comes from.** The cumulative total
-    is `retry_policy.review_attempts_across_runs`, which sums
-    `review_attempts_total` per prior run rather than restating its predicate
+    is `retry_policy.semantic_attempts_across_runs`, which sums
+    `semantic_attempts_total` per prior run rather than restating its predicate
     (RC1: the second copy of this rule that had no caller disagreed with the
     enforced one by exactly one attempt). Prior runs are every `runs` row
     carrying this plan's digest except the one this invocation is about to
     execute — fresh on `run start`, and on `run resume` the run being
     re-entered, whose own spend the scheduler's in-run ceiling already owns.
+
+    It counted **review rejections** until §19 M35, and that was the right
+    predicate for exactly as long as a review rejection was the failure that
+    repeated. Review no longer fails an attempt, so the failure that repeats is
+    a content failure — a red gate, a clause-4 conviction, §7.4's post-work
+    falsification refusal — and every one of those is a SEMANTIC row.
 
     **Grants are honoured.** `retry --force` / `retry --grant N` raise
     `node_lifecycle.granted_extra_attempts` on the run they were typed
@@ -2872,7 +2880,7 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
                 ", ".join(unknown), args.plan_file, ", ".join(sorted(known))),
             unknown_node_ids=unknown, plan_node_ids=sorted(known))
     database = getattr(args, "db", None)
-    ceiling = getattr(args, "review_ceiling", None)
+    ceiling = getattr(args, "semantic_ceiling", None)
     digest = getattr(args, "digest", None)
     if (not database or not digest or ceiling is None
             or not Path(database).is_file()):
@@ -2899,13 +2907,13 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
     exhausted: List[Dict[str, Any]] = []
     admitted: List[Dict[str, Any]] = []
     for node_id in sorted(known):
-        total, run_ids = retry_policy.review_attempts_across_runs(
+        total, run_ids = retry_policy.semantic_attempts_across_runs(
             attempts_by_run, node_id)
         effective = int(ceiling) + int(granted.get(node_id, 0))
         if total <= effective:
             continue
         record = {"node_id": node_id,
-                  "cumulative_review_rejections": total,
+                  "cumulative_semantic_attempts": total,
                   "effective_ceiling": effective,
                   "run_ids": list(run_ids)}
         (admitted if node_id in allowed else exhausted).append(record)
@@ -2913,23 +2921,23 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
     if exhausted:
         raise _RunRefused(
             "NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
-            "the review budget for {0} is already spent across earlier runs "
-            "of {1}: {2}. `review_ceiling` is {3}, and a fresh run would hand "
-            "each of these nodes the whole ceiling again, which is how a node "
-            "no reviewer will pass is re-attempted without limit. Read the "
-            "series with `maestro run convergence <run_id>` and re-author the "
-            "node's instruction, or admit it deliberately with "
-            "`--allow-exhausted-node <node_id>`.".format(
+            "the fix-loop budget for {0} is already spent across earlier "
+            "runs of {1}: {2}. `semantic_ceiling` is {3}, and a fresh run "
+            "would hand each of these nodes the whole ceiling again, which is "
+            "how a node that cannot be made to pass is re-attempted without "
+            "limit. Read the series with `maestro run convergence <run_id>` "
+            "and re-author the node's instruction, or admit it deliberately "
+            "with `--allow-exhausted-node <node_id>`.".format(
                 ", ".join(record["node_id"] for record in exhausted),
                 digest,
                 "; ".join(
-                    "{0} rejected {1} time(s) over {2}".format(
+                    "{0} spent {1} attempt(s) over {2}".format(
                         record["node_id"],
-                        record["cumulative_review_rejections"],
+                        record["cumulative_semantic_attempts"],
                         ", ".join(record["run_ids"]))
                     for record in exhausted),
                 ceiling),
-            plan_digest=digest, review_ceiling=int(ceiling),
+            plan_digest=digest, semantic_ceiling=int(ceiling),
             nodes=exhausted)
 
     if admitted:
@@ -2938,8 +2946,8 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
             for record in admitted:
                 store.record_budget_allowance(
                     args.run_id, record["node_id"],
-                    cumulative_review_rejections=record[
-                        "cumulative_review_rejections"],
+                    cumulative_semantic_attempts=record[
+                        "cumulative_semantic_attempts"],
                     effective_ceiling=record["effective_ceiling"],
                     run_ids=record["run_ids"])
         finally:
@@ -6172,8 +6180,8 @@ def build_parser() -> argparse.ArgumentParser:
     grant_group.add_argument(
         "--grant", type=_positive_grant, default=0, metavar="N",
         help="grant N extra attempts beyond the ceiling; a node blocked "
-             "REVIEW_BUDGET_EXHAUSTED reports the N it needs as "
-             "review_grant_required")
+             "SEMANTIC_BUDGET_EXHAUSTED reports the N it needs as "
+             "semantic_grant_required")
     _add_db(retry)
     retry.set_defaults(handler=_escape)
     skip = root.add_parser("skip")

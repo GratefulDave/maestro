@@ -6,7 +6,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Node code review no longer blocks a merge** (§19 M35). It still runs, its findings still
+  reach the retry prompt, the attempt row and the run report, and its verdict no longer fails
+  an attempt. `execution.review_ceiling` now bounds how many reviews of one node the scheduler
+  pays for rather than how many rejections a node may survive. `BlockReason.
+  REVIEW_BUDGET_EXHAUSTED` stays in the vocabulary so `run convergence` can read older ledgers;
+  nothing writes it. The record behind the change: `lane-p5-gap-policy` took 39 attempts across
+  four `run_id`s with 12 review rejections and zero passes, and in the paused r7 run
+  `run-c8910572828c4f5bb5c60c0582dd4be5` attempt 2 was blocked by two findings that both
+  restated one complaint about a concurrency hazard the plan asserts nothing about and its
+  single-threaded gate could never exhibit.
+- **The cross-run budget guard counts SEMANTIC attempts, not review rejections.**
+  `run start` / `run resume` refuse `NODE_BUDGET_EXHAUSTED_ACROSS_RUNS` against
+  `execution.semantic_ceiling` summed over every prior run of the digest. The refusal payload's
+  `cumulative_review_rejections` / `review_ceiling` are now `cumulative_semantic_attempts` /
+  `semantic_ceiling`, and the grant-magnitude payload (#81) moved from
+  `REVIEW_BUDGET_EXHAUSTED` onto `SEMANTIC_BUDGET_EXHAUSTED` as `semantic_grant_required`.
+  `semantic_attempts_total` no longer excludes rows carrying a review-rejection marker: the
+  second budget that exclusion protected no longer exists.
+- **A repair chain is opened by any SEMANTIC failure that arrives with a proven output commit**,
+  not only by a review rejection. `decide_repair`'s first clause keys on the stored output
+  commit, which is the thing being repaired.
+
 ### Added
+
+- **§7.4's post-work falsification.** After an agent node's post-node gate PASSES and before the
+  node is VERIFIED, the scheduler reverts every path the node wrote that its own gate's argv does
+  not select, re-runs the gate, and requires it to fail. A node's declared outputs include the
+  test file its own gate counts, so `min_cases` cannot tell nine real assertions from nine hollow
+  ones; a test file carrying its own copy of the production logic survives that revert and is now
+  refused. The refusal is SEMANTIC and carries the sealed output commit, so the next attempt
+  repairs the diff rather than re-implementing the node. It reads `node.outputs` and `node.gate`,
+  both already present in the shipped `maestro-plan.v2`, so it applies to an already-shipped plan
+  with no re-ship. Cost: one further gate run per agent attempt. Where every path a node wrote is
+  selected by its own gate the check has no subject; that is reported on the run's hygiene channel
+  and not refused.
 
 - `just -g mon` — a terminal run monitor, `.claude/skills/sssf/apps/visualizer/bin/maestro-mon`.
   It answers the questions the visualizer answers — phase depth, node states, attempts, blockers —

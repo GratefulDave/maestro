@@ -1149,6 +1149,43 @@ class LifecycleStore:
             (json.dumps(merged, sort_keys=True), run_id, node_id, attempt_no))
 
     @serialized
+    def record_review_advisory(self, run_id: str, node_id: str, attempt_no: int,
+                               extra: Mapping[str, Any]) -> None:
+        """Merge a reviewer's rejection onto the attempt row without failing it.
+
+        **Not a transition, and that is the whole of §19 M35.** A reviewer's
+        verdict is prose about work a count already adjudicated, so it no
+        longer decides whether an attempt lives: the attempt stays RUNNING and
+        goes on to `mark_verified` exactly as it would had the reviewer agreed.
+        What the reviewer produced is still worth keeping — the findings are
+        how the lane learns, and a merged node carrying the advisories it
+        merged with is the operator-facing half of that.
+
+        `record_salvage` merges the same way and additionally closes a RUNNING
+        attempt, which is right for an escape that ends the attempt and wrong
+        here for the same reason: nothing about this ends it. The two are kept
+        apart rather than merged behind a flag, because a boolean deciding
+        whether a write is terminal is exactly the overloaded role RC4 names.
+        """
+        row = self.conn.execute(
+            "SELECT extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
+        try:
+            merged = json.loads(row[0] or "{}")
+        except json.JSONDecodeError:
+            merged = {}
+        if not isinstance(merged, dict):
+            merged = {}
+        merged.update(extra)
+        self.conn.execute(
+            "UPDATE attempts SET extra_json=?"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (json.dumps(merged, sort_keys=True), run_id, node_id, attempt_no))
+
+    @serialized
     def record_salvage(self, run_id: str, node_id: str, attempt_no: int,
                        extra: Mapping[str, Any]) -> None:
         """Merge salvage facts into the attempt row and close it if live.
@@ -1235,9 +1272,9 @@ class LifecycleStore:
     @serialized
     def record_budget_allowance(
             self, run_id: str, node_id: str, *,
-            cumulative_review_rejections: int, effective_ceiling: int,
+            cumulative_semantic_attempts: int, effective_ceiling: int,
             run_ids: Sequence[str]) -> None:
-        """Record that an operator admitted a node whose cross-run review
+        """Record that an operator admitted a node whose cross-run fix-loop
         budget was already spent (§3.6 B10).
 
         B10 requires the escape from a refusal to exist; §1.2 requires the
@@ -1267,8 +1304,8 @@ class LifecycleStore:
                 " VALUES (?,?,'node',NULL,NULL,?,'operator',?,?)",
                 (run_id, node_id, NODE_BUDGET_ALLOWANCE_REASON,
                  json.dumps({
-                     "cumulative_review_rejections":
-                         cumulative_review_rejections,
+                     "cumulative_semantic_attempts":
+                         cumulative_semantic_attempts,
                      "effective_ceiling": effective_ceiling,
                      "run_ids": list(run_ids)}, sort_keys=True),
                  now_iso()))

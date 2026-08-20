@@ -58,6 +58,7 @@ import pydantic  # noqa: E402
 
 from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import finalization as fin  # noqa: E402
+from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
 from test_graded_findings import (ScriptedReviewer, a_handoff,  # noqa: E402
@@ -401,20 +402,34 @@ class TheTrapNoLongerConsumesTheCeilingTest(TheReviewLaneFixture):
 class TheOrdinaryRejectionIsUntouchedTest(TheReviewLaneFixture):
     """The control for the class above, and the reason the fix is a bound
     rather than a hole: a diff that stayed inside its declared paths and did
-    something adjacent to its instruction is still refused, still spends the
-    ceiling, and still blocks."""
+    something adjacent to its instruction is still *refused by the reviewer*,
+    and the refusal is still recorded against the node.
 
-    def test_a_lazy_diff_inside_its_declared_paths_still_blocks_the_lane(self):
+    What it no longer does is block, because since §19 M35 nothing a reviewer
+    says causes a lifecycle transition. The scope axis this file is about is
+    unaffected either way — it decides which findings reject, and that
+    verdict is now advice rather than authority.
+    """
+
+    def test_a_lazy_diff_inside_its_declared_paths_is_still_rejected(self):
         reviewer = ScriptedReviewer({
             "diff.implements_the_stated_instruction": (
                 "error", LAZY_MESSAGE, LAZY_RATIONALE, "in_scope")})
-        self.run_lane(reviewer)
+        ledgers = self.run_lane(reviewer)
 
         node = self.store.get_node("run1", "build")
-        self.assertNotEqual(st.NodeState.MERGED.value, self.states()["build"])
-        self.assertEqual(st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                         node.block_reason)
-        self.assertEqual(3, len(reviewer.reports))
+        # The reviewer said no, and the row says it said no.
+        rows = self.store.attempts_for("run1", "build")
+        self.assertTrue(rows[0].extra[rp.REVIEW_REJECTED_KEY])
+        recorded = cr.read_finding_ledger(ledgers["build"])
+        cells = [c for c in recorded
+                 if c.check_id == "diff.implements_the_stated_instruction"]
+        self.assertTrue(cells[0].rejects(cr.FindingGrade.ERROR))
+        self.assertFalse(cells[0].unreachable(cr.FindingGrade.ERROR))
+        # And the node merged anyway, on the counts that adjudicate it.
+        self.assertEqual(st.NodeState.MERGED.value, self.states()["build"])
+        self.assertIsNone(node.block_reason)
+        self.assertEqual(1, len(reviewer.reports))
 
     def test_a_mixed_review_rejects_and_tells_the_builder_what_not_to_try(self):
         """One finding of each scope. The lane is refused on the in-scope one,

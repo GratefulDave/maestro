@@ -422,6 +422,93 @@ def adjudicate_reachability(symbols: Sequence["rc.ProducedSymbol"],
         unreferenced_symbols=located)
 
 
+# ── §7.4's other half: the gate must still be falsifiable *after* the work ──
+
+
+def _gate_names(relpath: str, gate_argv: Sequence[str]) -> bool:
+    """Does the gate's own argv select `relpath`?
+
+    A token is compared with any `::` node-id suffix removed, because
+    `tests/t.py::TestX::test_y` selects `tests/t.py`. A token and a path match
+    when they are equal or when either is a directory prefix of the other:
+    `tests/unit` selects `tests/unit/test_x.py`, and a declared output of
+    `tests/` is selected by an argv naming a file beneath it. Both directions
+    matter and only one of them is obvious — the second is what stops a
+    broadly-declared output from being reverted out from under the very gate
+    that reads it.
+    """
+    path = relpath.strip("/")
+    for token in gate_argv:
+        candidate = str(token).split("::", 1)[0].strip("/")
+        if not candidate or candidate.startswith("-"):
+            continue
+        if candidate == path:
+            return True
+        if path.startswith(candidate + "/") or candidate.startswith(path + "/"):
+            return True
+    return False
+
+
+def outputs_unnamed_by_gate(written: Sequence[str],
+                            gate_argv: Sequence[str]) -> Tuple[str, ...]:
+    """The paths this attempt wrote that its own gate's argv does not select.
+
+    §7.4's pre-node gate proves the node's behaviour was *absent* before the
+    agent ran. It cannot prove the gate is the thing that observes it, because
+    a node's declared outputs include the test file its own gate counts: the
+    thing being satisfied is written by the thing satisfying it, and
+    `min_cases` counts cases, not assertions. Nine tests that never import the
+    production module pass the pre-gate (the file does not exist), pass the
+    post-gate (they never needed it), and merge.
+
+    The paths returned here are the other half of the node's own declaration —
+    everything it wrote that its gate does not select, which for every node in
+    a `test file + production file` plan is exactly the production file. Revert
+    those and the gate must go red. That is a count over two fields the plan
+    already carries, `outputs` and `gate`, and no model is asked anything.
+
+    `written` is the attempt's measured `added + changed`, not `node.outputs`
+    verbatim. The two agree on everything that matters and the measured form is
+    the usable one: §8.3's permission check has already proven the delta is a
+    subset of the declaration, a declared output the agent never wrote is
+    already at its base content so reverting it is a no-op, and a declaration
+    written as a glob expands here for free instead of being skipped as
+    unrevertable.
+    """
+    return tuple(rel for rel in written if not _gate_names(rel, gate_argv))
+
+
+def adjudicate_output_falsification(
+        gate: GateVerdict, reverted: Sequence[str]) -> VerificationVerdict:
+    """Refuse an attempt whose gate passes without the code it is meant to prove.
+
+    The predicate is `adjudicate_gate`'s own — the same §10.2 counting rule
+    that admitted the post-node gate, re-asked over the same selector against a
+    tree with `reverted` put back to the attempt's base. A gate that still
+    satisfies that rule with its subject removed was never observing the
+    subject, and the attempt is refused whatever the reviewer thought of it.
+
+    This is the same shape as §7.4's pre-node clause, taken from the other
+    side: clause 2 asks the gate to be red before the work exists, and this
+    asks it to be red again once the work is taken back out. Both are one
+    command, one exit, one count.
+
+    SEMANTIC, never terminal. Unlike `GATE_NOT_FALSIFIABLE`, a retry can
+    genuinely change this answer: the agent wrote the test, so new
+    instructions naming the paths its tests must exercise are new
+    instructions. It spends `semantic_ceiling` like any other content failure.
+    """
+    if not reverted or not gate.green:
+        return VerificationVerdict(verified=True)
+    return VerificationVerdict(
+        verified=False,
+        reason=("the node's gate still passed with {0} reverted to this "
+                "attempt's base — the declared tests do not exercise the code "
+                "they are supposed to prove".format(", ".join(reverted))),
+        retry_class=st.RetryClass.SEMANTIC,
+        offending_paths=tuple(reverted))
+
+
 # ── §7.3's review-node predicate lives in the review path, not here ─────────
 #
 # `verify_review_node` stood here as a second expression of §7.3's five-clause

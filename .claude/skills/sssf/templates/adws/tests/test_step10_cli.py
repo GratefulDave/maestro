@@ -1106,9 +1106,13 @@ class OperatorCliTest(unittest.TestCase):
                 label="gate", scope="node", selector="code",
                 command=("gate",), exit_code=0, green=True,
                 counts={"passed": 1, "failed": 0, "skipped": 0, "errored": 0})
+            red = maestro.worktree.GateResult(
+                label="gate", scope="node", selector="code",
+                command=("gate",), exit_code=1, green=False,
+                counts={"passed": 0, "failed": 1, "skipped": 0, "errored": 0})
 
-            def run_gate(_attempt, _node, _phase, _cancel_requested):
-                return green
+            def run_gate(_attempt, _node, phase, _cancel_requested):
+                return red if phase == "falsify" else green
 
             def integration_gate(_path, _specs, _cancel_requested):
                 return green

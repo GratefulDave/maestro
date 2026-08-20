@@ -1,9 +1,11 @@
-"""Executable proof that the operator escape past a review ceiling has a
+"""Executable proof that the operator escape past a node's ceiling has a
 magnitude, and that the block says how big it has to be (#81, B10, §11.3).
 
-`_review_ceiling_reached` compares a **cumulative** count — every
-review-rejected attempt for the `(run_id, node_id)` pair, across every base,
-never decreasing — against `review_ceiling + granted`. `retry --force` grants
+`_semantic_ceiling_reached` compares a **cumulative** count — every SEMANTIC
+attempt for the `(run_id, node_id)` pair, across every base, never decreasing —
+against `semantic_ceiling + granted`. It was the review ceiling until §19 M35
+removed that block; the payload moved onto the ceiling that survives rather
+than being deleted with the one that did not. `retry --force` grants
 exactly one, and a second `--force` is refused because the first moved the node
 to PENDING and `LifecycleStore.retry` declares
 `require_state=(BLOCKED, RUNNING)`. So the escape was capped at +1 in exactly
@@ -41,13 +43,13 @@ from adw_modules import scheduler_types as st  # noqa: E402
 
 from test_code_review import FakeReview  # noqa: E402
 from test_lifecycle import make_node, new_store  # noqa: E402
-from test_scheduler import SchedulerFixture  # noqa: E402
+from test_scheduler import SchedulerFixture, green  # noqa: E402
 
 BASE_SHA = "0" * 40
 
 #: The run this issue was filed from: `lane-p4-enrichment-ordering` in
-#: `run-2a44d226e75a4be391a14f02b78a6d25`, blocked with seven review-rejected
-#: attempts against a ceiling of six.
+#: `run-2a44d226e75a4be391a14f02b78a6d25`, blocked with seven spent attempts
+#: against a ceiling of six.
 STRANDED_ALREADY = 7
 STRANDED_CEILING = 6
 
@@ -69,6 +71,7 @@ def _rejected(node_id: str, attempt_no: int) -> st.AttemptRecord:
     return st.AttemptRecord(
         run_id="run1", node_id=node_id, attempt_no=attempt_no,
         base_sha=BASE_SHA, state=st.NodeState.PENDING,
+        retry_class=st.RetryClass.SEMANTIC,
         extra={rp.REVIEW_REJECTED_KEY: True})
 
 
@@ -78,7 +81,7 @@ def _blocked_node(store: lc.LifecycleStore, node_id: str = "a") -> None:
     store.create_run("run1", "d", [make_node(node_id, 0)])
     store.start_attempt("run1", node_id, base_sha="s1")
     store.mark_blocked("run1", node_id,
-                       st.BlockReason.REVIEW_BUDGET_EXHAUSTED)
+                       st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
     store.declare_outcome("run1")
 
 
@@ -168,22 +171,22 @@ class GrantMagnitudeTests(unittest.TestCase):
     def test_the_grant_reopens_a_node_past_its_ceiling(self):
         """The two halves meeting, on the numbers this issue was filed from.
 
-        Seven review-rejected attempts against a ceiling of six: the next
-        rejection is checked as `7 + 1 >= 6 + granted`, so a grant of one or
-        two re-blocks the node after burning a whole attempt — a worktree, a
-        pane, an agent run and a reviewer pass — and only three reopens it.
+        Seven spent attempts against a ceiling of six: the next failure is
+        checked as `7 + 1 >= 6 + granted`, so a grant of one or two re-blocks
+        the node after burning a whole attempt — a worktree, a pane, an agent
+        run and three gate runs — and only three reopens it.
         """
         cfg = st.SchedulerConfig(
             concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
             final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
-            semantic_ceiling=3, review_ceiling=STRANDED_CEILING)
+            semantic_ceiling=STRANDED_CEILING, review_ceiling=3)
         rows = [_rejected("n", i) for i in range(STRANDED_ALREADY)]
         for insufficient in (0, 1, 2):
             self.assertTrue(
-                sch.Scheduler._review_ceiling_reached(
+                sch.Scheduler._semantic_ceiling_reached(
                     CeilingProbe(cfg, rows), "n", insufficient),
                 f"a grant of {insufficient} must not reopen the node")
-        self.assertFalse(sch.Scheduler._review_ceiling_reached(
+        self.assertFalse(sch.Scheduler._semantic_ceiling_reached(
             CeilingProbe(cfg, rows), "n", 3))
 
         # And the store can actually issue that three, in one command, against
@@ -193,7 +196,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             self.addCleanup(store.close)
             _blocked_node(store, "n")
             store.retry("run1", "n", grant=3)
-            self.assertFalse(sch.Scheduler._review_ceiling_reached(
+            self.assertFalse(sch.Scheduler._semantic_ceiling_reached(
                 CeilingProbe(cfg, rows), "n",
                 store.get_node("run1", "n").granted_extra_attempts))
 
@@ -278,15 +281,20 @@ class BlockPayloadTests(SchedulerFixture):
 
     def _block(self):
         review = FakeReview([False, False, False])
+        # §7.4's post-work falsification refuses every attempt: the gate stays
+        # green with the production file reverted, so the node spends its
+        # fix-loop budget and blocks on it.
+        self.gate_script[("build", "falsify")] = [green(), green(), green()]
         self.written["build"] = {"build.py": "ok\n"}
         report = self.schedule([self.agent("build")],
+                               config=self.config(semantic_ceiling=3),
                                deps=self.deps(review_attempt=review)).run()
         self.assertEqual(
             self.store.get_node("run1", "build").block_reason,
-            st.BlockReason.REVIEW_BUDGET_EXHAUSTED)
+            st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
         blocked = [row for row in self.store.audit_transitions("run1", "build")
                    if row.get("reason") ==
-                   f"blocked:{st.BlockReason.REVIEW_BUDGET_EXHAUSTED.value}"]
+                   f"blocked:{st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED.value}"]
         self.assertEqual(len(blocked), 1)
         return report, blocked[0]["detail"]
 
@@ -296,8 +304,8 @@ class BlockPayloadTests(SchedulerFixture):
         cumulative count was 7. The count the ceiling is compared against is
         the one an operator needs, and it was in no output at all."""
         report, detail = self._block()
-        self.assertEqual(detail["review_attempts_total"], 2)
-        self.assertEqual(detail["review_ceiling"], 3)
+        self.assertEqual(detail["semantic_attempts_total"], 2)
+        self.assertEqual(detail["semantic_ceiling"], 3)
         self.assertEqual(detail["granted_extra_attempts"], 0)
         # The per-process series is not that number and never was: it counts
         # findings per attempt, not attempts against a budget.
@@ -305,20 +313,21 @@ class BlockPayloadTests(SchedulerFixture):
 
     def test_the_payload_names_a_grant_that_actually_reopens_the_node(self):
         """The required grant is the arithmetic, not its inputs: the count the
-        decision read excludes the attempt being blocked, whose marker is
-        written in the same transaction, so a grant sized off the raw count
-        would be short by exactly one."""
+        decision read excludes the attempt being blocked, whose row is written
+        in the same transaction, so a grant sized off the raw count would be
+        short by exactly one."""
         _, detail = self._block()
-        required = detail["review_grant_required"]
+        required = detail["semantic_grant_required"]
         self.assertEqual(required, 2)
 
-        scheduler = self.schedule([self.agent("build")])
+        scheduler = self.schedule([self.agent("build")],
+                                  config=self.config(semantic_ceiling=3))
         # Everything the payload offers short of the stated grant still
         # re-blocks, and the stated grant does not.
         for insufficient in range(required):
             self.assertTrue(
-                scheduler._review_ceiling_reached("build", insufficient))
-        self.assertFalse(scheduler._review_ceiling_reached("build", required))
+                scheduler._semantic_ceiling_reached("build", insufficient))
+        self.assertFalse(scheduler._semantic_ceiling_reached("build", required))
 
     def test_the_payload_reaches_the_surface_it_is_diagnosed_from(self):
         """B15 — a field with zero readers is a build failure. `run status`
@@ -331,26 +340,29 @@ class BlockPayloadTests(SchedulerFixture):
                     for (node_id, _), entries in history.items()
                     if node_id == "build"
                     for entry in entries
-                    if "review_attempts_total" in (entry.get("detail") or {})]
+                    if "semantic_attempts_total" in (entry.get("detail") or {})]
         self.assertEqual(len(payloads), 1)
-        self.assertEqual(payloads[0]["review_grant_required"],
-                         detail["review_grant_required"])
-        self.assertEqual(payloads[0]["review_attempts_total"],
-                         detail["review_attempts_total"])
+        self.assertEqual(payloads[0]["semantic_grant_required"],
+                         detail["semantic_grant_required"])
+        self.assertEqual(payloads[0]["semantic_attempts_total"],
+                         detail["semantic_attempts_total"])
 
     def test_the_stated_grant_is_issuable_in_one_command(self):
         """End to end: block, read the payload, hand its number to `retry
         --grant`, and the node is PENDING with a budget that admits another
-        review round."""
+        attempt."""
         _, detail = self._block()
         self.store.declare_outcome("run1")
-        self.store.retry("run1", "build", grant=detail["review_grant_required"])
+        self.store.retry("run1", "build",
+                         grant=detail["semantic_grant_required"])
 
         node = self.store.get_node("run1", "build")
         self.assertEqual(node.state, st.NodeState.PENDING)
         self.assertFalse(
-            self.schedule([self.agent("build")])._review_ceiling_reached(
-                "build", node.granted_extra_attempts))
+            self.schedule(
+                [self.agent("build")],
+                config=self.config(semantic_ceiling=3)
+            )._semantic_ceiling_reached("build", node.granted_extra_attempts))
 
 
 if __name__ == "__main__":

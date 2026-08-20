@@ -61,6 +61,7 @@ from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import finalization as fin  # noqa: E402
 from adw_modules import finalization_window as fw  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
+from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
 from test_report_schema_guard import find_permissive_report_models  # noqa: E402
@@ -528,8 +529,11 @@ class SubThresholdFindingsStillMergeTest(SchedulerFixture):
 
     def test_one_error_grade_finding_rejects_the_same_lane(self):
         """The control for the test above, with one grade changed and nothing
-        else: an ERROR still refuses the merge, so grading did not delete the
-        check's teeth."""
+        else: an ERROR is still a rejection, so grading did not delete the
+        check's teeth. Since §19 M35 a rejection no longer refuses the merge —
+        it is recorded against the attempt and the node merges on its counts —
+        so what this asserts is the recorded verdict, which is the part
+        grading owns."""
         ledgers: Dict[str, Path] = {}
         reviewer = ScriptedReviewer({
             "diff.introduces_no_obvious_defect": (
@@ -542,9 +546,10 @@ class SubThresholdFindingsStillMergeTest(SchedulerFixture):
                           review_attempt=self._review_stage(reviewer, ledgers))
                       ).run()
 
-        self.assertNotEqual(st.NodeState.MERGED.value, self.states()["build"])
-        self.assertEqual(st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                         self.store.get_node("run1", "build").block_reason)
+        rows = self.store.attempts_for("run1", "build")
+        self.assertTrue(rows[0].extra[rp.REVIEW_REJECTED_KEY])
+        self.assertEqual(st.NodeState.MERGED.value, self.states()["build"])
+        self.assertIsNone(self.store.get_node("run1", "build").block_reason)
 
 
 # ── A9: at or above the threshold still rejects ─────────────────────────────

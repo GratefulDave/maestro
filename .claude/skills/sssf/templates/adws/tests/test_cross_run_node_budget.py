@@ -1,18 +1,25 @@
-"""A node's review budget survives the run boundary it used to be reset by.
+"""A node's fix-loop budget survives the run boundary it used to be reset by.
 
-`execution.review_ceiling` is enforced by `Scheduler._review_ceiling_reached`,
-which counts `retry_policy.review_attempts_total` over `(run_id, node_id)`.
+`execution.semantic_ceiling` is enforced by
+`Scheduler._semantic_ceiling_reached`, which counts
+`retry_policy.semantic_attempts_total` over `(run_id, node_id)`.
 Inside a run that scope is right. Across runs it is a hole: `run start` mints a
 fresh `run_id`, `create_run` seeds a `node_lifecycle` row with no history, and
 the same node against the same plan bytes is handed the whole ceiling again.
-A node no reviewer will pass can therefore be re-attempted without limit — one
-run at a time, with nothing in the ledger counting it and no operator told.
-That is #92's shape: a debt no amount of spending pays off.
+A node that cannot be made to pass can therefore be re-attempted without limit
+— one run at a time, with nothing in the ledger counting it and no operator
+told. That is #92's shape: a debt no amount of spending pays off, and the
+measured shape of `lane-p5-gap-policy`: 39 attempts over four `run_id`s.
+
+The guard counted **review rejections** until §19 M35, which was the right
+predicate for exactly as long as a rejection was the failure that repeated.
+Review no longer fails an attempt, so what repeats is a content failure, and
+every one of those is a SEMANTIC row.
 
 What is settled here:
 
-  §7.5   the cumulative count is `review_attempts_total` summed per run, never
-         a second copy of the predicate (RC1)
+  §7.5   the cumulative count is `semantic_attempts_total` summed per run,
+         never a second copy of the predicate (RC1)
   §7.1   a node's identity across runs is `(plan_digest, node_id)`; a re-shipped
          plan is different bytes and legitimately starts the count again
   §19 M6 the guard sits in `_execute_run`, so `run start` and `run resume` both
@@ -23,9 +30,9 @@ What is settled here:
          record in the ledger rather than living in the argv of a dead process
   §1.2   every fact a caller branches on travels as a typed field
 
-Every rejection below is written through the real `LifecycleStore` by the same
-calls `scheduler._settle_review_rejection` makes, so the count is taken over
-rows a scheduler would actually have written. Nothing here reads pane text,
+Every failure below is written through the real `LifecycleStore` by the same
+`fail_attempt` call the scheduler makes, so the count is taken over rows a
+scheduler would actually have written. Nothing here reads pane text,
 prompt text, or any free-text field.
 
 Run with:  uv run adws/adw_test.py -k cross_run_node_budget
@@ -121,7 +128,7 @@ class CrossRunBudgetFixture(unittest.TestCase):
     a real ledger — the four things `run start` needs before it can be refused
     for anything as specific as a budget."""
 
-    REVIEW_CEILING = 3
+    SEMANTIC_CEILING = 3
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -183,8 +190,9 @@ class CrossRunBudgetFixture(unittest.TestCase):
                           "effort": "medium", "concurrency": 2,
                           "node_timeout_s": 120, "turn_timeout_s": 30,
                           "final_acceptance_timeout_s": 45,
-                          "backstop_t_s": 600, "semantic_ceiling": 3,
-                          "review_ceiling": self.REVIEW_CEILING,
+                          "backstop_t_s": 600,
+                          "semantic_ceiling": self.SEMANTIC_CEILING,
+                          "review_ceiling": 3,
                           "vendor": "openai"},
         }
         (self.repo / "adws" / "maestro.config.yaml").write_text(
@@ -269,8 +277,9 @@ class CrossRunBudgetFixture(unittest.TestCase):
                                       for index in range(findings)]}
         if blocked:
             store.mark_blocked(
-                run_id, node_id, st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                detail=detail, attempt_extra=marker)
+                run_id, node_id, st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                detail=detail, retry_class=st.RetryClass.SEMANTIC,
+                attempt_extra=marker)
         else:
             store.fail_attempt(run_id, node_id, st.RetryClass.SEMANTIC,
                                detail=detail, attempt_extra=marker)
@@ -322,9 +331,9 @@ class TheCrossRunBudgetRefusesAFreshRunTest(CrossRunBudgetFixture):
         _code, payload = self._run(["run", "start", "named"])
 
         self.assertEqual(self.digest, payload["plan_digest"])
-        self.assertEqual(self.REVIEW_CEILING, payload["review_ceiling"])
+        self.assertEqual(self.SEMANTIC_CEILING, payload["semantic_ceiling"])
         self.assertEqual([{"node_id": FIRST,
-                           "cumulative_review_rejections": 5,
+                           "cumulative_semantic_attempts": 5,
                            "effective_ceiling": 3,
                            "run_ids": ["run-bbb-second", "run-aaa-first"]}],
                          payload["nodes"])
@@ -357,7 +366,7 @@ class TheCrossRunBudgetRefusesAFreshRunTest(CrossRunBudgetFixture):
         """`exceed` means strictly greater. A node that spent its ceiling and
         no more is a node the in-run guard has already stopped once; refusing
         it here as well would move the boundary by one without saying so."""
-        self._rejected_run("run-aaa-first", self.REVIEW_CEILING)
+        self._rejected_run("run-aaa-first", self.SEMANTIC_CEILING)
 
         code, payload = self._run(["run", "start", "named"])
 
@@ -416,7 +425,7 @@ class TheGuardRefusesOnlyWhatItShouldTest(CrossRunBudgetFixture):
 
         self.assertEqual(OUTCOME, payload["outcome"])
         self.assertEqual(4, payload["nodes"][0]["effective_ceiling"])
-        self.assertEqual(6, payload["nodes"][0]["cumulative_review_rejections"])
+        self.assertEqual(6, payload["nodes"][0]["cumulative_semantic_attempts"])
 
 
 # ── `run resume` crosses the same guard (§19 M6) ────────────────────────────
@@ -425,7 +434,7 @@ class BothRunVerbsCrossTheGuardTest(CrossRunBudgetFixture):
 
     def test_resume_does_not_charge_a_run_for_its_own_rejections(self):
         """The run being resumed is already governed by
-        `Scheduler._review_ceiling_reached`, which counts exactly these rows.
+        `Scheduler._semantic_ceiling_reached`, which counts exactly these rows.
         Counting them here as well would charge one rejection to two budgets
         and make every over-ceiling run unresumable — turning the escape from
         a blocked node into a dead end."""
@@ -447,7 +456,7 @@ class BothRunVerbsCrossTheGuardTest(CrossRunBudgetFixture):
         self.assertEqual(OUTCOME, payload["outcome"])
         self.assertEqual(["run-aaa-first"], payload["nodes"][0]["run_ids"])
         self.assertEqual(6, payload["nodes"][0][
-            "cumulative_review_rejections"])
+            "cumulative_semantic_attempts"])
 
 
 # ── §3.6 B10's escape ───────────────────────────────────────────────────────
@@ -489,7 +498,7 @@ class TheOperatorEscapeTest(CrossRunBudgetFixture):
         self.assertNotIn(run_id, ("run-aaa-first",))
         self.assertEqual(FIRST, node_id)
         self.assertEqual("operator", actor)
-        self.assertEqual({"cumulative_review_rejections": 6,
+        self.assertEqual({"cumulative_semantic_attempts": 6,
                           "effective_ceiling": 3,
                           "run_ids": ["run-aaa-first"]},
                          json.loads(detail))
@@ -557,12 +566,12 @@ class TheOperatorEscapeTest(CrossRunBudgetFixture):
 # ── the counter itself ──────────────────────────────────────────────────────
 
 class TheCumulativeCountIsOnePredicateTest(unittest.TestCase):
-    """`review_attempts_across_runs` as a pure function over attempt rows.
+    """`semantic_attempts_across_runs` as a pure function over attempt rows.
 
-    RC1: a second copy of the review budget rule lived in
+    RC1: a second copy of a budget rule lived in
     `retry_policy.review_budget_exhausted`, had no production caller, and
     disagreed with the enforced one by exactly one attempt. This function sums
-    `review_attempts_total` rather than restating its predicate, and these
+    `semantic_attempts_total` rather than restating its predicate, and these
     cases pin that it agrees with it row for row.
     """
 
@@ -583,44 +592,55 @@ class TheCumulativeCountIsOnePredicateTest(unittest.TestCase):
             "run-b": (self._attempt("run-b", "n", 1, rejected=True),),
         }
         self.assertEqual((3, ("run-a", "run-b")),
-                         rp.review_attempts_across_runs(rows, "n"))
+                         rp.semantic_attempts_across_runs(rows, "n"))
 
-    def test_it_agrees_with_review_attempts_total_per_run(self):
+    def test_it_agrees_with_semantic_attempts_total_per_run(self):
         rows = {
             "run-a": (self._attempt("run-a", "n", 1, rejected=True),
                       self._attempt("run-a", "n", 2, rejected=False)),
             "run-b": (self._attempt("run-b", "n", 1, rejected=True),
                       self._attempt("run-b", "n", 2, rejected=True)),
         }
-        total, _runs = rp.review_attempts_across_runs(rows, "n")
+        total, _runs = rp.semantic_attempts_across_runs(rows, "n")
         self.assertEqual(
-            sum(rp.review_attempts_total(attempts, "n")
+            sum(rp.semantic_attempts_total(attempts, "n")
                 for attempts in rows.values()),
             total)
 
-    def test_a_run_with_no_rejection_is_not_named(self):
+    def test_a_run_with_no_semantic_failure_is_not_named(self):
         """The run ids exist so the refusal can say where the attempts went.
         A run that holds none of them is not an answer to that question."""
         rows = {
-            "run-a": (self._attempt("run-a", "n", 1, rejected=False),),
+            "run-a": (self._attempt("run-a", "n", 1, rejected=False,
+                                    semantic=False),),
             "run-b": (self._attempt("run-b", "n", 1, rejected=True),),
         }
         self.assertEqual((1, ("run-b",)),
-                         rp.review_attempts_across_runs(rows, "n"))
+                         rp.semantic_attempts_across_runs(rows, "n"))
 
-    def test_another_nodes_rejections_are_not_counted(self):
+    def test_another_nodes_attempts_are_not_counted(self):
         rows = {"run-a": (self._attempt("run-a", "other", 1, rejected=True),)}
-        self.assertEqual((0, ()), rp.review_attempts_across_runs(rows, "n"))
+        self.assertEqual((0, ()), rp.semantic_attempts_across_runs(rows, "n"))
 
-    def test_a_semantic_failure_that_is_not_a_rejection_is_not_counted(self):
-        """The two ceilings are disjoint. A red gate spends the semantic
-        budget and this count must not see it (§7.5)."""
+    def test_an_infra_failure_is_not_counted(self):
+        """No infra fault ever produces a budget decrement (§7.5). An
+        ENVIRONMENTAL row is invisible here whatever else it carries."""
+        rows = {"run-a": (self._attempt("run-a", "n", 1, rejected=False,
+                                        semantic=False),
+                          self._attempt("run-a", "n", 2, rejected=True,
+                                        semantic=False))}
+        self.assertEqual((0, ()), rp.semantic_attempts_across_runs(rows, "n"))
+
+    def test_a_content_failure_that_is_not_a_rejection_is_counted(self):
+        """The exclusion §19 M35 removed, asserted as its absence: a red gate
+        is a content failure and spends this budget, marker or no marker."""
         rows = {"run-a": (self._attempt("run-a", "n", 1, rejected=False),
                           self._attempt("run-a", "n", 2, rejected=False))}
-        self.assertEqual((0, ()), rp.review_attempts_across_runs(rows, "n"))
+        self.assertEqual((2, ("run-a",)),
+                         rp.semantic_attempts_across_runs(rows, "n"))
 
     def test_no_runs_at_all_is_zero(self):
-        self.assertEqual((0, ()), rp.review_attempts_across_runs({}, "n"))
+        self.assertEqual((0, ()), rp.semantic_attempts_across_runs({}, "n"))
 
 
 # ── the ledger query ────────────────────────────────────────────────────────

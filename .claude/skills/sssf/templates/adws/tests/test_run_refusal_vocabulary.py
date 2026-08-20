@@ -273,19 +273,19 @@ class TheRunVerbsPrintTheTypedRefusalTest(unittest.TestCase):
             maestro._RunRefused(
                 "NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
                 "lane-x has spent its review budget",
-                plan_digest="c" * 64, review_ceiling=3,
+                plan_digest="c" * 64, semantic_ceiling=3,
                 nodes=[{"node_id": "lane-x",
-                        "cumulative_review_rejections": 7,
+                        "cumulative_semantic_attempts": 7,
                         "effective_ceiling": 3,
                         "run_ids": ["run-a", "run-b"]}]))
 
         self.assertEqual(3, code)
         self.assertEqual("NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
                          payload["outcome"])
-        self.assertEqual(3, payload["review_ceiling"])
+        self.assertEqual(3, payload["semantic_ceiling"])
         self.assertEqual("c" * 64, payload["plan_digest"])
         self.assertEqual([{"node_id": "lane-x",
-                           "cumulative_review_rejections": 7,
+                           "cumulative_semantic_attempts": 7,
                            "effective_ceiling": 3,
                            "run_ids": ["run-a", "run-b"]}],
                          payload["nodes"])
@@ -297,7 +297,7 @@ class TheRunVerbsPrintTheTypedRefusalTest(unittest.TestCase):
             maestro._run_resume,
             maestro._RunRefused(
                 "NODE_BUDGET_EXHAUSTED_ACROSS_RUNS", "spent",
-                plan_digest="c" * 64, review_ceiling=3, nodes=[]))
+                plan_digest="c" * 64, semantic_ceiling=3, nodes=[]))
 
         self.assertEqual(3, code)
         self.assertEqual("NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",

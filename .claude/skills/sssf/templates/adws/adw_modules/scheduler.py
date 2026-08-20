@@ -350,11 +350,14 @@ class RunReport:
     #: measured content and this is what the operator is told instead. Empty in
     #: the ordinary case, and empty is the claim that the adapters are clean.
     adapter_hygiene: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
-    #: `node_id -> findings` for every node blocked `REVIEW_BUDGET_EXHAUSTED`.
-    #: Reported beside the blocked set for the same reason the acceptance
-    #: result is: a block reason names the rule that fired, never the thing to
-    #: fix, and a lane that spent three attempts on review deserves to say what
-    #: the reviewer objected to without the operator re-running it.
+    #: `node_id -> findings` for every node a reviewer rejected, merged or not.
+    #: Reported for the same reason the acceptance result is: a node's state
+    #: names what happened to it, never the thing to fix, and a lane whose
+    #: reviewer objected deserves to say what about without the operator
+    #: re-running it. It used to be populated only where `review_ceiling` had
+    #: blocked the node, which is the one case where the findings were least
+    #: useful — the node was already dead. A reviewer that can no longer block
+    #: anything (§19 M35) reports on everything it read instead.
     review_findings: Dict[str, str] = field(default_factory=dict)
     #: `node_id -> findings-per-attempt`, one entry per review-rejected
     #: attempt in order. `review_findings` says what the last reviewer
@@ -1479,17 +1482,27 @@ class Scheduler:
                 "unprovisioned-worktree {0}".format(entry)
                 for entry in residue.unprovisioned_worktrees))
 
-        # ── the review gate (§7.3's review-node predicate) ──────────────────
+        # ── the review stage, which no longer decides anything (§19 M35) ─────
         #
-        # Here, and not one line earlier or later. After `_settle_context`,
-        # because that is the proof this attempt's owned process group is
-        # absent, and the reviewer opens a pane of its own — starting it while
-        # the builder might still be alive would put two owned groups inside
-        # one attempt's quiescence obligation. Before `mark_verified`, because
-        # VERIFIED is what `_merge_frontier` reads: a node that reaches it has
-        # already won the right to merge, and a gate after that point would be
-        # judging code the scheduler had already committed to.
-        if self.deps.review_attempt is not None:
+        # Here, and not one line earlier. After `_settle_context`, because that
+        # is the proof this attempt's owned process group is absent, and the
+        # reviewer opens a pane of its own — starting it while the builder
+        # might still be alive would put two owned groups inside one attempt's
+        # quiescence obligation.
+        #
+        # It no longer needs to be before `mark_verified` for any reason of
+        # authority, because it has none: a rejection is recorded and the
+        # attempt proceeds. It stays before it anyway so the findings are on
+        # the row by the time the node is eligible to merge, which is what lets
+        # a merged node carry the advisories it merged with.
+        #
+        # Bounded by `execution.review_ceiling`, counted over this node's
+        # already-stored rejection markers: the one prose layer §1.2 lets
+        # survive must terminate on a count, and with the verdict no longer
+        # convicting, what the count now bounds is what the reviewer costs
+        # rather than what it may refuse.
+        if (self.deps.review_attempt is not None
+                and self._review_wanted(node.node_id)):
             review = self._review_with_redispatch(
                 node, record, attempt, head, output_sha)
             if review is None:
@@ -1497,13 +1510,84 @@ class Scheduler:
                 return
             self._require_running(record)
             if not review.passed:
-                self._settle_review_rejection(node, review, record, output_sha)
+                self._record_review_advisory(node, review, record, output_sha)
+
+        # ── §7.4's post-work half, and the last word (§19 M35) ──────────────
+        #
+        # After the review stage rather than before it, and the ordering is
+        # load-bearing in one direction only: a refusal here recycles the
+        # attempt, and the reviewer's findings have to be on the row and in the
+        # guidance ledger by then or the repair prompt carries a falsification
+        # verdict and nothing else. Paying for a review of an attempt this may
+        # refuse is the cost of that, and it buys the thing GOAL 1a asks for —
+        # a reviewer that cannot stop a merge but whose objections still reach
+        # the next attempt.
+        #
+        # The falsifiability base is the chain root's head, not this attempt's
+        # base: §7.4 takes its witness once per repair chain, and the question
+        # asked here is about the node's whole work rather than about one
+        # attempt's edit to it. A repair that touched only its test file has a
+        # measured delta of one path, and asking this over that delta would
+        # find nothing to revert and pass vacuously.
+        if node.kind is st.NodeKind.AGENT:
+            falsified = self._falsify_outputs(
+                node, attempt,
+                basis.integration_head if basis is not None else attempt.base)
+            self._require_running(record)
+            if not falsified.verified:
+                self._settle_context(context)
+                # The commit is already sealed and provable, so this failure is
+                # repaired rather than re-implemented (§7.5) — the next attempt
+                # branches from this tree and is asked to make its tests
+                # exercise the paths named in the verdict.
+                self._settle_verdict(
+                    node, falsified, execution, record,
+                    extra_facts=rp.review_output_extra(output_sha))
                 return
 
         with self._lock:
             self._require_running(record)
             self._output_shas[node.node_id] = output_sha
             store.mark_verified(self.run_id, node.node_id, output_sha)
+
+    def _falsify_outputs(self, node: st.PlanNode, attempt: wt.AttemptWorktree,
+                         falsify_base: str) -> "vf.VerificationVerdict":
+        """§7.4's post-work half: take the subject back out and re-ask the gate.
+
+        Here, and not earlier, because it needs a green post-node gate to be
+        meaningful — the question is whether *that* green survives the removal
+        of the code it was supposed to be about. Before `_settle_context` and
+        before `mark_verified`, for the reasons the review stage below gives:
+        the gate is a harness process like the two that ran already, and
+        VERIFIED is what `_merge_frontier` reads.
+
+        The cost is one extra gate run per agent attempt, which roughly
+        matches the cost §7.4 already states for running the gate twice.
+
+        The check has no subject when every path the attempt wrote is selected
+        by the node's own gate — a node that produced nothing but the files its
+        gate counts. That shape is the defect in its purest form and is
+        **reported, not refused**: no plan this runtime has executed contains
+        one, so a refusal would be a rule with no measured case behind it, and
+        this design does not ship those (§16.3).
+        """
+        argv = tuple(node.gate_command)[1:]
+        written = wt.paths_written_since(attempt, falsify_base)
+        unnamed = vf.outputs_unnamed_by_gate(written, argv)
+        if not unnamed:
+            self._report_hygiene(node.node_id, (
+                "falsification-unrevertable: every path this node wrote is "
+                "selected by the node's own gate, so the gate could not be "
+                "re-asked without its subject",))
+            return vf.VerificationVerdict(verified=True)
+        reverted = wt.revert_paths_to(attempt, falsify_base, unnamed)
+        try:
+            result = self.deps.run_gate(
+                attempt, node, "falsify", self._cancelled.is_set)
+        finally:
+            wt.restore_paths_from_head(attempt, reverted)
+        return vf.adjudicate_output_falsification(
+            vf.adjudicate_gate(result, node.gate_min_cases), reverted)
 
     def _review_with_redispatch(self, node: st.PlanNode, record: st.AttemptRecord,
                                 attempt: wt.AttemptWorktree, head: str,
@@ -1724,8 +1808,19 @@ class Scheduler:
         return rc.unreferenced(produced, surface, base_sources)
 
     def _settle_verdict(self, node: st.PlanNode, verdict: "vf.VerificationVerdict",
-                        execution: NodeExecution, record: st.AttemptRecord) -> None:
-        """Turn a failed VERIFIED predicate into a classification (§7.5)."""
+                        execution: NodeExecution, record: st.AttemptRecord,
+                        extra_facts: Optional[Mapping[str, Any]] = None) -> None:
+        """Turn a failed VERIFIED predicate into a classification (§7.5).
+
+        `extra_facts` is merged onto the failing attempt's row beside the
+        guidance entry. Exactly one caller passes it and it carries exactly one
+        fact: the output commit of an attempt that failed §7.4's post-work
+        falsification refusal, which reached that failure with a sealed commit
+        in hand. `decide_repair` proves the repair basis against that commit,
+        so an attempt that failed without recording it is re-implemented from
+        the integration head rather than repaired — which is the discard §7.5's
+        repair chain exists to prevent.
+        """
         if verdict.block_reason is not None:
             self._settle_failure(
                 node, rp.Classification(block_reason=verdict.block_reason),
@@ -1749,12 +1844,13 @@ class Scheduler:
         # record what the launcher saw (§7.6).
         self._settle_failure(
             node, _with_reason(classification, execution.launch_detail or None),
-            verdict, record)
+            verdict, record, extra_facts=extra_facts)
 
     def _settle_failure(self, node: st.PlanNode, classification: rp.Classification,
                         verdict: Optional["vf.VerificationVerdict"] = None,
                         record: Optional[st.AttemptRecord] = None,
-                        allow_watchdog_fence: bool = False) -> None:
+                        allow_watchdog_fence: bool = False,
+                        extra_facts: Optional[Mapping[str, Any]] = None) -> None:
         """Block or release only the generation that still owns RUNNING."""
         if record is None:
             return
@@ -1793,7 +1889,9 @@ class Scheduler:
                 # two — and is written to the attempt row as well as to
                 # memory, because memory does not survive the process and the
                 # next attempt may be dispatched by a different one.
-                extra = rp.guidance_extra_verification(detail)
+                extra = dict(rp.guidance_extra_verification(detail))
+                if extra_facts:
+                    extra.update(extra_facts)
                 self._guidance[record.guidance_key] = self._guidance.get(
                     record.guidance_key, rp.GuidanceLedger()).with_verification(
                         rp.verification_guidance(detail))
@@ -1807,8 +1905,10 @@ class Scheduler:
                     store.mark_blocked(
                         self.run_id, node.node_id,
                         st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
-                        detail=detail or None, retry_class=retry_class,
-                        attempt_extra=extra)
+                        detail=self._semantic_budget_detail(
+                            detail, node.node_id,
+                            lifecycle.granted_extra_attempts),
+                        retry_class=retry_class, attempt_extra=extra)
                     return
             else:
                 # LAUNCHER_TRANSIENT's budget is a property of the member, not
@@ -1834,27 +1934,60 @@ class Scheduler:
             store.fail_attempt(self.run_id, node.node_id, retry_class,
                                detail=detail or None, attempt_extra=extra)
 
-    def _settle_review_rejection(self, node: st.PlanNode, review: Any,
-                                 record: st.AttemptRecord,
-                                 output_sha: str) -> None:
-        """Recycle the attempt with the reviewer's findings, or block on budget.
+    def _review_wanted(self, node_id: str) -> bool:
+        """May another reviewer be dispatched for this node in this run?
 
-        The same shape as `_settle_failure`'s SEMANTIC arm, and deliberately so
-        — a rejected diff earns another attempt against *new instructions*,
-        never a repeat of the same request. What differs is the budget: this
-        counts against `review_ceiling` through a marker on the attempt row,
-        and the semantic ceiling is untouched. A node whose gate went red twice
-        still gets its full review allowance, and vice versa.
+        `execution.review_ceiling`, counted over the rejection markers already
+        stored on this node's attempt rows. It is the same number and the same
+        `COUNT(*)` it always was; what changed is what running out of it costs.
+        It used to block the node — the reviewer's prose deciding a lifecycle
+        transition, which §1.2 forbids and which four run_ids of
+        `lane-p5-gap-policy` paid for (§19 M35). It now stops the scheduler
+        paying for further reviews of a node whose reviewer has rejected it
+        `review_ceiling` times, and nothing else: the attempt in flight merges
+        on its counts either way.
 
-        `output_sha` is the commit this attempt committed and the reviewer
-        judged, and it is stored on the row because **nothing else records it
-        on this path**: `node_lifecycle.output_sha` is written by
-        `mark_verified`, which a rejected attempt never reaches. Without it the
-        next attempt cannot name the diff it is being asked to repair, and the
-        recycled attempt goes back to re-implementing the node from an empty
-        tree — which is the whole defect. Passed in rather than read off the
-        verdict: the caller committed it, and the verdict is an object the
-        reviewer produced.
+        This is §1.2's condition on the one prose layer that survives, met in
+        the only way that is still available to it. A layer that cannot state
+        its verdict as a count does not adjudicate; a layer that adjudicates
+        nothing still has to terminate, or it is an unbounded cost.
+
+        The grant `retry --force` writes is honoured here for the same reason
+        the semantic ceiling honours it: an operator who deliberately widened a
+        node wants the reviewer's advice on the attempts they bought.
+        """
+        lifecycle = self.deps.store.get_node(self.run_id, node_id)
+        attempts = self.deps.store.attempts_for(self.run_id, node_id)
+        spent = rp.review_attempts_total(attempts, node_id)
+        return spent < (self.config.review_ceiling
+                        + lifecycle.granted_extra_attempts)
+
+    def _record_review_advisory(self, node: st.PlanNode, review: Any,
+                                record: st.AttemptRecord,
+                                output_sha: str) -> None:
+        """Keep everything a rejection used to carry, and fail nothing (§19 M35).
+
+        What this writes is byte-for-byte what `_settle_review_rejection`
+        wrote: the same four facts on the attempt row the convergence series
+        and the ledger are rebuilt from, the same typed detail, the same
+        REVIEW slot in the guidance ledger. What it no longer does is call
+        `fail_attempt` or `mark_blocked`. The attempt stays RUNNING and its
+        caller goes on to `mark_verified`.
+
+        The findings still reach two readers, which is the whole reason the
+        stage still runs. `self._review_findings` is the run report's
+        operator-facing surface, and it is now populated for every rejected
+        node rather than only for the ones a ceiling cut off — a merged node
+        that was rejected is exactly the node an operator wants to read about.
+        And `self._guidance` still holds the REVIEW slot, so a *later* failure
+        of this same node at this same base — a red gate on a subsequent
+        attempt, a falsification refusal — carries the reviewer's objections
+        into the retry prompt. That is how a lane learns from a reviewer that
+        can no longer stop it.
+
+        `output_sha` is stored for the reason it always was: `node_lifecycle.
+        output_sha` is written by `mark_verified`, and the repair basis
+        (§7.5) is proved against the commit this row names.
         """
         store = self.deps.store
         findings = review.findings_text()
@@ -1864,114 +1997,61 @@ class Scheduler:
                     or record.key in self._watchdog_fences):
                 return
 
-            # Four facts on the row the budget already counts: that the
-            # reviewer rejected, how many findings it raised, the typed
-            # findings themselves, and the commit that was judged. The count is
-            # what the convergence series is rebuilt from; the entry is what
-            # the ledger is rebuilt from; the commit is what the next attempt's
-            # repair basis is proved against.
             marker = {rp.REVIEW_REJECTED_KEY: True,
                       rp.REVIEW_FINDINGS_COUNT_KEY: len(review.findings),
-                      "review_subject_digest": review.subject_digest}
+                      "review_subject_digest": review.subject_digest,
+                      "review_advisory": True}
             marker.update(rp.review_output_extra(output_sha))
             marker.update(rp.guidance_extra_review(review))
-            detail = {
-                "reason": "code review rejected the diff",
-                "subject_digest": review.subject_digest,
-                "replayed": bool(review.replayed),
-                # The check ids only. The messages are the builder's retry
-                # guidance and live in the prompt; duplicating their prose into
-                # a durable audit row would be the second representation §4
-                # convicts, and §10.1 forbids any guard reading it back.
-                "blocking_checks": [c.check_id for c in review.findings],
-            }
             self._review_convergence.setdefault(node.node_id, []).append(
                 len(review.findings))
-
-            lifecycle = store.get_node(self.run_id, node.node_id)
-            if self._review_ceiling_reached(
-                    node.node_id, lifecycle.granted_extra_attempts):
-                store.mark_blocked(
-                    self.run_id, node.node_id,
-                    st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                    detail=self._review_budget_detail(
-                        detail, node.node_id, lifecycle.granted_extra_attempts),
-                    attempt_extra=marker)
-                # Surfaced where the operator will actually read it: the block
-                # reason alone says a budget ran out and nothing about what the
-                # reviewer objected to, which is the evidence gap that makes a
-                # blocked node undiagnosable without re-running it.
-                self._review_findings[node.node_id] = findings
-                return
-
-            # Replaces only the REVIEW slot: a rejection must not erase what
-            # verification said, or the node oscillates between the two
-            # surfaces fixing one constraint while regressing the other.
+            self._review_findings[node.node_id] = findings
             self._guidance[record.guidance_key] = self._guidance.get(
                 record.guidance_key, rp.GuidanceLedger()).with_review(
                     rp.review_guidance(review))
-            store.fail_attempt(self.run_id, node.node_id,
-                               st.RetryClass.SEMANTIC,
-                               detail=detail, attempt_extra=marker)
+            store.record_review_advisory(
+                self.run_id, node.node_id, record.attempt_no, marker)
 
-    def _review_ceiling_reached(self, node_id: str, granted: int) -> bool:
-        """At most `review_ceiling + granted` review-rejected attempts per node.
-
-        The same off-by-one `_semantic_ceiling_reached` documents: the policy
-        counts marker rows that already exist, and this attempt's marker is
-        written by the call this decision gates. Without the increment K would
-        admit K+1 attempts.
-
-        `granted` is the same `retry --force` grant the semantic ceiling
-        honours, and here it is also B10's missing operator escape: a review
-        that FAILed for a flaky or environmental reason would otherwise strand
-        the producer, because a byte-identical resubmission replays the stored
-        FAIL rather than being re-reviewed into a different answer.
-
-        This is the only enforcer of that rule. A second copy of it lived in
-        `retry_policy.review_budget_exhausted`, had no production caller, and
-        disagreed with this one by exactly the increment above — two
-        representations of one rule, of which the unused one was wrong (RC1).
-        The prose that justified the rule was carried here when it was deleted.
-        """
-        attempts = self.deps.store.attempts_for(self.run_id, node_id)
-        already = rp.review_attempts_total(attempts, node_id)
-        return already + 1 >= self.config.review_ceiling + granted
-
-    def _review_budget_detail(self, detail: Mapping[str, Any], node_id: str,
-                              granted: int) -> Dict[str, Any]:
-        """The block payload for `REVIEW_BUDGET_EXHAUSTED`, with the numbers an
-        operator needs to size the escape (#81).
+    def _semantic_budget_detail(self, detail: Mapping[str, Any], node_id: str,
+                                granted: int) -> Dict[str, Any]:
+        """The block payload for `SEMANTIC_BUDGET_EXHAUSTED`, with the numbers
+        an operator needs to size the escape (#81).
 
         Everything the block reason carried before this said *that* a budget
         ran out. Reopening the node needs to know by how much it overran, and
         the count is cumulative across every base for the `(run_id, node_id)`
         pair — so it is not the per-process series `review_convergence`
         reports, and it was not recoverable from anything the run printed. One
-        real node blocked here with seven review-rejected attempts while the
-        run report printed a convergence series of `[3]`, because only three of
-        the seven happened in the process that reported.
+        real node blocked with seven spent attempts while the run report
+        printed a convergence series of `[3]`, because only three of the seven
+        happened in the process that reported.
 
-        `review_grant_required` is the arithmetic rather than the inputs to it,
-        deliberately: the count this decision reads excludes the attempt
-        currently being blocked, whose marker `mark_blocked` writes in the same
+        `semantic_grant_required` is the arithmetic rather than the inputs to
+        it, deliberately: the count this decision reads excludes the attempt
+        currently being blocked, whose row `mark_blocked` writes in the same
         transaction, so an operator reading the raw count off the payload and
         sizing a grant from it would be short by exactly one — the off-by-one
-        `_review_ceiling_reached` documents, moved onto the operator. It is the
-        smallest `retry --grant N` under which this node can absorb one further
-        rejection instead of re-blocking on it.
+        `_semantic_ceiling_reached` documents, moved onto the operator. It is
+        the smallest `retry --grant N` under which this node can absorb one
+        further failure instead of re-blocking on it.
+
+        It lived on `REVIEW_BUDGET_EXHAUSTED` until §19 M35 removed that block
+        entirely. The payload moved rather than being deleted with it: the
+        ceiling an operator now has to size an escape against is this one, and
+        deleting the only place its magnitude was ever reported would have
+        re-opened #81 while closing something else.
         """
-        already = rp.review_attempts_total(
+        already = rp.semantic_attempts_total(
             self.deps.store.attempts_for(self.run_id, node_id), node_id)
-        # After the block, `already + 1` markers are stored. The next
-        # rejection blocks again unless `stored + 1 < ceiling + granted`.
-        required = (already + 1) + 2 - self.config.review_ceiling - granted
+        # After the block, `already + 1` rows are stored. The next failure
+        # blocks again unless `stored + 1 < ceiling + granted`.
+        required = (already + 1) + 2 - self.config.semantic_ceiling - granted
         return dict(
             detail,
-            review_attempts_total=already,
-            review_ceiling=self.config.review_ceiling,
+            semantic_attempts_total=already,
+            semantic_ceiling=self.config.semantic_ceiling,
             granted_extra_attempts=granted,
-            review_grant_required=max(1, required))
+            semantic_grant_required=max(1, required))
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts
@@ -2150,10 +2230,13 @@ class Scheduler:
             acceptance=acceptance,
             ancestry=dict(acceptance.ancestry) if acceptance else {},
             adapter_hygiene=dict(self._adapter_hygiene),
-            review_findings={
-                node_id: findings
-                for node_id, findings in self._review_findings.items()
-                if any(n == node_id for n, _ in blocked)},
+            # Every node a reviewer rejected, not only the blocked ones. The
+            # filter belonged to a world where a rejection was what blocked a
+            # node, so a rejected node was necessarily a blocked one; since
+            # §19 M35 the common case is a rejected node that merged, and
+            # dropping its findings here would be the only place they were
+            # ever going to be read from.
+            review_findings=dict(self._review_findings),
             review_convergence={
                 node_id: tuple(counts)
                 for node_id, counts in self._review_convergence.items()})
