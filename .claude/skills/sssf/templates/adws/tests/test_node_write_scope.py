@@ -244,7 +244,6 @@ class WindowFactory:
             launch=self._launch,
             poll_report=lambda: self.report,
             record_reviewer_session=lambda session: None,
-            record_stall=lambda session, signal, elapsed: None,
             kill=lambda session: None,
             time_source=self.clock,
             wall_clock=lambda: 1_760_000_000.0)

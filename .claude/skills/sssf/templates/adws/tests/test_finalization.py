@@ -125,7 +125,6 @@ class WindowFactory:
         self.session_id = session_id
         self.launches = 0
         self.calls = []
-        self.stalls = []
         self.clock = FakeClock()
 
     def __call__(self, matrix) -> fw.FinalizationWindow:
@@ -137,8 +136,6 @@ class WindowFactory:
             launch=self._launch,
             poll_report=self._poll_report,
             record_reviewer_session=lambda session: self.calls.append("record"),
-            record_stall=lambda session, signal, elapsed: self.stalls.append(
-                (session, signal, elapsed)),
             kill=lambda session: self.calls.append("kill"),
             time_source=self.clock,
             wall_clock=lambda: 1_760_000_000.0,
@@ -874,7 +871,11 @@ class FinalizeOrchestration(unittest.TestCase):
             self.assertEqual(stalled.signal,
                              fw.FinalizationSignal.TURN_TIMEOUT)
             self.assertFalse(store.has(DIGEST))
-            self.assertEqual(len(stalling.stalls), 1)
+            # The stall's durable half is this typed exception and the
+            # outcome behind it -- the window holds no recorder of its own,
+            # because both production call sites passed a no-op one and a
+            # seam that records nothing is worse than none at all.
+            self.assertIn("kill", stalling.calls)
 
             rerun = WindowFactory(report=clean_report(matrix_for()))
             outcome = self._finalize(store, rerun)

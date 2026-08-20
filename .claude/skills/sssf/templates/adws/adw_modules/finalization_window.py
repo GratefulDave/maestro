@@ -17,7 +17,9 @@ is a bounded window with the three obligations §11.2 states:
   (c) expiry converts into a durable typed result by kill and red
       outcome: `FINALIZATION_STALLED`, which is deliberately not a receipt
       (§6.5) -- a stall is a fact about the machine or the route, never a
-      verdict about the plan.
+      verdict about the plan. The typed `WindowOutcome` this returns is
+      that result; recording it belongs to the caller, against the store
+      that owns its phase, and this module holds no recorder for it.
 
 **The signals are §7.6's, not a second set.** `FinalizationSignal` reuses
 the watchdog's own `StallReason` strings for the two structural signals,
@@ -33,6 +35,51 @@ applies: a reviewer that has not started yet is not a dead process, and a
 cold start is not a stalled turn. This is what keeps *not yet started*,
 *working*, and *stopped without declaring* distinguishable, which is what
 B14's fix required.
+
+**The three answers are three signals, not two and a wall clock.** Issue
+#89 was raised against `run-2a44d226e75a4be391a14f02b78a6d25`, where seven
+reviews took a receipt lock and wrote no receipt. Reading them apart
+required distinguishing *never started* from *stopped without declaring*
+from *worked until the span ran out*, and only the third had a signal
+anyone could name afterwards:
+
+  * `NEVER_STARTED` — armed, readable, and never once observed working,
+    with an empty transcript, past `start_deadline_s`. Previously this
+    state had no signal at all and could only end at the span bound, which
+    is the failure the issue's acceptance names.
+  * `ACTOR_ABANDONED` — see below. It used to convict on a *single* `idle`
+    sample.
+  * `WINDOW_TIMEOUT` — the span bound, unchanged and still last.
+
+**Quiescence is confirmed, never sampled once.** A single `idle` reading is
+not evidence that a reviewer stopped. Herdr reports a pane as `idle`
+whenever the agent is between turns *or* blocked inside a tool call, and
+the liveness latch is already set by then, so one sample convicts a pause
+as readily as a stop. `idle` therefore has to *persist* for
+`quiescence_confirm_s`, and any transcript record appearing during that
+interval — or any return to a working status, or a status that cannot be
+read at all — restarts the confirmation.
+
+The transcript half is the load-bearing one, and it is deliberately
+conservative in only one direction: it can delay a conviction, never
+manufacture one. It cannot be used to keep a reviewer alive that has
+stopped emitting records, which is what the failed reviews in
+`run-2a44d226e75a4be391a14f02b78a6d25` all did — each died holding a
+blocking `hub op=wait` on a sub-task it had spawned, with its transcript
+silent for the whole wait (2.4s to 76.4s across the five that reached a
+session). Silence is what this detector reads, so a reviewer in that shape
+is still convicted on the confirmation interval rather than kept alive by
+it. What ends such a review is not this module's business: delegating a
+review to a sub-task is a reviewer-contract violation, and the signal here
+only has to name the state honestly.
+
+Both deadlines carry in-code defaults and are optional overrides, because
+an installation's `maestro.config.yaml` predates them and a required key
+would break every existing deployment. Both are also bounded by the span
+at the point of use, so no setting of either can push total detection past
+the finalization window — obligation (b) says that clock bounds everything
+inside it, and a detector that could outlast it would not be an
+earlier-firing detector at all.
 
 **One clock, stated.** Every timeout in this module is measured in
 `time.monotonic` and nothing else. The lifecycle store keeps
@@ -85,9 +132,17 @@ class FinalizationSignal(str, Enum):
     TURN_TIMEOUT = wd.StallReason.TURN_TIMEOUT.value
     WINDOW_TIMEOUT = "WINDOW_TIMEOUT"
     #: B14: the reviewer went live and then stopped without declaring. Not a
-    #: wall clock — it fires the moment the route reports the agent back at its
-    #: composer with no report written, however long or short the review was.
+    #: wall clock — it fires once the route has reported the agent back at its
+    #: composer, with no report written and no transcript record appearing,
+    #: for `quiescence_confirm_s` together.
     ACTOR_ABANDONED = "ACTOR_ABANDONED"
+    #: The reviewer launched and never went live at all: a readable pane that
+    #: has never once reported working, with an empty transcript, past
+    #: `start_deadline_s`. Distinct from ACTOR_ABANDONED because the two want
+    #: opposite handling — nothing was reviewed here, and nothing was left
+    #: half-done — and distinct from WINDOW_TIMEOUT because a failed start is
+    #: knowable in seconds and must not be paid for at the span bound (#89).
+    NEVER_STARTED = "NEVER_STARTED"
 
 
 #: Herdr statuses that mean the agent is alive and doing something. `idle` is
@@ -98,8 +153,27 @@ class FinalizationSignal(str, Enum):
 LIVE_WORKING_STATUSES = frozenset({"working", "blocked"})
 
 #: The status that means "back at the composer, not doing anything". After the
-#: reviewer has been observed working, this means it stopped without declaring.
+#: reviewer has been observed working, this means it stopped without declaring
+#: -- but only once it has held across `quiescence_confirm_s` with no
+#: transcript record appearing, because a pane blocked inside a tool call reads
+#: `idle` too.
 QUIESCENT_STATUS = "idle"
+
+#: How long an armed, readable reviewer may go without ever reporting a working
+#: status before it is a failed start. Generous on purpose: it has to clear a
+#: cold start on the slowest route, and the observed reviewers reported working
+#: within seconds of the pane opening. It is also the *only* protection against
+#: convicting a reviewer that is merely slow to begin, since the default record
+#: counter answers 0 whenever no transcript path was recorded on the session.
+#: So it is set far above any plausible start rather than as tight as the
+#: signal would allow.
+DEFAULT_START_DEADLINE_S = 120.0
+
+#: How long `idle` must hold, with no transcript record appearing, before the
+#: reviewer is convicted of stopping without declaring. Sized against the
+#: failure it exists to prevent: the reviewers killed in #89 were convicted
+#: 2.4-31 seconds into a blocking `hub wait`, all of them alive and mid-review.
+DEFAULT_QUIESCENCE_CONFIRM_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -117,12 +191,34 @@ class FinalizationConfig:
     finalization_timeout_s: float
     turn_timeout_s: float
     poll_interval_s: float = 1.0
+    #: Both deadlines are optional overrides with in-code defaults. An
+    #: installation's `maestro.config.yaml` predates them, and a key that had
+    #: to be present would refuse to start every existing deployment.
+    start_deadline_s: float = DEFAULT_START_DEADLINE_S
+    quiescence_confirm_s: float = DEFAULT_QUIESCENCE_CONFIRM_S
 
     def __post_init__(self) -> None:
         for name in ("finalization_timeout_s", "turn_timeout_s",
-                     "poll_interval_s"):
+                     "poll_interval_s", "start_deadline_s",
+                     "quiescence_confirm_s"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} is a wall clock; it is positive")
+
+    @property
+    def effective_start_deadline_s(self) -> float:
+        """Bounded by the span, so no setting outlasts obligation (b).
+
+        Bounded here rather than refused in `__post_init__`: an installation
+        may legitimately run a window shorter than this default, and refusing
+        that config would turn a defaulted field into a required one — the
+        thing these two fields exist to avoid.
+        """
+        return min(self.start_deadline_s, self.finalization_timeout_s)
+
+    @property
+    def effective_quiescence_confirm_s(self) -> float:
+        """Bounded by the span, for the same reason."""
+        return min(self.quiescence_confirm_s, self.finalization_timeout_s)
 
 
 @dataclass
@@ -166,6 +262,12 @@ class WindowOutcome:
     report: Optional[Any] = None
     signal: Optional[FinalizationSignal] = None
     killed: bool = False
+    #: Whether the route ever reported this reviewer working or blocked. The
+    #: typed discriminator between a review that never began and one that
+    #: began and stopped — a caller deciding what to do with a failed review
+    #: needs to tell those apart, and reading it off the signal name alone
+    #: would make every future signal a change to that caller.
+    observed_working: bool = False
 
 
 # ── injected collaborators (Protocols; the ledger owns the tracer) ──────────
@@ -188,13 +290,6 @@ class SessionRecorder(Protocol):
     opens the window (§6.5, §11.2)."""
 
     def __call__(self, session: ReviewerSession) -> None: ...
-
-
-class StallRecorder(Protocol):
-    """Records `FINALIZATION_STALLED` durably beside the session row."""
-
-    def __call__(self, session: ReviewerSession, signal: FinalizationSignal,
-                 elapsed_s: float) -> None: ...
 
 
 class ReviewerKiller(Protocol):
@@ -274,7 +369,6 @@ class FinalizationWindow:
         launch: ReviewerLauncher,
         poll_report: ReportPoller,
         record_reviewer_session: SessionRecorder,
-        record_stall: StallRecorder,
         kill: ReviewerKiller,
         process_alive: Callable[[int], bool] = DEFAULT_PROCESS_ALIVE,
         transcript_record_count: Callable[[ReviewerSession], int] = (
@@ -287,7 +381,6 @@ class FinalizationWindow:
         self._launch = launch
         self._poll_report = poll_report
         self._record_reviewer_session = record_reviewer_session
-        self._record_stall = record_stall
         self._kill = kill
         self._process_alive = process_alive
         self._transcript_record_count = transcript_record_count
@@ -307,6 +400,17 @@ class FinalizationWindow:
         # fresh prompt, not started", which is the normal post-launch state and
         # not a stall.
         self._actor_was_working = False
+        # Whether any status at all has been read. A pane whose status cannot
+        # be read is an unobserved reviewer, not a failed one, so NEVER_STARTED
+        # stays unreachable until the route has answered at least once.
+        self._actor_status_seen = False
+        # The confirmation state for quiescence: when the current unbroken run
+        # of `idle` began, and the transcript record count it began at. Any
+        # record appearing, any working status, or any unreadable status clears
+        # it — which is what stops a reviewer blocked in a tool call from being
+        # convicted on one sample.
+        self._quiescent_since: Optional[float] = None
+        self._quiescent_at_count = 0
 
     # ── the span ────────────────────────────────────────────────────────
 
@@ -365,7 +469,8 @@ class FinalizationWindow:
         if report is not None:
             return self._finish(WindowOutcome(
                 completed=True, session=session,
-                elapsed_s=self._elapsed(), report=report))
+                elapsed_s=self._elapsed(), report=report,
+                observed_working=self._actor_was_working))
 
         # (b) the one span-bounding wall clock, over everything.
         elapsed = self._elapsed()
@@ -380,22 +485,11 @@ class FinalizationWindow:
         if session.pid is not None and not self._process_alive(session.pid):
             return self._stall(FinalizationSignal.PROCESS_DEAD, elapsed)
 
-        # (c) B14 — quiescence after liveness, checked before either clock so a
-        # reviewer that stopped without declaring is reported as what it is
-        # rather than waiting out a timeout that would name the wrong cause.
-        #
-        # The order matters and is the whole point: the report check at the top
-        # of this method already ran, so reaching here with the actor idle means
-        # it is idle *and* has written nothing. B14's fix is not a shorter
-        # timeout — a legitimate large review takes a long time and any wall
-        # clock bounds honest work. It is noticing that the thing stopped.
-        if self._actor_status is not None:
-            status = (self._actor_status(session) or "").strip().casefold()
-            if status in LIVE_WORKING_STATUSES:
-                self._actor_was_working = True
-            elif status == QUIESCENT_STATUS and self._actor_was_working:
-                return self._stall(FinalizationSignal.ACTOR_ABANDONED, elapsed)
-
+        # The transcript is read *before* any status is judged, and that order
+        # is deliberate. `idle` covers both "between turns" and "blocked in a
+        # tool call", so the status alone cannot say whether anything stopped;
+        # the transcript can. Judging this poll's status against the previous
+        # poll's record count would decide that question on stale evidence.
         record_count = self._transcript_record_count(session)
         if self._turn_observed_at is None:
             # The turn clock starts at launch, not at open and not at this
@@ -407,6 +501,55 @@ class FinalizationWindow:
             self._turn_observed_at = self._time_source()
         session.turn_count = self._turn_observed_count
 
+        now = self._time_source()
+        status: Optional[str] = None
+        if self._actor_status is not None:
+            raw = self._actor_status(session)
+            if raw is not None:
+                status = raw.strip().casefold()
+                self._actor_status_seen = True
+            if status in LIVE_WORKING_STATUSES:
+                self._actor_was_working = True
+
+        # A failed start (#89). Armed, answering, never once working, nothing
+        # written: there is no review here to wait for, and waiting for it at
+        # the span bound is what the issue's acceptance refuses. Checked only
+        # where a status reader exists, because without one "never reported
+        # working" is not an observation about the reviewer.
+        if (self._actor_status is not None
+                and self._actor_status_seen
+                and not self._actor_was_working
+                and record_count == 0
+                and session.launched_at is not None
+                and (now - session.launched_at)
+                > self._config.effective_start_deadline_s):
+            return self._stall(FinalizationSignal.NEVER_STARTED, elapsed)
+
+        # (c) B14 — quiescence after liveness, checked before the turn clock so
+        # a reviewer that stopped without declaring is reported as what it is
+        # rather than waiting out a timeout that would name the wrong cause.
+        #
+        # The report check at the top of this method already ran, so reaching
+        # here with the actor idle means it is idle *and* has written nothing.
+        # B14's fix is not a shorter timeout — a legitimate large review takes a
+        # long time and any wall clock bounds honest work. It is noticing that
+        # the thing stopped. What it must not do is mistake a pause for a stop:
+        # the idle has to hold, and any record appearing inside it restarts the
+        # confirmation from that record.
+        if status == QUIESCENT_STATUS and self._actor_was_working:
+            if (self._quiescent_since is None
+                    or record_count > self._quiescent_at_count):
+                self._quiescent_since = now
+                self._quiescent_at_count = record_count
+            elif (now - self._quiescent_since
+                  > self._config.effective_quiescence_confirm_s):
+                return self._stall(FinalizationSignal.ACTOR_ABANDONED, elapsed)
+        else:
+            # Working, blocked, unreadable, or a status this module does not
+            # name: none of them confirm quiescence, and an unreadable status
+            # is a missing observation rather than evidence of a stop.
+            self._quiescent_since = None
+
         since_progress = self._time_source() - self._turn_observed_at
         if since_progress > self._config.turn_timeout_s:
             return self._stall(FinalizationSignal.TURN_TIMEOUT, elapsed)
@@ -417,8 +560,8 @@ class FinalizationWindow:
 
         The arming step is not optional bookkeeping. `poll` returns early on
         `not session.armed`, so a `run` that never calls `report_launched`
-        leaves PROCESS_DEAD, ACTOR_ABANDONED and TURN_TIMEOUT unreachable and
-        the span bound as the *only* detector — which is precisely the state
+        leaves PROCESS_DEAD, NEVER_STARTED, ACTOR_ABANDONED and TURN_TIMEOUT
+        unreachable and the span bound as the *only* detector — the state
         B14 was recorded against, a reviewer idle at its prompt having written
         nothing while the verb waited out a wall clock. §6.5 requires the
         structural signals to be the working detector and the span bound to be
@@ -464,16 +607,24 @@ class FinalizationWindow:
         verb stops waiting and reports the pane. The survivor is a leak,
         not a hazard (§7.8) — finalization measures nothing and merges
         nothing, and a report arriving after the declaration has no reader.
+
+        The durable half is the returned `WindowOutcome` and nothing else.
+        This module used to take a `StallRecorder` as well, and both of its
+        call sites passed `lambda ...: None` — so the seam read as wired
+        while recording nothing anywhere, which is how four distinct signals
+        came to settle as one free-text reason. Each caller now records where
+        it settles, against the store that actually owns that phase's
+        lifecycle, from the typed `signal` on this outcome.
         """
         session = self._require_open()
         killed = False
         if session.harness_owned_group:
             self._kill(session)
             killed = True
-        self._record_stall(session, signal, elapsed)
         return self._finish(WindowOutcome(
             completed=False, session=session, elapsed_s=elapsed,
-            signal=signal, killed=killed))
+            signal=signal, killed=killed,
+            observed_working=self._actor_was_working))
 
     def _finish(self, outcome: WindowOutcome) -> WindowOutcome:
         self._outcome = outcome
