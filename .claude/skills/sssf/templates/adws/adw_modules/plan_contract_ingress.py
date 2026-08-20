@@ -151,6 +151,145 @@ def _parse_verifier_command(command: object) -> Tuple[str, Tuple[str, ...]]:
     raise IngressError("UNMAPPABLE_COMMAND:{}".format(tokens[0]))
 
 
+def _requirements_by_id(ir: Mapping[str, Any]) -> dict:
+    """`{requirement_id: requirement}` over the IR's declared requirements.
+
+    One index, built once and read by both consumers below. Two indexes built
+    from the same list are two chances to disagree about which record a lane's
+    `requirement_ids` names, and this projection now resolves that binding
+    twice — once for the effects a requirement authorises, once for the words
+    that bound the node's scope.
+
+    A malformed entry is skipped rather than refused here. Both callers refuse
+    in their own vocabulary when the id they were looking for is missing, and
+    a refusal raised from the index would name the plan's requirement list
+    instead of the lane whose contract is incomplete.
+    """
+    declared = ir.get("requirements")
+    index: dict = {}
+    for item in declared if isinstance(declared, list) else ():
+        if not isinstance(item, dict):
+            continue
+        requirement_id = item.get("requirement_id")
+        if isinstance(requirement_id, str) and requirement_id:
+            index.setdefault(requirement_id, item)
+    return index
+
+
+#: How a requirement's own words are labelled inside a node's instruction.
+#: A label rather than a bare paste: the builder and the reviewer both need to
+#: know that what follows is the plan's transcribed requirement and not a
+#: paraphrase written for them, because the whole value of the text is that it
+#: is the sentence the plan author actually wrote.
+REQUIREMENT_HEADING = "Requirement {0}, in the plan's own words:"
+
+
+def _node_instruction(ir: Mapping[str, Any], lane: Mapping[str, Any],
+                      lane_id: str) -> str:
+    """The lane's title as a label, then the requirement text that bounds it.
+
+    §3.6 B9 makes the reviewer's input a declared contract — goal, `produces`,
+    acceptance — and §19 M1 records the cost of a projection that dropped the
+    goal: every agent-node reviewer in every run was told "make the gate pass"
+    and nothing else. This is that same defect one projection earlier. The
+    field was populated, so nothing downstream could tell a summary from the
+    contract, and every consumer faithfully relayed a lossy value.
+
+    Measured over the four executable plans in the `lexgenius-pipeline`
+    deployment, 2,256 bytes of lane titles stood in for 18,824 bytes of
+    `requirements[].text` across 51 agent nodes. `lane-p4-enrichment-ordering`
+    carried 199 bytes of a 971-byte requirement, and the dropped remainder is
+    the sentence deferring the production wiring to a later plan. Its reviewer
+    rejected the diff six times for omitting exactly that wiring, on
+    `diff.implements_the_stated_instruction`, and burned the lane's whole
+    review ceiling.
+
+    Of the three shapes issue #87 lists, this is the third, and the other two
+    are refused on the design's own terms:
+
+    * A bare `requirement_id` on the node makes the bounding text a *reference*
+      to bytes that live outside the plan. `maestro-plan.v1` is frozen from the
+      moment it ships and its bytes are its identity (§6.3) — that is why a
+      `PromptAsset` is carried by content digest. Text recoverable only from
+      the authoring IR is text that can change without changing the plan
+      digest, and the IR "takes no further part" after this projection.
+    * `prompt_assets` is a channel with no runtime reader. `plan_model`'s
+      `_NODE_PROJECTION_EXEMPT` records the reason in the code — "consumed
+      while authoring the plan, not while running it; nothing on the
+      scheduler's side reads one" — and a `PromptAsset` is a `path` plus a
+      `sha256`, so routing text through it would mean writing files from a
+      projection documented as a pure function of the IR, the receipt and the
+      repository, *and* building the reader that does not exist. A channel
+      with no writers is B15's field with no readers; the repair is not to
+      write into it, it is to use the channel that already has both.
+
+    `instruction` has both. `maestro._agent_node_prompt` opens the builder's
+    prompt with it and `code_review._node_goal` is the reviewer's declared
+    goal, so widening this one field reaches both halves of the contract with
+    no new channel, no new field, and no new reader to keep in step.
+
+    One recorded objection is answered rather than ignored.
+    `scheduler_types.PlanNode.effects` says handing the reviewer the
+    requirement's own text "was considered and declined", because the text of
+    `lane-p1-canonical-object-key` said both "pure derivation and policy
+    module" and "server-side copy it", which would put the reviewer in the
+    builder's position adjudicating a contradiction. That objection was about
+    a *self-contradictory* requirement, and admission now refuses exactly that
+    IR: `EFFECT_AUTHORIZED` blocks a requirement that prescribes an effect its
+    own plan forbids, and it runs below, before any plan file is written. The
+    contradiction the objection feared cannot reach a node any more, so what
+    survives admission is text a reviewer can read without weighing one clause
+    against another. `effects` stays typed and stays carried; this adds the
+    scope the typed field was never able to express — which lane owns which
+    work, and which work a later plan owns.
+
+    §1.2 is unaffected. No lifecycle transition keys on these bytes: they are
+    plan content, canonicalized and digested like every other field, read by
+    the two prompt builders and by nothing that moves a node between states.
+    """
+    title = _require_text(
+        lane.get("title"), "UNMAPPABLE_LANES", "{}.title".format(lane_id))
+    bound = _require_id_list(
+        lane.get("requirement_ids"), "UNMAPPABLE_LANES",
+        "{}.requirement_ids".format(lane_id))
+    index = _requirements_by_id(ir)
+    blocks = [title]
+    seen = set()
+    for requirement_id in bound:
+        # Declared order, first occurrence only. The plan's bytes are its
+        # identity, so the instruction must be a pure function of the IR: a
+        # set here would order it by hash and a duplicate id would paste one
+        # requirement twice.
+        if requirement_id in seen:
+            continue
+        seen.add(requirement_id)
+        requirement = index.get(requirement_id)
+        if not isinstance(requirement, dict):
+            # The lane binds an id the plan does not declare. Refused rather
+            # than skipped: skipping is how the title became the whole brief.
+            raise IngressError(
+                "UNMAPPABLE_REQUIREMENTS:{}.requirement_ids:{}".format(
+                    lane_id, requirement_id))
+        text = _require_text(
+            requirement.get("text"), "UNMAPPABLE_REQUIREMENTS",
+            "{}.text".format(requirement_id)).strip()
+        if not text:
+            # `_require_text` refuses `""`; a requirement whose text is only
+            # whitespace is the same absence spelled differently, and it would
+            # otherwise project a heading with nothing under it.
+            raise IngressError(
+                "UNMAPPABLE_REQUIREMENTS:{}.text".format(requirement_id))
+        blocks.append("{0}\n{1}".format(
+            REQUIREMENT_HEADING.format(requirement_id), text))
+    # A lane binding no requirement at all is deliberately not refused here.
+    # Admission's `SURFACE_REACHABLE` already refuses it below, naming the
+    # output no requirement claims — a message about the plan's requirement
+    # coverage, which is what is actually wrong. Refusing here first would
+    # replace that with a worse one and would send an author back twice for
+    # two defects in one document, which §11.1 rejects.
+    return "\n\n".join(blocks)
+
+
 def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
     """The lane's dispositions toward each act the plan forbids.
 
@@ -175,9 +314,7 @@ def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
                 meanings[entry["effect"]] = meaning.strip()
     if not meanings:
         return []
-    by_id = {item.get("requirement_id"): item
-             for item in ir.get("requirements", [])
-             if isinstance(item, dict)}
+    by_id = _requirements_by_id(ir)
     dispositions = {}
     for requirement_id in lane.get("requirement_ids") or []:
         requirement = by_id.get(requirement_id)
@@ -341,13 +478,16 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         needs = _require_id_list(
             lane.get("depends_on"), "UNMAPPABLE_LANES",
             "{}.depends_on".format(lane_id))
-        # The lane's title becomes the agent's `instruction` — the prompt it
-        # works from. Falling back to the lane id handed an agent the string
-        # `lane-freeze` as its whole brief, which is not a defaulted field but
-        # an absent one, silently.
-        instruction = _require_text(
-            lane.get("title"), "UNMAPPABLE_LANES",
-            "{}.title".format(lane_id))
+        # The node's `instruction` — the prompt the builder works from and the
+        # goal the reviewer judges against. This field has been widened twice
+        # now, each time because what it carried was smaller than the brief:
+        # first from the lane id, which handed an agent the string
+        # `lane-freeze` as its whole brief, then from the lane's title, which
+        # is a headline for a requirement rather than the requirement. It now
+        # carries the title as a label and the bound requirements' own words
+        # beneath it; `_node_instruction` records why, and why the two
+        # cheaper shapes were declined.
+        instruction = _node_instruction(ir, lane, lane_id)
         nodes.append({
             "kind": "agent",
             "node_id": lane_id,
