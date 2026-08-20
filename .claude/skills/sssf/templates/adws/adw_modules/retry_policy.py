@@ -30,8 +30,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
-                    Tuple)
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 from .scheduler_types import (
     AttemptRecord,
@@ -325,6 +325,44 @@ def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> in
     return sum(1 for a in attempts
                if a.node_id == node_id
                and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
+
+
+def review_attempts_across_runs(
+        attempts_by_run: Mapping[str, Iterable[AttemptRecord]],
+        node_id: str) -> Tuple[int, Tuple[str, ...]]:
+    """This node's review-rejected attempts summed over many runs, and the
+    runs that hold them.
+
+    The cumulative scope `review_attempts_total` establishes stops at the run
+    boundary, and a node can be re-attempted past its ceiling simply by
+    starting the plan again: each fresh `run_id` mints a `node_lifecycle` row
+    with an empty history, so the reviewer's verdict on the same node against
+    the same plan bytes is spent over and over with nothing counting it. That
+    is the debt #92 names — spend no amount of success pays off — accruing one
+    run at a time.
+
+    It counts by calling `review_attempts_total` per run rather than by
+    restating its predicate. RC1 is the recorded cost of the alternative: a
+    second copy of the review budget rule lived in
+    `retry_policy.review_budget_exhausted`, had no production caller, and
+    disagreed with the enforced one by exactly one attempt. One predicate,
+    counted in more places.
+
+    The run ids come back beside the total because the refusal that reads this
+    has to name them — an operator told a node is out of attempts and not told
+    where they went has to go and find the runs themselves — and deriving them
+    from a second pass would be the same duplication one level up. Ordering
+    follows the caller's mapping, which is the reader's newest-first run order,
+    and only runs that actually hold a rejection appear.
+    """
+    total = 0
+    holders: List[str] = []
+    for run_id, attempts in attempts_by_run.items():
+        counted = review_attempts_total(attempts, node_id)
+        if counted:
+            total += counted
+            holders.append(run_id)
+    return total, tuple(holders)
 
 
 def review_convergence_from_attempts(
