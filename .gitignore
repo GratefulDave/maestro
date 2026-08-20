@@ -168,3 +168,4 @@ __pycache__/
 # Agent-harness state must never reach the installable tree
 .omc/
 .omp/
+.lex/
