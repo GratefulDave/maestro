@@ -66,54 +66,70 @@ assuming it is current against a deployment** — run `runtime_sync.py check` ag
 rather than trusting this file, which can itself go stale. When landing a change, say explicitly which copies
 you touched, and mirror deliberately rather than assuming a mirror already happened.
 
-**State as of 2026-08-19, re-derived by running the test.** `tests/test_template_parity.py`
-**passes** from this repo — both assertions, same-files and byte-identical-contents. The earlier
-reading recorded here was stale twice over: it reported six content differences, five of which were
-this repository's own uncommitted working tree rather than a divergence between the copies, and it
-reported `tests/test_base_commit_enforcement.py` and `tests/test_review_clock_siblings.py` as
-present in the-library and absent here. The direction was backwards. Neither template copy held
-those tests, and neither held the two functions they exercise; both files existed only on the
-unmerged `issues/sweep` branch. They have since been carved onto `carve/sweep-parity-tests` with
-`maestro._validate_review_clocks`, `maestro._refuse_base_commit_divergence`, and
-`worktree.resolve_commit`, and mirrored across. The one committed divergence that reading did find
-is also closed: both copies' `maestro.config.yaml` now carries `execution.review_reject_grade`.
+**State as of 2026-08-20, re-derived by running both the tool and the test.**
+`tests/test_template_parity.py` **passes** from this repo — both assertions, same-files and
+byte-identical-contents — and `runtime_sync.py check` agrees: template and the-library are level
+over **200** compared files. That is after three branches landed here today (#104, the
+`maestro-plan.v2` bump and the pre-v2 run refusal; #105, the reviewer-key environment split; #106,
+the finalization turn clock gated on route liveness) and the-library was brought level by
+`runtime_sync.py mirror --apply --commit` in its PR #120. The 2026-08-19 reading recorded here
+(189 files) is superseded rather than wrong: the count moves whenever a test file is added, which
+is exactly why it dates a snapshot instead of describing an invariant.
 
 Two qualifications outrank any such snapshot, this one included. **the-library's mirror can be
-uncommitted there.** It is committed as of 2026-08-19 — 189 tracked files under
-`skills/sssf/templates/adws/`, working tree clean, that branch 13 commits ahead of its remote — but
-it has been uncommitted before, and the check that would catch it is not the parity test. A green
-parity run or a `runtime_sync check` says the bytes on disk agree; it says nothing about whether
-they are committed, and an agent that resets or checks out in that repository takes an uncommitted
-mirror with it. Confirm with `git status` there, not with parity. And the differing set moves while
-it is being measured, because other lanes write into this template concurrently: an earlier
-observation watched `test_agent_start_busy_retry.py` go from clean to modified minutes apart. Any
-comparison between these copies is a reading of a moving tree — run the test, do not trust this
-paragraph.
+uncommitted there.** It is committed as of 2026-08-20 — 200 tracked files under
+`skills/sssf/templates/adws/`, nothing modified or untracked under that path, and `main` level with
+its remote after PR #120 — but it has been uncommitted before, and the check that would catch it is
+not the parity test. A green parity run or a `runtime_sync check` says the bytes on disk agree; it
+says nothing about whether they are committed, and an agent that resets or checks out in that
+repository takes an uncommitted mirror with it. Confirm with `git status` there, not with parity.
+That repository also carries unrelated work — 14 modified and 10 untracked files elsewhere in its
+tree, both before and after this mirror. `runtime_sync.py mirror --commit` stages only the paths it
+wrote, which is what preserves them; a `git add -A` in that repo would sweep them into a commit
+claiming to be a mirror. And the differing set moves while it is being measured, because other lanes
+write into this template concurrently: an earlier observation watched
+`test_agent_start_busy_retry.py` go from clean to modified minutes apart. Any comparison between
+these copies is a reading of a moving tree — run the test, do not trust this paragraph.
 
-Both deployments were mirrored from this template on 2026-08-19 and both now **track** `adws/` in
-git — `lexgenius-pipeline` at 196 files on branch `parked/cmo-consolidation-l-run`, `lexgenius` at
-199 on `chore/mirror-adws-runtime`, each under a commit named "Mirror ADW runtime from maestro into
-…". That is new. The earlier reading here recorded `adws/` as *entirely untracked* in
-lexgenius-pipeline, which meant git would neither preserve nor notice a change to it; that hazard is
-closed for both, and a mirror there is now a reviewable diff rather than an invisible overwrite.
+Both deployments **track** `adws/` in git — `lexgenius` at 203 files on branch
+`chore/mirror-adws-runtime`, `lexgenius-pipeline` on `parked/cmo-consolidation-l-run`, each under a
+commit named "Mirror ADW runtime from maestro into …". The earlier reading here recorded `adws/` as
+*entirely untracked* in lexgenius-pipeline, which meant git would neither preserve nor notice a
+change to it; that hazard is closed for both, and a mirror there is now a reviewable diff rather
+than an invisible overwrite.
 
-Re-derived 2026-08-19 with `runtime_sync.py check`, which is the tool to use — not `diff -rq`, which
+Re-derived 2026-08-20 with `runtime_sync.py check`, which is the tool to use — not `diff -rq`, which
 reports a filename without saying which side is ahead:
 
 | comparison | result |
 | --- | --- |
-| template ↔ the-library | level over 189 files |
-| template ↔ `lexgenius-pipeline/adws/` | level over 188 files (`maestro.config.yaml` held out) |
-| template ↔ `lexgenius/adws/` | 5 files differ |
+| template ↔ the-library | level over 200 files |
+| template ↔ `lexgenius/adws/` | 24 files differ; 7 more exist only in the template |
+| template ↔ `lexgenius-pipeline/adws/` | **not re-derived on 2026-08-20** — see below |
 
-The five, with the direction that decides what to do about each: `lexgenius` is ahead on
-`adw_modules/deliver.py` (+7), `tests/test_deliver.py` (+26), and `tests/test_step10_cli.py` (+58) —
-content that exists only there, which a mirror would destroy, which is why `runtime_sync` refuses
-it; the template is ahead on `tests/test_route_admission.py` (+98) and `tests/test_step7_launcher.py`
-(+439), the ordinary case a mirror resolves. Issue #71 tracks the per-file decision.
+lexgenius-pipeline was deliberately left untouched: a Maestro run was executing in that repository
+while this reading was taken, and nothing — not a mirror, not a `check`, not a maestro verb — was
+pointed at it. Its last recorded reading (2026-08-19, level over 188 files with
+`maestro.config.yaml` held out) is therefore stale by construction, because three changes have
+landed in this template since. Do not quote that number as current; re-derive it when the repository
+is idle.
 
-`_node_goal` now answers `1` in **both** deployments, so the M1 reviewer-contract fix has reached
-each and no deployment's reviewers are still judging against the placeholder. lexgenius-pipeline was
+Of the 24 files differing from `lexgenius`, the template is ahead on 23 — `maestro.py` by 584 lines,
+`tests/test_finalization_window.py` by 633 — and `lexgenius` is ahead on exactly one,
+`tests/test_node_write_scope.py`, by a single line; that one is the case a mirror would destroy and
+`runtime_sync` refuses. The 7 present only in the template are all tests, and a file present in one
+copy and not the other is a deletion rather than an edit. Issue #71 tracks the per-file decision.
+
+Mirroring a deployment costs something it did not cost before. #104 makes a `maestro-plan.v1` plan
+**unrunnable** at run start (`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`); the remedy is to re-ship the plan
+from its IR, which is cheap but is not nothing, and it cannot be done while that plan is mid-run.
+Mirroring this template into a deployment that holds shipped v1 plans refuses those plans until they
+are re-shipped, so sequence the mirror against what is running there rather than treating it as a
+neutral copy.
+
+`_node_goal` answers `1` in `lexgenius` as of 2026-08-20, so that deployment's reviewers are not
+judging against the placeholder. The same was true of lexgenius-pipeline when it was last read on
+2026-08-19; it was not re-read on 2026-08-20, for the reason above. lexgenius-pipeline was
 brought level by hand on 2026-08-18, after the divergence had already been paid for by run
 `run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told "Make the gate '…' pass over
 selector '…', changing only the declared outputs" verbatim while the plan it was running carried the

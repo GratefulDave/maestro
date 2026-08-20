@@ -65,9 +65,36 @@ Run these in the repository the plan will change.
    `effects`. Those two fields have no independent reader before a run begins (#31). Whatever
    judgement the review represents is the reviewer's own, made before they run the verb — the verb
    records that it happened and to which exact bytes, and nothing more.
-5. `maestro plan ship <plan-name>` — projects the reviewed IR into a `maestro-plan.v1` plan,
+5. `maestro plan ship <plan-name>` — projects the reviewed IR into a `maestro-plan.v2` plan,
    validates the projection, and finalizes it. Finalizing is required before the plan can run, and
    before it can participate in a workspace.
+
+The version the projection emits is `maestro-plan.v2`, and a run refuses anything older. The bump
+is not a structural change: v2 carries the same in-plan types, the same fields, and the same
+obligations as v1, and `plan_model.PlanV2` subclasses the frozen `Plan` for exactly that reason.
+What moved is what the projection *puts in* an agent node's `instruction`. It used to write the
+lane's title there and drop `requirements[].text`, so every builder and every reviewer downstream
+was handed a summary of the lane's contract instead of the contract itself (§19 M26). A populated
+field cannot be audited by its consumers: the fixed projection went on emitting the same
+`maestro-plan.v1` the degenerate one emitted, so a plan shipped before the fix and a plan shipped
+after it were indistinguishable to a runtime carrying every fix. The version string is the only
+channel that difference can travel on.
+
+`_load_runnable_plan` — the one function that turns plan bytes into a plan a run will execute, and
+so the point `run start`, `run resume`, and a workspace participant all cross — refuses a plan whose
+declared version is outside `_RUNNABLE_PLAN_SCHEMA_VERSIONS` with
+`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`, naming the plan, the version found, and the remedy. It is an
+allowlist rather than a denylist: a version registered later and not added to it refuses rather than
+runs. A `maestro-plan.v1` plan stays readable, canonical, validatable, and finalizable; only running
+it is refused.
+
+If you hold a plan shipped before the bump, re-ship it. There is no upgrade function and no in-place
+edit (§6.3) — the requirement text a v1 plan is missing is not recoverable from the projected plan,
+only from the IR it was projected from. Run `maestro plan ship <plan-name>` again against the same
+`.maestro/<name>.plan.json` and its existing `.maestro/<name>.plan-review.json`: nothing needs to be
+re-approved, because the IR bytes and the receipt bound to them are unchanged. The projection is
+simply re-run by code that carries the requirement text, and the plan is re-validated and
+re-finalized under a new digest.
 
 `gate`, `review`, and `ship` are the plan CLI's shipped surface — one verb, one argument,
 everything else resolved from `maestro.config.yaml`. They landed in commit 6707e50 (PR #8) and are
@@ -103,8 +130,9 @@ regenerated and no receipt already signed is invalidated — `provision_keys` re
 it finds. Re-running does **not** clean a shell that already sourced the old file, so in any shell
 that did, `unset PLANCTL_REVIEWER_HMAC_KEY` (or open a new one) before `maestro plan gate`.
 
-`gate` enforces the same boundary from the other side: it refuses outright if that key is present in its
-own environment, because a gate command able to see the reviewer's key would no longer prove that
+`gate` enforces the same boundary from the other side: it refuses outright if that key is present
+in its own environment, because a gate command able to see the reviewer's key would no longer prove
+that
 gating and reviewing happen on two sides of a line neither side can cross. Nobody has to remember to
 keep the key separate — Maestro checks for it before either command does anything else.
 

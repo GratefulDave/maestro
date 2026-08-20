@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# Persistent Maestro run monitor — phase depth, node states, attempts, blockers.
+#
+# The visualizer answers the same questions in a browser; this is the terminal
+# half, for watching a run without leaving the shell. It reads the lifecycle
+# ledger directly rather than shelling out to maestro.py per refresh, so the
+# poll costs a few SQLite reads and nothing else.
+#
+# Invoked through the global justfile recipe, so it is reachable from anywhere:
+#
+#   just -g mon                     watch the newest RUNNING run in the default repo
+#   just -g mon <run-id>            watch one run by id
+#   just -g mon <plan-name>         watch the newest run of that plan
+#   just -g mon <selector> <secs>   set the refresh interval (default 5)
+#
+# Point it at another deployment with MAESTRO_DB=<path to lifecycle.sqlite3>,
+# or MAESTRO_REPO=<repo root> to derive that path the way maestro does.
+set -uo pipefail
+
+DEFAULT_REPO="/Users/davidandrews/PycharmProjects/lexgenius-pipeline"
+REPO="${MAESTRO_REPO:-$DEFAULT_REPO}"
+STATE_ROOT="/Users/davidandrews/PycharmProjects/.maestro-state"
+DB="${MAESTRO_DB:-$STATE_ROOT/$(basename "$REPO")/lifecycle.sqlite3}"
+
+SELECTOR="${1:-}"
+INTERVAL="${2:-10}"
+
+if [[ ! -f $DB ]]; then
+  printf 'maestro-mon: no lifecycle ledger at %s\n' "$DB" >&2
+  printf 'maestro-mon: set MAESTRO_DB=<path> or MAESTRO_REPO=<repo root>\n' >&2
+  exit 1
+fi
+
+q() { sqlite3 "$DB" "$@"; }
+
+# Resolve the selector to exactly one run id. A bare run id passes through; a
+# plan name is resolved through that plan's shipped digest, because `runs`
+# stores the digest and not the name; nothing takes the newest run that has not
+# reached a terminal outcome, falling back to the newest run of any state so an
+# operator watching a run that just converged still sees why.
+resolve_run() {
+  local sel="$1" found digest plan_file
+  if [[ $sel == run-* ]]; then
+    found=$(q "SELECT run_id FROM runs WHERE run_id='$sel';")
+    [[ -n $found ]] || { printf 'maestro-mon: no run %s in %s\n' "$sel" "$DB" >&2; exit 1; }
+    printf '%s' "$found"; return
+  fi
+  if [[ -n $sel ]]; then
+    plan_file="$REPO/.maestro/plans/$sel/maestro-plan.v1"
+    [[ -f $plan_file ]] || { printf 'maestro-mon: no plan %s at %s\n' "$sel" "$plan_file" >&2; exit 1; }
+    digest=$(shasum -a 256 "$plan_file" | cut -d' ' -f1)
+    found=$(q "SELECT run_id FROM runs WHERE plan_digest='$digest' ORDER BY created_at DESC LIMIT 1;")
+    [[ -n $found ]] || { printf 'maestro-mon: no run of plan %s (digest %s)\n' "$sel" "${digest:0:12}" >&2; exit 1; }
+    printf '%s' "$found"; return
+  fi
+  found=$(q "SELECT run_id FROM runs
+              WHERE latest_outcome IS NULL
+                 OR latest_outcome NOT IN ('CANCELLED','ABANDONED','CONVERGED')
+              ORDER BY created_at DESC LIMIT 1;")
+  [[ -n $found ]] || found=$(q "SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1;")
+  [[ -n $found ]] || { printf 'maestro-mon: no runs in %s\n' "$DB" >&2; exit 1; }
+  printf '%s' "$found"
+}
+
+RUN=$(resolve_run "$SELECTOR")
+
+while true; do
+  clear
+  printf '\033[1mmaestro-mon\033[0m  %s   refresh %ss\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$INTERVAL"
+  printf 'run %s\n' "$RUN"
+  printf 'db  %s\n\n' "$DB"
+
+  q -header -column "
+    SELECT COALESCE(NULLIF(latest_outcome,''),'(running)') AS outcome,
+           substr(last_transition_at,12,8)                 AS last_move,
+           scheduler_pid                                   AS pid
+      FROM runs WHERE run_id='$RUN';"
+  printf '\n'
+
+  q -header -column "
+    SELECT d.depth,
+           l.node_id,
+           l.state,
+           l.attempt_no                              AS att,
+           COALESCE(NULLIF(l.block_reason,''),'-')   AS blocked_on,
+           substr(l.updated_at,12,8)                 AS updated
+      FROM node_lifecycle l
+      JOIN dag_nodes d ON d.run_id=l.run_id AND d.node_id=l.node_id
+     WHERE l.run_id='$RUN'
+     ORDER BY d.depth, l.node_id;"
+  printf '\n'
+
+  printf '\033[1mlast 8 transitions\033[0m\n'
+  q -header -column "
+    SELECT substr(created_at,12,8)            AS at,
+           node_id,
+           from_state || ' -> ' || to_state   AS move,
+           substr(reason,1,40)                AS reason
+      FROM transitions
+     WHERE run_id='$RUN'
+     ORDER BY id DESC LIMIT 8;"
+
+  printf '\n\033[1mconvergence\033[0m  (findings per review-reaching attempt)\n'
+  ( cd "$REPO" && uv run python adws/maestro.py run convergence "$RUN" 2>&1 \
+      | sed -n '2,$p' ) || printf '  convergence unavailable\n'
+
+  sleep "$INTERVAL"
+done
