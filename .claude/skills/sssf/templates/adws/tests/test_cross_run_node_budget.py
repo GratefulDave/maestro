@@ -60,7 +60,6 @@ from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import review_convergence as rc  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
-from test_finalization import WindowFactory, clean_report  # noqa: E402
 from test_node_instruction_requirement_text import (  # noqa: E402
     _authored_plan, _ir, _repo)
 
@@ -200,22 +199,10 @@ class CrossRunBudgetFixture(unittest.TestCase):
             data_dir=self.state / "data",
             verify_keys=[receipt_crypto.seed_to_public_key(self.seed)],
             signing_seed=self.seed, create=True)
-        objects = (
-            fin.ReviewObject(object_id="plan", kind=fin.ObjectKind.PLAN),
-            fin.ReviewObject(object_id="node:" + FIRST,
-                             kind=fin.ObjectKind.NODE),
-            fin.ReviewObject(object_id="node:" + FIRST + "#gate",
-                             kind=fin.ObjectKind.GATE),
-            fin.ReviewObject(object_id="evidence:0",
-                             kind=fin.ObjectKind.EVIDENCE),
-        )
-        matrix = fin.compute_matrix(fin.DEFAULT_RUBRIC, self.digest, objects)
-        fin.finalize(
-            plan_digest=self.digest, objects=objects,
-            rubric=fin.DEFAULT_RUBRIC, store=store, validate=lambda: (),
-            window_factory=WindowFactory(report=clean_report(matrix)),
-            occupancy_reader=lambda session: 0.4,
-            sleep=lambda seconds: None, clock=lambda: 1_760_000_000.0)
+        # The receipt `plan finalize` writes since the reviewer was removed:
+        # deterministic, PASS, no cells -- the production helper, so this
+        # fixture cannot drift from what the verb actually signs.
+        store.write(maestro._deterministic_receipt(self.digest))
 
     @property
     def database(self) -> Path:
