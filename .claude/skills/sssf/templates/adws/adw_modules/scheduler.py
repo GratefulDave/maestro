@@ -1393,6 +1393,17 @@ class Scheduler:
             self._report_hygiene(node.node_id, tuple(
                 "{0} {1}".format(d.kind, d.path)
                 for d in residue.cleanliness.divergences))
+        # Residue an agent left *outside* the attempt's own tree. Reviewers
+        # create ad-hoc detached worktrees under /tmp of their own accord and
+        # remove them inconsistently; the inventory comparison above measures
+        # one tree and can never see one that lives somewhere else. Reported
+        # on the same hygiene channel and with the same consequence — the
+        # merge is not blocked, because the node that produced the diff did
+        # not create the tree and must not be stranded for it.
+        if residue.unprovisioned_worktrees:
+            self._report_hygiene(node.node_id, tuple(
+                "unprovisioned-worktree {0}".format(entry)
+                for entry in residue.unprovisioned_worktrees))
 
         # ── the review gate (§7.3's review-node predicate) ──────────────────
         #

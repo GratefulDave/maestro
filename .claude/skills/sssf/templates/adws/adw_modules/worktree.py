@@ -968,6 +968,12 @@ class CheckResult:
     ok: bool
     merge_permitted: bool
     detail: Tuple[str, ...] = ()
+    #: Worktrees git has registered against this repository that no Maestro
+    #: bracket provisioned — one report line per tree, path first. Populated
+    #: only at the pre-merge evaluation, because that is the point at which an
+    #: agent has finished writing and a tree it created and abandoned is
+    #: observable. Report-only by construction: see `unprovisioned_worktrees`.
+    unprovisioned_worktrees: Tuple[str, ...] = ()
 
 
 def compare_to_expected(worktree: Path, expected: Inventory,
@@ -1017,6 +1023,106 @@ def _git_checks(attempt: AttemptWorktree) -> Tuple[bool, bool, bool, Tuple[str, 
     return branch_checked_out, head_resolves, base_is_ancestor, tuple(detail)
 
 
+def _registered_worktrees(repo: Path) -> Tuple[Tuple[Path, Optional[str]], ...]:
+    """Every worktree git has registered against `repo`, with its branch.
+
+    git's own registration table is the authority here, and deliberately so.
+    The alternative — walking `/tmp` for directories that look like worktrees —
+    is slower, misses every tree created anywhere else, and cannot tell a
+    registered worktree from an abandoned copy of one. `git worktree list
+    --porcelain` answers the only question that matters: which trees does this
+    repository currently believe it has.
+
+    A second element of `None` means the tree has a detached HEAD, which is
+    what `git worktree add --detach` produces and what every observed
+    reviewer-created tree has had.
+    """
+    result = _git(repo, "worktree", "list", "--porcelain", check=False)
+    if result.returncode != 0:
+        return ()
+    registrations: List[Tuple[Path, Optional[str]]] = []
+    path: Optional[Path] = None
+    branch: Optional[str] = None
+    bare = False
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+            branch, bare = None, False
+        elif line.startswith("branch "):
+            branch = line[len("branch "):].strip()
+        elif line.strip() == "bare":
+            bare = True
+        elif not line.strip() and path is not None:
+            if not bare:
+                registrations.append((path, branch))
+            path, branch, bare = None, None, False
+    if path is not None and not bare:
+        registrations.append((path, branch))
+    return tuple(registrations)
+
+
+def _resolved(path: Path) -> Path:
+    """Resolve for comparison, tolerating a registration whose tree is gone."""
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def unprovisioned_worktrees(attempt: AttemptWorktree) -> Tuple[str, ...]:
+    """Worktrees registered against this repository that Maestro did not create.
+
+    Reviewer agents create ad-hoc detached worktrees of their own accord — one
+    transcript ran `git worktree add --detach /tmp/lexgenius-review-<sha>`
+    twelve times with no matching `worktree remove` — and no Maestro code
+    creates or removes them. Those trees are outside the attempt worktree
+    entirely, so `compare_to_expected` cannot see them: it measures one tree's
+    inventory, and residue that lives in a *different* tree is invisible to it
+    however carefully the inventory is compared.
+
+    The discriminator is **detachment**, and it is a structural property of
+    Maestro's own code rather than a guess about who owns a path. Every
+    worktree this system registers against a run's repository is created on a
+    branch: `create_worktree` above opens each attempt with `git worktree add
+    -b`, and `run start` opens the run's integration checkout the same way.
+    The one `--detach` call Maestro makes anywhere — the deterministic
+    cross-repository acceptance checkout — runs at final acceptance, after
+    every node has merged, so no attempt is at its pre-merge evaluation while
+    one exists. A detached worktree observed here is therefore not one of
+    ours, whatever it is called and wherever it lives.
+
+    Naming a path pattern instead would have been the wrong instrument twice
+    over: `/tmp` is where the observed reviewers happened to write, not where
+    the next one must, and an operator's own checkout of the repository sits
+    outside every Maestro root while being nobody's residue. Detachment
+    separates the two without the code having to recognise either.
+
+    The two path exemptions below are belt-and-braces for a Maestro tree that
+    somehow arrives detached — the main worktree the attempt branches from,
+    and anything under the worktrees root `create_attempt_worktree` puts every
+    attempt of every node in, so a sibling or a concurrent run is never
+    reported.
+
+    A leak on a branch is not reported and that is a stated limit, not an
+    oversight: it is a false negative on a detection-only signal, where the
+    alternative is reporting every developer checkout of the repository as
+    residue and teaching the operator to ignore the channel.
+    """
+    provisioned_root = _resolved(attempt.path.parent)
+    main = _resolved(attempt.repo)
+    lines: List[str] = []
+    for path, branch in _registered_worktrees(attempt.path):
+        if branch:
+            continue
+        resolved = _resolved(path)
+        if resolved == main:
+            continue
+        if resolved == provisioned_root or provisioned_root in resolved.parents:
+            continue
+        lines.append("{0} (detached)".format(resolved))
+    return tuple(sorted(lines))
+
+
 def check_at_create(attempt: AttemptWorktree) -> CheckResult:
     """The first of the three evaluation points: nothing has run yet (§8.3).
 
@@ -1053,12 +1159,23 @@ def check_pre_merge(attempt: AttemptWorktree, expected: Inventory) -> CheckResul
     named rather than convicting the node: the commit was sealed before the
     gate ran and the merge consumes committed objects, so a post-gate rewrite
     is a maintenance signal about the adapter and never a merge hazard.
+
+    Residue outside the attempt's own tree is reported on the same terms and
+    for a stronger reason. A worktree an agent registered against the
+    repository and abandoned is real residue — it holds a checkout and an
+    administrative entry under `.git/worktrees` that nothing will reclaim —
+    but it is not the producing node's doing, and `merge_permitted` therefore
+    does not move. Blocking the merge would strand a node's correct, gated,
+    committed work on a reviewer's housekeeping, which is the shape §8.3
+    already refuses for in-tree post-gate residue and refuses more plainly
+    here, where the node did not even perform the act being reported.
     """
     branch_ok, head_ok, ancestor_ok, detail = _git_checks(attempt)
     cleanliness = compare_to_expected(attempt.path, expected, "report")
     git_ok = branch_ok and head_ok and ancestor_ok
     return CheckResult("pre-merge", branch_ok, head_ok, ancestor_ok, cleanliness,
-                       git_ok, git_ok, detail)
+                       git_ok, git_ok, detail,
+                       unprovisioned_worktrees(attempt))
 
 
 # ── gates: node-scoped by default, whole-suite only as integration ──────────
