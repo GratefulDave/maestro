@@ -38,6 +38,7 @@ from .scheduler_types import (
     BlockReason,
     DEFAULT_RETRY_CLASS,
     NodeKind,
+    REPAIR_KEY,
     RetryClass,
     SchedulerConfig,
 )
@@ -350,6 +351,252 @@ def review_convergence_from_attempts(
         node_id: [count for _no, count in sorted(items)]
         for node_id, items in by_node.items()
     }
+
+
+# ── the repair basis: a rejected diff is repaired, not re-implemented ────────
+#
+# A review rejection classifies SEMANTIC and recycles the attempt, and until
+# this section existed the recycled attempt branched from the integration head
+# like every other attempt — which discards the rejected diff entirely and asks
+# the builder to implement the node again from an empty tree. Consecutive
+# attempts were therefore not iterations of one artifact but independent
+# implementations, each judged fresh, and findings could not descend because
+# nothing accumulated: one production node produced 2, 2, 1, 3 findings over
+# four rejections, all four attempts based on the same commit, rewriting 573
+# lines each time and deleting the 1-finding version rather than repairing it.
+# `review_ceiling` was six chances to guess right in one shot, never six rounds
+# of refinement.
+#
+# This is issue #90's shape applied to the other actor. There, a *reviewer*
+# that failed was re-dispatched against the attempt's surviving output commit
+# rather than the builder being discarded; here, a builder whose diff was
+# rejected is sent back to that same surviving commit rather than to an empty
+# tree. Both decisions read the same three kinds of fact — a git object name, a
+# count of durable rows, and a member of a closed vocabulary — and neither
+# reads a word of the reviewer's prose (§1.2). The findings travel in the
+# prompt, where `render_guidance` already puts them and where nothing
+# transitions on them.
+
+#: The git object name of the commit a rejected attempt actually produced,
+#: stored on the rejected attempt's own row beside the marker that says it was
+#: rejected. `node_lifecycle.output_sha` cannot serve: it is written by
+#: `mark_verified`, which a rejected attempt never reaches, so on this path the
+#: lifecycle row holds nothing at all. The attempt's durable ref does hold the
+#: commit, but a ref read alone proves only what the ref points at *now* — it
+#: cannot say whether that is still what the harness committed. Two facts,
+#: compared, are what make the subject of a repair provable, exactly as
+#: `ReviewStallFacts` keeps `output_sha` and `surviving_sha` as two fields.
+REVIEW_OUTPUT_SHA_KEY = "review_output_sha"
+
+#: At most this many *consecutive* repair attempts before the chain breaks and
+#: the node is re-derived from the integration head.
+#:
+#: In code and not in `maestro.config.yaml`: the config is deployment-owned and
+#: deliberately not mirrored between the template and its deployments, so a key
+#: added there would exist in one copy of the runtime and not the others.
+#:
+#: Three, and the number matters less than the fact that it is a constant
+#: compared against a count of durable rows. Each admitted repair strictly
+#: increases `chain_length`, so no chain can exceed it; a broken chain restarts
+#: from the integration head at `chain_length` zero, and the *number* of chains
+#: is bounded by `review_ceiling + granted`, which this section does not touch.
+#: The loop therefore adds no attempts at all — it only changes what an attempt
+#: the review budget had already paid for starts from.
+REPAIR_CHAIN_LIMIT = 3
+
+#: Why a rejected diff was not repaired. Module constants, never strings
+#: composed at the call site, for the reason `classify_review_stall`'s reasons
+#: are: the value is written into a durable row and an operator who greps for
+#: it needs a closed set to grep.
+REPAIR_NO_PRIOR_REJECTION = "the previous attempt was not rejected by review"
+REPAIR_OUTPUT_UNPROVEN = (
+    "the rejected attempt has no provable output commit to repair")
+REPAIR_HEAD_MOVED = (
+    "the integration head moved while this node was being reviewed, so the "
+    "rejected diff and the findings about it are both stale")
+REPAIR_CHAIN_EXHAUSTED = (
+    "the repair chain reached its limit without the diff being accepted")
+REPAIR_FINDINGS_ROSE = (
+    "the last repair raised more findings than the rejection it repaired")
+REPAIR_ADMITTED = "repairing the rejected diff"
+
+
+@dataclass(frozen=True)
+class RepairFacts:
+    """The typed facts one repair decision reads (§1.2).
+
+    Every field is a git object name, an integer, a boolean derived from git's
+    own object database, or a member of `RetryClass`. Nothing here is pane
+    text, prompt text, a free-text envelope field, or an agent's claim about
+    its own work — the reviewer's prose reaches the *prompt* and is read
+    nowhere else, and the reviewer's verdict reaches this decision only as the
+    typed marker on the attempt row and as an integer count of findings.
+
+    `prior` is the node's highest-numbered attempt row, which is the attempt
+    the one being opened directly succeeds.
+
+    `rejected_ref_sha` is what that attempt's own durable ref holds *now*, read
+    back from git rather than remembered, and `output_proven` is
+    `worktree.is_attempt_output_commit` over it: the shape test, the object
+    test, the descent-from-its-own-base test, and the exact-ref test, all four.
+    A repair that branched from anything else would be repairing a tree the
+    evidence chain does not name.
+
+    `repaired_findings` is the findings count of the rejection that `prior`
+    itself was repairing, or `None` when `prior` repaired nothing or when the
+    count was never stored. `None` is "unknown" and never zero, for the reason
+    `review_convergence_from_attempts` skips it: zero would read as "the
+    reviewer found nothing", which is the one thing a rejection cannot mean.
+    """
+
+    integration_head: str
+    prior: Optional[AttemptRecord]
+    rejected_ref_sha: Optional[str] = None
+    output_proven: bool = False
+    repaired_findings: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RepairBasis:
+    """What an admitted repair changes about the attempt being opened."""
+
+    #: The commit the attempt's worktree branches from — the rejected diff.
+    base_sha: str
+    #: The integration head it is nevertheless derived from (§8.1). Equal to
+    #: the head this decision was taken against, and recorded because
+    #: `base_sha` can no longer carry it.
+    integration_head: str
+    #: The attempt whose rejected diff is being repaired.
+    repair_of_attempt: int
+    #: Including this one. Bounded by `REPAIR_CHAIN_LIMIT`.
+    chain_length: int
+
+
+@dataclass(frozen=True)
+class RepairDecision:
+    """Exactly one basis or none, with the reason the ledger records for it."""
+
+    basis: Optional[RepairBasis]
+    reason: str
+
+
+def review_output_extra(output_sha: str) -> Dict[str, Any]:
+    """The rejected attempt's output commit, as its own row stores it."""
+    return {REVIEW_OUTPUT_SHA_KEY: output_sha}
+
+
+def repair_extra(basis: RepairBasis) -> Dict[str, Any]:
+    """The repair marker, as the *new* attempt's row stores it.
+
+    `base_sha` is deliberately absent: the attempt row already has a `base_sha`
+    column holding exactly that value, and a second copy would be the two
+    representations §4 convicts. Every key written here has a reader (§3.6
+    B15) — `AttemptRecord.integration_head` reads `integration_head`,
+    `AttemptRecord.repair_chain_length` reads `chain_length`, and
+    `AttemptRecord.repair_of_attempt` reads `attempt_no`, which
+    `repaired_findings_count` follows to find the rejection this chain's
+    progress is measured against.
+    """
+    return {REPAIR_KEY: {
+        "attempt_no": basis.repair_of_attempt,
+        "integration_head": basis.integration_head,
+        "chain_length": basis.chain_length,
+    }}
+
+
+def repaired_findings_count(
+        attempts: Iterable[AttemptRecord],
+        prior: Optional[AttemptRecord]) -> Optional[int]:
+    """The findings count of the rejection `prior` was itself repairing.
+
+    `None` when `prior` repaired nothing, when the attempt it names is not
+    among the rows given, or when that attempt's row predates
+    `REVIEW_FINDINGS_COUNT_KEY`. Unknown, never zero.
+    """
+    if prior is None:
+        return None
+    repaired_no = prior.repair_of_attempt
+    if repaired_no is None:
+        return None
+    for attempt in attempts:
+        if attempt.node_id != prior.node_id or attempt.attempt_no != repaired_no:
+            continue
+        count = (attempt.extra or {}).get(REVIEW_FINDINGS_COUNT_KEY)
+        return int(count) if isinstance(count, int) else None
+    return None
+
+
+def decide_repair(facts: RepairFacts) -> RepairDecision:
+    """Whether the attempt being opened repairs the rejected diff, or restarts.
+
+    Five refusals, then the admission. Each refusal is structural, and the
+    order is the order in which a fact becomes knowable rather than a
+    preference:
+
+    1. **The previous attempt was not rejected by review.** Both halves are
+       read: the row's `retry_class` must be SEMANTIC *and* it must carry
+       `REVIEW_REJECTED_KEY`. Either alone is the wrong predicate — a red gate
+       is SEMANTIC without being a rejection, and the marker without the class
+       would admit a row `mark_blocked` wrote. A gate failure leaves nothing to
+       repair: the tree it produced never passed its own gate, so the next
+       attempt restarts from the integration head exactly as it always has. An
+       ENVIRONMENTAL or LAUNCHER_TRANSIENT failure fails the same test and is
+       untouched by any of this.
+    2. **The rejected diff is not provable.** No stored output commit, a ref
+       that no longer holds it, or a commit that fails
+       `is_attempt_output_commit` means the subject of the repair cannot be
+       named, and branching from a tree the evidence chain does not name is
+       worse than starting over.
+    3. **The integration head moved.** §8.1 puts attempt worktrees on the
+       integration head, and a repair honours that by branching from a commit
+       that *descends* from the head the rejection was measured against — which
+       is only the current head while no sibling has merged. When one has, the
+       rejected commit descends from a head that is no longer integration's,
+       and branching from it would silently hand the builder a tree missing the
+       sibling's work. The same equality also expires the findings, and it is
+       the expiry `AttemptRecord.guidance_key` already performs, so the two
+       cannot disagree: a base the guidance is invalid at is a base the repair
+       is refused at.
+    4. **The chain reached `REPAIR_CHAIN_LIMIT`.** A rejected diff that is
+       fundamentally wrong must not be repaired forever; after three
+       consecutive repairs the node is re-derived from the integration head
+       with the findings still in the prompt.
+    5. **The last repair made it worse.** Findings rising across a repair — the
+       repaired rejection raised fewer than the repair did — is the ledger
+       saying the diff in hand is not the thing to keep. Both counts are
+       integers stored on rows the review budget already counts; an unknown
+       count never breaks the chain, because "unknown" is not "rose".
+
+    Nothing here can block a node. Every refusal falls back to the behaviour
+    that existed before this function did, which is the fresh base the
+    scheduler would have used anyway.
+    """
+    prior = facts.prior
+    if (prior is None
+            or prior.retry_class is not RetryClass.SEMANTIC
+            or not (prior.extra or {}).get(REVIEW_REJECTED_KEY)):
+        return RepairDecision(None, REPAIR_NO_PRIOR_REJECTION)
+    rejected_sha = (prior.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)
+    if (not isinstance(rejected_sha, str) or not rejected_sha
+            or not facts.output_proven
+            or facts.rejected_ref_sha != rejected_sha):
+        return RepairDecision(None, REPAIR_OUTPUT_UNPROVEN)
+    if prior.integration_head != facts.integration_head:
+        return RepairDecision(None, REPAIR_HEAD_MOVED)
+    chain_length = prior.repair_chain_length + 1
+    if chain_length > REPAIR_CHAIN_LIMIT:
+        return RepairDecision(None, REPAIR_CHAIN_EXHAUSTED)
+    prior_findings = (prior.extra or {}).get(REVIEW_FINDINGS_COUNT_KEY)
+    if (isinstance(prior_findings, int)
+            and facts.repaired_findings is not None
+            and prior_findings > facts.repaired_findings):
+        return RepairDecision(None, REPAIR_FINDINGS_ROSE)
+    return RepairDecision(
+        RepairBasis(base_sha=rejected_sha,
+                    integration_head=facts.integration_head,
+                    repair_of_attempt=prior.attempt_no,
+                    chain_length=chain_length),
+        REPAIR_ADMITTED)
 
 
 # ── §7.5 the reviewer-side failure: retry the reviewer, not the builder ──────
@@ -940,8 +1187,48 @@ def _fit_surface(blocks: List[List[str]], share: int) -> List[str]:
     return ([_HISTORY_MARKER, ""] + lines) if dropped else lines
 
 
+#: The preamble that turns an implement prompt into a repair prompt.
+#:
+#: A repair prompt is not the implement prompt with findings appended, and the
+#: difference is not tone. The implement prompt's first line is the node's
+#: `instruction`, and an agent handed that plus a list of findings reads a
+#: request to build the node — which is exactly what it did before, and exactly
+#: what produced a fresh 573-line implementation each attempt. The instruction
+#: still bounds the work and is still the first thing in the prompt; what these
+#: lines add is the one fact the prompt could not otherwise carry: the work
+#: already exists in the tree the agent is looking at, and the task is to
+#: change it rather than to write it.
+#:
+#: The commit is named because an agent that wants to see what it is repairing
+#: can read the diff, and because a named commit is checkable — a prompt that
+#: said "your previous work is here" without saying which commit would be a
+#: claim the agent could not verify. Nothing transitions on any of this
+#: (§10.1/§1.2): every lifecycle decision about the repair was already taken by
+#: `decide_repair` over typed rows before this text was rendered.
+def _repair_lines(basis: "RepairBasis") -> List[str]:
+    return [
+        "REPAIR, NOT REIMPLEMENTATION.",
+        "This attempt's working tree is not empty and does not start from the "
+        "integration head. It starts from commit {0} — the diff a previous "
+        "attempt of this node produced, which passed its gate and was then "
+        "rejected by code review.".format(basis.base_sha),
+        "The work is already there. Do not write this node again from "
+        "scratch: read what is in the tree, and change it so that the findings "
+        "below no longer hold. A rewrite discards the parts the reviewer did "
+        "not object to and is judged as a new diff, which is what previous "
+        "attempts did and why the same objections kept recurring.",
+        "The instruction at the top of this prompt still bounds the work — it "
+        "says what this node must do, and the findings below say what is wrong "
+        "with the code in hand. Both bind. Your diff is still judged in full "
+        "against the integration head {0}, not against commit {1}, so every "
+        "term the instruction states must still hold when you are "
+        "done.".format(basis.integration_head, basis.base_sha),
+    ]
+
+
 def render_guidance(node: object, ledger: Optional[GuidanceLedger],
-                    char_budget: int = GUIDANCE_CHAR_BUDGET) -> Optional[str]:
+                    char_budget: int = GUIDANCE_CHAR_BUDGET,
+                    repair: Optional["RepairBasis"] = None) -> Optional[str]:
     """Every surface's standing constraints, rendered for the retry prompt.
 
     This string is the one place the ledger is ever read. It mutates the
@@ -954,6 +1241,14 @@ def render_guidance(node: object, ledger: Optional[GuidanceLedger],
     from growing the prompt without bound: `_fit` truncates within a section
     and marks that it did, so history is what gets dropped under pressure and
     a whole surface never silently disappears (B13).
+
+    `repair` is the typed basis `decide_repair` admitted, or `None` for the
+    ordinary fresh-base retry. It changes the preamble and nothing else: the
+    findings below are the same findings either way, and the repair preamble
+    is what tells the agent they are about code it is looking at rather than
+    code it is about to write. It renders **before** the budget is divided
+    among the surfaces and is never truncated, because a repair prompt whose
+    repair instruction was elided is an implement prompt.
     """
     if ledger is None or ledger.empty:
         return None
@@ -967,6 +1262,8 @@ def render_guidance(node: object, ledger: Optional[GuidanceLedger],
         "Every constraint below is binding at the same time. Earlier attempts "
         "were rejected for fixing one surface while regressing another; a "
         "constraint a prior attempt already satisfied still binds."]
+    if repair is not None:
+        preamble = _repair_lines(repair) + [""] + preamble
     share = max(0, (char_budget - sum(len(l) + 1 for l in preamble))
                 ) // len(sections)
     rendered: List[str] = list(preamble)

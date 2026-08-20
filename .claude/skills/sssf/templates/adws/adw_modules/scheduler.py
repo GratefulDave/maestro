@@ -1128,13 +1128,67 @@ class Scheduler:
                         _exception_reason(exc)),
                     record=context.record)
 
+    def _repair_decision(self, node: st.PlanNode,
+                         head: str) -> rp.RepairDecision:
+        """Gather the typed facts and ask `retry_policy` whether to repair.
+
+        Everything read here is a durable row or a git object: the node's
+        attempt rows, the previous attempt's own ref as git resolves it now,
+        and `is_attempt_output_commit` over the sha that row stored. No pane
+        text, no prompt text, no envelope field, and no agent's claim about
+        its own work reaches the decision (§1.2) — the reviewer's findings
+        travel to the *prompt* and are read nowhere else.
+
+        `attempt_ref_commit` is allowed to raise. §7.5's git rule is that only
+        the documented not-found exit means the object is absent, and a
+        transient git failure read as "the commit is gone" would silently
+        discard a builder's committed tree — the exact discard this method
+        exists to prevent. Raising here lands in the worker's containment
+        handler and costs an ENVIRONMENTAL retry, which is the correct price
+        for a machine fault; the stall path calls the same helper the same way.
+        """
+        store = self.deps.store
+        repo = Path(self.deps.repo)
+        attempts = store.attempts_for(self.run_id, node.node_id)
+        prior = max(attempts, key=lambda row: row.attempt_no, default=None)
+        rejected_ref_sha: Optional[str] = None
+        output_proven = False
+        if prior is not None:
+            rejected_ref_sha = wt.attempt_ref_commit(
+                repo, self.run_id, node.node_id, prior.attempt_no)
+            rejected_sha = (prior.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
+            if isinstance(rejected_sha, str) and rejected_sha:
+                output_proven = wt.is_attempt_output_commit(
+                    repo, rejected_sha, run_id=self.run_id,
+                    node_id=node.node_id, attempt_no=prior.attempt_no,
+                    expected_base=prior.base_sha)
+        return rp.decide_repair(rp.RepairFacts(
+            integration_head=head,
+            prior=prior,
+            rejected_ref_sha=rejected_ref_sha,
+            output_proven=output_proven,
+            repaired_findings=rp.repaired_findings_count(attempts, prior)))
+
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
         head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
 
+        # A rejected diff is repaired rather than re-implemented. `basis` is
+        # `None` for every attempt that is not repairing one — a first attempt,
+        # a red gate, an environmental or launcher retry, a rejection whose
+        # commit cannot be proved, and a rejection whose integration head has
+        # since moved — and in every one of those cases `base` is `head` and
+        # nothing below this line behaves differently from before.
+        decision = self._repair_decision(node, head)
+        basis = decision.basis
+        base = basis.base_sha if basis is not None else head
+
         # §7.6 — the window opens BEFORE the worktree exists, so a hung
         # `git worktree add` is inside it rather than outside.
-        attempt_no = store.start_attempt(self.run_id, node.node_id, head)
+        attempt_no = store.start_attempt(
+            self.run_id, node.node_id, base,
+            attempt_extra=rp.repair_extra(basis) if basis is not None else None,
+            detail={"repair": decision.reason})
         with self._lock:
             # Recorded against the durable row as soon as it exists, and
             # before anything can observe the attempt RUNNING: leased by this
@@ -1147,7 +1201,7 @@ class Scheduler:
         self._require_running(record)
 
         attempt = wt.create_attempt_worktree(
-            self.deps.repo, self.run_id, node.node_id, attempt_no, head,
+            self.deps.repo, self.run_id, node.node_id, attempt_no, base,
             Path(self.deps.worktrees_root), Path(self.deps.scratch_root))
         with self._lock:
             self._attempt_worktrees[node.node_id] = attempt
@@ -1246,7 +1300,8 @@ class Scheduler:
         try:
             execution = self.deps.run_node(
                 attempt, node, record,
-                rp.render_guidance(node, self._guidance.get(record.guidance_key)),
+                rp.render_guidance(node, self._guidance.get(record.guidance_key),
+                                   repair=basis),
                 on_launch, self._cancelled.is_set)
         except BaseException as exc:
             # §16.3 item 45. The quiesce below used to sit in a bare `finally`,
@@ -1423,7 +1478,7 @@ class Scheduler:
                 return
             self._require_running(record)
             if not review.passed:
-                self._settle_review_rejection(node, review, record)
+                self._settle_review_rejection(node, review, record, output_sha)
                 return
 
         with self._lock:
@@ -1714,7 +1769,8 @@ class Scheduler:
                                detail=detail or None, attempt_extra=extra)
 
     def _settle_review_rejection(self, node: st.PlanNode, review: Any,
-                                 record: st.AttemptRecord) -> None:
+                                 record: st.AttemptRecord,
+                                 output_sha: str) -> None:
         """Recycle the attempt with the reviewer's findings, or block on budget.
 
         The same shape as `_settle_failure`'s SEMANTIC arm, and deliberately so
@@ -1723,6 +1779,16 @@ class Scheduler:
         counts against `review_ceiling` through a marker on the attempt row,
         and the semantic ceiling is untouched. A node whose gate went red twice
         still gets its full review allowance, and vice versa.
+
+        `output_sha` is the commit this attempt committed and the reviewer
+        judged, and it is stored on the row because **nothing else records it
+        on this path**: `node_lifecycle.output_sha` is written by
+        `mark_verified`, which a rejected attempt never reaches. Without it the
+        next attempt cannot name the diff it is being asked to repair, and the
+        recycled attempt goes back to re-implementing the node from an empty
+        tree — which is the whole defect. Passed in rather than read off the
+        verdict: the caller committed it, and the verdict is an object the
+        reviewer produced.
         """
         store = self.deps.store
         findings = review.findings_text()
@@ -1732,13 +1798,16 @@ class Scheduler:
                     or record.key in self._watchdog_fences):
                 return
 
-            # Three facts on the row the budget already counts: that the
-            # reviewer rejected, how many findings it raised, and the typed
-            # findings themselves. The count is what the convergence series
-            # is rebuilt from; the entry is what the ledger is rebuilt from.
+            # Four facts on the row the budget already counts: that the
+            # reviewer rejected, how many findings it raised, the typed
+            # findings themselves, and the commit that was judged. The count is
+            # what the convergence series is rebuilt from; the entry is what
+            # the ledger is rebuilt from; the commit is what the next attempt's
+            # repair basis is proved against.
             marker = {rp.REVIEW_REJECTED_KEY: True,
                       rp.REVIEW_FINDINGS_COUNT_KEY: len(review.findings),
                       "review_subject_digest": review.subject_digest}
+            marker.update(rp.review_output_extra(output_sha))
             marker.update(rp.guidance_extra_review(review))
             detail = {
                 "reason": "code review rejected the diff",
