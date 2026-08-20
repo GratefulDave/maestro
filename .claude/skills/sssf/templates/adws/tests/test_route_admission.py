@@ -710,7 +710,22 @@ class BootstrapCliTest(unittest.TestCase):
                 verify_keys=(keys.route_public,))
             self.assertTrue(admitted.admits("omp"))
             self.assertTrue(admitted.admits("claude"))
-            self.assertTrue((fixture["state"] / "keys" / "maestro.env").is_file())
+            # The env-file split, end to end through the real verb rather than
+            # through `write_env_file` alone: what an operator sources is what
+            # bootstrap actually wrote, and `plan gate` refuses on the reviewer
+            # variable being set, so the author file carrying it is the whole
+            # defect. Both paths are reported so neither has to be guessed at.
+            author_env = fixture["state"] / "keys" / "maestro.env"
+            reviewer_env = fixture["state"] / "keys" / "reviewer-hmac.env"
+            self.assertTrue(author_env.is_file())
+            self.assertTrue(reviewer_env.is_file())
+            self.assertEqual(payload["env_file"], str(author_env))
+            self.assertEqual(payload["reviewer_env_file"], str(reviewer_env))
+            author_body = author_env.read_text(encoding="ascii")
+            self.assertNotIn("PLANCTL_REVIEWER_HMAC_KEY", author_body)
+            self.assertNotIn(keys.reviewer_hmac.hex(), author_body)
+            self.assertIn("PLANCTL_REVIEWER_HMAC_KEY=" + keys.reviewer_hmac.hex(),
+                          reviewer_env.read_text(encoding="ascii"))
 
             output = io.StringIO()
             with helper._repository_cwd(fixture["repo"]), \

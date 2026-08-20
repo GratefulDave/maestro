@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -712,6 +713,32 @@ class ReviewerKeyCustodyTest(PlanContractVerbFixture):
             self.assertEqual(path.read_text(encoding="ascii").strip(), "too-short")
         self.assertIn("invalidate", str(caught.exception))
 
+    def test_the_key_bootstrap_provisions_is_the_one_plan_review_resolves(self):
+        """The half of the env-file split that must NOT change.
+
+        Splitting the environment files removed the only route by which the
+        reviewer key reached an author's shell. The route `plan review` itself
+        uses is a different one -- `_reviewer_hmac_key` reads the key file
+        `provision_keys` wrote, with no environment involved -- and this holds
+        that the two are the same bytes after the split, so a reviewer needs no
+        export line and gets no `REVIEWER_IDENTITY`-shaped surprise.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(Path(tmp))
+            layout = self._layout(fixture)
+            keys = route_admission.provision_keys(
+                Path(layout["repository_state"]) / "keys")
+            route_admission.write_env_file(
+                keys, verify_key_env="MAESTRO_VERIFY_KEY",
+                signing_seed_env="MAESTRO_SIGNING_SEED",
+                route_verify_key_env="MAESTRO_ROUTE_VERIFY_KEY")
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PLANCTL_REVIEWER_HMAC_KEY", None)
+                resolved = maestro._reviewer_hmac_key(layout)
+        self.assertEqual(resolved, keys.reviewer_hmac.hex())
+        self.assertEqual(
+            maestro._reviewer_hmac_key_file(layout).name, "reviewer-hmac.key")
+
     def test_an_operator_supplied_key_wins_over_the_minted_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._fixture(Path(tmp))
@@ -873,14 +900,22 @@ class VisiblePaneTest(PlanContractVerbFixture):
 
 
 class BootstrapReviewerKeyTest(unittest.TestCase):
-    """`maestro bootstrap` mints the reviewer key, so nobody ever types one.
+    """`maestro bootstrap` mints the reviewer key, so nobody ever types one --
+    and writes it where sourcing the author's environment cannot reach it.
 
-    The key is needed before `maestro plan review` exists: /arch-review drives
-    `planctl review` through the skill directly and only needs the env file
-    bootstrap already writes.
+    The two files exist because one file did not work. An operator has to
+    source the author bindings for ordinary work, and while the reviewer
+    binding sat in the same file, doing so made `plan gate` refuse their own
+    plan with `REVIEWER_KEY_PRESENT`. The gate check is right; bootstrap was
+    what handed the author the key.
     """
 
-    def test_bootstrap_writes_the_reviewer_key_into_the_env_file(self):
+    @staticmethod
+    def _bindings(body):
+        return dict(line.split("=", 1) for line in body.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#"))
+
+    def test_the_author_env_file_carries_no_reviewer_binding(self):
         with tempfile.TemporaryDirectory() as tmp:
             keys = route_admission.provision_keys(Path(tmp) / "keys")
             env_file = route_admission.write_env_file(
@@ -888,16 +923,46 @@ class BootstrapReviewerKeyTest(unittest.TestCase):
                 signing_seed_env="MAESTRO_SIGNING_SEED",
                 route_verify_key_env="MAESTRO_ROUTE_VERIFY_KEY")
             body = env_file.read_text(encoding="ascii")
-            bindings = dict(
-                line.split("=", 1) for line in body.splitlines() if line.strip())
+            bindings = self._bindings(body)
             mode = stat.S_IMODE(env_file.stat().st_mode)
-        self.assertIn("PLANCTL_REVIEWER_HMAC_KEY", bindings)
-        for name in ("MAESTRO_VERIFY_KEY", "MAESTRO_SIGNING_SEED",
-                     "MAESTRO_ROUTE_VERIFY_KEY"):
-            self.assertIn(name, bindings)
+        self.assertEqual(
+            sorted(bindings),
+            ["MAESTRO_ROUTE_VERIFY_KEY", "MAESTRO_SIGNING_SEED",
+             "MAESTRO_VERIFY_KEY"])
+        # Not just absent as a binding: the key's bytes are nowhere in the
+        # file an author sources, under any name.
+        self.assertNotIn("PLANCTL_REVIEWER_HMAC_KEY", body)
+        self.assertNotIn(keys.reviewer_hmac.hex(), body)
+        self.assertEqual(mode, 0o600)
+
+    def test_the_reviewer_binding_gets_its_own_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys = route_admission.provision_keys(Path(tmp) / "keys")
+            reviewer_env = route_admission.write_reviewer_env_file(keys)
+            body = reviewer_env.read_text(encoding="ascii")
+            bindings = self._bindings(body)
+            mode = stat.S_IMODE(reviewer_env.stat().st_mode)
+        self.assertNotEqual(reviewer_env, keys.env_file)
+        self.assertEqual(reviewer_env.name, "reviewer-hmac.env")
+        self.assertEqual(list(bindings), ["PLANCTL_REVIEWER_HMAC_KEY"])
         self.assertEqual(bindings["PLANCTL_REVIEWER_HMAC_KEY"],
                          keys.reviewer_hmac.hex())
+        self.assertIn("REVIEWER_KEY_PRESENT", body)
         self.assertEqual(mode, 0o600)
+
+    def test_the_author_writer_cannot_be_asked_for_the_reviewer_binding(self):
+        """The separation is structural, not a matter of what callers pass.
+
+        A caller that could still name the reviewer variable would put the
+        combined file one keyword argument away from coming back. There is no
+        such parameter, and this is what says so.
+        """
+        parameters = inspect.signature(route_admission.write_env_file).parameters
+        self.assertEqual(
+            [name for name in parameters if "reviewer" in name], [])
+        self.assertEqual(
+            sorted(name for name in parameters if name != "keys"),
+            ["route_verify_key_env", "signing_seed_env", "verify_key_env"])
 
     def test_the_minted_key_clears_planctl_s_minimum_length(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -83,8 +83,27 @@ Ed25519 signing material it already manages, and `maestro plan review <plan-name
 the plan name and nothing else — injects the key into the `planctl review` subprocess directly. No
 shell ever holds it, no export line exists, and there is no reviewer identity to pass. (An
 environment-variable override remains, for a reviewer who deliberately supplies their own key, the
-same way the Ed25519 signing key already supports one; the ordinary path never touches it.) `gate`
-enforces the same boundary from the other side: it refuses outright if that key is present in its
+same way the Ed25519 signing key already supports one; the ordinary path never touches it.)
+
+Bootstrap's environment files are split along the same line, because for a while they were not.
+`maestro bootstrap` writes two files into `<state-root>/<repo>/keys/`, both 0600: `maestro.env`,
+carrying the verify key, the signing seed, and the route verify key — everything author-side work
+needs, and nothing that can make a gate refuse — and `reviewer-hmac.env`, carrying the reviewer
+binding and nothing else. Source `maestro.env` freely. Nothing in Maestro's supported path reads
+`reviewer-hmac.env`: it exists only for driving `planctl review` directly, outside Maestro, as
+`/arch-review` does for an architecture IR, and sourcing it in an authoring shell is exactly what
+`REVIEWER_KEY_PRESENT` is there to catch. While the two bindings shared one file, an operator who
+sourced it to finalize or start a run had the reviewer's key in their shell, `gate` correctly
+refused their own plan, and the only way forward was unsetting and re-exporting a variable by hand
+between stages — which is where the key got lost. Maestro's own bootstrap was what put it there.
+
+If your state root still holds a combined `maestro.env`, re-run `maestro bootstrap`: it rewrites
+that file in place without the reviewer binding and writes `reviewer-hmac.env` beside it. No key is
+regenerated and no receipt already signed is invalidated — `provision_keys` reuses the key material
+it finds. Re-running does **not** clean a shell that already sourced the old file, so in any shell
+that did, `unset PLANCTL_REVIEWER_HMAC_KEY` (or open a new one) before `maestro plan gate`.
+
+`gate` enforces the same boundary from the other side: it refuses outright if that key is present in its
 own environment, because a gate command able to see the reviewer's key would no longer prove that
 gating and reviewing happen on two sides of a line neither side can cross. Nobody has to remember to
 keep the key separate — Maestro checks for it before either command does anything else.
