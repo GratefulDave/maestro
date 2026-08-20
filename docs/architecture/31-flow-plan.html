@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Maestro plan flow · Signed PASS or FAIL receipt</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #2d3142;   /* deep warm charcoal */
+      --color-ink:     #f5f5f5;   /* warm off-white */
+      --color-muted:   #bfc0c0;   /* silver */
+      --color-accent:  #f08a59;   /* accent */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Flowchart · Maestro</p>
+    <h1>Maestro plan flow · Signed PASS or FAIL receipt</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="31-flow-plan-title 31-flow-plan-desc">
+      <title id="31-flow-plan-title">Maestro plan flow · Signed PASS or FAIL receipt</title>
+      <desc id="31-flow-plan-desc">Flowchart of Maestro plan verbs: gate and review prepare a Plan IR, then ship composes author, validate, and finalize; ineligible plans stop at AUTHORING_BLOCKED, and finalize writes a signed PASS or FAIL receipt from a reviewer in a Herdr pane.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- plan ship groups author + validate + finalize -->
+      <rect x="440" y="176" width="240" height="280" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="452" y="192" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">PLAN SHIP</text>
+
+      <!-- Arrows (drawn first, behind nodes) -->
+      <line x1="560" y1="88" x2="560" y2="112" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="160" x2="560" y2="208" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="256" x2="560" y2="280" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="360" x2="560" y2="384" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="660" y1="320" x2="800" y2="320" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="440" x2="560" y2="472" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="552" x2="560" y2="576" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="660" y1="512" x2="800" y2="512" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- Arrow labels -->
+      <rect x="496" y="366" width="56" height="12" rx="2" fill="#2d3142"/>
+      <text x="524" y="376" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ELIGIBLE</text>
+
+      <rect x="706" y="300" width="48" height="12" rx="2" fill="#2d3142"/>
+      <text x="730" y="310" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BLOCKED</text>
+
+      <rect x="520" y="558" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="536" y="568" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PASS</text>
+
+      <rect x="714" y="492" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="730" y="502" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FAIL</text>
+
+      <!-- gate -->
+      <rect x="470" y="40" width="180" height="48" rx="6" fill="#2d3142"/>
+      <rect x="470" y="40" width="180" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="560" y="60" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">gate</text>
+      <text x="560" y="74" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">render + mutate</text>
+
+      <!-- review -->
+      <rect x="470" y="112" width="180" height="48" rx="6" fill="#2d3142"/>
+      <rect x="470" y="112" width="180" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="560" y="132" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review</text>
+      <text x="560" y="146" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">require-approved</text>
+
+      <!-- author -->
+      <rect x="470" y="208" width="180" height="48" rx="6" fill="#2d3142"/>
+      <rect x="470" y="208" width="180" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="560" y="228" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">author</text>
+      <text x="560" y="242" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">from-plan-contract</text>
+
+      <!-- validate / eligible? -->
+      <polygon points="560,280 660,320 560,360 460,320" fill="#2d3142"/>
+      <polygon points="560,280 660,320 560,360 460,320" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="560" y="316" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">validate</text>
+      <text x="560" y="332" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">eligible?</text>
+
+      <!-- AUTHORING_BLOCKED -->
+      <rect x="800" y="296" width="200" height="48" rx="24" fill="#2d3142"/>
+      <rect x="800" y="296" width="200" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="900" y="316" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AUTHORING_BLOCKED</text>
+      <text x="900" y="330" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">no reviewer</text>
+
+      <!-- finalize (focal) -->
+      <rect x="470" y="384" width="180" height="56" rx="6" fill="#2d3142"/>
+      <rect x="470" y="384" width="180" height="56" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="560" y="408" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">finalize</text>
+      <text x="560" y="424" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">Herdr pane</text>
+
+      <!-- verdict? -->
+      <polygon points="560,472 660,512 560,552 460,512" fill="#2d3142"/>
+      <polygon points="560,472 660,512 560,552 460,512" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="560" y="516" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">verdict?</text>
+
+      <!-- FAIL -->
+      <rect x="800" y="488" width="200" height="48" rx="24" fill="#2d3142"/>
+      <rect x="800" y="488" width="200" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="900" y="508" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">FAIL</text>
+      <text x="900" y="522" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">terminal</text>
+
+      <!-- PASS signed receipt (focal) -->
+      <rect x="470" y="576" width="180" height="48" rx="24" fill="#2d3142"/>
+      <rect x="470" y="576" width="180" height="48" rx="24" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="560" y="596" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PASS</text>
+      <text x="560" y="610" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">signed receipt</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <text x="40" y="656" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND · SHAPE CARRIES TYPE</text>
+
+      <rect x="40" y="672" width="24" height="12" rx="6" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="72" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">End (oval)</text>
+
+      <rect x="200" y="672" width="24" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="232" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Step (rectangle)</text>
+
+      <polygon points="392,678 404,672 416,678 404,684" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="428" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision (diamond)</text>
+
+      <rect x="600" y="672" width="24" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="632" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Signed receipt</text>
+
+      <rect x="800" y="672" width="24" height="12" rx="2" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="832" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">ship composes author + validate + finalize</text>
+    </svg>
+  </div>
+</body>
+</html>

@@ -497,6 +497,34 @@ def _symlink_blob_id(worktree: Path, relpath: str) -> str:
                 stdin=target).stdout.strip()
 
 
+def blob_text(worktree: Path, blob: str) -> Optional[str]:
+    """One blob's contents as text, or `None` when it is not text.
+
+    The baseline inventory records a blob id per path, so a file the attempt
+    *changed* can be compared against the bytes it started from without keeping
+    a second copy of the tree.
+
+    `None` means exactly one thing — the object exists and is not decodable as
+    UTF-8, so no parser will read it — and it never means the read failed.
+    §7.5: only git's documented not-found exit means an object is absent, and
+    `cat-file` has none, so a nonzero exit here is environmental and raises.
+    The id came from an inventory git itself produced, which makes a failure to
+    read it a fact about the machine rather than about the tree; resolving it
+    to `None` would let a transient git failure read as "this file had no
+    prior version", and a caller comparing against a base would then attribute
+    the whole file to the attempt that touched one line of it.
+    """
+    try:
+        result = _git(worktree, "cat-file", "blob", blob, check=False)
+    except UnicodeDecodeError:
+        return None
+    if result.returncode != 0:
+        raise WorktreeError(
+            f"git cat-file blob {blob} in {worktree} -> {result.returncode}: "
+            f"{result.stderr.strip()}")
+    return result.stdout
+
+
 def _committable_paths(worktree: Path) -> List[str]:
     """git's own enumeration of this working tree, as relative paths (§8.3).
 

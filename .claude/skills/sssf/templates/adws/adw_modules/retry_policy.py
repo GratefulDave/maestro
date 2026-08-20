@@ -834,6 +834,7 @@ def guidance_extra_verification(detail: Optional[dict]) -> Dict[str, Any]:
         "reason": guidance.reason,
         "offending_paths": list(guidance.offending_paths),
         "failed_clause": guidance.failed_clause,
+        "unreferenced_symbols": list(guidance.unreferenced_symbols),
     }}
 
 
@@ -877,7 +878,9 @@ def guidance_from_attempts(
             ledger = ledger.with_verification(VerificationGuidance(
                 reason=str(payload.get("reason") or ""),
                 offending_paths=tuple(payload.get("offending_paths") or ()),
-                failed_clause=payload.get("failed_clause")))
+                failed_clause=payload.get("failed_clause"),
+                unreferenced_symbols=tuple(
+                    payload.get("unreferenced_symbols") or ())))
         elif surface == "review":
             findings = tuple(
                 ReviewFinding(
@@ -983,6 +986,12 @@ class VerificationGuidance:
     reason: str = ""
     offending_paths: Tuple[str, ...] = ()
     failed_clause: Optional[int] = None
+    #: Located `path:line:name` records for symbols the attempt defined that
+    #: nothing references (#118). Carried separately from `offending_paths`
+    #: because the two are different facts with different repairs — one names
+    #: where the attempt wrote, the other names what it must delete — and a
+    #: prompt that conflated them would ask for the wrong edit.
+    unreferenced_symbols: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1056,7 +1065,8 @@ def verification_guidance(detail: Optional[dict]) -> VerificationGuidance:
     return VerificationGuidance(
         reason=str(reason),
         offending_paths=tuple(detail.get("offending_paths") or ()),
-        failed_clause=detail.get("clause"))
+        failed_clause=detail.get("clause"),
+        unreferenced_symbols=tuple(detail.get("unreferenced_symbols") or ()))
 
 
 def review_guidance(review: object) -> ReviewGuidance:
@@ -1138,6 +1148,22 @@ def _offending_path_lines(paths: Sequence[str]) -> List[str]:
     return lines
 
 
+def _unreferenced_symbol_lines(symbols: Sequence[str]) -> List[str]:
+    """Every unreachable symbol, in full, as `path:line:name`.
+
+    Not sampled, unlike the offending paths above. That elision is safe because
+    a permission breach is repaired by writing elsewhere and the count is the
+    fact that matters; this list is the work itself, and an agent handed twenty
+    of thirty deletes twenty, ships again, and spends another attempt on the
+    ten the prompt elided.
+    """
+    lines = [f"Symbols this node defined that nothing references "
+             f"({len(symbols)} in total). Each must be removed, or given a "
+             f"caller that a test exercises:"]
+    lines.extend("  " + symbol for symbol in symbols)
+    return lines
+
+
 def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     lines = ["Verification (§8.3):",
              "A prior attempt for this node did not verify."
@@ -1148,6 +1174,8 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
         lines.append(g.reason)
     if g.offending_paths:
         lines.extend(_offending_path_lines(g.offending_paths))
+    if g.unreferenced_symbols:
+        lines.extend(_unreferenced_symbol_lines(g.unreferenced_symbols))
     lines.append("Declared outputs: "
                  + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)"))
     return lines

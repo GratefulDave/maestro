@@ -297,6 +297,13 @@ class BlockReason(str, Enum):
     #: agent cannot make git carry the path; the declaration or the ignore
     #: rule has to change.
     DECLARED_OUTPUT_UNCOMMITTABLE = "DECLARED_OUTPUT_UNCOMMITTABLE"
+    #: A code node's command defined module-level symbols that nothing on the
+    #: merged surface references (#118). `min_cases` is a floor with no
+    #: ceiling, so before this an attempt could ship arbitrary unreachable
+    #: machinery and stay green. Re-running a deterministic command against an
+    #: unchanged base emits the same symbols, so the repair is the command or
+    #: the plan, never another attempt.
+    PRODUCED_SYMBOL_UNREFERENCED = "PRODUCED_SYMBOL_UNREFERENCED"
 
 
 #: The failures that fit no retry class, because re-running a
@@ -317,6 +324,7 @@ NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.CODE_NODE_NO_EFFECT,
     BlockReason.PERMISSION_SCOPE_VIOLATION,
     BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE,
+    BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
 )
 
 
@@ -333,6 +341,7 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     BlockReason.CODE_NODE_NO_EFFECT: (Escape.SKIP, Escape.ABANDON),
     BlockReason.PERMISSION_SCOPE_VIOLATION: (Escape.SKIP, Escape.ABANDON),
     BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE: (Escape.SKIP, Escape.ABANDON),
+    BlockReason.PRODUCED_SYMBOL_UNREFERENCED: (Escape.SKIP, Escape.ABANDON),
     # K is a ceiling on a spend, not a verdict, so the forced grant is the
     # designed exit — one attempt per invocation, never a raised cap (§7.5).
     BlockReason.SEMANTIC_BUDGET_EXHAUSTED: (

@@ -35,8 +35,9 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from . import reachability as rc
 from . import scheduler_types as st
 from . import worktree as wt
 
@@ -217,6 +218,11 @@ class VerificationVerdict:
     block_reason: Optional[st.BlockReason] = None
     retry_class: Optional[st.RetryClass] = None
     offending_paths: Tuple[str, ...] = ()
+    #: Located `path:line:name` records for symbols the attempt defined that
+    #: nothing references. Typed rather than folded into `reason`, for the same
+    #: cause `offending_paths` is: the retry prompt has to name every one of
+    #: them, and a prose sentence a later reader has to re-parse is not a list.
+    unreferenced_symbols: Tuple[str, ...] = ()
 
     @property
     def asserts_repository_wide(self) -> bool:
@@ -338,6 +344,43 @@ def verify_code_node(exit_code: int,
             block_reason=st.BlockReason.CODE_NODE_NO_EFFECT)
 
     return VerificationVerdict(verified=True)
+
+
+def adjudicate_reachability(symbols: Sequence["rc.ProducedSymbol"],
+                            node_kind: st.NodeKind) -> VerificationVerdict:
+    """Refuse an attempt that shipped machinery nothing references.
+
+    `min_cases` is a floor with no ceiling: it asserts that at least N cases
+    ran and nothing asserts that what shipped beside them is reachable. An
+    observed lane merged three green attempts carrying a document-locator
+    persistence layer no path ever called, its reviewer graded the finding
+    non-blocking, and the merged surface grew past every requirement that
+    described it. The count of unreachable produced symbols is the counted
+    fact that refuses the next one — no model is asked, and §1.2 is satisfied
+    because the transition keys on that count rather than on anyone's prose.
+
+    The consequence splits by node kind for the same reason §7.5 splits the
+    permission failure. An agent is not deterministic, and a retry prompt
+    naming the symbols to remove is genuinely new instructions, so its refusal
+    is SEMANTIC. A code node's command is deterministic and re-running it
+    against an unchanged base emits the same unreachable symbols, so its
+    refusal is terminal and names the plan defect instead of a spent budget.
+    """
+    if not symbols:
+        return VerificationVerdict(verified=True)
+    located = tuple(symbol.located() for symbol in symbols)
+    reason = (f"the attempt defined {len(located)} symbol"
+              f"{'' if len(located) == 1 else 's'} nothing on the merged "
+              "surface references, from production or from a test")
+    if node_kind is st.NodeKind.CODE:
+        return VerificationVerdict(
+            verified=False, reason=reason,
+            block_reason=st.BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
+            unreferenced_symbols=located)
+    return VerificationVerdict(
+        verified=False, reason=reason,
+        retry_class=st.RetryClass.SEMANTIC,
+        unreferenced_symbols=located)
 
 
 # ── §7.3's review-node predicate lives in the review path, not here ─────────

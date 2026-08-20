@@ -100,6 +100,9 @@
     .section-copy { max-width: 48rem; margin: .7rem 0 0; color: var(--muted); }
 
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .85rem; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .85rem; }
+    a.card { display: block; text-decoration: none; }
+    .section-copy a { color: var(--cyan); }
     .card { padding: 1.35rem; border: 1px solid var(--line-soft); border-radius: .8rem; background: linear-gradient(145deg, rgba(21,27,37,.84), rgba(13,17,24,.8)); }
     .card h3 { margin: 0 0 .45rem; font-size: .95rem; letter-spacing: -.01em; }
     .card p { margin: 0; color: var(--muted); font-size: .87rem; }
@@ -148,9 +151,10 @@
       .flow { grid-template-columns: 1fr; }
       .flow-step { min-height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
       .flow-step b { margin-top: .7rem; }
+      .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 620px) {
-      .grid, .metric-grid { grid-template-columns: 1fr; }
+      .grid, .grid-3, .metric-grid { grid-template-columns: 1fr; }
       .section-head { grid-template-columns: 1fr; gap: .2rem; }
       h1 { font-size: 3.25rem; }
       section { padding-top: 4rem; }
@@ -166,6 +170,9 @@
         <span><strong>Maestro</strong><small>software factory</small></span>
       </a>
       <nav aria-label="Documentation">
+        <p class="nav-label">Diagrams</p>
+        <a href="#architecture">Architecture</a>
+        <a href="architecture/index.html">Gallery</a>
         <p class="nav-label">System</p>
         <a href="#overview">Overview</a>
         <a href="#execution">Execution model</a>
@@ -193,6 +200,30 @@
           <span class="pill">Bounded retries</span>
         </div>
       </header>
+
+      <section id="architecture">
+        <div class="section-head">
+          <span class="section-no">LIVE</span>
+          <div><h2>Architecture diagrams</h2><p class="section-copy">These diagrams are live-code views of the shipped control plane, not slides. Open the <a href="architecture/index.html">architecture gallery</a>, or jump to a specific diagram below.</p></div>
+        </div>
+        <div class="grid-3">
+          <a class="card" href="architecture/01-system.html"><span class="tag">01 · system</span><h3>System architecture</h3><p>Control plane, workers, isolated worktrees, and the SQLite trace.</p></a>
+          <a class="card" href="architecture/02-layers.html"><span class="tag">02 · layers</span><h3>Control-plane layers</h3><p>Authority stacked from plan schema through scheduling, launch, and merge.</p></a>
+          <a class="card" href="architecture/03-deployment.html"><span class="tag">03 · deploy</span><h3>Deployment</h3><p>Where Maestro runs — host, panes, worktrees, and durable state.</p></a>
+          <a class="card" href="architecture/10-classes-plan.html"><span class="tag">10 · classes</span><h3>Plan model classes</h3><p>Typed plan nodes, dependencies, gates, and scheduler projection.</p></a>
+          <a class="card" href="architecture/11-classes-scheduler.html"><span class="tag">11 · classes</span><h3>Scheduler lifecycle classes</h3><p>Ready set, attempts, retries, verification, and the merge frontier.</p></a>
+          <a class="card" href="architecture/12-classes-envelopes.html"><span class="tag">12 · classes</span><h3>Envelope ADW classes</h3><p>Typed envelopes that carry work across the ADW boundary.</p></a>
+          <a class="card" href="architecture/20-state-node.html"><span class="tag">20 · state</span><h3>NodeState machine</h3><p>PENDING through MERGED, plus BLOCKED and CANCELLED terminals.</p></a>
+          <a class="card" href="architecture/21-state-run.html"><span class="tag">21 · state</span><h3>Derived run state</h3><p>Run outcome projected from node states, not a separate machine.</p></a>
+          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · state</span><h3>Attempt retry class</h3><p>Bounded semantic, environmental, and launcher-transient retries.</p></a>
+          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · flow</span><h3>Run start flowchart</h3><p>From digest to worker pool: admit, schedule, isolate, and record.</p></a>
+          <a class="card" href="architecture/31-flow-plan.html"><span class="tag">31 · flow</span><h3>Plan ship flowchart</h3><p>Validate, finalize, and ship a plan until it is runnable.</p></a>
+          <a class="card" href="architecture/32-flow-escape.html"><span class="tag">32 · flow</span><h3>Operator escape flowchart</h3><p>retry, skip, and abandon as explicit, recorded escapes.</p></a>
+          <a class="card" href="architecture/40-mind-modules.html"><span class="tag">40 · mind</span><h3>Runtime module tree</h3><p>Module ownership: who may mutate lifecycle, who is transport only.</p></a>
+          <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · mind</span><h3>Verb groups</h3><p>plan, run, and workspace command groups on the operator CLI.</p></a>
+          <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · mind</span><h3>Nine root verbs</h3><p>bootstrap, plan, deliver, run, retry, skip, abandon, attempt, workspace.</p></a>
+        </div>
+      </section>
 
       <section id="overview">
         <div class="section-head">
