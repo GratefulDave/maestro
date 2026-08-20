@@ -1626,17 +1626,45 @@ class LifecycleStore:
 
     # ── scheduler-driven transitions ────────────────────────────────────────
 
-    def start_attempt(self, run_id: str, node_id: str, base_sha: str) -> int:
-        """PENDING -> RUNNING, opening a new attempt row (§7.6's attempt window)."""
+    def start_attempt(self, run_id: str, node_id: str, base_sha: str,
+                      attempt_extra: Optional[Mapping[str, Any]] = None,
+                      detail: Optional[Mapping[str, Any]] = None) -> int:
+        """PENDING -> RUNNING, opening a new attempt row (§7.6's attempt window).
+
+        `attempt_extra` is written into the row's `extra_json` **in the same
+        transaction that creates it**, and that is the point rather than a
+        convenience. The only current writer is the repair basis, whose
+        `integration_head` is what `AttemptRecord.integration_head` — and
+        therefore `guidance_key`, and therefore the next repair decision —
+        reads. A row that existed for even one read without it would answer
+        `base_sha` for its integration head, which for a repair attempt is the
+        rejected commit rather than the head, and every reader would be wrong
+        about a fact the row is the only record of.
+
+        `'{}'` when nothing is passed, byte-identical to what this wrote
+        before, so a row opened by an ordinary attempt is unchanged.
+
+        `detail` lands on the audit-tier `transitions` row this write already
+        creates, and is where the repair decision's *reason* goes — including
+        every reason a repair was refused, which by construction leaves no
+        trace on the attempt row itself because a refused repair produces an
+        ordinary fresh-base attempt indistinguishable from any other. Its
+        reader is `transitions()`; §5.3 forbids reading the audit tier at
+        runtime and nothing does, which is exactly what a diagnosis field
+        should be.
+        """
+        payload = json.dumps(dict(attempt_extra), sort_keys=True) if attempt_extra else "{}"
+
         def extra(lifecycle: st.NodeLifecycle):
             return [(
                 "INSERT INTO attempts (run_id, node_id, attempt_no, base_sha, state,"
-                " started_at, turn_count, extra_json) VALUES (?,?,?,?,?,?,0,'{}')",
+                " started_at, turn_count, extra_json) VALUES (?,?,?,?,?,?,0,?)",
                 (run_id, node_id, lifecycle.attempt_no, base_sha,
-                 st.NodeState.RUNNING.value, time.time()))]
+                 st.NodeState.RUNNING.value, time.time(), payload))]
         lifecycle = self._transition_node(
             run_id, node_id, st.NodeState.RUNNING, actor="scheduler", reason="attempt-start",
-            new_attempt=True, require_state=(st.NodeState.PENDING,), extra_writes=extra)
+            new_attempt=True, require_state=(st.NodeState.PENDING,), detail=detail,
+            extra_writes=extra)
         return lifecycle.attempt_no
 
     def mark_verified(self, run_id: str, node_id: str, output_sha: str) -> st.NodeLifecycle:

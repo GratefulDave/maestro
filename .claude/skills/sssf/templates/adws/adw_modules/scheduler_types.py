@@ -724,6 +724,17 @@ class NodeLifecycle:
                 "reported and an exit that cannot be looked up (§11.3)")
 
 
+#: The `attempts.extra_json` key a repair attempt's own row carries: which
+#: rejected attempt it is repairing, which integration head it was nevertheless
+#: derived from, and how long the repair chain it ends is.
+#:
+#: Declared here rather than in `retry_policy` because `AttemptRecord` reads it
+#: and this module is read-only from there — the shared vocabulary lives with
+#: the row it describes, and `retry_policy` imports the name so the writer and
+#: the three readers below cannot drift into two spellings.
+REPAIR_KEY = "repair_of"
+
+
 @dataclass
 class AttemptRecord:
     """One attempt of one node. The window §7.6 watches opens with this row.
@@ -757,8 +768,59 @@ class AttemptRecord:
         return (self.run_id, self.node_id, self.attempt_no)
 
     @property
+    def integration_head(self) -> str:
+        """The integration head this attempt was derived from (§8.1).
+
+        Equal to `base_sha` for every attempt that branched straight off the
+        integration head, which was every attempt before repair bases existed
+        and is still every attempt that is not repairing a rejected diff. A
+        repair attempt branches from the *rejected attempt's output commit*
+        instead, so its `base_sha` is no longer the integration head, and the
+        head it was nevertheless derived from is recorded on its own row under
+        `REPAIR_KEY` when the row is opened.
+
+        Read from the stored marker rather than recomputed, because the fact
+        wanted here is which head the attempt was *branched from*, and
+        `worktree.integration_head` answers which head exists *now* — the two
+        differ exactly when a sibling merged, which is the case every reader of
+        this property exists to detect.
+        """
+        marker = (self.extra or {}).get(REPAIR_KEY)
+        if isinstance(marker, dict):
+            head = marker.get("integration_head")
+            if isinstance(head, str) and head:
+                return head
+        return self.base_sha
+
+    @property
+    def repair_chain_length(self) -> int:
+        """How many consecutive repair attempts this row is the end of.
+
+        Zero for an attempt branched from the integration head, which is what a
+        row written before repair bases existed reads as — correct rather than
+        merely convenient, since under that code no attempt ever repaired
+        anything.
+        """
+        marker = (self.extra or {}).get(REPAIR_KEY)
+        if isinstance(marker, dict):
+            length = marker.get("chain_length")
+            if isinstance(length, int) and length > 0:
+                return length
+        return 0
+
+    @property
+    def repair_of_attempt(self) -> Optional[int]:
+        """The attempt number whose rejected diff this attempt is repairing."""
+        marker = (self.extra or {}).get(REPAIR_KEY)
+        if isinstance(marker, dict):
+            prior = marker.get("attempt_no")
+            if isinstance(prior, int):
+                return prior
+        return None
+
+    @property
     def guidance_key(self) -> Tuple[str, str]:
-        """The scope retry guidance is valid within: `(node_id, base_sha)`.
+        """The scope retry guidance is valid within: `(node_id, integration_head)`.
 
         §7.5 already scopes the prompt-mutation budget this way, and for the
         same reason the guidance itself must be: a review finding or a
@@ -773,5 +835,18 @@ class AttemptRecord:
         the budget itself: the scope is derived from a stored fact the attempt
         row already carries, so there is no reset event to fire and nothing
         that can drift.
+
+        **The integration head and not `base_sha`, and the distinction only
+        appeared when repair bases did.** The paragraph above says "when an
+        upstream merge advances the integration head" — the head was always the
+        fact the expiry was about, and `base_sha` was its proxy only for as
+        long as the two were the same string. A repair attempt bases on the
+        rejected attempt's output commit, so keying on `base_sha` would mint a
+        fresh, empty ledger for the very attempt whose whole purpose is to act
+        on the findings in it, and the repair prompt would carry none of them.
+        Keyed on the head, a repair chain accumulates guidance across its
+        attempts and still expires the instant a sibling merges — which is also
+        the instant the repair basis itself is refused, so the two rules cannot
+        come apart.
         """
-        return (self.node_id, self.base_sha)
+        return (self.node_id, self.integration_head)
