@@ -251,6 +251,35 @@ the codebase, that is a different defect and a different check —
 `plan.intent_is_accomplished_by_the_graph`, which asks whether the lanes taken together leave
 anything load-bearing unowned.
 
+## What a review rejection costs
+
+A rejection is not a fresh start. When code review rejects an attempt, the next attempt branches
+from the commit that attempt produced and the builder is asked to change it — the reviewer's
+located findings name what to change, and the lane's `instruction` still leads the prompt and still
+bounds the work. Consecutive rejections are therefore rounds of refinement on one artifact rather
+than independent implementations, and a `review_ceiling` of six buys six rounds rather than six
+one-shot guesses.
+
+Two consequences for authoring. First, write the `instruction` so it reads correctly a second time,
+against a tree that already contains a partial answer: a sentence that only makes sense as a
+green-field brief ("create `src/gap_policy.py`") is weaker on a repair attempt than one that names
+the property the file must have. Second, a repair is refused, and the attempt falls back to a fresh
+base, whenever a sibling lane has merged since the rejection was measured — the rejected commit no
+longer sits on the integration head, and handing the builder a tree missing the sibling's work
+would be worse than restarting. Lanes that finish close together therefore lose repair chains to
+each other, which is one more reason to keep a phase's lanes genuinely independent.
+
+The chain is bounded: `REPAIR_CHAIN_LIMIT` caps consecutive repairs, a repair whose findings rose
+above the rejection it repaired ends the chain, and the number of chains is bounded by
+`review_ceiling`, which the loop does not change. Nothing here adds attempts; it changes only what
+an attempt the budget had already paid for starts from.
+
+`maestro run convergence` is how you read this from outside. It reports findings per attempt for
+each lane, which is the trend a repair chain is supposed to produce, and it distinguishes a run
+that ended without converging from one that has not converged *yet*: a live run reports "not
+converged yet" with cause `run still in flight`, and a run whose scheduler cannot be found on this
+machine reports that it cannot say rather than asserting either answer.
+
 ## Several repositories
 
 There is no multi-repository Plan IR. Each repository runs the whole single-repository sequence to
