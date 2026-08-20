@@ -153,7 +153,7 @@ class WorkspaceCliContract(unittest.TestCase):
             "plan set-aside", "plan set-aside-log",
             "deliver",
             "run start", "run status", "run list", "run pause", "run cancel",
-            "run resume",
+            "run resume", "run convergence",
             "retry", "skip", "abandon",
             "attempt salvage",
             "workspace author", "workspace validate", "workspace finalize",

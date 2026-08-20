@@ -45,6 +45,7 @@ from adw_modules import plan_validate as pv
 from adw_modules import publication
 from adw_modules import receipt_crypto
 from adw_modules import retry_policy
+from adw_modules import review_convergence
 from adw_modules import route_admission
 from adw_modules import route_receipts
 from adw_modules import scheduler
@@ -865,7 +866,7 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 #: receipt or launches anything, so none of them needs key material — asking
 #: `run status` for a signing seed is how a read verb becomes unusable on a
 #: machine that merely wants to watch a run.
-_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel")
+_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence")
 
 #: Flags that select *which* run to read and how to print it. They are the only
 #: flags a configured run verb accepts, because they override no derived path;
@@ -1110,6 +1111,13 @@ def _bind_run_ledger_configuration(
     args.db = str(layout["database"])
     args.repository_state = str(layout["repository_state"])
     args.plan_digests = _named_plan_digests(layout)
+    # The one execution setting a read verb needs, and the reason it is not
+    # "nothing more": `run convergence` measures how many review attempts a
+    # lane actually took, and that number means nothing without the ceiling it
+    # is being compared against. Read from the layout rather than from
+    # `_load_maestro_config`, so the comparison costs a read verb no key
+    # material (#30).
+    args.review_ceiling = layout["execution"]["review_ceiling"]
 
 
 def _select_run(reader: "lc.LifecycleReader",
@@ -3501,6 +3509,36 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_convergence(args: argparse.Namespace) -> int:
+    """Findings-per-attempt per lane, for a run that has already finished (#30).
+
+    The scheduler prints this series when a run ends in the process that ran
+    it. That is the only place it has ever existed, so a run that was resumed,
+    cancelled, or simply read the next morning could not be asked whether its
+    reviewers were converging — and `execution.review_ceiling` was sized by
+    hand from three lanes somebody happened to still have on screen.
+
+    Same reader, same tables, same query path as `run status` (§10.6). It
+    writes nothing and decides nothing; the ledger it opens is `mode=ro`.
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        record = _select_run(reader, args)
+        profile = review_convergence.run_convergence(
+            record.run_id, reader.nodes(record.run_id),
+            reader.attempts(record.run_id), reader.transitions(record.run_id),
+            review_ceiling=getattr(args, "review_ceiling", None))
+    finally:
+        reader.close()
+    if getattr(args, "as_json", False):
+        print(json.dumps(profile.as_dict(), sort_keys=True))
+    else:
+        print(review_convergence.render(profile))
+    return 0
+
+
 def _run_pause(args: argparse.Namespace) -> int:
     """Stop the scheduler without making the run terminal (§7.3).
 
@@ -5368,6 +5406,13 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--digest")
     _add_run_execution_options(resume)
     resume.set_defaults(handler=_run_resume)
+    # A read verb, so it takes exactly what `run status` takes: which run, and
+    # how to print it (#30).
+    convergence = run_sub.add_parser("convergence")
+    convergence.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    _add_run_selection(convergence)
+    _add_db(convergence)
+    convergence.set_defaults(handler=_run_convergence)
 
     retry = root.add_parser("retry")
     retry.add_argument("run_id")
