@@ -7,7 +7,7 @@ receipts are create-once, and replay is keyed on the digest alone — all
 three deliberate — so nothing revoked, superseded, or set aside a receipt
 and a FAIL was terminal for those bytes forever.
 
-§19 M16 is what that cost. `plan_finalization.review_objects` projected the
+§19 M16 is what that cost. The plan projection emitted the
 plan's whole-suite integration gate as a node gate, so the reviewer was
 asked whether the whole-suite selector was narrow — a question whose
 correct answer the architecture states in advance. The plan FAILed on it.
@@ -70,7 +70,7 @@ from adw_modules import finalization as fin  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
 from test_finalization import (  # noqa: E402
-    DIGEST, OBJECTS, WindowFactory, clean_report, make_store, matrix_for)
+    DIGEST, FIXTURE_RUBRIC, clean_report, make_store, matrix_for)
 
 INVOKER = "operator:david"
 REASON = ("the BLOCKING cell was a projection defect in Maestro "
@@ -81,23 +81,74 @@ def failing_report(matrix=None):
     """A report whose one BLOCKING finding makes the derived verdict FAIL."""
     matrix = matrix_for() if matrix is None else matrix
     blocking = next(cell for cell in matrix.graded_cells
-                    if fin.DEFAULT_RUBRIC.check(cell.check_id).severity
+                    if FIXTURE_RUBRIC.check(cell.check_id).severity
                     is fin.Severity.BLOCKING)
     return clean_report(
         matrix, findings=((blocking.check_id, blocking.object_id),))
 
 
-def finalize(store, factory, *, digest=DIGEST, clock=lambda: 1_760_000_000.0):
-    return fin.finalize(
+class Review:
+    """One reviewer's finished output, and a counter for how many times a
+    review was actually dispatched.
+
+    `finalization.finalize` and the window factory it drove were deleted when
+    `plan finalize` stopped dispatching a reviewer. Nothing about the escape
+    depends on them: what B10 is about is the receipt, the store, and the
+    absence that admits a fresh review. So the review is represented by its
+    report and its identity, and `launches` still counts dispatches, because
+    "replay launches nothing" is one of the properties asserted below.
+    """
+
+    def __init__(self, report, *, route="omp", model="opus",
+                 session_id="sess-1"):
+        self.report = report
+        self.route = route
+        self.model = model
+        self.session_id = session_id
+        self.launches = 0
+
+
+class Outcome:
+    """What `finalize` below answers: the verdict, the receipt, and whether
+    the receipt was replayed rather than written."""
+
+    def __init__(self, verdict, receipt, replayed):
+        self.verdict = verdict
+        self.receipt = receipt
+        self.replayed = replayed
+
+
+def finalize(store, review, *, digest=DIGEST, clock=lambda: 1_760_000_000.0):
+    """Review a digest once, or replay the receipt it already has.
+
+    The same three steps every review path takes, in the same order: recover
+    an interrupted publication, short-circuit on a stored receipt without
+    dispatching anything, otherwise verify the report against the code-computed
+    matrix and write the create-once signed receipt.
+    """
+    store.recover(digest)
+    if store.has(digest):
+        stored = store.load(digest)
+        return Outcome(stored.verdict, stored, True)
+    review.launches += 1
+    matrix = matrix_for(digest=digest)
+    report = fin.ReviewerReport.model_validate(review.report)
+    fin.verify_report(matrix, report)
+    derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
+    receipt = fin.Receipt(
         plan_digest=digest,
-        objects=OBJECTS,
-        rubric=fin.DEFAULT_RUBRIC,
-        store=store,
-        validate=lambda: (),
-        window_factory=factory,
-        occupancy_reader=lambda session: 0.4,
-        sleep=factory.sleep,
-        clock=clock)
+        rubric_version=FIXTURE_RUBRIC.version,
+        verdict=derived.verdict,
+        cells=derived.cells,
+        reviewer=fin.ReviewerIdentity(route=review.route, model=review.model,
+                                      session_id=review.session_id),
+        created_at_epoch=clock())
+    try:
+        store.write(receipt)
+    except fin.ReceiptExists:
+        stored = store.load(digest)
+        return Outcome(stored.verdict, stored, True)
+    return Outcome(receipt.verdict, receipt, False)
 
 
 def reopen(store, repo, data_dir, seed, *, signing=False):
@@ -117,13 +168,13 @@ class TheEscapeAdmitsAFreshReview(unittest.TestCase):
         without re-authoring the plan to change its digest."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            first = WindowFactory(report=failing_report())
+            first = Review(report=failing_report())
             self.assertEqual(finalize(store, first).verdict, fin.Verdict.FAIL)
 
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             self.assertFalse(store.has(DIGEST))
 
-            second = WindowFactory(report=clean_report(matrix_for()),
+            second = Review(report=clean_report(matrix_for()),
                                    session_id="sess-2")
             outcome = finalize(store, second)
 
@@ -139,7 +190,7 @@ class TheEscapeAdmitsAFreshReview(unittest.TestCase):
         leaves it in — no receipt — and that is the whole admission."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             self.assertFalse(store.path_for(DIGEST).is_file())
             self.assertFalse(store.signature_path_for(DIGEST).is_file())
@@ -149,10 +200,10 @@ class TheEscapeAdmitsAFreshReview(unittest.TestCase):
     def test_a_second_fail_can_be_set_aside_again_and_both_are_kept(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-1"))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-2"),
                      clock=lambda: 1_760_000_500.0)
             store.set_aside(DIGEST, invoked_by=INVOKER, reason="and again")
@@ -170,7 +221,7 @@ class TheSupersededReceiptIsRetained(unittest.TestCase):
     def test_the_original_receipt_is_still_readable_from_the_store(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             original = store.load(DIGEST)
 
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
@@ -185,7 +236,7 @@ class TheSupersededReceiptIsRetained(unittest.TestCase):
         re-signed: a re-signed copy would be a different fact."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             signed_bytes = store.path_for(DIGEST).read_bytes()
             signature = store.signature_path_for(DIGEST).read_text().strip()
 
@@ -200,7 +251,7 @@ class TheSupersededReceiptIsRetained(unittest.TestCase):
     def test_a_tampered_retained_receipt_is_a_hard_error_not_a_shrug(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
             archive, _, _, _ = store._set_aside_paths(DIGEST, 1)
@@ -220,7 +271,7 @@ class TheEscapeRefuses(unittest.TestCase):
         machine's mistake."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=clean_report(matrix_for())))
+            finalize(store, Review(report=clean_report(matrix_for())))
             with self.assertRaises(fin.SetAsideRefused) as caught:
                 store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             self.assertIn("PASS", str(caught.exception))
@@ -238,7 +289,7 @@ class TheEscapeRefuses(unittest.TestCase):
         """Attributable and deliberate, or it did not happen."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             for invoked_by, reason in ((" ", REASON), (INVOKER, ""),
                                        ("", "")):
                 with self.assertRaises(fin.SetAsideRefused):
@@ -253,7 +304,7 @@ class TheEscapeRefuses(unittest.TestCase):
         authority."""
         with tempfile.TemporaryDirectory() as tmp:
             store, repo, data, seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             keyless = fin.ReceiptStore(
                 store.root, repo_paths=(repo,), data_dir=data,
                 verify_keys=[rc.seed_to_public_key(seed)])
@@ -269,8 +320,8 @@ class ReplayIsUnchanged(unittest.TestCase):
         nobody set aside is still terminal for those bytes."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
-            replay = WindowFactory(report=clean_report(matrix_for()))
+            finalize(store, Review(report=failing_report()))
+            replay = Review(report=clean_report(matrix_for()))
             outcome = finalize(store, replay)
             self.assertTrue(outcome.replayed)
             self.assertEqual(replay.launches, 0)
@@ -279,8 +330,8 @@ class ReplayIsUnchanged(unittest.TestCase):
     def test_an_unescaped_pass_still_short_circuits_with_no_reviewer(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=clean_report(matrix_for())))
-            replay = WindowFactory(report=failing_report())
+            finalize(store, Review(report=clean_report(matrix_for())))
+            replay = Review(report=failing_report())
             outcome = finalize(store, replay)
             self.assertTrue(outcome.replayed)
             self.assertEqual(replay.launches, 0)
@@ -290,13 +341,13 @@ class ReplayIsUnchanged(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
             other = "b" * 64
-            finalize(store, WindowFactory(report=failing_report()))
-            finalize(store, WindowFactory(
+            finalize(store, Review(report=failing_report()))
+            finalize(store, Review(
                 report=failing_report(matrix_for(digest=other))), digest=other)
 
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
-            replay = WindowFactory(report=clean_report(matrix_for(digest=other)))
+            replay = Review(report=clean_report(matrix_for(digest=other)))
             outcome = finalize(store, replay, digest=other)
             self.assertTrue(outcome.replayed)
             self.assertEqual(replay.launches, 0)
@@ -309,7 +360,7 @@ class TheRecordIsTypedAndDurable(unittest.TestCase):
     def test_the_record_survives_a_store_reopen_and_carries_the_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, repo, data, seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             written = store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
             reopened = reopen(store, repo, data, seed)
@@ -327,7 +378,7 @@ class TheRecordIsTypedAndDurable(unittest.TestCase):
     def test_the_record_names_the_exact_receipt_bytes_it_superseded(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             superseded = store.path_for(DIGEST).read_bytes()
 
             record = store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
@@ -335,13 +386,13 @@ class TheRecordIsTypedAndDurable(unittest.TestCase):
             self.assertEqual(record.superseded_receipt_sha256,
                              hashlib.sha256(superseded).hexdigest())
             self.assertEqual(record.superseded_rubric_version,
-                             fin.DEFAULT_RUBRIC.version)
+                             FIXTURE_RUBRIC.version)
             self.assertEqual(record.superseded_reviewer.session_id, "sess-1")
 
     def test_the_record_round_trips_through_its_stored_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             record = store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             self.assertEqual(fin.SetAsideRecord.from_bytes(record.to_bytes()),
                              record)
@@ -353,7 +404,7 @@ class TheRecordIsTypedAndDurable(unittest.TestCase):
             fin.SetAsideRecord(
                 plan_digest=DIGEST, sequence=1, invoked_by=INVOKER,
                 reason=REASON, superseded_verdict=fin.Verdict.FAIL,
-                superseded_rubric_version=fin.DEFAULT_RUBRIC.version,
+                superseded_rubric_version=FIXTURE_RUBRIC.version,
                 superseded_reviewer=fin.ReviewerIdentity(
                     route="omp", model="opus", session_id="sess-1"),
                 superseded_created_at_epoch=1_760_000_000.0,
@@ -371,7 +422,7 @@ class TheRecordIsTypedAndDurable(unittest.TestCase):
     def test_a_tampered_record_is_a_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
             _, _, record_path, _ = store._set_aside_paths(DIGEST, 1)
@@ -390,7 +441,7 @@ class TheOperatorVerb(unittest.TestCase):
 
     def _environment(self, tmp):
         store, repo, data, seed = make_store(tmp)
-        finalize(store, WindowFactory(report=failing_report()))
+        finalize(store, Review(report=failing_report()))
         access = ["--repo", str(repo), "--receipt-dir", str(store.root),
                   "--data-dir", str(data),
                   "--verify-key", rc.seed_to_public_key(seed).hex()]
@@ -566,7 +617,7 @@ class SetAsidePublicationIsCrashRecoverable(unittest.TestCase):
     def test_a_crash_at_each_publication_step_leaves_a_resolvable_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             probe, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(probe, WindowFactory(report=failing_report()))
+            finalize(probe, Review(report=failing_report()))
             steps = _count_set_aside_ops(probe)
         self.assertGreaterEqual(steps, 4)
 
@@ -574,7 +625,7 @@ class SetAsidePublicationIsCrashRecoverable(unittest.TestCase):
             with self.subTest(crash_after=step):
                 with tempfile.TemporaryDirectory() as tmp:
                     store, _repo, _data, _seed = make_store(Path(tmp))
-                    finalize(store, WindowFactory(report=failing_report()))
+                    finalize(store, Review(report=failing_report()))
                     original = store.path_for(DIGEST).read_bytes()
                     orig_stage, orig_unlink = _crash_after_n_set_aside_ops(
                         store, step)
@@ -595,10 +646,10 @@ class TheArchivedReceiptIsBoundToTheRecord(unittest.TestCase):
     def test_a_swapped_archive_signature_pair_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-1"))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-2"),
                      clock=lambda: 1_760_000_500.0)
             store.set_aside(DIGEST, invoked_by=INVOKER, reason="and again")

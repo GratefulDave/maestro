@@ -333,10 +333,14 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(args.plan_file, "named")
         self.assertIsNone(getattr(args, "layout", None))
 
-    def test_named_plan_finalize_derives_reviewer_state(self):
+    def test_named_plan_finalize_derives_receipt_state_and_no_reviewer(self):
+        """A configured `plan finalize` binds the receipt store and nothing
+        else. It used to derive a reviewer route, model, effort, profile,
+        session directory, report file and three window clocks, all of them to
+        launch and bound a pane; the verb dispatches nothing now, so none of
+        them is bound and none is even a flag."""
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._named_plan_configuration(Path(tmp))
-            digest = maestro.plan_digest.digest_of(fixture["stored"])
             with mock.patch.dict(
                     os.environ, fixture["environment"], clear=False), \
                     self._repository_cwd(fixture["repo"]), \
@@ -344,16 +348,22 @@ class OperatorCliTest(unittest.TestCase):
                         maestro, "_plan_finalize", return_value=0) as finalize:
                 self.assertEqual(maestro.main(["plan", "finalize", "named"]), 0)
         args = finalize.call_args.args[0]
-        root = fixture["state"] / "finalization" / digest
         self.assertEqual(Path(args.plan_file).resolve(),
                          fixture["plan_file"].resolve())
-        self.assertEqual(args.reviewer_route, "claude")
-        self.assertEqual(args.reviewer_model, "review-model")
-        self.assertEqual(args.reviewer_effort, "high")
-        self.assertIsNone(args.reviewer_profile)
-        self.assertEqual(args.reviewer_session_dir, str(root / "session"))
-        self.assertEqual(args.reviewer_report_file, str(root / "report.json"))
-        self.assertEqual(args.finalization_timeout_s, 60.0)
+        self.assertEqual(Path(args.repo).resolve(), fixture["repo"].resolve())
+        self.assertEqual(Path(args.receipt_dir).resolve(),
+                         (fixture["state"] / "receipts").resolve())
+        self.assertEqual(Path(args.data_dir).resolve(),
+                         (fixture["state"] / "data").resolve())
+        self.assertEqual(args.verify_key, [fixture["environment"][
+            "MAESTRO_TEST_VERIFY_KEY"]])
+        self.assertEqual(args.signing_seed, fixture["environment"][
+            "MAESTRO_TEST_SIGNING_SEED"])
+        for absent in ("reviewer_route", "reviewer_model", "reviewer_effort",
+                       "reviewer_profile", "reviewer_session_dir",
+                       "reviewer_report_file", "finalization_timeout_s",
+                       "reviewer_turn_timeout_s", "reviewer_poll_interval_s"):
+            self.assertIsNone(getattr(args, absent, None), absent)
 
     def test_named_run_start_derives_digest_and_external_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -718,45 +728,39 @@ class OperatorCliTest(unittest.TestCase):
                 maestro._finalization_store(args)
 
     def test_plan_finalize_runs_validation_adapter_and_emits_receipt(self):
+        """The adapter half: what the verb asks of `plan_validate`, and what it
+        writes when the answer is eligible. The store is real, because the
+        receipt is now the verb's entire output and a mocked store would assert
+        this test's beliefs about it rather than the schema's."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            plan_file = root / "plan.json"
+            repo = root / "repo"
+            repo.mkdir()
+            plan_file = repo / "plan.json"
             plan_file.write_text("{}", encoding="utf-8")
             digest = "a" * 64
-            receipt = finalization.Receipt(
-                plan_digest=digest, rubric_version="test.v1",
-                verdict=finalization.Verdict.PASS, cells=(),
-                reviewer=finalization.ReviewerIdentity(
-                    route="omp", model="test", session_id="session"),
-                created_at_epoch=0.0)
+            seed = receipt_crypto.generate_seed()
             args = mock.Mock(
-                plan_file=str(plan_file), repo=str(root),
+                plan_file=str(plan_file), repo=str(repo),
                 receipt_dir=str(root / "receipts"), data_dir=str(root / "data"),
                 # Bound by installed configuration, so it is named here: a
                 # `Mock` invents every attribute it is asked for, and the
                 # declared-runners block has to be a mapping.
                 runners={},
-                verify_key=[receipt_crypto.seed_to_public_key(
-                    receipt_crypto.generate_seed()).hex()],
-                signing_seed=receipt_crypto.generate_seed().hex())
+                verify_key=[receipt_crypto.seed_to_public_key(seed).hex()],
+                signing_seed=seed.hex())
             validation = pv.ValidationResult(
                 pv.Outcome.FINALIZATION_ELIGIBLE, digest, ())
-            outcome = finalization.FinalizationOutcome(
-                finalization.Verdict.PASS, receipt, replayed=False)
             with mock.patch.object(
                     maestro.pv, "validate_plan", return_value=validation
-            ), mock.patch.object(
-                    maestro.plan_model, "parse_bytes", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro.plan_finalization, "review_objects", return_value=()
-            ), mock.patch.object(
-                    maestro, "_finalization_store", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_reviewer_window_factory", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro.finalization, "finalize", return_value=outcome
-            ) as finalize, contextlib.redirect_stdout(io.StringIO()) as output:
+            ) as validate, contextlib.redirect_stdout(io.StringIO()) as output:
                 code = maestro._plan_finalize(args)
+            receipt = finalization.ReceiptStore(
+                root / "receipts", repo_paths=(repo,),
+                data_dir=root / "data",
+                verify_keys=(receipt_crypto.seed_to_public_key(seed),),
+            ).load(digest)
+
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue()), {
             "digest": digest,
@@ -764,7 +768,10 @@ class OperatorCliTest(unittest.TestCase):
             "replayed": False,
             "verdict": "PASS",
         })
-        self.assertEqual(finalize.call_args.kwargs["plan_digest"], digest)
+        self.assertEqual(validate.call_args.args[1], str(repo))
+        self.assertEqual(receipt.rubric_version,
+                         maestro.DETERMINISTIC_RUBRIC_VERSION)
+        self.assertEqual(receipt.reviewer.route, "deterministic")
 
     def test_run_resume_refuses_before_claiming_execution(self):
         output = io.StringIO()

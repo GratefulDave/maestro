@@ -67,7 +67,16 @@ Run these in the repository the plan will change.
    records that it happened and to which exact bytes, and nothing more.
 5. `maestro plan ship <plan-name>` — projects the reviewed IR into a `maestro-plan.v2` plan,
    validates the projection, and finalizes it. Finalizing is required before the plan can run, and
-   before it can participate in a workspace.
+   before it can participate in a workspace. **No model is dispatched here either.**
+   `maestro plan finalize` runs the deterministic obligations and, if the plan is eligible, writes
+   the signed receipt itself — verdict PASS, rubric version `maestro-deterministic.v1`, no cells,
+   and a reviewer identity of `(deterministic, plan_validate, <digest>)`, because that is what
+   actually judged the bytes. It used to launch a reviewer in a pane and derive the verdict from
+   that reviewer's per-cell answers; the prompt it handed over was the matrix of check ids, the
+   plan digest, and a path to write to, and it never contained the plan. A lifecycle transition
+   caused by a model's answers about a plan it was not shown is what §1.2 forbids, so the reviewer
+   was removed rather than repaired. Eligibility is unchanged, and an ineligible plan still exits 2
+   with typed blockers and no receipt.
 
 The version the projection emits is `maestro-plan.v2`, and a run refuses anything older. The bump
 is not a structural change: v2 carries the same in-plan types, the same fields, and the same
@@ -218,13 +227,18 @@ the outputs together, and ask one question before shipping: **could an agent sat
 by changing only these files?**
 
 An instruction that fails that question is unsatisfiable from its first attempt, and the failure is
-silent. The reviewer correctly rejects every diff that does not do what the instruction says; the
-permission check would correctly reject every diff that does. The lane then spends its whole review
-budget alternating between the two before ending `BLOCKED` with `REVIEW_BUDGET_EXHAUSTED` — with a
-green gate and a rising case count every attempt, because the work it *was* permitted to do was
-fine. The finalization reviewer — `maestro plan finalize`, which `maestro plan ship` runs — now
-asks this of every lane as `node.writes_are_sufficient`, BLOCKING, so the answer costs one review
-cell instead of a run, and a lane that fails it is fixed in the next authoring round.
+silent. The node reviewer correctly rejects every diff that does not do what the instruction says;
+the permission check would correctly reject every diff that does. The lane then spends its whole
+review budget alternating between the two before ending `BLOCKED` with `REVIEW_BUDGET_EXHAUSTED` —
+with a green gate and a rising case count every attempt, because the work it *was* permitted to do
+was fine.
+
+**Nothing downstream will catch this for you.** A plan-finalization reviewer used to be asked it as
+a rubric cell, `node.writes_are_sufficient`; that reviewer is gone, and `maestro plan finalize` is
+deterministic now, so no check between the authored bytes and the run reads an instruction against
+its `outputs`. It is a question for the authoring round and for `maestro plan review`, where a
+person holding the reviewer's key reads the IR — and the whole cost of getting it wrong is paid at
+run time, one lane's review budget at a time.
 
 The shape that trips it is an end-to-end behavioural claim over code the lane does not own:
 

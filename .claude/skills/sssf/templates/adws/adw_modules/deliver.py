@@ -322,22 +322,6 @@ def step_findings(source: str, payloads: Sequence[Mapping[str, Any]]
     return tuple(found)
 
 
-def report_findings(report: Optional[Mapping[str, Any]]) -> Tuple[Finding, ...]:
-    """The reviewer's `finding` cells. A `clear` cell is not a finding."""
-    if not isinstance(report, Mapping):
-        return ()
-    found: List[Finding] = []
-    for cell in report.get("cells") or ():
-        if not isinstance(cell, Mapping):
-            continue
-        if str(cell.get("status")) != "finding":
-            continue
-        found.append(Finding(
-            "finalize", str(cell.get("check_id") or "check"),
-            str(cell.get("object_id") or ""), str(cell.get("message") or "")))
-    return tuple(found)
-
-
 # ── dependency order ────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -496,10 +480,6 @@ AuthorTurn = Callable[[str, str, Path], Mapping[str, Any]]
 #: printed.
 PlanStep = Callable[[str, str], Tuple[int, Sequence[Mapping[str, Any]]]]
 
-#: `reviewer_report(name) -> Mapping | None` reads the reviewer's report for a
-#: plan that finalized, so a FAIL verdict yields its finding cells.
-ReviewerReport = Callable[[str], Optional[Mapping[str, Any]]]
-
 #: `run_start(name) -> (status, payloads)` runs `maestro run start <name>`.
 RunStart = Callable[[str], Tuple[int, Sequence[Mapping[str, Any]]]]
 
@@ -575,7 +555,6 @@ class Delivery:
     envelope_dir: Path
     author_turn: AuthorTurn
     plan_step: PlanStep
-    reviewer_report: ReviewerReport
     request: str = ""
     max_attempts: int = MAX_ATTEMPTS
     remove_plan_dir: Optional[Callable[[str], None]] = None
@@ -748,11 +727,16 @@ class Delivery:
             if verb == "ship":
                 verdict = _shipped_verdict(payloads)
                 if verdict == "FAIL":
-                    found = report_findings(self.reviewer_report(name))
-                    return found or (Finding(
-                        "finalize", "REVIEWER_FAIL",
-                        message="the reviewer returned FAIL and the report "
-                                "carried no readable cell"),)
+                    # `plan finalize` is deterministic and writes only PASS, so
+                    # a FAIL here is a receipt an earlier reviewer signed over
+                    # these bytes. It is still terminal for them, and there is
+                    # no report to read cells out of -- the reviewer that wrote
+                    # them is gone.
+                    return (Finding(
+                        "finalize", "RECEIPT_FAIL",
+                        message="these plan bytes carry a FAIL receipt, which "
+                                "is terminal for them; `plan set-aside` is the "
+                                "operator escape"),)
         return ()
 
     def _clear_plan_directory(self, name: str) -> None:

@@ -134,7 +134,7 @@ class ProductionPoller(unittest.TestCase):
         `verify_report` and the plan is condemned on cells the reviewer had
         not written yet.
         """
-        kind = fin.ObjectKind.NODE
+        kind = fin.ObjectKind.DIFF
         rubric = fin.Rubric(version="test.v1", checks=(
             fin.RubricCheck(check_id="check.0", question="q0",
                             applies_to=(kind,), severity=fin.Severity.BLOCKING),

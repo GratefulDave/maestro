@@ -252,7 +252,13 @@ class EveryMaestroDispatchSiteDeclaresItsWindow(unittest.TestCase):
                  if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute)
                  and node.func.attr == "LaunchSpec"]
-        self.assertGreaterEqual(len(specs), 4)
+        # A floor, so an assertion over an empty list cannot pass for clean.
+        # Three sites: the node reviewer, the build/agent node, and the plan
+        # contract's authoring turn. There were four until `plan finalize`
+        # stopped dispatching a reviewer and its factory was deleted; the
+        # floor moved with the site rather than being left to acquit a
+        # discovery that had gone silently empty.
+        self.assertGreaterEqual(len(specs), 3)
         missing = [node.lineno for node in specs
                    if "context_window_tokens" not in
                    {kw.arg for kw in node.keywords}]
