@@ -92,6 +92,23 @@ def herdr_error_code(text: str) -> str:
 REVIEWER_HMAC_KEY_FILE = "reviewer-hmac.key"
 REVIEWER_HMAC_KEY_ENV = "PLANCTL_REVIEWER_HMAC_KEY"
 
+# Two environment files, along the same line `plan gate` and `plan review` are
+# split along. `maestro.env` is the author's: the verify key, the signing seed,
+# and the route verify key, which is everything author-side work needs and
+# nothing that can make a gate refuse. `reviewer-hmac.env` is the reviewer's
+# and carries one binding.
+#
+# They were one file, and that defeated the separation the gate check exists to
+# prove. An operator has to source the author file to finalize or start a run;
+# sourcing it also exported `PLANCTL_REVIEWER_HMAC_KEY`, so `maestro plan gate`
+# then refused their own plan with `REVIEWER_KEY_PRESENT` -- correctly, because
+# the author side must not hold the key that authorizes its own plan. The only
+# way forward was unsetting the variable, gating, re-exporting it, reviewing,
+# and unsetting it again, by hand, between stages. That is where the key got
+# lost, and Maestro's own bootstrap was what put it in the author's shell.
+OPERATOR_ENV_FILE = "maestro.env"
+REVIEWER_ENV_FILE = "reviewer-hmac.env"
+
 _KEY_FILES = {
     "signing_seed": "signing.seed",
     "signing_pub": "signing.pub",
@@ -110,6 +127,7 @@ class KeyMaterial:
     reviewer_hmac: bytes
     keys_dir: Path
     env_file: Path
+    reviewer_env_file: Path
     created: Tuple[str, ...]
 
 
@@ -181,7 +199,8 @@ def provision_keys(keys_dir: Path) -> KeyMaterial:
         route_public=route_public,
         reviewer_hmac=reviewer_hmac,
         keys_dir=directory,
-        env_file=directory / "maestro.env",
+        env_file=directory / OPERATOR_ENV_FILE,
+        reviewer_env_file=directory / REVIEWER_ENV_FILE,
         created=tuple(created),
     )
 
@@ -190,19 +209,19 @@ def write_env_file(
         keys: KeyMaterial, *,
         verify_key_env: str, signing_seed_env: str,
         route_verify_key_env: str,
-        reviewer_hmac_key_env: str = REVIEWER_HMAC_KEY_ENV,
 ) -> Path:
-    """Write the operator environment bindings (0600).
+    """Write the author-side operator bindings (0600).
 
-    The reviewer binding is here so the plan-contract skill can be driven
-    directly -- `planctl review` outside Maestro -- by sourcing one file the
-    operator never had to write.
+    Author-side, and structurally so rather than by discipline: this function
+    takes no parameter that could name the reviewer binding, so the file an
+    operator sources before `finalize` or `start` cannot carry the key that
+    would make `maestro plan gate` refuse. The reviewer's binding has its own
+    file -- `write_reviewer_env_file`.
     """
     body = (
         "{verify}={verify_hex}\n"
         "{seed}={seed_hex}\n"
         "{route}={route_hex}\n"
-        "{reviewer}={reviewer_hex}\n"
     ).format(
         verify=verify_key_env,
         verify_hex=keys.signing_public.hex(),
@@ -210,11 +229,43 @@ def write_env_file(
         seed_hex=keys.signing_seed.hex(),
         route=route_verify_key_env,
         route_hex=keys.route_public.hex(),
-        reviewer=reviewer_hmac_key_env,
-        reviewer_hex=keys.reviewer_hmac.hex(),
     )
     _write_secret(keys.env_file, body)
     return keys.env_file
+
+
+def write_reviewer_env_file(
+        keys: KeyMaterial, *,
+        reviewer_hmac_key_env: str = REVIEWER_HMAC_KEY_ENV,
+) -> Path:
+    """Write the reviewer binding (0600), alone, in its own file.
+
+    Nothing in Maestro's supported path reads this file. `maestro plan review`
+    resolves the key from `<keys>/reviewer-hmac.key` and injects it into the
+    `planctl review` subprocess itself, so a reviewer using Maestro never needs
+    an environment at all. The file exists for the one case Maestro does not
+    drive: the plan-contract skill running `planctl review` directly, which is
+    what `/arch-review` does for an architecture IR, against a `planctl` that
+    reads the key from its environment and has no other way to be given one.
+
+    It is a separate file so that sourcing the author's environment cannot pick
+    it up, and it says what sourcing it costs, because the operator who does so
+    deliberately is the one person who has to know.
+    """
+    body = (
+        "# Reviewer-only. Do NOT source this in an authoring shell: while this\n"
+        "# variable is set, `maestro plan gate` refuses with\n"
+        "# REVIEWER_KEY_PRESENT, because the author side must not hold the key\n"
+        "# that authorizes its own plan. `maestro plan review` injects the key\n"
+        "# itself and never reads this file; source it only to drive `planctl\n"
+        "# review` directly, in a shell that gates nothing.\n"
+        "{reviewer}={reviewer_hex}\n"
+    ).format(
+        reviewer=reviewer_hmac_key_env,
+        reviewer_hex=keys.reviewer_hmac.hex(),
+    )
+    _write_secret(keys.reviewer_env_file, body)
+    return keys.reviewer_env_file
 
 
 def encode_receipt(receipt: Mapping[str, object]) -> bytes:
