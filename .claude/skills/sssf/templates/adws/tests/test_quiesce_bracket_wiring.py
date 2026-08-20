@@ -154,6 +154,79 @@ class PreMergeHygieneReportTests(SchedulerFixture):
         self.assertEqual(report.adapter_hygiene, {})
 
 
+# ── issue #21: residue outside the attempt's own tree ──────────────────────
+
+class UnprovisionedWorktreeReportTests(SchedulerFixture):
+    """A worktree a reviewer registered against the repository and abandoned.
+
+    Reviewer agents open detached worktrees under `/tmp` of their own accord
+    — one transcript twelve times, with no matching removal — and no Maestro
+    code creates or removes those paths. The pre-merge cleanliness comparison
+    measures the attempt's own tree, so a tree registered beside it was
+    invisible to it and the leak was silent.
+
+    This is a wiring proof like the rest of this file: the detector could be
+    correct in isolation forever while `check_pre_merge`'s new field had no
+    production reader, which is exactly the shape §3.6 B15 makes a build
+    failure. So it drives the real scheduler and reads the report.
+    """
+
+    def _gate_that_opens_a_reviewer_worktree(self, name="lexgenius-review-31ef146"):
+        """The reviewer's own command, at a path Maestro never chose."""
+        self.leaked = (self.root / name).resolve()
+
+        def reviewing(attempt, node, phase, cancel_requested):
+            if phase == "post":
+                _git(attempt.path, "worktree", "add", "--detach",
+                     str(self.root / name), "HEAD")
+                return green()
+            return red()
+        return reviewing
+
+    def test_a_worktree_a_reviewer_left_behind_is_reported_with_its_path(self):
+        self.written = {"a": {"a.py": "A\n"}}
+        report = self.schedule(
+            [self.agent("a")],
+            deps=self.deps(run_gate=self._gate_that_opens_a_reviewer_worktree())).run()
+
+        entries = report.adapter_hygiene.get("a", ())
+        self.assertTrue(
+            any(entry.startswith("unprovisioned-worktree")
+                and str(self.leaked) in entry
+                for entry in entries),
+            report.adapter_hygiene)
+
+    def test_the_node_still_merges_because_it_did_not_open_the_tree(self):
+        """The consequence, chosen deliberately. The leak is real residue —
+        a checkout and an administrative entry nothing will reclaim — but the
+        node that produced the diff did not create it, and blocking the merge
+        would strand correct, gated, committed work on someone else's
+        housekeeping."""
+        self.written = {"a": {"a.py": "A\n"}}
+        report = self.schedule(
+            [self.agent("a")],
+            deps=self.deps(run_gate=self._gate_that_opens_a_reviewer_worktree())).run()
+
+        self.assertEqual(self.states(), {"a": "MERGED"})
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_the_runs_own_worktrees_are_never_reported(self):
+        """The false-positive control at the wiring level. This fixture opens
+        an integration checkout outside the worktrees root and an attempt
+        worktree inside it, both on branches — reporting either would make the
+        channel noise on every run that ever completed."""
+        self.written = {"a": {"a.py": "A\n"}}
+        report = self.schedule([self.agent("a")]).run()
+
+        self.assertEqual(self.states(), {"a": "MERGED"})
+        self.assertEqual(
+            [entry for entries in report.adapter_hygiene.values()
+             for entry in entries
+             if entry.startswith("unprovisioned-worktree")],
+            [])
+
+
+
 # ── §8.8 cleanup: the attempt worktree goes, once ancestry is proven ────────
 
 class MergedWorktreeCleanupTests(SchedulerFixture):

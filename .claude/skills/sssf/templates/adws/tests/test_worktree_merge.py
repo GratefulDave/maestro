@@ -562,6 +562,97 @@ class FourChecks(WorktreeTestCase):
         self.assertEqual(_git(attempt.path, "rev-parse", "HEAD"), sha)
 
 
+# ── issue #21: worktrees a reviewer registered and abandoned ───────────
+
+class ReviewerCreatedWorktrees(WorktreeTestCase):
+    """Residue that lives outside the attempt's own tree (issue #21).
+
+    Reviewer agents run `git worktree add --detach /tmp/<name>-<sha>` of their
+    own accord and remove the tree inconsistently — one transcript did it
+    twelve times with no matching `worktree remove`. No Maestro code creates
+    or removes those paths. `compare_to_expected` measures one tree, so a tree
+    registered *beside* it is invisible to it however carefully the inventory
+    is compared, and the leak was silent.
+
+    Detection reads git's own registration table rather than scanning `/tmp`:
+    the reviewer's choice of directory is not a contract, and a filesystem
+    scan cannot tell a registered worktree from an abandoned copy of one.
+    """
+
+    def _verified_bracket(self):
+        """One node's attempt, measured and committed — the state the
+        pre-merge evaluation is defined over."""
+        attempt = _attempt(self.repo, self.root)
+        baseline = wt.take_baseline(attempt)
+        (attempt.path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+        after = wt.inventory(attempt.path)
+        d = wt.delta(baseline, after)
+        sha = wt.commit_measured_delta(attempt, d, after, "nodeA: measured delta")
+        return attempt, wt.expected_inventory(baseline, d, after), sha
+
+    def _reviewer_worktree(self, name: str = "lexgenius-review-31ef146") -> Path:
+        """Exactly what the transcript ran, at a path Maestro never chose."""
+        scratch = self.root / name
+        _git(self.repo, "worktree", "add", "--detach", str(scratch), "HEAD")
+        return scratch.resolve()
+
+    def test_a_detached_worktree_a_reviewer_left_behind_is_reported_by_path(self):
+        attempt, expected, sha = self._verified_bracket()
+        leaked = self._reviewer_worktree()
+
+        verdict = wt.check_pre_merge(attempt, expected)
+        self.assertEqual(len(verdict.unprovisioned_worktrees), 1, verdict)
+        self.assertIn(str(leaked), verdict.unprovisioned_worktrees[0])
+        self.assertIn("detached", verdict.unprovisioned_worktrees[0])
+        # The producing node did not create it, so it is not stranded for it.
+        self.assertTrue(verdict.merge_permitted)
+        self.assertEqual(_git(attempt.path, "rev-parse", "HEAD"), sha)
+
+    def test_the_attempt_and_its_siblings_are_never_reported_as_residue(self):
+        """The false-positive control. Every worktree Maestro opens against a
+        run's repository is opened on a branch and under the worktrees root,
+        and reporting one of those would make the channel useless."""
+        attempt, expected, _ = self._verified_bracket()
+        sibling = _attempt(self.repo, self.root, node_id="nodeB")
+        second_attempt = _attempt(self.repo, self.root, attempt_no=2)
+        self.assertTrue(sibling.path.is_dir() and second_attempt.path.is_dir())
+
+        verdict = wt.check_pre_merge(attempt, expected)
+        self.assertEqual(verdict.unprovisioned_worktrees, ())
+
+    def test_an_integration_checkout_on_a_branch_is_not_residue(self):
+        """`run start` opens the run's integration checkout with `worktree add
+        -b`, outside the worktrees root. It is Maestro's, it is not detached,
+        and an operator's own checkout of the repository is the same shape."""
+        attempt, expected, _ = self._verified_bracket()
+        integration = self.root / "integration"
+        _git(self.repo, "worktree", "add", "-q", "-b", "integration/run1",
+             str(integration), "HEAD")
+
+        verdict = wt.check_pre_merge(attempt, expected)
+        self.assertEqual(verdict.unprovisioned_worktrees, ())
+
+    def test_a_repository_with_no_stray_worktrees_reports_nothing(self):
+        """Empty is a claim. A detector that has only ever returned 'dirty'
+        proves as little as one that has only ever returned 'clean'."""
+        attempt, expected, _ = self._verified_bracket()
+        verdict = wt.check_pre_merge(attempt, expected)
+        self.assertEqual(verdict.unprovisioned_worktrees, ())
+
+    def test_the_earlier_evaluations_do_not_carry_the_field(self):
+        """The report belongs to pre-merge alone: at create nothing has run,
+        and at post-commit the consequence is conviction, which this signal
+        must never reach — a node cannot be convicted for a tree a reviewer
+        opened after its commit was sealed."""
+        attempt, expected, _ = self._verified_bracket()
+        self._reviewer_worktree()
+        self.assertEqual(wt.check_at_create(attempt).unprovisioned_worktrees, ())
+        post = wt.check_post_commit(attempt, expected)
+        self.assertEqual(post.unprovisioned_worktrees, ())
+        self.assertTrue(post.ok, post)
+
+
+
 # ── F3: gate scope ──────────────────────────────────────────────────────────
 
 class GateScope(WorktreeTestCase):
