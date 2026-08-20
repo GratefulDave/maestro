@@ -14,6 +14,7 @@ because none of them is the thing under test here.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -89,9 +90,14 @@ class DeliveryFixture(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def write_receipt(self, name, verdict="PASS"):
+    def write_receipt(self, name, verdict="PASS", ir_bytes=None):
+        if ir_bytes is None:
+            ir_bytes = (self.plans / (name + deliver.IR_SUFFIX)).read_bytes()
         path = self.plans / (name + deliver.RECEIPT_SUFFIX)
-        path.write_text(json.dumps({"verdict": verdict}), encoding="utf-8")
+        path.write_text(json.dumps({
+            "verdict": verdict,
+            "ir_sha256": hashlib.sha256(ir_bytes).hexdigest(),
+        }), encoding="utf-8")
         return path
 
     def author_turn(self, kind, prompt, envelope):
@@ -186,6 +192,7 @@ class SpecToPackagesTest(DeliveryFixture):
 
         def architecture(_attempt):
             self.write_ir("arch", ARCHITECTURE_IR)
+            self.write_receipt("arch")
             return {"success": True, "summary": "anchor",
                     "architecture_ir": ".maestro/arch.plan.json"}
 
@@ -223,6 +230,21 @@ class SpecToPackagesTest(DeliveryFixture):
         self.write_ir("arch", ARCHITECTURE_IR)
         self.write_receipt("arch", verdict="FAIL")
         self.assertIsNone(self.delivery()._approved_architecture())
+
+    def test_a_new_architecture_must_have_a_matching_pass_receipt(self):
+        def architecture(_attempt):
+            self.write_ir("arch", ARCHITECTURE_IR)
+            self.write_receipt("arch", ir_bytes=b"stale architecture")
+            return {"success": True, "summary": "anchor",
+                    "architecture_ir": ".maestro/arch.plan.json"}
+
+        self.lane_script["architecture"] = architecture
+
+        with self.assertRaisesRegex(
+                deliver.DeliverError, "ARCHITECTURE_RECEIPT_MISMATCH"):
+            self.delivery().architecture()
+        self.assertEqual([turn["kind"] for turn in self.turns], ["architecture"])
+
 
     def test_the_lane_may_not_declare_a_path_outside_the_plans_directory(self):
         self.lane_script["architecture"] = lambda _a: {
@@ -793,8 +815,9 @@ class AuthorConfigurationTest(unittest.TestCase):
             repo, path = self._config(Path(tmp), None)
             layout = maestro._load_maestro_layout(repo.resolve(), path)
             self.assertIsNone(layout["author"])
-            with self.assertRaises(maestro._MaestroConfigurationError):
+            with self.assertRaises(maestro._MaestroConfigurationError) as caught:
                 maestro._deliver_author_lane(layout)
+            self.assertIn("requires an author: block", str(caught.exception))
 
     def test_an_author_route_with_no_route_receipt_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

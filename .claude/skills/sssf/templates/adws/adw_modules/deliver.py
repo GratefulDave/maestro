@@ -26,6 +26,7 @@ halts -- is pure and must be testable without an agent or a run.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -608,6 +609,10 @@ class Delivery:
             raise DeliverError("ARCHITECTURE_IR_MISSING:{}".format(path))
         if _plan_kind(path) != ARCHITECTURE_KIND:
             raise DeliverError("ARCHITECTURE_KIND_WRONG:{}".format(path))
+        receipt = path.with_name(
+            path.name[:-len(IR_SUFFIX)] + RECEIPT_SUFFIX)
+        if not _receipt_passes(receipt, path):
+            raise DeliverError("ARCHITECTURE_RECEIPT_MISMATCH:{}".format(path))
         return path, True
 
     def _resolve_declared(self, written: Any, fallback: Path) -> Path:
@@ -636,7 +641,7 @@ class Delivery:
                 continue
             receipt = candidate.with_name(
                 candidate.name[:-len(IR_SUFFIX)] + RECEIPT_SUFFIX)
-            if _receipt_passes(receipt):
+            if _receipt_passes(receipt, candidate):
                 return candidate
         return None
 
@@ -884,16 +889,18 @@ def _plan_kind(path: Path) -> str:
         return ""
 
 
-def _receipt_passes(path: Path) -> bool:
+def _receipt_passes(path: Path, ir_path: Path) -> bool:
+    """True only for a PASS receipt bound to these exact IR bytes."""
     if not Path(path).is_file():
         return False
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        ir_bytes = Path(ir_path).read_bytes()
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload.get("verdict") != "PASS":
         return False
-    return payload.get("verdict") == "PASS" or payload.get("approved") is True
+    return payload.get("ir_sha256") == hashlib.sha256(ir_bytes).hexdigest()
 
 
 def _shipped_verdict(payloads: Sequence[Mapping[str, Any]]) -> str:
