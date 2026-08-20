@@ -2800,6 +2800,52 @@ def derive_run_state(
     return "QUIESCENT"
 
 
+#: The derived states that say the run has stopped. Four are terminal on the
+#: node rows alone; ABANDONED is the scheduler-death case, which
+#: `derive_run_state` has already established from the process table.
+STOPPED_RUN_STATES: Tuple[str, ...] = (
+    "EMPTY", "MERGED", "CANCELLED", "QUIESCENT", "ABANDONED")
+
+#: The derived states that establish the opposite from the node rows alone: a
+#: node is RUNNING this instant, or a cancellation has not yet reached every
+#: node. Neither needs a liveness probe to be true.
+LIVE_RUN_STATES: Tuple[str, ...] = ("RUNNING", "CANCELLING")
+
+
+def run_in_flight(
+        record: RunRecord, nodes: Sequence[NodeRow], *,
+        is_alive: Callable[[int], bool] = wd.process_is_alive,
+        host: Optional[str] = None) -> Optional[bool]:
+    """Is this run still going? `True` / `False` / `None` = cannot be said.
+
+    `derive_run_state` answers *what shape* a run is in, and a reader wanting
+    only "has it stopped" was left to partition nine strings for itself. Two of
+    them do not partition: BLOCKED and PENDING both mean "work is left and
+    nothing is executing it this instant", which is the shape of a run whose
+    scheduler declared and exited *and* of a live one between two polls. What
+    separates them is not in the node rows at all — it is whether a scheduler
+    process is still behind the run — so this composes the two facts `run
+    status` already reports side by side rather than adding a third derivation
+    of either (§10.6).
+
+    The tri-state is `scheduler_liveness`'s, and for its reason: no pid
+    recorded, or a pid recorded on another host, means the process table this
+    machine can read cannot answer, and a caller must render that as unknown.
+    Collapsing `None` onto either boolean is how a report comes to assert that
+    a run ended when no row ever said so — the defect this function exists to
+    let a reader avoid, not one it may commit itself.
+
+    Every input is a typed row or the process table (§1.2). No write, no
+    prose; `LifecycleReader` opens the database `mode=ro`.
+    """
+    state = derive_run_state(record, nodes, is_alive=is_alive, host=host)
+    if state in STOPPED_RUN_STATES:
+        return False
+    if state in LIVE_RUN_STATES:
+        return True
+    return scheduler_liveness(record, is_alive=is_alive, host=host)
+
+
 class LifecycleReader:
     """Every read the operator's read verbs make, and no write at all.
 

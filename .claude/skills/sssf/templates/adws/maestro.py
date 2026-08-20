@@ -4048,13 +4048,22 @@ def _run_list(args: argparse.Namespace) -> int:
 
 
 def _run_convergence(args: argparse.Namespace) -> int:
-    """Findings-per-attempt per lane, for a run that has already finished (#30).
+    """Findings-per-attempt per lane, for any run the ledger holds (#30, #107).
 
     The scheduler prints this series when a run ends in the process that ran
     it. That is the only place it has ever existed, so a run that was resumed,
     cancelled, or simply read the next morning could not be asked whether its
     reviewers were converging — and `execution.review_ceiling` was sized by
     hand from three lanes somebody happened to still have on screen.
+
+    This was documented as being "for a run that has already finished", and the
+    verdicts were written as though that were enforced. It is not: nothing
+    refuses the verb against a live run, and an operator watching one was told
+    "not converged — run ended first" about a lane that was RUNNING on its
+    fourth attempt (#107). So the run's own liveness is derived here, where the
+    `runs` row is in hand, and handed to the profile — `lc.run_in_flight` over
+    the same record and node rows `_live_state` reads, not a second rule about
+    what "finished" means (§10.6).
 
     Same reader, same tables, same query path as `run status` (§10.6). It
     writes nothing and decides nothing; the ledger it opens is `mode=ro`.
@@ -4064,10 +4073,15 @@ def _run_convergence(args: argparse.Namespace) -> int:
     reader = _open_reader(args.db)
     try:
         record = _select_run(reader, args)
+        # Read once and reused: the liveness derivation and the lane profile
+        # must be two views of one observation, not two reads of a ledger a
+        # scheduler is still writing to.
+        nodes = reader.nodes(record.run_id)
         profile = review_convergence.run_convergence(
-            record.run_id, reader.nodes(record.run_id),
+            record.run_id, nodes,
             reader.attempts(record.run_id), reader.transitions(record.run_id),
-            review_ceiling=getattr(args, "review_ceiling", None))
+            review_ceiling=getattr(args, "review_ceiling", None),
+            in_flight=lc.run_in_flight(record, nodes))
     finally:
         reader.close()
     if getattr(args, "as_json", False):
