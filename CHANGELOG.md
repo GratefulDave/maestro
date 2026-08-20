@@ -8,6 +8,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `just -g mon` — a terminal run monitor, `.claude/skills/sssf/apps/visualizer/bin/maestro-mon`.
+  It answers the questions the visualizer answers — phase depth, node states, attempts, blockers —
+  without leaving the shell, and it reads the lifecycle ledger directly rather than shelling out to
+  `maestro.py` per refresh, so a poll costs a few SQLite reads and nothing else. `just -g mon`
+  watches the newest RUNNING run in the default repo; `just -g mon <run-id>` or `<plan-name>`
+  selects one; a second argument sets the refresh interval, default 5 seconds. `MAESTRO_DB` or
+  `MAESTRO_REPO` points it at another deployment.
+
+  The entry point is the global justfile recipe `mon`, which is what makes it reachable from any
+  directory. That recipe is a one-line shim into this repository, so the body of the thing is
+  version-controlled here and reviewable as a diff rather than living in an unversioned justfile —
+  the same arrangement `maestro-viz` and its `viz` recipe already use.
+
 - `runtime_sync.py mirror … --apply --commit` — a mirror now copies *and* records itself, so
   bringing a deployment level is one command instead of a mirror followed by a hand-written
   `git add` and `git commit`. The recording is not decoration: `lexgenius-pipeline` carried its
@@ -393,6 +406,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   typed key, read only by the report and the JSON (§1.2, §10.1).
 
 ### Changed
+
+- The plan-contract projection emits **`maestro-plan.v2`**, and a run refuses anything older with
+  `RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`. Nothing structural changed — `plan_model.PlanV2` subclasses
+  the frozen `Plan` and redeclares only its version marker, because v2's obligations *are* v1's.
+  What moved is what the projection puts in an agent node's `instruction`: it used to write the
+  lane's title and drop `requirements[].text`, so every builder and every reviewer downstream was
+  handed a summary of the lane's contract instead of the contract (§19 M26). The fixed projection
+  went on emitting `maestro-plan.v1`, which left a plan shipped before the fix indistinguishable in
+  version from one shipped after it — a populated field cannot be audited by its consumers, so the
+  version string is the only channel that difference can travel on.
+
+  The refusal lives in `_load_runnable_plan`, the one function that turns plan bytes into a plan a
+  run will execute, so the coverage claim is a property of the call graph rather than of a list of
+  verbs (§19 M6 is the recorded cost of the alternative). It is an allowlist: a version registered
+  later and not added to it refuses rather than runs. A v1 plan stays readable, canonical,
+  validatable, and finalizable; only running it is refused, and the remedy it names is to re-ship
+  the plan from its IR — there is no upgrade function, because the missing requirement text is not
+  recoverable from the projected plan.
+
+- `maestro bootstrap` no longer writes the reviewer's HMAC key into `maestro.env`. It writes two
+  0600 files into `<state-root>/<repo>/keys/`: `maestro.env`, carrying the verify key, the signing
+  seed, and the route verify key — everything author-side work needs and nothing that can make a
+  gate refuse — and `reviewer-hmac.env`, carrying the reviewer binding and nothing else. `maestro
+  plan gate` refuses while `PLANCTL_REVIEWER_HMAC_KEY` is set, which is correct; what put it there
+  was Maestro's own bootstrap, so an operator who sourced the combined file to finalize or start a
+  run was then refused on their own plan and had to unset and re-export a variable by hand between
+  stages. Nothing in the supported path reads `reviewer-hmac.env` — `plan review` injects the key
+  into the `planctl` subprocess itself — and it exists only for driving `planctl review` directly.
+  Re-run `maestro bootstrap` to split an existing combined file: `provision_keys` reuses the key
+  material it finds, so no key is regenerated and no signed receipt is invalidated.
+
+- The finalization turn clock is gated on route liveness. `_reviewer_window_factory` — the window
+  `maestro plan finalize` builds — passed no `actor_status` reader, while `_code_review_runner`'s
+  window a few hundred lines below passed one, so every detector behind that seam was unreachable
+  on the operator path and `TURN_TIMEOUT` was the only sub-span signal left. It fired
+  unconditionally, below a quiescence branch that could never arm, and returned
+  `FINALIZATION_STALLED signal=TURN_TIMEOUT after 128.6s` against a reviewer whose Herdr pane was
+  still advancing (§19 M30). The factory now supplies raw per-pane `agent_status` — never
+  `observe()`, which collapses idle into RUNNING and cannot express "went live, then stopped" — so
+  `ACTOR_ABANDONED` and `NEVER_STARTED` are reachable and the turn clock only convicts an actor the
+  route has stopped reporting live. `finalization_window.DEFAULT_TURN_TIMEOUT_S` is 900.0 and the
+  CLI default is taken from it rather than restated, because two literals for one clock is how a
+  raised module default comes to look like it did nothing. The run-side sibling in `watchdog.py` is
+  **not** fixed (#107, §16.3 item 59).
 
 - Bare `maestro run cancel` now **pauses** instead of discarding the run. It was the operator's
   only stop control and served two intents — end this run, and stop this run because I am about to
