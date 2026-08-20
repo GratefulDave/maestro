@@ -14,7 +14,9 @@ close: a plan that declares the new member passes one gate and fails the other,
 with no route that passes both. Nothing else in either repository notices,
 because each suite is green against its own copy of the vocabulary. This module
 is the only thing standing between that edit and a production plan that cannot
-be authored.
+be authored. The same holds one document over: a claim's `witness` is required
+by this runtime's `CLAIM_UNWITNESSABLE`, so a scope or store member on one side
+only refuses at ingress a plan the authoring validator accepted.
 
 The schema is published from `the-library`. When this runtime is the-library's
 own template checkout the schema is in the same repository; when it is
@@ -71,6 +73,16 @@ PINNED = (
         "$defs.requirementSurfaceEntry.properties.mutation.enum",
         lambda defs: defs["requirementSurfaceEntry"]["properties"]["mutation"]["enum"],
         "MUTATIONS",
+    ),
+    (
+        "$defs.witnessScope.enum",
+        lambda defs: defs["witnessScope"]["enum"],
+        "WITNESS_SCOPES",
+    ),
+    (
+        "$defs.witnessStore.enum",
+        lambda defs: defs["witnessStore"]["enum"],
+        "WITNESS_STORES",
     ),
 )
 
@@ -240,6 +252,14 @@ class SchemaVocabularyParityTests(unittest.TestCase):
 
     def test_the_surface_mutation_vocabulary_matches_the_published_schema(self):
         pointer, reader, constant = PINNED[2]
+        self.assert_vocabulary_matches(pointer, reader(self.defs), constant)
+
+    def test_the_witness_scope_vocabulary_matches_the_published_schema(self):
+        pointer, reader, constant = PINNED[3]
+        self.assert_vocabulary_matches(pointer, reader(self.defs), constant)
+
+    def test_the_witness_store_vocabulary_matches_the_published_schema(self):
+        pointer, reader, constant = PINNED[4]
         self.assert_vocabulary_matches(pointer, reader(self.defs), constant)
 
     def test_every_pinned_row_names_a_constant_this_runtime_defines(self):

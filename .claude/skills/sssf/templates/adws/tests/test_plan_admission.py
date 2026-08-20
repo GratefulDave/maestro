@@ -105,6 +105,18 @@ def _ir(**overrides) -> dict:
              "execution_context": ".", "requirement_ids": ["req-freeze"],
              "depends_on": ["lane-tables"], "verifier_ids": ["verify-freeze"]},
         ],
+        "claims": [
+            {"claim_id": "claim-tables", "kind": "static_artifact_contract",
+             "subject": "tests/test_tables.py", "predicate": "exercises",
+             "object": "The consolidation tables are created.",
+             "polarity": "positive", "verifier_ids": ["verify-tables"],
+             "witness": {"scope": "in_process", "store": "in_memory"}},
+            {"claim_id": "claim-freeze", "kind": "static_artifact_contract",
+             "subject": "tests/test_run_log.py", "predicate": "exercises",
+             "object": "Every run is logged against the tables.",
+             "polarity": "positive", "verifier_ids": ["verify-freeze"],
+             "witness": {"scope": "in_process", "store": "in_memory"}},
+        ],
         "verifiers": [
             {"verifier_id": "verify-tables", "lane_ids": ["lane-tables"],
              "source_ids": ["src-readme"], "min_executed": 1,
@@ -179,7 +191,7 @@ class TheObligationSetTest(AdmissionTestCase):
     def test_the_obligations_are_a_checkable_count(self):
         """The predecessor of this tuple had no reader anywhere in the tree,
         which is §3.6 B15 arriving on its own commit. This is the reader."""
-        self.assertEqual(len(pv.ADMISSION_OBLIGATIONS), 6)
+        self.assertEqual(len(pv.ADMISSION_OBLIGATIONS), 7)
         self.assertEqual(set(pv.ADMISSION_OBLIGATIONS),
                          set(pv.AdmissionObligation))
 
@@ -345,7 +357,9 @@ class SurfaceReachabilityTest(AdmissionTestCase):
                            "prohibited_behavior": PROSE,
                            "affected_lane_ids": ["lane-freeze"]}]
         ir["claims"] = [{"claim_id": "claim-freeze", "subject": PROSE,
-                         "predicate": "exercises", "object": PROSE}]
+                         "predicate": "exercises", "object": PROSE,
+                         "witness": {"scope": "in_process",
+                                     "store": "in_memory"}}]
         self.assert_admitted(ir)
 
 
@@ -665,6 +679,19 @@ class TheAuthoringSchemaAdmitsWhatMaestroRequiresTest(unittest.TestCase):
                          pv.EFFECTS)
         self.assertEqual(self.enum_of(entry["properties"]["disposition"]),
                          pv.DISPOSITIONS)
+
+    def test_the_schema_requires_a_witness_on_every_claim(self):
+        claim = self.defs()["claim"]
+        self.assertIn("witness", claim["required"])
+        self.assertIn("witness", claim["properties"])
+
+    def test_the_witness_vocabularies_agree(self):
+        witness = self.defs()["claimWitness"]
+        self.assertEqual(self.enum_of(witness["properties"]["scope"]),
+                         pv.WITNESS_SCOPES)
+        self.assertEqual(self.enum_of(witness["properties"]["store"]),
+                         pv.WITNESS_STORES)
+        self.assertEqual(sorted(witness["required"]), ["scope", "store"])
 
     def test_the_schema_carries_prohibited_effects_with_a_meaning(self):
         entry = self.defs()["prohibitedEffect"]

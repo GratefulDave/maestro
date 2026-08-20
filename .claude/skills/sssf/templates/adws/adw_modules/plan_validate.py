@@ -888,9 +888,10 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
 
 # ── contract-IR admission ───────────────────────────────────────────────────
 #
-# Two obligations over a `plan-contract.v1` IR, over two domains, asked at the
-# same moment: can any correct attempt satisfy this lane's contract, and does
-# any requirement prescribe an effect the plan forbids.
+# Three obligations over a `plan-contract.v1` IR, over three domains, asked at
+# the same moment: can any correct attempt satisfy this lane's contract, does
+# any requirement prescribe an effect the plan forbids, and can any fixture
+# the gate runs witness what a claim asserts.
 #
 # ## What the run cost, and why prose could not decide it
 #
@@ -963,11 +964,11 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
 
 
 class AdmissionObligation(str, Enum):
-    """The obligations over a `plan-contract.v1` IR, at admission.
+    """The seven obligations over a `plan-contract.v1` IR, at admission.
 
-    Named `Admission*` rather than `Surface*` because the set now spans two
+    Named `Admission*` rather than `Surface*` because the set now spans three
     domains. A class called `Surface…` carrying `EFFECT_AUTHORIZED` is how
-    "the twelve" stops being a checkable count and becomes a sentence in a
+    "the fourteen" stops being a checkable count and becomes a sentence in a
     docstring — the failure `OBLIGATIONS` above carries a comment about.
     """
 
@@ -984,6 +985,10 @@ class AdmissionObligation(str, Enum):
     EFFECT_DISCHARGED = "EFFECT_DISCHARGED"
     #: Requirements bound to one lane agree about that lane's effects.
     EFFECT_CONSISTENT = "EFFECT_CONSISTENT"
+    #: Every claim states the boundary its behaviour crosses and the store its
+    #: state lives in, and no claim asserts what only a second invocation
+    #: could observe over a store that dies with the first.
+    CLAIM_UNWITNESSABLE = "CLAIM_UNWITNESSABLE"
 
 
 #: Named as a tuple as well as an enum so the count is checkable rather than a
@@ -997,6 +1002,7 @@ ADMISSION_OBLIGATIONS: Tuple[AdmissionObligation, ...] = (
     AdmissionObligation.EFFECT_AUTHORIZED,
     AdmissionObligation.EFFECT_DISCHARGED,
     AdmissionObligation.EFFECT_CONSISTENT,
+    AdmissionObligation.CLAIM_UNWITNESSABLE,
 )
 
 
@@ -1077,15 +1083,59 @@ DISPOSITIONS: Tuple[str, ...] = ("performed", "planned", "fake_only", "none")
 _EXECUTING_DISPOSITIONS: frozenset = frozenset({"performed", "fake_only"})
 
 
+#: The boundary a claim's behaviour crosses — what a fixture would have to span
+#: to observe the claim at all.
+#:
+#: * ``in_process`` — everything one invocation of the verifier can observe.
+#:   In-process ordering, a "second run" driven inside one pytest process, and
+#:   any state one interpreter holds from start to finish are all this.
+#: * ``cross_invocation`` — behaviour only a *second* invocation can observe:
+#:   survival across a restart or a process death, cross-process ordering, a
+#:   cursor read back by something that did not write it.
+#:
+#: Two members and not three. `cross_process` was proposed and refused: under
+#: this lattice it decides exactly what `cross_invocation` decides, and a
+#: member that changes no decision is §3.6 B15 — the defect this module's own
+#: docstring cites — arriving on its first commit.
+WITNESS_SCOPES: Tuple[str, ...] = ("in_process", "cross_invocation")
+
+
+#: Where the state a claim is about lives while the verifier runs.
+#:
+#: * ``none`` — the claim is about no stored state at all. A pure function's
+#:   return value.
+#: * ``in_memory`` — one interpreter's own objects: a dict, an in-memory
+#:   SQLite session, a fake injected for the duration of one test.
+#: * ``tmp_path`` — a filesystem location the run creates and can read back.
+#: * ``repository`` — a tracked path in the worktree.
+#: * ``external`` — a store outside the run entirely: a real database, a
+#:   bucket, a queue.
+#:
+#: The vocabulary names *where the bytes are*, not what writes them, for the
+#: reason `EFFECTS` names acts rather than mechanisms: a mechanism name lets a
+#: lane use the mechanism without committing to the fact the cell asserts, and
+#: the author's declaration stops being falsifiable.
+WITNESS_STORES: Tuple[str, ...] = ("none", "in_memory", "tmp_path",
+                                   "repository", "external")
+
+
+#: The stores that outlive one invocation, and so can be read by a second one.
+#: A claim scoped `cross_invocation` over anything else asserts something no
+#: fixture the gate runs can witness: no correct attempt produces the evidence,
+#: and the reviewer is asked to judge what the gate never shows it.
+_WITNESSING_STORES: frozenset = frozenset({"tmp_path", "repository",
+                                           "external"})
+
+
 @dataclass(frozen=True)
 class AdmissionBlocker:
     """One typed blocker with a JSON pointer into the authored IR.
 
-    Deliberately not `Blocker`: those twelve are obligations over
-    `maestro-plan.v1` stored bytes and their count is asserted as twelve.
+    Deliberately not `Blocker`: those fourteen are obligations over
+    `maestro-plan.v1` stored bytes and their count is asserted as fourteen.
     These are obligations over the contract IR, which is a different document
-    with different pointers, and merging the two enums would make "the twelve"
-    a sentence again rather than a checkable count.
+    with different pointers, and merging the two enums would make "the
+    fourteen" a sentence again rather than a checkable count.
     """
 
     obligation: AdmissionObligation
@@ -1667,12 +1717,124 @@ def validate_effect_authorization(ir: Mapping[str, Any]
     return tuple(blockers)
 
 
+def validate_claim_witness(ir: Mapping[str, Any]
+                           ) -> Tuple[AdmissionBlocker, ...]:
+    """Refuse a claim no fixture the gate runs could witness.
+
+    A claim states what the run has to show. A verifier shows it by running
+    one command, once, and reporting what it observed. When the claim is about
+    a boundary that command never crosses, no correct attempt produces the
+    evidence: the builder writes the behaviour, the gate cannot see it, and
+    the reviewer is asked to judge something the gate never showed it. That is
+    the same class as an unreachable write surface — a contract no correct
+    attempt satisfies — one domain over, so it is refused at the same moment
+    rather than discovered after a node has spent its retry budget.
+
+    The decision reads two enumerated cells and nothing else. `witness.scope`
+    is the boundary the claim's behaviour crosses; `witness.store` is where
+    the state it is about lives while the verifier runs. A claim scoped
+    `cross_invocation` over a store that dies with the invocation is the
+    refusal; every `in_process` claim is admitted under every store, because
+    an author who says the behaviour is within one invocation has said
+    something a single command can check.
+
+    Nothing here reads `requirements[].text`, `claims[].object`,
+    `verifiers[].oracle`, `seams[].contract`, or any other free-text field. A
+    requirement whose prose says "survives a restart" while its claim declares
+    `in_process` is admitted, and a claim whose prose says nothing about
+    persistence is refused when its declared cells say it crosses an
+    invocation over an in-memory store. An admission decision is a lifecycle
+    transition and §1.2 forbids one caused by free text; whether the declared
+    cells are *true* is the plan-contract reviewer's to falsify (§3.6 B12),
+    exactly as it is for `surface` and `effects`.
+
+    A `claims` key that is absent or not a list yields nothing here. The
+    authoring schema requires the array and `planctl validate` refuses a
+    malformed one in its own vocabulary; reporting the same defect twice makes
+    one plan error look like two.
+    """
+    blockers: List[AdmissionBlocker] = []
+
+    claims = ir.get("claims")
+    if not isinstance(claims, list):
+        return ()
+
+    for index, claim in enumerate(claims):
+        pointer = "/claims/{0}/witness".format(index)
+        if not isinstance(claim, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE,
+                "/claims/{0}".format(index),
+                "a claim is an object carrying a {scope, store} witness"))
+            continue
+        label = claim.get("claim_id")
+        if not isinstance(label, str) or not label:
+            label = "at index {0}".format(index)
+
+        declared = claim.get("witness")
+        if declared is None:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer,
+                "claim {0} declares no witness; a claim states the boundary "
+                "its behaviour crosses and the store its state lives in, so a "
+                "gate that cannot observe what the claim asserts is refused "
+                "before a run starts rather than after a node has spent its "
+                "retry budget. Declare {{\"scope\": one of {1}, \"store\": "
+                "one of {2}}}".format(
+                    label, ", ".join(WITNESS_SCOPES),
+                    ", ".join(WITNESS_STORES))))
+            continue
+        if not isinstance(declared, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer,
+                "claim {0} declares a witness that is not a {{scope, store}} "
+                "object".format(label)))
+            continue
+
+        scope = declared.get("scope")
+        store = declared.get("store")
+        well_formed = True
+        if scope not in WITNESS_SCOPES:
+            well_formed = False
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer + "/scope",
+                "claim {0} declares scope {1!r}, which is not one of "
+                "{2}".format(label, scope, ", ".join(WITNESS_SCOPES))))
+        if store not in WITNESS_STORES:
+            well_formed = False
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer + "/store",
+                "claim {0} declares store {1!r}, which is not one of "
+                "{2}".format(label, store, ", ".join(WITNESS_STORES))))
+        if not well_formed:
+            continue
+
+        if scope == "cross_invocation" and store not in _WITNESSING_STORES:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer,
+                "claim {0} is scoped cross_invocation over store {1}, which "
+                "does not outlive the invocation that creates it, so no "
+                "fixture this plan's gate can run observes the second "
+                "invocation the claim is about and no correct attempt "
+                "produces the evidence. A witnessing store is one of {2}: "
+                "give the claim a store the run can read back, or scope it "
+                "in_process and state the within-invocation behaviour the "
+                "gate actually shows".format(
+                    label, store,
+                    ", ".join(sorted(_WITNESSING_STORES)))))
+
+    return tuple(blockers)
+
+
 def validate_admission(ir: Mapping[str, Any]) -> Tuple[AdmissionBlocker, ...]:
-    """Both admission predicates, in one pass, collecting every blocker.
+    """All three admission predicates, in one pass, collecting every blocker.
 
     Not short-circuiting, for §11.1's reason: an author sent back twice for
     two admission defects in one document is the fail-fast validator this
-    design already refuses.
+    design already refuses. The three are over three domains — repository
+    paths, external acts, and the boundary a gate can observe — so a document
+    carrying one of each is refused once, naming all three.
     """
     return (tuple(validate_contract_surface(ir))
-            + tuple(validate_effect_authorization(ir)))
+            + tuple(validate_effect_authorization(ir))
+            + tuple(validate_claim_witness(ir)))
