@@ -1388,11 +1388,21 @@ def _bootstrap(args: argparse.Namespace) -> int:
     keys_dir = Path(layout["repository_state"]) / "keys"
     try:
         keys = route_admission.provision_keys(keys_dir)
+        # Two files, because one file put the reviewer's key into the author's
+        # shell. `maestro.env` is what an operator sources for ordinary
+        # author-side work and it carries no reviewer binding;
+        # `reviewer-hmac.env` carries that binding and nothing else, and
+        # nothing in the supported path reads it -- `plan review` injects the
+        # key itself. Both paths are reported so an operator can see which is
+        # which without opening either.
         env_file = route_admission.write_env_file(
             keys,
             verify_key_env=layout["key_env"]["verify_key_env"],
             signing_seed_env=layout["key_env"]["signing_seed_env"],
             route_verify_key_env=layout["key_env"]["route_verify_key_env"],
+        )
+        reviewer_env_file = route_admission.write_reviewer_env_file(
+            keys,
             reviewer_hmac_key_env=layout["key_env"].get(
                 "reviewer_hmac_key_env", _REVIEWER_HMAC_KEY_ENV),
         )
@@ -1434,6 +1444,7 @@ def _bootstrap(args: argparse.Namespace) -> int:
     payload = {
         "outcome": "ROUTES_ADMITTED",
         "env_file": str(env_file),
+        "reviewer_env_file": str(reviewer_env_file),
         "keys_dir": str(keys.keys_dir),
         "receipts": {item.route: str(item.path) for item in written},
         "reused": [item.route for item in written if item.reused],
