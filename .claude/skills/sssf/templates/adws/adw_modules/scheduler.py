@@ -65,6 +65,7 @@ from . import code_review as cr
 from . import launcher as lch
 from . import lifecycle as lc
 from . import plan_model as pm
+from . import reachability as rc
 from . import retry_policy as rp
 from . import scheduler_types as st
 from . import verification as vf
@@ -1363,6 +1364,18 @@ class Scheduler:
             self._settle_verdict(node, verdict, execution, record)
             return
 
+        unreachable = self._unreferenced_produced_symbols(
+            attempt, baseline, measured, after)
+        if unreachable:
+            # `min_cases` is a floor with no ceiling (#118). Evaluated here,
+            # beside the ignored-output refusal and before the commit, because
+            # it is the same kind of fact: a count taken over the measured
+            # delta that no model was asked about and no later stage recovers.
+            verdict = vf.adjudicate_reachability(unreachable, node.kind)
+            self._settle_context(context)
+            self._settle_verdict(node, verdict, execution, record)
+            return
+
         if node.kind is st.NodeKind.CODE:
             verdict = vf.verify_code_node(
                 exit_code=execution.exit_code, permission=permission,
@@ -1656,6 +1669,53 @@ class Scheduler:
                             subject_sha=record.base_sha, payload=payload),
             self.deps.store.attempts_for(self.run_id, node.node_id))
         self.deps.store.record_result(self.run_id, adjudged)
+
+    def _unreferenced_produced_symbols(
+            self, attempt: "wt.AttemptWorktree", baseline: "wt.Inventory",
+            measured: "wt.InventoryDelta", after: "wt.Inventory"
+            ) -> Tuple["rc.ProducedSymbol", ...]:
+        """The counted fact behind #118, measured over this attempt's delta.
+
+        Three sources, each read from where it is authoritative: what the
+        attempt wrote (the worktree), what stood there before it (the baseline
+        inventory's blob, so a module the attempt merely touched is not
+        adjudicated for bloat that predates the run), and the surface a
+        reference may come from — every Python path in git's universe for this
+        worktree, production and test alike.
+
+        A changed file whose base blob is not text is skipped entirely rather
+        than treated as new. Treating it as new would attribute every symbol in
+        it to this attempt, which is the false refusal this check must not
+        manufacture — and a base git could not read at all is not answered here
+        at all: `blob_text` raises, because §7.5 forbids reading a failed git
+        call as a fact about the tree.
+        """
+        written = tuple(rel for rel in measured.added + measured.changed
+                        if rel.endswith(".py"))
+        if not written:
+            return ()
+        produced: Dict[str, str] = {}
+        base_sources: Dict[str, str] = {}
+        for rel in written:
+            entry = baseline.get(rel)
+            if entry is not None:
+                prior = wt.blob_text(attempt.path, entry[1])
+                if prior is None:
+                    continue
+                base_sources[rel] = prior
+            current = _read_source(attempt.path / rel)
+            if current is not None:
+                produced[rel] = current
+        if not produced:
+            return ()
+        surface: Dict[str, str] = dict(produced)
+        for rel in after:
+            if rel in surface or not rel.endswith(".py"):
+                continue
+            source = _read_source(attempt.path / rel)
+            if source is not None:
+                surface[rel] = source
+        return rc.unreferenced(produced, surface, base_sources)
 
     def _settle_verdict(self, node: st.PlanNode, verdict: "vf.VerificationVerdict",
                         execution: NodeExecution, record: st.AttemptRecord) -> None:
@@ -2319,6 +2379,14 @@ def _check_result_reason(result: "wt.CheckResult") -> str:
     return "{0} check failed".format(result.stage)
 
 
+def _read_source(path: Path) -> Optional[str]:
+    """One file's text, or `None` for anything a parser could not read."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def _failure_detail(classification: rp.Classification,
                     verdict: Optional["vf.VerificationVerdict"]
                     ) -> Dict[str, Any]:
@@ -2353,6 +2421,12 @@ def _failure_detail(classification: rp.Classification,
         detail["clause"] = verdict.failed_clause
         if verdict.reason:
             detail["verdict"] = verdict.reason
+        if verdict.unreferenced_symbols:
+            # What the attempt must delete, located, and durable for the same
+            # reason the offending paths are: a node that exhausts its semantic
+            # budget over unreachable machinery must leave behind which symbols
+            # they were, not a sentence saying there were some.
+            detail["unreferenced_symbols"] = list(verdict.unreferenced_symbols)
         if verdict.offending_paths:
             # The paths §7.5 says justify calling a permission failure
             # SEMANTIC. They were named in the retry prompt and nowhere
