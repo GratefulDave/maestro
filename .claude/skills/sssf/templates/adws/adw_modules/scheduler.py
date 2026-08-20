@@ -1416,21 +1416,10 @@ class Scheduler:
         # already won the right to merge, and a gate after that point would be
         # judging code the scheduler had already committed to.
         if self.deps.review_attempt is not None:
-            self._require_running(record)
-            try:
-                review = self.deps.review_attempt(
-                    attempt, node, record, head, output_sha)
-            except cr.ReviewStalled:
-                # A reviewer that never reported says nothing about the code.
-                # ENVIRONMENTAL, so it spends an infra retry rather than a
-                # review attempt, and mutates no prompt — telling a builder to
-                # fix findings that were never produced would be the refund
-                # loop §7.5 convicts.
-                self._settle_failure(
-                    node, rp.Classification(
-                        retry_class=st.RetryClass.ENVIRONMENTAL,
-                        reason="the code reviewer stalled without reporting"),
-                    record=record)
+            review = self._review_with_redispatch(
+                node, record, attempt, head, output_sha)
+            if review is None:
+                # Settled inside — the attempt is already released or blocked.
                 return
             self._require_running(record)
             if not review.passed:
@@ -1441,6 +1430,125 @@ class Scheduler:
             self._require_running(record)
             self._output_shas[node.node_id] = output_sha
             store.mark_verified(self.run_id, node.node_id, output_sha)
+
+    def _review_with_redispatch(self, node: st.PlanNode, record: st.AttemptRecord,
+                                attempt: wt.AttemptWorktree, head: str,
+                                output_sha: str) -> Optional[Any]:
+        """Review this attempt's committed output, re-dispatching the *reviewer*
+        when the reviewer is what failed. `None` means the attempt was settled.
+
+        A reviewer that never reported says nothing about the code — that much
+        the stall arm always had right, and it is why this classifies
+        ENVIRONMENTAL rather than SEMANTIC and mutates no prompt. What it had
+        wrong is which actor the retry lands on. Failing the whole attempt
+        discards a tree that has already passed its post-node gate, its
+        permission check, and its post-commit cleanliness check, and re-derives
+        the node from the integration head; issue #90 recorded that happening
+        to one node four times in a row — four accepted envelopes, four passing
+        gates, zero verdicts, then `ENVIRONMENTAL_BUDGET_EXHAUSTED` on a node
+        no reviewer had ever judged. And it is not a compensation for an
+        unreliable reviewer: over the same corpus the reviewer completed 33
+        reviews and failed 7, so this is a rare, node-specific failure
+        discarding a builder commit nothing ever faulted.
+
+        The budget is the ENVIRONMENTAL one, unchanged — the class this failure
+        already belonged to — spent on re-dispatching the reviewer instead of
+        on discarding the builder. Exhausting it falls through to exactly the
+        settle this method replaced, with the reason it always wrote, so a run
+        that cannot get a verdict ends where it ended before.
+
+        **Nothing here needs the receipt lock reclaimed, and the reason is
+        worth stating because the opposite is the natural assumption.**
+        `ReceiptStore._locked` is an `fcntl.flock` held for the body of a
+        context manager over an open descriptor; the kernel releases it when
+        that descriptor closes, process death included. A `<digest>.lock` file
+        left on disk beside no receipt is the *file* `recover()` created by
+        opening it, not a lock anyone still holds. `code_review.review_attempt`
+        opens with `store.recover(subject_digest)` and then `store.has(...)`,
+        so a re-dispatch re-acquires the lock uncontended, finds no receipt,
+        and proceeds; a race that did produce two writers is already resolved
+        create-once by `ReceiptExists`. Attribution survives too — the receipt
+        carries `ReviewerIdentity(route, model, session_id)` taken from the
+        session that actually reported, which is the dispatch that produced it.
+        """
+        # Bound once. Re-reading the optional attribute inside the loop would
+        # leave every dispatch calling something the type says may be `None`,
+        # and the caller's guard is what makes it not be.
+        dispatch = self.deps.review_attempt
+        assert dispatch is not None, "the caller checks this before calling"
+        store = self.deps.store
+        budget = self.config.retry_budget(st.RetryClass.ENVIRONMENTAL)
+        while True:
+            self._require_running(record)
+            try:
+                return dispatch(attempt, node, record, head, output_sha)
+            except cr.ReviewStalled as stall:
+                facts = rp.ReviewStallFacts(
+                    output_sha=output_sha,
+                    # Read back from git *after* the stall, never remembered
+                    # from before it: the question is whether the builder's
+                    # work is still where the evidence chain says it is.
+                    surviving_sha=wt.attempt_ref_commit(
+                        self.deps.repo, self.run_id, node.node_id,
+                        record.attempt_no),
+                    dispatches_spent=rp.review_dispatches_spent(
+                        store.get_attempt(self.run_id, node.node_id,
+                                          record.attempt_no)),
+                    budget=budget,
+                    # Typed fields off the exception. `getattr` because a
+                    # `ReviewStalled` raised by a route that never opened a
+                    # session carries none of them, and an absent fact is
+                    # recorded absent rather than invented.
+                    signal=_stall_signal(stall),
+                    route=getattr(stall, "route", None),
+                    model=getattr(stall, "model", None),
+                    session_id=getattr(stall, "session_id", None),
+                    elapsed_s=getattr(stall, "elapsed_s", None),
+                    window_headroom_s=self._attempt_window_headroom(record))
+                decision = rp.classify_review_stall(facts)
+                # Recorded on **both** arms, and decided before it is written.
+                #
+                # Both arms, because `ReviewStalled.signal` is the reviewer
+                # window's own typed account of how it ended and until this row
+                # existed it had zero readers and zero durable representations:
+                # `maestro.py` records stalls with `lambda _s, _sig, _e: None`
+                # on every window factory, and the arm below writes one reason
+                # string for all four signals, so nothing on disk told
+                # ACTOR_ABANDONED from PROCESS_DEAD, TURN_TIMEOUT, or
+                # WINDOW_TIMEOUT. §3.6 B15 makes a field with no readers a
+                # build failure. Writing only the re-dispatched stalls would
+                # have left the *last* one — the one that settles the attempt,
+                # and the one an operator diagnoses from — unrecorded.
+                #
+                # Decided first, because the count this write increments is the
+                # loop's bound: reading it after the write would spend a
+                # dispatch on deciding whether to spend one.
+                store.record_review_dispatch(
+                    self.run_id, node.node_id, record.attempt_no,
+                    rp.review_dispatch_row(facts))
+                if decision.outcome is not rp.ReviewDispatchOutcome.REDISPATCH:
+                    self._settle_failure(
+                        node, rp.Classification(
+                            retry_class=st.RetryClass.ENVIRONMENTAL,
+                            reason=decision.reason),
+                        record=record)
+                    return None
+
+    def _attempt_window_headroom(self, record: st.AttemptRecord) -> Optional[float]:
+        """Seconds left in this attempt's §7.6 wall-clock window, or `None`.
+
+        `None` where it cannot be measured — an attempt row whose `started_at`
+        was never written reads `0.0`, and treating that as "no time left"
+        would refuse every re-dispatch on a ledger old enough to lack it.
+        Unmeasured is not zero.
+
+        `time.time()` and not `time.monotonic()`: `start_attempt` writes
+        `started_at` with `time.time()`, and subtracting one clock's reading
+        from another's is a number with no meaning.
+        """
+        if record.started_at <= 0:
+            return None
+        return self.config.node_timeout_s - (time.time() - record.started_at)
 
     # ── settling a failed attempt ───────────────────────────────────────────
 
@@ -2093,6 +2201,23 @@ def _with_reason(classification: rp.Classification,
 def _exception_reason(exc: BaseException) -> str:
     """Type and message, the shape `_block_quiescence` already records."""
     return "{0}: {1}".format(type(exc).__name__, exc)
+
+
+def _stall_signal(stall: BaseException) -> Optional[str]:
+    """The reviewer window's own typed account of how it ended, as its value.
+
+    `ReviewStalled.signal` is a `finalization_window.FinalizationSignal`
+    member — a closed vocabulary the window owns and this module only reads.
+    The `.value` rather than the member so the ledger stores a string it can
+    round-trip, and `str()` on anything unexpected rather than a raise: this
+    runs inside a failure handler, and a handler that raises on a shape it did
+    not anticipate turns a recoverable stall into a lost attempt.
+    """
+    signal = getattr(stall, "signal", None)
+    if signal is None:
+        return None
+    value = getattr(signal, "value", signal)
+    return value if isinstance(value, str) else str(value)
 
 
 def _check_result_reason(result: "wt.CheckResult") -> str:

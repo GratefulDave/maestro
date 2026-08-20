@@ -148,18 +148,20 @@ def load_record(path: Path, public_key: bytes) -> Dict[str, Any]:
 
 def _attempt_ref_sha(repo: Path, run_id: str, node_id: str,
                      attempt_no: int) -> Optional[str]:
-    ref = "refs/heads/{}".format(wt.branch_name(run_id, node_id, attempt_no))
-    resolved = wt._git(
-        Path(repo), "rev-parse", "--verify", "--quiet", "{}^{{commit}}".format(ref),
-        check=False)
-    if resolved.returncode == 0:
-        return resolved.stdout.strip()
-    if resolved.returncode == 1:
-        return None
-    raise SalvageRefused(
-        "SALVAGE_BRACKET_UNPROVEN",
-        f"git rev-parse of {ref} exited {resolved.returncode}: "
-        f"{resolved.stderr.strip()}")
+    """The surviving-commit read, in this verb's refusal vocabulary.
+
+    The read itself is `worktree.attempt_ref_commit`, which owns §7.5's git
+    rule — exit 1 means absent, every other nonzero is a fact about the
+    machine. It lived here privately until issue #90 needed the same read to
+    decide whether a stalled reviewer's subject still exists; two copies of one
+    rule is the shape this design convicts, so the rule moved to `worktree` and
+    this wrapper keeps only what is local: the outcome name a salvage refusal
+    is spelled with.
+    """
+    try:
+        return wt.attempt_ref_commit(Path(repo), run_id, node_id, attempt_no)
+    except wt.WorktreeError as exc:
+        raise SalvageRefused("SALVAGE_BRACKET_UNPROVEN", str(exc)) from exc
 
 
 

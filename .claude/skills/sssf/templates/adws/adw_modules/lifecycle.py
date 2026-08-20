@@ -954,6 +954,55 @@ class LifecycleStore:
         return {str(key): str(value) for key, value in payload.items()}
 
     @serialized
+    def record_review_dispatch(self, run_id: str, node_id: str, attempt_no: int,
+                               dispatch: Mapping[str, Any]) -> None:
+        """Append one typed reviewer-dispatch record to the attempt's own row.
+
+        **Not a transition, and that is the point.** The attempt is still
+        RUNNING, its base is unchanged, its commit is unchanged, and its
+        evidence chain — envelope, pane correlation, worktree path, output
+        SHA, red pre-gate, green post-gate, permission check — is unchanged
+        and complete. What happened is that one more *reviewer* was sent at
+        that same commit, which is a fact about the reviewer and about
+        nothing else. Writing it as a node transition would be the category
+        error issue #90 is made of: the reviewer's failure recorded as the
+        builder's.
+
+        The row it appends to is the same one the re-dispatch budget counts
+        (`retry_policy.review_dispatches_spent`), which is what makes the
+        budget survive a process boundary. A scheduler that crashed between
+        dispatches and resumed would otherwise re-arm the allowance, and an
+        allowance that re-arms on restart is not a bound.
+
+        Append rather than overwrite: `record_salvage`'s `extra.update` is
+        right for facts that have one value, and wrong for a sequence. A
+        malformed or absent list is replaced rather than raised on — the
+        alternative is a run that cannot make progress because an old row is
+        the wrong shape, and the count that reads it already treats a
+        non-list as zero.
+        """
+        row = self.conn.execute(
+            "SELECT extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
+        try:
+            merged = json.loads(row[0] or "{}")
+        except json.JSONDecodeError:
+            merged = {}
+        if not isinstance(merged, dict):
+            merged = {}
+        dispatches = merged.get(rp.REVIEW_DISPATCH_KEY)
+        if not isinstance(dispatches, list):
+            dispatches = []
+        merged[rp.REVIEW_DISPATCH_KEY] = dispatches + [dict(dispatch)]
+        self.conn.execute(
+            "UPDATE attempts SET extra_json=?"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (json.dumps(merged, sort_keys=True), run_id, node_id, attempt_no))
+
+    @serialized
     def record_salvage(self, run_id: str, node_id: str, attempt_no: int,
                        extra: Mapping[str, Any]) -> None:
         """Merge salvage facts into the attempt row and close it if live.

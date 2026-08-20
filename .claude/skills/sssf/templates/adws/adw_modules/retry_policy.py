@@ -352,6 +352,185 @@ def review_convergence_from_attempts(
     }
 
 
+# ── §7.5 the reviewer-side failure: retry the reviewer, not the builder ──────
+
+#: Every reviewer dispatch made against one attempt's committed output, stored
+#: on that attempt's own row. A list rather than a counter, because the count
+#: is not the only thing the ledger owes an operator: which route and model
+#: stalled, on which signal, and after how long is the difference between "the
+#: reviewer is wedged" and "this commit is too large for that context window",
+#: and neither is recoverable from a number.
+#:
+#: It lives on the attempt row rather than in process memory for the reason
+#: `GUIDANCE_KEY` does: the budget below is a `COUNT(*)` over durable rows, and
+#: a resumed scheduler that counted an in-memory list would re-arm the budget
+#: at every process boundary — which is the refund loop §7.5 convicts, arrived
+#: at through a counter that looks local and is not.
+REVIEW_DISPATCH_KEY = "review_dispatches"
+
+
+class ReviewDispatchOutcome(str, Enum):
+    """What a reviewer-side failure earns.
+
+    `REDISPATCH` sends the *reviewer* at the same commit again. `SETTLE` hands
+    the failure back to the ENVIRONMENTAL default, which is what the
+    reviewer-stall arm did unconditionally before this existed — and doing it
+    unconditionally is issue #90: the builder's committed, gate-passing tree
+    was discarded and the node re-derived from base, four times over, for a
+    failure that was never the builder's.
+    """
+
+    REDISPATCH = "REDISPATCH"
+    SETTLE = "SETTLE"
+
+
+#: Why a reviewer-side failure was not re-dispatched. Module constants, never
+#: strings composed at the call site: `_settle_failure` writes the value into
+#: the durable failure detail, and a reason an operator greps for has to be
+#: one of a closed set to be greppable at all. The decision below returns one
+#: of these *beside* its outcome; nothing ever branches on the text.
+#:
+#: `REVIEW_REDISPATCH_EXHAUSTED` is deliberately the wording the stall arm has
+#: always written. A run that exhausts its re-dispatches ends exactly where it
+#: ended before, and an operator's existing query for that reason keeps
+#: finding it.
+REVIEW_OUTPUT_UNPROVEN = "the attempt has no provable output commit to re-review"
+REVIEW_REDISPATCH_EXHAUSTED = "the code reviewer stalled without reporting"
+REVIEW_REDISPATCH_NO_HEADROOM = (
+    "the code reviewer stalled and the attempt window cannot hold another "
+    "review of the same length")
+
+
+@dataclass(frozen=True)
+class ReviewDispatchDecision:
+    """Exactly one outcome, with the reason the ledger records for it."""
+
+    outcome: ReviewDispatchOutcome
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReviewStallFacts:
+    """The typed facts one reviewer-side failure carries (§1.2).
+
+    Every field is either a git object name, a number, or a member of a closed
+    vocabulary the reviewer's own machinery defines. Nothing here is pane text,
+    prompt text, or a free-text envelope field, and nothing here is an agent's
+    claim about its own work — a stalled reviewer produced no claim, which is
+    precisely what makes this a fact about the machine.
+
+    `surviving_sha` is what the attempt's own git ref holds *now*, read back
+    after the stall rather than remembered from before it. `output_sha` is what
+    the harness committed. They are two fields and not one on purpose: equal
+    means the builder's work is still exactly where the evidence chain says it
+    is, and anything else — a moved ref, a missing ref — means the subject of
+    the re-review cannot be proven and the re-dispatch is refused.
+    """
+
+    output_sha: Optional[str]
+    surviving_sha: Optional[str]
+    dispatches_spent: int
+    budget: int
+    #: `finalization_window.FinalizationSignal`'s value — the reviewer window's
+    #: own typed account of how it ended. Carried for the ledger; the decision
+    #: below never branches on it.
+    signal: Optional[str] = None
+    route: Optional[str] = None
+    model: Optional[str] = None
+    session_id: Optional[str] = None
+    elapsed_s: Optional[float] = None
+    #: Seconds left in this attempt's §7.6 window when the stall was observed.
+    #: `None` means the caller could not measure it, which is not the same as
+    #: zero and is treated as "unmeasured" rather than as "none left".
+    window_headroom_s: Optional[float] = None
+
+
+def review_dispatches_spent(attempt: Optional[AttemptRecord]) -> int:
+    """`COUNT(*)` over the typed dispatch rows this attempt already stored.
+
+    Scoped to the attempt rather than to the node, because that is the scope
+    the fact is true within: a dispatch spent re-reviewing attempt a4's commit
+    says nothing about a5's, and counting across attempts would let one
+    attempt's wedged reviewer spend the next attempt's allowance.
+
+    A row written before this key existed carries no list and counts zero,
+    which is correct rather than merely convenient: under that code no
+    dispatch beyond the first was ever made.
+    """
+    if attempt is None:
+        return 0
+    stored = (attempt.extra or {}).get(REVIEW_DISPATCH_KEY)
+    if not isinstance(stored, list):
+        return 0
+    return len(stored)
+
+
+def review_dispatch_row(facts: "ReviewStallFacts") -> Dict[str, Any]:
+    """One dispatch record, as the attempt row stores it.
+
+    `dispatch_no` is derived from the count rather than passed in, so the
+    stored sequence cannot disagree with the budget that counts it.
+    """
+    return {
+        "output_sha": facts.output_sha,
+        "surviving_sha": facts.surviving_sha,
+        "dispatch_no": facts.dispatches_spent + 1,
+        "signal": facts.signal,
+        "route": facts.route,
+        "model": facts.model,
+        "session_id": facts.session_id,
+        "elapsed_s": facts.elapsed_s,
+    }
+
+
+def classify_review_stall(facts: "ReviewStallFacts") -> ReviewDispatchDecision:
+    """§7.5 applied to the actor that actually failed.
+
+    A reviewer that never reported says nothing about the code, which is why
+    the stall arm has always classified ENVIRONMENTAL. What it also says
+    nothing about is the *builder*, and that half was missing: the whole
+    attempt was failed, so a committed tree that had passed its post-node gate
+    and its permission check was discarded and the node re-derived from the
+    integration head. Issue #90 measured the cost — four attempts, four
+    accepted envelopes, four passing gates, zero verdicts, and a node blocked
+    `ENVIRONMENTAL_BUDGET_EXHAUSTED` having never once been reviewed — and the
+    growth it causes: each restart replays the retry guidance ledger, so every
+    cycle produced a larger implementation of the same requirement.
+
+    The retry that matches the failure is another *reviewer* against the same
+    commit. Three facts decide it, all structural:
+
+    1. There is an output commit, and the attempt's own ref still holds it.
+       Without that the subject of the re-review is unproven, and re-reviewing
+       something other than what the evidence chain names is worse than not
+       re-reviewing at all.
+    2. The re-dispatch budget is not spent. It is the ENVIRONMENTAL budget —
+       the class this failure already belonged to — spent on re-dispatching
+       the reviewer rather than on discarding the builder.
+    3. The attempt's §7.6 window can still hold a review of the length the one
+       that just stalled took. Without this the re-dispatch converts a
+       reviewer stall into a `NODE_TIMEOUT` and discards the same commit one
+       horizon later, which is the failure this function exists to stop.
+
+    None of the three reads text. `surviving_sha` is `git rev-parse` over the
+    attempt's own ref, `dispatches_spent` is a count of durable rows, and the
+    headroom is arithmetic over two numbers the attempt row and the config
+    already carry.
+    """
+    if not facts.output_sha or facts.surviving_sha != facts.output_sha:
+        return ReviewDispatchDecision(
+            ReviewDispatchOutcome.SETTLE, REVIEW_OUTPUT_UNPROVEN)
+    if facts.dispatches_spent >= facts.budget:
+        return ReviewDispatchDecision(
+            ReviewDispatchOutcome.SETTLE, REVIEW_REDISPATCH_EXHAUSTED)
+    if (facts.window_headroom_s is not None and facts.elapsed_s is not None
+            and facts.window_headroom_s < facts.elapsed_s):
+        return ReviewDispatchDecision(
+            ReviewDispatchOutcome.SETTLE, REVIEW_REDISPATCH_NO_HEADROOM)
+    return ReviewDispatchDecision(
+        ReviewDispatchOutcome.REDISPATCH, REVIEW_REDISPATCH_EXHAUSTED)
+
+
 # ── guidance, made durable ───────────────────────────────────────
 
 #: The extra key each entry is stored under on the attempt that produced it.

@@ -253,6 +253,37 @@ def is_attempt_output_commit(repo: Path, output_sha: str, *, run_id: str,
     return resolved.returncode == 0 and resolved.stdout.strip() == output_sha
 
 
+def attempt_ref_commit(repo: Path, run_id: str, node_id: str,
+                       attempt_no: int) -> Optional[str]:
+    """The commit this attempt's own durable ref holds, or `None` if absent.
+
+    The surviving-commit read. `commit_measured_delta` advances
+    `refs/heads/maestro/{run}/{node}/a{n}` by compare-and-swap, so this ref is
+    where a builder's work outlives the process that produced it — and asking
+    it *again*, after some later step failed, is the difference between "the
+    tree is still there" and an in-memory SHA a caller happens to remember.
+    Issue #90's re-review of a stalled reviewer's subject reads it; so does
+    salvage, which is why it lives here rather than privately in either.
+
+    §7.5's git rule is enforced, not approximated. Only `rev-parse`'s
+    documented exit 1 means the ref is absent; every other nonzero exit is a
+    fact about the machine and raises, because reporting a transient git
+    failure as "the commit is gone" is how a caller decides to discard work
+    that is sitting on disk.
+    """
+    ref = "refs/heads/{}".format(branch_name(run_id, node_id, attempt_no))
+    resolved = _git(
+        Path(repo), "rev-parse", "--verify", "--quiet", "{}^{{commit}}".format(ref),
+        check=False)
+    if resolved.returncode == 0:
+        return resolved.stdout.strip()
+    if resolved.returncode == 1:
+        return None
+    raise WorktreeError(
+        "git rev-parse of {0} exited {1}: {2}".format(
+            ref, resolved.returncode, resolved.stderr.strip()))
+
+
 # ── §8.2 identity ───────────────────────────────────────────────────────────
 
 def branch_name(run_id: str, node_id: str, attempt_no: int) -> str:

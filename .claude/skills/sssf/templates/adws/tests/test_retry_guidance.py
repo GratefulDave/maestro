@@ -331,11 +331,19 @@ class ReviewStalledClassificationTests(SchedulerFixture):
     No test drove that arm; this one does, and it also pins the §7.5 contract
     around it: a stall spends an infra retry, mutates no prompt, and its
     reason reaches the durable transition row.
+
+    **What the stall spends changed with issue #90 and this test changed with
+    it.** It used to assert two builder launches, because the stall failed the
+    whole attempt and the node was re-derived from the integration head — which
+    is the defect, asserted as the contract. The infra retry is now spent on
+    re-dispatching the *reviewer* against the attempt's existing commit, so the
+    builder launches once; the durable ENVIRONMENTAL row and its reason arrive
+    only once the re-dispatch budget is spent, which is what the second case
+    below drives. `tests/test_reviewer_redispatch.py` holds the rest.
     """
 
-    def test_a_reviewer_stall_is_environmental_and_its_reason_is_durable(self):
+    def test_a_reviewer_stall_does_not_re_run_the_builder(self):
         from adw_modules import code_review as cr
-        from adw_modules import lifecycle as lc
 
         class _Stall(cr.ReviewStalled):
             def __init__(self):
@@ -358,8 +366,28 @@ class ReviewStalledClassificationTests(SchedulerFixture):
         self.assertIs(node.state, st.NodeState.MERGED)
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
-        # A stall says nothing about the code: no prompt mutation (§7.5).
-        self.assertEqual(self.prompts["a"], [None, None])
+        # A stall says nothing about the code: no prompt mutation (§7.5) and,
+        # since #90, no second builder either.
+        self.assertEqual(self.prompts["a"], [None])
+        self.assertEqual(calls["n"], 2)
+
+    def test_an_exhausted_redispatch_budget_is_environmental_and_durable(self):
+        from adw_modules import code_review as cr
+        from adw_modules import lifecycle as lc
+
+        class _Stall(cr.ReviewStalled):
+            def __init__(self):
+                RuntimeError.__init__(self, "stall")
+
+        self.written = {"a": {"a.py": "A\n"}}
+
+        def review_attempt(attempt, node, record, base_sha, output_sha):
+            raise _Stall()
+
+        self.schedule(
+            [self.agent("a")],
+            config=self.config(environmental_retries=1, semantic_ceiling=1),
+            deps=self.deps(review_attempt=review_attempt)).run()
 
         # The classifier's reason survives into the durable transition row —
         # the evidence gap `_failure_detail` closes, now closed for stalls too.
