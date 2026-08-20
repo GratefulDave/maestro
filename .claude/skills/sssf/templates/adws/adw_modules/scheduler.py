@@ -1256,7 +1256,13 @@ class Scheduler:
             self._quiesce(record, "pre-baseline")
         self._require_running(record)
 
-        if pre_verdict is not None and pre_verdict.green:
+        # §7.4 clause 2, asked of the predicate rather than re-derived here.
+        # A repair attempt's base is the rejected diff, whose post-gate had to
+        # have PASSED for review to run on it at all, so its pre-gate is green
+        # by construction; the witness clause 2 wants was taken at the chain
+        # root's base, which `basis.integration_head` records.
+        if pre_verdict is not None and vf.pre_gate_not_falsifiable(
+                pre_verdict, repairing=basis is not None):
             self._settle_context(context)
             self._settle_failure(
                 node, rp.Classification(
@@ -1389,7 +1395,7 @@ class Scheduler:
             verdict = vf.verify_agent_node(
                 envelope_parsed=execution.envelope_parsed,
                 pre_gate=pre_verdict, post_gate=_pending_gate(),
-                permission=permission)
+                permission=permission, repairing=basis is not None)
 
         if not verdict.verified and verdict.failed_clause != 3:
             self._settle_context(context)
@@ -1433,7 +1439,7 @@ class Scheduler:
                 envelope_parsed=execution.envelope_parsed,
                 pre_gate=pre_verdict,
                 post_gate=vf.adjudicate_gate(post, node.gate_min_cases),
-                permission=permission)
+                permission=permission, repairing=basis is not None)
             if not verdict.verified:
                 self._settle_context(context)
                 self._settle_verdict(node, verdict, execution, record)

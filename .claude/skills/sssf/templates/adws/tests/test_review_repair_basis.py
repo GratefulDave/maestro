@@ -53,9 +53,11 @@ from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import verification as vf  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
 
-from test_scheduler import SchedulerFixture, _git, green, red  # noqa: E402
+from test_scheduler import (  # noqa: E402
+    SchedulerFixture, _git, green, red, unparseable)
 
 
 class _Cell:
@@ -679,6 +681,195 @@ class AttemptRowReadersTests(unittest.TestCase):
             rp.repaired_findings_count([first, second], second), 2)
         self.assertIsNone(rp.repaired_findings_count([first, second], first))
         self.assertIsNone(rp.repaired_findings_count([second], second))
+
+
+# ── §7.4 clause 2 over a repair base ────────────────────────────────────────
+
+class RepairFalsifiabilityTests(RepairFixture):
+    """The repair loop was dead on arrival, and none of the 32 tests above
+    could see it, because every one of them let the fixture script the gate
+    independently of the tree.
+
+    §7.4 requires an agent node's pre-node gate to FAIL at the attempt's
+    actual base. Review only ever runs on an attempt whose **post-node gate
+    PASSED**, so a rejected diff always leaves a tree where this node's gate
+    is green — and a repair attempt bases on exactly that tree. Its pre-gate
+    is therefore green by construction, clause 2 convicted it, and the node
+    blocked `GATE_NOT_FALSIFIABLE` with `launched_at` null and `turn_count`
+    zero: the agent was never launched at all. Run
+    `run-7034bdf98d5342acafc61c439c2caa58`, node `lane-p5-gap-policy`,
+    attempt 2, whose row carried a well-formed
+    `repair_of = {attempt_no: 1, chain_length: 1, integration_head: ...}`
+    beside a block reason that made the repair unreachable.
+
+    It was also a regression. Before the repair basis existed, a rejection
+    restarted the node from a fresh base where the gate was red, so the
+    agent ran; afterwards the same rejection hard-blocked the node and the
+    run with it.
+
+    These tests script the pre-gate the way a real tree produces it -- red at
+    the node's own base, green at a repair base -- which is the one thing the
+    fixture above never did.
+    """
+
+    def _rejected_then_accepted(self):
+        return [reject(2, "d1"), _Review(True, digest="d2")]
+
+    def rows(self, node_id: str = "a"):
+        return sorted(self.store.attempts_for("run1", node_id),
+                      key=lambda row: row.attempt_no)
+
+    def test_a_repair_attempt_whose_pre_gate_is_green_still_launches(self):
+        """The production failure, end to end.
+
+        The repair attempt's pre-gate passes at its own base -- as it must,
+        since that base is a tree whose post-gate passed -- and the attempt
+        proceeds anyway, because clause 2's witness was taken at the chain
+        root and is inherited rather than re-established.
+
+        `launched_at` is the typed fact that separates this from the defect:
+        the blocked attempt never reached a launch, so a row that carries one
+        cannot be the blocked shape. Asserting MERGED alongside it also pins
+        `retry_policy.classify`'s own copy of this rule closed -- a repair
+        that reached settle and re-derived GATE_NOT_FALSIFIABLE there would
+        block the node just the same, and this node would not be MERGED.
+        """
+        self.gate_script[("a", "pre")] = [red(), green()]
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(review_ceiling=4),
+            deps=self.deps(run_node=self.per_attempt_builder(),
+                           review_attempt=self.scripted_reviewer(
+                               self._rejected_then_accepted()))
+        ).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.state, st.NodeState.MERGED)
+        self.assertIsNone(node.block_reason)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+        rows = self.rows()
+        self.assertEqual([row.attempt_no for row in rows], [1, 2])
+        # The second attempt is a repair, and it launched.
+        self.assertEqual(rows[1].repair_of_attempt, 1)
+        self.assertEqual(rows[1].base_sha,
+                         rows[0].extra[rp.REVIEW_OUTPUT_SHA_KEY])
+        self.assertIsNotNone(rows[1].launched_at)
+        self.assertTrue(rows[1].armed)
+        # And the builder was actually dispatched for it, twice in total.
+        self.assertEqual(len(self.prompts["a"]), 2)
+
+    def test_a_non_repair_attempt_whose_pre_gate_is_green_still_blocks(self):
+        """§7.4's guarantee for everything that is not a repair, unchanged.
+
+        No rejection has happened, so `basis` is `None`, `base` is the
+        integration head, and a green pre-gate there is the vacuous
+        acceptance clause 2 exists to catch. The carve-out must not reach it.
+        """
+        self.gate_script[("a", "pre")] = [green()]
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(review_ceiling=4),
+            deps=self.deps(run_node=self.per_attempt_builder(),
+                           review_attempt=self.scripted_reviewer(
+                               [_Review(True, digest="d1")]))
+        ).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIs(node.state, st.NodeState.BLOCKED)
+        self.assertIs(node.block_reason, st.BlockReason.GATE_NOT_FALSIFIABLE)
+        self.assertIn(node.block_reason, st.NON_RETRYABLE)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+        # The agent was never launched, and no reviewer was ever dispatched.
+        self.assertNotIn("a", self.prompts)
+        self.assertEqual(self.reviewed, [])
+        rows = self.rows()
+        self.assertEqual([row.attempt_no for row in rows], [1])
+        self.assertIsNone(rows[0].launched_at)
+        self.assertIsNone(rows[0].repair_of_attempt)
+
+    def test_a_repair_attempt_whose_pre_gate_is_red_is_untouched(self):
+        """A red pre-gate at a repair base is an ordinary falsifiable
+        attempt, and nothing about it changes. `repairing` widens what clause
+        2 accepts; it never narrows what it demands."""
+        self.gate_script[("a", "pre")] = [red(), red()]
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(review_ceiling=4),
+            deps=self.deps(run_node=self.per_attempt_builder(),
+                           review_attempt=self.scripted_reviewer(
+                               self._rejected_then_accepted()))
+        ).run()
+
+        self.assertIs(self.store.get_node("run1", "a").state,
+                      st.NodeState.MERGED)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        rows = self.rows()
+        self.assertEqual(rows[1].base_sha,
+                         rows[0].extra[rp.REVIEW_OUTPUT_SHA_KEY])
+        self.assertIsNotNone(rows[1].launched_at)
+
+
+class RepairFalsifiabilityPredicateTests(unittest.TestCase):
+    """The predicate itself, where the three inputs are separable.
+
+    The scheduler tests above cannot isolate an unparseable pre-gate from the
+    retry that follows it, and the distinction matters: an unparseable gate is
+    a fact about the runner, not about the witness, so it stays ENVIRONMENTAL
+    on both sides of the carve-out (§10.2).
+    """
+
+    def verdict(self, result, repairing):
+        return vf.verify_agent_node(
+            envelope_parsed=True,
+            pre_gate=vf.adjudicate_pre_gate(result, min_cases=1),
+            post_gate=vf.adjudicate_gate(green(), min_cases=1),
+            permission=wt.PermissionVerdict(passes=True),
+            repairing=repairing)
+
+    def test_the_predicate_answers_the_two_cases_directly(self):
+        self.assertTrue(vf.pre_gate_not_falsifiable(
+            vf.adjudicate_pre_gate(green(), min_cases=1)))
+        self.assertFalse(vf.pre_gate_not_falsifiable(
+            vf.adjudicate_pre_gate(green(), min_cases=1), repairing=True))
+        self.assertFalse(vf.pre_gate_not_falsifiable(
+            vf.adjudicate_pre_gate(red(), min_cases=1)))
+        self.assertFalse(vf.pre_gate_not_falsifiable(
+            vf.adjudicate_pre_gate(red(), min_cases=1), repairing=True))
+
+    def test_repairing_defaults_to_false(self):
+        """Every existing caller keeps §7.4's rule byte for byte, and a new
+        caller that forgets the argument fails closed rather than open."""
+        verdict = vf.verify_agent_node(
+            envelope_parsed=True,
+            pre_gate=vf.adjudicate_pre_gate(green(), min_cases=1),
+            post_gate=vf.adjudicate_gate(green(), min_cases=1),
+            permission=wt.PermissionVerdict(passes=True))
+        self.assertIs(verdict.block_reason,
+                      st.BlockReason.GATE_NOT_FALSIFIABLE)
+
+    def test_a_green_pre_gate_blocks_clause_two_unless_repairing(self):
+        blocked = self.verdict(green(), repairing=False)
+        self.assertFalse(blocked.verified)
+        self.assertEqual(blocked.failed_clause, 2)
+        self.assertIs(blocked.block_reason,
+                      st.BlockReason.GATE_NOT_FALSIFIABLE)
+
+        repaired = self.verdict(green(), repairing=True)
+        self.assertTrue(repaired.verified)
+        self.assertIsNone(repaired.block_reason)
+
+    def test_an_unparseable_pre_gate_is_environmental_for_both(self):
+        """Not a witness question. `repairing` must not convert a broken
+        runner into an accepted clause 2."""
+        for repairing in (False, True):
+            with self.subTest(repairing=repairing):
+                verdict = self.verdict(unparseable(), repairing=repairing)
+                self.assertFalse(verdict.verified)
+                self.assertEqual(verdict.failed_clause, 2)
+                self.assertIsNone(verdict.block_reason)
+                self.assertIs(verdict.retry_class,
+                              st.RetryClass.ENVIRONMENTAL)
 
 
 if __name__ == "__main__":

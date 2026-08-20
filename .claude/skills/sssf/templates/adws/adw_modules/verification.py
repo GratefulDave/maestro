@@ -239,14 +239,53 @@ def _permission_paths(permission: "wt.PermissionVerdict") -> Tuple[str, ...]:
     return tuple(permission.conjunct1_violations) + tuple(permission.conjunct2_violations)
 
 
+def pre_gate_not_falsifiable(pre_gate: GateVerdict,
+                             repairing: bool = False) -> bool:
+    """§7.4 clause 2, as the one predicate every caller asks.
+
+    The rule is unchanged for every attempt that opens at the integration
+    head: a green pre-gate cannot witness this node's behaviour, so it is
+    `GATE_NOT_FALSIFIABLE` — terminal and non-retryable, since re-running an
+    agent cannot make a gate falsifiable.
+
+    **A repair attempt is the one attempt whose base is not the head, and
+    evaluating this rule there is unsatisfiable by construction.** A repair
+    bases on the rejected attempt's *output* commit, and review only ever
+    runs on an attempt whose post-node gate already PASSED — so the tree a
+    repair starts from is one where this node's gate is green, always. Asked
+    at the repair base, clause 2 blocked every repair attempt before the
+    agent was launched, which made the repair loop unreachable and regressed
+    the node to a hard block where a fresh base had previously retried.
+
+    The witness is not re-established per attempt; it is **inherited from the
+    chain root**. A repair chain descends by construction from an attempt
+    that branched from the integration head and passed clause 2 there —
+    `decide_repair` admits a basis only over a *proven* output commit of the
+    prior attempt at a head that has not moved — so `repairing` asserts a fact
+    already established, not a fact waived. It needs no new persisted field:
+    `extra_json.repair_of.integration_head` already records the base the
+    witness was taken at, and `AttemptRecord.integration_head` already reads it.
+
+    A **red** pre-gate at a repair base is untouched: an ordinary falsifiable
+    attempt, and the caller proceeds as it does for any other. An unparseable
+    pre-gate is not this predicate's business at all — that is a fact about
+    the runner rather than about the witness, and stays ENVIRONMENTAL for
+    repair and non-repair alike (§10.2).
+    """
+    return pre_gate.green and not repairing
+
+
 def verify_agent_node(envelope_parsed: bool,
                       pre_gate: GateVerdict,
                       post_gate: GateVerdict,
-                      permission: "wt.PermissionVerdict") -> VerificationVerdict:
+                      permission: "wt.PermissionVerdict",
+                      repairing: bool = False) -> VerificationVerdict:
     """§7.3's four clauses for an agent node.
 
     1. the terminal envelope **parses** as a typed envelope (§10.1);
-    2. the **pre-node gate FAILED** at this attempt's actual base (§7.4);
+    2. the **pre-node gate FAILED** at this attempt's actual base (§7.4) —
+       or, for a repair attempt, at the base its chain root took the witness
+       at, which is what `repairing` carries (`pre_gate_not_falsifiable`);
     3. the **post-node gate PASSED** under §10.2's counting rule;
     4. the worktree delta passes §8.3's two-conjunct permission check.
 
@@ -274,7 +313,7 @@ def verify_agent_node(envelope_parsed: bool,
         return VerificationVerdict(
             verified=False, failed_clause=2, reason=pre_gate.reason,
             retry_class=st.RetryClass.ENVIRONMENTAL)
-    if pre_gate.green:
+    if pre_gate_not_falsifiable(pre_gate, repairing):
         return VerificationVerdict(
             verified=False, failed_clause=2,
             reason=("the pre-node gate passed at this attempt's base, so it "
