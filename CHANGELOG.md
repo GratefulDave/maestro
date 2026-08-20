@@ -464,6 +464,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A review rejection now repairs the diff it rejected instead of discarding it (PR #111). A
+  rejection classified SEMANTIC recycled the attempt, and the next attempt branched from the
+  integration head like any other, so the builder was asked to implement the node again from an
+  empty file with the reviewer's findings carried across as text. Consecutive attempts were
+  independent implementations rather than iterations of one artifact: `lane-p5-gap-policy` of run
+  `fb9973646d344400a9e4f4d7818d00f2` produced 2, 2, 1, and 3 findings across four rejections with
+  the same `base_sha` on every attempt row, and the one-finding tree was deleted rather than
+  corrected.
+
+  `retry_policy.decide_repair` now selects the base. It is five structural refusals and an
+  admission, reading a git object name, a count of durable rows, and members of closed
+  vocabularies — never the reviewer's prose. A repair is admitted only when the previous attempt
+  was SEMANTIC and carried `review_rejected`, when the commit it stored is exactly what that
+  attempt's own ref still publishes, when the integration head has not moved, when the chain is
+  under `REPAIR_CHAIN_LIMIT`, and when the last repair did not raise more findings than the
+  rejection it repaired. Every refusal falls back to the fresh base used before, so nothing here
+  can block a node. `render_guidance` prepends a repair block naming the commit in the tree and
+  stating that the work is to be changed rather than written; it renders before the surfaces
+  divide the character budget, so truncation never turns a repair prompt into an implement
+  prompt. The loop adds no attempts — it changes only what an attempt the review budget had
+  already paid for starts from.
+
+- `maestro run convergence` no longer reports a live run as one that already ended (PR #112).
+  The verdict partitioned the derived run state into finished and not finished with no third
+  answer, so a run between polls printed "not converged — run ended first" beside the live attempt
+  rows the same report had just rendered. `lifecycle.run_in_flight` now answers `True`, `False`, or
+  `None`, composing the derived state with scheduler liveness rather than adding a third derivation
+  of either, and `None` renders as unknown instead of collapsing onto either boolean. A run that
+  has not finished reports "not converged yet" with cause `run still in flight`.
+
 - A destroyed Herdr workspace no longer burns the launcher budget on relaunches that cannot
   succeed (issue #79). `HerdrLauncher` memoizes the run's workspace id — deliberately, since that
   is what makes a run's placement a property of the run rather than of wherever focus happens to

@@ -69,31 +69,35 @@ you touched, and mirror deliberately rather than assuming a mirror already happe
 **State as of 2026-08-20, re-derived by running both the tool and the test.**
 `tests/test_template_parity.py` **passes** from this repo — both assertions, same-files and
 byte-identical-contents — and `runtime_sync.py check` agrees: template and the-library are level
-over **200** compared files. That is after three branches landed here today (#104, the
+over **201** compared files. That is after five branches landed here today (#104, the
 `maestro-plan.v2` bump and the pre-v2 run refusal; #105, the reviewer-key environment split; #106,
-the finalization turn clock gated on route liveness) and the-library was brought level by
-`runtime_sync.py mirror --apply --commit` in its PR #120. The 2026-08-19 reading recorded here
-(189 files) is superseded rather than wrong: the count moves whenever a test file is added, which
-is exactly why it dates a snapshot instead of describing an invariant.
+the finalization turn clock gated on route liveness; PR #111, a review rejection repairing the
+diff it rejected instead of re-implementing the node; PR #112, `run convergence` no longer
+reporting a live run as one that already ended) and the-library was brought level by
+`runtime_sync.py mirror --apply` in its PR #121. Earlier readings recorded here (189, then 200
+files) are superseded rather than wrong: the count moves whenever a test file is added, which is
+exactly why it dates a snapshot instead of describing an invariant.
 
 Two qualifications outrank any such snapshot, this one included. **the-library's mirror can be
-uncommitted there.** It is committed as of 2026-08-20 — 200 tracked files under
+uncommitted there.** It is committed as of 2026-08-20 — 201 tracked files under
 `skills/sssf/templates/adws/`, nothing modified or untracked under that path, and `main` level with
-its remote after PR #120 — but it has been uncommitted before, and the check that would catch it is
+its remote after PR #121 — but it has been uncommitted before, and the check that would catch it is
 not the parity test. A green parity run or a `runtime_sync check` says the bytes on disk agree; it
 says nothing about whether they are committed, and an agent that resets or checks out in that
 repository takes an uncommitted mirror with it. Confirm with `git status` there, not with parity.
 That repository also carries unrelated work — 14 modified and 10 untracked files elsewhere in its
-tree, both before and after this mirror. `runtime_sync.py mirror --commit` stages only the paths it
-wrote, which is what preserves them; a `git add -A` in that repo would sweep them into a commit
-claiming to be a mirror. And the differing set moves while it is being measured, because other lanes
+tree, identical sets before and after this mirror, verified by diffing the two `git status` outputs.
+Stage only the paths the mirror wrote — `git add skills/sssf/templates/adws` — which is what
+preserves them; a `git add -A` in that repo would sweep them into a commit claiming to be a
+mirror. And the differing set moves while it is being measured, because other lanes
 write into this template concurrently: an earlier observation watched
 `test_agent_start_busy_retry.py` go from clean to modified minutes apart. Any comparison between
 these copies is a reading of a moving tree — run the test, do not trust this paragraph.
 
-Both deployments **track** `adws/` in git — `lexgenius` at 203 files on branch
-`chore/mirror-adws-runtime`, `lexgenius-pipeline` on `parked/cmo-consolidation-l-run`, each under a
-commit named "Mirror ADW runtime from maestro into …". The earlier reading here recorded `adws/` as
+Both deployments **track** `adws/` in git — `lexgenius` at 211 files on branch
+`chore/mirror-adws-runtime`, `lexgenius-pipeline` at 208 on `parked/cmo-consolidation-l-run`, each
+under a commit named "Mirror the ADW runtime from maestro into this deployment". The earlier
+reading here recorded `adws/` as
 *entirely untracked* in lexgenius-pipeline, which meant git would neither preserve nor notice a
 change to it; that hazard is closed for both, and a mirror there is now a reviewable diff rather
 than an invisible overwrite.
@@ -103,22 +107,25 @@ reports a filename without saying which side is ahead:
 
 | comparison | result |
 | --- | --- |
-| template ↔ the-library | level over 200 files |
-| template ↔ `lexgenius/adws/` | 24 files differ; 7 more exist only in the template |
-| template ↔ `lexgenius-pipeline/adws/` | **not re-derived on 2026-08-20** — see below |
+| template ↔ the-library | level over 201 files |
+| template ↔ `lexgenius/adws/` | level over 200 files (`maestro.config.yaml` held out) |
+| template ↔ `lexgenius-pipeline/adws/` | level over 200 files (`maestro.config.yaml` held out) |
 
-lexgenius-pipeline was deliberately left untouched: a Maestro run was executing in that repository
-while this reading was taken, and nothing — not a mirror, not a `check`, not a maestro verb — was
-pointed at it. Its last recorded reading (2026-08-19, level over 188 files with
-`maestro.config.yaml` held out) is therefore stale by construction, because three changes have
-landed in this template since. Do not quote that number as current; re-derive it when the repository
-is idle.
+All three were brought level on 2026-08-20, and both deployments' mirrors are committed on their
+own branches. The run that had been executing in lexgenius-pipeline is dead — its scheduler was
+killed and its panes closed — so that repository was writable again and was mirrored with the
+others.
 
-Of the 24 files differing from `lexgenius`, the template is ahead on 23 — `maestro.py` by 584 lines,
-`tests/test_finalization_window.py` by 633 — and `lexgenius` is ahead on exactly one,
-`tests/test_node_write_scope.py`, by a single line; that one is the case a mirror would destroy and
-`runtime_sync` refuses. The 7 present only in the template are all tests, and a file present in one
-copy and not the other is a deletion rather than an edit. Issue #71 tracks the per-file decision.
+`lexgenius` was the one that needed a decision, and issue #71's per-file question is now answered.
+The three files it had genuinely been ahead on are no longer ahead: `adw_modules/deliver.py` and
+`tests/test_step10_cli.py` were already byte-identical, and the template's `tests/test_deliver.py`
+turned out to be a strict superset of the deployment's — zero lines existed only there, and
+`DeliverReleaseSafetyTest`, the class issue #95 records a previous mirror destroying, is present in
+the template. Exactly one file was still ahead in the deployment, `tests/test_node_write_scope.py`
+by a single line: a `record_stall` keyword argument the template deliberately removed when the
+re-dispatch lock test stopped taking a stall recorder. Keeping it would have failed against the
+runtime now in that tree, so it was overwritten with `--overwrite-ahead`, which is the only use of
+that flag here and was taken after reading the line rather than in place of reading it.
 
 Mirroring a deployment costs something it did not cost before. #104 makes a `maestro-plan.v1` plan
 **unrunnable** at run start (`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`); the remedy is to re-ship the plan
@@ -127,10 +134,8 @@ Mirroring this template into a deployment that holds shipped v1 plans refuses th
 are re-shipped, so sequence the mirror against what is running there rather than treating it as a
 neutral copy.
 
-`_node_goal` answers `1` in `lexgenius` as of 2026-08-20, so that deployment's reviewers are not
-judging against the placeholder. The same was true of lexgenius-pipeline when it was last read on
-2026-08-19; it was not re-read on 2026-08-20, for the reason above. lexgenius-pipeline was
-brought level by hand on 2026-08-18, after the divergence had already been paid for by run
+`_node_goal` answers `1` in **both** deployments as of 2026-08-20, so no deployment's reviewers are
+judging against the placeholder. lexgenius-pipeline was brought level by hand on 2026-08-18, after the divergence had already been paid for by run
 `run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told "Make the gate '…' pass over
 selector '…', changing only the declared outputs" verbatim while the plan it was running carried the
 correct instruction (§19 M13).
