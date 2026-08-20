@@ -1,4 +1,4 @@
-"""The twelve deterministic obligations, and the typed blockers (§6.4).
+"""The fourteen deterministic obligations, and the typed blockers (§6.4).
 
 `maestro plan validate` runs every obligation and emits exactly one outcome
 (§11.1). `FINALIZATION_ELIGIBLE` carries the canonical digest and publishes
@@ -7,7 +7,9 @@ the plan, launches no reviewer, and publishes nothing — the blocked result
 has no digest field to publish, so "publishes nothing" is a shape rather
 than a promise.
 
-Eleven of the twelve are computed from git objects alone. The two facts that
+Thirteen of the fourteen are computed from the stored bytes and git objects
+alone — the last two of the fourteen need neither, being pure functions over
+the parsed plan. The two facts that
 are not git facts enter through injected protocol seams rather than being
 reached for directly:
 
@@ -33,9 +35,34 @@ and §6.4 fixes both:
   nothing to do. Every other gate is checked for the collection count as
   stated. Both arms require a selector to exist at all.
 
+Two more obligations are gate *scope* rather than gate executability, and
+they were checks a prose reviewer used to be asked (§3.6 B12's rubric,
+`gate.selector_is_scoped_to_this_node` and
+`gate.selector_covers_the_merged_surface`). A reviewer answering them was
+answering a question a pure function over `Gate.argv` and the nodes'
+declared `outputs` decides exactly, so they are refusals here instead:
+
+* **`GATE_SELECTOR_NODE_SCOPED`** — a node's gate selector may name that
+  node's own outputs, or paths no node in the plan claims; it may not reach
+  into a *sibling's* declared output. The literal rubric question was
+  stricter — selector paths a subset of this node's outputs — and would
+  refuse plans `GATE_EXECUTABLE` deliberately admits, where a gate names a
+  test file that already exists at base and no node owns. This is the weaker
+  form, and it still convicts the defect the rubric was written for: a node
+  accepting on a lane it does not build.
+* **`INTEGRATION_GATE_COVERS_LANES`** — the integration gate is the plan's
+  one whole-suite gate (§6.2, §8.8), so a selector naming *no* path covers
+  the merged surface by construction and passes. A selector naming paths
+  must contain every node gate's selector paths under posix prefix
+  containment; a node gate whose own selector names no path is covered only
+  by the whole-suite case, because there is no path to contain. Each lane's
+  own gate selector is the definition of that lane's test surface: deciding
+  which of a node's `outputs` is a *test* output would need a naming
+  heuristic, which is the judgment this promotion exists to remove.
+
 Blockers are collected rather than raised one at a time: §11.1 emits typed
-blockers, plural, and a fail-fast validator makes an author fix twelve plans
-instead of one. The single exception is a plan that does not parse, where
+blockers, plural, and a fail-fast validator makes an author fix fourteen
+plans instead of one. The single exception is a plan that does not parse, where
 nothing downstream has a model to run against.
 """
 
@@ -62,7 +89,13 @@ from . import runner_resolution as rr
 
 
 class Obligation(str, Enum):
-    """The twelve, in §6.4's order."""
+    """The fourteen, in §6.4's order.
+
+    The last two arrived from the plan-review rubric rather than from §6.4's
+    original list: they were the only two of its eleven checks that a pure
+    function over the stored plan decides with no judgment about prose, so
+    they are stated here as refusals instead of being asked of a reviewer.
+    """
 
     CLOSED_PARSE = "CLOSED_PARSE"
     REFERENCES_RESOLVE_ONCE = "REFERENCES_RESOLVE_ONCE"
@@ -76,9 +109,11 @@ class Obligation(str, Enum):
     REVIEW_PAYLOAD_BUDGET = "REVIEW_PAYLOAD_BUDGET"
     LINEAGE_RESOLVES = "LINEAGE_RESOLVES"
     GATE_CORE_UNSHARED = "GATE_CORE_UNSHARED"
+    GATE_SELECTOR_NODE_SCOPED = "GATE_SELECTOR_NODE_SCOPED"
+    INTEGRATION_GATE_COVERS_LANES = "INTEGRATION_GATE_COVERS_LANES"
 
 
-#: Named as a tuple as well as an enum so "twelve" is a checkable count
+#: Named as a tuple as well as an enum so "fourteen" is a checkable count
 #: rather than a sentence in a docstring.
 OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.CLOSED_PARSE,
@@ -93,6 +128,8 @@ OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.REVIEW_PAYLOAD_BUDGET,
     Obligation.LINEAGE_RESOLVES,
     Obligation.GATE_CORE_UNSHARED,
+    Obligation.GATE_SELECTOR_NODE_SCOPED,
+    Obligation.INTEGRATION_GATE_COVERS_LANES,
 )
 
 
@@ -175,7 +212,7 @@ class SubprocessCollector:
 
     The runner is **resolved**, never inherited. `resolver` is the single
     producer `runner_resolution.resolve`, memoised per `(runner, cwd)` so the
-    twelve obligations pay the capability probe once for a plan rather than
+    fourteen obligations pay the capability probe once for a plan rather than
     once per gate. A resolution that refuses becomes `CollectorUnavailable` —
     which is a reuse, not a new type: this module's own docstring already
     states that a collector which cannot run is "an operational refusal with
@@ -667,6 +704,114 @@ def _gate_core_unshared(plan: "pm.Plan") -> List[Blocker]:
     return blockers
 
 
+def _path_under(path: str, prefix: str) -> bool:
+    """Posix prefix containment over two already-normalized paths.
+
+    `.` is the whole tree, which `posixpath.normpath` produces for an argv
+    token of `.` or `./`, and a normalized path never carries the `./` a
+    naive `startswith` would need.
+    """
+    if prefix == ".":
+        return True
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def _gate_selector_node_scoped(plan: "pm.Plan") -> List[Blocker]:
+    """A node gate may not accept on a sibling lane's declared output.
+
+    The weak form of the rubric's question (see the module docstring): a
+    selector path passes if it is one of this node's own normalized outputs,
+    or if it is under no *other* node's declared output. A selector naming a
+    pre-existing file no node claims stays admitted, which is what keeps
+    `GATE_EXECUTABLE`'s all-existing and mixed arms reachable.
+
+    Ownership is resolved in declaration order, so the sibling a message
+    names is the same one on every run over the same bytes. A path claimed by
+    two nodes is `SINGLE_OUTPUT_OWNER`'s defect, not this one's.
+    """
+    owners: List[Tuple[str, str]] = []
+    claimed: Set[str] = set()
+    for node in plan.nodes:
+        for path in node.outputs:
+            normalized = _norm(path)
+            if normalized in claimed:
+                continue
+            claimed.add(normalized)
+            owners.append((normalized, node.node_id))
+
+    blockers: List[Blocker] = []
+    for index, node in enumerate(plan.nodes):
+        if not isinstance(node, pm.AgentNode):
+            continue
+        own = {_norm(path) for path in node.outputs}
+        for path in pm.selector_paths(node.gate):
+            if path in own:
+                continue
+            for owned, owner_id in owners:
+                if owner_id == node.node_id:
+                    continue
+                if not _path_under(path, owned):
+                    continue
+                blockers.append(Blocker(
+                    Obligation.GATE_SELECTOR_NODE_SCOPED,
+                    "/nodes/{0}/gate/argv".format(index),
+                    "{0}'s gate selects {1}, which {2} declares as its output "
+                    "({3}); a node's gate is scoped to that node's own work "
+                    "(§6.2), so accepting on a sibling lane's output is that "
+                    "lane's acceptance wearing this node's name".format(
+                        node.node_id, path, owner_id, owned)))
+                break
+    return blockers
+
+
+def _integration_gate_covers_lanes(plan: "pm.Plan") -> List[Blocker]:
+    """The integration gate names the whole surface the plan produces.
+
+    Two arms, and the empty selector is the permissive one. An integration
+    gate whose argv names no path falls back to the runner's whole-tree
+    collection — which is what the integration gate is for (§6.2, §8.8) — and
+    covers every lane by construction.
+
+    Otherwise every agent node's gate selector paths must sit under some
+    integration-gate selector path. A node gate that itself names no path is
+    covered **only** in the whole-suite case just described: there is no path
+    to contain, so a narrowed integration gate cannot be shown to reach it,
+    and the message says so rather than passing it silently. Such a gate is
+    already `GATE_EXECUTABLE`'s defect; blockers are collected, so it is
+    reported by both.
+    """
+    covers = pm.selector_paths(plan.merge_policy.integration_gate)
+    if not covers:
+        return []
+
+    pointer = "/merge_policy/integration_gate/argv"
+    blockers: List[Blocker] = []
+    for node in plan.nodes:
+        if not isinstance(node, pm.AgentNode):
+            continue
+        paths = pm.selector_paths(node.gate)
+        if not paths:
+            blockers.append(Blocker(
+                Obligation.INTEGRATION_GATE_COVERS_LANES, pointer,
+                "{0}'s gate selector names no path, so nothing states the "
+                "surface it produces; only a whole-suite integration gate "
+                "covers such a lane, and this one names {1}".format(
+                    node.node_id, ", ".join(covers))))
+            continue
+        uncovered = tuple(
+            path for path in paths
+            if not any(_path_under(path, prefix) for prefix in covers))
+        if uncovered:
+            blockers.append(Blocker(
+                Obligation.INTEGRATION_GATE_COVERS_LANES, pointer,
+                "the integration gate selects {0}, which does not name {1}'s "
+                "gate surface: {2}. A gate over a subset of the lanes it must "
+                "integrate passes without ever collecting the lanes it "
+                "omits (§8.8)".format(
+                    ", ".join(covers), node.node_id, ", ".join(uncovered))))
+    return blockers
+
+
 def validate_plan(stored: bytes, repo: Union[str, Path], *,
                   receipts: ReceiptIndex, collector: GateCollector,
                   config: Optional[ValidationConfig] = None) -> ValidationResult:
@@ -732,6 +877,8 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
                 plan.supersedes)))
 
     blockers.extend(_gate_core_unshared(plan))
+    blockers.extend(_gate_selector_node_scoped(plan))
+    blockers.extend(_integration_gate_covers_lanes(plan))
 
     if blockers:
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))

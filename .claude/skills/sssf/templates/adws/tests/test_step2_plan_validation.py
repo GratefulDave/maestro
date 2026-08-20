@@ -1,7 +1,7 @@
-"""Executable proof of §6.4 — the twelve deterministic obligations.
+"""Executable proof of §6.4 — the fourteen deterministic obligations.
 
 Every test here builds a real throwaway git repository and runs real `git`,
-because eleven of the twelve obligations are computed from git objects alone
+because most of the obligations are computed from git objects alone
 and a mocked object store would simply assert this module's own beliefs back
 at it. The two things that are *not* git facts — whether a receipt exists for
 the superseded digest, and how many cases a selector collects — enter through
@@ -12,12 +12,16 @@ Each obligation gets a red test and the green control shares one fixture, so
 §13.4's rule holds here too: a check that convicts nothing has not been shown
 to convict anything.
 
-  §6.4  the twelve, and that every one of them can fail on its own
+  §6.4  the fourteen, and that every one of them can fail on its own
   §6.4  "gate command core" is defined, so a reordered flag does not evade it
   §6.4  the same comparison runs against the integration gate
   §6.4  gate executability has two arms — produced paths are checked for
         well-formedness, everything else for a collection count
   §6.4  environment checks are not eligibility obligations
+  §6.2  a node gate is scoped to that node's own work — a selector may name
+        what no node owns, but never a sibling's declared output
+  §8.8  the integration gate names the merged surface: either no selector at
+        all, or one containing every lane's gate selector
   §6.2  hypothesis quarantine — only an agent node's `reads` may hold one
   §6.3  the digest is taken over the stored bytes, and non-canonical bytes
         are refused rather than quietly rewritten into agreement
@@ -233,14 +237,14 @@ class TheGreenControl(ValidationTestCase):
         self.assertEqual(result.outcome, pv.Outcome.AUTHORING_BLOCKED)
         self.assertIsNone(result.digest)
 
-    def test_there_are_exactly_twelve_obligations(self):
-        self.assertEqual(len(pv.OBLIGATIONS), 12)
-        self.assertEqual(len(set(pv.OBLIGATIONS)), 12)
+    def test_there_are_exactly_fourteen_obligations(self):
+        self.assertEqual(len(pv.OBLIGATIONS), 14)
+        self.assertEqual(len(set(pv.OBLIGATIONS)), 14)
         self.assertEqual(set(pv.OBLIGATIONS), set(pv.Obligation))
 
     def test_every_obligation_is_reported_not_only_the_first(self):
         """§11.1 emits typed blockers, plural. A fail-fast validator would
-        make an author fix twelve plans instead of one."""
+        make an author fix fourteen plans instead of one."""
         data = self.mapping()
         data["merge_policy"]["integration_branch"] = "no-such-branch"
         data["base_commit"] = "0" * 40
@@ -623,6 +627,164 @@ class GateCoreIsNotShared(ValidationTestCase):
         self.assertEqual([b for b in result.blockers
                           if b.obligation is pv.Obligation.GATE_CORE_UNSHARED],
                          [])
+
+
+class GateSelectorIsScopedToItsNode(ValidationTestCase):
+    """§6.2 — a node's gate is scoped to that node's own work.
+
+    The weak form: a selector path is admitted when it is one of this node's
+    own outputs, or when no node in the plan claims it. The literal reading —
+    selector paths a subset of this node's outputs — would refuse the very
+    plans `GATE_EXECUTABLE`'s all-existing and mixed arms exist to admit, so
+    the pre-existing-file control below is as load-bearing as the red case.
+    """
+
+    def test_a_node_may_not_gate_on_a_siblings_declared_output(self):
+        data = self.mapping()
+        # A `::` test id keeps the command core distinct from n-write's, so
+        # this convicts scope rather than re-convicting GATE_CORE_UNSHARED.
+        data["nodes"][1]["gate"]["argv"] = [
+            "tests/test_greeting.py::test_greeting"]
+        data["nodes"][1]["gate"]["min_cases"] = 1
+        found = self.assertBlocked(self.validate(data),
+                                   pv.Obligation.GATE_SELECTOR_NODE_SCOPED)
+        self.assertEqual([b.pointer for b in found], ["/nodes/1/gate/argv"])
+        self.assertIn("n-write", found[0].message)
+        self.assertIn("tests/test_greeting.py", found[0].message)
+
+    def test_a_path_under_a_siblings_directory_output_is_reaching_in(self):
+        data = self.mapping()
+        data["nodes"][0]["outputs"] = ["src/greeting.py", "tests/lane_write"]
+        data["nodes"][0]["gate"]["argv"] = ["tests/lane_write"]
+        data["nodes"][1]["gate"]["argv"] = ["tests/lane_write/test_extra.py"]
+        self.collector.counts["tests/lane_write/test_extra.py"] = 2
+        found = self.assertBlocked(self.validate(data),
+                                   pv.Obligation.GATE_SELECTOR_NODE_SCOPED)
+        self.assertEqual([b.pointer for b in found], ["/nodes/1/gate/argv"])
+        self.assertIn("n-write", found[0].message)
+
+    def test_a_code_nodes_output_is_a_sibling_too(self):
+        data = self.mapping()
+        data["nodes"][2]["outputs"] = ["tests/test_suite.py"]
+        data["nodes"][1]["gate"]["argv"] = ["tests/test_suite.py"]
+        self.collector.counts["tests/test_suite.py"] = 2
+        found = self.assertBlocked(self.validate(data),
+                                   pv.Obligation.GATE_SELECTOR_NODE_SCOPED)
+        self.assertIn("n-suite", found[0].message)
+
+    def test_a_node_gating_on_its_own_output_is_scoped(self):
+        """n-write selects exactly the test file it produces."""
+        result = self.validate()
+        self.assertEqual(
+            [b for b in result.blockers
+             if b.obligation is pv.Obligation.GATE_SELECTOR_NODE_SCOPED], [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
+
+    def test_a_selector_over_a_path_no_node_owns_stays_admitted(self):
+        """n-cover gates `tests/test_existing.py`, which exists at base and
+        appears in no node's `outputs`. Refusing it would take
+        GATE_EXECUTABLE's all-existing arm with it."""
+        data = self.mapping()
+        self.assertNotIn("tests/test_existing.py",
+                         [p for node in data["nodes"]
+                          for p in node.get("outputs", [])])
+        result = self.validate(data)
+        self.assertEqual(
+            [b for b in result.blockers
+             if b.obligation is pv.Obligation.GATE_SELECTOR_NODE_SCOPED], [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
+
+
+class TheIntegrationGateCoversEveryLane(ValidationTestCase):
+    """§8.8 — the integration gate names the whole surface the plan produces.
+
+    A gate over a subset of the lanes it must integrate passes without ever
+    collecting the lanes it omits, which is a merged surface nothing asserted.
+    """
+
+    def test_a_subset_selector_names_the_lane_it_omits(self):
+        data = self.mapping()
+        data["merge_policy"]["integration_gate"]["argv"] = [
+            "tests/test_greeting.py::test_greeting"]
+        found = self.assertBlocked(
+            self.validate(data),
+            pv.Obligation.INTEGRATION_GATE_COVERS_LANES)
+        self.assertEqual([b.pointer for b in found],
+                         ["/merge_policy/integration_gate/argv"])
+        self.assertIn("n-cover", found[0].message)
+        self.assertIn("tests/test_existing.py", found[0].message)
+
+    def test_every_uncovered_lane_is_named_not_only_the_first(self):
+        data = self.mapping()
+        data["merge_policy"]["integration_gate"]["argv"] = ["src"]
+        self.collector.counts["src"] = 3
+        found = self.assertBlocked(
+            self.validate(data),
+            pv.Obligation.INTEGRATION_GATE_COVERS_LANES)
+        named = " ".join(b.message for b in found)
+        self.assertEqual(len(found), 2)
+        self.assertIn("n-write", named)
+        self.assertIn("n-cover", named)
+
+    def test_a_whole_suite_node_gate_needs_a_whole_suite_integration_gate(self):
+        """A node gate naming no path states no surface, so a narrowed
+        integration gate cannot be shown to reach it."""
+        data = self.mapping()
+        data["nodes"][1]["gate"]["argv"] = ["-k", "greeting"]
+        self.collector.counts["-k greeting"] = 2
+        found = self.assertBlocked(
+            self.validate(data),
+            pv.Obligation.INTEGRATION_GATE_COVERS_LANES)
+        self.assertIn("n-cover", found[0].message)
+        self.assertIn("names no path", found[0].message)
+
+    def test_that_same_node_gate_passes_under_a_whole_suite_integration_gate(self):
+        data = self.mapping()
+        data["nodes"][1]["gate"]["argv"] = ["-k", "greeting"]
+        self.collector.counts["-k greeting"] = 2
+        data["merge_policy"]["integration_gate"]["argv"] = ["-q"]
+        result = self.validate(data)
+        self.assertEqual(
+            [b for b in result.blockers
+             if b.obligation is pv.Obligation.INTEGRATION_GATE_COVERS_LANES],
+            [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
+
+    def test_an_integration_gate_naming_no_selector_covers_everything(self):
+        """The one gate permitted to name no selector runs the whole tree,
+        so it covers every lane by construction (§6.2, §8.8)."""
+        data = self.mapping()
+        data["merge_policy"]["integration_gate"]["argv"] = ["-q"]
+        result = self.validate(data)
+        self.assertIsNone(pm.selector_of(pm.parse_mapping(data)
+                                         .merge_policy.integration_gate))
+        self.assertEqual(
+            [b for b in result.blockers
+             if b.obligation is pv.Obligation.INTEGRATION_GATE_COVERS_LANES],
+            [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
+
+    def test_a_selector_naming_every_lanes_surface_is_covered(self):
+        data = self.mapping()
+        data["merge_policy"]["integration_gate"]["argv"] = [
+            "tests/test_greeting.py", "tests/test_existing.py"]
+        self.collector.counts["tests/test_existing.py"] = 2
+        result = self.validate(data)
+        self.assertEqual(
+            [b for b in result.blockers
+             if b.obligation is pv.Obligation.INTEGRATION_GATE_COVERS_LANES],
+            [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
+
+    def test_a_directory_selector_contains_the_lanes_beneath_it(self):
+        """The reference plan's own integration gate is `tests`, and both
+        lanes select files under it."""
+        result = self.validate()
+        self.assertEqual(
+            [b for b in result.blockers
+             if b.obligation is pv.Obligation.INTEGRATION_GATE_COVERS_LANES],
+            [])
+        self.assertEqual(result.outcome, pv.Outcome.FINALIZATION_ELIGIBLE)
 
 
 class TheRealCollector(ValidationTestCase):
