@@ -69,6 +69,7 @@ ALLOWED: Dict[str, str] = {
     "retry_policy.find_output_content_comparisons": "detector: convicts a classifier that compares against process output text",
     "retry_policy.find_ungated_git_absence": "detector: convicts a git-absence conclusion drawn without a gate",
     "finalization.find_forbidden_report_fields": "detector: convicts verdict or severity appearing in a reviewer report",
+    "permissions.argv_denies_delegation": "detector: convicts a launch argv that leaves an actor able to delegate the work its signature attests to (B12/§1.2). Production removes the capability rather than reading it back — `route_capability_argv` is the production half — so this exists to assert over the real argv builders and over a planted violation",
     "enforcement.scan_real_tree": "detector: scans the installed tree for §13.4 fixture violations",
     "enforcement.assert_installed_bytes": "detector: proves the installed bytes match the reviewed tree (RC8)",
     "enforcement.assert_verbs": "detector: proves the CLI exposes the verbs the docs claim",
