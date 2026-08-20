@@ -32,6 +32,7 @@ Run with:  uv run adws/adw_test.py -k window
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 import sys
 import tempfile
@@ -83,7 +84,6 @@ class Harness:
         self.calls = []
         self.killed = []
         self.sessions = []
-        self.stalls = []
         self.launch_calls = 0
         self.alive = alive
         self.records = records
@@ -102,7 +102,6 @@ class Harness:
             launch=self._launch,
             poll_report=self._poll_report,
             record_reviewer_session=self._record_session,
-            record_stall=self._record_stall,
             kill=self._kill,
             process_alive=lambda pid: self.alive,
             transcript_record_count=lambda session: self.records,
@@ -135,10 +134,6 @@ class Harness:
     def _record_session(self, session):
         self.calls.append("record_reviewer_session")
         self.sessions.append(session)
-
-    def _record_stall(self, session, signal, elapsed_s):
-        self.calls.append("record_stall")
-        self.stalls.append((session, signal, elapsed_s))
 
     def _kill(self, session):
         self.calls.append("kill")
@@ -437,7 +432,6 @@ class QuiescenceIsConfirmedNotSampled(unittest.TestCase):
             h.records = turn                 # ...but the transcript advanced
             self.assertIsNone(h.window.poll())
         self.assertEqual(h.killed, [])
-        self.assertEqual(h.stalls, [])
 
     def test_returning_to_working_restarts_the_confirmation(self):
         h = self._worked_then_idle()
@@ -621,7 +615,6 @@ class ExpiryConvertsToAKillAndATypedOutcome(unittest.TestCase):
             launch=h._launch,
             poll_report=h._poll_report,
             record_reviewer_session=h._record_session,
-            record_stall=h._record_stall,
             kill=h._kill,
             time_source=h.monotonic,
             wall_clock=h.epoch,
@@ -653,16 +646,33 @@ class ExpiryConvertsToAKillAndATypedOutcome(unittest.TestCase):
         self.assertEqual(h.killed, [])
         self.assertEqual(outcome.signal, fw.FinalizationSignal.WINDOW_TIMEOUT)
 
-    def test_a_stall_is_recorded_durably_beside_the_session_row(self):
+    def test_the_stall_is_returned_as_one_typed_result_not_a_side_effect(self):
+        """(c)'s durable half is the outcome this returns, and there is no
+        second channel for it.
+
+        The window used to take a `StallRecorder` alongside, and both
+        production call sites passed `lambda ...: None` — a seam that read as
+        wired while recording nothing, which is how four distinct signals came
+        to settle as one free-text reason. Recording now belongs to whoever
+        called, against the store that owns its phase, and everything such a
+        caller needs is on this object.
+        """
         h = Harness(config=make_config(finalization_timeout_s=10.0))
         h.window.open()
         h.monotonic.advance(11.0)
         outcome = h.window.poll()
-        self.assertEqual(len(h.stalls), 1)
-        session, signal, elapsed = h.stalls[0]
-        self.assertEqual(session.session_id, "sess-7")
-        self.assertEqual(signal, outcome.signal)
-        self.assertEqual(elapsed, 11.0)
+        self.assertFalse(outcome.completed)
+        self.assertEqual(outcome.session.session_id, "sess-7")
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.WINDOW_TIMEOUT)
+        self.assertEqual(outcome.elapsed_s, 11.0)
+
+    def test_the_window_takes_no_stall_recorder(self):
+        """A no-op collaborator nothing writes is the same B15 smell one
+        level down: it makes an absent record look like a present one."""
+        self.assertNotIn(
+            "record_stall",
+            inspect.signature(fw.FinalizationWindow.__init__).parameters)
+        self.assertFalse(hasattr(fw, "StallRecorder"))
 
     def test_the_outcome_carries_the_route_model_and_session_id(self):
         """§6.5: the verb prints the reviewer's recorded (route, model,

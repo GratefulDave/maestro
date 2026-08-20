@@ -208,13 +208,14 @@ ALLOWED: Dict[str, str] = {
     # every existing deployment. What has no production writer is the operator
     # *override*: `maestro.py` builds `FinalizationConfig` from `args` and
     # passes neither, so no config value can currently reach either field.
-    # That wiring is a maestro.py change and lands with the lane that owns it.
-    "FinalizationConfig.start_deadline_s": "DEFERRED: reachable on its default; "
-                                           "the operator override needs a "
-                                           "maestro.py writer (#89)",
-    "FinalizationConfig.quiescence_confirm_s": "DEFERRED: reachable on its "
+    # That wiring is a maestro.py change and is tracked as #100, where the two
+    # flags have to land on the tuning side of `_RUN_TUNING_OPTIONS`.
+    "FinalizationConfig.start_deadline_s": "DEFERRED #100: reachable on its "
+                                           "default; the operator override "
+                                           "needs a maestro.py writer",
+    "FinalizationConfig.quiescence_confirm_s": "DEFERRED #100: reachable on its "
                                                "default; the operator override "
-                                               "needs a maestro.py writer (#89)",
+                                               "needs a maestro.py writer",
 }
 
 

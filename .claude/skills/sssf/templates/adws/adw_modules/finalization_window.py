@@ -17,7 +17,9 @@ is a bounded window with the three obligations §11.2 states:
   (c) expiry converts into a durable typed result by kill and red
       outcome: `FINALIZATION_STALLED`, which is deliberately not a receipt
       (§6.5) -- a stall is a fact about the machine or the route, never a
-      verdict about the plan.
+      verdict about the plan. The typed `WindowOutcome` this returns is
+      that result; recording it belongs to the caller, against the store
+      that owns its phase, and this module holds no recorder for it.
 
 **The signals are §7.6's, not a second set.** `FinalizationSignal` reuses
 the watchdog's own `StallReason` strings for the two structural signals,
@@ -290,13 +292,6 @@ class SessionRecorder(Protocol):
     def __call__(self, session: ReviewerSession) -> None: ...
 
 
-class StallRecorder(Protocol):
-    """Records `FINALIZATION_STALLED` durably beside the session row."""
-
-    def __call__(self, session: ReviewerSession, signal: FinalizationSignal,
-                 elapsed_s: float) -> None: ...
-
-
 class ReviewerKiller(Protocol):
     """Terminates the reviewer's process group. Called only where the
     group is harness-owned (§6.5, §8.3)."""
@@ -374,7 +369,6 @@ class FinalizationWindow:
         launch: ReviewerLauncher,
         poll_report: ReportPoller,
         record_reviewer_session: SessionRecorder,
-        record_stall: StallRecorder,
         kill: ReviewerKiller,
         process_alive: Callable[[int], bool] = DEFAULT_PROCESS_ALIVE,
         transcript_record_count: Callable[[ReviewerSession], int] = (
@@ -387,7 +381,6 @@ class FinalizationWindow:
         self._launch = launch
         self._poll_report = poll_report
         self._record_reviewer_session = record_reviewer_session
-        self._record_stall = record_stall
         self._kill = kill
         self._process_alive = process_alive
         self._transcript_record_count = transcript_record_count
@@ -614,13 +607,20 @@ class FinalizationWindow:
         verb stops waiting and reports the pane. The survivor is a leak,
         not a hazard (§7.8) — finalization measures nothing and merges
         nothing, and a report arriving after the declaration has no reader.
+
+        The durable half is the returned `WindowOutcome` and nothing else.
+        This module used to take a `StallRecorder` as well, and both of its
+        call sites passed `lambda ...: None` — so the seam read as wired
+        while recording nothing anywhere, which is how four distinct signals
+        came to settle as one free-text reason. Each caller now records where
+        it settles, against the store that actually owns that phase's
+        lifecycle, from the typed `signal` on this outcome.
         """
         session = self._require_open()
         killed = False
         if session.harness_owned_group:
             self._kill(session)
             killed = True
-        self._record_stall(session, signal, elapsed)
         return self._finish(WindowOutcome(
             completed=False, session=session, elapsed_s=elapsed,
             signal=signal, killed=killed,

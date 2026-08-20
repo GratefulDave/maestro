@@ -1583,7 +1583,6 @@ def _reviewer_window_factory(args: argparse.Namespace):
                 poll_interval_s=args.reviewer_poll_interval_s),
             launch=launch_reviewer, poll_report=poll_report,
             record_reviewer_session=lambda _session: None,
-            record_stall=lambda _session, _signal, _elapsed: None,
             kill=kill_reviewer)
 
     return factory
@@ -1712,7 +1711,6 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     poll_interval_s=args.reviewer_poll_interval_s),
                 launch=launch_reviewer, poll_report=poll_report,
                 record_reviewer_session=lambda _s: None,
-                record_stall=lambda _s, _sig, _e: None,
                 kill=kill_reviewer,
                 actor_status=read_status)
 

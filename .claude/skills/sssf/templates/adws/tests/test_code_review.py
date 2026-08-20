@@ -431,7 +431,6 @@ class ActorAbandonedTests(unittest.TestCase):
                                               session_id="pane1"),
             poll_report=lambda: report,
             record_reviewer_session=lambda _s: None,
-            record_stall=lambda _s, _sig, _e: None,
             kill=lambda _s: None,
             actor_status=next_status,
             transcript_record_count=lambda _s: 0)
