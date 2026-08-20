@@ -879,11 +879,24 @@ class ReviewObjectTests(unittest.TestCase):
         # Both controls are present, and they are excluded from grading.
         self.assertEqual(len(matrix.canary_cells), 2)
 
-    def test_the_code_rubric_emits_no_plan_cells(self):
-        """The two review families share an enum and must not share cells."""
+    def test_a_rubric_emits_no_cell_for_a_kind_it_does_not_declare(self):
+        """`compute_matrix` ranges over `applies_to` and nothing else.
+
+        This used to be stated as "the code rubric emits no *plan* cells",
+        because two rubrics shared `ObjectKind` and a leak between them would
+        have been a real defect. Plan finalization dispatches no reviewer now
+        and its five object kinds were deleted with it, so the property is
+        stated over a rubric that declares one kind and is asked about the
+        other -- the same guarantee, without a kind that no longer exists.
+        """
+        one_kind = fin.Rubric(version="fixture.v1", checks=(
+            fin.RubricCheck(check_id="file.only", question="q",
+                            applies_to=(fin.ObjectKind.CHANGED_FILE,),
+                            severity=fin.Severity.BLOCKING),))
         matrix = fin.compute_matrix(
-            cr.CODE_RUBRIC, "c" * 64,
-            (fin.ReviewObject(object_id="plan", kind=fin.ObjectKind.PLAN),))
+            one_kind, "c" * 64,
+            (fin.ReviewObject(object_id="diff:abc",
+                              kind=fin.ObjectKind.DIFF),))
         self.assertEqual(matrix.graded_cells, ())
 
 
@@ -1016,95 +1029,6 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 self.assertTrue(Path(path).is_relative_to(review_root), key)
                 self.assertFalse(Path(path).is_relative_to(repo), key)
             self.assertEqual(spec.worktree, Path(str(repo)))
-
-    def test_the_plan_finalize_reviewer_launch_carries_every_redirection(self):
-        """The same omission, at the reviewer `plan finalize` builds.
-
-        It allocates its own launcher rather than sharing the node runner's, so
-        it is a second construction of the same `LaunchSpec` and failed the same
-        way — the refusal simply waits until the verb is exercised.
-        """
-        import argparse
-        from unittest import mock
-
-        import maestro
-        from adw_modules import launcher as lch
-        from adw_modules import route_receipts as rr
-
-        fixtures = Path(__file__).parent / "fixtures" / "step8"
-        key = rr.load_public_key(fixtures / "route_receipts.pub")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            repo.mkdir()
-            state = root / "state"
-            session_dir = state / "finalize-session"
-            args = argparse.Namespace(
-                herdr="/bin/true", omp="/bin/true", claude="/bin/true",
-                repo=str(repo), reviewer_route="omp", reviewer_model="m",
-                reviewer_effort="high", reviewer_profile="p",
-                reviewer_session_dir=str(session_dir),
-                reviewer_report_file=str(state / "review" / "report.json"),
-                route_verify_key=[key.hex()],
-                route_receipt=["omp={}".format(fixtures / "omp.json")],
-                finalization_timeout_s=60, reviewer_turn_timeout_s=20,
-                reviewer_poll_interval_s=1)
-
-            captured = {}
-
-            class FakeLauncher:
-                def __init__(self, **_kwargs):
-                    pass
-
-                def launch(self, spec):
-                    captured["spec"] = spec
-                    return lch.LaunchHandle(
-                        correlation_token=spec.correlation_token,
-                        pane_id="w1:p2", agent_name="reviewer",
-                        launched_cwd=spec.worktree,
-                        environment=spec.environment)
-
-                def cancel(self, handle, deadline):
-                    return None
-
-            windows = []
-
-            class CapturedWindow:
-                def __init__(self, **kwargs):
-                    self.launch = kwargs["launch"]
-                    windows.append(self)
-
-            matrix = fin.compute_matrix(
-                cr.CODE_RUBRIC, "c" * 64,
-                cr.review_objects(("a.py",), OUTPUT_SHA))
-            with mock.patch.object(maestro.launcher, "HerdrLauncher",
-                                   FakeLauncher), \
-                    mock.patch.object(maestro.agent_pi, "catalog",
-                                      lambda: (("stub", "m", 400_000),)), \
-                    mock.patch.object(maestro.finalization_window,
-                                      "FinalizationWindow", CapturedWindow):
-                maestro._reviewer_window_factory(args)(matrix)
-                # Inside the patch: the launch now resolves the reviewer's
-                # context window from the catalog to put it on the spec (B13 at
-                # the launcher chokepoint), so the stub has to still be in
-                # place when the spec is built, not only when it is assembled.
-                windows[0].launch()
-
-            spec = captured["spec"]
-            pane_env = _pane_env(lch.pane_env_flags(spec.environment))
-            self.assertEqual(set(pane_env), set(lch.SCRATCH_ENV_KEYS))
-            # A sibling of the session directory the operator named, so it
-            # lands wherever that reviewer's own state does — never in the
-            # repository under review.
-            for key_name, value in pane_env.items():
-                path = (value.split("cache_dir=", 1)[-1]
-                        if key_name == "PYTEST_ADDOPTS" else value)
-                self.assertTrue(Path(path).is_relative_to(
-                    session_dir.with_name(session_dir.name + ".scratch")),
-                    key_name)
-                self.assertFalse(Path(path).is_relative_to(repo), key_name)
-
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

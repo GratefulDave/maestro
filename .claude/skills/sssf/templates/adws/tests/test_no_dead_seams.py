@@ -68,7 +68,7 @@ ALLOWED: Dict[str, str] = {
     "verification.free_text_reads": "detector, asserted from tests only",
     "retry_policy.find_output_content_comparisons": "detector: convicts a classifier that compares against process output text",
     "retry_policy.find_ungated_git_absence": "detector: convicts a git-absence conclusion drawn without a gate",
-    "finalization.find_forbidden_report_fields": "detector: convicts verdict or severity appearing in a reviewer report",
+    "finalization.find_forbidden_report_fields": "detector: convicts verdict or severity appearing in a reviewer report (node review's -- it is the only report a reviewer writes now)",
     "permissions.argv_denies_delegation": "detector: convicts a launch argv that leaves an actor able to delegate the work its signature attests to (B12/§1.2). Production removes the capability rather than reading it back — `route_capability_argv` is the production half — so this exists to assert over the real argv builders and over a planted violation",
     "enforcement.scan_real_tree": "detector: scans the installed tree for §13.4 fixture violations",
     "enforcement.assert_installed_bytes": "detector: proves the installed bytes match the reviewed tree (RC8)",
@@ -90,6 +90,19 @@ ALLOWED: Dict[str, str] = {
                                   "config.concurrency (scheduler.py:460, :503) "
                                   "and the test asserts the two agree",
     "finalization.graded_cells": "derived view of the matrix, asserted in tests",
+
+    # Its one production caller was plan finalization's `finalize`, deleted
+    # when `plan finalize` became deterministic and stopped dispatching a
+    # reviewer. It is not orphaned by accident: `code_review.grade_verdict`
+    # says in its own docstring that it is "deliberately a second function
+    # rather than a threshold parameter on it", because plan finalization's
+    # verdicts had to stay unthresholded. There is no unthresholded review
+    # left, so the two should collapse into one -- a code-review-path change,
+    # not a plan-path one, which is why it is named here rather than done in
+    # the same breath as the removal.
+    "finalization.derive_verdict": "DEFERRED: sole production caller deleted "
+                                   "with the plan reviewer; collapse it into "
+                                   "code_review.grade_verdict",
     "finalization_window.opened_at_monotonic": "accessor over the private "
                                                "_opened_at_monotonic that "
                                                "production maintains",
@@ -181,9 +194,15 @@ ALLOWED: Dict[str, str] = {
                                    "production caller",
     "lifecycle.audit_transitions": "DEFERRED: diagnostics reader over the "
                                    "transitions table, no production caller",
-    "finalization_window.require_fresh_session_dir": "DEFERRED: "
-                                                     "finalization-path, no "
-                                                     "production caller",
+    # Its reason used to read "finalization-path". That path is gone --
+    # `plan finalize` dispatches no reviewer -- and the function did not go
+    # with it, because §6.5's fresh-session rule is about any reviewer and the
+    # one review that still launches is node review. It is still unwired
+    # there, which is the deferred work; what changed is which caller it is
+    # waiting for.
+    "finalization_window.require_fresh_session_dir": "DEFERRED: the node "
+                                                     "reviewer's launch does "
+                                                     "not call it yet",
     "publication.prepare": "DEFERRED: WorkspacePublisher.prepare, publication "
                            "path, no production caller",
 

@@ -837,92 +837,6 @@ class TheCanaryStillConvictsTest(unittest.TestCase):
         self.assertEqual((), outcome.advisories)
 
 
-# ── the regression control: plan finalization is untouched ──────────────────
-
-class PlanFinalizationVerdictsAreUnchangedTest(unittest.TestCase):
-    """Node review and plan finalization share `ObjectKind`, `compute_matrix`,
-    `verify_report` and `derive_verdict`. What isolates them is that grading
-    lives entirely in `code_review`: a second report model, a second derivation
-    function, a second located-findings invariant. `finalization` has no
-    threshold to be handed and no grade to read.
-
-    This class fails if any of that leaks.
-    """
-
-    PLAN_OBJECTS = (fin.ReviewObject(object_id="plan:1", kind=fin.ObjectKind.PLAN),
-                    fin.ReviewObject(object_id="node:a", kind=fin.ObjectKind.NODE))
-
-    def _matrix(self) -> fin.ApplicabilityMatrix:
-        return fin.compute_matrix(fin.DEFAULT_RUBRIC, "c" * 64,
-                                  self.PLAN_OBJECTS)
-
-    def _report(self, matrix: fin.ApplicabilityMatrix,
-                findings: Dict[str, str]) -> fin.ReviewerReport:
-        cells = []
-        for cell in matrix.cells:
-            if cell.canary is fin.CanaryKind.KNOWN_BAD:
-                cells.append({"check_id": cell.check_id,
-                              "object_id": cell.object_id,
-                              "status": "finding", "message": "control"})
-            elif cell.check_id in findings:
-                cells.append({"check_id": cell.check_id,
-                              "object_id": cell.object_id,
-                              "status": "finding",
-                              "message": findings[cell.check_id]})
-            else:
-                cells.append({"check_id": cell.check_id,
-                              "object_id": cell.object_id, "status": "clear"})
-        return fin.ReviewerReport.model_validate(
-            {"plan_digest": matrix.plan_digest,
-             "pair_count": matrix.pair_count, "cells": cells})
-
-    def test_any_blocking_finding_still_fails_a_plan(self):
-        """Plan finalization has no threshold: one blocking finding is a FAIL,
-        exactly as before. If grading had leaked into `derive_verdict` this
-        would pass instead."""
-        matrix = self._matrix()
-        report = self._report(matrix, {"node.reads_are_sufficient":
-                                       "the node cannot work from its reads"})
-        derived = fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC)
-        self.assertIs(fin.Verdict.FAIL, derived.verdict)
-
-    def test_an_advisory_finding_still_passes_a_plan(self):
-        matrix = self._matrix()
-        report = self._report(matrix, {"plan.decomposition_is_honest":
-                                       "one node wearing two names"})
-        derived = fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC)
-        self.assertIs(fin.Verdict.PASS, derived.verdict)
-
-    def test_a_plan_reviewer_cannot_grade_and_is_refused_if_it_tries(self):
-        """The isolation, from the other side: the plan report schema did not
-        grow a grade, so a plan reviewer that emits one is rejected unparsed
-        rather than silently graded."""
-        with self.assertRaises(pydantic.ValidationError):
-            fin.ReportCell.model_validate(
-                {"check_id": "c", "object_id": "o", "status": "finding",
-                 "message": "m", "grade": "warning"})
-
-    def test_a_plan_finding_still_needs_no_grade_rationale(self):
-        """The plan reviewer's contract is unchanged: `clear|finding` plus a
-        message, as §6.5 states it."""
-        parsed = fin.ReportCell.model_validate(
-            {"check_id": "c", "object_id": "o", "status": "finding",
-             "message": "m"})
-        self.assertIs(fin.CellStatus.FINDING, parsed.status)
-
-    def test_finalizations_derivation_takes_no_threshold(self):
-        """Stated as an executed fact rather than as a comment: the function
-        plan finalization uses has no parameter grading could ride in on."""
-        import inspect
-        self.assertEqual(
-            ["matrix", "report", "rubric"],
-            list(inspect.signature(fin.derive_verdict).parameters))
-
-
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
-
-
 class GradeSurvivesTheReceipt(unittest.TestCase):
     """The grade that decided the verdict is inside the signed receipt.
 
@@ -1006,9 +920,12 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
         restored = fin.Receipt.from_bytes(self._receipt("warning").to_bytes())
         self.assertEqual("warning", restored.reject_at)
 
-    def test_plan_finalizations_receipt_carries_none(self):
-        """Plan finalization's verdict runs under no threshold, and `None` is
-        the honest value rather than a default standing in for one."""
+    def test_a_verdict_derived_under_no_threshold_carries_none(self):
+        """Not every verdict runs under a grade threshold. Plan finalization
+        was the original such caller and now derives nothing at all -- its
+        receipt is written by `maestro._deterministic_receipt` with no cells --
+        so `None` still has to be the honest value rather than a default
+        standing in for a threshold nobody ran under."""
         restored = fin.Receipt.from_bytes(
             self._receipt(None, digest="2").to_bytes())
         self.assertIsNone(restored.reject_at)

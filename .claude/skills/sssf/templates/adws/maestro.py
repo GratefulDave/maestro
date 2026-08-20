@@ -38,7 +38,6 @@ from adw_modules import participant
 from adw_modules import plan_author
 from adw_modules import plan_contract_ingress
 from adw_modules import runner_resolution
-from adw_modules import plan_finalization
 from adw_modules import plan_digest
 from adw_modules import plan_model
 from adw_modules import plan_validate as pv
@@ -1068,21 +1067,10 @@ def _apply_repository_config(
     args.omp = config["executables"]["omp"]
     args.claude = config["executables"]["claude"]
 
-    if args.command == "plan" and args.plan_command == "finalize":
-        digest = plan_digest.digest_of(plan_file.read_bytes())
-        reviewer = config["reviewer"]
-        finalization_root = (
-            config["repository_state"] / "finalization" / digest)
-        args.reviewer_route = reviewer["route"]
-        args.reviewer_model = reviewer["model"]
-        args.reviewer_effort = reviewer["effort"]
-        args.reviewer_profile = reviewer["profile"]
-        args.reviewer_session_dir = str(finalization_root / "session")
-        args.reviewer_report_file = str(finalization_root / "report.json")
-        args.finalization_timeout_s = reviewer["finalization_timeout_s"]
-        args.reviewer_turn_timeout_s = reviewer["turn_timeout_s"]
-        args.reviewer_poll_interval_s = reviewer["poll_interval_s"]
-    elif args.command == "run":
+    # `plan finalize` binds nothing further. It dispatches no reviewer, so it
+    # needs no route, no session, no report path and no window clocks -- only
+    # the receipt key material bound above.
+    if args.command == "run":
         execution = config["execution"]
         # `start` mints; `resume` re-enters the run it just resolved. Minting
         # for `resume` would hand the scheduler an empty ledger, a fresh
@@ -1585,124 +1573,6 @@ def _finalization_store(args: argparse.Namespace) -> finalization.ReceiptStore:
     except (finalization.ReceiptStoreLocationError,
             finalization.SigningKeyUnavailable) as exc:
         raise _PlanReceiptConfigurationError(str(exc)) from exc
-
-
-def _reviewer_window_factory(args: argparse.Namespace):
-    """Build the one real reviewer window for an eligible plan."""
-    required = (
-        args.herdr, args.omp, args.claude, args.reviewer_route,
-        args.reviewer_model, args.reviewer_effort, args.reviewer_session_dir,
-        args.reviewer_report_file, args.route_verify_key, args.route_receipt,
-    )
-    if not all(required):
-        raise _PlanReceiptConfigurationError(
-            "Herdr reviewer route, verified route receipt, session, report, "
-            "and liveness configuration are required to finalize a plan")
-    try:
-        route_keys = tuple(bytes.fromhex(value) for value in args.route_verify_key)
-        receipt_paths = dict(
-            entry.split("=", 1) for entry in args.route_receipt)
-    except (TypeError, ValueError) as exc:
-        raise _PlanReceiptConfigurationError(
-            "--route-receipt must be ROUTE=PATH and route keys hexadecimal") from exc
-    if (not route_keys or any(len(key) != receipt_crypto.PUBLIC_KEY_SIZE
-                              for key in route_keys)):
-        raise _PlanReceiptConfigurationError(
-            "--route-verify-key must contain Ed25519 public keys")
-    admitted = route_receipts.load_admitted_routes(
-        {route: Path(path) for route, path in receipt_paths.items()},
-        verify_keys=route_keys)
-    runner = launcher.HerdrLauncher(
-        herdr_path=Path(args.herdr), omp_path=Path(args.omp),
-        claude_path=Path(args.claude), admitted_routes=admitted)
-    report_path = Path(args.reviewer_report_file)
-    prompt_path = report_path.with_suffix(".prompt.json")
-    session_dir = Path(args.reviewer_session_dir)
-    # §8.3 again: this reviewer's pane needs the redirection exactly as the
-    # node reviewer's does. Its scratch is a sibling of the session directory
-    # the operator named, so it lands wherever that reviewer's own state does
-    # and never in the repository being reviewed.
-    scratch_dir = session_dir.with_name(session_dir.name + ".scratch")
-
-    def factory(matrix: finalization.ApplicabilityMatrix):
-        prompt_path.parent.mkdir(parents=True, exist_ok=True)
-        prompt_text = json.dumps({
-            "matrix": [
-                {"check_id": cell.check_id, "object_id": cell.object_id,
-                 "canary": cell.canary.value if cell.canary else None}
-                for cell in matrix.cells
-            ],
-            "plan_digest": matrix.plan_digest,
-            "report_path": str(report_path.resolve()),
-        }, sort_keys=True)
-        # B13 for the finalization reviewer. The matrix grows with the plan, so
-        # this prompt is runtime-sized too.
-        _preflight_prompt(prompt_text, args.reviewer_route, args.reviewer_model)
-        prompt_path.write_text(prompt_text, encoding="utf-8")
-        _clear_stale_reviewer_report(report_path)
-        handle = None
-
-        def launch_reviewer():
-            nonlocal handle
-            handle = _typed_launch_pane(runner, launcher.LaunchSpec(
-                correlation_token="finalize-" + matrix.plan_digest,
-                worktree=Path(args.repo), prompt_path=prompt_path,
-                envelope_path=report_path, route=args.reviewer_route,
-                model=args.reviewer_model, effort=args.reviewer_effort,
-                profile=args.reviewer_profile, session_dir=session_dir,
-                context_window_tokens=_route_context_window(
-                    args.reviewer_route, args.reviewer_model),
-                environment=worktree.launch_env(scratch_dir)))
-            return finalization_window.ReviewerSession(
-                route=args.reviewer_route, model=args.reviewer_model,
-                session_id=handle.pane_id, session_dir=str(session_dir),
-                # `harness_owned_group` stays keyed on `process_group` alone
-                # and must not learn about the fallback: it is what decides
-                # whether the stall path SIGKILLs, and §8.3 conditions that on
-                # a receipt §9.8 records as only partly executed. `pid` may
-                # take the fallback, because its only consumer is the window's
-                # `process_alive` read (#20).
-                harness_owned_group=handle.process_group is not None,
-                pid=handle.process_group or handle.liveness_pid)
-
-        def poll_report():
-            return _poll_reviewer_report(report_path)
-
-        def read_status(_session):
-            # B14's fix, on the path B14 was recorded against. The window has
-            # carried `actor_status` since #89, and every detector gated on it
-            # — ACTOR_ABANDONED, NEVER_STARTED, and now the turn clock — was
-            # unreachable here because this factory passed no reader, while
-            # `_code_review_runner`'s window a few hundred lines below passed
-            # one. So `plan finalize` had the span bound and a raw turn clock
-            # and nothing in between: it could not tell a reviewer that never
-            # started from one that stopped without declaring from one that was
-            # working the whole time, which is the exact distinction B14's
-            # incident ("`plans finalize` waited 22 minutes") required, and it
-            # convicted the third of them on `cmo-consolidation-l-r5`.
-            #
-            # Raw per-pane status, never `observe()`: that call collapses idle
-            # into RUNNING for a build node, and a collapsed status cannot
-            # express "went live, then stopped". `agent_status` answers None
-            # when the pane cannot be read, and the window treats that as a
-            # missing observation rather than as evidence.
-            return runner.agent_status(handle) if handle is not None else None
-
-        def kill_reviewer(_session):
-            if handle is not None:
-                runner.cancel(handle, finalization_window.time.monotonic() + 1.0)
-
-        return finalization_window.FinalizationWindow(
-            config=finalization_window.FinalizationConfig(
-                finalization_timeout_s=args.finalization_timeout_s,
-                turn_timeout_s=args.reviewer_turn_timeout_s,
-                poll_interval_s=args.reviewer_poll_interval_s),
-            launch=launch_reviewer, poll_report=poll_report,
-            record_reviewer_session=lambda _session: None,
-            kill=kill_reviewer,
-            actor_status=read_status)
-
-    return factory
 
 
 def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLauncher"):
@@ -2273,7 +2143,59 @@ def _reviewer_occupancy(
     return tokens / window
 
 
+#: The rubric label a deterministically finalized plan carries. It is not a
+#: rubric: no check was asked of anything, and the label exists so a reader of
+#: a receipt can tell which authority wrote it without inspecting `cells`.
+#: `Receipt.to_bytes` treats any label other than "maestro-rubric.v1" as the
+#: graded shape, so this one round-trips through the closed receipt schema
+#: unchanged -- which is why the deterministic path adds no receipt field. A
+#: boolean would have had to join the schema's fixed key set, and that set is
+#: compared exactly, so it would have rejected every receipt already signed.
+DETERMINISTIC_RUBRIC_VERSION = "maestro-deterministic.v1"
+
+
+def _deterministic_receipt(digest: str) -> finalization.Receipt:
+    """The receipt an eligible plan earns, with no reviewer in the path.
+
+    §1.2 forbids a lifecycle transition caused by an agent's prose. A plan
+    becoming runnable is such a transition, and until this verb was rewritten
+    it was caused by a reviewer's per-cell answers about a matrix of check ids
+    -- a reviewer that was never shown the plan, only the matrix, the digest,
+    and where to write its report. What replaces it is `plan_validate`'s
+    deterministic obligations, every one re-derivable from git objects alone,
+    which have already run by the time this is reached.
+
+    So the receipt records who actually judged: route "deterministic", model
+    "plan_validate", and the digest as the session id, because the computation
+    is a pure function of those bytes and there is no session to name. `cells`
+    is empty for the same reason -- no cell was answered -- and an empty cell
+    list is the one case the receipt's per-cell key check skips, so the shape
+    is already legal under the schema every existing signed receipt was
+    written to.
+    """
+    return finalization.Receipt(
+        plan_digest=digest,
+        rubric_version=DETERMINISTIC_RUBRIC_VERSION,
+        verdict=finalization.Verdict.PASS,
+        cells=(),
+        reviewer=finalization.ReviewerIdentity(
+            route="deterministic", model="plan_validate", session_id=digest),
+        created_at_epoch=time.time(),
+        reject_at=None)
+
+
 def _plan_finalize(args: argparse.Namespace) -> int:
+    """`maestro plan finalize` (§11.1) -- deterministic, and dispatches nothing.
+
+    Eligibility is `plan_validate`'s, unchanged. What used to follow it was a
+    launched reviewer inside a bounded window; what follows it now is the
+    signed receipt itself. The create-once and replay semantics of §6.5 are
+    untouched, because they never belonged to the reviewer: `store.recover`
+    finishes any interrupted publication, `store.has` short-circuits a digest
+    that already carries a receipt, and a `ReceiptExists` raised by a
+    concurrent writer replays that writer's receipt rather than overwriting
+    it.
+    """
     try:
         stored = Path(args.plan_file).read_bytes()
         validation = pv.validate_plan(
@@ -2290,40 +2212,31 @@ def _plan_finalize(args: argparse.Namespace) -> int:
                 ],
             }, sort_keys=True))
             return 2
-        plan = plan_model.parse_bytes(stored)
-        outcome = finalization.finalize(
-            plan_digest=validation.digest,
-            objects=plan_finalization.review_objects(plan),
-            rubric=finalization.DEFAULT_RUBRIC,
-            store=_finalization_store(args),
-            validate=lambda: (),
-            window_factory=lambda matrix: _reviewer_window_factory(args)(matrix),
-            occupancy_reader=_reviewer_occupancy)
+        store = _finalization_store(args)
+        store.recover(validation.digest)
+        if store.has(validation.digest):
+            receipt, replayed = store.load(validation.digest), True
+        else:
+            receipt = _deterministic_receipt(validation.digest)
+            try:
+                store.write(receipt)
+                replayed = False
+            except finalization.ReceiptExists:
+                receipt, replayed = store.load(validation.digest), True
     except _PlanReceiptConfigurationError as exc:
         return _refusal("FINALIZATION_CONFIGURATION_REQUIRED", str(exc))
     except (_PlanReceiptVerificationError, finalization.SignatureMissing,
             finalization.SignatureInvalid, finalization.ReceiptInvalid) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
-    except finalization.ReportRejected as exc:
-        # S6.5's terminal outcome for the bytes: no receipt exists, and the
-        # rejection reason is the operator's whole diagnosis. It is a verb
-        # outcome, not a crash -- `plan ship` reads the JSON `outcome`, so a
-        # traceback here is invisible to every caller that reads it.
-        return _refusal("REPORT_REJECTED", str(exc))
-    except finalization.FinalizationStalled as exc:
-        # A stall is a fact about the machine or the route, never a verdict
-        # about the plan, and it writes no receipt -- so rerunning
-        # `plan finalize` is legal and reviews afresh.
-        return _refusal("FINALIZATION_STALLED", str(exc))
     except (finalization.ReceiptStoreLocationError,
             receipt_crypto.KeyMaterialError,
             route_receipts.ReceiptInvalid, ValueError, OSError) as exc:
         return _refusal("FINALIZATION_FAILED", str(exc))
     print(json.dumps({
         "outcome": "FINALIZED",
-        "digest": outcome.receipt.plan_digest,
-        "verdict": outcome.verdict.value,
-        "replayed": outcome.replayed,
+        "digest": receipt.plan_digest,
+        "verdict": receipt.verdict.value,
+        "replayed": replayed,
     }, sort_keys=True))
     return 0
 
@@ -3401,7 +3314,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             # Through `_typed_launch_pane` like every other dispatch, so the
             # builder's spec is given its route's window on the same path the
             # reviewers' are. Called directly against `runner.launch` before,
-            # which meant one of the four dispatch sites would have reached the
+            # which meant one of this module's dispatch sites would have reached the
             # launcher's B13 check with nothing measured on its spec.
             handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
@@ -4863,11 +4776,18 @@ def _plan_ship_authoring(destination: Path, projected: bytes,
       digest and the new one takes its place, unless that plan is approved.
 
     An approved plan is never replaced. `Verdict.PASS` means a receipt exists
-    that binds a reviewer to those exact bytes, and a run keys on the digest,
-    so replacing the file could pull the plan out from under work that refers
-    to it. `FAIL` carries no such risk -- it is terminal for those bytes, so
-    nothing may ever run them -- and neither does a plan with no receipt at
-    all.
+    over those exact bytes, and a run keys on the digest, so replacing the file
+    could pull the plan out from under work that refers to it. `FAIL` carries
+    no such risk -- it is terminal for those bytes, so nothing may ever run
+    them -- and neither does a plan with no receipt at all.
+
+    This guard bites harder than it used to, and deliberately. While a plan
+    could FAIL review, a finalized plan was sometimes replaceable; now that
+    `plan finalize` is deterministic, every finalized plan is PASS, so any
+    re-ship whose IR moved is refused. The route back is to remove the plan
+    directory once no live run holds its bytes -- which is exactly what
+    `maestro deliver` does on a re-ship, and what the refusal below names.
+    `plan set-aside` is NOT that route: it reopens a FAIL and refuses a PASS.
     """
     if not destination.exists():
         return None
@@ -4877,8 +4797,12 @@ def _plan_ship_authoring(destination: Path, projected: bytes,
     superseded = plan_digest.digest_of(existing)
     if approved(superseded):
         raise _ShipSupersedeRefused(
-            "the plan on disk ({}) is approved and differs from the projected "
-            "plan; finalize it or remove its approval before re-shipping"
+            "the plan on disk ({}) carries a PASS receipt and differs from "
+            "the projected plan; every finalized plan is PASS now that "
+            "`plan finalize` is deterministic, so re-shipping moved bytes "
+            "means removing this plan's directory once no live run holds it "
+            "(`maestro deliver` does that on a re-ship). `plan set-aside` "
+            "cannot help here: it reopens a FAIL and refuses a PASS."
             .format(superseded))
     archive = _superseded_plan_path(destination, superseded)
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -5324,23 +5248,6 @@ def _deliver_release_run(config: Dict[str, Any], name: str,
     return () if released is None else (str(released),)
 
 
-def _deliver_reviewer_report(config: Dict[str, Any], name: str):
-    """The report behind a finalization verdict, so a FAIL yields its cells."""
-    plan_file = (config["plans_dir"] / name / "maestro-plan.v1")
-    if not plan_file.is_file():
-        return None
-    digest = plan_digest.digest_of(plan_file.read_bytes())
-    report = (config["repository_state"] / "finalization" / digest
-              / "report.json")
-    if not report.is_file():
-        return None
-    try:
-        payload = json.loads(report.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
 def _plan_runs_not_over(config: Dict[str, Any], name: str
                         ) -> Tuple[Tuple[str, str], ...]:
     """Runs against these exact plan bytes that an operator can still resume.
@@ -5451,7 +5358,6 @@ def _deliver(args: argparse.Namespace) -> int:
         envelope_dir=session_root,
         author_turn=_deliver_author_turn(config, lane, runner, session_root),
         plan_step=_deliver_plan_step,
-        reviewer_report=lambda name: _deliver_reviewer_report(config, name),
         request=args.request or "",
         max_attempts=args.max_attempts,
         remove_plan_dir=lambda name: _deliver_remove_plan(
@@ -5971,29 +5877,14 @@ def build_parser() -> argparse.ArgumentParser:
     finalize = plan_sub.add_parser("finalize")
     finalize.add_argument("plan_name")
     finalize.add_argument("--repo", default=".")
+    # The receipt is the whole surface. Twelve reviewer flags stood here --
+    # route, model, effort, profile, session dir, report file, the three
+    # executables, the two route-receipt flags and three window clocks -- and
+    # every one of them existed to launch and bound a pane. There is no pane.
     finalize.add_argument("--receipt-dir")
     finalize.add_argument("--data-dir")
     finalize.add_argument("--verify-key", action="append")
     finalize.add_argument("--signing-seed")
-    finalize.add_argument("--herdr")
-    finalize.add_argument("--omp")
-    finalize.add_argument("--claude")
-    finalize.add_argument("--reviewer-route")
-    finalize.add_argument("--reviewer-model")
-    finalize.add_argument("--reviewer-effort")
-    finalize.add_argument("--reviewer-profile")
-    finalize.add_argument("--reviewer-session-dir")
-    finalize.add_argument("--reviewer-report-file")
-    finalize.add_argument("--route-receipt", action="append")
-    finalize.add_argument("--route-verify-key", action="append")
-    finalize.add_argument("--finalization-timeout-s", type=float, default=600.0)
-    # Taken from the module rather than typed here. Two literals for one clock
-    # is how a raised module default comes to look like it did nothing: this
-    # default binds last on the unconfigured path and would silently win.
-    finalize.add_argument(
-        "--reviewer-turn-timeout-s", type=float,
-        default=finalization_window.DEFAULT_TURN_TIMEOUT_S)
-    finalize.add_argument("--reviewer-poll-interval-s", type=float, default=1.0)
     finalize.set_defaults(handler=_plan_finalize)
     gate = plan_sub.add_parser("gate")
     gate.add_argument("plan_name")

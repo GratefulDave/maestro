@@ -1,11 +1,21 @@
-"""Executable proof of finalization (§6.5, §6.6, §11.1).
+"""Executable proof of the review kernel and the receipt (§6.5, §6.6).
 
-What §6.5 actually requires, and what each block below settles:
+One verb used to reach every block below and no longer does. `plan finalize`
+dispatches no reviewer: a plan is finalized on `plan_validate`'s deterministic
+obligations alone, and `tests/test_plan_finalize_deterministic.py` is where
+that path is proven. What survives here is the kernel node review runs on, and
+the receipt store both review paths share.
 
-  ordering    -- every deterministic obligation runs BEFORE any reviewer
-                 is launched. The failure being prevented is a reviewer
-                 passing thirty nodes and publication then dying on a pure
-                 function of the authored bytes.
+That is why the rubric these tests range over is defined in this file. It used
+to be `finalization.DEFAULT_RUBRIC`, the plan rubric, which was deleted with
+the review it served. A fixture rubric is the honest replacement: every
+property below is a property of `compute_matrix`, `verify_report`,
+`derive_verdict` and `Receipt` for *any* rubric, and asserting them against
+code review's production rubric would restate `test_code_review.py` while
+tying this file to whichever questions that rubric happens to ask this week.
+
+What each block settles:
+
   the matrix  -- code computes the (check x object) applicability matrix,
                  so two reviewers receive identical coverage.
   the report  -- the reviewer emits per-cell `clear|finding` plus a
@@ -26,15 +36,12 @@ What §6.5 actually requires, and what each block below settles:
                  reviewer's (route, model, session id), signed with a
                  detached Ed25519 signature, in a store that refuses to
                  sit inside the repository or the SSSF data directory.
-  replay      -- keyed on the digest alone, short-circuiting with zero
-                 reviewer calls.
-  the stall   -- `FINALIZATION_STALLED` is not a receipt: no receipt
-                 exists for the digest afterwards, and a rerun is legal.
+  replay      -- keyed on the digest alone, and readable across every
+                 receipt shape ever signed: `maestro-rubric.v1`, the
+                 pre-grading v2, and today's.
 
 Real resources only: a real `git init` repository and real temporary
-directories for the store-location invariant, and the real
-`FinalizationWindow` (driven by an injected clock) wherever a window is
-needed — never a mock of either.
+directories for the store-location invariant -- never a mock of either.
 
 Run with:  uv run adws/adw_test.py -k finaliz
 """
@@ -55,33 +62,49 @@ sys.path.insert(0, str(ADWS))
 import pydantic  # noqa: E402
 
 from adw_modules import finalization as fin  # noqa: E402
-from adw_modules import finalization_window as fw  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
 DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 OTHER_DIGEST = "a" * 64
 
+#: Two kinds, four checks, both severities, and one check that applies to
+#: only one of the kinds -- the smallest rubric that can still distinguish a
+#: matrix which respects `applies_to` from one that does not, and a verdict
+#: derivation that reads severity from the rubric from one that guesses.
+FIXTURE_RUBRIC = fin.Rubric(
+    version="fixture-rubric.v1",
+    checks=(
+        fin.RubricCheck(
+            check_id="diff.implements_the_instruction",
+            question="Does the diff do what it was asked to do?",
+            applies_to=(fin.ObjectKind.DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="diff.is_explained",
+            question="Is the diff's shape accounted for?",
+            applies_to=(fin.ObjectKind.DIFF,),
+            severity=fin.Severity.ADVISORY),
+        fin.RubricCheck(
+            check_id="file.introduces_no_secret",
+            question="Does this file introduce a credential?",
+            applies_to=(fin.ObjectKind.CHANGED_FILE,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="object.was_actually_read",
+            question="Was this object read rather than skimmed?",
+            applies_to=(fin.ObjectKind.DIFF, fin.ObjectKind.CHANGED_FILE),
+            severity=fin.Severity.ADVISORY),
+    ))
+
 OBJECTS = (
-    fin.ReviewObject(object_id="plan", kind=fin.ObjectKind.PLAN),
-    fin.ReviewObject(object_id="node:build", kind=fin.ObjectKind.NODE),
-    fin.ReviewObject(object_id="node:build#gate", kind=fin.ObjectKind.GATE),
-    fin.ReviewObject(object_id="evidence:0", kind=fin.ObjectKind.EVIDENCE),
+    fin.ReviewObject(object_id="diff:" + "f" * 40, kind=fin.ObjectKind.DIFF),
+    fin.ReviewObject(object_id="file:a.py", kind=fin.ObjectKind.CHANGED_FILE),
+    fin.ReviewObject(object_id="file:b.py", kind=fin.ObjectKind.CHANGED_FILE),
 )
 
 
-class FakeClock:
-    def __init__(self, start: float = 0.0) -> None:
-        self._now = start
-
-    def __call__(self) -> float:
-        return self._now
-
-    def advance(self, seconds: float) -> None:
-        self._now += seconds
-
-
 def matrix_for(objects=OBJECTS, digest=DIGEST) -> fin.ApplicabilityMatrix:
-    return fin.compute_matrix(fin.DEFAULT_RUBRIC, digest, objects)
+    return fin.compute_matrix(FIXTURE_RUBRIC, digest, objects)
 
 
 def clean_report(matrix, *, digest=None, pair_count=None,
@@ -108,53 +131,28 @@ def clean_report(matrix, *, digest=None, pair_count=None,
     }
 
 
-class WindowFactory:
-    """Builds the real `FinalizationWindow` over injected collaborators.
+def written_receipt(store, *, digest=DIGEST, findings=()):
+    """One receipt, written by the same three calls every review path makes.
 
-    `stalled=True` never produces a report and lets the injected sleep
-    advance the clock past the span bound, which is how the stall path is
-    exercised without sleeping.
+    `finalize()` used to do this and was deleted with the plan reviewer, so the
+    tests that need a receipt on disk assemble one from the kernel rather than
+    from a verb. Nothing is stubbed: the matrix, the report, the derived cells
+    and the signature are all real.
     """
-
-    def __init__(self, report=None, *, stalled=False, route="omp",
-                 model="opus", session_id="sess-1"):
-        self.report = report
-        self.stalled = stalled
-        self.route = route
-        self.model = model
-        self.session_id = session_id
-        self.launches = 0
-        self.calls = []
-        self.clock = FakeClock()
-
-    def __call__(self, matrix) -> fw.FinalizationWindow:
-        self.matrix = matrix
-        return fw.FinalizationWindow(
-            config=fw.FinalizationConfig(finalization_timeout_s=10.0,
-                                         turn_timeout_s=5.0,
-                                         poll_interval_s=1.0),
-            launch=self._launch,
-            poll_report=self._poll_report,
-            record_reviewer_session=lambda session: self.calls.append("record"),
-            kill=lambda session: self.calls.append("kill"),
-            time_source=self.clock,
-            wall_clock=lambda: 1_760_000_000.0,
-        )
-
-    def _launch(self):
-        self.launches += 1
-        self.calls.append("launch")
-        return fw.ReviewerSession(route=self.route, model=self.model,
-                                  session_id=self.session_id,
-                                  harness_owned_group=True)
-
-    def _poll_report(self):
-        if self.stalled:
-            return None
-        return self.report
-
-    def sleep(self, seconds):
-        self.clock.advance(4.0)
+    matrix = matrix_for(digest=digest)
+    report = fin.ReviewerReport.model_validate(
+        clean_report(matrix, findings=findings))
+    derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
+    receipt = fin.Receipt(
+        plan_digest=digest,
+        rubric_version=FIXTURE_RUBRIC.version,
+        verdict=derived.verdict,
+        cells=derived.cells,
+        reviewer=fin.ReviewerIdentity(route="omp", model="opus",
+                                      session_id="sess-1"),
+        created_at_epoch=1_760_000_000.0)
+    store.write(receipt)
+    return receipt
 
 
 def make_store(tmp: Path, *, seed=None, verify_keys=None, root=None):
@@ -179,7 +177,7 @@ class TheMatrixIsComputedByCode(unittest.TestCase):
         pairs = [(c.check_id, c.object_id) for c in matrix.cells]
         self.assertEqual(len(pairs), len(set(pairs)))
         for obj in OBJECTS:
-            for check in fin.DEFAULT_RUBRIC.applicable(obj):
+            for check in FIXTURE_RUBRIC.applicable(obj):
                 self.assertIn((check.check_id, obj.object_id), pairs)
 
     def test_a_check_is_not_applied_to_an_inapplicable_object_kind(self):
@@ -188,7 +186,7 @@ class TheMatrixIsComputedByCode(unittest.TestCase):
             if cell.is_canary:
                 continue
             obj = next(o for o in OBJECTS if o.object_id == cell.object_id)
-            check = fin.DEFAULT_RUBRIC.check(cell.check_id)
+            check = FIXTURE_RUBRIC.check(cell.check_id)
             self.assertIn(obj.kind, check.applies_to)
 
     def test_two_computations_of_the_same_plan_are_identical(self):
@@ -256,13 +254,13 @@ class VerdictAndSeverityAreUnrepresentable(unittest.TestCase):
     def test_severity_comes_from_the_rubric_not_the_report(self):
         matrix = matrix_for()
         report = fin.ReviewerReport.model_validate(clean_report(matrix))
-        derived = fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC)
+        derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
         for cell in derived.cells:
             if cell.canary is not None:
                 continue
             self.assertEqual(
                 cell.severity,
-                fin.DEFAULT_RUBRIC.check(cell.check_id).severity)
+                FIXTURE_RUBRIC.check(cell.check_id).severity)
 
 
 class TheReportIsVerifiedAgainstTheMatrix(unittest.TestCase):
@@ -297,7 +295,8 @@ class TheReportIsVerifiedAgainstTheMatrix(unittest.TestCase):
 
     def test_an_invented_cell_is_rejected(self):
         payload = clean_report(self.matrix)
-        payload["cells"].append({"check_id": "invented", "object_id": "plan",
+        payload["cells"].append({"check_id": "invented",
+                                 "object_id": "file:a.py",
                                  "status": "clear", "message": ""})
         rejected = self._reject(payload)
         self.assertEqual(rejected.reason, fin.RejectionReason.CELL_SET)
@@ -341,7 +340,7 @@ class TheCanaryIsAPair(unittest.TestCase):
         """Excluded from verdict derivation -- otherwise every plan
         FAILs, since the known-bad cell is always answered `finding`."""
         report = fin.ReviewerReport.model_validate(clean_report(self.matrix))
-        derived = fin.derive_verdict(self.matrix, report, fin.DEFAULT_RUBRIC)
+        derived = fin.derive_verdict(self.matrix, report, FIXTURE_RUBRIC)
         self.assertEqual(derived.verdict, fin.Verdict.PASS)
         canaries = [c for c in derived.cells if c.canary is not None]
         self.assertEqual(len(canaries), 2)
@@ -370,30 +369,30 @@ class VerdictDerivation(unittest.TestCase):
         matrix = matrix_for()
         report = fin.ReviewerReport.model_validate(clean_report(matrix))
         self.assertEqual(
-            fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC).verdict,
+            fin.derive_verdict(matrix, report, FIXTURE_RUBRIC).verdict,
             fin.Verdict.PASS)
 
     def test_a_blocking_finding_is_a_fail(self):
         matrix = matrix_for()
         blocking = next(c for c in matrix.graded_cells
-                        if fin.DEFAULT_RUBRIC.check(c.check_id).severity
+                        if FIXTURE_RUBRIC.check(c.check_id).severity
                         is fin.Severity.BLOCKING)
         payload = clean_report(
             matrix, findings=((blocking.check_id, blocking.object_id),))
         report = fin.ReviewerReport.model_validate(payload)
         self.assertEqual(
-            fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC).verdict,
+            fin.derive_verdict(matrix, report, FIXTURE_RUBRIC).verdict,
             fin.Verdict.FAIL)
 
     def test_an_advisory_finding_alone_is_still_a_pass(self):
         matrix = matrix_for()
         advisory = next(c for c in matrix.graded_cells
-                        if fin.DEFAULT_RUBRIC.check(c.check_id).severity
+                        if FIXTURE_RUBRIC.check(c.check_id).severity
                         is fin.Severity.ADVISORY)
         payload = clean_report(
             matrix, findings=((advisory.check_id, advisory.object_id),))
         report = fin.ReviewerReport.model_validate(payload)
-        derived = fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC)
+        derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
         self.assertEqual(derived.verdict, fin.Verdict.PASS)
 
 
@@ -432,10 +431,10 @@ class ReceiptIntegrity(unittest.TestCase):
     def _receipt(self, verdict=fin.Verdict.PASS, digest=DIGEST):
         matrix = matrix_for(digest=digest)
         report = fin.ReviewerReport.model_validate(clean_report(matrix))
-        derived = fin.derive_verdict(matrix, report, fin.DEFAULT_RUBRIC)
+        derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
         return fin.Receipt(
             plan_digest=digest,
-            rubric_version=fin.DEFAULT_RUBRIC.version,
+            rubric_version=FIXTURE_RUBRIC.version,
             verdict=verdict,
             cells=derived.cells,
             reviewer=fin.ReviewerIdentity(route="omp", model="opus",
@@ -672,247 +671,6 @@ class ReceiptIntegrity(unittest.TestCase):
             self.assertEqual(store.load(DIGEST), receipt)
 
 
-class FinalizeOrchestration(unittest.TestCase):
-
-    def _finalize(self, store, factory, *, blockers=(), occupancy=0.4,
-                  digest=DIGEST, calls=None, clock=lambda: 1_760_000_000.0):
-        def validate():
-            if calls is not None:
-                calls.append("validate")
-            return list(blockers)
-
-        def window_factory(matrix):
-            if calls is not None:
-                calls.append("window")
-            return factory(matrix)
-
-        return fin.finalize(
-            plan_digest=digest,
-            objects=OBJECTS,
-            rubric=fin.DEFAULT_RUBRIC,
-            store=store,
-            validate=validate,
-            window_factory=window_factory,
-            occupancy_reader=lambda session: occupancy,
-            sleep=factory.sleep,
-            clock=clock)
-
-    def test_obligations_run_before_any_reviewer_is_launched(self):
-        """§6.5's asserted, tested ordering invariant."""
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            calls = []
-            factory = WindowFactory(report=clean_report(matrix_for()))
-            # One shared list, so the ordering asserted is a real ordering
-            # across validation, window construction, and the launch.
-            factory.calls = calls
-            self._finalize(store, factory, calls=calls)
-            self.assertEqual(calls, ["validate", "window", "launch", "record"])
-
-    def test_an_unsafe_finalization_clock_never_publishes_a_receipt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            factory = WindowFactory(report=clean_report(matrix_for()))
-            with self.assertRaises(fin.ReceiptInvalid):
-                self._finalize(store, factory, clock=lambda: float("nan"))
-            self.assertFalse(store.has(DIGEST))
-
-    def test_blockers_launch_no_reviewer_and_publish_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            factory = WindowFactory(report=clean_report(matrix_for()))
-            blocker = fin.Blocker(pointer="/nodes/0/gate",
-                                  code="GATE_NOT_EXECUTABLE",
-                                  message="selector collects nothing")
-            with self.assertRaises(fin.AuthoringBlocked) as caught:
-                self._finalize(store, factory, blockers=[blocker])
-            self.assertEqual(caught.exception.blockers, (blocker,))
-            self.assertEqual(factory.launches, 0)
-            self.assertFalse(store.has(DIGEST))
-
-    def test_a_pass_writes_a_signed_receipt_with_the_full_matrix(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            factory = WindowFactory(report=clean_report(matrix_for()))
-            outcome = self._finalize(store, factory)
-            self.assertEqual(outcome.verdict, fin.Verdict.PASS)
-            self.assertFalse(outcome.replayed)
-            self.assertTrue(store.has(DIGEST))
-            self.assertEqual(len(store.load(DIGEST).cells),
-                             matrix_for().pair_count)
-
-    def test_a_blocking_finding_publishes_a_fail_receipt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            matrix = matrix_for()
-            blocking = next(c for c in matrix.graded_cells
-                            if fin.DEFAULT_RUBRIC.check(c.check_id).severity
-                            is fin.Severity.BLOCKING)
-            factory = WindowFactory(report=clean_report(
-                matrix, findings=((blocking.check_id, blocking.object_id),)))
-            outcome = self._finalize(store, factory)
-            self.assertEqual(outcome.verdict, fin.Verdict.FAIL)
-            self.assertEqual(store.load(DIGEST).verdict, fin.Verdict.FAIL)
-
-    def test_a_replay_short_circuits_with_zero_reviewer_calls(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            first = WindowFactory(report=clean_report(matrix_for()))
-            self._finalize(store, first)
-            second = WindowFactory(report=clean_report(matrix_for()))
-            outcome = self._finalize(store, second)
-            self.assertTrue(outcome.replayed)
-            self.assertEqual(second.launches, 0)
-            self.assertEqual(outcome.verdict, fin.Verdict.PASS)
-
-    def test_interrupted_detached_publication_recovers_as_a_verified_replay(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            original_stage = store._stage
-
-            def interrupt_after_receipt_commit(destination, data):
-                original_stage(destination, data)
-                if destination == store.path_for(DIGEST):
-                    raise OSError("simulated crash after receipt commit")
-
-            store._stage = interrupt_after_receipt_commit
-            with self.assertRaises(OSError):
-                self._finalize(store, WindowFactory(report=clean_report(matrix_for())))
-            store._stage = original_stage
-
-            replay = WindowFactory(report=clean_report(matrix_for()))
-            outcome = self._finalize(store, replay)
-
-            self.assertTrue(outcome.replayed)
-            self.assertEqual(replay.launches, 0)
-            self.assertEqual(store.load(DIGEST).plan_digest, DIGEST)
-
-    def test_concurrent_finalizers_replay_the_one_verified_receipt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            start = threading.Barrier(3)
-            outcomes = []
-            errors = []
-
-            def finalize_once():
-                try:
-                    start.wait()
-                    outcomes.append(self._finalize(
-                        store, WindowFactory(report=clean_report(matrix_for()))))
-                except Exception as exc:
-                    errors.append(exc)
-
-            first = threading.Thread(target=finalize_once)
-            second = threading.Thread(target=finalize_once)
-            first.start()
-            second.start()
-            start.wait()
-            first.join()
-            second.join()
-
-            self.assertEqual(errors, [])
-            self.assertEqual(len(outcomes), 2)
-            self.assertEqual({outcome.receipt for outcome in outcomes},
-                             {store.load(DIGEST)})
-            self.assertEqual(sum(not outcome.replayed for outcome in outcomes), 1)
-
-    def test_replay_is_keyed_on_the_digest_alone(self):
-        """§6.5: keying on routes, policy, or delivery target would mean
-        changing a route re-reviews unchanged bytes."""
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            self._finalize(store, WindowFactory(report=clean_report(matrix_for())))
-            rerouted = WindowFactory(report=clean_report(matrix_for()),
-                                     route="claude", model="sonnet",
-                                     session_id="sess-99")
-            outcome = self._finalize(store, rerouted)
-            self.assertTrue(outcome.replayed)
-            self.assertEqual(rerouted.launches, 0)
-            self.assertEqual(outcome.receipt.reviewer.route, "omp")
-
-    def test_a_fail_is_terminal_for_those_bytes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            matrix = matrix_for()
-            blocking = next(c for c in matrix.graded_cells
-                            if fin.DEFAULT_RUBRIC.check(c.check_id).severity
-                            is fin.Severity.BLOCKING)
-            failing = clean_report(
-                matrix, findings=((blocking.check_id, blocking.object_id),))
-            self._finalize(store, WindowFactory(report=failing))
-            retry = WindowFactory(report=clean_report(matrix))
-            outcome = self._finalize(store, retry)
-            self.assertTrue(outcome.replayed)
-            self.assertEqual(outcome.verdict, fin.Verdict.FAIL)
-            self.assertEqual(retry.launches, 0)
-
-    def test_a_stall_writes_no_receipt_and_leaves_the_digest_reviewable(self):
-        """§6.5: `FINALIZATION_STALLED` is deliberately not a receipt --
-        FAIL is terminal for the bytes, and a stall is a fact about the
-        machine or the route."""
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            stalling = WindowFactory(stalled=True)
-            with self.assertRaises(fin.FinalizationStalled) as caught:
-                self._finalize(store, stalling)
-            stalled = caught.exception
-            self.assertEqual(stalled.route, "omp")
-            self.assertEqual(stalled.model, "opus")
-            self.assertEqual(stalled.session_id, "sess-1")
-            # TURN_TIMEOUT, not WINDOW_TIMEOUT, and the difference is §6.5's
-            # whole ordering claim rather than a detail of this fixture. The
-            # window now arms the session in `run` before its first poll, so
-            # a reviewer that stops without declaring is convicted by the
-            # structural signal that names what actually happened. It read
-            # WINDOW_TIMEOUT for as long as `run` never armed — with the
-            # session unarmed, `poll` returned early and the span bound was
-            # the only detector left, which is B14's recorded failure and the
-            # inversion §6.5 exists to forbid.
-            self.assertEqual(stalled.signal,
-                             fw.FinalizationSignal.TURN_TIMEOUT)
-            self.assertFalse(store.has(DIGEST))
-            # The stall's durable half is this typed exception and the
-            # outcome behind it -- the window holds no recorder of its own,
-            # because both production call sites passed a no-op one and a
-            # seam that records nothing is worse than none at all.
-            self.assertIn("kill", stalling.calls)
-
-            rerun = WindowFactory(report=clean_report(matrix_for()))
-            outcome = self._finalize(store, rerun)
-            self.assertEqual(outcome.verdict, fin.Verdict.PASS)
-            self.assertEqual(rerun.launches, 1)
-
-    def test_a_rejected_report_writes_no_receipt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            fabricated = clean_report(matrix_for(), digest=OTHER_DIGEST)
-            factory = WindowFactory(report=fabricated)
-            with self.assertRaises(fin.ReportRejected):
-                self._finalize(store, factory)
-            self.assertFalse(store.has(DIGEST))
-
-    def test_a_null_occupancy_row_rejects_before_the_receipt_exists(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            factory = WindowFactory(report=clean_report(matrix_for()))
-            with self.assertRaises(fin.ReportRejected) as caught:
-                self._finalize(store, factory, occupancy=None)
-            self.assertEqual(caught.exception.reason,
-                             fin.RejectionReason.OCCUPANCY)
-            self.assertFalse(store.has(DIGEST))
-
-    def test_a_report_with_an_unknown_field_never_reaches_a_receipt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store, _repo, _data, _seed = make_store(Path(tmp))
-            payload = clean_report(matrix_for())
-            payload["cells"][0]["severity"] = "BLOCKING"
-            factory = WindowFactory(report=payload)
-            with self.assertRaises(pydantic.ValidationError):
-                self._finalize(store, factory)
-            self.assertFalse(store.has(DIGEST))
-
-
-
 class ALegacyV1ReceiptStillReplays(unittest.TestCase):
     """`reject_at` is required for v2, not for receipts written before it.
 
@@ -935,14 +693,7 @@ class ALegacyV1ReceiptStillReplays(unittest.TestCase):
     def test_a_signed_v1_receipt_parses_and_replays_after_the_v2_upgrade(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, seed = make_store(Path(tmp))
-            first = WindowFactory(report=clean_report(matrix_for()))
-            written = fin.finalize(
-                plan_digest=DIGEST, objects=OBJECTS,
-                rubric=fin.DEFAULT_RUBRIC, store=store,
-                validate=lambda: (), window_factory=first,
-                occupancy_reader=lambda session: 0.4, sleep=first.sleep,
-                clock=lambda: 1_760_000_000.0)
-            self.assertFalse(written.replayed)
+            written_receipt(store)
             historical = self._install_signed_v1(
                 store, seed, store.path_for(DIGEST).read_bytes())
 
@@ -952,18 +703,14 @@ class ALegacyV1ReceiptStillReplays(unittest.TestCase):
             self.assertEqual(parsed.verdict, fin.Verdict.PASS)
             self.assertEqual(store.load(DIGEST), parsed)
 
-            replay = WindowFactory(report=clean_report(matrix_for()))
-            outcome = fin.finalize(
-                plan_digest=DIGEST, objects=OBJECTS,
-                rubric=fin.DEFAULT_RUBRIC, store=store,
-                validate=lambda: (), window_factory=replay,
-                occupancy_reader=lambda session: 0.4, sleep=replay.sleep,
-                clock=lambda: 1_760_000_000.0)
-            self.assertTrue(outcome.replayed)
-            self.assertEqual(replay.launches, 0)
-            self.assertEqual(outcome.receipt.rubric_version,
-                             "maestro-rubric.v1")
-            self.assertIsNone(outcome.receipt.reject_at)
+            # Replay: the digest already carries a receipt, so every caller
+            # short-circuits on `has` and no review of any kind is dispatched.
+            self.assertTrue(store.has(DIGEST))
+            replayed = store.load(DIGEST)
+            self.assertEqual(replayed.rubric_version, "maestro-rubric.v1")
+            self.assertIsNone(replayed.reject_at)
+            with self.assertRaises(fin.ReceiptExists):
+                written_receipt(store)
 
 
 
@@ -993,14 +740,7 @@ class APreGradingV2ReceiptStillReplays(unittest.TestCase):
     def test_a_signed_pre_grading_v2_receipt_parses_verifies_and_replays(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, seed = make_store(Path(tmp))
-            first = WindowFactory(report=clean_report(matrix_for()))
-            written = fin.finalize(
-                plan_digest=DIGEST, objects=OBJECTS,
-                rubric=fin.DEFAULT_RUBRIC, store=store,
-                validate=lambda: (), window_factory=first,
-                occupancy_reader=lambda session: 0.4, sleep=first.sleep,
-                clock=lambda: 1_760_000_000.0)
-            self.assertFalse(written.replayed)
+            written_receipt(store)
             historical = self._install_signed_pre_grading_v2(
                 store, seed, store.path_for(DIGEST).read_bytes())
 
@@ -1013,31 +753,19 @@ class APreGradingV2ReceiptStillReplays(unittest.TestCase):
             self.assertEqual(parsed.verdict, fin.Verdict.PASS)
             self.assertEqual(store.load(DIGEST), parsed)
 
-            replay = WindowFactory(report=clean_report(matrix_for()))
-            outcome = fin.finalize(
-                plan_digest=DIGEST, objects=OBJECTS,
-                rubric=fin.DEFAULT_RUBRIC, store=store,
-                validate=lambda: (), window_factory=replay,
-                occupancy_reader=lambda session: 0.4, sleep=replay.sleep,
-                clock=lambda: 1_760_000_000.0)
-            self.assertTrue(outcome.replayed)
-            self.assertEqual(replay.launches, 0)
-            self.assertEqual(outcome.receipt.rubric_version,
-                             "maestro-rubric.v2")
-            self.assertIsNone(outcome.receipt.reject_at)
-            for cell in outcome.receipt.cells:
+            self.assertTrue(store.has(DIGEST))
+            replayed = store.load(DIGEST)
+            self.assertEqual(replayed.rubric_version, "maestro-rubric.v2")
+            self.assertIsNone(replayed.reject_at)
+            for cell in replayed.cells:
                 self.assertIsNone(cell.grade)
+            with self.assertRaises(fin.ReceiptExists):
+                written_receipt(store)
 
     def test_a_receipt_written_today_still_requires_reject_at_and_grade(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            factory = WindowFactory(report=clean_report(matrix_for()))
-            fin.finalize(
-                plan_digest=DIGEST, objects=OBJECTS,
-                rubric=fin.DEFAULT_RUBRIC, store=store,
-                validate=lambda: (), window_factory=factory,
-                occupancy_reader=lambda session: 0.4, sleep=factory.sleep,
-                clock=lambda: 1_760_000_000.0)
+            written_receipt(store)
             payload = json.loads(store.path_for(DIGEST).read_bytes())
             self.assertIn("reject_at", payload)
             self.assertTrue(payload["cells"])

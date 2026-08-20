@@ -60,9 +60,9 @@ from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
 from test_finalization import (  # noqa: E402
-    DIGEST, OBJECTS, WindowFactory, clean_report, make_store, matrix_for)
+    DIGEST, clean_report, make_store, matrix_for)
 from test_receipt_set_aside import (  # noqa: E402
-    INVOKER, REASON, failing_report, finalize)
+    INVOKER, REASON, Review, failing_report, finalize)
 
 
 def _emit(call):
@@ -92,7 +92,7 @@ class TheAbsentReceiptNamesItsCauseTest(unittest.TestCase):
         needed `plan finalize`."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
             refusal = maestro._receipt_absent(store, DIGEST)
@@ -104,10 +104,10 @@ class TheAbsentReceiptNamesItsCauseTest(unittest.TestCase):
     def test_the_escape_count_is_the_number_of_escapes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-1"))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-2"),
                      clock=lambda: 1_760_000_500.0)
             store.set_aside(DIGEST, invoked_by=INVOKER, reason="and again")
@@ -173,7 +173,7 @@ class TheRunPathRefusalsAreNamedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, _repo, _data, seed = make_store(root)
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             args = self._arguments(root, store, seed)
             with self._eligible():
@@ -189,7 +189,7 @@ class TheRunPathRefusalsAreNamedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, _repo, _data, seed = make_store(root)
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             args = self._arguments(root, store, seed)
             with self._eligible():
                 with self.assertRaises(maestro._RunRefused) as caught:
@@ -216,7 +216,7 @@ class TheRunPathRefusalsAreNamedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, _repo, _data, seed = make_store(root)
-            finalize(store, WindowFactory(report=clean_report(matrix_for())))
+            finalize(store, Review(report=clean_report(matrix_for())))
             args = self._arguments(root, store, seed)
             with self._eligible(), mock.patch.object(
                     maestro.plan_model, "parse_bytes",

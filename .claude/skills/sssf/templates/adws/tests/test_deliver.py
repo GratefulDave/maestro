@@ -14,6 +14,7 @@ because none of them is the thing under test here.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -77,7 +78,6 @@ class DeliveryFixture(unittest.TestCase):
         self.steps = []
         self.removed = []
         self.released = []
-        self.reports = {}
         self.step_script = {}
         self.lane_script = {}
         self.started = []
@@ -126,12 +126,6 @@ class DeliveryFixture(unittest.TestCase):
             return 0, [{"outcome": "PLAN_SHIPPED", "verdict": "PASS"}]
         return 0, [{"outcome": "OK"}]
 
-    def reviewer_report(self, name):
-        report = self.reports.get(name)
-        if callable(report):
-            return report()
-        return report
-
     def remove_plan_dir(self, name):
         self.removed.append(name)
 
@@ -160,7 +154,7 @@ class DeliveryFixture(unittest.TestCase):
         kwargs = dict(
             spec=self.spec, repo=self.repo, plans_dir=self.plans,
             envelope_dir=self.envelopes, author_turn=self.author_turn,
-            plan_step=self.plan_step, reviewer_report=self.reviewer_report,
+            plan_step=self.plan_step,
             remove_plan_dir=self.remove_plan_dir)
         kwargs.update(overrides)
         return deliver.Delivery(**kwargs)
@@ -320,28 +314,28 @@ class RepairLoopTest(DeliveryFixture):
         self.assertIn("collects 0 cases at base", repair[0]["prompt"])
         self.assertIn("attempt 2 of 3", repair[0]["prompt"])
 
-    def test_a_reviewer_fail_verdict_is_a_failed_attempt_though_ship_exits_zero(self):
+    def test_a_fail_verdict_is_a_failed_attempt_though_ship_exits_zero(self):
+        """`plan ship` exits 0 on a FAIL verdict, so the verdict in its payload
+        is the only thing that says the attempt failed.
+
+        The findings used to come from the finalization reviewer's report
+        cells. There is no such reviewer and no such report: `plan finalize` is
+        deterministic and writes only PASS, so the one way to see FAIL here is
+        a receipt an earlier reviewer signed over these exact bytes. It is
+        still terminal for them, and it is still a failed attempt.
+        """
         self.ok("gate", "alpha")
         self.ok("review", "alpha")
         self.step_script[("ship", "alpha")] = lambda index: (
             0, [{"outcome": "PLAN_SHIPPED",
                  "verdict": "FAIL" if index == 0 else "PASS"}])
-        self.reports["alpha"] = {"cells": [
-            {"check_id": "evidence-supports-claim", "object_id": "evidence:s0",
-             "status": "finding", "message": "the cited blob has no such claim"},
-            {"check_id": "gate-counts", "object_id": "node:lane-a#gate",
-             "status": "clear", "message": ""},
-        ]}
 
         result = self.delivery().run()
 
         self.assertEqual(result["outcome"], "DELIVERED_NOT_RUN")
         self.assertEqual(result["packages"][0]["attempts"], 2)
         repair = [turn for turn in self.turns if turn["kind"] == "repair"][0]
-        self.assertIn("evidence-supports-claim", repair["prompt"])
-        self.assertIn("the cited blob has no such claim", repair["prompt"])
-        # A clear cell is not a finding and must not be handed back as one.
-        self.assertNotIn("gate-counts", repair["prompt"])
+        self.assertIn("RECEIPT_FAIL", repair["prompt"])
 
     def test_three_failures_stop_and_surface_the_findings(self):
         failure = {"outcome": "PLAN_GATE_FAILED", "step": "validate",
@@ -383,13 +377,13 @@ class RepairLoopTest(DeliveryFixture):
         self.assertEqual(findings[0]["code"], "STEP_FAILED")
         self.assertEqual(findings[0]["source"], "gate")
 
-    def test_a_fail_verdict_with_an_unreadable_report_still_yields_a_finding(self):
+    def test_a_fail_verdict_yields_a_typed_finding_and_not_a_bare_exit(self):
         self.ok("gate", "alpha")
         self.ok("review", "alpha")
         self.ok("ship", "alpha", [{"outcome": "PLAN_SHIPPED", "verdict": "FAIL"}])
         result = self.delivery(max_attempts=1).run()
         self.assertEqual(result["packages"][0]["findings"][0]["code"],
-                         "REVIEWER_FAIL")
+                         "RECEIPT_FAIL")
 
     def test_review_is_not_reached_when_the_gate_fails(self):
         self.step_script[("gate", "alpha")] = (2, [{"outcome": "PLAN_GATE_FAILED"}])
@@ -955,17 +949,20 @@ class FindingParsingTest(unittest.TestCase):
                  if item.code == "planctl"]
         self.assertEqual(codes, ["maestro.command", "maestro.lane_gate"])
 
-    def test_a_clear_cell_is_never_reported_as_a_finding(self):
-        report = {"cells": [
-            {"check_id": "a", "object_id": "plan", "status": "clear"},
-            {"check_id": "b", "object_id": "plan", "status": "finding",
-             "message": "no"},
-        ]}
-        found = deliver.report_findings(report)
-        self.assertEqual([item.code for item in found], ["b"])
+    def test_no_finding_is_ever_read_out_of_a_reviewer_report(self):
+        """`report_findings` and the `reviewer_report` seam it read are gone.
 
-    def test_a_missing_report_yields_no_findings_rather_than_raising(self):
-        self.assertEqual(deliver.report_findings(None), ())
+        They existed for one caller: a FAIL verdict from the plan-finalization
+        reviewer, whose per-cell report was turned into repair findings. That
+        reviewer is deleted, so the seam had no producer left -- exactly the
+        dead-seam shape `tests/test_no_dead_seams.py` convicts -- and this
+        asserts it stays deleted rather than growing a test-only writer.
+        """
+        self.assertFalse(hasattr(deliver, "report_findings"))
+        self.assertFalse(hasattr(deliver, "ReviewerReport"))
+        self.assertNotIn("reviewer_report",
+                         {field.name for field in
+                          dataclasses.fields(deliver.Delivery)})
 
 
 class RunStartIsolationTest(unittest.TestCase):

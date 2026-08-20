@@ -56,10 +56,22 @@ ADWS = Path(__file__).resolve().parents[1]
 if str(ADWS) not in sys.path:
     sys.path.insert(0, str(ADWS))
 
+from adw_modules import code_review as cr
 from adw_modules import finalization as fin
 
-#: The modules that make up the finalization surface.
-FINALIZATION_MODULES = ("finalization.py", "finalization_window.py")
+#: The modules that make up the review surface. `code_review.py` is in the
+#: list because it is where a reviewer's payload is parsed: `plan finalize`
+#: stopped dispatching a reviewer and `finalization.finalize` was deleted with
+#: it, taking the only `ReviewerReport.model_validate` call in the runtime.
+#: Discovery kept working and found nothing, which is the failure mode this
+#: file's own docstring warns about — a guard that runs over an empty set is
+#: green for the wrong reason. So the surface is where the parse is.
+FINALIZATION_MODULES = ("finalization.py", "finalization_window.py",
+                        "code_review.py")
+
+#: Where a discovered root name is resolved. `CodeReviewerReport` lives in
+#: `code_review`; its cells and the shared primitives live in `finalization`.
+ROOT_MODULES = (fin, cr)
 
 
 def _parse_roots() -> List[str]:
@@ -111,26 +123,44 @@ def find_permissive_report_models(model) -> List[str]:
             if current.model_config.get("extra") != "forbid"]
 
 
+def _resolve_root(name):
+    for module in ROOT_MODULES:
+        candidate = getattr(module, name, None)
+        if (isinstance(candidate, type)
+                and issubclass(candidate, pydantic.BaseModel)):
+            return candidate
+    return None
+
+
 def _root_models():
-    return [getattr(fin, name) for name in _parse_roots()
-            if isinstance(getattr(fin, name, None), type)
-            and issubclass(getattr(fin, name), pydantic.BaseModel)]
+    found = [_resolve_root(name) for name in _parse_roots()]
+    return [model for model in found if model is not None]
 
 
 class ReportSchemaIsDiscoveredNotListedTest(unittest.TestCase):
 
     def test_the_report_root_is_found_rather_than_named(self):
         self.assertIn(
-            "ReviewerReport", _parse_roots(),
-            "the finalization surface's parse root was not discovered — the "
+            "CodeReviewerReport", _parse_roots(),
+            "the review surface's parse root was not discovered — the "
             "checks below would run over nothing")
 
+    def test_discovery_finds_a_model_rather_than_only_a_name(self):
+        """The control for the check above, and for the way this test broke.
+
+        A name that resolves to nothing leaves `_root_models()` empty, and
+        every assertion below an empty loop passes. So the discovery has to
+        produce a model, not just a string.
+        """
+        self.assertTrue(_root_models())
+        self.assertIn(cr.CodeReviewerReport, _root_models())
+
     def test_the_closure_reaches_past_the_root(self):
-        """`ReportCell` is reached through `ReviewerReport.cells`, so a guard
-        pointed at the root alone still covers it. That is the property that
-        makes discovery sufficient."""
-        closure = fin.report_schema_closure(fin.ReviewerReport)
-        self.assertIn(fin.ReportCell, closure)
+        """A cell is reached through the report's `cells`, so a guard pointed
+        at the root alone still covers it. That is the property that makes
+        discovery sufficient."""
+        closure = fin.report_schema_closure(cr.CodeReviewerReport)
+        self.assertIn(cr.CodeReportCell, closure)
 
     def test_a_model_added_to_the_schema_is_covered_without_being_listed(self):
         """The gap this file closes. A third report-shaped model reached from

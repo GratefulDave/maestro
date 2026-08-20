@@ -24,6 +24,16 @@ The approval guard is the one that must not be got wrong, so it fails closed:
 only a receipt that is *absent* proves a plan unapproved. A receipt that cannot
 be read, or a store that cannot be located, proves nothing — and the answer
 decides whether a plan's bytes get replaced.
+
+That guard bites harder than it did when it was written, and the change is
+worth stating where the tests for it live. While `plan finalize` dispatched a
+reviewer, a finalized plan could carry a FAIL receipt and stay replaceable.
+Finalize is deterministic now: an eligible plan gets PASS and an ineligible one
+gets no receipt at all, so *every* finalized plan is approved and any re-ship
+whose IR moved is refused. The route back is to remove the plan directory once
+no live run holds its bytes — which is what `maestro deliver` does on a re-ship
+— and the refusal says so. `plan set-aside` is not that route: it reopens a
+FAIL and refuses a PASS.
 """
 from __future__ import annotations
 
@@ -84,6 +94,26 @@ class ShipAuthoringDecision(unittest.TestCase):
             maestro._plan_ship_authoring(
                 self.plan, b"new plan", ALWAYS_APPROVED)
         self.assertEqual(self.plan.read_bytes(), b"old plan")
+
+    def test_the_refusal_names_a_route_back_that_exists(self):
+        """An operator meets this refusal on every re-ship of a finalized plan
+        now, so what it tells them to do has to be a thing they can do.
+
+        It used to say "finalize it or remove its approval", and neither is
+        available: the plan is already finalized, and `plan set-aside` refuses
+        a PASS receipt outright — it exists to reopen a FAIL. Removing the
+        plan's own bytes is the route, and it is the one `maestro deliver`
+        takes.
+        """
+        self.plan.write_bytes(b"old plan")
+        with self.assertRaises(maestro._ShipSupersedeRefused) as refused:
+            maestro._plan_ship_authoring(
+                self.plan, b"new plan", ALWAYS_APPROVED)
+        detail = str(refused.exception)
+        self.assertIn(plan_digest.digest_of(b"old plan"), detail)
+        self.assertIn("removing this plan's directory", detail)
+        self.assertIn("maestro deliver", detail)
+        self.assertIn("refuses a PASS", detail)
 
     def test_approval_is_only_consulted_when_the_bytes_actually_differ(self):
         """A re-ship of an approved, unchanged plan still resumes.

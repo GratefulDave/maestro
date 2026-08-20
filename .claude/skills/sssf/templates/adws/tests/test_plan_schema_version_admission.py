@@ -67,10 +67,10 @@ from adw_modules import plan_model as pm  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
 from test_finalization import (  # noqa: E402
-    DIGEST, WindowFactory, clean_report, make_store, matrix_for)
+    DIGEST, clean_report, make_store, matrix_for)
 from test_node_instruction_requirement_text import (  # noqa: E402
     REAL_LANE_TITLE, REAL_REQUIREMENT_TEXT, _authored_plan, _ir, _repo)
-from test_receipt_set_aside import finalize  # noqa: E402
+from test_receipt_set_aside import Review, finalize  # noqa: E402
 
 
 def _emit(call):
@@ -259,7 +259,7 @@ class TheRunStartVersionGuardTest(unittest.TestCase):
         """The positive control. Without it the guard could be refusing
         everything and every assertion above would still pass."""
         args = self._arguments(self.v2)
-        finalize(self.store, WindowFactory(report=clean_report(matrix_for())))
+        finalize(self.store, Review(report=clean_report(matrix_for())))
         with self._eligible():
             plan = maestro._load_runnable_plan(args)
         self.assertIs(type(plan), pm.PlanV2)
@@ -282,7 +282,7 @@ class TheRunStartVersionGuardTest(unittest.TestCase):
         have parsed declared a registered version.
         """
         args = self._arguments(b"{}\n")
-        finalize(self.store, WindowFactory(report=clean_report(matrix_for())))
+        finalize(self.store, Review(report=clean_report(matrix_for())))
         with self._eligible():
             with self.assertRaises(pm.SchemaVersionUnknown):
                 maestro._load_runnable_plan(args)
