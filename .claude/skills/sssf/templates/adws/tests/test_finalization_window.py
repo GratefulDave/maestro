@@ -65,13 +65,20 @@ def make_config(**overrides) -> fw.FinalizationConfig:
     return fw.FinalizationConfig(**fields)
 
 
+#: Distinguishes "this window has no status reader" from "the reader answered
+#: None". The two are different states and the module treats them differently:
+#: the first leaves quiescence detection out of the picture entirely, the
+#: second is a missing observation about a reviewer that may be perfectly fine.
+_NO_STATUS_READER = object()
+
+
 class Harness:
     """One window plus the collaborators it is given, all recording."""
 
     def __init__(self, *, config=None, report_after_polls=None,
                  harness_owned_group=True, monotonic_start=0.0,
                  epoch_start=1_760_000_000.0, alive=True, records=0,
-                 pid=None):
+                 pid=None, status=_NO_STATUS_READER):
         self.pid = pid
         self.calls = []
         self.killed = []
@@ -80,6 +87,11 @@ class Harness:
         self.launch_calls = 0
         self.alive = alive
         self.records = records
+        #: The route's raw pane status, mutated by a test between polls. Left
+        #: at the sentinel when the window is built with no status reader at
+        #: all, which is the shape `plan finalize` still uses.
+        self.status = status
+        self.status_reads = 0
         self._report_after_polls = report_after_polls
         self._polls = 0
         self.monotonic = FakeClock(monotonic_start)
@@ -94,9 +106,15 @@ class Harness:
             kill=self._kill,
             process_alive=lambda pid: self.alive,
             transcript_record_count=lambda session: self.records,
+            actor_status=(None if status is _NO_STATUS_READER
+                          else self._actor_status),
             time_source=self.monotonic,
             wall_clock=self.epoch,
         )
+
+    def _actor_status(self, _session):
+        self.status_reads += 1
+        return self.status
 
     def _launch(self):
         self.launch_calls += 1
@@ -303,6 +321,237 @@ class SignalsArmAtReportedLaunch(unittest.TestCase):
         h.monotonic.advance(2.0)                     # 11s since that turn
         outcome = h.window.poll()
         self.assertEqual(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
+
+
+class AReviewerThatNeverGoesLiveIsAFailedStart(unittest.TestCase):
+    """#89's acceptance. Seven reviews in
+    `run-2a44d226e75a4be391a14f02b78a6d25` took a receipt lock and wrote no
+    receipt, and the only instrument that could end one of them was the
+    600-second span bound. A reviewer that has never once been reported
+    working, with an empty transcript, is knowable long before that."""
+
+    def test_a_reviewer_that_never_works_is_not_waited_out_on_the_span(self):
+        """The regression this test exists for: if `NEVER_STARTED` stops
+        firing, the window falls back to `finalization_timeout_s` and this
+        assertion catches it by naming the signal *and* the elapsed time."""
+        h = Harness(config=make_config(finalization_timeout_s=600.0,
+                                       turn_timeout_s=1_000.0,
+                                       start_deadline_s=30.0),
+                    status="idle", pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(29.0)
+        self.assertIsNone(h.window.poll())
+        h.monotonic.advance(2.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.NEVER_STARTED)
+        self.assertFalse(outcome.observed_working)
+        # Far below the span bound: the whole point is not paying 600s for it.
+        self.assertLess(outcome.elapsed_s, 600.0)
+
+    def test_a_reviewer_that_worked_is_never_called_a_failed_start(self):
+        h = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                       start_deadline_s=30.0),
+                    status="working", pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(31.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_a_transcript_record_alone_refutes_a_failed_start(self):
+        """It wrote something. Whatever else is wrong with it, it started."""
+        h = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                       start_deadline_s=30.0),
+                    status="idle", pid=5, records=1)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(31.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_an_unreadable_status_is_never_a_failed_start(self):
+        """A missing observation is not evidence. Convicting on one would
+        kill every healthy reviewer whenever the route hiccups."""
+        h = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                       start_deadline_s=30.0),
+                    status=None, pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(31.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_a_window_with_no_status_reader_cannot_reach_the_signal(self):
+        """`plan finalize` builds its window without one. "Never reported
+        working" is not an observation there, so it must not convict."""
+        h = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                       start_deadline_s=30.0), pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(31.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_the_failed_start_deadline_does_not_apply_before_arming(self):
+        h = Harness(config=make_config(start_deadline_s=30.0), status="idle")
+        h.window.open()
+        h.monotonic.advance(31.0)
+        self.assertIsNone(h.window.poll())
+
+
+class QuiescenceIsConfirmedNotSampled(unittest.TestCase):
+    """One `idle` sample is not evidence that a reviewer stopped.
+
+    Herdr reports a pane as `idle` both between turns and while the agent is
+    blocked inside a tool call, and the liveness latch is already set by the
+    time either happens — so a single sample cannot tell a pause from a stop
+    and convicts both. What separates them is whether records are still
+    appearing, which is why the confirmation reads the transcript rather than
+    only the clock.
+    """
+
+    @staticmethod
+    def _worked_then_idle(**config_overrides):
+        h = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                       quiescence_confirm_s=60.0,
+                                       **config_overrides),
+                    status="working", pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.records = 1
+        h.window.poll()                      # latches "was working"
+        h.status = "idle"
+        return h
+
+    def test_one_idle_sample_does_not_convict(self):
+        h = self._worked_then_idle()
+        h.monotonic.advance(1.0)
+        self.assertIsNone(h.window.poll())
+        self.assertEqual(h.killed, [])
+
+    def test_an_advancing_transcript_restarts_the_confirmation(self):
+        """The load-bearing half. The pane says `idle` at every sample
+        because the agent is blocked in a tool call, but records keep
+        appearing — so the confirmation never completes and the reviewer
+        is left alone."""
+        h = self._worked_then_idle()
+        for turn in range(2, 12):
+            h.monotonic.advance(30.0)        # half the confirmation each time
+            h.records = turn                 # ...but the transcript advanced
+            self.assertIsNone(h.window.poll())
+        self.assertEqual(h.killed, [])
+        self.assertEqual(h.stalls, [])
+
+    def test_returning_to_working_restarts_the_confirmation(self):
+        h = self._worked_then_idle()
+        self.assertIsNone(h.window.poll())   # the confirmation starts here
+        h.monotonic.advance(30.0)
+        h.status = "working"
+        self.assertIsNone(h.window.poll())
+        h.status = "idle"
+        h.monotonic.advance(31.0)            # 61s after the first idle sample
+        self.assertIsNone(h.window.poll())   # ...but only 31s of held idle
+
+    def test_an_unreadable_status_restarts_the_confirmation(self):
+        h = self._worked_then_idle()
+        self.assertIsNone(h.window.poll())
+        h.monotonic.advance(30.0)
+        h.status = None
+        self.assertIsNone(h.window.poll())
+        h.status = "idle"
+        h.monotonic.advance(31.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_a_reviewer_silent_inside_a_blocking_wait_is_still_convicted(self):
+        """The confirmation must not become a way to keep a reviewer alive.
+
+        Every failed review in `run-2a44d226e75a4be391a14f02b78a6d25` died
+        holding a blocking `hub op=wait` on a sub-task it had spawned, and in
+        all five that reached a session the transcript was silent for the whole
+        wait — 2.4s, 14.6s, 30.9s, 35.8s and 76.4s before the exit. Silence is
+        exactly what this detector reads, so that shape is convicted on the
+        confirmation interval rather than deferred by it.
+        """
+        h = self._worked_then_idle()
+        self.assertIsNone(h.window.poll())
+        for _ in range(7):
+            h.monotonic.advance(10.0)        # a blocking wait writes nothing
+            outcome = h.window.poll()
+            if outcome is not None:
+                break
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.ACTOR_ABANDONED)
+        # One poll interval past the confirmation, and two orders of magnitude
+        # inside the 600s span this replaces as the instrument of record.
+        self.assertLessEqual(outcome.elapsed_s, 70.0)
+
+    def test_idle_held_with_a_silent_transcript_still_convicts(self):
+        """B14 is not repealed: a reviewer that really did stop without
+        declaring is still caught, and still before any wall clock."""
+        h = self._worked_then_idle()
+        self.assertIsNone(h.window.poll())
+        h.monotonic.advance(61.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.ACTOR_ABANDONED)
+        self.assertTrue(outcome.observed_working)
+        # The harness's span bound is 600s; the point is not paying it.
+        self.assertLess(outcome.elapsed_s, 600.0)
+
+    def test_the_two_failures_are_told_apart_by_a_typed_field(self):
+        """A caller deciding what to do with a failed review needs "never
+        began" and "began and stopped" as data, not as a signal name it has
+        to know the meaning of."""
+        started = self._worked_then_idle()
+        started.window.poll()
+        started.monotonic.advance(61.0)
+        self.assertTrue(started.window.poll().observed_working)
+
+        never = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                           start_deadline_s=30.0),
+                        status="idle", pid=5)
+        never.window.open()
+        never.window.report_launched(pid=5)
+        never.monotonic.advance(31.0)
+        self.assertFalse(never.window.poll().observed_working)
+
+
+class TheNewDeadlinesAreOptionalOverrides(unittest.TestCase):
+    """A deployment's `maestro.config.yaml` predates both keys. A config
+    that does not mention them must build and behave."""
+
+    def test_a_config_without_them_takes_the_in_code_defaults(self):
+        config = fw.FinalizationConfig(finalization_timeout_s=600.0,
+                                       turn_timeout_s=120.0)
+        self.assertEqual(config.start_deadline_s, fw.DEFAULT_START_DEADLINE_S)
+        self.assertEqual(config.quiescence_confirm_s,
+                         fw.DEFAULT_QUIESCENCE_CONFIRM_S)
+
+    def test_the_defaults_fire_well_inside_a_six_hundred_second_span(self):
+        """Both defaults have to beat the span bound they exist to replace,
+        or nothing changed for the run that raised #89."""
+        self.assertLess(fw.DEFAULT_START_DEADLINE_S, 600.0)
+        self.assertLess(fw.DEFAULT_QUIESCENCE_CONFIRM_S, 600.0)
+
+    def test_non_positive_deadlines_are_refused_like_every_other_clock(self):
+        for field in ("start_deadline_s", "quiescence_confirm_s"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    make_config(**{field: 0.0})
+
+    def test_neither_deadline_can_outlast_the_span_it_sits_inside(self):
+        """Obligation (b): the span bound is over everything. A detector
+        configured longer than the window would never fire, and the window
+        would be back to being the only instrument."""
+        config = make_config(finalization_timeout_s=30.0,
+                             start_deadline_s=120.0,
+                             quiescence_confirm_s=90.0)
+        self.assertEqual(config.effective_start_deadline_s, 30.0)
+        self.assertEqual(config.effective_quiescence_confirm_s, 30.0)
+
+    def test_an_over_long_setting_is_bounded_rather_than_refused(self):
+        """Bounding, not refusing: an installation may run a window shorter
+        than these defaults, and refusing that config would make a defaulted
+        field required — which is what these defaults exist to prevent."""
+        config = make_config(finalization_timeout_s=10.0)
+        self.assertEqual(config.start_deadline_s, fw.DEFAULT_START_DEADLINE_S)
+        self.assertEqual(config.effective_start_deadline_s, 10.0)
 
 
 class ClocksAreNeverMixed(unittest.TestCase):

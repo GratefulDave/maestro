@@ -412,6 +412,10 @@ class ActorAbandonedTests(unittest.TestCase):
 
     def _window(self, statuses, report=None, **kw):
         self.status_calls = list(statuses)
+        #: Injected so the confirmation interval can be crossed without
+        #: sleeping. `idle` no longer convicts on one sample, so a test that
+        #: wants the conviction has to hold the status *and* move the clock.
+        self.now = [0.0]
 
         def next_status(_session):
             return (self.status_calls.pop(0) if self.status_calls
@@ -420,7 +424,9 @@ class ActorAbandonedTests(unittest.TestCase):
         base = dict(
             config=fw.FinalizationConfig(finalization_timeout_s=600.0,
                                          turn_timeout_s=300.0,
-                                         poll_interval_s=0.01),
+                                         poll_interval_s=0.01,
+                                         quiescence_confirm_s=60.0),
+            time_source=lambda: self.now[0],
             launch=lambda: fw.ReviewerSession(route="omp", model="m",
                                               session_id="pane1"),
             poll_report=lambda: report,
@@ -432,15 +438,29 @@ class ActorAbandonedTests(unittest.TestCase):
         base.update(kw)
         return fw.FinalizationWindow(**base)
 
-    def test_idle_after_working_with_no_report_is_a_stall(self):
+    def test_idle_held_after_working_with_no_report_is_a_stall(self):
         window = self._window(["working", "idle"])
         window.open()
         window.report_launched(pid=None)
         self.assertIsNone(window.poll())           # observed working
-        outcome = window.poll()                    # then idle, nothing written
+        self.assertIsNone(window.poll())           # idle: confirmation starts
+        self.now[0] += 61.0
+        outcome = window.poll()                    # still idle, nothing written
         self.assertIsNotNone(outcome)
         self.assertFalse(outcome.completed)
         self.assertIs(outcome.signal, fw.FinalizationSignal.ACTOR_ABANDONED)
+        self.assertTrue(outcome.observed_working)
+
+    def test_one_idle_sample_after_working_is_not_yet_a_stall(self):
+        """A pane reads `idle` between turns and while blocked inside a tool
+        call alike. One sample is not evidence that anything stopped."""
+        window = self._window(["working", "idle"])
+        window.open()
+        window.report_launched(pid=None)
+        self.assertIsNone(window.poll())
+        self.assertIsNone(window.poll())
+        self.now[0] += 59.0
+        self.assertIsNone(window.poll())
 
     def test_idle_before_ever_working_is_not_a_stall(self):
         """`launch()` returns while the agent still sits at a fresh prompt, and
