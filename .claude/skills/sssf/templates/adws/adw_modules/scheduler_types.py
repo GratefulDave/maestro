@@ -137,6 +137,89 @@ class CancelCause(str, Enum):
 REOPENABLE_CANCEL_CAUSES: Tuple[CancelCause, ...] = (CancelCause.RUN_CANCEL,)
 
 
+class MergeCause(str, Enum):
+    """How a node reached `MERGED` — the same shape as `CancelCause`, one
+    column over, and forced by the same defect one state along.
+
+    `MERGED` was one word carrying two facts. A node reaches it down one of
+    two paths, and §1.1 item 4 is the whole difference between them:
+
+    * `SCHEDULER` — the run merged it. The node passed §7.3's four-clause
+      verification predicate, went `VERIFIED`, and was merged by §8.5's
+      deterministic frontier with the ancestry proof §8.6 requires. The
+      complete evidence chain scoped to its kind exists and is enumerable
+      from the ledger: attempt row, output commit, gate results, the
+      permission check over the measured delta, and — for an agent node —
+      a reviewer that passed the diff before `mark_verified` was called.
+    * `OPERATOR_ACCEPTED` — `maestro skip` (§11.3). The operator supplied the
+      work by hand and asserted it. The five identity gates `skip` runs are
+      real and are not relaxed by this member: the accepted SHA is still a
+      canonical digest, still descends from the latest attempt base, is still
+      an ancestor of HEAD, still *equals* HEAD, and the tree is still clean.
+      What it does not carry is the rest of the chain — no reviewer verdict
+      is required, no post-node gate need have passed, no permission check
+      over a measured delta was taken, and there is no merge commit. Those
+      are the facts §1.1 item 4 enumerates, and a node merged this way holds
+      none of them.
+
+    Stored typed on `node_lifecycle.merge_cause`, because §1.2 forbids a
+    reader reconstructing a lifecycle fact from prose — and reconstructing it
+    was the only thing an operator could do. In git the difference is visible:
+    a merged lane leaves a merge commit and a skipped lane leaves only the
+    attempt commit, so reading the integration log was the sole way to tell
+    the two apart. `run status` reported both as `MERGED` with an
+    `output_sha`, identically, over a node whose every attempt was `CANCELLED`
+    or `BLOCKED` and none of which carried a verdict (#93).
+
+    The absent evidence itself is *not* a second member here. What the chain
+    holds is a set of facts about a node's history, and encoding a summary of
+    them in this vocabulary would be one fact in two representations — the RC1
+    shape §4 convicts. The cause says who wrote the state; the skip
+    transition's typed detail says what the ledger could and could not show
+    about the node at the moment it was written.
+
+    Adding a member later stays additive, as it did for `CancelCause`: a
+    ledger written before this column carries neither value and reads
+    `UNRECORDED` (below), never one of these two.
+    """
+
+    SCHEDULER = "SCHEDULER"
+    OPERATOR_ACCEPTED = "OPERATOR_ACCEPTED"
+
+
+#: The merge causes that carry no evidence chain of their own (§1.1 item 4),
+#: so an audit looking for merges whose evidence must be established some
+#: other way reads this list rather than naming the member. Data rather than
+#: a branch, exactly as `REOPENABLE_CANCEL_CAUSES` is.
+UNEVIDENCED_MERGE_CAUSES: Tuple[MergeCause, ...] = (MergeCause.OPERATOR_ACCEPTED,)
+
+#: What a reader says about a `MERGED` node whose cause was never recorded:
+#: a row written before the column existed. It is deliberately **not** a
+#: `MergeCause` member, because it is the absence of the fact rather than a
+#: third value of it, and nothing may ever write it. The migration invents no
+#: facts (§7.3's rule for an unrecorded `cancel_cause`): reading an
+#: unrecorded merge as `SCHEDULER` would have every pre-existing row assert
+#: an evidence chain nobody checked, which is the exact false confidence this
+#: column exists to remove.
+MERGE_CAUSE_UNRECORDED = "UNRECORDED"
+
+
+def merge_cause_label(state: NodeState,
+                      merge_cause: Optional[MergeCause]) -> Optional[str]:
+    """The one derivation of "how did this node reach MERGED".
+
+    Three answers and a fourth non-answer: the two `MergeCause` members,
+    `UNRECORDED` for a `MERGED` row older than the column, and `None` for a
+    node that is not `MERGED` at all — where the question does not arise and
+    the column is NULL for that reason instead. `run status`, the visualizer,
+    and the tests read this function rather than each re-deriving the pair,
+    so the three cannot drift into three answers (RC1).
+    """
+    if state is not NodeState.MERGED:
+        return None
+    return merge_cause.value if merge_cause else MERGE_CAUSE_UNRECORDED
+
+
 # ── §7.5 retry classes ──────────────────────────────────────────────────────
 
 class RetryClass(str, Enum):

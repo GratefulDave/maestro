@@ -191,6 +191,16 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   -- lane the operator gave up on. The column is what lets the resume reopen
   -- exactly the nodes the stop request took, and nothing else.
   cancel_cause           TEXT,
+  -- How this node reached MERGED (`st.MergeCause`), NULL in every other
+  -- state. The twin of `cancel_cause` one state along, and it exists for the
+  -- same reason: `MERGED` was one word carrying two facts, and the only way
+  -- to tell them apart was to read the integration branch's git log, where a
+  -- run-merged lane leaves a merge commit and an operator-accepted one
+  -- leaves only the attempt commit (#93). NULL on a MERGED row written
+  -- before this column means *unrecorded*, never `SCHEDULER`: the migration
+  -- invents no facts, and reading an unrecorded merge as a run-merged one
+  -- would have every older row assert an evidence chain nobody checked.
+  merge_cause            TEXT,
   output_sha             TEXT,
   granted_extra_attempts INTEGER NOT NULL DEFAULT 0,
   updated_at             TEXT NOT NULL,
@@ -319,6 +329,7 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
 #: additions by name and must not be handed a column from another table.
 _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("cancel_cause", "TEXT"),
+    ("merge_cause", "TEXT"),
 )
 
 #: Every table an older ledger may be missing a column from, in one place so
@@ -647,6 +658,85 @@ def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: s
         raise IllegalTransition(
             "BLOCKED is operator-terminal (§7.3): no automatic transition leaves it, "
             f"only an operator escape may — refusing the move to {to_state.value}")
+
+
+# ── what the ledger could show about a node at the moment it was accepted ────
+
+@dataclass(frozen=True)
+class MergeEvidence:
+    """What the ledger held about a node's evidence chain when `skip` ran.
+
+    §1.1 item 4 requires every merged node to carry a complete evidence chain
+    scoped to its kind, and `skip` merges a node that by construction may
+    carry none of it. The gap was not *recorded* anywhere, so an audit had no
+    way to find it afterwards: one real agent node was reported `MERGED` with
+    an `output_sha` while every one of its attempts was `CANCELLED` or
+    `BLOCKED`, no reviewer had ever produced a verdict on it, and 928 lines
+    merged on a gate run and an operator's word (#93).
+
+    These are facts counted off the ledger, not a judgement about them. In
+    particular there is no `missing` field enumerating what is absent: that
+    is derivable from the counts below by any reader, and storing the
+    conclusion beside its inputs is one fact in two representations (RC1) —
+    the copy that goes stale being the one nothing recomputes.
+
+    `verified_ever` is the load-bearing one, and it is load-bearing because
+    of *where* `mark_verified` sits. The review gate runs after the node's
+    context has settled and before `mark_verified` is called, so a node that
+    ever reached `VERIFIED` is a node whose post-node gate passed and whose
+    reviewer, where one was configured, did not reject the diff. Zero
+    `VERIFIED` transitions is therefore the structural statement that no part
+    of the machine's own chain was ever completed for this node — not an
+    inference from prose, and not a reading of the git log (§1.2).
+
+    It is genuinely discriminating rather than always false at skip time: a
+    node that verified and then blocked on a merge conflict (§8.7) reaches
+    `skip` with the chain intact, and reads `verified_ever=True` here.
+    """
+
+    #: Count of `VERIFIED` transitions ever recorded for this node.
+    verified_transitions: int
+    #: Count of attempt rows a reviewer rejected the diff of
+    #: (`rp.REVIEW_REJECTED_KEY`). Distinct from the above and not its
+    #: complement — a rejection says a reviewer *looked*, which is more than
+    #: zero says, and is why both are recorded rather than one derived.
+    review_rejections: int
+    #: Count of attempt rows, the denominator the other two are read against.
+    attempts_recorded: int
+    #: The stored `block_reason` the node carried when the operator accepted
+    #: it, or `None` where the escape was taken against a stranded RUNNING
+    #: node, which stores no reason.
+    block_reason: Optional[st.BlockReason]
+
+    @property
+    def verified_ever(self) -> bool:
+        """Did any part of the machine's own evidence chain ever complete?"""
+        return self.verified_transitions > 0
+
+    def as_detail(self) -> Dict[str, Any]:
+        """The typed transition-detail payload, which is where this lands.
+
+        The authority tier gets the one fact a reader must key on — the
+        `merge_cause` column — and the audit tier gets the evidence, exactly
+        as §11.3 settled for `retry --grant`: the grant's magnitude is a
+        typed field on the transition's detail that `run status` reads back,
+        while the guard reads the column. §5.3 forbids the *runtime* reading
+        the audit tier; the read verbs are not the runtime.
+        """
+        return {
+            "verified_ever": self.verified_ever,
+            "verified_transitions": self.verified_transitions,
+            "review_rejections": self.review_rejections,
+            "attempts_recorded": self.attempts_recorded,
+            "block_reason": (self.block_reason.value
+                             if self.block_reason else None),
+        }
+
+
+#: Where `MergeEvidence.as_detail` lands on the skip transition. Named so the
+#: writer, `run status`, and the tests agree on one key rather than three
+#: spellings of it.
+MERGE_EVIDENCE_KEY = "merge_evidence"
 
 
 # ── the store ────────────────────────────────────────────────────────────────
@@ -1321,6 +1411,7 @@ class LifecycleStore:
         require_state: Optional[Tuple[st.NodeState, ...]] = None,
         detail: Optional[Mapping[str, Any]] = None,
         cancel_cause: Optional[st.CancelCause] = None,
+        merge_cause: Optional[st.MergeCause] = None,
         extra_writes: Optional[Callable[[st.NodeLifecycle], Sequence[Tuple[str, Tuple]]]] = None,
     ) -> st.NodeLifecycle:
         """Guard, then write the lifecycle row, the audit row, and the run's
@@ -1363,15 +1454,26 @@ class LifecycleStore:
             # for a cancellation it is no longer under.
             new_cancel_cause = (cancel_cause
                                 if to_state is st.NodeState.CANCELLED else None)
+            # Scoped to MERGED exactly as the line above is scoped to
+            # CANCELLED. Nothing transitions out of MERGED (§7.3), so the
+            # clearing arm is unreachable by construction rather than by
+            # care — it is written anyway so that the scoping rule is one
+            # rule stated twice rather than a rule and an assumption, and so
+            # that a later narrowing of absolute terminality cannot leave a
+            # node carrying a merge cause for a merge it is no longer under.
+            new_merge_cause = (merge_cause
+                               if to_state is st.NodeState.MERGED else None)
             now = now_iso()
             self.conn.execute(
                 "UPDATE node_lifecycle SET state=?, attempt_no=?, block_reason=?,"
-                " output_sha=?, granted_extra_attempts=?, cancel_cause=?, updated_at=?"
+                " output_sha=?, granted_extra_attempts=?, cancel_cause=?,"
+                " merge_cause=?, updated_at=?"
                 " WHERE run_id=? AND node_id=?",
                 (lifecycle.state.value, lifecycle.attempt_no,
                  lifecycle.block_reason.value if lifecycle.block_reason else None,
                  lifecycle.output_sha, lifecycle.granted_extra_attempts,
-                 new_cancel_cause.value if new_cancel_cause else None, now,
+                 new_cancel_cause.value if new_cancel_cause else None,
+                 new_merge_cause.value if new_merge_cause else None, now,
                  run_id, node_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
@@ -1414,9 +1516,21 @@ class LifecycleStore:
             output_sha=output_sha, require_state=(st.NodeState.RUNNING,), extra_writes=extra)
 
     def mark_merged(self, run_id: str, node_id: str) -> st.NodeLifecycle:
-        """VERIFIED -> MERGED, absolutely terminal from here on (§7.3, §8.6)."""
+        """VERIFIED -> MERGED, absolutely terminal from here on (§7.3, §8.6).
+
+        Stamps `SCHEDULER`, which is the whole of the distinction §11.3's
+        `skip` could not previously be told apart by. The value is written
+        here rather than defaulted in `_transition_node` deliberately: a
+        default would make `SCHEDULER` the answer for any future caller that
+        forgot to say, and the one thing this column must never do is assert
+        an evidence chain by omission. `VERIFIED` is the require_state, so
+        the claim is not a courtesy — reaching this line means the node
+        passed §7.3's four-clause predicate and, for an agent node, a
+        reviewer that did not reject its diff.
+        """
         return self._transition_node(
             run_id, node_id, st.NodeState.MERGED, actor="scheduler", reason="merged",
+            merge_cause=st.MergeCause.SCHEDULER,
             require_state=(st.NodeState.VERIFIED,))
 
     def mark_blocked(self, run_id: str, node_id: str, reason: st.BlockReason, *,
@@ -2107,14 +2221,56 @@ class LifecycleStore:
             granted_extra_delta=delta,
             detail=detail or None, extra_writes=extra)
 
+    def _merge_evidence(self, run_id: str, node_id: str) -> MergeEvidence:
+        """Count what the ledger holds about this node's evidence chain.
+
+        Read *before* the transition is written, and that ordering matters:
+        `skip` closes a stranded RUNNING attempt in the same transaction, so
+        counting afterwards would count a row the escape itself had just
+        changed. Every figure here is a `COUNT(*)` over rows the run wrote,
+        which is what makes the record a fact rather than an assertion (§1.2).
+        """
+        verified = self.conn.execute(
+            "SELECT COUNT(*) FROM transitions"
+            " WHERE run_id=? AND node_id=? AND kind='node' AND to_state=?",
+            (run_id, node_id, st.NodeState.VERIFIED.value)).fetchone()
+        attempts = self.attempts_for(run_id, node_id)
+        return MergeEvidence(
+            verified_transitions=int(verified[0]) if verified else 0,
+            review_rejections=rp.review_attempts_total(attempts, node_id),
+            attempts_recorded=len(attempts),
+            block_reason=self.get_node(run_id, node_id).block_reason)
+
     def skip(self, run_id: str, node_id: str, *, accept_sha: str, repo_path) -> st.NodeLifecycle:
         """BLOCKED -> MERGED, or stranded RUNNING -> MERGED when the
         scheduler is provably dead: the operator supplied the work by hand.
         Verifies `git merge-base --is-ancestor` and the four worktree checks
         against the supplied SHA before accepting — it does not bypass those
         gates (§11.3).
+
+        The state it writes is `MERGED` and the cause it stamps is
+        `OPERATOR_ACCEPTED`, and those are two facts rather than one said
+        twice. The state is what the scheduler and the merge frontier read:
+        the node is done, its descendants are eligible, and nothing about
+        that changes because an operator supplied the work. The cause is what
+        every *reader* needs and none of them had — `run status` and the
+        visualizer reported an operator-accepted node identically to one the
+        run merged, so the only way to tell them apart was the integration
+        branch's git log, where a merged lane leaves a merge commit and this
+        one leaves only the attempt commit (#93, §1.2).
+
+        The evidence chain §1.1 item 4 requires is recorded as what the
+        ledger could show, on the transition, in the same write. Not as a
+        refusal: an operator who has done the work by hand and proved its
+        identity five ways is exercising the escape §11.3 exists for, and a
+        `skip` that refused an unreviewed node would leave the operator
+        exactly where issue #81 left them. What was missing was never the
+        permission — it was the record that the chain is absent, which is
+        what makes an audit possible afterwards instead of a re-derivation
+        from git.
         """
         self._require_escape_legal(run_id)
+        evidence = self._merge_evidence(run_id, node_id)
         extra, detail = self._prepare_stranded_running(run_id, node_id)
         repo = Path(repo_path)
         latest_attempt = self.conn.execute(
@@ -2174,11 +2330,15 @@ class LifecycleStore:
             raise SkipAncestryRefused(
                 f"{node_id}: {repo_path} is not a clean worktree at {accept_sha}; "
                 "skip does not bypass cleanliness (§11.3)")
+        detail = dict(detail or {})
+        detail[MERGE_EVIDENCE_KEY] = evidence.as_detail()
         return self._transition_node(
             run_id, node_id, st.NodeState.MERGED, actor="operator",
             reason=st.Escape.SKIP.value,
             require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
-            output_sha=accept_sha, detail=detail, extra_writes=extra)
+            output_sha=accept_sha,
+            merge_cause=st.MergeCause.OPERATOR_ACCEPTED,
+            detail=detail, extra_writes=extra)
 
     def abandon(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         """Any non-absolutely-terminal state -> CANCELLED (§7.3, §7.8, §11.3).
@@ -2257,6 +2417,17 @@ class NodeRow:
     output_sha: Optional[str]
     granted_extra_attempts: int
     updated_at: str
+    #: How this node reached MERGED (§7.3, §11.3), and `None` both for a node
+    #: that is not MERGED and for a MERGED row written before the column
+    #: existed. The two `None`s are told apart by `state`, exactly as
+    #: `cancel_cause`'s are, and `st.merge_cause_label` is the one place that
+    #: does it — a reader must not re-derive the pair (RC1).
+    merge_cause: Optional[st.MergeCause] = None
+
+    @property
+    def merge_provenance(self) -> Optional[str]:
+        """`SCHEDULER`, `OPERATOR_ACCEPTED`, `UNRECORDED`, or `None`."""
+        return st.merge_cause_label(self.state, self.merge_cause)
 
 
 # ── the run's live state, derived rather than remembered (§7.3, §11.2) ───────
@@ -2528,9 +2699,19 @@ class LifecycleReader:
         return found[0] if found else None
 
     def nodes(self, run_id: str) -> Tuple[NodeRow, ...]:
+        # `mode=ro`, so this reader cannot migrate a ledger that predates
+        # `merge_cause` and must not refuse to read one either — the same
+        # rule `runs()` follows for the scheduler-ownership columns. An
+        # absent column is simply not selected and reads back `None`, which
+        # `st.merge_cause_label` renders as `UNRECORDED` for a MERGED row
+        # rather than guessing `SCHEDULER`.
+        available = set(_table_columns(self.conn, "node_lifecycle"))
+        merge_cause_sql = (" l.merge_cause,"
+                           if "merge_cause" in available else " NULL AS merge_cause,")
         rows = self._rows(
             "SELECT d.node_id, d.kind, d.depth, d.needs_json, l.state,"
             " l.attempt_no, l.block_reason, l.output_sha,"
+            + merge_cause_sql +
             " l.granted_extra_attempts, l.updated_at"
             " FROM dag_nodes d JOIN node_lifecycle l"
             " ON l.run_id = d.run_id AND l.node_id = d.node_id"
@@ -2543,6 +2724,8 @@ class LifecycleReader:
                 block_reason=(st.BlockReason(row["block_reason"])
                               if row["block_reason"] else None),
                 output_sha=row["output_sha"],
+                merge_cause=(st.MergeCause(row["merge_cause"])
+                             if row["merge_cause"] else None),
                 granted_extra_attempts=row["granted_extra_attempts"],
                 updated_at=row["updated_at"])
             for row in rows)

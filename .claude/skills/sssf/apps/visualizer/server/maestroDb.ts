@@ -111,6 +111,7 @@ interface NodeRow {
   attempt_no: number | null;
   block_reason: string | null;
   cancel_cause: string | null;
+  merge_cause: string | null;
   output_sha: string | null;
   granted_extra_attempts: number | null;
   updated_at: string | null;
@@ -314,10 +315,17 @@ export class MaestroDb {
     const db = this.freshDb();
     const cause = this.optionalColumn(
       db, "node_lifecycle", "l", "cancel_cause");
+    // Same treatment, and for the same reason: a ledger written before the
+    // column selects NULL, which `mergeProvenance` reads as UNRECORDED
+    // rather than as SCHEDULER. Guessing the other way would have every
+    // pre-existing MERGED node claim an evidence chain nobody checked.
+    const merged = this.optionalColumn(
+      db, "node_lifecycle", "l", "merge_cause");
     return db
       .query<NodeRow, [string]>(
         `SELECT d.node_id, d.kind, d.depth, d.needs_json, d.outputs_json,
-                l.state, l.attempt_no, l.block_reason, ${cause}, l.output_sha,
+                l.state, l.attempt_no, l.block_reason, ${cause}, ${merged},
+                l.output_sha,
                 l.granted_extra_attempts, l.updated_at
            FROM dag_nodes d
            JOIN node_lifecycle l
@@ -426,6 +434,7 @@ export class MaestroDb {
       attempt_no: node.attempt_no ?? 0,
       block_reason: node.block_reason,
       cancel_cause: node.cancel_cause,
+      merge_cause: mergeProvenance(node.state, node.merge_cause),
       output_sha: node.output_sha,
       granted_extra_attempts: node.granted_extra_attempts ?? 0,
       updated_at: node.updated_at,
@@ -542,6 +551,27 @@ function firstVerdict(entries: MaestroTransition[]): string | null {
 
 /** §7.3's absolutely-terminal node states: nothing automatic leaves them. */
 const ABSOLUTELY_TERMINAL = new Set(["MERGED", "CANCELLED"]);
+
+/**
+ * What a MERGED row is showing about how it got there: the stored
+ * `merge_cause`, or `UNRECORDED` where the column is absent or NULL on a
+ * MERGED row — a ledger written before the column existed. `null` for any
+ * other state, where the question does not arise.
+ *
+ * The twin of `lifecycle.merge_cause_label` on the Python side, and the one
+ * place this dashboard derives the pair. `derive_run_state` and `liveState`
+ * being one rule in two languages with nothing comparing them is how the
+ * dashboard once rendered CANCELLING for a run whose every node was terminal
+ * (issue #39); keeping this to a single named function on each side is the
+ * cheapest thing that keeps the two readable against each other.
+ */
+export function mergeProvenance(
+  state: string,
+  mergeCause: string | null,
+): string | null {
+  if (state !== "MERGED") return null;
+  return mergeCause ?? "UNRECORDED";
+}
 
 /**
  * What a run is doing NOW, which is usually not what it last declared.

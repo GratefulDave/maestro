@@ -13,7 +13,7 @@
  * negative or inflated in-flight duration.
  */
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
-import { Ban, ChevronRight, GitBranch, TriangleAlert } from 'lucide-vue-next'
+import { Ban, ChevronRight, GitBranch, TriangleAlert, UserRound } from 'lucide-vue-next'
 import type { MaestroAttempt, MaestroNode, MaestroRunDetail } from '../lib/types'
 import { ApiHttpError, fetchRun } from '../lib/api'
 import { fmtDate, fmtDuration, ts } from '../lib/format'
@@ -306,6 +306,24 @@ function expanded(node: MaestroNode): boolean {
               <template v-if="node.cancel_cause === 'ABANDONED'">
                 — the operator gave this node up; a resume does not reopen it
               </template>
+            </div>
+
+            <!--
+              A MERGED node says how it got there. The state chip still reads
+              MERGED, because that is the state and the frontier keys on it;
+              this line is the provenance the chip cannot carry. Rendered only
+              where there is something to say — a node the run merged is the
+              ordinary case and needs no annotation.
+            -->
+            <div v-if="node.merge_cause === 'OPERATOR_ACCEPTED'" class="accepted-why">
+              <UserRound :size="15" /> operator-accepted — the operator
+              supplied this work by hand and proved its identity; the run did
+              not establish an evidence chain for it
+            </div>
+
+            <div v-else-if="node.merge_cause === 'UNRECORDED'" class="accepted-why">
+              <TriangleAlert :size="15" /> merged before this ledger recorded
+              how — run-merged or operator-accepted cannot be told apart here
             </div>
 
             <div v-if="expanded(node)" class="attempts">
@@ -654,6 +672,21 @@ function expanded(node: MaestroNode): boolean {
   color: var(--red);
   font-family: var(--mono);
   font-size: 14px;
+}
+
+/*
+ * Amber rather than red. An operator-accepted node is not a failure and must
+ * not read as one — it is a node whose evidence chain the run did not
+ * establish, which is a thing to know rather than a thing to fix.
+ */
+.accepted-why {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .attempts {
