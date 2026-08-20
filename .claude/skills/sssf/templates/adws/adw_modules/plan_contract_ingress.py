@@ -1,7 +1,20 @@
-"""Receipt-verified projection from plan-contract.v1 to maestro-plan.v1.
+"""Receipt-verified projection from plan-contract.v1 to maestro-plan.v2.
 
 This is an authoring boundary, not a lossy converter. Missing Maestro
 extensions, ambient paths, receiptless input, and unparseable gates refuse.
+
+**It emits v2, and the version moved because what this module puts in
+`nodes[].instruction` changed meaning.** It used to write the lane's title
+there and drop `requirements[].text` — the sentence that bounds the lane's
+scope — so every builder and every reviewer downstream faithfully relayed a
+summary of the contract instead of the contract (§19 M26). `_node_instruction`
+below fixed that. Emitting `maestro-plan.v1` afterwards would have left a plan
+projected before the fix byte-indistinguishable *in version* from one
+projected after it, and a fully-fixed runtime would have executed the
+degenerate one without a word: the field is populated either way, so no
+consumer, no totality guard, and no reader sweep can separate them. The
+version string is the only channel that carries this, and
+`maestro._RUNNABLE_PLAN_SCHEMA_VERSIONS` is the reader that acts on it.
 """
 from __future__ import annotations
 
@@ -11,6 +24,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from . import plan_author
+from . import plan_model
 from . import plan_validate
 
 
@@ -590,7 +604,10 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         integration[declared[0]], "UNMAPPABLE_INTEGRATION", declared[0])
     plan_id = _require_text(ir.get("plan_id"), "IR_SCHEMA", "plan_id")
     draft = {
-        "schema_version": "maestro-plan.v1",
+        # Read from the model rather than spelled here: the constant and the
+        # registered parser class are the same fact, and a literal beside
+        # them is a second place for it to be wrong.
+        "schema_version": plan_model.SCHEMA_V2,
         "plan_id": plan_id,
         "intent": _require_text(ir.get("title"), "IR_SCHEMA", "title"),
         "evidence": evidence,
@@ -644,7 +661,7 @@ def project_canonical_plan(
 def author_from_plan_contract(
         ir_path: Path, receipt_path: Path, destination: Path, repo: Path,
         rendered_path: Optional[Path] = None) -> Tuple[bytes, dict]:
-    """Verify the receipt, project, canonicalize, and write maestro-plan.v1."""
+    """Verify the receipt, project, canonicalize, and write maestro-plan.v2."""
     stored, draft, ir = project_canonical_plan(
         ir_path, receipt_path, repo, rendered_path)
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")

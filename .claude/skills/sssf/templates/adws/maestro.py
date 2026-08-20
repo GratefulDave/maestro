@@ -2704,8 +2704,98 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
                 "lifecycle database is inside the {}: {}".format(label, boundary))
 
 
+#: The plan schema versions this runtime will execute (§6.3, §19 M26).
+#:
+#: An **allowlist**, not a denylist. A version registered later and not added
+#: here is refused rather than run, which is the direction a fail-closed
+#: check has to fail; a denylist would run every version nobody remembered to
+#: list. Adding an entry is a decision that the projection which emits that
+#: version produces instructions a reviewer can judge against — that is the
+#: whole content of the v1/v2 distinction, and no structural check can
+#: substitute for it.
+_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({plan_model.SCHEMA_V2})
+
+
+def _refuse_unrunnable_plan_schema(args: argparse.Namespace,
+                                   stored: bytes) -> None:
+    """Refuse a plan whose schema version this runtime does not execute.
+
+    **Why a version can refuse a run at all.** `plan_contract_ingress` used to
+    map a lane's `title` onto `nodes[].instruction` and drop
+    `requirements[].text`, so every builder prompt and every reviewer contract
+    carried a summary of the lane's contract in place of the contract
+    (§3.6 B9, §19 M26). The field was *populated* the whole time, which is
+    precisely why nothing downstream could convict it: a totality guard sees a
+    value, a reader sweep sees a reader, and a reviewer relays what it is
+    given. The repair widened the field — and the projection went on emitting
+    `maestro-plan.v1`, the same string the degenerate projection emitted, so a
+    plan shipped before the repair and a plan shipped after it were
+    indistinguishable to a runtime carrying every fix. Four shipped plans and
+    51 agent nodes in the lexgenius-pipeline deployment are in the first
+    state. This is the check that stops one of them starting.
+
+    **Where it sits, and why here.** `_load_runnable_plan` is the one function
+    that turns plan bytes into a plan a run will execute, and it is called
+    from exactly one place — `_execute_run`, which `run start` and
+    `run resume` both enter, and which the workspace coordinator reaches by
+    invoking `maestro run start` as a participant subprocess. So the coverage
+    claim ("no run starts against an unrunnable plan version") is a property
+    of the call graph rather than of a list of verbs somebody has to keep
+    updating. §19 M6 is the recorded cost of the alternative: B13's size
+    preflight was installed on one launch path, a second route reached the
+    same agent without crossing it, and the guarantee decayed with nothing
+    going red.
+
+    **What it keys on.** The `schema_version` string in the stored bytes, read
+    *before* the bytes become a model. That is format selection, the way a
+    magic number selects a decoder, and it is the one carve-out §5.3 grants to
+    its stored-value prohibition; reading the version off a parsed `Plan`
+    would be the forbidden direction, and nothing here does. Prose, pane text,
+    and agent self-report are nowhere on this path (§1.2).
+
+    **What it deliberately declines to answer.** Bytes with no
+    `schema_version`, or bytes that are not JSON, get no opinion here —
+    `plan_model.parse_bytes` already refuses both with its own typed errors
+    (`SchemaVersionUnknown`, `PlanParseError`), and naming one defect in two
+    vocabularies teaches an operator that the second one is optional. Nothing
+    that could actually run escapes through the gap: bytes that reach a
+    scheduler have parsed, and bytes that have parsed declared a registered
+    version, and every registered version is either in the allowlist above or
+    refused right here.
+    """
+    try:
+        declared = json.loads(stored.decode("utf-8")).get("schema_version")
+    except (UnicodeDecodeError, ValueError, AttributeError):
+        return
+    if not isinstance(declared, str):
+        return
+    if declared in _RUNNABLE_PLAN_SCHEMA_VERSIONS:
+        return
+    runnable = ", ".join(sorted(_RUNNABLE_PLAN_SCHEMA_VERSIONS))
+    raise _RunRefused(
+        "RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE",
+        "{plan} declares schema_version {declared!r}; this runtime executes "
+        "{runnable}. A {declared} plan was projected by a `plan_contract_"
+        "ingress` that wrote the lane title into nodes[].instruction and "
+        "dropped requirements[].text, so its reviewers judge the work against "
+        "a summary of its contract rather than the contract (§19 M26), and "
+        "the field is populated either way so nothing downstream can tell. "
+        "There is no upgrade function and no in-place edit (§6.3): re-ship "
+        "the plan from its IR with `maestro plan ship <plan_name>` "
+        "(docs/plan-authoring.md), which re-projects it at {runnable}, "
+        "re-validates, and re-finalizes it under a new digest.".format(
+            plan=args.plan_file, declared=declared, runnable=runnable),
+        declared_schema_version=declared,
+        runnable_schema_versions=sorted(_RUNNABLE_PLAN_SCHEMA_VERSIONS))
+
+
 def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
     stored = Path(args.plan_file).read_bytes()
+    # First, because it is the most specific thing wrong with these bytes and
+    # every check below would pass over a v1 plan and say nothing. An operator
+    # whose run is refused for a stale receipt learns the wrong lesson about a
+    # plan whose real defect is that its instructions are titles.
+    _refuse_unrunnable_plan_schema(args, stored)
     receipts = _VerifiedReceipts(args)
     validation = pv.validate_plan(
         stored, args.repo, receipts=receipts, collector=_plan_collector(args))

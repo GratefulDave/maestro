@@ -60,9 +60,27 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import scheduler_types as st
 
-#: The only shipped schema version. A v1 file under v2 code dispatches to
-#: this frozen class with v1 obligations (§6.3).
+#: The first shipped schema version. A v1 file under v2 code dispatches to
+#: this frozen class with v1 obligations (§6.3). It is still parsed, still
+#: validated, still finalizable; it is no longer *runnable* — see
+#: `maestro._RUNNABLE_PLAN_SCHEMA_VERSIONS` for why and where that is refused.
 SCHEMA_V1 = "maestro-plan.v1"
+
+#: The version the plan-contract projection emits and the runtime executes.
+#:
+#: It exists because a semantic change to projected output that leaves the
+#: version string alone is undetectable downstream. `plan_contract_ingress`
+#: used to map a lane's *title* onto `AgentNode.instruction` and drop
+#: `requirements[].text` (§19 M26); the fix widened the field, and emitted the
+#: same `maestro-plan.v1` the broken projection emitted, so a plan shipped
+#: before the fix and a plan shipped after it were indistinguishable to a
+#: fully-fixed runtime — 51 agent nodes across four shipped plans in the
+#: lexgenius-pipeline deployment carry a title-only instruction under that
+#: version. The version string is the only channel on which that difference
+#: can travel, because the difference is in what a field *means*, not in
+#: whether it is present, and B15-style reader sweeps cannot see it (§19 M26:
+#: "a populated field cannot be audited by its consumers").
+SCHEMA_V2 = "maestro-plan.v2"
 
 #: The closed set of gate runners. §6.2 deleted the plain-argv arm for agent
 #: nodes: an exit-code-only gate cannot satisfy the counting rule.
@@ -559,6 +577,37 @@ class Plan(BaseModel):
         return tuple(projected)
 
 
+class PlanV2(Plan):
+    """`maestro-plan.v2`. Structurally identical to v1, and that is the point.
+
+    Nothing a parser can see separates the two: the same ten in-plan types,
+    the same fields, the same closed-parse rules, the same obligations. What
+    changed is what the projection *puts in* `AgentNode.instruction` — under
+    v1 the lane's title, a summary of the requirement the lane was bound to;
+    under v2 the requirement text itself (§19 M26). A change to the meaning of
+    a field's contents is still a change to the artifact, and the version
+    string is the only place it can be recorded, because every structural
+    check passes either way.
+
+    It subclasses `Plan` rather than restating its forty lines of fields, and
+    the inheritance is the honest encoding of "v2's obligations *are* v1's
+    obligations". §6.3 freezes a shipped class, so `Plan` cannot move under
+    this one, and a duplicated field list would be one rule with two
+    representations — RC1's shape, at the layer that defines what a plan is.
+    A v3 that genuinely differs in structure gets a standalone class; the
+    inheritance is available here only because nothing structural differs.
+
+    No `schema_version` value is read off this model, and none may be (§5.3's
+    carve-out). The version's whole job is done before parsing: it selects
+    this class in the registry, and the run-start guard reads it from the
+    stored bytes rather than from a parsed plan.
+    """
+
+    model_config = _STRICT
+
+    schema_version: Literal["maestro-plan.v2"]
+
+
 # ── the projection is total, or it raises (§6.2, §3.6 B15) ─────────────────
 
 class ProjectionIncomplete(RuntimeError):
@@ -708,6 +757,7 @@ def registered_versions() -> Tuple[str, ...]:
 
 
 register_parser(SCHEMA_V1, Plan)
+register_parser(SCHEMA_V2, PlanV2)
 
 
 def _pointer(loc: Sequence[Any]) -> str:

@@ -312,9 +312,37 @@ class SchemaRegistryTests(unittest.TestCase):
     def test_v1_dispatches_to_the_frozen_v1_model(self):
         self.assertIs(pm.parser_for(pm.SCHEMA_V1), pm.Plan)
 
+    def test_v2_dispatches_to_its_own_class_not_to_the_v1_one(self):
+        """§6.3's registry, exercised by the second entry it has ever had.
+
+        v2 is structurally identical to v1 — the difference is what the
+        projection puts in `instruction` (§19 M26) — so the risk here is not
+        that v2 fails to parse but that it parses *as v1*, which would put the
+        two versions back in one world and make the run-start guard the only
+        thing separating them.
+        """
+        self.assertIs(pm.parser_for(pm.SCHEMA_V2), pm.PlanV2)
+        self.assertIsNot(pm.parser_for(pm.SCHEMA_V2), pm.Plan)
+        data = plan_mapping()
+        data["schema_version"] = pm.SCHEMA_V2
+        plan = pm.parse_mapping(data)
+        self.assertIsInstance(plan, pm.PlanV2)
+        self.assertEqual(pm.SCHEMA_V2, plan.schema_version)
+
+    def test_neither_class_will_wear_the_other_version_marker(self):
+        """The marker is a `Literal` field, not a free string. Without this,
+        `PlanV2` subclassing `Plan` would let a v1 body validate as v2 and the
+        registry's dispatch would be decoration."""
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            pm.Plan.model_validate({**plan_mapping(),
+                                    "schema_version": pm.SCHEMA_V2})
+        with self.assertRaises(ValidationError):
+            pm.PlanV2.model_validate(plan_mapping())
+
     def test_an_unknown_version_is_a_typed_refusal_not_a_guess(self):
         data = plan_mapping()
-        data["schema_version"] = "maestro-plan.v2"
+        data["schema_version"] = "maestro-plan.v7"
         with self.assertRaises(pm.SchemaVersionUnknown):
             pm.parse_mapping(data)
 
