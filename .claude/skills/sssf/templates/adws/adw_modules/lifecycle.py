@@ -2056,19 +2056,56 @@ class LifecycleStore:
                                             retry_class=retry_class),
                 {"scheduler_liveness": False})
 
-    def retry(self, run_id: str, node_id: str, *, force: bool = False) -> st.NodeLifecycle:
+    def retry(self, run_id: str, node_id: str, *, force: bool = False,
+              grant: int = 0) -> st.NodeLifecycle:
         """BLOCKED -> PENDING, or stranded RUNNING -> PENDING when the
         scheduler is provably dead. `force` grants exactly one extra attempt
-        beyond the semantic ceiling, never raising the cap itself (§7.5, §11.3)."""
+        beyond the semantic ceiling, and `grant` grants exactly that many,
+        neither raising the cap itself (§7.5, §11.3).
+
+        `grant` exists because the escape was capped at +1 by construction, in
+        the situation that needs more than +1 by construction (#81). The grant
+        is spent by a *cumulative* count — `review_attempts_total` and
+        `semantic_attempts_total` are scoped to `(run_id, node_id)` across
+        every base and never decrease — so a node already past its ceiling
+        needs a grant sized to the distance, not another +1. Repeating
+        `--force` cannot supply that distance: the first call moves the node to
+        PENDING and `require_state` below then refuses the second, which is
+        the guard doing its job rather than a bug in it. So the magnitude
+        belongs on the one call the state admits.
+
+        The escape's *identity* is unchanged: any grant is still
+        `Escape.RETRY_FORCE`, because a grant of three is the same operator
+        decision as a grant of one taken three rounds later, and a second
+        escape verb would have to be threaded through `exits_for` and every
+        refusal surface to say nothing new. The magnitude is a typed field on
+        the transition's detail, where `run status` reads it back, rather than
+        a distinction in the vocabulary.
+        """
+        if grant < 0:
+            raise EscapeRefused(
+                f"{node_id}: retry grant must be positive, got {grant}")
+        if grant and force:
+            # Not a style preference: `--force` *is* a grant of one, so
+            # accepting both would leave the total silently ambiguous between
+            # 1, `grant`, and `grant + 1` — the exact arithmetic an operator
+            # sizing a grant cannot afford to guess at.
+            raise EscapeRefused(
+                f"{node_id}: --force is a grant of one; pass one of "
+                "--force or --grant, never both")
+        delta = grant if grant else (1 if force else 0)
         self._require_escape_legal(run_id)
         extra, detail = self._prepare_stranded_running(
             run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL)
-        reason = st.Escape.RETRY_FORCE.value if force else st.Escape.RETRY.value
+        reason = st.Escape.RETRY_FORCE.value if delta else st.Escape.RETRY.value
+        detail = dict(detail or {})
+        if delta:
+            detail["granted_extra_delta"] = delta
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="operator", reason=reason,
             require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
-            granted_extra_delta=1 if force else 0,
-            detail=detail, extra_writes=extra)
+            granted_extra_delta=delta,
+            detail=detail or None, extra_writes=extra)
 
     def skip(self, run_id: str, node_id: str, *, accept_sha: str, repo_path) -> st.NodeLifecycle:
         """BLOCKED -> MERGED, or stranded RUNNING -> MERGED when the
