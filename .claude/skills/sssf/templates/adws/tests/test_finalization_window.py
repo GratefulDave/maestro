@@ -33,6 +33,7 @@ Run with:  uv run adws/adw_test.py -k window
 from __future__ import annotations
 
 import inspect
+import json
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from pathlib import Path
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
+import maestro  # noqa: E402
 from adw_modules import finalization_window as fw  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import watchdog as wd  # noqa: E402
@@ -89,7 +91,9 @@ class Harness:
         self.records = records
         #: The route's raw pane status, mutated by a test between polls. Left
         #: at the sentinel when the window is built with no status reader at
-        #: all, which is the shape `plan finalize` still uses.
+        #: all. Both shipped windows now pass one — `plan finalize` and the
+        #: run's per-attempt review — so the readerless shape is the contract
+        #: for a caller that has no route to ask, not a live call site.
         self.status = status
         self.status_reads = 0
         self._report_after_polls = report_after_polls
@@ -375,8 +379,9 @@ class AReviewerThatNeverGoesLiveIsAFailedStart(unittest.TestCase):
         self.assertIsNone(h.window.poll())
 
     def test_a_window_with_no_status_reader_cannot_reach_the_signal(self):
-        """`plan finalize` builds its window without one. "Never reported
-        working" is not an observation there, so it must not convict."""
+        """A window built without one cannot observe "never reported
+        working", so it must not convict on it. Both shipped call sites now
+        pass a reader; this is the contract for one that cannot."""
         h = Harness(config=make_config(turn_timeout_s=1_000.0,
                                        start_deadline_s=30.0), pid=5)
         h.window.open()
@@ -763,6 +768,375 @@ class TheReviewerSessionIsFresh(unittest.TestCase):
             authoring.mkdir()
             reviewer = Path(tmp) / "reviewer"
             fw.require_fresh_session_dir(reviewer, authoring_dirs=[authoring])
+
+
+class TheTurnClockCannotOutvoteALiveObservation(unittest.TestCase):
+    """The regression these exist for is `cmo-consolidation-l-r5`:
+
+        FINALIZATION_STALLED: route=omp model=openai-codex/gpt-5.6-luna
+        session_id=w146:p2 signal=TURN_TIMEOUT after 128.6s
+
+    The reviewer was not stalled. Pane `w146:p2` was still alive after the
+    verb gave up, its revision counter still climbing and its transcript
+    still growing. `TURN_TIMEOUT` reads transcript silence, and a reviewer
+    thinking for longer than the turn timeout is silent in exactly the way a
+    dead one is — which is why B14 forbids deciding this on a wall clock and
+    why the check is now gated on what the route reports, the same way
+    `ACTOR_ABANDONED` is.
+    """
+
+    @staticmethod
+    def _armed(status, **config_overrides):
+        fields = dict(finalization_timeout_s=100_000.0, turn_timeout_s=10.0)
+        fields.update(config_overrides)
+        h = Harness(config=make_config(**fields), status=status, pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        return h
+
+    def test_an_actor_reported_working_is_never_convicted_by_the_turn_clock(self):
+        """The defect, directly. A route saying `working` at every poll,
+        with a transcript that never grows, past many multiples of the turn
+        timeout: the window stays open."""
+        h = self._armed("working")
+        for _ in range(40):
+            h.monotonic.advance(25.0)        # 2.5x turn_timeout_s each poll
+            self.assertIsNone(h.window.poll())
+        self.assertGreaterEqual(h.monotonic(), 100 * 10.0)
+
+    def test_an_actor_reported_blocked_is_treated_the_same(self):
+        """`blocked` is a live working status too — an agent inside a tool
+        call is working, and its transcript does not grow while it waits."""
+        h = self._armed("blocked")
+        h.monotonic.advance(500.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_an_actor_reported_not_working_still_stalls_on_the_turn_clock(self):
+        """The signal keeps its job. Reported at its composer, nothing
+        written, past the turn timeout: this is the state `TURN_TIMEOUT` was
+        always for, and it still converts."""
+        h = self._armed("idle", start_deadline_s=100_000.0,
+                        quiescence_confirm_s=100_000.0)
+        h.monotonic.advance(11.0)
+        outcome = h.window.poll()
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
+        self.assertFalse(outcome.completed)
+
+    def test_a_window_with_no_status_reader_still_stalls_on_the_turn_clock(self):
+        """Absence of a reader is not an observation of work. Such a window
+        has only this clock and PROCESS_DEAD beneath the span bound, and
+        disarming it there would leave the span as the only detector — the
+        state B14 was recorded against."""
+        h = Harness(config=make_config(finalization_timeout_s=100_000.0,
+                                       turn_timeout_s=10.0), pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(11.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
+
+    def test_a_route_that_stops_reporting_working_becomes_convictable(self):
+        """The gate reads what the route says *now*, not the whole-window
+        liveness latch. A reviewer that worked and then stopped must still
+        convert, or the fix would trade one silent failure for another."""
+        h = self._armed("working", start_deadline_s=100_000.0,
+                        quiescence_confirm_s=100_000.0)
+        h.monotonic.advance(500.0)
+        self.assertIsNone(h.window.poll())
+        h.status = "idle"
+        h.monotonic.advance(11.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
+
+    def test_an_unreadable_status_does_not_clear_a_live_observation(self):
+        """A route that hiccups says nothing about the reviewer. The last
+        readable status stands, exactly as it does for quiescence."""
+        h = self._armed("working")
+        h.monotonic.advance(500.0)
+        self.assertIsNone(h.window.poll())
+        h.status = None
+        h.monotonic.advance(500.0)
+        self.assertIsNone(h.window.poll())
+
+    def test_a_never_readable_status_still_stalls_on_the_turn_clock(self):
+        """A reader that has never once answered has produced no observation
+        of work, so it cannot excuse the silence."""
+        h = self._armed("idle", start_deadline_s=100_000.0,
+                        quiescence_confirm_s=100_000.0)
+        h.status = None
+        h.monotonic.advance(11.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
+
+    def test_quiescence_after_liveness_still_fires_before_the_turn_clock(self):
+        """B14's own detector is unchanged and still the one that names a
+        reviewer which stopped without declaring."""
+        h = self._armed("working", turn_timeout_s=100_000.0,
+                        quiescence_confirm_s=60.0)
+        h.records = 1
+        h.window.poll()                       # latches "was working"
+        h.status = "idle"
+        h.monotonic.advance(1.0)
+        self.assertIsNone(h.window.poll())
+        h.monotonic.advance(61.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal,
+                         fw.FinalizationSignal.ACTOR_ABANDONED)
+        self.assertTrue(outcome.observed_working)
+
+    def test_a_new_record_still_restarts_the_quiescence_confirmation(self):
+        """Any record appearing inside the confirmation interval restarts
+        it from that record, so a reviewer paused inside a tool call is not
+        convicted for pausing."""
+        h = self._armed("working", turn_timeout_s=100_000.0,
+                        quiescence_confirm_s=60.0)
+        h.records = 1
+        h.window.poll()
+        h.status = "idle"
+        h.monotonic.advance(59.0)
+        self.assertIsNone(h.window.poll())
+        h.records = 2                          # it is still writing
+        h.monotonic.advance(59.0)
+        self.assertIsNone(h.window.poll())     # confirmation restarted
+        h.monotonic.advance(2.0)
+        self.assertIsNone(h.window.poll())
+        h.monotonic.advance(60.0)
+        self.assertEqual(h.window.poll().signal,
+                         fw.FinalizationSignal.ACTOR_ABANDONED)
+
+    def test_a_genuinely_hung_reviewer_still_converges_at_the_span_bound(self):
+        """Termination, named. A route reporting `working` forever with a
+        transcript that never grows now clears every gated detector — so the
+        signal that ends the window is `WINDOW_TIMEOUT`, obligation (b)'s one
+        span-bounding wall clock, and it still converts to a kill and a red
+        outcome rather than hanging."""
+        h = Harness(config=make_config(finalization_timeout_s=600.0,
+                                       turn_timeout_s=10.0),
+                    status="working", pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(599.0)
+        self.assertIsNone(h.window.poll())
+        h.monotonic.advance(2.0)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.WINDOW_TIMEOUT)
+        self.assertFalse(outcome.completed)
+        self.assertTrue(outcome.killed)
+        self.assertEqual(h.killed, [h.window.session])
+
+    def test_the_window_still_completes_when_the_report_arrives(self):
+        """The gate must not keep a finished review open: the report check
+        runs before every detector and is unaffected."""
+        h = Harness(config=make_config(finalization_timeout_s=100_000.0,
+                                       turn_timeout_s=10.0),
+                    status="working", pid=5, report_after_polls=2)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(500.0)
+        self.assertIsNone(h.window.poll())
+        outcome = h.window.poll()
+        self.assertTrue(outcome.completed)
+        self.assertIsNone(outcome.signal)
+
+
+class ThePlanFinalizeWindowCanSeeItsReviewer(unittest.TestCase):
+    """Every gate in this module reads `actor_status`, and `plan finalize`
+    used to pass none.
+
+    B14's incident is `plans finalize` waiting 22 minutes, and B14's recorded
+    fix is a raw per-pane status reader. The window has accepted one since
+    #89, and `_code_review_runner`'s window passed one — but
+    `_reviewer_window_factory`, the `plan finalize` path, did not. So on the
+    one path B14 was recorded against, `ACTOR_ABANDONED` and `NEVER_STARTED`
+    were both unreachable and the turn clock had nothing to be gated on: a
+    reviewer that never started, one that stopped without declaring, and one
+    working the whole time were a single undifferentiated silence. That is
+    what convicted a live reviewer on `cmo-consolidation-l-r5`. Without this
+    reader the gate in `poll` is inert here, so this test is the other half
+    of the fix rather than a detail of it.
+    """
+
+    def _factory_window(self, agent_status_returns,
+                        finalization_timeout_s=600.0):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        args = SimpleNamespace(
+            repo=str(root / "repo"),
+            herdr=str(root / "herdr"), omp=str(root / "omp"),
+            claude=str(root / "claude"),
+            route_verify_key=["00" * 32],
+            route_receipt=["claude=" + str(root / "r.json")],
+            # `claude` deliberately: it publishes no model catalog, so B13's
+            # size check resolves to "no window" instead of demanding a
+            # registered model. Which route reviews is not what is under test
+            # here — whether the window is given a reader is.
+            reviewer_route="claude", reviewer_model="review-model",
+            reviewer_effort="high", reviewer_profile=None,
+            reviewer_session_dir=str(root / "session"),
+            reviewer_report_file=str(root / "report.json"),
+            finalization_timeout_s=finalization_timeout_s,
+            reviewer_turn_timeout_s=fw.DEFAULT_TURN_TIMEOUT_S,
+            reviewer_poll_interval_s=1.0)
+        (root / "repo").mkdir()
+        matrix = maestro.finalization.ApplicabilityMatrix(
+            plan_digest="a" * 64, rubric_version="maestro-rubric.v2", cells=())
+        runner = mock.Mock()
+        runner.agent_status.return_value = agent_status_returns
+        handle = SimpleNamespace(pane_id="w146:p2", process_group=None,
+                                 liveness_pid=4321)
+        with mock.patch.object(maestro.route_receipts,
+                               "load_admitted_routes", return_value={}), \
+                mock.patch.object(maestro.launcher, "HerdrLauncher",
+                                  return_value=runner), \
+                mock.patch.object(maestro, "_preflight_prompt"), \
+                mock.patch.object(maestro, "_typed_launch_pane",
+                                  return_value=handle):
+            window = maestro._reviewer_window_factory(args)(matrix)
+            session = window.open()
+        return window, session, runner
+
+    def test_the_finalize_factory_gives_the_window_a_status_reader(self):
+        window, session, runner = self._factory_window("working")
+        self.assertIsNotNone(window._actor_status)
+        self.assertEqual(window._actor_status(session), "working")
+        self.assertTrue(runner.agent_status.called)
+
+    def test_the_reader_answers_none_before_a_pane_exists(self):
+        """A window whose reviewer has not launched has nothing to read, and
+        the module treats that as a missing observation rather than as
+        evidence of a stall."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "repo").mkdir()
+        args = SimpleNamespace(
+            repo=str(root / "repo"),
+            herdr=str(root / "herdr"), omp=str(root / "omp"),
+            claude=str(root / "claude"),
+            route_verify_key=["00" * 32],
+            route_receipt=["omp=" + str(root / "r.json")],
+            reviewer_route="omp", reviewer_model="review-model",
+            reviewer_effort="high", reviewer_profile=None,
+            reviewer_session_dir=str(root / "session"),
+            reviewer_report_file=str(root / "report.json"),
+            finalization_timeout_s=600.0,
+            reviewer_turn_timeout_s=fw.DEFAULT_TURN_TIMEOUT_S,
+            reviewer_poll_interval_s=1.0)
+        matrix = maestro.finalization.ApplicabilityMatrix(
+            plan_digest="a" * 64, rubric_version="maestro-rubric.v2", cells=())
+        with mock.patch.object(maestro.route_receipts,
+                               "load_admitted_routes", return_value={}), \
+                mock.patch.object(maestro.launcher, "HerdrLauncher",
+                                  return_value=mock.Mock()), \
+                mock.patch.object(maestro, "_preflight_prompt"):
+            window = maestro._reviewer_window_factory(args)(matrix)
+        self.assertIsNone(window._actor_status(None))
+
+    def test_a_live_reviewer_on_the_finalize_path_is_not_convicted(self):
+        """The two halves together, on the shipped path: the factory's reader
+        reports `working`, so the turn clock cannot end this window."""
+        window, session, _runner = self._factory_window(
+            "working", finalization_timeout_s=100_000.0)
+        clock = FakeClock(0.0)
+        window._time_source = clock
+        window._opened_at_monotonic = 0.0
+        window.report_launched(pid=4321)
+        window._transcript_record_count = lambda _s: 0
+        window._process_alive = lambda _pid: True
+        clock.advance(fw.DEFAULT_TURN_TIMEOUT_S * 3)
+        self.assertIsNone(window.poll())
+
+
+class TheTurnClockHasOneInCodeDefault(unittest.TestCase):
+    """Two literals for one clock is how a raised default comes to look like
+    it did nothing: the CLI default binds last on the unconfigured path and
+    silently wins whatever the module says."""
+
+    def test_the_module_names_the_default(self):
+        self.assertEqual(fw.DEFAULT_TURN_TIMEOUT_S, 900.0)
+
+    def test_the_default_is_not_the_width_that_convicted_a_live_reviewer(self):
+        """128.6s against a 120s clock is the incident. The gate above is the
+        fix; this only stops the not-working case being trigger-happy."""
+        self.assertGreater(fw.DEFAULT_TURN_TIMEOUT_S, 128.6)
+
+    def test_plan_finalize_with_no_flag_takes_it(self):
+        """The path an operator actually uses, not the constant in
+        isolation. `plan finalize` typed without `--reviewer-turn-timeout-s`
+        must arrive at the window carrying 900s — a module default the CLI
+        then overrode with its own literal would be no fix at all."""
+        args = maestro.build_parser().parse_args(
+            ["plan", "finalize", "plans/demo.json"])
+        self.assertEqual(args.reviewer_turn_timeout_s, 900.0)
+
+    def test_the_cli_default_is_the_module_constant_itself(self):
+        """Not merely equal today. A second literal is what drifts."""
+        args = maestro.build_parser().parse_args(
+            ["plan", "finalize", "plans/demo.json"])
+        self.assertEqual(args.reviewer_turn_timeout_s,
+                         fw.DEFAULT_TURN_TIMEOUT_S)
+
+    def test_an_installed_configuration_still_governs_its_own_reviewer(self):
+        """The in-code default is the *unconfigured* default, and saying so
+        is half the fix. In an installed repository `plan finalize` binds
+        `reviewer.turn_timeout_s` from `maestro.config.yaml` — a required
+        key, deployment-owned and never mirrored — so it, not this constant,
+        is what a deployment's reviewer runs under. A deployment wanting the
+        wider clock raises its own config, and `_validate_review_clocks`
+        requires it to raise `finalization_timeout_s` past it at the same
+        time. Nothing in-code can reach across that boundary, which is why
+        the liveness gate rather than the width is the fix that ships.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "project"
+            (repo / "adws").mkdir(parents=True)
+            (repo / "plans").mkdir(parents=True)
+            binaries = {}
+            for binary_name in ("herdr", "omp", "claude"):
+                binary = root / binary_name
+                binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binary.chmod(0o755)
+                binaries[binary_name] = str(binary)
+            config_path = repo / "adws" / "maestro.config.yaml"
+            config_path.write_text(json.dumps({
+                "schema": "maestro-config.v1",
+                "plans_dir": "plans",
+                "state_root": "../maestro-state",
+                "keys": {
+                    "verify_key_env": "MAESTRO_TEST_VERIFY_KEY",
+                    "signing_seed_env": "MAESTRO_TEST_SIGNING_SEED",
+                    "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
+                },
+                "executables": binaries,
+                "route_receipts": {"omp": "route-receipts/omp.json"},
+                "reviewer": {
+                    "route": "omp", "model": "review-model", "effort": "high",
+                    "finalization_timeout_s": 60, "turn_timeout_s": 20,
+                    "poll_interval_s": 1,
+                },
+                "execution": {
+                    "route": "omp", "model": "execution-model",
+                    "effort": "medium", "concurrency": 2,
+                    "node_timeout_s": 120, "turn_timeout_s": 30,
+                    "final_acceptance_timeout_s": 45, "backstop_t_s": 600,
+                    "semantic_ceiling": 3,
+                },
+            }), encoding="utf-8")
+
+            layout = maestro._load_maestro_layout(repo, config_path)
+
+            self.assertEqual(layout["reviewer"]["turn_timeout_s"], 20)
+            self.assertNotEqual(layout["reviewer"]["turn_timeout_s"],
+                                fw.DEFAULT_TURN_TIMEOUT_S)
 
 
 if __name__ == "__main__":

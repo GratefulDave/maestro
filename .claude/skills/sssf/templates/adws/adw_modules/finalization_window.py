@@ -51,6 +51,18 @@ anyone could name afterwards:
     sample.
   * `WINDOW_TIMEOUT` — the span bound, unchanged and still last.
 
+**The turn clock is evidence of a stop only where nothing contradicts it.**
+`TURN_TIMEOUT` reads transcript silence, and silence has two causes: a
+reviewer that stopped, and a reviewer still thinking. It used to convict both,
+unconditionally and ahead of every gated detector above it, which is the wall
+clock B14 forbids wearing a structural signal's name. On
+`cmo-consolidation-l-r5` it killed a reviewer whose pane was still answering
+128.6 seconds in and blocked the plan with no receipt. It now fires only where
+the route is not reporting the actor working — the same gating `ACTOR_ABANDONED`
+carries, on observed status rather than elapsed time. It keeps its job for the
+actor reported at its composer and for the window that has no status reader to
+ask, and it can no longer outvote a live observation.
+
 **Quiescence is confirmed, never sampled once.** A single `idle` reading is
 not evidence that a reviewer stopped. Herdr reports a pane as `idle`
 whenever the agent is between turns *or* blocked inside a tool call, and
@@ -168,6 +180,26 @@ QUIESCENT_STATUS = "idle"
 #: So it is set far above any plausible start rather than as tight as the
 #: signal would allow.
 DEFAULT_START_DEADLINE_S = 120.0
+
+#: The in-code default for the turn clock, and the only place it is named.
+#: `maestro.py`'s `--reviewer-turn-timeout-s` takes its argparse default from
+#: here rather than repeating a number, because two defaults for one clock is
+#: how a raised module default comes to look like it did nothing: the CLI
+#: default binds last and silently wins.
+#:
+#: 900s rather than the 120s this shipped with. 120s convicted a live reviewer
+#: at 128.6s on `cmo-consolidation-l-r5` — a reviewer whose pane was still
+#: answering and whose transcript was still growing after the verb gave up.
+#: The gate in `poll` is the fix for that; this is only the width. A route that
+#: reports nothing at all still has to be bounded, so the number is generous
+#: rather than absent, and the span bound remains over it either way.
+#:
+#: Note the interaction with `maestro._validate_review_clocks`, which refuses a
+#: *configured* `reviewer.turn_timeout_s` at or above
+#: `reviewer.finalization_timeout_s`. A deployment that wants this width in its
+#: own config must raise its span bound past it; unconfigured, the span bound
+#: simply fires first, which is the same disarming reached by another route.
+DEFAULT_TURN_TIMEOUT_S = 900.0
 
 #: How long `idle` must hold, with no transcript record appearing, before the
 #: reviewer is convicted of stopping without declaring. Sized against the
@@ -411,6 +443,15 @@ class FinalizationWindow:
         # convicted on one sample.
         self._quiescent_since: Optional[float] = None
         self._quiescent_at_count = 0
+        # The route's most recent *readable* status, which is what the turn
+        # clock is gated on. Deliberately not `_actor_was_working`, which is a
+        # latch over the whole window: a reviewer that worked once and then
+        # died must stay convictable, so the turn clock reads what the route
+        # says *now* rather than what it once said. An unreadable poll leaves
+        # this alone rather than clearing it, for the same reason the
+        # quiescence latch treats an unreadable status as a missing
+        # observation — a route that hiccups says nothing about the reviewer.
+        self._actor_status_current: Optional[str] = None
 
     # ── the span ────────────────────────────────────────────────────────
 
@@ -508,6 +549,7 @@ class FinalizationWindow:
             if raw is not None:
                 status = raw.strip().casefold()
                 self._actor_status_seen = True
+                self._actor_status_current = status
             if status in LIVE_WORKING_STATUSES:
                 self._actor_was_working = True
 
@@ -550,8 +592,38 @@ class FinalizationWindow:
             # is a missing observation rather than evidence of a stop.
             self._quiescent_since = None
 
+        # The turn clock, gated the way the quiescence detector above it is:
+        # on what the route reports, never on elapsed time alone.
+        #
+        # B14's binding lesson is "do not add a wall clock — a legitimate large
+        # review takes a long time and a timeout bounds honest work", and this
+        # check *was* that wall clock, sitting unconditionally underneath the
+        # detector written to obey the lesson, and firing first. A reviewer
+        # reasoning for longer than `turn_timeout_s` without emitting a
+        # transcript record is indistinguishable from a dead one under elapsed
+        # time, and B14 exists precisely because that inference is wrong. It
+        # was paid for on `cmo-consolidation-l-r5`: `TURN_TIMEOUT after 128.6s`
+        # against a pane that was still answering, with a growing revision
+        # counter and a live transcript, and the plan left blocked with no
+        # receipt written.
+        #
+        # So silence convicts only where the route is *not* reporting the actor
+        # working. The signal keeps its whole job — an actor reported back at
+        # its composer, or one the route has never once been able to describe,
+        # still converts here rather than being paid for at the span bound.
+        # What it can no longer do is contradict a live observation.
+        #
+        # Absence of a reader is not an observation of work. A window built
+        # with no `actor_status` at all has only this clock and PROCESS_DEAD
+        # beneath the span bound, so disarming it there would leave the span as
+        # the sole detector — exactly the state B14 was recorded against. It
+        # therefore still fires where nothing can be asked.
+        route_reports_working = (
+            self._actor_status is not None
+            and self._actor_status_current in LIVE_WORKING_STATUSES)
         since_progress = self._time_source() - self._turn_observed_at
-        if since_progress > self._config.turn_timeout_s:
+        if (since_progress > self._config.turn_timeout_s
+                and not route_reports_working):
             return self._stall(FinalizationSignal.TURN_TIMEOUT, elapsed)
         return None
 

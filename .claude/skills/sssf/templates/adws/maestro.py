@@ -1668,6 +1668,26 @@ def _reviewer_window_factory(args: argparse.Namespace):
         def poll_report():
             return _poll_reviewer_report(report_path)
 
+        def read_status(_session):
+            # B14's fix, on the path B14 was recorded against. The window has
+            # carried `actor_status` since #89, and every detector gated on it
+            # — ACTOR_ABANDONED, NEVER_STARTED, and now the turn clock — was
+            # unreachable here because this factory passed no reader, while
+            # `_code_review_runner`'s window a few hundred lines below passed
+            # one. So `plan finalize` had the span bound and a raw turn clock
+            # and nothing in between: it could not tell a reviewer that never
+            # started from one that stopped without declaring from one that was
+            # working the whole time, which is the exact distinction B14's
+            # incident ("`plans finalize` waited 22 minutes") required, and it
+            # convicted the third of them on `cmo-consolidation-l-r5`.
+            #
+            # Raw per-pane status, never `observe()`: that call collapses idle
+            # into RUNNING for a build node, and a collapsed status cannot
+            # express "went live, then stopped". `agent_status` answers None
+            # when the pane cannot be read, and the window treats that as a
+            # missing observation rather than as evidence.
+            return runner.agent_status(handle) if handle is not None else None
+
         def kill_reviewer(_session):
             if handle is not None:
                 runner.cancel(handle, finalization_window.time.monotonic() + 1.0)
@@ -1679,7 +1699,8 @@ def _reviewer_window_factory(args: argparse.Namespace):
                 poll_interval_s=args.reviewer_poll_interval_s),
             launch=launch_reviewer, poll_report=poll_report,
             record_reviewer_session=lambda _session: None,
-            kill=kill_reviewer)
+            kill=kill_reviewer,
+            actor_status=read_status)
 
     return factory
 
@@ -5952,7 +5973,12 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--route-receipt", action="append")
     finalize.add_argument("--route-verify-key", action="append")
     finalize.add_argument("--finalization-timeout-s", type=float, default=600.0)
-    finalize.add_argument("--reviewer-turn-timeout-s", type=float, default=120.0)
+    # Taken from the module rather than typed here. Two literals for one clock
+    # is how a raised module default comes to look like it did nothing: this
+    # default binds last on the unconfigured path and would silently win.
+    finalize.add_argument(
+        "--reviewer-turn-timeout-s", type=float,
+        default=finalization_window.DEFAULT_TURN_TIMEOUT_S)
     finalize.add_argument("--reviewer-poll-interval-s", type=float, default=1.0)
     finalize.set_defaults(handler=_plan_finalize)
     gate = plan_sub.add_parser("gate")
