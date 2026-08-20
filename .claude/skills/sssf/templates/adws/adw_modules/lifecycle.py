@@ -203,6 +203,23 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   merge_cause            TEXT,
   output_sha             TEXT,
   granted_extra_attempts INTEGER NOT NULL DEFAULT 0,
+  -- The attempt number this node's retry-class spend is counted *from*.
+  -- Written at a typed boundary and nowhere else: `run resume` raises it for
+  -- every node in the run, an operator `retry` raises it for the one node it
+  -- names, and in both cases to the highest attempt already classified at
+  -- that instant. `attempts_spent` then counts only attempts above it, so a
+  -- node is charged for what it spent since the boundary rather than for
+  -- everything it ever spent (§7.5, §11.3).
+  --
+  -- A floor rather than a decrement, because the attempt rows are the
+  -- evidence chain: refreshing a budget by deleting or rewriting what it
+  -- counted would destroy the record of the failures that produced it.
+  -- Moving where the count starts leaves every row exactly as it was.
+  --
+  -- Nullable with no default, so a ledger written before the column reads
+  -- NULL, and NULL is read as 0 -- no boundary recorded, counted from the
+  -- beginning of the node's life, which is the behaviour that predates it.
+  retry_spend_floor      INTEGER,
   updated_at             TEXT NOT NULL,
   PRIMARY KEY (run_id, node_id)
 );
@@ -330,6 +347,7 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
 _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("cancel_cause", "TEXT"),
     ("merge_cause", "TEXT"),
+    ("retry_spend_floor", "INTEGER"),
 )
 
 #: Every table an older ledger may be missing a column from, in one place so
@@ -346,6 +364,38 @@ _ADDED_COLUMNS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...] = (
     ("node_lifecycle", _NODE_LIFECYCLE_ADDED_COLUMNS),
     ("attempt_baselines", _ATTEMPT_BASELINE_ADDED_COLUMNS),
 )
+
+#: Raise a node's retry-budget floor to the highest of its attempts that has
+#: **already** been classified. One definition of the boundary, rendered for
+#: the two scopes that may cross it — a run-wide resume and a per-node retry —
+#: so the two can never come to mean different things.
+#:
+#: "Already classified" is what makes the two writers agree with the accounting
+#: each performs around them. `resume_run` charges an inherited RUNNING attempt
+#: ENVIRONMENTAL *after* writing the boundary, and an operator `retry` closes a
+#: stranded RUNNING attempt the same way in the same transaction; neither row
+#: is classified at the instant the floor is computed, so both land above it
+#: and are charged against the refreshed budget. §9.7's exemption survives
+#: intact too: an inherited attempt that declared an accepted result is closed
+#: UNCLASSIFIED and still costs nothing.
+#:
+#: `MAX(attempt_no)` and not `COUNT(*)`: `attempts_spent` filters the rows it
+#: counts by class, and a floor expressed as a count of one class could not
+#: say anything about another. An attempt number orders every class at once.
+_RETRY_SPEND_FLOOR_SQL = (
+    "UPDATE node_lifecycle SET retry_spend_floor = ("
+    "SELECT COALESCE(MAX(a.attempt_no), 0) FROM attempts a"
+    " WHERE a.run_id = node_lifecycle.run_id"
+    " AND a.node_id = node_lifecycle.node_id"
+    " AND a.retry_class IS NOT NULL)")
+
+#: Every node of one run — the resume boundary is a property of the run.
+_RAISE_RUN_RETRY_SPEND_FLOOR = _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=?"
+
+#: One node — the escape boundary is a decision about that node alone, which
+#: is what a `run resume` flag cannot express (§11.3).
+_RAISE_NODE_RETRY_SPEND_FLOOR = (
+    _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=? AND node_id=?")
 
 
 def _host_label(name: str) -> str:
@@ -1258,16 +1308,51 @@ class LifecycleStore:
             (turn_count, attempt.launched_at, attempt.run_id, attempt.node_id,
              attempt.attempt_no))
 
+    @serialized
+    def retry_spend_floor(self, run_id: str, node_id: str) -> int:
+        """The attempt number this node's retry budgets are counted from.
+
+        0 when no boundary has been crossed, and 0 for a ledger written before
+        the column: NULL says nobody recorded a boundary, never that one was
+        recorded at zero, and both read the same because counting from the
+        beginning of the node's life is what the absence of a boundary means.
+        """
+        row = self.conn.execute(
+            "SELECT retry_spend_floor FROM node_lifecycle"
+            " WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{node_id} has no lifecycle row")
+        return int(row[0] or 0)
+
     def attempts_spent(self, run_id: str, node_id: str,
                         retry_class: st.RetryClass) -> int:
-        """How many attempts of this node already failed in this class.
+        """How many attempts of this node failed in this class *since its last
+        boundary* (§7.5, §11.3).
 
         Counts only rows already classified, which is what keeps §7.5's rule
         that no infra fault produces a budget decrement true of the other
         direction as well: an unclassified row contributes to nothing.
+
+        Counts only rows above `retry_spend_floor`, which is the other half.
+        Without it this number was cumulative over the node's whole life and
+        nothing debited, expired, or reset it, so spend on a defect that has
+        since been fixed was charged forever: three `LAUNCHER_TRANSIENT`
+        attempts burned in ten seconds relaunching against a workspace herdr
+        had already destroyed (#79) left the node permanently over a budget of
+        two, and the next launcher failure of any kind — including one that
+        was genuinely transient — blocked it on first contact with zero
+        tolerance, on a debt no amount of success could pay off (#92).
+
+        The floor moves only at a typed boundary written by an operator: a
+        `run resume`, or a `retry` naming this node. It never moves because an
+        attempt succeeded, because time passed, or because anything an agent
+        said, so §1.2 holds — the budget a node is charged against is a
+        function of the ledger's transition rows, not of any process's opinion
+        about whether its earlier failures still count.
         """
+        floor = self.retry_spend_floor(run_id, node_id)
         return sum(1 for a in self.attempts_for(run_id, node_id)
-                   if a.retry_class is retry_class)
+                   if a.retry_class is retry_class and a.attempt_no > floor)
 
     def close(self) -> None:
         """Close the shared connection. One connection outlives every thread
@@ -1917,6 +2002,23 @@ class LifecycleStore:
         would strand the next resume: a scheduler that dies before declaring
         leaves `latest_outcome` at `CANCELLED`, and a `CANCELLED` with no
         cause is refused.
+
+        **Every node's retry-budget floor is raised here, in the same
+        transaction, for the same reason `cancel_requested` is cleared.** A
+        resume is a boundary or it is nothing: the operator is stating that the
+        conditions the run failed under have been dealt with, and a budget
+        that carried every attempt the run ever spent contradicted that
+        statement on the next line — a node whose launcher budget went to a
+        defect that has since been fixed was scheduled by the resume only to
+        block again on first contact (#92). The floor is a per-node column
+        rather than a run-level one because the count it bounds is per-node,
+        and it is written by one correlated UPDATE rather than a loop so a run
+        with a hundred nodes crosses the boundary in one statement.
+
+        It is raised to the highest attempt *already classified*, so the
+        inherited-attempt accounting below is untouched: an attempt this
+        resume charges ENVIRONMENTAL is still charged, against the refreshed
+        budget, and an attempt spared as UNCLASSIFIED still costs nothing.
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1927,6 +2029,7 @@ class LifecycleStore:
                 " scheduler_start_epoch=? WHERE run_id=?",
                 (now, os.getpid(), scheduler_host(), now,
                  wd.process_start_epoch(os.getpid()), run_id))
+            self.conn.execute(_RAISE_RUN_RETRY_SPEND_FLOOR, (run_id,))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -2244,6 +2347,20 @@ class LifecycleStore:
         refusal surface to say nothing new. The magnitude is a typed field on
         the transition's detail, where `run status` reads it back, rather than
         a distinction in the vocabulary.
+
+        **The retry-class budgets are refreshed here, and they take no
+        magnitude.** `grant` sizes the two *ceilings* — review and semantic —
+        which count a node's judged work and where the right answer is "how
+        many more rounds", a number only the operator knows. The retry classes
+        count infrastructure faults, and a node handed back to the scheduler
+        after its launcher budget went to a defect that has since been fixed
+        needs the whole allowance rather than a number reverse-engineered from
+        a count no report carries: the escape exists to put the node back on
+        the frontier, and returning it there already exhausted schedules it
+        only to block again on first contact (#92). So the floor is raised for
+        the one node this escape names — which is the granularity a `run
+        resume` flag cannot express, since it raises the ceiling for every
+        node in the run and leaves the deployment's configuration edited (#91).
         """
         if grant < 0:
             raise EscapeRefused(
@@ -2258,8 +2375,19 @@ class LifecycleStore:
                 "--force or --grant, never both")
         delta = grant if grant else (1 if force else 0)
         self._require_escape_legal(run_id)
-        extra, detail = self._prepare_stranded_running(
+        stranded, detail = self._prepare_stranded_running(
             run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL)
+
+        def extra(lifecycle: st.NodeLifecycle):
+            # The floor first, the stranded attempt's classification second,
+            # and the order is the semantics rather than a style choice: the
+            # floor is the highest attempt *already* classified, so a row this
+            # same transaction is about to classify must not be in it. Written
+            # the other way round, the escape would forgive the very failure
+            # it is being invoked over.
+            return ([(_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id))]
+                    + list(stranded(lifecycle) if stranded else ()))
+
         reason = st.Escape.RETRY_FORCE.value if delta else st.Escape.RETRY.value
         detail = dict(detail or {})
         if delta:
