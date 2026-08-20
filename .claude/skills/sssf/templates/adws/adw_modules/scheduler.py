@@ -1651,7 +1651,9 @@ class Scheduler:
                 store.mark_blocked(
                     self.run_id, node.node_id,
                     st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                    detail=detail, attempt_extra=marker)
+                    detail=self._review_budget_detail(
+                        detail, node.node_id, lifecycle.granted_extra_attempts),
+                    attempt_extra=marker)
                 # Surfaced where the operator will actually read it: the block
                 # reason alone says a budget ran out and nothing about what the
                 # reviewer objected to, which is the evidence gap that makes a
@@ -1692,6 +1694,41 @@ class Scheduler:
         attempts = self.deps.store.attempts_for(self.run_id, node_id)
         already = rp.review_attempts_total(attempts, node_id)
         return already + 1 >= self.config.review_ceiling + granted
+
+    def _review_budget_detail(self, detail: Mapping[str, Any], node_id: str,
+                              granted: int) -> Dict[str, Any]:
+        """The block payload for `REVIEW_BUDGET_EXHAUSTED`, with the numbers an
+        operator needs to size the escape (#81).
+
+        Everything the block reason carried before this said *that* a budget
+        ran out. Reopening the node needs to know by how much it overran, and
+        the count is cumulative across every base for the `(run_id, node_id)`
+        pair — so it is not the per-process series `review_convergence`
+        reports, and it was not recoverable from anything the run printed. One
+        real node blocked here with seven review-rejected attempts while the
+        run report printed a convergence series of `[3]`, because only three of
+        the seven happened in the process that reported.
+
+        `review_grant_required` is the arithmetic rather than the inputs to it,
+        deliberately: the count this decision reads excludes the attempt
+        currently being blocked, whose marker `mark_blocked` writes in the same
+        transaction, so an operator reading the raw count off the payload and
+        sizing a grant from it would be short by exactly one — the off-by-one
+        `_review_ceiling_reached` documents, moved onto the operator. It is the
+        smallest `retry --grant N` under which this node can absorb one further
+        rejection instead of re-blocking on it.
+        """
+        already = rp.review_attempts_total(
+            self.deps.store.attempts_for(self.run_id, node_id), node_id)
+        # After the block, `already + 1` markers are stored. The next
+        # rejection blocks again unless `stored + 1 < ceiling + granted`.
+        required = (already + 1) + 2 - self.config.review_ceiling - granted
+        return dict(
+            detail,
+            review_attempts_total=already,
+            review_ceiling=self.config.review_ceiling,
+            granted_extra_attempts=granted,
+            review_grant_required=max(1, required))
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts

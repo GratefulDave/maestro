@@ -3736,7 +3736,8 @@ def _escape(args: argparse.Namespace) -> int:
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
     try:
         if args.command == "retry":
-            row = store.retry(args.run_id, args.node_id, force=args.force)
+            row = store.retry(args.run_id, args.node_id, force=args.force,
+                              grant=getattr(args, "grant", 0) or 0)
         elif args.command == "skip":
             row = store.skip(args.run_id, args.node_id,
                              accept_sha=args.accept_sha, repo_path=args.repo)
@@ -5483,10 +5484,39 @@ def build_parser() -> argparse.ArgumentParser:
     _add_db(convergence)
     convergence.set_defaults(handler=_run_convergence)
 
+    def _positive_grant(value: str) -> int:
+        """`--grant 0` and `--grant -2` are refused at parse time rather than
+        accepted as a no-op escape: an operator who typed a grant asked for
+        one, and a silently ignored magnitude would leave the node blocked
+        with a transition claiming it had been retried."""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"grant must be an integer, got {value!r}")
+        if parsed < 1:
+            raise argparse.ArgumentTypeError(
+                f"grant must be at least 1, got {parsed}")
+        return parsed
+
     retry = root.add_parser("retry")
     retry.add_argument("run_id")
     retry.add_argument("node_id")
-    retry.add_argument("--force", action="store_true")
+    # One escape, two magnitudes. `--force` is a grant of one and keeps that
+    # meaning exactly; `--grant N` is the same grant sized to a node that is
+    # already N past its ceiling, which repeated `--force` cannot express —
+    # the first call moves the node to PENDING and the store's `require_state`
+    # then refuses the second (#81). Mutually exclusive so the total is never
+    # ambiguous between N and N+1.
+    grant_group = retry.add_mutually_exclusive_group()
+    grant_group.add_argument(
+        "--force", action="store_true",
+        help="grant one extra attempt beyond the ceiling")
+    grant_group.add_argument(
+        "--grant", type=_positive_grant, default=0, metavar="N",
+        help="grant N extra attempts beyond the ceiling; a node blocked "
+             "REVIEW_BUDGET_EXHAUSTED reports the N it needs as "
+             "review_grant_required")
     _add_db(retry)
     retry.set_defaults(handler=_escape)
     skip = root.add_parser("skip")
