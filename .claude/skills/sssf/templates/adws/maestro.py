@@ -924,6 +924,10 @@ def _bind_layout_executables(args: argparse.Namespace, layout: Dict[str, Any]) -
 def _apply_repository_config(
         args: argparse.Namespace, argv: Sequence[str]) -> None:
     """Bind named-plan and bootstrap entrypoints to installed repository state."""
+    if (args.command == "attempt"
+            and getattr(args, "attempt_command", None) == "salvage"):
+        _bind_salvage_configuration(args, argv)
+        return
     if not _configured_command(args):
         return
     config_path = _installed_config_path()
@@ -1101,6 +1105,62 @@ def _named_plan_digests(layout: Dict[str, Any]) -> Dict[str, str]:
         if stored.is_file():
             digests[candidate.name] = plan_digest.digest_of(stored.read_bytes())
     return digests
+
+
+#: Salvage options the installed configuration can answer for itself. Each
+#: names a path `run start` already mints from `repository_state`, so the verb
+#: held both halves of the derivation and asked the operator for the answer
+#: anyway -- at the one moment an operator is least able to reconstruct it, and
+#: with a silent failure mode: a wrong `--worktrees-root` reports
+#: `SALVAGE_WORKTREE_ABSENT`, which reads as "the work is gone" when the work
+#: is fine and the path was wrong (#83).
+#:
+#: `--record-dir` and `--signing-seed` are deliberately absent. The record
+#: directory is where signed evidence lands and is an operator's choice, and a
+#: verb that quietly finds its own signing key is worse than one that asks.
+_SALVAGE_DERIVED_OPTIONS = ("--worktrees-root", "--scratch-root", "--db")
+
+
+def _bind_salvage_configuration(
+        args: argparse.Namespace, argv: Sequence[str]) -> None:
+    """Derive salvage's run-directory paths exactly as `run start` mints them.
+
+    Salvage takes the run id positionally and reads the same
+    `maestro.config.yaml`, so `repository_state / "runs" / <run_id>` is the
+    same derivation on both sides -- spelled once here rather than retyped at
+    the prompt. Only the options the operator did not type are bound, so an
+    explicit flag still wins: a run directory that was relocated or copied is
+    precisely the case a derived default cannot answer.
+
+    Only the layout is loaded, never the keys. A stranded attempt is recovered
+    with the operator's own seed on the command line, and reading key material
+    here would be the verb finding its own key.
+    """
+    supplied = {item.split("=", 1)[0] for item in argv if item.startswith("-")}
+    if all(option in supplied for option in _SALVAGE_DERIVED_OPTIONS):
+        return
+    config_path = _installed_config_path()
+    if not os.path.lexists(str(config_path)):
+        # Unconfigured tree. The handler refuses by flag name, which is a
+        # better message than a configuration error about a file nobody
+        # installed.
+        return
+    if not config_path.is_file():
+        raise _MaestroConfigurationError(
+            str(_MAESTRO_CONFIG_FILE) + " is not a regular file")
+    layout = _load_maestro_layout(
+        config_path.parent.parent.resolve(), config_path)
+    runs_root = (layout["repository_state"] / "runs").resolve()
+    run_root = (runs_root / str(args.run_id)).resolve()
+    if not _path_is_within(run_root, runs_root):
+        raise _MaestroConfigurationError(
+            "run id does not name a directory inside the run boundary")
+    if "--worktrees-root" not in supplied:
+        args.worktrees_root = str(run_root / "worktrees")
+    if "--scratch-root" not in supplied:
+        args.scratch_root = str(run_root / "scratch")
+    if "--db" not in supplied:
+        args.db = str(layout["database"])
 
 
 def _bind_run_ledger_configuration(
@@ -3669,6 +3729,15 @@ def _parse_salvage_seed(value: object) -> bytes:
 
 
 def _attempt_salvage(args: argparse.Namespace) -> int:
+    missing = [flag for flag, value in (
+        ("--worktrees-root", getattr(args, "worktrees_root", None)),
+        ("--scratch-root", getattr(args, "scratch_root", None)),
+    ) if not value]
+    if missing:
+        return _refusal(
+            "RUN_CONFIGURATION_REQUIRED",
+            " and ".join(missing) + " is required outside a configured "
+            "repository")
     store = _store(args)
     if store is None:
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
@@ -5397,8 +5466,10 @@ def build_parser() -> argparse.ArgumentParser:
     salvage_cmd.add_argument("--invoked-by", required=True)
     salvage_cmd.add_argument("--reason", required=True)
     salvage_cmd.add_argument("--repo", default=".")
-    salvage_cmd.add_argument("--worktrees-root", required=True)
-    salvage_cmd.add_argument("--scratch-root", required=True)
+    # Not `required`: both are derived from the installed configuration by
+    # `_bind_salvage_configuration`, and an explicit flag still wins (#83).
+    salvage_cmd.add_argument("--worktrees-root")
+    salvage_cmd.add_argument("--scratch-root")
     salvage_cmd.add_argument("--record-dir", required=True)
     salvage_cmd.add_argument("--signing-seed", required=True)
     _add_db(salvage_cmd)
