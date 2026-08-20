@@ -875,6 +875,57 @@ _RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence")
 #: behaviours the operator meant, and derives no path at all.
 _RUN_SELECTION_OPTIONS = frozenset({"--run-id", "--json", "--discard"})
 
+#: Run-execution flags that override a *setting* rather than a *path*, mapped
+#: to the `argparse` destination each one writes.
+#:
+#: The all-or-nothing rule above is about identity: `--plan-file` typed by hand
+#: beside a `--digest` bound from configuration is two halves describing
+#: different runs, and there is no way to tell which half is wrong. None of the
+#: flags below can produce that disagreement. A retry budget, a concurrency
+#: limit or a model name names no file, resolves no run and is compared against
+#: nothing — it is the one number the operator meant to change for this
+#: invocation.
+#:
+#: Treating them as identity flags is what made `run resume <id>
+#: --environmental-retries 6` refuse with fifteen missing values (#91): the
+#: single tuning flag switched binding off, and the fourteen paths it had
+#: nothing to do with then had to be retyped. There was no supported
+#: command-line way to raise a retry budget for one resume at all; the only
+#: route was editing `execution:` in a deployment-owned `maestro.config.yaml`,
+#: a persistent change made to express a one-run intent.
+#:
+#: So these bind from configuration like everything else and are then written
+#: back from what the operator typed, which is `_bind_salvage_configuration`'s
+#: rule (#83) applied to the run verbs: only the options the operator did not
+#: type are derived, and an explicit flag still wins.
+#:
+#: The executables (`--herdr`, `--omp`, `--claude`) are deliberately *not*
+#: here. They name paths, and a run's route receipts attest the launcher it was
+#: admitted with, so an executable swapped under a configured route is the
+#: half-disagreement this rule exists to refuse.
+_RUN_TUNING_OPTIONS: Dict[str, str] = {
+    "--concurrency": "concurrency",
+    "--node-timeout-s": "node_timeout_s",
+    "--turn-timeout-s": "turn_timeout_s",
+    "--final-acceptance-timeout-s": "final_acceptance_timeout_s",
+    "--backstop-t-s": "backstop_t_s",
+    "--semantic-ceiling": "semantic_ceiling",
+    "--review-ceiling": "review_ceiling",
+    "--environmental-retries": "environmental_retries",
+    "--launcher-retries": "launcher_retries",
+    "--credential-retries": "credential_retries",
+    "--provision": "provision_argv",
+    "--agent-route": "agent_route",
+    "--agent-model": "agent_model",
+    "--agent-effort": "agent_effort",
+    "--agent-profile": "agent_profile",
+}
+
+#: Named once so the refusal can quote a few of them, rather than telling an
+#: operator that "tuning flags" exist without saying which ones they are.
+_RUN_TUNING_EXAMPLES = ("--concurrency", "--environmental-retries",
+                        "--launcher-retries", "--review-ceiling")
+
 #: Plan verbs whose positional argument is overloaded — a plan *name* the
 #: installed configuration resolves, or a filesystem path to the plan bytes.
 #: `author` is excluded because it also binds executables and *writes* the
@@ -943,15 +994,42 @@ def _apply_repository_config(
             str(_MAESTRO_CONFIG_FILE) + " is not a regular file")
     options = tuple(item.split("=", 1)[0] for item in argv
                     if item.startswith("-"))
+    supplied = frozenset(options)
+    tuning: Dict[str, Any] = {}
     if args.command == "run" and args.run_command != "start":
-        if any(option not in _RUN_SELECTION_OPTIONS for option in options):
+        manual = tuple(sorted(
+            supplied - _RUN_SELECTION_OPTIONS - frozenset(_RUN_TUNING_OPTIONS)))
+        if manual:
             # A fully manual invocation. Every path it works on came from a
             # flag, and binding the other half from configuration is exactly
             # how the two halves come to disagree about which run this is.
+            #
+            # Recorded rather than merely acted on, because the operator has to
+            # be told *which* flag did this. Fifteen missing values read as a
+            # broken installation; they are the consequence of one word on the
+            # command line, and `_missing_run_configuration_detail` is where
+            # that word is finally said (#91). An option this partition does
+            # not classify lands here too — the safe side, since an unknown
+            # flag may well name a path.
+            args.manual_run_options = manual
             return
+        # Not manual, so configuration binds — but what the operator typed must
+        # survive it. The `run` branch below assigns every one of these
+        # unconditionally, so without this snapshot a tuning flag that no
+        # longer disables binding would instead be silently overwritten by the
+        # configured value, which is the same defect wearing a quieter face.
+        tuning = {attribute: getattr(args, attribute, None)
+                  for option, attribute in _RUN_TUNING_OPTIONS.items()
+                  if option in supplied}
     elif options:
+        # The same class as the branch above, refusing loudly rather than
+        # silently, and it named the rule without ever naming the word that
+        # broke it. Quote the flags: an operator reading "do not accept
+        # runtime flags" beside a command line of their own has to guess which
+        # of them counted as runtime.
         raise _MaestroConfigurationError(
-            "configured named-plan commands do not accept runtime flags")
+            "configured named-plan commands do not accept runtime flags: "
+            + ", ".join(sorted(supplied)))
 
     repo = config_path.parent.parent.resolve()
     if args.command == "bootstrap" or (
@@ -1088,6 +1166,13 @@ def _apply_repository_config(
         args.review_timeout_s = reviewer["finalization_timeout_s"]
         args.reviewer_turn_timeout_s = reviewer["turn_timeout_s"]
         args.reviewer_poll_interval_s = reviewer["poll_interval_s"]
+
+        # Last, so it wins over every configured value assigned above. This is
+        # the whole of "an explicit flag still wins" for the run verbs: the
+        # settings the operator typed are put back exactly as parsed, and no
+        # path was rederived on their account.
+        for attribute, value in tuning.items():
+            setattr(args, attribute, value)
 
 
 def _named_plan_digests(layout: Dict[str, Any]) -> Dict[str, str]:
@@ -2248,6 +2333,39 @@ def _run_start(args: argparse.Namespace) -> int:
                         "{0}: {1}".format(type(exc).__name__, exc))
 
 
+def _missing_run_configuration_detail(
+        args: argparse.Namespace, missing: Sequence[str]) -> str:
+    """The `missing run configuration` refusal, plus the rule that caused it.
+
+    A list of fifteen absent values is a symptom, and on a configured
+    repository it is never the operator's actual mistake: every one of them
+    binds from `adws/maestro.config.yaml`. What happened is that one flag on
+    the command line named a path by hand, so `_apply_repository_config`
+    declined to bind the other half rather than let two halves describe
+    different runs. The old message said none of that, so the reading it
+    invited was "my installation is broken" — and the remedy, deleting one
+    word, was not derivable from anything printed (#91).
+
+    Same shape as #78, and the same correction: the refusal is right, the
+    vocabulary named a consequence instead of the rule. Name the flag, name
+    the rule, name both ways out.
+    """
+    detail = "missing run configuration: {}".format(", ".join(missing))
+    manual = tuple(getattr(args, "manual_run_options", ()) or ())
+    if not manual:
+        return detail
+    named = ", ".join(manual)
+    return (
+        detail + "; configuration binding was disabled by " + named
+        + " because it names a path, key or executable by hand, and a run "
+        "half-derived from " + str(_MAESTRO_CONFIG_FILE) + " and half typed "
+        "at the prompt cannot be trusted to name one run. Either drop "
+        + named + " and let every value above bind from configuration, or "
+        "supply all of them as flags. Tuning flags ("
+        + ", ".join(_RUN_TUNING_EXAMPLES) + " and the other settings in "
+        "execution:) override a value without disabling binding.")
+
+
 def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerConfig:
     required = ("plan_file", "repo", "receipt_dir", "data_dir", "verify_key",
                 "digest", "db", "run_id", "integration_path", "worktrees_root",
@@ -2257,7 +2375,7 @@ def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerCon
     missing = [name for name in required if not getattr(args, name, None)]
     if missing:
         raise _PlanReceiptConfigurationError(
-            "missing run configuration: {}".format(", ".join(missing)))
+            _missing_run_configuration_detail(args, missing))
     # Every field of `SchedulerConfig` is named here, and
     # `test_every_scheduler_config_field_is_projected` fails if one is not.
     # This is the projection §7.4 describes: the one that copied a gate's
