@@ -54,6 +54,24 @@ exactly that shape: `lane-p4-enrichment-ordering` collected seven rejections,
 was blocked twice, and reached MERGED by operator skip. Counting it as a lane
 that converged in eleven attempts would feed the ceiling the one number it
 must never be sized from — the length of a lane that never converged at all.
+
+**A run that has not finished has not failed to converge (#107).** The verdict
+column had one residual cause for every lane that was rejected and never
+passed, and its text was "run ended first". Read against a live run it was
+simply false: `run convergence` printed "not converged — run ended first;
+still descending" for `lane-p5-gap-policy` while that lane was RUNNING on its
+fourth attempt, `runs.latest_outcome` was NULL, and the scheduler process was
+alive — and the summary line closed with "no lane in this run converged, so it
+measures no convergence length", a terminal judgement on a run that could
+still converge minutes later.
+
+The measurement was never wrong; `a1:2 a2:2 a3:1` was exactly the ledger, and
+the trend beside it was the signal the operator was actually watching. What
+was wrong was that one verdict covered two different facts. Whether the run
+has stopped is `lifecycle.run_in_flight` — `derive_run_state` over the node
+rows, composed with `scheduler_liveness` over the process table, and `None`
+where neither can answer — and it arrives here as a value the caller computed
+from the `runs` row, never as anything a lane says about itself.
 """
 
 from __future__ import annotations
@@ -112,9 +130,24 @@ class Cause(str, Enum):
     #: `skip` merged it over the reviewer. Its attempt count is not a
     #: convergence length and must not be read as one.
     MERGED_WITHOUT_PASSING_REVIEW = "MERGED_WITHOUT_PASSING_REVIEW"
-    #: The run ended — cancelled, still running, or otherwise quiescent —
-    #: while the lane was still descending.
+    #: The run stopped — merged, cancelled, quiescent, or abandoned — before a
+    #: later attempt could pass. This is a finding about the plan: the lane had
+    #: its chance and did not take it, and the series says whether it was still
+    #: descending when the run went away.
     RUN_ENDED = "RUN_ENDED"
+    #: The run has *not* stopped. Nothing has been decided about this lane yet;
+    #: it simply has not finished. Distinct from `RUN_ENDED` because the
+    #: two are different facts and only the first is a finding about the plan —
+    #: single verdict that used to cover both told an operator watching a live
+    #: run that it had already ended (#107).
+    RUN_IN_FLIGHT = "RUN_IN_FLIGHT"
+    #: Whether the run is still going cannot be established: no scheduler pid
+    #: is recorded, or it was recorded on a host whose process table this
+    #: machine cannot read (`lifecycle.run_in_flight` answers `None`). The
+    #: series is still exactly what the ledger holds; the *reason* the lane
+    #: stopped being retried is what is unknown, and reporting it as ended
+    #: would be the same overclaim in the other direction.
+    RUN_LIVENESS_UNKNOWN = "RUN_LIVENESS_UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -195,6 +228,13 @@ class RunConvergence:
     run_id: str
     review_ceiling: Optional[int]
     lanes: Tuple[LaneConvergence, ...]
+    #: Whether the run had stopped when this profile was taken, as
+    #: `lifecycle.run_in_flight` derives it — `True` still going, `False`
+    #: stopped, `None` not establishable. Carried on the profile rather than
+    #: re-derived per lane so every lane of one reading answers from one
+    #: observation of one ledger; a run that ends between two lanes must not
+    #: produce a profile that disagrees with itself.
+    in_flight: Optional[bool] = None
 
     @property
     def converged(self) -> Tuple[LaneConvergence, ...]:
@@ -249,6 +289,7 @@ class RunConvergence:
         return {
             "run_id": self.run_id,
             "review_ceiling": self.review_ceiling,
+            "in_flight": self.in_flight,
             "longest_convergence": (
                 {"node_id": longest.node_id,
                  "convergence_length": longest.convergence_length}
@@ -340,10 +381,33 @@ def _passed_at(node_id: str, attempts: Iterable[Any]) -> Optional[int]:
     return max(verified) if verified else None
 
 
+def _unfinished_cause(in_flight: Optional[bool]) -> Cause:
+    """Why a still-descending lane stopped being retried — or that it has not.
+
+    Nothing here is a judgement about the lane. The lane's own rows have
+    already been exhausted by the two branches above (the ceiling blocked it,
+    or an operator merged over the reviewer); what is left is entirely a
+    question about the *run*, and the answer is `lifecycle.run_in_flight`'s
+    tri-state passed straight through. The mapping is total and the `None` arm
+    is deliberate: a reader that cannot say must say that, not pick the
+    likelier of the two claims it is unable to support.
+    """
+    if in_flight is True:
+        return Cause.RUN_IN_FLIGHT
+    if in_flight is False:
+        return Cause.RUN_ENDED
+    return Cause.RUN_LIVENESS_UNKNOWN
+
+
 def lane_convergence(node: Any, attempts: Iterable[Any],
-                     transitions: Iterable[Mapping[str, Any]]
-                     ) -> LaneConvergence:
-    """One lane's profile, from the rows the ledger already holds."""
+                     transitions: Iterable[Mapping[str, Any]],
+                     in_flight: Optional[bool] = None) -> LaneConvergence:
+    """One lane's profile, from the rows the ledger already holds.
+
+    `in_flight` is the run's, not the lane's, and it changes no measurement:
+    the series, the pass, and the convergence length are the same rows either
+    way. It selects which of three true statements the residual verdict makes.
+    """
     attempts = tuple(attempts)
     transitions = tuple(transitions)
     node_id = node.node_id
@@ -363,7 +427,7 @@ def lane_convergence(node: Any, attempts: Iterable[Any],
         elif state == MERGED_NODE_STATE:
             cause = Cause.MERGED_WITHOUT_PASSING_REVIEW
         else:
-            cause = Cause.RUN_ENDED
+            cause = _unfinished_cause(in_flight)
     else:
         outcome, cause = Outcome.NO_REVIEW, None
 
@@ -378,13 +442,20 @@ def lane_convergence(node: Any, attempts: Iterable[Any],
 def run_convergence(run_id: str, nodes: Iterable[Any],
                     attempts: Iterable[Any],
                     transitions: Iterable[Mapping[str, Any]],
-                    review_ceiling: Optional[int] = None) -> RunConvergence:
-    """Every lane of one run, ordered as the reader returned the nodes."""
+                    review_ceiling: Optional[int] = None,
+                    in_flight: Optional[bool] = None) -> RunConvergence:
+    """Every lane of one run, ordered as the reader returned the nodes.
+
+    `in_flight` comes from `lifecycle.run_in_flight`, computed once by the
+    caller that already holds the `runs` row, and is handed to every lane
+    unchanged. This module stays duck-typed over nodes, attempts, and
+    transitions — it has never held a `RunRecord` and does not start now.
+    """
     attempts = tuple(attempts)
     transitions = tuple(transitions)
     return RunConvergence(
-        run_id=run_id, review_ceiling=review_ceiling,
-        lanes=tuple(lane_convergence(node, attempts, transitions)
+        run_id=run_id, review_ceiling=review_ceiling, in_flight=in_flight,
+        lanes=tuple(lane_convergence(node, attempts, transitions, in_flight)
                     for node in nodes))
 
 
@@ -400,7 +471,15 @@ _CAUSE_TEXT = {
     Cause.REVIEW_CEILING_REACHED: "review ceiling reached",
     Cause.MERGED_WITHOUT_PASSING_REVIEW: "merged without passing review",
     Cause.RUN_ENDED: "run ended first",
+    Cause.RUN_IN_FLIGHT: "run still in flight",
+    Cause.RUN_LIVENESS_UNKNOWN: "no later attempt recorded",
 }
+
+#: `not converged` is a verdict; on a run that has not finished there is no
+#: verdict yet, and the word that carries the whole difference is "yet". The
+#: line an operator saw read "not converged — run ended first" beside a lane
+#: that was RUNNING on its fourth attempt at that moment (#107).
+_IN_FLIGHT_OUTCOME_TEXT = "not converged yet"
 
 
 def _series_text(lane: LaneConvergence) -> str:
@@ -416,7 +495,8 @@ def _attempts_text(count: Optional[int]) -> str:
 
 
 def _verdict_text(lane: LaneConvergence) -> str:
-    text = _OUTCOME_TEXT[lane.outcome]
+    text = (_IN_FLIGHT_OUTCOME_TEXT if lane.cause is Cause.RUN_IN_FLIGHT
+            else _OUTCOME_TEXT[lane.outcome])
     if lane.outcome is Outcome.CONVERGED:
         text += " at a{} ({})".format(
             lane.passed_at_attempt, _attempts_text(lane.convergence_length))
@@ -452,8 +532,19 @@ def render(profile: RunConvergence) -> str:
     lines.append("")
     longest = profile.longest
     if longest is None:
-        lines.append("  no lane in this run converged, so it measures no "
-                     "convergence length")
+        # Three sentences for three states, and the tense is the whole point.
+        # "converged" is past and closed; a run still executing has not
+        # finished failing to converge, and saying so read as a terminal
+        # judgement on a run that could still converge minutes later (#107).
+        if profile.in_flight is True:
+            lines.append("  no lane has converged yet and the run has not "
+                         "ended, so it measures no convergence length yet")
+        elif profile.in_flight is False:
+            lines.append("  no lane in this run converged, so it measures no "
+                         "convergence length")
+        else:
+            lines.append("  no lane in this run has converged, so it measures "
+                         "no convergence length")
     else:
         lines.append("  longest observed convergence: {} ({})".format(
             _attempts_text(longest.convergence_length), longest.node_id))

@@ -143,6 +143,29 @@ class ConvergenceLedgerFixture(unittest.TestCase):
 
     # ── ledger builders, through the production store ───────────────────────
 
+    #: A pid no process holds, so `scheduler_liveness` answers False against
+    #: the real process table. The same constant and the same reason as
+    #: `test_retry_budget_resume_reset`: "the scheduler is gone" stays a fact
+    #: about this machine rather than an injected stub.
+    DEAD_PID = 2_000_000_000
+
+    def _scheduler_exited(self, store, run_id):
+        """The `runs` row a finished scheduler leaves behind.
+
+        `claim_run` records the running process and is never cleared, so an
+        ended run still names the pid that ran it — which is exactly what
+        `lifecycle.run_in_flight` reads to tell a stopped run from a live one.
+        A fixture that never claimed at all would leave the pid NULL, and the
+        honest answer to "is this run still going" would then be `None`.
+        """
+        with mock.patch("os.getpid", return_value=self.DEAD_PID):
+            store.claim_run(run_id)
+
+    def _end_run(self, store, run_id, **kwargs):
+        """A run that stopped: its scheduler declared an outcome and exited."""
+        self._scheduler_exited(store, run_id)
+        return store.declare_outcome(run_id, **kwargs)
+
     @staticmethod
     def _reject(store, run_id, node_id, findings, *, blocked=False):
         """One rejected review, written exactly as `_settle_review_rejection`.
@@ -189,15 +212,21 @@ class ConvergenceLedgerFixture(unittest.TestCase):
             store.start_attempt(run_id, "unreviewed", BASE)
             store.fail_attempt(run_id, "unreviewed",
                                st.RetryClass.ENVIRONMENTAL)
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
         return run_id
 
     def _profile(self, run_id, review_ceiling=None):
+        """Built the way `maestro._run_convergence` builds it: one reader, one
+        node read, and the run's liveness derived from that same `runs` row by
+        the production function rather than asserted by the test."""
         reader = lc.LifecycleReader.open(self.database)
         try:
+            record = reader.run(run_id)
+            nodes = reader.nodes(run_id)
             return rc.run_convergence(
-                run_id, reader.nodes(run_id), reader.attempts(run_id),
-                reader.transitions(run_id), review_ceiling=review_ceiling)
+                run_id, nodes, reader.attempts(run_id),
+                reader.transitions(run_id), review_ceiling=review_ceiling,
+                in_flight=lc.run_in_flight(record, nodes))
         finally:
             reader.close()
 
@@ -240,7 +269,7 @@ class ConvergenceProfileTest(ConvergenceLedgerFixture):
                 self._reject(store, run_id, "descending", findings)
             store.start_attempt(run_id, "descending", BASE)
             self._reject(store, run_id, "descending", 2, blocked=True)
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
 
         lane = self._profile(run_id).lanes[0]
         self.assertEqual(lane.findings_per_attempt, ((1, 4), (2, 3), (3, 2)))
@@ -256,7 +285,7 @@ class ConvergenceProfileTest(ConvergenceLedgerFixture):
             for findings in (2, 2, 2):
                 store.start_attempt(run_id, "descending", BASE)
                 self._reject(store, run_id, "descending", findings)
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
 
         lane = self._profile(run_id).lanes[0]
         self.assertIs(lane.descending, False)
@@ -271,7 +300,7 @@ class ConvergenceProfileTest(ConvergenceLedgerFixture):
             store.start_attempt(run_id, "converging", BASE)
             store.mark_verified(run_id, "converging", "c" * 40)
             store.mark_merged(run_id, "converging")
-            store.declare_outcome(run_id, acceptance_result=True)
+            self._end_run(store, run_id, acceptance_result=True)
 
         lane = self._profile(run_id).lanes[0]
         self.assertIs(lane.outcome, rc.Outcome.CONVERGED)
@@ -300,7 +329,7 @@ class SkippedLaneTest(ConvergenceLedgerFixture):
                 self._reject(store, run_id, "descending", findings)
             store.start_attempt(run_id, "descending", head)
             self._reject(store, run_id, "descending", 3, blocked=True)
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
             store.skip(run_id, "descending", accept_sha=head, repo_path=repo)
         return run_id
 
@@ -341,7 +370,7 @@ class CountRecoveryTest(ConvergenceLedgerFixture):
                 attempt_extra={rp.REVIEW_REJECTED_KEY: True,
                                rp.REVIEW_FINDINGS_COUNT_KEY: 9,
                                rc.REVIEW_SUBJECT_DIGEST_KEY: "d1"})
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
 
         lane = self._profile(run_id).lanes[0]
         self.assertEqual(lane.findings_per_attempt, ((1, 9),))
@@ -356,7 +385,7 @@ class CountRecoveryTest(ConvergenceLedgerFixture):
             store.fail_attempt(
                 run_id, "descending", st.RetryClass.SEMANTIC,
                 attempt_extra={rp.REVIEW_REJECTED_KEY: True})
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
 
         lane = self._profile(run_id).lanes[0]
         self.assertEqual(lane.findings_per_attempt, ((1, None),))
@@ -373,7 +402,7 @@ class CountRecoveryTest(ConvergenceLedgerFixture):
             store.start_attempt(run_id, "descending", BASE)
             self._reject(store, run_id, "descending", 5)
             self._reject(store, run_id, "converging", 1)
-            store.declare_outcome(run_id)
+            self._end_run(store, run_id)
 
         lanes = {lane.node_id: lane for lane in self._profile(run_id).lanes}
         self.assertEqual(lanes["converging"].findings_per_attempt, ((1, 1),))
@@ -391,7 +420,7 @@ class CeilingWarningTest(ConvergenceLedgerFixture):
             store.start_attempt(run_id, "converging", BASE)
             store.mark_verified(run_id, "converging", "c" * 40)
             store.mark_merged(run_id, "converging")
-            store.declare_outcome(run_id, acceptance_result=True)
+            self._end_run(store, run_id, acceptance_result=True)
         return run_id
 
     def test_a_ceiling_below_an_observed_convergence_warns_and_names_the_lane(self):
@@ -445,7 +474,7 @@ class ConvergenceVerbTest(ConvergenceLedgerFixture):
             store.start_attempt("run-warn", "converging", BASE)
             store.mark_verified("run-warn", "converging", "c" * 40)
             store.mark_merged("run-warn", "converging")
-            store.declare_outcome("run-warn", acceptance_result=True)
+            self._end_run(store, "run-warn", acceptance_result=True)
 
         code, output = self._run(["run", "convergence", "named"])
         self.assertEqual(code, 0, output)
@@ -490,6 +519,170 @@ class ConvergenceVerbTest(ConvergenceLedgerFixture):
         self.assertEqual(code, 3)
         self.assertEqual(json.loads(output)["outcome"], "RUN_NOT_FOUND")
         self.assertFalse(self.database.exists())
+
+
+class LiveRunTest(ConvergenceLedgerFixture):
+    """#107 — a run that has not finished has not failed to converge.
+
+    Observed on `run-fb9973646d344400a9e4f4d7818d00f2`: `run convergence`
+    printed
+
+        lane-p5-gap-policy   a1:2 a2:2 a3:1   not converged — run ended first; still descending
+
+    while that lane was RUNNING on attempt 4, `runs.latest_outcome` was NULL,
+    and the scheduler process was alive. The series was right and the trend was
+    right; the verdict beside them was a false statement about the run, and the
+    summary line called it terminal.
+    """
+
+    def _live_run(self, run_id="run-live", leave_attempt_open=True):
+        """The reported shape: 2, 2, 1 findings, then a fourth attempt open.
+
+        `claim_run` records *this* process, which is alive for as long as the
+        test is, so `scheduler_liveness` answers True against the real process
+        table. No `declare_outcome`, because no scheduler declared one.
+        """
+        with self._store() as store:
+            store.create_run(run_id, self.digest, [DESCENDING, CONVERGING])
+            store.claim_run(run_id)
+            for findings in (2, 2, 1):
+                store.start_attempt(run_id, "descending", BASE)
+                self._reject(store, run_id, "descending", findings)
+            if leave_attempt_open:
+                store.start_attempt(run_id, "descending", BASE)
+
+            store.start_attempt(run_id, "converging", BASE)
+            self._reject(store, run_id, "converging", 2)
+            store.start_attempt(run_id, "converging", BASE)
+            store.mark_verified(run_id, "converging", "c" * 40)
+            store.mark_merged(run_id, "converging")
+        return run_id
+
+    def test_a_lane_mid_attempt_is_unfinished_and_the_run_has_not_ended(self):
+        lane = {l.node_id: l for l in self._profile(self._live_run()).lanes}
+        descending = lane["descending"]
+        self.assertIs(descending.outcome, rc.Outcome.NOT_CONVERGED)
+        self.assertIs(descending.cause, rc.Cause.RUN_IN_FLIGHT)
+        self.assertEqual(descending.state, "RUNNING")
+
+    def test_the_rendered_verdict_does_not_say_the_run_ended(self):
+        rendered = rc.render(self._profile(self._live_run()))
+        self.assertIn("not converged yet — run still in flight", rendered)
+        self.assertNotIn("run ended first", rendered)
+
+    def test_the_trend_and_the_per_attempt_counts_are_unchanged(self):
+        """The half of the line that was already correct stays correct."""
+        profile = self._profile(self._live_run())
+        descending = {l.node_id: l for l in profile.lanes}["descending"]
+        self.assertEqual(descending.findings_per_attempt,
+                         ((1, 2), (2, 2), (3, 1)))
+        self.assertIs(descending.descending, True)
+        self.assertIn("a1:2 a2:2 a3:1", rc.render(profile))
+        self.assertIn("still descending", rc.render(profile))
+
+    def test_a_lane_that_converged_still_reports_its_length_mid_run(self):
+        """An in-flight run is not an excuse to withhold what did converge."""
+        profile = self._profile(self._live_run())
+        converging = {l.node_id: l for l in profile.lanes}["converging"]
+        self.assertIs(converging.outcome, rc.Outcome.CONVERGED)
+        self.assertEqual(converging.convergence_length, 2)
+        self.assertIn("converged at a2 (2 review attempts)",
+                      rc.render(profile))
+
+    def test_between_attempts_the_live_scheduler_holds_the_run_open(self):
+        """The case the node rows alone cannot decide. Nothing is RUNNING, so
+        `derive_run_state` says PENDING — which is equally the shape of a run
+        whose scheduler exited. The pid is what separates them."""
+        run_id = self._live_run("run-between", leave_attempt_open=False)
+        lane = {l.node_id: l for l in self._profile(run_id).lanes}
+        self.assertEqual(lane["descending"].state, "PENDING")
+        self.assertIs(lane["descending"].cause, rc.Cause.RUN_IN_FLIGHT)
+
+    def test_the_summary_line_is_not_a_terminal_judgement_on_a_live_run(self):
+        run_id = "run-live-nothing"
+        with self._store() as store:
+            store.create_run(run_id, self.digest, [DESCENDING])
+            store.claim_run(run_id)
+            for findings in (2, 1):
+                store.start_attempt(run_id, "descending", BASE)
+                self._reject(store, run_id, "descending", findings)
+            store.start_attempt(run_id, "descending", BASE)
+
+        profile = self._profile(run_id)
+        self.assertIsNone(profile.longest)
+        rendered = rc.render(profile)
+        self.assertIn("no lane has converged yet and the run has not ended",
+                      rendered)
+        self.assertNotIn("no lane in this run converged", rendered)
+
+    def test_a_run_claimed_on_another_host_says_neither(self):
+        """`run_in_flight` answers `None` when the recorded pid belongs to a
+        machine whose process table this one cannot read, and an unknown must
+        render as unknown: "ended" and "in flight" are both unsupported."""
+        run_id = "run-elsewhere"
+        with self._store() as store, \
+                mock.patch.object(lc, "scheduler_host",
+                                  return_value="some-other-box"):
+            store.create_run(run_id, self.digest, [DESCENDING])
+            store.claim_run(run_id)
+            for findings in (2, 1):
+                store.start_attempt(run_id, "descending", BASE)
+                self._reject(store, run_id, "descending", findings)
+
+        profile = self._profile(run_id)
+        self.assertIsNone(profile.in_flight)
+        self.assertIs(profile.lanes[0].cause, rc.Cause.RUN_LIVENESS_UNKNOWN)
+        rendered = rc.render(profile)
+        self.assertIn("no later attempt recorded", rendered)
+        self.assertNotIn("run ended first", rendered)
+        self.assertNotIn("run still in flight", rendered)
+
+    def test_the_verb_an_operator_types_reports_the_live_run_as_live(self):
+        """End to end, through `maestro.main` and the real reader — the path
+        that printed the false line (§10.6: the verb derives liveness)."""
+        self._live_run()
+        code, output = self._run(["run", "convergence", "named"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("a1:2 a2:2 a3:1", output)
+        self.assertIn("not converged yet — run still in flight", output)
+        self.assertIn("still descending", output)
+        self.assertNotIn("run ended first", output)
+
+    def test_json_carries_the_liveness_the_render_keys_on(self):
+        self._live_run()
+        code, output = self._run(["run", "convergence", "named", "--json"])
+        self.assertEqual(code, 0, output)
+        payload = json.loads(output)
+        self.assertIs(payload["in_flight"], True)
+        lanes = {lane["node_id"]: lane for lane in payload["lanes"]}
+        self.assertEqual(lanes["descending"]["cause"], "RUN_IN_FLIGHT")
+        self.assertEqual(lanes["descending"]["findings_per_attempt"],
+                         [{"attempt_no": 1, "findings": 2},
+                          {"attempt_no": 2, "findings": 2},
+                          {"attempt_no": 3, "findings": 1}])
+
+    def test_the_same_rows_after_the_scheduler_exits_do_say_it_ended(self):
+        """The planted change: one fact moves — whether a process is behind the
+        run — and nothing else. The verdict must flip, or it is not reading it.
+
+        This is also the regression guard in the other direction. An ended run
+        that never converged still has to say so; the fix must not turn every
+        verdict into a hedge.
+        """
+        run_id = self._live_run("run-flip", leave_attempt_open=False)
+        before = {l.node_id: l for l in self._profile(run_id).lanes}
+        self.assertIs(before["descending"].cause, rc.Cause.RUN_IN_FLIGHT)
+
+        with self._store() as store:
+            self._end_run(store, run_id)
+
+        profile = self._profile(run_id)
+        after = {l.node_id: l for l in profile.lanes}
+        self.assertIs(profile.in_flight, False)
+        self.assertIs(after["descending"].cause, rc.Cause.RUN_ENDED)
+        self.assertEqual(after["descending"].findings_per_attempt,
+                         before["descending"].findings_per_attempt)
+        self.assertIn("run ended first", rc.render(profile))
 
 
 class NonVacuityTest(ConvergenceLedgerFixture):

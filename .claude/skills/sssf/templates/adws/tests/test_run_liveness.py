@@ -720,5 +720,100 @@ class SignalPidIdentity(unittest.TestCase):
         self.assertNotEqual(started, float(int(started)))
 
 
+class HasThisRunStopped(unittest.TestCase):
+    """`run_in_flight` — the yes/no/cannot-say `derive_run_state` withholds.
+
+    Nine derived strings do not partition into stopped and going: BLOCKED and
+    PENDING both mean "work is left and nothing is executing it this instant",
+    which is the shape of a run whose scheduler declared and exited *and* of a
+    live one between two polls. `run convergence` partitioned them by hand, put
+    both on the "ended" side, and told an operator watching a live run that it
+    had already ended (#107).
+    """
+
+    def flight(self, rec, nodes, *, alive=True, host=HOST):
+        return lc.run_in_flight(rec, nodes, is_alive=lambda _pid: alive,
+                                host=host)
+
+    def test_a_node_running_needs_no_probe_to_be_going(self):
+        rec = record(pid=42, outcome=None)
+        nodes = [node_row("a", st.NodeState.RUNNING)]
+        self.assertEqual(derive(rec, nodes), "RUNNING")
+        self.assertIs(self.flight(rec, nodes), True)
+
+    def test_every_node_merged_is_stopped(self):
+        rec = record(pid=42, outcome=st.RunOutcome.ACCEPTED)
+        nodes = [node_row("a", st.NodeState.MERGED)]
+        self.assertEqual(derive(rec, nodes), "MERGED")
+        self.assertIs(self.flight(rec, nodes), False)
+
+    def test_a_dead_scheduler_over_a_running_node_is_stopped(self):
+        """ABANDONED is a stop, and `derive_run_state` established it from the
+        process table before this function was asked anything."""
+        rec = record(pid=42, outcome=None)
+        nodes = [node_row("a", st.NodeState.RUNNING)]
+        self.assertEqual(derive(rec, nodes, alive=False), "ABANDONED")
+        self.assertIs(self.flight(rec, nodes, alive=False), False)
+
+    def test_pending_is_decided_by_the_pid_and_not_by_the_node_rows(self):
+        """The pair that made the false verdict possible. Identical node rows,
+        identical derived state, opposite answers."""
+        rec = record(pid=42, outcome=st.RunOutcome.BLOCKED)
+        nodes = [node_row("a", st.NodeState.PENDING),
+                 node_row("b", st.NodeState.MERGED)]
+        self.assertEqual(derive(rec, nodes, alive=True), "PENDING")
+        self.assertEqual(derive(rec, nodes, alive=False), "PENDING")
+        self.assertIs(self.flight(rec, nodes, alive=True), True)
+        self.assertIs(self.flight(rec, nodes, alive=False), False)
+
+    def test_blocked_is_decided_the_same_way(self):
+        rec = record(pid=42, outcome=st.RunOutcome.BLOCKED)
+        nodes = [node_row("a", st.NodeState.BLOCKED),
+                 node_row("b", st.NodeState.PENDING)]
+        self.assertEqual(derive(rec, nodes, alive=True), "BLOCKED")
+        self.assertIs(self.flight(rec, nodes, alive=True), True)
+        self.assertIs(self.flight(rec, nodes, alive=False), False)
+
+    def test_an_unreadable_process_table_answers_neither(self):
+        """No pid, or a pid on another host: `None`, and a caller must render
+        that as unknown rather than pick the likelier claim."""
+        no_pid = record(pid=None, outcome=st.RunOutcome.BLOCKED)
+        nodes = [node_row("a", st.NodeState.PENDING)]
+        self.assertIsNone(self.flight(no_pid, nodes))
+        elsewhere = record(pid=42, host="other-box",
+                           outcome=st.RunOutcome.BLOCKED)
+        self.assertIsNone(self.flight(elsewhere, nodes, host=HOST))
+
+    def test_a_cancellation_still_reaching_nodes_is_going(self):
+        rec = record(pid=42, cancel=True)
+        nodes = [node_row("a", st.NodeState.CANCELLED),
+                 node_row("b", st.NodeState.PENDING)]
+        self.assertEqual(derive(rec, nodes), "CANCELLING")
+        self.assertIs(self.flight(rec, nodes), True)
+
+    def test_a_finished_cancellation_is_stopped(self):
+        rec = record(pid=42, cancel=True)
+        nodes = [node_row("a", st.NodeState.CANCELLED)]
+        self.assertEqual(derive(rec, nodes), "CANCELLED")
+        self.assertIs(self.flight(rec, nodes), False)
+
+    def test_every_derived_state_is_classified(self):
+        """The partition is total. A tenth string added to `derive_run_state`
+        without a home here would fall through to the liveness probe and be
+        reported as a live run, which is the direction that strands nothing but
+        does mislead — so the two sets are asserted against the function's own
+        vocabulary rather than left implicit."""
+        derived = {"EMPTY", "EMPTY", "MERGED", "CANCELLED", "QUIESCENT",
+                   "ABANDONED", "CANCELLING", "RUNNING", "BLOCKED", "PENDING"}
+        classified = set(lc.STOPPED_RUN_STATES) | set(lc.LIVE_RUN_STATES)
+        self.assertEqual(derived - classified, {"BLOCKED", "PENDING"})
+        self.assertEqual(classified - derived, set())
+
+    def test_no_node_at_all_is_stopped(self):
+        rec = record(pid=42)
+        self.assertEqual(derive(rec, []), "EMPTY")
+        self.assertIs(self.flight(rec, []), False)
+
+
 if __name__ == "__main__":
     unittest.main()
