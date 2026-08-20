@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -257,9 +258,19 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
 class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
     """`run start` clears its own litter, and refuses over everyone else's.
 
-    The distinction is path containment against the configured run root, never
-    a name or a claim (§1.2): a checkout under `<repository state>/runs` was
-    created by this system, and one anywhere else may be the operator's.
+    Two questions, and a reclaim needs both answered. *Whose* checkout is this
+    is path containment against the configured run root, never a name or a
+    claim (§1.2): a checkout under `<repository state>/runs` was created by
+    this system, and one anywhere else may be the operator's. *Is the run that
+    owns it still resumable* is that run's own recorded outcome, read from the
+    ledger. Containment alone once decided this, and a run that was merely
+    blocked lost its merges to a verb that never asked (§19 M24).
+
+    The harness stubs `lc.LifecycleStore`, so nothing here creates the ledger
+    a real run always has by the time the reclaim runs -- `_execute_run`
+    constructs the store above the block the reclaim sits in. `_record_run`
+    writes the two columns the predicate reads, so these tests state the run's
+    state instead of inheriting "no ledger" from the stub.
     """
 
     def _installation(self, root):
@@ -267,6 +278,21 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
         state = root / "state"
         (state / "runs").mkdir(parents=True)
         return repo, state
+
+    def _record_run(self, root, outcome, run_id="run-0"):
+        """The ledger row a real run has written by the time it holds a branch.
+
+        `latest_outcome` NULL is the crashed-run shape and is spelled by
+        passing `None`; the column exists either way, because a row is
+        inserted when the run starts and only the declaration is missing.
+        """
+        with sqlite3.connect(root / "state.db") as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY,"
+                " latest_outcome TEXT)")
+            connection.execute(
+                "INSERT OR REPLACE INTO runs (run_id, latest_outcome)"
+                " VALUES (?, ?)", (run_id, outcome))
 
     def _strand_integration(self, repo, state, run_id="run-0"):
         """What a run that died before its release leaves holding the branch."""
@@ -288,10 +314,12 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
         return code, json.loads(output.getvalue()), integration
 
     def test_a_stranded_checkout_in_our_own_run_root_is_reclaimed(self):
+        """The verb's documented subject: a release that failed and said so."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo, state = self._installation(root)
             stranded = self._strand_integration(repo, state)
+            self._record_run(root, "ACCEPTED")
 
             code, payload, _ = self._start(root, repo, state)
 
@@ -333,6 +361,7 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             root = Path(tmp)
             repo, state = self._installation(root)
             stranded = self._strand_integration(repo, state)
+            self._record_run(root, "ACCEPTED")
             retained = []
             for node in ("node-a", "node-b"):
                 attempt = state / "runs" / "run-0" / "worktrees" / node
@@ -359,6 +388,86 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
                 self.assertEqual(
                     _git(repo, "rev-parse", "--verify",
                          "attempt/" + attempt.name + "-1").returncode, 0)
+
+    def test_a_blocked_runs_checkout_is_refused_rather_than_reclaimed(self):
+        """A run an operator can resume is not this system's litter (§19 M24).
+
+        `run start` reclaims *without asking*, which is right for a leftover
+        and wrong for a run holding merges. The refusal names the run and the
+        state that produced it, so the operator can act on it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, state = self._installation(root)
+            stranded = self._strand_integration(repo, state)
+            self._record_run(root, "BLOCKED")
+            (stranded / "merged-work.txt").write_text("kept\n", encoding="utf-8")
+
+            code, payload, integration = self._start(root, repo, state)
+
+            self.assertEqual(code, 3, payload)
+            self.assertEqual(payload["outcome"],
+                             "INTEGRATION_WORKTREE_RUN_NOT_OVER")
+            self.assertIn("run-0", payload["detail"])
+            self.assertIn("BLOCKED", payload["detail"])
+            self.assertTrue(stranded.is_dir())
+            self.assertEqual(
+                (stranded / "merged-work.txt").read_text(encoding="utf-8"),
+                "kept\n")
+            self.assertIn(stranded.resolve(), _worktree_paths(repo))
+            self.assertFalse(integration.exists())
+
+    def test_a_crashed_runs_checkout_is_refused_rather_than_reclaimed(self):
+        """A NULL outcome is a run nothing ever declared quiescence for.
+
+        This is the behaviour change worth naming: before the state check,
+        `run start` silently reclaimed a crashed run's integration checkout
+        and carried on. That checkout may hold merged work, and destroying it
+        costs a `DurableOutputIdentityError` on the next resume rather than an
+        error at the moment of destruction, so it is now the operator's call.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, state = self._installation(root)
+            stranded = self._strand_integration(repo, state)
+            self._record_run(root, None)
+
+            code, payload, _ = self._start(root, repo, state)
+
+            self.assertEqual(code, 3, payload)
+            self.assertEqual(payload["outcome"],
+                             "INTEGRATION_WORKTREE_RUN_NOT_OVER")
+            self.assertIn("run-0", payload["detail"])
+            self.assertIn("no declared outcome", payload["detail"])
+            self.assertTrue(stranded.is_dir())
+            self.assertIn(stranded.resolve(), _worktree_paths(repo))
+
+    def test_the_operator_override_releases_a_crashed_runs_checkout(self):
+        """The route out of the refusal above, and the only one (§11.3).
+
+        `run start` has no flag of its own -- the operator resumes the run, or
+        ends it for good. `deliver`'s `--discard-live-runs` reaches the same
+        shared predicate, so this asserts the escape at the function both
+        callers cross rather than at one verb's argument parser.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, state = self._installation(root)
+            stranded = self._strand_integration(repo, state)
+            self._record_run(root, None)
+
+            released = maestro._reclaim_stranded_integration_worktree(
+                repo, state / "runs", BRANCH, root / "state.db",
+                discard_live=True)
+
+            # Resolved, because the path comes back through `git worktree
+            # list`, which reports the real path behind /var -> /private/var.
+            self.assertEqual(released, stranded.resolve())
+            self.assertFalse(stranded.exists())
+            self.assertNotIn(stranded.resolve(), _worktree_paths(repo))
+            self.assertEqual(
+                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0,
+                "discarding a checkout never takes the branch with it")
 
 
 if __name__ == "__main__":

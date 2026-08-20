@@ -1958,8 +1958,102 @@ def _configured_runs_root(args: argparse.Namespace) -> Optional[Path]:
     return (Path(state) / "runs") if state else None
 
 
+class _RunStateStillHeld(RuntimeError):
+    """State a run still needs is not this system's litter to take back.
+
+    Raised rather than returned so no caller can reach the removal by
+    ignoring a value. The message names the run and the recorded state that
+    refused, because "some run" is not a diagnosis an operator can act on.
+    """
+
+
+def _run_owning_worktree(occupant: Path,
+                         runs_root: Optional[Path]) -> Optional[str]:
+    """The run id a checkout under this system's run root belongs to.
+
+    The run root is laid out `<runs_root>/<run_id>/<...>`, so the first path
+    component below the root *is* the run identity. This is the same
+    structural fact `_reclaim_stranded_integration_worktree`'s containment
+    check already relies on, read one component further, rather than a second
+    naming convention nobody maintains.
+    """
+    if runs_root is None:
+        return None
+    try:
+        relative = occupant.resolve().relative_to(runs_root.resolve())
+    except (OSError, ValueError):
+        return None
+    return relative.parts[0] if relative.parts else None
+
+
+def _recorded_run_is_over(database: Any, run_id: str) -> Tuple[bool, str]:
+    """Whether `run_id` can never be resumed, and the state that says so.
+
+    The predicate is `lifecycle.resume_run`'s, inverted and read from the same
+    columns: a run this answers `True` for is exactly a run a resume would
+    refuse. There is one definition of "over for good" in this system and it
+    is the one that decides whether an operator can come back to the work --
+    a second definition here is how a verb starts deleting checkouts belonging
+    to runs the operator has every right to resume.
+
+    Both facts are typed values a scheduler wrote at the point the run stopped
+    (§7.3), read from `runs` exactly as `_deliver_accepted_run` reads it. §1.2:
+    nothing here consults a report, a pane, an envelope field, or an operator's
+    memory of which verb they typed.
+
+    Every unreadable case answers `False`. A missing ledger, an absent row, a
+    schema without the cause column, a database that will not open -- none of
+    them is evidence that a run finished, and the cost of guessing wrong is the
+    operator's merged work: `scheduler.py` re-proves every MERGED node's
+    `output_sha` against the integration head on resume and raises
+    `DurableOutputIdentityError` when it is not an ancestor, so a destroyed
+    checkout fails the run later rather than at the moment it was destroyed.
+    """
+    if database is None or not Path(database).is_file():
+        return False, "no lifecycle ledger"
+    try:
+        connection = sqlite3.connect(
+            "file:{}?mode=ro".format(database), uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return False, "unreadable lifecycle ledger"
+    try:
+        row = connection.execute(
+            "SELECT latest_outcome FROM runs WHERE run_id=?",
+            (run_id,)).fetchone()
+        outcome = str(row[0]) if row and row[0] is not None else ""
+        cause = ""
+        if outcome == scheduler_types.RunOutcome.CANCELLED.value:
+            cause_row = connection.execute(
+                "SELECT cancel_cause FROM runs WHERE run_id=?",
+                (run_id,)).fetchone()
+            cause = (str(cause_row[0])
+                     if cause_row and cause_row[0] is not None else "")
+    except sqlite3.Error:
+        return False, "unreadable lifecycle ledger"
+    finally:
+        connection.close()
+    if not outcome:
+        # NULL is not "finished quietly": it is a run no scheduler ever
+        # declared quiescence for, which includes every run that is live
+        # right now (lifecycle.py, `runs.latest_outcome`).
+        return False, "NULL (no declared outcome)"
+    if outcome == scheduler_types.RunOutcome.ACCEPTED.value:
+        return True, outcome
+    if outcome == scheduler_types.RunOutcome.CANCELLED.value:
+        reopenable = tuple(member.value for member
+                           in scheduler_types.REOPENABLE_CANCEL_CAUSES)
+        if cause in reopenable:
+            return False, outcome + " (" + cause + ")"
+        return True, outcome + " (" + (cause or "unrecorded cause") + ")"
+    # BLOCKED and STUCK are the resumable outcomes: §11.3's operator escapes
+    # are legal only against those two, which is the same statement as "an
+    # operator is still expected to come back to this run".
+    return False, outcome
+
+
 def _reclaim_stranded_integration_worktree(
-        repo: Path, runs_root: Optional[Path], branch: str) -> Optional[Path]:
+        repo: Path, runs_root: Optional[Path], branch: str,
+        database: Any, discard_live: bool = False) -> Optional[Path]:
     """Take back an integration checkout this system's own run root still holds.
 
     Permanent Maestro semantics, not a repair for one installation: an operator
@@ -1974,31 +2068,75 @@ def _reclaim_stranded_integration_worktree(
     be removed? -- and a second copy of the answer is how the two drift into
     disagreeing about whose worktree they are deleting.
 
-    The predicate is path containment against the configured run root, read
-    from `git worktree list`. It is deliberately not a claim, a message, or a
-    naming convention (§1.2): a worktree *under this repository's own runs
-    directory* was created by this system and is a leftover of a previous run;
-    anything else may be the operator's own checkout and is left exactly where
-    it is, so the caller still refuses and explains itself.
+    Two predicates, and both must hold. *Whose* is path containment against the
+    configured run root, read from `git worktree list`. It is deliberately not
+    a claim, a message, or a naming convention (§1.2): a worktree *under this
+    repository's own runs directory* was created by this system and is a
+    leftover of a previous run; anything else may be the operator's own
+    checkout and is left exactly where it is, so the caller still refuses and
+    explains itself.
+
+    *Whether it is still in use* is `_recorded_run_is_over` against the run
+    that owns the checkout. Containment alone says the worktree is Maestro's;
+    it says nothing about whether Maestro is done with it. A run declared
+    BLOCKED or STUCK is one an operator can resume, a run with no declared
+    outcome may have a scheduler attached to it right now, and this function's
+    own caller describes its subject as "the backlog" -- neither of those is
+    backlog. The refusal is a raise, so no caller reaches the removal by
+    ignoring a return value, and it carries the run id and the recorded state.
+
+    `discard_live` is the operator's escape for the case they genuinely mean:
+    a deliberate discard, asked for at the command line. It is not a default
+    and never inferred, because a flag nobody typed is not an intention (§11.3).
+
+    Removal is **unforced**. `--force` discards uncommitted content silently,
+    and a tree that is over should have nothing to discard -- so git's refusal
+    is evidence about the checkout rather than noise to override, exactly as
+    `worktree.remove_attempt_worktree` treats it. A refusal is reported on
+    stderr and the worktree is left for the operator.
 
     Only the checkout holding the integration branch is ever named here.
     Attempt worktrees -- including the blocked ones §8.8 retains for
     post-mortem -- hold their own attempt branches, never this one, so they are
     outside what this function can even select. `worktree prune` drops
     administrative records of directories that are already gone and never
-    removes a worktree that still exists.
+    removes a worktree that still exists; it does not run on the refusal path,
+    because a verb that declines to touch something touches nothing.
 
     Returns the path released, or `None` when nothing was.
+    Raises `_RunStateStillHeld` when the owning run is not over.
     """
     occupant = _worktree_holding_branch(repo, branch)
     released: Optional[Path] = None
     if (occupant is not None and runs_root is not None
             and _path_is_within(occupant.resolve(), runs_root.resolve())):
+        run_id = _run_owning_worktree(occupant, runs_root)
+        if run_id is None:
+            over, state = False, "no run identity in its path"
+        elif discard_live:
+            over, state = True, "discarded at operator request"
+        else:
+            over, state = _recorded_run_is_over(database, run_id)
+        if not over:
+            raise _RunStateStillHeld(
+                "the integration branch " + branch + " is checked out at "
+                + str(occupant) + ", which belongs to run "
+                + (run_id or "(unidentified)") + " whose recorded state is "
+                + state + ". That run is resumable, and removing its "
+                "integration checkout would take the merges every MERGED node "
+                "is re-proved against on resume. Resume that run, or end it "
+                "for good with `run cancel --discard`")
         result = subprocess.run(
-            ("git", "-C", str(repo), "worktree", "remove", "--force",
-             str(occupant)), capture_output=True, text=True, check=False)
+            ("git", "-C", str(repo), "worktree", "remove", str(occupant)),
+            capture_output=True, text=True, check=False)
         if result.returncode == 0:
             released = occupant
+        else:
+            # Unforced, so this is the ordinary way a non-empty tree says so.
+            # The operator learns what is in the way instead of losing it.
+            print("integration worktree not reclaimed: {}: {}".format(
+                occupant, (result.stderr or result.stdout or "").strip()),
+                file=sys.stderr)
     subprocess.run(("git", "-C", str(repo), "worktree", "prune"),
                    capture_output=True, text=True, check=False)
     return released
@@ -3076,8 +3214,20 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             # under exactly the boundary the release verb already applies -- and
             # under no other -- so an operator's checkout of the same branch
             # still reaches the refusal below untouched.
-            _reclaim_stranded_integration_worktree(
-                Path(args.repo), _configured_runs_root(args), branch)
+            try:
+                _reclaim_stranded_integration_worktree(
+                    Path(args.repo), _configured_runs_root(args), branch,
+                    getattr(args, "db", None))
+            except _RunStateStillHeld as held:
+                # The same defect at the same seam: whose was checked here
+                # from the day this reclaim was written, whether-in-use never
+                # was. A run this one is about to start has no more right to
+                # take another run's merges than the release verb does, so it
+                # gets the same predicate and a refusal that names the run
+                # holding the branch rather than the generic one below, which
+                # would say "not among them" about a worktree that is.
+                return _refusal("INTEGRATION_WORKTREE_RUN_NOT_OVER",
+                                str(held))
             occupant = _worktree_holding_branch(Path(args.repo), branch)
             if occupant is not None:
                 return _refusal(
@@ -4895,7 +5045,8 @@ def _deliver_blocked_lanes(config: Dict[str, Any], run_id: str):
         store.close()
 
 
-def _deliver_release_run(config: Dict[str, Any], name: str):
+def _deliver_release_run(config: Dict[str, Any], name: str,
+                         discard_live: bool = False):
     """Free the integration branch a previous run's worktree still holds.
 
     Deliberately narrow. `_execute_run` now releases the checkout it added on
@@ -4913,6 +5064,19 @@ def _deliver_release_run(config: Dict[str, Any], name: str):
     `_reclaim_stranded_integration_worktree`, shared with `run start`, which
     now applies it to the backlog itself before it refuses -- there is one
     rule about whose worktree may be removed and one place it is written.
+
+    "Backlog" is the whole justification for the verb, and until the state
+    check below existed nothing held the code to it: a run that sat BLOCKED
+    for hours with seven of twelve nodes MERGED, its integration checkout
+    holding those merges, was removed on exactly the same terms as a run that
+    finished last week. That is the second predicate now -- the run's own
+    recorded outcome, read from the lifecycle store (§1.2), never from this
+    docstring's description of what the verb is for.
+
+    Refusing is not failing. The verb returns the paths it released, and it
+    released none, so it answers `()` and says on stderr which run held the
+    branch and in what state. `--discard-live-runs` is how an operator says
+    they meant it.
     """
     stored = _deliver_plan_bytes(config, name)
     if stored is None:
@@ -4921,8 +5085,18 @@ def _deliver_release_run(config: Dict[str, Any], name: str):
         branch = plan_model.parse_bytes(stored).merge_policy.integration_branch
     except (ValueError, KeyError):
         return ()
-    released = _reclaim_stranded_integration_worktree(
-        Path(config["repo"]), config["repository_state"] / "runs", branch)
+    try:
+        released = _reclaim_stranded_integration_worktree(
+            Path(config["repo"]), config["repository_state"] / "runs", branch,
+            config.get("database"), discard_live=discard_live)
+    except _RunStateStillHeld as held:
+        # The escape is named by the verb that offers it. `run start` reaches
+        # the same refusal and has no such flag, so the shared message cannot
+        # carry one -- an escape an operator cannot type is worse than none.
+        print("RELEASE_REFUSED_RUN_NOT_OVER: " + str(held)
+              + ", or pass --discard-live-runs to discard it deliberately",
+              file=sys.stderr)
+        return ()
     return () if released is None else (str(released),)
 
 
@@ -4943,17 +5117,84 @@ def _deliver_reviewer_report(config: Dict[str, Any], name: str):
     return payload if isinstance(payload, dict) else None
 
 
-def _deliver_remove_plan(config: Dict[str, Any], name: str) -> None:
+def _plan_runs_not_over(config: Dict[str, Any], name: str
+                        ) -> Tuple[Tuple[str, str], ...]:
+    """Runs against these exact plan bytes that an operator can still resume.
+
+    Keyed by `plan_digest`, the same join `_deliver_accepted_run` uses, because
+    that is what binds a run to the bytes rather than to the plan's name: a
+    re-authored plan under the same name is different bytes and different runs.
+
+    Every unreadable case answers "there are runs" by refusing to answer at
+    all -- an existing ledger that will not open yields a single synthetic row
+    rather than an empty tuple, so the caller fails closed. A ledger that does
+    not exist yields nothing, because a run cannot be recorded in a store that
+    was never written.
+    """
+    stored = _deliver_plan_bytes(config, name)
+    database = config.get("database")
+    if stored is None or database is None or not Path(database).is_file():
+        return ()
+    unreadable = (("(unidentified)", "unreadable lifecycle ledger"),)
+    try:
+        connection = sqlite3.connect(
+            "file:{}?mode=ro".format(database), uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return unreadable
+    try:
+        rows = connection.execute(
+            "SELECT run_id FROM runs WHERE plan_digest=?",
+            (plan_digest.digest_of(stored),)).fetchall()
+    except sqlite3.Error:
+        return unreadable
+    finally:
+        connection.close()
+    held = []
+    for row in rows:
+        run_id = str(row[0])
+        over, state = _recorded_run_is_over(database, run_id)
+        if not over:
+            held.append((run_id, state))
+    return tuple(held)
+
+
+def _deliver_remove_plan(config: Dict[str, Any], name: str,
+                         discard_live: bool = False) -> None:
     """`plan author` is create-once, so a re-ship starts from no plan.
 
     Bounded to `plans_dir` by the same check every other derived path uses: a
     verb that deletes directories may not be talked into deleting one outside
     the tree it owns.
+
+    Bounded in time by the same predicate the release verb applies to a
+    worktree, and for the same reason. Containment answers *whose* directory
+    this is; it says nothing about whether anything still needs it. A run is
+    bound to plan bytes by their digest -- `_deliver_accepted_run` finds an
+    already-ACCEPTED run that way, and it is how a resumed `deliver` knows not
+    to redo a package -- so deleting the bytes while a resumable run is keyed
+    to them destroys the run's resumption evidence and not merely a plan the
+    author is about to rewrite.
+
+    Raised as a `DeliverError` because that is the failure `_deliver` already
+    knows how to turn into a refusal, and a re-ship that cannot clear the plan
+    directory has not "partly" failed -- it must not proceed to author over
+    bytes a live run is standing on.
     """
     directory = (config["plans_dir"] / _named_plan_name(name)).resolve()
     if not _path_is_within(directory, config["plans_dir"]):
         raise _MaestroConfigurationError(
             "plan directory resolves outside plans_dir: " + name)
+    if not discard_live:
+        held = _plan_runs_not_over(config, name)
+        if held:
+            raise deliver_module.DeliverError(
+                "PLAN_BYTES_HELD_BY_RUN: " + name + "'s plan bytes are the "
+                "bytes of " + ", ".join(
+                    run_id + " (" + state + ")" for run_id, state in held)
+                + ", which is resumable. Removing the plan directory would "
+                "destroy the digest that run is found by. Resume or cancel "
+                "that run, or pass --discard-live-runs to discard it "
+                "deliberately")
     if directory.is_dir():
         shutil.rmtree(directory)
 
@@ -4975,6 +5216,7 @@ def _deliver(args: argparse.Namespace) -> int:
     relative = str(resolved_spec.relative_to(Path(config["repo"]).resolve()))
 
     session_root = config["repository_state"] / "deliver"
+    discard_live = bool(getattr(args, "discard_live_runs", False))
     runner = _deliver_runner(config)
     delivery = deliver_module.Delivery(
         spec=relative,
@@ -4988,11 +5230,13 @@ def _deliver(args: argparse.Namespace) -> int:
         reviewer_report=lambda name: _deliver_reviewer_report(config, name),
         request=args.request or "",
         max_attempts=args.max_attempts,
-        remove_plan_dir=lambda name: _deliver_remove_plan(config, name),
+        remove_plan_dir=lambda name: _deliver_remove_plan(
+            config, name, discard_live),
         run_start=None if args.no_run else _deliver_run_start,
         accepted_run=lambda name: _deliver_accepted_run(config, name),
         blocked_lanes=lambda run_id: _deliver_blocked_lanes(config, run_id),
-        release_run=lambda name: _deliver_release_run(config, name),
+        release_run=lambda name: _deliver_release_run(
+            config, name, discard_live),
         shipped=lambda name: _deliver_shipped(config, name),
         ledger_path=session_root / (_deliver_ledger_name(relative)))
     try:
@@ -5558,6 +5802,13 @@ def build_parser() -> argparse.ArgumentParser:
     deliver.add_argument("--max-attempts", type=int,
                          default=deliver_module.MAX_ATTEMPTS)
     deliver.add_argument("--no-run", action="store_true")
+    # The operator escape for the two destructive steps inside `deliver`:
+    # reclaiming a previous run's integration checkout, and clearing a plan
+    # directory before a re-ship. Both refuse while the run they would take
+    # state from is resumable; this is how an operator says the discard is
+    # what they meant. One flag, because it is one intention (§11.3).
+    deliver.add_argument("--discard-live-runs", action="store_true",
+                         dest="discard_live_runs")
     deliver.set_defaults(handler=_deliver)
 
     run = root.add_parser("run")

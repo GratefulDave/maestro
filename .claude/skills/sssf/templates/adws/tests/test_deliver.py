@@ -18,10 +18,13 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 from unittest import mock
@@ -1049,6 +1052,280 @@ class AuthorTurnEnvironmentTest(unittest.TestCase):
             self.assertEqual(
                 Path(pane_env["XDG_CACHE_HOME"]).parent,
                 spec.session_dir.with_name(spec.session_dir.name + ".scratch"))
+
+
+class DeliverReleaseSafetyTest(unittest.TestCase):
+    """Only conclusively terminal Maestro runs release their worktrees."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.plans = self.root / "plans"
+        plan = self.plans / "alpha"
+        plan.mkdir(parents=True)
+        (plan / "maestro-plan.v1").write_text("plan", encoding="utf-8")
+        self.state = self.root / "state"
+        self.occupant = self.state / "runs" / "run-old" / "integration"
+        self.occupant.mkdir(parents=True)
+        self.database = self.root / "lifecycle.db"
+        self.config = {
+            "repo": self.repo,
+            "plans_dir": self.plans,
+            "repository_state": self.state,
+            "database": self.database,
+        }
+
+    def record_outcome(self, outcome):
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY, latest_outcome TEXT)")
+            connection.execute(
+                "INSERT INTO runs (run_id, latest_outcome) VALUES (?, ?)",
+                ("run-old", outcome))
+
+    def parsed_plan(self):
+        return SimpleNamespace(merge_policy=SimpleNamespace(
+            integration_branch="integration/alpha"))
+
+    def test_a_resumable_integration_worktree_is_preserved(self):
+        self.record_outcome("BLOCKED")
+        with mock.patch.object(
+                maestro.plan_model, "parse_bytes",
+                return_value=self.parsed_plan()), mock.patch.object(
+                    maestro, "_worktree_holding_branch",
+                    return_value=self.occupant), mock.patch.object(
+                        maestro.subprocess, "run") as run:
+            self.assertEqual(maestro._deliver_release_run(self.config, "alpha"), ())
+        run.assert_not_called()
+
+    def test_an_active_integration_worktree_is_preserved(self):
+        self.record_outcome(None)
+        with mock.patch.object(
+                maestro.plan_model, "parse_bytes",
+                return_value=self.parsed_plan()), mock.patch.object(
+                    maestro, "_worktree_holding_branch",
+                    return_value=self.occupant), mock.patch.object(
+                        maestro.subprocess, "run") as run:
+            self.assertEqual(maestro._deliver_release_run(self.config, "alpha"), ())
+        run.assert_not_called()
+
+    def test_an_accepted_run_worktree_is_removed_without_force(self):
+        self.record_outcome("ACCEPTED")
+        with mock.patch.object(
+                maestro.plan_model, "parse_bytes",
+                return_value=self.parsed_plan()), mock.patch.object(
+                    maestro, "_worktree_holding_branch",
+                    return_value=self.occupant), mock.patch.object(
+                        maestro.subprocess, "run",
+                        return_value=subprocess.CompletedProcess((), 0)) as run:
+            self.assertEqual(
+                maestro._deliver_release_run(self.config, "alpha"),
+                (str(self.occupant),))
+        self.assertEqual(run.call_args_list, [
+            mock.call(
+                ("git", "-C", str(self.repo), "worktree", "remove",
+                 str(self.occupant)),
+                capture_output=True, text=True, check=False),
+            mock.call(
+                ("git", "-C", str(self.repo), "worktree", "prune"),
+                capture_output=True, text=True, check=False),
+        ])
+
+    # -- what the three cases above imply but do not themselves pin ----------
+
+    def _release(self, discard_live=False):
+        """`_deliver_release_run` with git stubbed and stderr captured."""
+        stderr = io.StringIO()
+        with mock.patch.object(
+                maestro.plan_model, "parse_bytes",
+                return_value=self.parsed_plan()), mock.patch.object(
+                    maestro, "_worktree_holding_branch",
+                    return_value=self.occupant), mock.patch.object(
+                        maestro.subprocess, "run",
+                        return_value=subprocess.CompletedProcess((), 0)) as run:
+            with contextlib.redirect_stderr(stderr):
+                released = maestro._deliver_release_run(
+                    self.config, "alpha", discard_live)
+        return released, stderr.getvalue(), run
+
+    def test_the_refusal_names_the_run_and_the_state_that_refused(self):
+        """A refusal an operator cannot act on is a refusal that gets forced."""
+        self.record_outcome("BLOCKED")
+        released, reported, run = self._release()
+        self.assertEqual(released, ())
+        run.assert_not_called()
+        self.assertIn("run-old", reported)
+        self.assertIn("BLOCKED", reported)
+        self.assertIn("--discard-live-runs", reported)
+
+    def test_a_run_with_no_declared_outcome_says_so_rather_than_guessing(self):
+        self.record_outcome(None)
+        released, reported, _ = self._release()
+        self.assertEqual(released, ())
+        self.assertIn("run-old", reported)
+        self.assertIn("no declared outcome", reported)
+
+    def test_an_unrecorded_run_is_treated_as_live_not_as_finished(self):
+        """No row at all is the crashed-run case, and it is not evidence."""
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY,"
+                " latest_outcome TEXT)")
+        released, reported, run = self._release()
+        self.assertEqual(released, ())
+        run.assert_not_called()
+        self.assertIn("run-old", reported)
+
+    def test_the_operator_override_discards_a_live_run_deliberately(self):
+        """§11.3: the escape exists, and nothing but the flag reaches it."""
+        self.record_outcome("BLOCKED")
+        released, _, run = self._release(discard_live=True)
+        self.assertEqual(released, (str(self.occupant),))
+        self.assertEqual(run.call_args_list[0], mock.call(
+            ("git", "-C", str(self.repo), "worktree", "remove",
+             str(self.occupant)),
+            capture_output=True, text=True, check=False))
+
+    def test_a_cancelled_run_an_operator_can_reopen_is_preserved(self):
+        """`run cancel` is reopenable, so its checkout is not backlog."""
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY,"
+                " latest_outcome TEXT, cancel_cause TEXT)")
+            connection.execute(
+                "INSERT INTO runs (run_id, latest_outcome, cancel_cause)"
+                " VALUES (?, ?, ?)", ("run-old", "CANCELLED", "RUN_CANCEL"))
+        released, reported, run = self._release()
+        self.assertEqual(released, ())
+        run.assert_not_called()
+        self.assertIn("RUN_CANCEL", reported)
+
+    def test_a_discarded_run_is_over_and_its_checkout_is_reclaimed(self):
+        """`run cancel --discard` ends a run for good, so this one is litter."""
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY,"
+                " latest_outcome TEXT, cancel_cause TEXT)")
+            connection.execute(
+                "INSERT INTO runs (run_id, latest_outcome, cancel_cause)"
+                " VALUES (?, ?, ?)", ("run-old", "CANCELLED", "DISCARDED"))
+        released, _, _ = self._release()
+        self.assertEqual(released, (str(self.occupant),))
+
+    def test_an_unreadable_ledger_preserves_rather_than_removes(self):
+        """An unmeasured run is not a finished one; fail closed."""
+        self.database.write_bytes(b"not a database at all")
+        released, reported, run = self._release()
+        self.assertEqual(released, ())
+        run.assert_not_called()
+        self.assertIn("unreadable lifecycle ledger", reported)
+
+    def test_a_worktree_that_will_not_come_away_is_reported_not_forced(self):
+        """Unforced removal: git's refusal is evidence, not noise (§8.8)."""
+        self.record_outcome("ACCEPTED")
+        stderr = io.StringIO()
+        refused = subprocess.CompletedProcess(
+            (), 1, stdout="", stderr="fatal: contains modified files")
+        with mock.patch.object(
+                maestro.plan_model, "parse_bytes",
+                return_value=self.parsed_plan()), mock.patch.object(
+                    maestro, "_worktree_holding_branch",
+                    return_value=self.occupant), mock.patch.object(
+                        maestro.subprocess, "run",
+                        return_value=refused) as run:
+            with contextlib.redirect_stderr(stderr):
+                released = maestro._deliver_release_run(self.config, "alpha")
+        self.assertEqual(released, ())
+        self.assertNotIn("--force", str(run.call_args_list))
+        self.assertIn("contains modified files", stderr.getvalue())
+
+    def test_an_operators_own_checkout_is_never_reached_by_the_state_check(self):
+        """Containment still decides first; a foreign worktree is untouched."""
+        self.record_outcome("BLOCKED")
+        outside = self.root / "operator" / "integration"
+        outside.mkdir(parents=True)
+        with mock.patch.object(
+                maestro.plan_model, "parse_bytes",
+                return_value=self.parsed_plan()), mock.patch.object(
+                    maestro, "_worktree_holding_branch",
+                    return_value=outside), mock.patch.object(
+                        maestro.subprocess, "run",
+                        return_value=subprocess.CompletedProcess((), 0)) as run:
+            self.assertEqual(
+                maestro._deliver_release_run(self.config, "alpha"), ())
+        self.assertEqual(run.call_args_list, [mock.call(
+            ("git", "-C", str(self.repo), "worktree", "prune"),
+            capture_output=True, text=True, check=False)])
+
+
+class DeliverPlanRemovalSafetyTest(unittest.TestCase):
+    """The same predicate over the other destructive step inside `deliver`.
+
+    `_deliver_remove_plan` proved *whose* directory it was deleting and never
+    whether anything still needed it. A run is bound to plan bytes by their
+    digest, so clearing the directory under a resumable run destroys the
+    evidence `_deliver_accepted_run` finds that run by.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # Resolved, because `_deliver_remove_plan` compares a resolved
+        # directory against the configured `plans_dir` as given, and the real
+        # configuration hands it a resolved path.
+        self.root = Path(self._tmp.name).resolve()
+        self.plans = self.root / "plans"
+        self.directory = self.plans / "alpha"
+        self.directory.mkdir(parents=True)
+        self.plan_bytes = b"plan bytes"
+        (self.directory / "maestro-plan.v1").write_bytes(self.plan_bytes)
+        self.database = self.root / "lifecycle.db"
+        self.config = {
+            "plans_dir": self.plans,
+            "repository_state": self.root / "state",
+            "database": self.database,
+        }
+
+    def record(self, outcome):
+        digest = maestro.plan_digest.digest_of(self.plan_bytes)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY,"
+                " plan_digest TEXT, latest_outcome TEXT)")
+            connection.execute(
+                "INSERT INTO runs (run_id, plan_digest, latest_outcome)"
+                " VALUES (?, ?, ?)", ("run-old", digest, outcome))
+
+    def test_a_resumable_runs_plan_bytes_are_not_deleted(self):
+        self.record("BLOCKED")
+        with self.assertRaises(deliver.DeliverError) as raised:
+            maestro._deliver_remove_plan(self.config, "alpha")
+        self.assertIn("run-old", str(raised.exception))
+        self.assertIn("BLOCKED", str(raised.exception))
+        self.assertTrue(self.directory.is_dir())
+
+    def test_an_accepted_runs_plan_bytes_are_cleared_for_the_re_ship(self):
+        self.record("ACCEPTED")
+        maestro._deliver_remove_plan(self.config, "alpha")
+        self.assertFalse(self.directory.is_dir())
+
+    def test_plan_bytes_no_run_is_keyed_to_are_cleared(self):
+        maestro._deliver_remove_plan(self.config, "alpha")
+        self.assertFalse(self.directory.is_dir())
+
+    def test_the_operator_override_clears_a_live_runs_plan_bytes(self):
+        self.record("BLOCKED")
+        maestro._deliver_remove_plan(self.config, "alpha", True)
+        self.assertFalse(self.directory.is_dir())
+
+    def test_an_unreadable_ledger_preserves_the_plan_bytes(self):
+        self.database.write_bytes(b"not a database at all")
+        with self.assertRaises(deliver.DeliverError):
+            maestro._deliver_remove_plan(self.config, "alpha")
+        self.assertTrue(self.directory.is_dir())
 
 
 if __name__ == "__main__":
