@@ -435,7 +435,6 @@ class ReceiptLockTests(unittest.TestCase):
                                              poll_interval_s=0.001),
                 launch=launch, poll_report=lambda: None,
                 record_reviewer_session=lambda _s: None,
-                record_stall=lambda _s, _sig, _e: None,
                 kill=lambda _s: None,
                 actor_status=lambda _s: (statuses.pop(0) if statuses else "idle"),
                 transcript_record_count=lambda _s: 0)
