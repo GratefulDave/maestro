@@ -307,6 +307,11 @@ class SchedulerDeps:
     #: unreviewed path is reachable only by a caller that constructs
     #: `SchedulerDeps` itself and omits it.
     review_attempt: Optional[ReviewRunner] = None
+    #: Raw per-pane agent status for the watchdog's turn clock (#107 / B14).
+    #: Never `observe()` — that call collapses idle into RUNNING. `None` is
+    #: not an observation of work: the clock still fires. `maestro run start`
+    #: supplies the reader; omitting it is the M30 failure mode.
+    actor_status: Optional[Callable[[st.AttemptRecord], Optional[str]]] = None
 
     def __post_init__(self) -> None:
         if self.quiesce_attempt is None:
@@ -995,6 +1000,28 @@ class Scheduler:
                 self.run_id, attempt.node_id,
                 attempt.attempt_no) is st.Adjudication.ACCEPTED
 
+        def preserve_unpublished(attempt: st.AttemptRecord) -> None:
+            """Publish unpublished builder work onto the attempt ref (#97).
+
+            Kill already ran. Empty delta is a no-op — nothing to salvage.
+            Errors propagate to the watchdog's preserve wrapper, which still
+            fails the attempt.
+            """
+            with self._lock:
+                worktree = self._attempt_worktrees.get(attempt.node_id)
+            if (worktree is None
+                    or worktree.attempt_no != attempt.attempt_no
+                    or worktree.baseline is None):
+                return
+            after = wt.inventory(worktree.path)
+            measured = wt.delta(worktree.baseline, after)
+            if measured.is_empty:
+                return
+            wt.commit_measured_delta(
+                worktree, measured, after,
+                "{} attempt {} NODE_TIMEOUT".format(
+                    attempt.node_id, attempt.attempt_no))
+
         watchdog = wd.Watchdog(
             config=self.config,
             attempts_provider=running_attempts,
@@ -1003,6 +1030,8 @@ class Scheduler:
             fail_attempt=fail,
             exit_status_observed=exit_status_observed,
             declared_result_observed=declared_result_observed,
+            actor_status=self.deps.actor_status,
+            preserve_unpublished=preserve_unpublished,
             time_source=time.time)
 
         backstop = wd.RunBackstop(
