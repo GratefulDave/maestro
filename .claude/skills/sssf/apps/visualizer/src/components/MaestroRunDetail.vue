@@ -166,10 +166,22 @@ function toggle(nodeId: string) {
 }
 
 /** A node opens itself when it is the one that needs looking at. */
+
+function mergedRejecting(node: MaestroNode): MaestroAttempt['review_findings'] {
+  if (node.state !== 'MERGED') return []
+  const attempt = node.attempts.find((item) => item.attempt_no === node.attempt_no)
+  return attempt?.review_findings ?? []
+}
+
+const rejectingMerges = computed(() =>
+  (run.value?.nodes ?? [])
+    .map((node) => ({ node, findings: mergedRejecting(node) }))
+    .filter((item) => item.findings.length > 0),
+)
 function expanded(node: MaestroNode): boolean {
   if (open.value.has(node.node_id)) return true
   if (open.value.size > 0) return false
-  return node.state === 'RUNNING' || node.state === 'BLOCKED'
+  return node.state === 'RUNNING' || node.state === 'BLOCKED' || mergedRejecting(node).length > 0
 }
 </script>
 
@@ -229,6 +241,28 @@ function expanded(node: MaestroNode): boolean {
             <span class="k">plan digest</span>
             <span class="v mono">{{ run.plan_digest }}</span>
           </div>
+        </div>
+
+        <div
+          v-if="run.declared_outcome === 'ACCEPTED' && rejectingMerges.length"
+          class="findings-banner"
+        >
+          ACCEPTED with rejecting findings on
+          {{ rejectingMerges.length }}
+          merged {{ rejectingMerges.length === 1 ? 'node' : 'nodes' }}
+          — review advised; it did not adjudicate
+          <ul>
+            <li v-for="item in rejectingMerges" :key="item.node.node_id">
+              <code>{{ item.node.node_id }}</code>
+              · a{{ item.node.attempt_no }} ·
+              {{ item.findings.length }} blocking
+              <div v-for="(finding, i) in item.findings" :key="i">
+                <code>{{ finding.check_id }}</code>
+                {{ finding.object_id }}
+                — {{ finding.message }}
+              </div>
+            </li>
+          </ul>
         </div>
 
         <div class="integration" :class="{ missing: !run.integration }">
@@ -321,7 +355,12 @@ function expanded(node: MaestroNode): boolean {
               not establish an evidence chain for it
             </div>
 
-            <div v-else-if="node.merge_cause === 'UNRECORDED'" class="accepted-why">
+
+            <div v-if="mergedRejecting(node).length" class="findings-why">
+              merged with {{ mergedRejecting(node).length }}
+              rejecting {{ mergedRejecting(node).length === 1 ? 'finding' : 'findings' }}
+            </div>
+            <div v-if="node.merge_cause === 'UNRECORDED'" class="accepted-why">
               <TriangleAlert :size="15" /> merged before this ledger recorded
               how — run-merged or operator-accepted cannot be told apart here
             </div>
@@ -348,6 +387,13 @@ function expanded(node: MaestroNode): boolean {
                 <code v-if="attempt.session_path" class="a-session" :title="attempt.session_path">
                   {{ attempt.session_path }}
                 </code>
+                <ul v-if="attempt.review_findings.length" class="a-findings">
+                  <li v-for="(finding, i) in attempt.review_findings" :key="i">
+                    <code>{{ finding.check_id }}</code>
+                    {{ finding.object_id }}
+                    <div>{{ finding.message }}</div>
+                  </li>
+                </ul>
               </div>
               <div v-if="!node.attempts.length" class="a-none">no attempt has started yet</div>
             </div>
@@ -687,6 +733,42 @@ function expanded(node: MaestroNode): boolean {
   font-family: var(--mono);
   font-size: 13px;
   line-height: 1.45;
+}
+
+.findings-banner {
+  padding: 10px 14px;
+  border: 1px solid rgba(232, 168, 56, 0.45);
+  border-radius: 10px;
+  background: rgba(232, 168, 56, 0.08);
+  color: var(--amber);
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+.findings-banner ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.findings-why {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.a-findings {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--amber);
+  font-size: 14px;
+}
+
+.a-findings code {
+  font-family: var(--mono);
+  font-size: 13px;
 }
 
 .attempts {

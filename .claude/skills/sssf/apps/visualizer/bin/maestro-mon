@@ -106,5 +106,9 @@ while true; do
   ( cd "$REPO" && uv run python adws/maestro.py run convergence "$RUN" 2>&1 \
       | sed -n '2,$p' ) || printf '  convergence unavailable\n'
 
+  printf '\n\033[1mfindings\033[0m  (rejecting findings on merged nodes)\n'
+  ( cd "$REPO" && uv run python adws/maestro.py run findings "$RUN" 2>&1 \
+      | sed -n '2,$p' ) || printf '  findings unavailable\n'
+
   sleep "$INTERVAL"
 done

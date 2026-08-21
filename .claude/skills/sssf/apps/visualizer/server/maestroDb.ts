@@ -29,6 +29,7 @@ import type {
   MaestroAttempt,
   MaestroIntegration,
   MaestroNode,
+  MaestroReviewFinding,
   MaestroRunDetail,
   MaestroRunSummary,
   MaestroTransition,
@@ -160,6 +161,31 @@ function parseJson<T>(raw: string | null | undefined, fallback: T): T {
     return fallback;
   }
 }
+
+function reviewFindingsFromExtra(extra: Record<string, unknown>): MaestroReviewFinding[] {
+  const guidance = extra.guidance;
+  if (guidance == null || typeof guidance !== "object" || Array.isArray(guidance)) {
+    return [];
+  }
+  const payload = guidance as Record<string, unknown>;
+  if (payload.surface !== "review") return [];
+  const raw = payload.findings;
+  if (!Array.isArray(raw)) return [];
+  const findings: MaestroReviewFinding[] = [];
+  for (const item of raw) {
+    if (item == null || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    if (row.blocking !== true) continue;
+    findings.push({
+      check_id: typeof row.check_id === "string" ? row.check_id : "",
+      object_id: typeof row.object_id === "string" ? row.object_id : "",
+      message: typeof row.message === "string" ? row.message : "",
+      blocking: true,
+    });
+  }
+  return findings;
+}
+
 
 export class MaestroDb {
   readonly path: string;
@@ -418,6 +444,7 @@ export class MaestroDb {
           typeof extra.session_path === "string" ? extra.session_path : null,
         verdict: firstVerdict(entries),
         transitions: entries,
+        review_findings: reviewFindingsFromExtra(extra),
       };
       const list = attemptsByNode.get(attempt.node_id);
       if (list) list.push(projected);

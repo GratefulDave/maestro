@@ -595,6 +595,63 @@ describe("the DAG and its attempts", () => {
   });
 });
 
+describe("review findings on a merged attempt", () => {
+  test("blocking guidance findings reach the attempt; advisories do not", () => {
+    const path = ledger("findings", (seed) => {
+      insertRun(seed, "run-r7", { latest_outcome: "ACCEPTED" });
+      insertNode(seed, "run-r7", "lane-one", "MERGED", { attempt_no: 1 });
+      insertAttempt(seed, "run-r7", "lane-one", 1, "VERIFIED", {
+        extra: {
+          review_rejected: true,
+          review_advisory: true,
+          guidance: {
+            surface: "review",
+            subject_digest: "abc",
+            findings: [
+              {
+                check_id: "diff.implements_the_stated_instruction",
+                object_id: "diff:c",
+                message: "the instruction is not what merged",
+                blocking: true,
+              },
+              {
+                check_id: "diff.is_coherent_with_its_surroundings",
+                object_id: "src/mod.py:12",
+                message: "style only",
+                blocking: false,
+              },
+            ],
+          },
+        },
+      });
+    });
+    const db = new MaestroDb(path);
+    const attempt = db.run("run-r7")!.nodes[0]!.attempts[0]!;
+    expect(attempt.review_findings).toEqual([
+      {
+        check_id: "diff.implements_the_stated_instruction",
+        object_id: "diff:c",
+        message: "the instruction is not what merged",
+        blocking: true,
+      },
+    ]);
+    db.close();
+  });
+
+  test("an attempt with no guidance carries an empty list, not null", () => {
+    const db = new MaestroDb(
+      ledger("findings-empty", (seed) => {
+        insertRun(seed, "run-clean", { latest_outcome: "ACCEPTED" });
+        insertNode(seed, "run-clean", "lane-one", "MERGED", { attempt_no: 1 });
+        insertAttempt(seed, "run-clean", "lane-one", 1, "VERIFIED");
+      }),
+    );
+    expect(db.run("run-clean")!.nodes[0]!.attempts[0]!.review_findings).toEqual([]);
+    db.close();
+  });
+});
+
+
 describe("plan names", () => {
   test("a run is named by hashing the plan file, and unnamed when it changed", () => {
     const plans = join(root, "plans");
