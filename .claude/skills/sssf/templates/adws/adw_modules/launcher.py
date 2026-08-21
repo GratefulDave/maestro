@@ -437,6 +437,12 @@ class LaunchSpec:
     #: count as panes arrive, which is correct for 1, 2 and 3 panes and merely
     #: wider than the table for 4 and 5.
     pane_group_size: int = 0
+    #: Secondary escape hatch, default off. The operator's tool policy is the
+    #: omp profile (`--pm-profile`). True appends
+    #: `permissions.route_capability_argv`; False passes no `--tools` /
+    #: `--disallowedTools`. Maestro does not editorialise about tools unless
+    #: asked.
+    restrict_tools: bool = False
 
 
 @dataclass(frozen=True)
@@ -564,11 +570,10 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
     Enter four times each at a composer that would not take it. A message on
     the command line has no composer to swallow it.
 
-    The `--tools` allowlist is §3.6 B12 enforced where it can be enforced: an
-    actor that never holds `task` or `hub` cannot hand its work to a second
-    model and then sign a receipt naming itself. `permissions` owns the set;
-    this states it. The flag precedes `-c` and the `@prompt` positional
-    because omp's `MESSAGES` positional must stay last.
+    Tool policy is the configured `--pm-profile`. `--tools` is a secondary
+    hatch, off unless `spec.restrict_tools` is set. The flag, when present,
+    precedes `-c` and the `@prompt` positional because omp's `MESSAGES`
+    positional must stay last.
     """
     if not spec.profile:
         raise ValueError("OMP_PROFILE_REQUIRED")
@@ -576,7 +581,8 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         str(binary), "--pm-profile", spec.profile,
         "--session-dir", str(spec.session_dir),
     ]
-    argv.extend(permissions.route_capability_argv(spec.route))
+    if spec.restrict_tools:
+        argv.extend(permissions.route_capability_argv(spec.route))
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
         argv.append("-c")
     argv.append("@{0}".format(spec.prompt_path.resolve()))
@@ -584,19 +590,21 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
 
 
 def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
-    """Claude's argv, with the same delegation denial the omp route carries.
+    """Claude's argv. Tool denial is the same hatch the omp route carries.
 
-    Expressed as `--disallowedTools` rather than as `--tools`: see
-    `permissions.route_capability_argv` for why the two routes are told in
-    opposite directions. Both flags exist in the installed binary (`claude`
-    2.1.237 reports `--disallowedTools, --disallowed-tools <tools...>`), which
-    is `--help` capture — the same evidence level §9.6 already records for
+    Expressed as `--disallowedTools` rather than as `--tools` when the hatch
+    is on: see `permissions.route_capability_argv`. Default is no denial
+    list. Both flags exist in the installed binary (`claude` 2.1.237 reports
+    `--disallowedTools, --disallowed-tools <tools...>`), which is `--help`
+    capture — the same evidence level §9.6 already records for
     `--dangerously-skip-permissions` and `--remote-control` beside it.
     """
+    denial = (permissions.route_capability_argv(spec.route)
+              if spec.restrict_tools else ())
     return (
         str(binary), "--model", spec.model, "--effort", spec.effort,
         "--dangerously-skip-permissions", "--remote-control",
-        *permissions.route_capability_argv(spec.route),
+        *denial,
     )
 
 

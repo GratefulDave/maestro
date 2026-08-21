@@ -315,17 +315,15 @@ def route_capability_argv(route: str) -> Tuple[str, ...]:
 def argv_denies_delegation(route: str, argv: Sequence[str]) -> bool:
     """Whether `argv` leaves `route`'s actor unable to delegate its work.
 
-    A detector, in §13.4's sense: production never calls it, tests assert it
-    over the real `launcher.build_omp_argv` / `build_claude_argv` output and
-    over a planted violation. It exists as a named object rather than as an
-    assertion inside one test file because B15's lesson is precisely that an
-    invariant living only inside a test dies with that test — Gates 1-10 were
-    deleted by the cutover commit that orphaned their fields.
+    An observation, not a gate. Production never calls it. Tests assert it
+    over planted argv and over the real builders. True requires a containment
+    *stated in the argv*: an allowlist that names no delegation tool and does
+    not grant `eval`, or a deny list that names every delegation tool.
 
-    True requires one of the two containments to be *stated in the argv*:
-    either an allowlist that names no delegation tool, or a deny list that
-    names every one of them. An argv carrying neither is unconstrained, which
-    is the state every Maestro launch was in before this module grew.
+    `eval` is not in `DELEGATION_TOOLS` — that table drives the `--tools`
+    hatch, which this module does not expand. Granting `eval` is still not
+    denial: omp's eval sandbox exposes `agent()`. An argv that lists it
+    returns False.
     """
     denied = route_delegation_tools(route)
     if not denied:
@@ -333,7 +331,9 @@ def argv_denies_delegation(route: str, argv: Sequence[str]) -> bool:
     tokens = list(argv)
     for index, token in enumerate(tokens):
         if token == "--tools" and index + 1 < len(tokens):
-            allowed = {t.strip() for t in tokens[index + 1].split(",")}
+            allowed = {t.strip() for t in tokens[index + 1].split(",") if t.strip()}
+            if "eval" in allowed:
+                return False
             if allowed and not (allowed & set(denied)):
                 return True
     for index, token in enumerate(tokens):
