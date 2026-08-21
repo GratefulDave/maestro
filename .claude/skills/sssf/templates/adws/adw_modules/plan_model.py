@@ -316,6 +316,40 @@ def restrict_selector(gate: Gate, keep: Iterable[str]) -> Gate:
     return gate.model_copy(update={"argv": tuple(argv)})
 
 
+def unscoped_argv(argv: Sequence[str]) -> Tuple[str, ...]:
+    """Flags only: drop every token that selects cases.
+
+    The integration gate is the plan's one unscoped command (§8.8). A plan
+    that named paths or `-k` expressions still executes as the runner's
+    default whole-tree collection. Concatenating lane specs is the other
+    defect this function exists not to become: the union of what the lanes
+    already ran cannot see a test no lane owned.
+
+    Value flags travel with their values. Selector flags and path-shaped
+    tokens are dropped. Nothing here injects `-o addopts=`; that flag is a
+    collection-count concern and a full-suite integration run must not
+    carry it.
+    """
+    ordered = tuple(argv)
+    kept: List[str] = []
+    index = 0
+    while index < len(ordered):
+        token = ordered[index]
+        if token in SELECTOR_FLAGS and index + 1 < len(ordered):
+            index += 2
+            continue
+        if token in VALUE_FLAGS and index + 1 < len(ordered):
+            kept.extend(ordered[index:index + 2])
+            index += 2
+            continue
+        if token.startswith("-"):
+            kept.append(token)
+            index += 1
+            continue
+        index += 1
+    return tuple(kept)
+
+
 def _is_noise(token: str) -> bool:
     return token in NOISE_FLAGS or token.startswith(NOISE_PREFIXES)
 

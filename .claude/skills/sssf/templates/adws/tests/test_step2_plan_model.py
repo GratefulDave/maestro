@@ -253,6 +253,19 @@ class SelectorAndCommandCoreTests(unittest.TestCase):
         self.assertNotEqual(a, pm.command_core(self.gate(["tests/test_a.py"],
                                                          runner="vitest")))
 
+    def test_unscoped_argv_drops_paths_and_selector_flags(self):
+        """The integration gate's executed argv is whole-tree collection."""
+        self.assertEqual(
+            pm.unscoped_argv(["-q", "tests/a.py", "tests/b.py"]),
+            ("-q",))
+        self.assertEqual(
+            pm.unscoped_argv(["-k", "greeting", "--tb=short", "tests"]),
+            ("--tb=short",))
+        self.assertEqual(pm.unscoped_argv(["-q"]), ("-q",))
+        self.assertEqual(pm.unscoped_argv(["tests"]), ())
+        self.assertNotIn("-o", pm.unscoped_argv(["-q", "tests"]))
+        self.assertNotIn("addopts=", pm.unscoped_argv(["-q", "tests"]))
+
 
 class CanonicalBytesTests(unittest.TestCase):
     def test_canonicalization_is_stable(self):

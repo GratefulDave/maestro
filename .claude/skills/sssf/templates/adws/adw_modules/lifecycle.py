@@ -672,7 +672,9 @@ def total_run_outcome(
     stragglers = [nid for nid, state, _ in node_states
                   if state not in (st.NodeState.MERGED, st.NodeState.CANCELLED)]
     if merged and not stragglers and acceptance_result is True:
-        return OutcomeReport(outcome=st.RunOutcome.ACCEPTED, abandoned_nodes=cancelled)
+        return OutcomeReport(outcome=st.RunOutcome.ACCEPTED,
+                             abandoned_nodes=cancelled,
+                             acceptance_result=acceptance_result)
 
     blocked = tuple(nid for nid, state, _ in node_states if state is st.NodeState.BLOCKED)
     reasons = {nid: reason for nid, state, reason in node_states
