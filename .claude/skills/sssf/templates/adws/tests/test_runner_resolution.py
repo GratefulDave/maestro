@@ -466,5 +466,53 @@ class DeclaredRunnerConfigTest(unittest.TestCase):
                 self._layout(config, repo)
 
 
+
+class IntegrationGateStaysUnscopedTest(unittest.TestCase):
+    """G1 — final acceptance runs the plan's unscoped command.
+
+    A named subset that covers every lane still misses a test no lane owned.
+    Concatenating the union of lane specs is the same hole. The adapter
+    strips selectors and ignores `specs`.
+    """
+
+    def test_named_files_in_the_plan_argv_are_not_the_executed_argv(self):
+        named = (
+            "-q",
+            "tests/unit/ingestion/test_cmo_gap_policy.py",
+            "tests/unit/ingestion/test_cmo_table_isolation.py",
+        )
+        plan = SimpleNamespace(
+            merge_policy=SimpleNamespace(
+                integration_gate=SimpleNamespace(
+                    runner="pytest", argv=named)))
+        runner = rr.ResolvedRunner(
+            runner="pytest", executable="/abs/.venv/bin/pytest",
+            origin="declared", probe_exit=5, version="stub")
+        captured = {}
+
+        def fake_run(worktree_path, resolved, argv, scratch, cancel_requested,
+                     label="integration-gate"):
+            captured["argv"] = tuple(argv)
+            captured["label"] = label
+            return None
+
+        lane_union = (
+            "tests/unit/ingestion/test_cmo_gap_policy.py",
+            "tests/lane_only.py",
+        )
+        with mock.patch.object(
+                maestro.worktree, "run_integration_gate", side_effect=fake_run):
+            _, run_ig = maestro._scheduler_gate_deps(plan, {"pytest": runner})
+            run_ig(Path("/tmp/integration"), lane_union, lambda: False)
+
+        self.assertEqual(captured["argv"], ("-q",))
+        self.assertNotIn(
+            "tests/unit/ingestion/test_cmo_table_isolation.py",
+            captured["argv"])
+        self.assertNotIn("tests/lane_only.py", captured["argv"])
+        self.assertNotIn("-o", captured["argv"])
+        self.assertEqual(captured["label"], "integration-gate")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

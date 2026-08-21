@@ -3695,9 +3695,16 @@ def _scheduler_gate_deps(plan: plan_model.Plan, runners):
             cancel_requested, label="{}-{}".format(node.node_id, phase))
 
     def run_integration_gate(integration_path, specs, cancel_requested):
+        # `specs` is the union of merged node specs, recorded on the
+        # acceptance result. It is not the integration command: appending
+        # it would make this gate the union of what the lanes already ran,
+        # which is the §8.8 gap. The executed argv is the plan's command
+        # with every selector stripped, so a named subset cannot hide a
+        # test no lane owned.
+        del specs
         return worktree.run_integration_gate(
             integration_path, runners[integration_gate.runner],
-            tuple(integration_gate.argv),
+            plan_model.unscoped_argv(integration_gate.argv),
             Path(integration_path).parent / ".maestro",
             cancel_requested, label="integration-gate")
 
