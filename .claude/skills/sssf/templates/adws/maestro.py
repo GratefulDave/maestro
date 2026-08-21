@@ -236,6 +236,12 @@ def _config_nonnegative_integer(value, label):
     return value
 
 
+def _config_bool(value, label):
+    if not isinstance(value, bool):
+        raise _MaestroConfigurationError(label + " must be a boolean")
+    return value
+
+
 def _config_reject_grade(value) -> "code_review.FindingGrade":
     """§3.6 A9's rejection threshold, validated at load rather than at review.
 
@@ -615,7 +621,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
          "semantic_ceiling"),
         ("profile", "vendor", "review_ceiling", "review_reject_grade",
          "provision", "environmental_retries", "launcher_retries",
-         "credential_retries"))
+         "credential_retries", "restrict_actor_tools"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -656,6 +662,12 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             execution_raw["semantic_ceiling"], "execution.semantic_ceiling"),
         "vendor": (_config_string(execution_raw["vendor"], "execution.vendor")
                    if "vendor" in execution_raw else None),
+        # Secondary hatch. Default off: the omp profile is the tool policy.
+        # True appends permissions.route_capability_argv on every launch.
+        "restrict_actor_tools": (
+            _config_bool(execution_raw["restrict_actor_tools"],
+                         "execution.restrict_actor_tools")
+            if "restrict_actor_tools" in execution_raw else False),
         # Separate from the semantic ceiling by construction. Defaulted rather
         # than required so an existing config keeps working, but the default is
         # a real bound, not "unlimited".
@@ -1153,6 +1165,7 @@ def _apply_repository_config(
         args.agent_model = execution["model"]
         args.agent_effort = execution["effort"]
         args.agent_profile = execution["profile"]
+        args.restrict_actor_tools = execution["restrict_actor_tools"]
 
         # The reviewer bindings, which until now existed only in the `plan
         # finalize` branch above. That asymmetry was the whole defect: the run
@@ -1692,6 +1705,7 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     # opened.
                     pane_group=node.node_id, pane_role="reviewer",
                     pane_group_size=2,
+                    restrict_tools=getattr(args, "restrict_actor_tools", False),
                     environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
@@ -3501,6 +3515,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # reviewer in unrelated corners of a flat tab.
                 pane_group=node.node_id, pane_role="builder",
                 pane_group_size=2,
+                restrict_tools=getattr(args, "restrict_actor_tools", False),
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
@@ -5186,6 +5201,8 @@ def _deliver_author_turn(config: Dict[str, Any],
             # (`handoff_budget.ROUTES_PUBLISHING_A_WINDOW`), so the day the
             # route publishes a catalog this site is covered with no edit.
             context_window_tokens=_route_context_window(lane.route, lane.model),
+            restrict_tools=bool(
+                config.get("execution", {}).get("restrict_actor_tools", False)),
             environment=worktree.launch_env(
                 session_root / (token + ".scratch"))))
         deadline = time.monotonic() + lane.author_timeout_s
