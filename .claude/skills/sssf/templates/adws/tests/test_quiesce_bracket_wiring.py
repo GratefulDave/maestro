@@ -325,7 +325,7 @@ class GuidanceScopeTests(SchedulerFixture):
         calls = {"post": 0}
 
         def run_gate(attempt, node, phase, cancel_requested):
-            if phase == "pre":
+            if phase in ("pre", "falsify"):
                 return red()
             calls["post"] += 1
             return red() if calls["post"] == 1 else green()

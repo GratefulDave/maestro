@@ -32,6 +32,7 @@ Run with:  uv run adws/adw_test.py -k window
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import subprocess
@@ -940,121 +941,6 @@ class TheTurnClockCannotOutvoteALiveObservation(unittest.TestCase):
         self.assertIsNone(outcome.signal)
 
 
-class ThePlanFinalizeWindowCanSeeItsReviewer(unittest.TestCase):
-    """Every gate in this module reads `actor_status`, and `plan finalize`
-    used to pass none.
-
-    B14's incident is `plans finalize` waiting 22 minutes, and B14's recorded
-    fix is a raw per-pane status reader. The window has accepted one since
-    #89, and `_code_review_runner`'s window passed one — but
-    `_reviewer_window_factory`, the `plan finalize` path, did not. So on the
-    one path B14 was recorded against, `ACTOR_ABANDONED` and `NEVER_STARTED`
-    were both unreachable and the turn clock had nothing to be gated on: a
-    reviewer that never started, one that stopped without declaring, and one
-    working the whole time were a single undifferentiated silence. That is
-    what convicted a live reviewer on `cmo-consolidation-l-r5`. Without this
-    reader the gate in `poll` is inert here, so this test is the other half
-    of the fix rather than a detail of it.
-    """
-
-    def _factory_window(self, agent_status_returns,
-                        finalization_timeout_s=600.0):
-        from types import SimpleNamespace
-        from unittest import mock
-
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        args = SimpleNamespace(
-            repo=str(root / "repo"),
-            herdr=str(root / "herdr"), omp=str(root / "omp"),
-            claude=str(root / "claude"),
-            route_verify_key=["00" * 32],
-            route_receipt=["claude=" + str(root / "r.json")],
-            # `claude` deliberately: it publishes no model catalog, so B13's
-            # size check resolves to "no window" instead of demanding a
-            # registered model. Which route reviews is not what is under test
-            # here — whether the window is given a reader is.
-            reviewer_route="claude", reviewer_model="review-model",
-            reviewer_effort="high", reviewer_profile=None,
-            reviewer_session_dir=str(root / "session"),
-            reviewer_report_file=str(root / "report.json"),
-            finalization_timeout_s=finalization_timeout_s,
-            reviewer_turn_timeout_s=fw.DEFAULT_TURN_TIMEOUT_S,
-            reviewer_poll_interval_s=1.0)
-        (root / "repo").mkdir()
-        matrix = maestro.finalization.ApplicabilityMatrix(
-            plan_digest="a" * 64, rubric_version="maestro-rubric.v2", cells=())
-        runner = mock.Mock()
-        runner.agent_status.return_value = agent_status_returns
-        handle = SimpleNamespace(pane_id="w146:p2", process_group=None,
-                                 liveness_pid=4321)
-        with mock.patch.object(maestro.route_receipts,
-                               "load_admitted_routes", return_value={}), \
-                mock.patch.object(maestro.launcher, "HerdrLauncher",
-                                  return_value=runner), \
-                mock.patch.object(maestro, "_preflight_prompt"), \
-                mock.patch.object(maestro, "_typed_launch_pane",
-                                  return_value=handle):
-            window = maestro._reviewer_window_factory(args)(matrix)
-            session = window.open()
-        return window, session, runner
-
-    def test_the_finalize_factory_gives_the_window_a_status_reader(self):
-        window, session, runner = self._factory_window("working")
-        self.assertIsNotNone(window._actor_status)
-        self.assertEqual(window._actor_status(session), "working")
-        self.assertTrue(runner.agent_status.called)
-
-    def test_the_reader_answers_none_before_a_pane_exists(self):
-        """A window whose reviewer has not launched has nothing to read, and
-        the module treats that as a missing observation rather than as
-        evidence of a stall."""
-        from types import SimpleNamespace
-        from unittest import mock
-
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        (root / "repo").mkdir()
-        args = SimpleNamespace(
-            repo=str(root / "repo"),
-            herdr=str(root / "herdr"), omp=str(root / "omp"),
-            claude=str(root / "claude"),
-            route_verify_key=["00" * 32],
-            route_receipt=["omp=" + str(root / "r.json")],
-            reviewer_route="omp", reviewer_model="review-model",
-            reviewer_effort="high", reviewer_profile=None,
-            reviewer_session_dir=str(root / "session"),
-            reviewer_report_file=str(root / "report.json"),
-            finalization_timeout_s=600.0,
-            reviewer_turn_timeout_s=fw.DEFAULT_TURN_TIMEOUT_S,
-            reviewer_poll_interval_s=1.0)
-        matrix = maestro.finalization.ApplicabilityMatrix(
-            plan_digest="a" * 64, rubric_version="maestro-rubric.v2", cells=())
-        with mock.patch.object(maestro.route_receipts,
-                               "load_admitted_routes", return_value={}), \
-                mock.patch.object(maestro.launcher, "HerdrLauncher",
-                                  return_value=mock.Mock()), \
-                mock.patch.object(maestro, "_preflight_prompt"):
-            window = maestro._reviewer_window_factory(args)(matrix)
-        self.assertIsNone(window._actor_status(None))
-
-    def test_a_live_reviewer_on_the_finalize_path_is_not_convicted(self):
-        """The two halves together, on the shipped path: the factory's reader
-        reports `working`, so the turn clock cannot end this window."""
-        window, session, _runner = self._factory_window(
-            "working", finalization_timeout_s=100_000.0)
-        clock = FakeClock(0.0)
-        window._time_source = clock
-        window._opened_at_monotonic = 0.0
-        window.report_launched(pid=4321)
-        window._transcript_record_count = lambda _s: 0
-        window._process_alive = lambda _pid: True
-        clock.advance(fw.DEFAULT_TURN_TIMEOUT_S * 3)
-        self.assertIsNone(window.poll())
-
-
 class TheTurnClockHasOneInCodeDefault(unittest.TestCase):
     """Two literals for one clock is how a raised default comes to look like
     it did nothing: the CLI default binds last on the unconfigured path and
@@ -1068,21 +954,37 @@ class TheTurnClockHasOneInCodeDefault(unittest.TestCase):
         fix; this only stops the not-working case being trigger-happy."""
         self.assertGreater(fw.DEFAULT_TURN_TIMEOUT_S, 128.6)
 
-    def test_plan_finalize_with_no_flag_takes_it(self):
-        """The path an operator actually uses, not the constant in
-        isolation. `plan finalize` typed without `--reviewer-turn-timeout-s`
-        must arrive at the window carrying 900s — a module default the CLI
-        then overrode with its own literal would be no fix at all."""
-        args = maestro.build_parser().parse_args(
-            ["plan", "finalize", "plans/demo.json"])
-        self.assertEqual(args.reviewer_turn_timeout_s, 900.0)
+    def test_no_cli_flag_supplies_a_second_default_for_the_turn_clock(self):
+        """`plan finalize --reviewer-turn-timeout-s` was the second literal.
 
-    def test_the_cli_default_is_the_module_constant_itself(self):
-        """Not merely equal today. A second literal is what drifts."""
-        args = maestro.build_parser().parse_args(
-            ["plan", "finalize", "plans/demo.json"])
-        self.assertEqual(args.reviewer_turn_timeout_s,
-                         fw.DEFAULT_TURN_TIMEOUT_S)
+        It carried its own default and bound last on the unconfigured path,
+        which is how a raised module constant comes to look like it did
+        nothing. The flag is gone with the reviewer that verb used to launch,
+        and no other verb replaced it, so the clock has exactly two writers
+        left: this module's constant and an installation's
+        `reviewer.turn_timeout_s`.
+        """
+        self.assertNotIn("--reviewer-turn-timeout-s",
+                         _every_flag(maestro.build_parser()))
+
+    def test_maestro_never_types_a_literal_for_this_clock(self):
+        """The property the flag's default violated, stated over the source.
+
+        Every assignment to `reviewer_turn_timeout_s` in maestro.py must read
+        an installation's configuration. A constant there is a second literal
+        wherever it sits, flag or not.
+        """
+        source = (Path(maestro.__file__)).read_text(encoding="utf-8")
+        assignments = [
+            node for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Attribute)
+                    and t.attr == "reviewer_turn_timeout_s"
+                    for t in node.targets)
+        ]
+        self.assertTrue(assignments, "the run path still binds the clock")
+        for node in assignments:
+            self.assertIsInstance(node.value, ast.Subscript)
 
     def test_an_installed_configuration_still_governs_its_own_reviewer(self):
         """The in-code default is the *unconfigured* default, and saying so
@@ -1137,6 +1039,20 @@ class TheTurnClockHasOneInCodeDefault(unittest.TestCase):
             self.assertEqual(layout["reviewer"]["turn_timeout_s"], 20)
             self.assertNotEqual(layout["reviewer"]["turn_timeout_s"],
                                 fw.DEFAULT_TURN_TIMEOUT_S)
+
+
+def _every_flag(parser) -> "set[str]":
+    """Every option string the CLI exposes, subparsers included."""
+    flags = set()
+    pending = [parser]
+    while pending:
+        current = pending.pop()
+        for action in current._actions:
+            flags.update(action.option_strings)
+            for choice in (getattr(action, "choices", None) or {}).values():
+                if hasattr(choice, "_actions"):
+                    pending.append(choice)
+    return flags
 
 
 if __name__ == "__main__":

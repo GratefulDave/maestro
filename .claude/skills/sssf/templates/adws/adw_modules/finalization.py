@@ -1,5 +1,13 @@
-"""Finalization (§6.5, §6.6, §11.1) — the rubric, the code-computed
-matrix, the reviewer report, the verdict, and the signed receipt.
+"""The review kernel (§6.5, §6.6) — the code-computed matrix, the reviewer
+report, the derived verdict, and the signed receipt.
+
+Two verbs once shared this module. `plan finalize` no longer does: a plan is
+finalized by `plan_validate`'s deterministic obligations alone and its receipt
+is written by `maestro._plan_finalize` with no reviewer dispatched, so
+`finalize()`, `AuthoringBlocked`, `FinalizationStalled` and the plan rubric
+were deleted rather than left reachable. What remains here is the kernel node
+review (`code_review.py`) runs on, plus the receipt store both the run path
+and the plan path read.
 
 The shape of this module is dictated by one sentence in §6.5: *the
 reviewer emits only per-cell `clear|finding` plus a message; it cannot
@@ -20,36 +28,35 @@ Everything else follows from where authority sits:
   confident PASS is not something a reviewer can say.
 * **The canary is a pair.** One synthetic cell known-bad by construction
   and one known-good, both excluded from verdict derivation. An
-  always-`clear` reviewer passes every plan; an always-`finding` reviewer
-  permanently poisons the plan it was asked about, because FAIL is
-  terminal for those bytes. Both are caught before any receipt exists.
+  always-`clear` reviewer passes every review; an always-`finding` reviewer
+  permanently poisons the bytes it was asked about, because FAIL is
+  terminal for them. Both are caught before any receipt exists.
 * **The receipt persists the full per-cell matrix on PASS and on FAIL**,
   with the reviewer's (route, model, session id), signed with a detached
   Ed25519 signature, in a store that refuses to sit inside the repository
-  or the SSSF data directory (§6.6).
+  or the SSSF data directory (§6.6). A plan receipt now records
+  `("deterministic", "plan_validate", <digest>)` there and carries no cells,
+  which is the same schema saying the same thing: nothing was asked of a
+  model.
 * **Replay is keyed on the digest alone**, so changing a route does not
-  re-review unchanged bytes.
-* **A stall is not a receipt.** `FINALIZATION_STALLED` leaves no receipt
-  for the digest, which is exactly what makes a rerun legal.
+  re-review unchanged bytes. `ReceiptStore.write` is create-once and raises
+  `ReceiptExists`; every caller replays from that rather than overwriting.
 * **A FAIL has an operator escape, and only an operator has it.** §3.6 B10
   requires re-review of byte-identical input to be impossible *or
   explicitly recorded, with an operator escape*. `ReceiptStore.set_aside`
   is that escape: it retains the FAILed receipt and its signature under an
   archival name, writes a signed `SetAsideRecord` naming who invoked it,
   why, and exactly which receipt it superseded, and frees the live slot so
-  the next `finalize` reviews afresh. It refuses a PASS and it refuses a
+  the next review runs afresh. It refuses a PASS and it refuses a
   digest with no receipt. Nothing calls it automatically and nothing reads
   its `reason`; what admits the fresh review is the same absence of a
-  receipt that a stall leaves behind.
+  receipt a stall leaves behind.
 
 **Boundaries this module does not cross.** The plan model, its canonical
 bytes, and its digest belong to §6.1–§6.4 and are another lane's: nothing
-here parses a plan or computes a digest. `finalize` takes the digest and a
-sequence of `ReviewObject`s as inputs, and takes the deterministic
-obligations as an injected `validate` callable, so the ordering invariant
-can be asserted without this module owning validation. The tracer's
-reviewer-session row and stall record belong to the ledger and are reached
-only through the window's injected recorders (`finalization_window`).
+here parses a plan or computes a digest. The tracer's reviewer-session row
+and stall record belong to the ledger and are reached only through the
+window's injected recorders (`finalization_window`).
 """
 
 from __future__ import annotations
@@ -72,39 +79,28 @@ from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
 from pydantic import BaseModel, ConfigDict
 
 from . import receipt_crypto as rc
-from .finalization_window import (FinalizationSignal, ReviewerSession,
-                                  WindowOutcome)
 
 # ── vocabulary ──────────────────────────────────────────────────────────────
 
 
 class ObjectKind(str, Enum):
-    """What a reviewable object is. §6.2's model, from the reviewer's side.
+    """What a reviewable object is, from the reviewer's side.
 
-    The first five are plan-finalization's objects. `DIFF` and `CHANGED_FILE`
-    are code review's (`code_review.py`), and they live here rather than in a
-    parallel enum so that `compute_matrix`, `verify_report`, `derive_verdict`,
-    `Receipt`, and `ReceiptStore` serve both reviews unchanged. A rubric only
-    ever emits cells for the kinds its own checks declare, so the two review
-    families never produce each other's cells.
+    Code review (`code_review.py`) is the only review left that dispatches a
+    reviewer, so these are its objects. Five plan-finalization kinds --
+    `PLAN`, `NODE`, `GATE`, `INTEGRATION_GATE`, `EVIDENCE` -- stood here until
+    `plan finalize` became deterministic. They were deleted rather than kept
+    for a future caller: an enum member no production code constructs is the
+    dead seam `tests/test_no_dead_seams.py` exists to convict, and a rubric
+    that could still name a plan object would let the removed review be
+    rebuilt by configuration.
 
-    `GATE` and `INTEGRATION_GATE` are separate kinds because the two objects
-    have opposite scope rules, not merely different ones. A node's gate is
-    scoped to that node's own work and is red before it runs (§7.4); the
-    plan's integration gate is the only gate in this design that runs the
-    whole suite, at the final head where every merged node's work is present
-    at once (§8.8), and its selector legitimately spans tests an earlier plan
-    already merged alongside tests this run's lanes will write (§6.4's third
-    executability arm, §19 M14). One kind serving both would ask the
-    integration gate whether its selector is narrow, which is the question
-    whose correct answer the architecture states as "no".
+    The kernel below -- `compute_matrix`, `verify_report`, `derive_verdict`,
+    `Receipt`, `ReceiptStore` -- is written against this enum rather than
+    against code review, so it serves any rubric whose checks declare the
+    kinds it ranges over.
     """
 
-    PLAN = "plan"
-    NODE = "node"
-    GATE = "gate"
-    INTEGRATION_GATE = "integration_gate"
-    EVIDENCE = "evidence"
     DIFF = "diff"
     CHANGED_FILE = "changed_file"
 
@@ -175,119 +171,6 @@ class Rubric:
     def applicable(self, obj: ReviewObject) -> Tuple[RubricCheck, ...]:
         return tuple(c for c in self.checks if obj.kind in c.applies_to)
 
-
-#: The rubric's questions are §6.2's judgments that no git object can
-#: settle: whether the graph accomplishes the stated intent, whether a node
-#: can do its work from the reads it declares and within the writes it is
-#: permitted, whether a node gate's selector is scoped to its own node's work
-#: and whether the integration gate's covers the merged surface instead,
-#: whether a hypothesis is dischargeable, whether evidence supports the claim
-#: made from it. Severity is a property of the question, fixed here in code.
-#:
-#: The version names the applicability matrix as much as the questions. A
-#: receipt persists its full per-cell matrix (§6.5) and that matrix is only
-#: interpretable against the rubric that produced it, so moving a check
-#: between object kinds is a new version even when no question's text
-#: changes. `v2` moved the two node-scoped gate checks off the plan's
-#: integration gate. `v3` added `node.writes_are_sufficient`, so a v2 receipt
-#: records a matrix in which that question was never asked of any node —
-#: which is exactly why the label has to move.
-#:
-#: A rubric version is not a receipt schema version, and §19 M21 is the price
-#: of confusing the two: `Receipt.from_bytes` discriminates on the presence of
-#: the key whose presence is in question, never on this label, so bumping the
-#: rubric adds no key, requires no key, and leaves every signed v1 and v2
-#: receipt parseable, verifiable and replayable at bytes nobody touched. The
-#: new question is nonetheless mandatory from v3 onward rather than optional
-#: forever (§3.6 B8): it is a matrix cell, `compute_matrix` emits it for every
-#: node, and `verify_report` refuses a report that does not answer every cell,
-#: so no v3 review can skip it.
-DEFAULT_RUBRIC = Rubric(
-    version="maestro-rubric.v3",
-    checks=(
-        RubricCheck(
-            check_id="plan.intent_is_accomplished_by_the_graph",
-            question=("Do the nodes, taken together, accomplish the stated "
-                      "intent, with nothing load-bearing left unowned?"),
-            applies_to=(ObjectKind.PLAN,),
-            severity=Severity.BLOCKING),
-        RubricCheck(
-            check_id="plan.decomposition_is_honest",
-            question=("Is the decomposition into nodes real work rather than "
-                      "one node wearing several names?"),
-            applies_to=(ObjectKind.PLAN,),
-            severity=Severity.ADVISORY),
-        RubricCheck(
-            check_id="node.reads_are_sufficient",
-            question=("Can this node's agent do the work from its declared "
-                      "reads alone?"),
-            applies_to=(ObjectKind.NODE,),
-            severity=Severity.BLOCKING),
-        # The write-scope counterpart of the check above, and the reason it
-        # exists: `outputs` is not a wish list, it is the node's entire write
-        # permission. Single-producer ownership gives a path to exactly one
-        # node (§6.4 SINGLE_OUTPUT_OWNER) and the attempt's permission check
-        # convicts any diff touching a path the node does not declare, so a
-        # node whose instruction can only be discharged by editing someone
-        # else's output is unsatisfiable from its first attempt — the reviewer
-        # rejects every diff that does not wire production and the permission
-        # check would reject every diff that does. That is a question about
-        # the authored bytes, so it belongs at plan review, where the answer
-        # costs one cell instead of a review budget.
-        #
-        # The question is deliberately about the *instruction*, not about the
-        # shape of `outputs`: a node that creates a new module nothing at base
-        # yet imports is the ordinary case, legitimate whenever its
-        # instruction stops at the module it owns and a downstream node owns
-        # the wiring. What convicts is an instruction stating a property that
-        # only some other node's file could be changed to satisfy.
-        RubricCheck(
-            check_id="node.writes_are_sufficient",
-            question=("Can this node's agent discharge its instruction by "
-                      "changing only its declared `outputs`, or does the "
-                      "instruction state a property that some file this node "
-                      "is not permitted to write would have to change for it "
-                      "to hold?"),
-            applies_to=(ObjectKind.NODE,),
-            severity=Severity.BLOCKING),
-        RubricCheck(
-            check_id="node.hypotheses_are_dischargeable",
-            question=("Is every Hypothesis this node reads dischargeable by "
-                      "this rubric rather than merely asserted?"),
-            applies_to=(ObjectKind.NODE,),
-            severity=Severity.BLOCKING),
-        RubricCheck(
-            check_id="gate.asserts_a_post_condition",
-            question=("Does the gate assert the post-state of this node's own "
-                      "work — red before, green after — rather than accepting "
-                      "the null result?"),
-            applies_to=(ObjectKind.GATE,),
-            severity=Severity.BLOCKING),
-        RubricCheck(
-            check_id="gate.selector_is_scoped_to_this_node",
-            question=("Does the selector name only what this node's outputs "
-                      "supply?"),
-            applies_to=(ObjectKind.GATE,),
-            severity=Severity.BLOCKING),
-        RubricCheck(
-            check_id="gate.selector_covers_the_merged_surface",
-            question=("Does the selector name the whole surface this plan "
-                      "produces — every lane's declared test output — rather "
-                      "than a subset of the lanes it must integrate?"),
-            applies_to=(ObjectKind.INTEGRATION_GATE,),
-            severity=Severity.BLOCKING),
-        RubricCheck(
-            check_id="gate.min_cases_is_meaningful",
-            question="Is `min_cases` more than a formality for this gate?",
-            applies_to=(ObjectKind.GATE, ObjectKind.INTEGRATION_GATE),
-            severity=Severity.ADVISORY),
-        RubricCheck(
-            check_id="evidence.supports_the_claim_made_from_it",
-            question=("Does this evidence actually support the claim the plan "
-                      "makes from it?"),
-            applies_to=(ObjectKind.EVIDENCE,),
-            severity=Severity.BLOCKING),
-    ))
 
 #: The control pair's check and its two synthetic objects (§6.5).
 CANARY_CHECK_ID = "canary.cell_was_read"
@@ -1411,13 +1294,22 @@ class ReceiptStore:
         """§3.6 B10's operator escape: set a FAIL receipt aside.
 
         The FAILed receipt and its signature are **retained** under an
-        archival name and the live slot is freed, so the next `finalize`
-        reviews these bytes afresh by exactly the path a
-        `FINALIZATION_STALLED` rerun takes — the absence of a receipt.
-        Replay is untouched: every digest whose receipt has not been set
-        aside still short-circuits on the digest alone, PASS or FAIL.
+        archival name and the live slot is freed, so the digest is judged
+        afresh — by exactly the path a stalled review's rerun takes, the
+        absence of a receipt. Replay is untouched: every digest whose
+        receipt has not been set aside still short-circuits on the digest
+        alone, PASS or FAIL.
 
-        What keeps a *plan's* FAIL from becoming cheap, so review does not
+        What "afresh" means now depends on which review wrote the receipt.
+        A node review runs again. A *plan* receipt is written by
+        `maestro plan finalize`, which dispatches nothing and derives its
+        PASS from the deterministic obligations, so a plan's FAIL can only
+        be one an earlier reviewer signed, and setting it aside admits the
+        deterministic path rather than a second opinion. The escape is
+        still the only way back from those bytes, and it is still an
+        attributable operator act.
+
+        What keeps a FAIL from becoming cheap, so review does not
         turn into a slot machine (B10):
 
         * it needs the finalizer's signing key, the same authority that
@@ -1503,139 +1395,3 @@ def _is_inside(candidate: Path, boundary: Path) -> bool:
     except ValueError:
         return False
     return True
-
-
-# ── the verb (§11.1 `maestro plan finalize`) ────────────────────────────────
-
-@dataclass(frozen=True)
-class Blocker:
-    """§6.4's typed blocker with a JSON pointer into the plan."""
-
-    pointer: str
-    code: str
-    message: str
-
-
-class AuthoringBlocked(RuntimeError):
-    """`AUTHORING_BLOCKED` — typed blockers, no reviewer, nothing
-    published (§6.4, §11.1)."""
-
-    def __init__(self, blockers: Sequence[Blocker]) -> None:
-        super().__init__(
-            "AUTHORING_BLOCKED: " + "; ".join(
-                f"{b.pointer} {b.code}" for b in blockers))
-        self.blockers = tuple(blockers)
-
-
-class FinalizationStalled(RuntimeError):
-    """`FINALIZATION_STALLED` (§6.5) — printed with the reviewer's
-    recorded (route, model, session id) and the signal that fired.
-
-    Deliberately **not** a receipt: FAIL is terminal for the bytes, and a
-    stall is a fact about the machine or the route, never a verdict about
-    the plan. No receipt exists for the digest afterwards, so a rerun of
-    `plan finalize` is legal and reviews afresh.
-    """
-
-    def __init__(self, session: ReviewerSession, signal: FinalizationSignal,
-                 elapsed_s: float) -> None:
-        super().__init__(
-            f"FINALIZATION_STALLED: route={session.route} "
-            f"model={session.model} session_id={session.session_id} "
-            f"signal={signal.value} after {elapsed_s:.1f}s")
-        self.route = session.route
-        self.model = session.model
-        self.session_id = session.session_id
-        self.signal = signal
-        self.elapsed_s = elapsed_s
-
-
-@dataclass(frozen=True)
-class FinalizationOutcome:
-    verdict: Verdict
-    receipt: Receipt
-    replayed: bool
-
-
-class WindowRunner(object):
-    """Structural type for what `window_factory` returns: anything with
-    `run(sleep)` yielding a `WindowOutcome`. `FinalizationWindow` is the
-    one implementation."""
-
-
-def finalize(
-    *,
-    plan_digest: str,
-    objects: Sequence[ReviewObject],
-    rubric: Rubric,
-    store: ReceiptStore,
-    validate: Callable[[], Sequence[Blocker]],
-    window_factory: Callable[[ApplicabilityMatrix], Any],
-    occupancy_reader: Callable[[ReviewerSession], Optional[float]],
-    occupancy_threshold: float = 0.8,
-    sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.time,
-) -> FinalizationOutcome:
-    """`maestro plan finalize` (§11.1), in the order §6.5 fixes.
-
-    1. **Every deterministic obligation first.** This ordering is the
-       asserted, tested invariant: the failure being prevented is a
-       reviewer passing thirty nodes and publication then dying on a pure
-       function of the authored bytes.
-    2. **Replay on the digest alone.** A receipt for this digest
-       short-circuits with zero reviewer calls, whatever the route.
-    3. Compute the matrix in code, launch exactly one reviewer inside the
-       finalization window.
-    4. A stalled window raises `FinalizationStalled` and writes no
-       receipt.
-    5. Verify the report against the matrix — echo, pair count, cell set,
-       both canaries, occupancy — all before the receipt exists.
-    6. Derive the verdict, stamp severity from the rubric, write the
-       create-once signed receipt with the full per-cell matrix.
-    """
-    blockers = list(validate())
-    if blockers:
-        raise AuthoringBlocked(blockers)
-    store.recover(plan_digest)
-
-
-    if store.has(plan_digest):
-        receipt = store.load(plan_digest)
-        return FinalizationOutcome(verdict=receipt.verdict, receipt=receipt,
-                                   replayed=True)
-
-    matrix = compute_matrix(rubric, plan_digest, objects)
-    window = window_factory(matrix)
-    outcome: WindowOutcome = window.run(sleep=sleep)
-    if not outcome.completed:
-        if outcome.signal is None:
-            raise RuntimeError(
-                "FINALIZATION_PROTOCOL_ERROR: incomplete window without signal")
-        raise FinalizationStalled(outcome.session, outcome.signal,
-                                  outcome.elapsed_s)
-
-    report = ReviewerReport.model_validate(outcome.report)
-    check_occupancy(occupancy_reader(outcome.session),
-                    threshold=occupancy_threshold)
-    verify_report(matrix, report)
-
-    derived = derive_verdict(matrix, report, rubric)
-    created_at_epoch = clock()
-    _require_created_at_epoch(created_at_epoch)
-    receipt = Receipt(
-        plan_digest=plan_digest,
-        rubric_version=rubric.version,
-        verdict=derived.verdict,
-        cells=derived.cells,
-        reviewer=ReviewerIdentity(route=outcome.session.route,
-                                  model=outcome.session.model,
-                                  session_id=outcome.session.session_id),
-        created_at_epoch=created_at_epoch)
-    try:
-        store.write(receipt)
-    except ReceiptExists:
-        existing = store.load(plan_digest)
-        return FinalizationOutcome(verdict=existing.verdict, receipt=existing,
-                                   replayed=True)
-    return FinalizationOutcome(verdict=receipt.verdict, receipt=receipt,
-                               replayed=False)

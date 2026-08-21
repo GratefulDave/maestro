@@ -92,9 +92,13 @@ from . import retry_policy as rp
 REVIEW_SUBJECT_DIGEST_KEY = "review_subject_digest"
 
 #: The transition reasons that carry a rejected review's `blocking_checks`.
-#: Both are written by the same `_settle_review_rejection` call — the first
-#: when the node earns another attempt, the second when that rejection was the
-#: one that spent the last of `review_ceiling`.
+#: This is the **historical** fallback path and reads ledgers written before
+#: §19 M35, when a rejection recycled or blocked the attempt and therefore
+#: wrote a transition. A rejection recorded since then writes no transition at
+#: all — it is `record_review_advisory`, which merges onto the attempt row and
+#: nothing else — so the primary path, `review_findings_count` on that row, is
+#: the one every current run is read through. Both are kept: this module has
+#: to read old runs, and #30's whole complaint was a surface that went blank.
 REVIEW_TRANSITION_REASONS = ("retry:SEMANTIC", "blocked:REVIEW_BUDGET_EXHAUSTED")
 
 #: The attempt state `mark_verified` writes. Named as a literal for the same

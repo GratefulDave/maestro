@@ -655,8 +655,8 @@ _NODE_PROJECTION_EXEMPT: Dict[str, str] = {
              "gate_selector and gate_min_cases; `_GATE_PROJECTION` below "
              "accounts for every one of its own fields"),
     "reads": ("evidence ids, meaningful only against `Plan.evidence`, which "
-              "is not on a node. Read from the plan by plan_validate and by "
-              "the plan rubric's node.reads_are_sufficient check, so the ids "
+              "is not on a node. Read from the plan by plan_validate "
+              "(REFERENCES_RESOLVE_ONCE, HYPOTHESIS_QUARANTINE), so the ids "
               "resolve to the evidence they name rather than travelling as "
               "opaque strings"),
     "cwd": ("a code node's command runs in that attempt's own worktree "

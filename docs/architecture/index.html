@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Maestro · Architecture gallery</title>
+  <meta name="description" content="Catalog of Maestro architecture, class, state, flow, and mindmap diagrams.">
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --color-paper:       #2d3142;
+      --color-paper-2:     #393e53;
+      --color-ink:         #f5f5f5;
+      --color-muted:       #bfc0c0;
+      --color-soft:        #8e98ac;
+      --color-rule:        rgba(245,245,245,0.12);
+      --color-accent:      #f08a59;
+      --color-accent-tint: rgba(240,138,89,0.08);
+      --color-link:        #6a95d8;
+      --font-sans:   'Geist', system-ui, sans-serif;
+      --font-serif:  'Instrument Serif', 'Times New Roman', serif;
+      --font-mono:   'Geist Mono', ui-monospace, Menlo, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      min-height: 100vh;
+      padding: 3rem 2rem;
+      color: var(--color-ink);
+    }
+
+    .container { max-width: 1200px; margin: 0 auto; }
+
+    a {
+      color: var(--color-link);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    a:hover { color: var(--color-ink); }
+
+    a:focus-visible {
+      outline: 2px solid var(--color-accent);
+      outline-offset: 3px;
+    }
+
+    .header { margin-bottom: 2rem; }
+
+    .header-eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.75rem, 3vw + 1rem, 2.5rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .subtitle {
+      font-family: var(--font-sans);
+      font-size: 1rem;
+      line-height: 1.55;
+      color: var(--color-muted);
+      max-width: 56ch;
+      margin-bottom: 1.25rem;
+    }
+
+    .home-link {
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1.25rem;
+      margin: 0 0 2.5rem;
+      padding: 1rem 0;
+      border-top: 1px solid rgba(245,245,245,0.10);
+      border-bottom: 1px solid rgba(245,245,245,0.10);
+      list-style: none;
+    }
+
+    .toc a {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      text-decoration: none;
+    }
+
+    .toc a:hover { color: var(--color-ink); }
+
+    .group { margin-bottom: 2.5rem; }
+
+    .group h2 {
+      font-family: var(--font-serif);
+      font-size: 1.5rem;
+      font-weight: 400;
+      letter-spacing: -0.01em;
+      color: var(--color-ink);
+      margin-bottom: 1rem;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr 0.9fr;
+      gap: 1rem;
+      list-style: none;
+    }
+
+    .card {
+      display: block;
+      background: #393e53;
+      border-radius: 6px;
+      border: 1px solid var(--color-rule);
+      padding: 1.25rem;
+      color: inherit;
+      text-decoration: none;
+      height: 100%;
+    }
+
+    .card:hover {
+      border-color: rgba(245,245,245,0.28);
+      color: inherit;
+    }
+
+    .card:focus-visible {
+      outline: 2px solid var(--color-accent);
+      outline-offset: 2px;
+    }
+
+    .card-file {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--color-soft);
+      margin-bottom: 0.75rem;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid rgba(245,245,245,0.08);
+    }
+
+    .card-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .card-dot.ink    { background: var(--color-ink); }
+    .card-dot.muted  { background: var(--color-muted); }
+    .card-dot.coral  { background: var(--color-accent); }
+    .card-dot.link   { background: var(--color-link); }
+    .card-dot.soft   { background: var(--color-soft); }
+
+    .card h3 {
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--color-ink);
+      letter-spacing: -0.005em;
+    }
+
+    .card p {
+      color: var(--color-muted);
+      font-size: 0.8125rem;
+      line-height: 1.55;
+    }
+
+    .footer {
+      margin-top: 2rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid rgba(245,245,245,0.10);
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      color: var(--color-soft);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .footer a {
+      color: var(--color-muted);
+      text-decoration: none;
+    }
+
+    .footer a:hover { color: var(--color-ink); }
+
+    @media (max-width: 900px) {
+      .cards { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 560px) {
+      body { padding: 2rem 1.25rem; }
+      .cards { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <p class="header-eyebrow">Maestro · Diagrams</p>
+      <h1>Architecture gallery</h1>
+      <p class="subtitle">One click from this catalog to every system, class, state, flow, and mindmap diagram.</p>
+      <a class="home-link" href="../index.html">Maestro docs home</a>
+    </header>
+
+    <nav aria-label="Diagram groups">
+      <ul class="toc">
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#classes">Classes</a></li>
+        <li><a href="#state">State</a></li>
+        <li><a href="#flow">Flow</a></li>
+        <li><a href="#mindmaps">Mindmaps</a></li>
+      </ul>
+    </nav>
+
+    <main>
+      <section class="group" id="architecture" aria-labelledby="architecture-heading">
+        <h2 id="architecture-heading">Architecture</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="01-system.html">
+              <p class="card-file">01-system.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>System architecture</h3>
+              </div>
+              <p>How an operator command becomes a run — scheduler sequences, HerdrLauncher is transport only.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="02-layers.html">
+              <p class="card-file">02-layers.html</p>
+              <div class="card-header">
+                <span class="card-dot ink" aria-hidden="true"></span>
+                <h3>Control-plane layers</h3>
+              </div>
+              <p>Layers from the visualizer poll through the signed receipt down to a Herdr pane.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="03-deployment.html">
+              <p class="card-file">03-deployment.html</p>
+              <div class="card-header">
+                <span class="card-dot muted" aria-hidden="true"></span>
+                <h3>Deployment</h3>
+              </div>
+              <p>Where adws, lifecycle SQLite, worktrees, Herdr panes, and the visualizer live on the host.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <section class="group" id="classes" aria-labelledby="classes-heading">
+        <h2 id="classes-heading">Classes</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="10-classes-plan.html">
+              <p class="card-file">10-classes-plan.html</p>
+              <div class="card-header">
+                <span class="card-dot ink" aria-hidden="true"></span>
+                <h3>Plan model classes</h3>
+              </div>
+              <p>Plan and PlanV2, AgentNode versus CodeNode, and MergePolicy’s integration gate.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="11-classes-scheduler.html">
+              <p class="card-file">11-classes-scheduler.html</p>
+              <div class="card-header">
+                <span class="card-dot muted" aria-hidden="true"></span>
+                <h3>Scheduler lifecycle classes</h3>
+              </div>
+              <p>Scheduler, SchedulerDeps, LifecycleStore, PlanNode, and AttemptRecord.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="12-classes-envelopes.html">
+              <p class="card-file">12-classes-envelopes.html</p>
+              <div class="card-header">
+                <span class="card-dot soft" aria-hidden="true"></span>
+                <h3>Envelope ADW classes</h3>
+              </div>
+              <p>EnvelopeBase, BuildOutput, ReviewOutput, AgentCall, GateReport, and PhaseParams.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <section class="group" id="state" aria-labelledby="state-heading">
+        <h2 id="state-heading">State</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="20-state-node.html">
+              <p class="card-file">20-state-node.html</p>
+              <div class="card-header">
+                <span class="card-dot ink" aria-hidden="true"></span>
+                <h3>NodeState machine</h3>
+              </div>
+              <p>The six NodeStates from PENDING through MERGED, BLOCKED, skip, retry, and CANCELLED.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="21-state-run.html">
+              <p class="card-file">21-state-run.html</p>
+              <div class="card-header">
+                <span class="card-dot muted" aria-hidden="true"></span>
+                <h3>Derived run state</h3>
+              </div>
+              <p>What the run is, from node rows, cancel_requested, and scheduler_liveness.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="22-state-attempt.html">
+              <p class="card-file">22-state-attempt.html</p>
+              <div class="card-header">
+                <span class="card-dot soft" aria-hidden="true"></span>
+                <h3>Attempt retry class</h3>
+              </div>
+              <p>Attempt settle and retry class — only SEMANTIC mutates_prompt.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <section class="group" id="flow" aria-labelledby="flow-heading">
+        <h2 id="flow-heading">Flow</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="30-flow-run.html">
+              <p class="card-file">30-flow-run.html</p>
+              <div class="card-header">
+                <span class="card-dot ink" aria-hidden="true"></span>
+                <h3>Run start flowchart</h3>
+              </div>
+              <p>Scheduler.run loop: ready_nodes until ACCEPTED or BLOCKED.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="31-flow-plan.html">
+              <p class="card-file">31-flow-plan.html</p>
+              <div class="card-header">
+                <span class="card-dot muted" aria-hidden="true"></span>
+                <h3>Plan ship flowchart</h3>
+              </div>
+              <p>Plan ship: author, validate, finalize — a signed PASS receipt on validation alone.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="32-flow-escape.html">
+              <p class="card-file">32-flow-escape.html</p>
+              <div class="card-header">
+                <span class="card-dot soft" aria-hidden="true"></span>
+                <h3>Operator escape flowchart</h3>
+              </div>
+              <p>Escapes from BLOCKED: retry, skip --accept-sha, and abandon.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="33-flow-commit.html">
+              <p class="card-file">33-flow-commit.html</p>
+              <div class="card-header">
+                <span class="card-dot link" aria-hidden="true"></span>
+                <h3>Pre-commit refusal flowchart</h3>
+              </div>
+              <p>Two counted refusals over the measured delta before the commit is taken.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="34-flow-repair-chain.html">
+              <p class="card-file">34-flow-repair-chain.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Repair chain flowchart</h3>
+              </div>
+              <p>A repair inherits its falsifiability witness from the chain root, bounded by REPAIR_CHAIN_LIMIT.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <section class="group" id="mindmaps" aria-labelledby="mindmaps-heading">
+        <h2 id="mindmaps-heading">Mindmaps</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="40-mind-modules.html">
+              <p class="card-file">40-mind-modules.html</p>
+              <div class="card-header">
+                <span class="card-dot ink" aria-hidden="true"></span>
+                <h3>Runtime module tree</h3>
+              </div>
+              <p>maestro.py collapsing live adw_modules into Plan, Run, Workspace, and ADW clusters.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="41-mind-cli.html">
+              <p class="card-file">41-mind-cli.html</p>
+              <div class="card-header">
+                <span class="card-dot muted" aria-hidden="true"></span>
+                <h3>Verb groups (plan/run/workspace)</h3>
+              </div>
+              <p>Operator verbs with plan, run, and workspace expanded; run start is the focal command.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="42-mind-cli-roots.html">
+              <p class="card-file">42-mind-cli-roots.html</p>
+              <div class="card-header">
+                <span class="card-dot link" aria-hidden="true"></span>
+                <h3>All operator root verbs</h3>
+              </div>
+              <p>All nine root verbs from maestro.py — the full operator CLI surface.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <a href="../index.html">Maestro docs home</a>
+      <span>17 diagrams · Architecture gallery</span>
+    </footer>
+  </div>
+</body>
+</html>

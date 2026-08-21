@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Two counted refusals before the commit</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #2d3142;
+      --color-ink:     #f5f5f5;
+      --color-muted:   #bfc0c0;
+      --color-accent:  #f08a59;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Flowchart · Maestro</p>
+    <h1>Two counted refusals before the commit</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="33-flow-commit-title 33-flow-commit-desc">
+      <title id="33-flow-commit-title">Two counted refusals before the commit</title>
+      <desc id="33-flow-commit-desc">Flowchart of the attempt's measured delta before commit_measured_delta is called: a declared output that exists on disk but is gitignored blocks the node with DECLARED_OUTPUT_UNCOMMITTABLE, and module-level symbols the attempt newly defined that no parsed AST reference reaches block a code node with PRODUCED_SYMBOL_UNREFERENCED or fail an agent attempt SEMANTIC with the located symbols carried into the next prompt. A delta with neither count reaches the commit.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- Arrows (drawn first, behind nodes) -->
+      <line x1="440" y1="112" x2="440" y2="144" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="192" x2="800" y2="192" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="440" y1="240" x2="440" y2="272" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="320" x2="680" y2="320" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <line x1="440" y1="368" x2="440" y2="400" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 760,272 V 256 A 8,8 0 0 1 768,248 H 900" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 760,368 V 384 A 8,8 0 0 0 768,392 H 900" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- Arrow labels -->
+      <rect x="660" y="172" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="676" y="182" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
+
+      <rect x="404" y="246" width="28" height="12" rx="2" fill="#2d3142"/>
+      <text x="418" y="256" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
+
+      <rect x="604" y="300" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="620" y="310" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
+
+      <rect x="404" y="374" width="28" height="12" rx="2" fill="#2d3142"/>
+      <text x="418" y="384" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
+
+      <rect x="812" y="228" width="44" height="12" rx="2" fill="#2d3142"/>
+      <text x="834" y="238" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CODE</text>
+
+      <rect x="808" y="372" width="52" height="12" rx="2" fill="#2d3142"/>
+      <text x="834" y="382" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">AGENT</text>
+
+      <!-- measured delta -->
+      <rect x="340" y="56" width="200" height="56" rx="6" fill="#2d3142"/>
+      <rect x="340" y="56" width="200" height="56" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="440" y="80" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">measured delta</text>
+      <text x="440" y="96" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">baseline · inventory</text>
+
+      <!-- gitignored declared output? -->
+      <polygon points="440,144 560,192 440,240 320,192" fill="#2d3142"/>
+      <polygon points="440,144 560,192 440,240 320,192" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="440" y="188" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">output gitignored?</text>
+      <text x="440" y="204" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">on disk, not in git</text>
+
+      <!-- BLOCKED · DECLARED_OUTPUT_UNCOMMITTABLE -->
+      <rect x="800" y="168" width="280" height="48" rx="24" fill="#2d3142"/>
+      <rect x="800" y="168" width="280" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="940" y="188" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
+      <text x="940" y="202" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">DECLARED_OUTPUT_UNCOMMITTABLE</text>
+
+      <!-- unreferenced produced symbols? (focal) -->
+      <polygon points="440,272 560,320 440,368 320,320" fill="#2d3142"/>
+      <polygon points="440,272 560,320 440,368 320,320" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="440" y="316" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">unreferenced symbols?</text>
+      <text x="440" y="332" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">AST, never text</text>
+
+      <!-- node kind? -->
+      <polygon points="760,272 840,320 760,368 680,320" fill="#2d3142"/>
+      <polygon points="760,272 840,320 760,368 680,320" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="760" y="324" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">node kind?</text>
+
+      <!-- BLOCKED · PRODUCED_SYMBOL_UNREFERENCED (focal) -->
+      <rect x="900" y="224" width="280" height="48" rx="24" fill="#2d3142"/>
+      <rect x="900" y="224" width="280" height="48" rx="24" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="1040" y="244" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
+      <text x="1040" y="258" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PRODUCED_SYMBOL_UNREFERENCED</text>
+
+      <!-- SEMANTIC retry -->
+      <rect x="900" y="368" width="280" height="48" rx="24" fill="#2d3142"/>
+      <rect x="900" y="368" width="280" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="1040" y="388" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SEMANTIC</text>
+      <text x="1040" y="402" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">prompt names every symbol</text>
+
+      <!-- commit_measured_delta -->
+      <rect x="340" y="400" width="200" height="48" rx="24" fill="#2d3142"/>
+      <rect x="340" y="400" width="200" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="440" y="420" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">commit_measured_delta</text>
+      <text x="440" y="434" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">output_sha</text>
+
+      <!-- Callout -->
+      <text x="40" y="560" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif">Exempt: dunder, decorated, collected, at base.</text>
+      <path d="M 296,548 Q 308,440 318,326" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="320" cy="320" r="2" fill="#f5f5f5"/>
+
+      <!-- Legend -->
+      <line x1="40" y1="656" x2="1240" y2="656" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <text x="40" y="672" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND · SHAPE CARRIES TYPE</text>
+
+      <rect x="40" y="688" width="24" height="12" rx="6" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="72" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">End (oval)</text>
+
+      <rect x="180" y="688" width="24" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="212" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Step</text>
+
+      <polygon points="300,696 312,688 324,696 312,704" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="336" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision</text>
+
+      <rect x="432" y="688" width="24" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="464" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Unreferenced-symbol count (#118)</text>
+    </svg>
+  </div>
+</body>
+</html>

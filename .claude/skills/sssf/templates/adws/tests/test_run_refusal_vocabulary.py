@@ -60,9 +60,9 @@ from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
 from test_finalization import (  # noqa: E402
-    DIGEST, OBJECTS, WindowFactory, clean_report, make_store, matrix_for)
+    DIGEST, clean_report, make_store, matrix_for)
 from test_receipt_set_aside import (  # noqa: E402
-    INVOKER, REASON, failing_report, finalize)
+    INVOKER, REASON, Review, failing_report, finalize)
 
 
 def _emit(call):
@@ -92,7 +92,7 @@ class TheAbsentReceiptNamesItsCauseTest(unittest.TestCase):
         needed `plan finalize`."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
             refusal = maestro._receipt_absent(store, DIGEST)
@@ -104,10 +104,10 @@ class TheAbsentReceiptNamesItsCauseTest(unittest.TestCase):
     def test_the_escape_count_is_the_number_of_escapes(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-1"))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
-            finalize(store, WindowFactory(report=failing_report(),
+            finalize(store, Review(report=failing_report(),
                                           session_id="sess-2"),
                      clock=lambda: 1_760_000_500.0)
             store.set_aside(DIGEST, invoked_by=INVOKER, reason="and again")
@@ -173,7 +173,7 @@ class TheRunPathRefusalsAreNamedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, _repo, _data, seed = make_store(root)
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             args = self._arguments(root, store, seed)
             with self._eligible():
@@ -189,7 +189,7 @@ class TheRunPathRefusalsAreNamedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, _repo, _data, seed = make_store(root)
-            finalize(store, WindowFactory(report=failing_report()))
+            finalize(store, Review(report=failing_report()))
             args = self._arguments(root, store, seed)
             with self._eligible():
                 with self.assertRaises(maestro._RunRefused) as caught:
@@ -216,7 +216,7 @@ class TheRunPathRefusalsAreNamedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store, _repo, _data, seed = make_store(root)
-            finalize(store, WindowFactory(report=clean_report(matrix_for())))
+            finalize(store, Review(report=clean_report(matrix_for())))
             args = self._arguments(root, store, seed)
             with self._eligible(), mock.patch.object(
                     maestro.plan_model, "parse_bytes",
@@ -258,6 +258,65 @@ class TheRunVerbsPrintTheTypedRefusalTest(unittest.TestCase):
         self.assertEqual(3, code)
         self.assertEqual("RUN_RECEIPT_ABSENT", payload["outcome"])
         self.assertEqual("NEVER_FINALIZED", payload["cause"])
+
+    def test_the_cross_run_node_budget_prints_its_nodes_as_a_field(self):
+        """The newest name in the vocabulary, and the shape it travels in.
+
+        An operator tool deciding which nodes to re-author has to read the
+        node ids, the cumulative counts and the runs that hold them. All three
+        are a list of typed records, because the refusal is about a *set* of
+        nodes and a sentence naming them would put the branching fact back
+        into prose (§1.2).
+        """
+        code, payload = self._drive(
+            maestro._run_start,
+            maestro._RunRefused(
+                "NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
+                "lane-x has spent its review budget",
+                plan_digest="c" * 64, semantic_ceiling=3,
+                nodes=[{"node_id": "lane-x",
+                        "cumulative_semantic_attempts": 7,
+                        "effective_ceiling": 3,
+                        "run_ids": ["run-a", "run-b"]}]))
+
+        self.assertEqual(3, code)
+        self.assertEqual("NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
+                         payload["outcome"])
+        self.assertEqual(3, payload["semantic_ceiling"])
+        self.assertEqual("c" * 64, payload["plan_digest"])
+        self.assertEqual([{"node_id": "lane-x",
+                           "cumulative_semantic_attempts": 7,
+                           "effective_ceiling": 3,
+                           "run_ids": ["run-a", "run-b"]}],
+                         payload["nodes"])
+
+    def test_run_resume_prints_the_cross_run_budget_too(self):
+        """§19 M6: a guard whose refusal only one verb can print is a guard
+        only one verb has."""
+        code, payload = self._drive(
+            maestro._run_resume,
+            maestro._RunRefused(
+                "NODE_BUDGET_EXHAUSTED_ACROSS_RUNS", "spent",
+                plan_digest="c" * 64, semantic_ceiling=3, nodes=[]))
+
+        self.assertEqual(3, code)
+        self.assertEqual("NODE_BUDGET_EXHAUSTED_ACROSS_RUNS",
+                         payload["outcome"])
+
+    def test_an_unknown_allowed_node_has_its_own_outcome(self):
+        """§3.6 B10's escape can be typed wrong, and a misspelled node id
+        admits nothing and refuses nothing. It is a different mistake from a
+        spent budget and gets a different name."""
+        code, payload = self._drive(
+            maestro._run_start,
+            maestro._RunRefused(
+                "ALLOW_EXHAUSTED_NODE_UNKNOWN", "no such node",
+                unknown_node_ids=["lane-typo"],
+                plan_node_ids=["lane-x", "lane-y"]))
+
+        self.assertEqual(3, code)
+        self.assertEqual("ALLOW_EXHAUSTED_NODE_UNKNOWN", payload["outcome"])
+        self.assertEqual(["lane-typo"], payload["unknown_node_ids"])
 
     def test_a_refusal_with_no_extra_facts_stays_two_fields(self):
         code, payload = self._drive(

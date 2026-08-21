@@ -30,8 +30,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
-                    Tuple)
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 from .scheduler_types import (
     AttemptRecord,
@@ -262,8 +262,7 @@ def semantic_attempts_at_base(attempts: Iterable[AttemptRecord], node_id: str,
     """
     return sum(1 for a in attempts
               if a.node_id == node_id and a.base_sha == base_sha
-              and a.retry_class is RetryClass.SEMANTIC
-              and not (a.extra or {}).get(REVIEW_REJECTED_KEY))
+              and a.retry_class is RetryClass.SEMANTIC)
 
 
 def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
@@ -274,19 +273,22 @@ def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> 
     can never produce a budget decrement (§7.5). Callers pass rows already
     scoped to one run.
 
-    **Review rejections are excluded**, and the exclusion is what keeps the two
-    ceilings genuinely separate. A rejected diff is written `SEMANTIC` because
-    that is what it is by §7.5's rule — it earns a prompt-mutating retry, and
-    the other two classes would be lies about a content verdict. But it is
-    counted under `review_ceiling`, so leaving it in this sum would spend both
-    budgets for one failure: a node rejected twice by review would arrive at
-    its third gate failure already out of semantic attempts, which is the
-    merged counter the two ceilings exist to avoid. The row says what the
-    attempt *was*; the marker says which budget it *spent*.
+    **This is the fix loop's bound, and it counts every content failure.** It
+    used to exclude rows carrying `REVIEW_REJECTED_KEY`, because a rejection
+    spent `review_ceiling` instead and charging one failure to two budgets
+    would have let a node rejected twice arrive at its third gate failure
+    already out of attempts. §19 M35 removed the second budget: a review
+    rejection no longer fails an attempt at all, so there is no longer a
+    failure this sum could double-charge, and an exclusion that once kept two
+    ceilings honest would now be a hole — a SEMANTIC row that happened also to
+    carry an advisory rejection marker would not be counted by anything.
+
+    What remains is one number for the loop the reference implementation draws
+    as `test_1 -> fix_1` bounded x3: `execution.semantic_ceiling`, counted over
+    `(run_id, node_id)` across every base. Stated, counted, never negotiated.
     """
     return sum(1 for a in attempts
-              if a.node_id == node_id and a.retry_class is RetryClass.SEMANTIC
-              and not (a.extra or {}).get(REVIEW_REJECTED_KEY))
+              if a.node_id == node_id and a.retry_class is RetryClass.SEMANTIC)
 
 
 # ── the review budget, counted the same way and kept separate ───────────────
@@ -325,6 +327,51 @@ def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> in
     return sum(1 for a in attempts
                if a.node_id == node_id
                and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
+
+
+def semantic_attempts_across_runs(
+        attempts_by_run: Mapping[str, Iterable[AttemptRecord]],
+        node_id: str) -> Tuple[int, Tuple[str, ...]]:
+    """This node's SEMANTIC attempts summed over many runs, and the runs that
+    hold them.
+
+    The cumulative scope `semantic_attempts_total` establishes stops at the run
+    boundary, and a node can be re-attempted past its ceiling simply by
+    starting the plan again: each fresh `run_id` mints a `node_lifecycle` row
+    with an empty history, so the same node against the same plan bytes is
+    spent over and over with nothing counting it. That is the debt #92 names —
+    spend no amount of success pays off — accruing one run at a time. It is
+    also the measured shape of `lane-p5-gap-policy`: 39 attempts over four
+    `run_id`s, no run of which exceeded its own in-run budget.
+
+    It counted review rejections until §19 M35, which was the right predicate
+    for exactly as long as a review rejection was the failure that repeated.
+    With review advisory, the failure that repeats is a content failure —
+    a red gate, a clause-4 conviction, §7.4's post-work falsification refusal —
+    and all three are SEMANTIC rows. Counting the rejections instead would now
+    count a marker no node's fate depends on and miss every failure that is.
+
+    It counts by calling `semantic_attempts_total` per run rather than by
+    restating its predicate. RC1 is the recorded cost of the alternative: a
+    second copy of a budget rule lived in `retry_policy.review_budget_
+    exhausted`, had no production caller, and disagreed with the enforced one
+    by exactly one attempt. One predicate, counted in more places.
+
+    The run ids come back beside the total because the refusal that reads this
+    has to name them — an operator told a node is out of attempts and not told
+    where they went has to go and find the runs themselves — and deriving them
+    from a second pass would be the same duplication one level up. Ordering
+    follows the caller's mapping, which is the reader's newest-first run order,
+    and only runs that actually hold a spent attempt appear.
+    """
+    total = 0
+    holders: List[str] = []
+    for run_id, attempts in attempts_by_run.items():
+        counted = semantic_attempts_total(attempts, node_id)
+        if counted:
+            total += counted
+            holders.append(run_id)
+    return total, tuple(holders)
 
 
 def review_convergence_from_attempts(
@@ -408,7 +455,8 @@ REPAIR_CHAIN_LIMIT = 3
 #: composed at the call site, for the reason `classify_review_stall`'s reasons
 #: are: the value is written into a durable row and an operator who greps for
 #: it needs a closed set to grep.
-REPAIR_NO_PRIOR_REJECTION = "the previous attempt was not rejected by review"
+REPAIR_NO_PRIOR_REJECTION = (
+    "the previous attempt failed before it produced a commit to repair")
 REPAIR_OUTPUT_UNPROVEN = (
     "the rejected attempt has no provable output commit to repair")
 REPAIR_HEAD_MOVED = (
@@ -533,15 +581,25 @@ def decide_repair(facts: RepairFacts) -> RepairDecision:
     order is the order in which a fact becomes knowable rather than a
     preference:
 
-    1. **The previous attempt was not rejected by review.** Both halves are
-       read: the row's `retry_class` must be SEMANTIC *and* it must carry
-       `REVIEW_REJECTED_KEY`. Either alone is the wrong predicate — a red gate
-       is SEMANTIC without being a rejection, and the marker without the class
-       would admit a row `mark_blocked` wrote. A gate failure leaves nothing to
-       repair: the tree it produced never passed its own gate, so the next
-       attempt restarts from the integration head exactly as it always has. An
-       ENVIRONMENTAL or LAUNCHER_TRANSIENT failure fails the same test and is
-       untouched by any of this.
+    1. **The previous attempt produced nothing worth repairing.** Both halves
+       are read: the row's `retry_class` must be SEMANTIC *and* it must carry
+       a stored output commit (`REVIEW_OUTPUT_SHA_KEY`). Either alone is the
+       wrong predicate — a red gate is SEMANTIC without having produced a
+       tree, and the commit without the class would admit a row `mark_blocked`
+       wrote. A gate failure leaves nothing to repair: the tree it produced
+       never passed its own gate, so the next attempt restarts from the
+       integration head exactly as it always has. An ENVIRONMENTAL or
+       LAUNCHER_TRANSIENT failure fails the same test and is untouched by any
+       of this.
+
+       The predicate used to be `REVIEW_REJECTED_KEY`, which was the same set
+       while a review rejection was the only way an attempt could fail *after*
+       its own gate had gone green. §19 M35 ended that: review no longer fails
+       anything, and §7.4's post-work falsification refusal took its place as
+       the failure that arrives with a proven commit in hand. Keying on the
+       commit rather than on which stage objected is what makes the repair
+       chain outlive the stage it was built for — and it is the honest
+       predicate either way, because the commit is the thing being repaired.
     2. **The rejected diff is not provable.** No stored output commit, a ref
        that no longer holds it, or a commit that fails
        `is_attempt_output_commit` means the subject of the repair cannot be
@@ -574,7 +632,7 @@ def decide_repair(facts: RepairFacts) -> RepairDecision:
     prior = facts.prior
     if (prior is None
             or prior.retry_class is not RetryClass.SEMANTIC
-            or not (prior.extra or {}).get(REVIEW_REJECTED_KEY)):
+            or not (prior.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)):
         return RepairDecision(None, REPAIR_NO_PRIOR_REJECTION)
     rejected_sha = (prior.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)
     if (not isinstance(rejected_sha, str) or not rejected_sha
@@ -796,6 +854,7 @@ def guidance_extra_verification(detail: Optional[dict]) -> Dict[str, Any]:
         "reason": guidance.reason,
         "offending_paths": list(guidance.offending_paths),
         "failed_clause": guidance.failed_clause,
+        "unreferenced_symbols": list(guidance.unreferenced_symbols),
     }}
 
 
@@ -839,7 +898,9 @@ def guidance_from_attempts(
             ledger = ledger.with_verification(VerificationGuidance(
                 reason=str(payload.get("reason") or ""),
                 offending_paths=tuple(payload.get("offending_paths") or ()),
-                failed_clause=payload.get("failed_clause")))
+                failed_clause=payload.get("failed_clause"),
+                unreferenced_symbols=tuple(
+                    payload.get("unreferenced_symbols") or ())))
         elif surface == "review":
             findings = tuple(
                 ReviewFinding(
@@ -945,6 +1006,12 @@ class VerificationGuidance:
     reason: str = ""
     offending_paths: Tuple[str, ...] = ()
     failed_clause: Optional[int] = None
+    #: Located `path:line:name` records for symbols the attempt defined that
+    #: nothing references (#118). Carried separately from `offending_paths`
+    #: because the two are different facts with different repairs — one names
+    #: where the attempt wrote, the other names what it must delete — and a
+    #: prompt that conflated them would ask for the wrong edit.
+    unreferenced_symbols: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1018,7 +1085,8 @@ def verification_guidance(detail: Optional[dict]) -> VerificationGuidance:
     return VerificationGuidance(
         reason=str(reason),
         offending_paths=tuple(detail.get("offending_paths") or ()),
-        failed_clause=detail.get("clause"))
+        failed_clause=detail.get("clause"),
+        unreferenced_symbols=tuple(detail.get("unreferenced_symbols") or ()))
 
 
 def review_guidance(review: object) -> ReviewGuidance:
@@ -1100,6 +1168,22 @@ def _offending_path_lines(paths: Sequence[str]) -> List[str]:
     return lines
 
 
+def _unreferenced_symbol_lines(symbols: Sequence[str]) -> List[str]:
+    """Every unreachable symbol, in full, as `path:line:name`.
+
+    Not sampled, unlike the offending paths above. That elision is safe because
+    a permission breach is repaired by writing elsewhere and the count is the
+    fact that matters; this list is the work itself, and an agent handed twenty
+    of thirty deletes twenty, ships again, and spends another attempt on the
+    ten the prompt elided.
+    """
+    lines = [f"Symbols this node defined that nothing references "
+             f"({len(symbols)} in total). Each must be removed, or given a "
+             f"caller that a test exercises:"]
+    lines.extend("  " + symbol for symbol in symbols)
+    return lines
+
+
 def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     lines = ["Verification (§8.3):",
              "A prior attempt for this node did not verify."
@@ -1110,6 +1194,8 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
         lines.append(g.reason)
     if g.offending_paths:
         lines.extend(_offending_path_lines(g.offending_paths))
+    if g.unreferenced_symbols:
+        lines.extend(_unreferenced_symbol_lines(g.unreferenced_symbols))
     lines.append("Declared outputs: "
                  + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)"))
     return lines

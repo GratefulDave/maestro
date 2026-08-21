@@ -190,8 +190,10 @@ class SchedulerFixture(unittest.TestCase):
             return scripted.pop(0)
         # The default shape a healthy agent node produces: the pre-gate is red
         # because the behaviour is absent, the post-gate green because the
-        # agent supplied it. Falsifiability, in fixture form.
-        return red() if phase == "pre" else green()
+        # agent supplied it, and the falsify-gate red again because taking the
+        # production file back out takes the behaviour with it (§7.4).
+        # Falsifiability, in fixture form, from both sides.
+        return red() if phase in ("pre", "falsify") else green()
 
     def quiesce_attempt(self, record, phase):
         self.assertIsInstance(record, st.AttemptRecord)
@@ -855,7 +857,9 @@ class GenerationFenceTests(SchedulerFixture):
                            run_gate=gate, run_node=runner)).run()
 
         self.assertEqual(len(provision_calls), 2)
-        self.assertEqual(gate_attempts, [2, 2])
+        # Three gate runs on the surviving attempt and none on the convicted
+        # one: pre, post, and §7.4's post-work falsify.
+        self.assertEqual(gate_attempts, [2, 2, 2])
         self.assertEqual(runner_attempts, [2])
         self.assertIs(self.store.get_attempt("run1", "a", 1).retry_class,
                       st.RetryClass.ENVIRONMENTAL)

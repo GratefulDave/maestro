@@ -122,7 +122,8 @@ class RetryClassTests(unittest.TestCase):
             {st.BlockReason.GATE_NOT_FALSIFIABLE,
              st.BlockReason.CODE_NODE_NO_EFFECT,
              st.BlockReason.PERMISSION_SCOPE_VIOLATION,
-             st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE})
+             st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE,
+             st.BlockReason.PRODUCED_SYMBOL_UNREFERENCED})
         # The `is_retryable(reason)` predicate that stood here was deleted: it
         # had no production caller, because `classify` already decides
         # retryability from the RetryClass at classification time and a

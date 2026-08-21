@@ -537,7 +537,7 @@ class CeilingProbe:
     touch three things and nothing else: `run_id`, `config`, and
     `deps.store.attempts_for`.
 
-    They are the only enforcers of §7.5's two ceilings.
+    They are the only enforcers of §7.5's ceilings.
     `retry_policy.review_budget_exhausted` and `semantic_budget_exhausted`
     stated the same rules from the outside, had no production caller, and
     disagreed with these by one — they counted only the rows that already
@@ -545,14 +545,19 @@ class CeilingProbe:
     whose row is written by the very call the decision gates. Testing the
     unused pair proved nothing about a run, so they were deleted and these
     tests re-pointed at what enforces the rule.
+
+    `_review_wanted` reads one more thing — the node's lifecycle row, for the
+    grant — so the fake store answers `get_node` as well.
     """
 
-    def __init__(self, cfg, attempts):
+    def __init__(self, cfg, attempts, granted=0):
         self.run_id = "run1"
         self.config = cfg
         self.deps = SimpleNamespace(
             store=SimpleNamespace(
-                attempts_for=lambda run_id, node_id: tuple(attempts)))
+                attempts_for=lambda run_id, node_id: tuple(attempts),
+                get_node=lambda run_id, node_id: SimpleNamespace(
+                    granted_extra_attempts=granted)))
 
 
 class ReviewBudgetTests(unittest.TestCase):
@@ -569,8 +574,7 @@ class ReviewBudgetTests(unittest.TestCase):
         self.assertEqual(rp.review_attempts_total(attempts, "n"), 2)
 
     def test_a_semantic_failure_never_spends_review_budget(self):
-        """The two ceilings bound different things. A shared counter would let
-        a node that burned its attempts on red gates merge unreviewed."""
+        """The dispatch bound and the fix-loop bound count different rows."""
         attempts = [
             st.AttemptRecord(run_id="run1", node_id="n", attempt_no=1,
                              base_sha=BASE_SHA, state=st.NodeState.PENDING,
@@ -580,41 +584,42 @@ class ReviewBudgetTests(unittest.TestCase):
         self.assertEqual(rp.semantic_attempts_total(attempts, "n"), 1)
 
     def test_the_ceiling_admits_exactly_its_count(self):
-        """`review_ceiling` attempts total, the in-flight one included.
+        """`review_ceiling` dispatches per node, counted over stored markers.
 
-        The scheduler decides while the failing attempt still holds RUNNING
-        and before its marker row is written, so at a ceiling of 3 it stops
-        the node on the third rejection — two stored markers plus this one —
-        rather than admitting a fourth.
+        Since §19 M35 the ceiling no longer stops a *node* — it stops the
+        scheduler paying for further reviews of one. The decision is taken
+        before the reviewer is dispatched rather than while a failing attempt
+        holds RUNNING, so there is no in-flight row to add: at a ceiling of 3,
+        three stored rejections is where the reviewer stops being sent.
         """
         cfg = st.SchedulerConfig(
             concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
             final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
             semantic_ceiling=3, review_ceiling=3)
-        rows = [self._attempt("n", i, True) for i in range(1)]
-        self.assertFalse(sch.Scheduler._review_ceiling_reached(
-            CeilingProbe(cfg, rows), "n", 0))
-        rows.append(self._attempt("n", 1, True))
-        self.assertTrue(sch.Scheduler._review_ceiling_reached(
-            CeilingProbe(cfg, rows), "n", 0))
+        rows = [self._attempt("n", i, True) for i in range(2)]
+        self.assertTrue(sch.Scheduler._review_wanted(
+            CeilingProbe(cfg, rows), "n"))
+        rows.append(self._attempt("n", 2, True))
+        self.assertFalse(sch.Scheduler._review_wanted(
+            CeilingProbe(cfg, rows), "n"))
 
     def test_a_forced_grant_reopens_an_exhausted_budget(self):
-        """B10's missing operator escape: a flaky FAIL would otherwise strand
-        the producer, because identical bytes replay the stored verdict."""
+        """B10's operator escape, still honoured: an operator who bought a
+        node more attempts wants the reviewer's advice on them."""
         cfg = st.SchedulerConfig(
             concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
             final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
             semantic_ceiling=3, review_ceiling=3)
-        rows = [self._attempt("n", i, True) for i in range(2)]
-        self.assertTrue(sch.Scheduler._review_ceiling_reached(
-            CeilingProbe(cfg, rows), "n", 0))
-        self.assertFalse(sch.Scheduler._review_ceiling_reached(
-            CeilingProbe(cfg, rows), "n", 1))
+        rows = [self._attempt("n", i, True) for i in range(3)]
+        self.assertFalse(sch.Scheduler._review_wanted(
+            CeilingProbe(cfg, rows, granted=0), "n"))
+        self.assertTrue(sch.Scheduler._review_wanted(
+            CeilingProbe(cfg, rows, granted=1), "n"))
 
     def test_a_semantic_row_never_spends_the_review_ceiling(self):
-        """The disjointness, asserted against the live enforcer rather than
-        only against the counting helper: a node that burned every attempt on
-        red gates must still arrive at review with its full allowance."""
+        """A node that burned every attempt on red gates still arrives at
+        review with its full allowance: the dispatch bound counts rejection
+        markers, and a red gate leaves none."""
         cfg = st.SchedulerConfig(
             concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
             final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
@@ -624,8 +629,8 @@ class ReviewBudgetTests(unittest.TestCase):
                              base_sha=BASE_SHA, state=st.NodeState.PENDING,
                              retry_class=st.RetryClass.SEMANTIC, extra={})
             for i in range(5)]
-        self.assertFalse(sch.Scheduler._review_ceiling_reached(
-            CeilingProbe(cfg, rows), "n", 0))
+        self.assertTrue(sch.Scheduler._review_wanted(
+            CeilingProbe(cfg, rows), "n"))
 
     def test_a_zero_ceiling_is_refused_as_a_setting(self):
         with self.assertRaises(ValueError):
@@ -693,21 +698,37 @@ class ReviewStageTests(SchedulerFixture):
         self.assertEqual(self.states()["build"], st.NodeState.MERGED.value)
         self.assertEqual(len(review.subjects), 1)
 
-    def test_the_stage_runs_before_the_merge_not_after(self):
-        """The review must see the diff while the node can still be recycled.
-        A node the reviewer rejected must never have reached MERGED."""
+    def test_a_rejected_diff_still_merges(self):
+        """§19 M35, stated as the assertion that would have failed before it.
+
+        The reviewer rejects every attempt and the node merges anyway. The
+        verdict is prose about work a count already adjudicated (§1.2), and
+        prose no longer causes a lifecycle transition here.
+        """
         review = FakeReview([False, False, False])
         self.written["build"] = {"build.py": "hardcoded\n"}
-        self.schedule([self.agent("build")],
-                      deps=self.deps(review_attempt=review)).run()
+        report = self.schedule([self.agent("build")],
+                               deps=self.deps(review_attempt=review)).run()
 
-        self.assertNotEqual(self.states()["build"], st.NodeState.MERGED.value)
+        self.assertEqual(self.states()["build"], st.NodeState.MERGED.value)
+        # Exactly one attempt: nothing recycled it.
+        self.assertEqual(len(review.subjects), 1)
+        self.assertEqual(len(self.prompts["build"]), 1)
+        # And the findings are on the record anyway, which is the half of the
+        # stage that survives — a merged node carries what it merged with.
+        self.assertIn("hardcoded", report.review_findings["build"])
+        self.assertEqual(report.review_convergence["build"], (1,))
+        rows = self.store.attempts_for("run1", "build")
+        self.assertTrue(rows[0].extra[rp.REVIEW_REJECTED_KEY])
+        self.assertTrue(rows[0].extra["review_advisory"])
 
-    def test_a_rejection_recycles_the_attempt_with_the_findings(self):
-        """The findings are the whole justification for spending another
-        attempt: a retry that repeats the original request would produce the
-        same diff and be rejected for the same reason."""
+    def test_a_rejection_rides_the_prompt_of_the_retry_something_else_caused(self):
+        """The findings are still worth having: when §7.4's post-work
+        falsification refusal recycles the attempt, the reviewer's objections
+        are already on the row and in the guidance ledger, so they reach the
+        builder in the repair prompt rather than being discarded."""
         review = FakeReview([False, True])
+        self.gate_script[("build", "falsify")] = [green()]
         self.written["build"] = {"build.py": "ok\n"}
         self.schedule([self.agent("build")],
                       deps=self.deps(review_attempt=review)).run()
@@ -720,38 +741,44 @@ class ReviewStageTests(SchedulerFixture):
         self.assertIn("code review", prompts[1].lower())
         self.assertIn("diff.gate_is_passed_on_the_merits", prompts[1])
 
-    def test_three_rejections_block_the_lane_and_surface_the_findings(self):
+    def test_the_fix_loop_bound_ends_the_lane_and_surfaces_the_findings(self):
+        """A node whose gate never observes its own production code spends
+        `semantic_ceiling` and blocks — the reviewer's rejections riding every
+        prompt without ever being the thing that stopped it."""
         review = FakeReview([False, False, False])
+        self.gate_script[("build", "falsify")] = [green(), green(), green()]
         self.written["build"] = {"build.py": "ok\n"}
         report = self.schedule(
             [self.agent("build")],
+            config=self.config(semantic_ceiling=3),
             deps=self.deps(review_attempt=review)).run()
 
         self.assertEqual(self.states()["build"], st.NodeState.BLOCKED.value)
         self.assertEqual(
             self.store.get_node("run1", "build").block_reason,
-            st.BlockReason.REVIEW_BUDGET_EXHAUSTED)
+            st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
         self.assertEqual(len(review.subjects), 3)
         # A bare budget-exhausted reason names the rule that fired and nothing
         # an operator can act on, so the findings ride the report.
         self.assertIn("build", report.review_findings)
         self.assertIn("hardcoded", report.review_findings["build"])
         # And how many findings each rejected attempt drew. Flat at 1 across
-        # all three: the reviewer was not converging, which is what says
-        # raising `review_ceiling` for this node would have bought nothing.
+        # all three: the reviewer was not converging.
         self.assertEqual(report.review_convergence["build"], (1, 1, 1))
 
     def test_resume_reloads_review_convergence_from_attempt_rows(self):
         """The series survives the process that observed it.
 
-        Rebuilt from the same review-rejected rows the budget is counted
-        from, so a run finished by a second process reports the whole run's
-        convergence rather than its own slice of it.
+        Rebuilt from the same review-rejected rows the dispatch bound is
+        counted from, so a run finished by a second process reports the whole
+        run's convergence rather than its own slice of it.
         """
         review = FakeReview([False, False, False])
+        self.gate_script[("build", "falsify")] = [green(), green(), green()]
         self.written["build"] = {"build.py": "ok\n"}
         self.schedule(
             [self.agent("build")],
+            config=self.config(semantic_ceiling=3),
             deps=self.deps(review_attempt=review)).run()
         rebuilt = rp.review_convergence_from_attempts(
             self.store.attempts_for("run1"))
@@ -760,14 +787,22 @@ class ReviewStageTests(SchedulerFixture):
         resumed.project()
         self.assertEqual(resumed._review_convergence["build"], [1, 1, 1])
 
-    def test_the_ceiling_is_configurable_and_respected(self):
+    def test_the_dispatch_bound_is_configurable_and_respected(self):
+        """`review_ceiling` stops the scheduler paying for further reviews of
+        a node it has already rejected that many times. The node goes on being
+        attempted; nobody is asked about it again."""
         review = FakeReview([False, False])
+        self.gate_script[("build", "falsify")] = [green(), green(), green()]
         self.written["build"] = {"build.py": "ok\n"}
         self.schedule([self.agent("build")],
-                      config=self.config(review_ceiling=2),
+                      config=self.config(review_ceiling=2,
+                                         semantic_ceiling=3),
                       deps=self.deps(review_attempt=review)).run()
 
         self.assertEqual(self.states()["build"], st.NodeState.BLOCKED.value)
+        self.assertEqual(
+            self.store.get_node("run1", "build").block_reason,
+            st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
         self.assertEqual(len(review.subjects), 2)
 
     def test_the_stage_never_runs_when_the_gate_already_failed(self):
@@ -879,11 +914,24 @@ class ReviewObjectTests(unittest.TestCase):
         # Both controls are present, and they are excluded from grading.
         self.assertEqual(len(matrix.canary_cells), 2)
 
-    def test_the_code_rubric_emits_no_plan_cells(self):
-        """The two review families share an enum and must not share cells."""
+    def test_a_rubric_emits_no_cell_for_a_kind_it_does_not_declare(self):
+        """`compute_matrix` ranges over `applies_to` and nothing else.
+
+        This used to be stated as "the code rubric emits no *plan* cells",
+        because two rubrics shared `ObjectKind` and a leak between them would
+        have been a real defect. Plan finalization dispatches no reviewer now
+        and its five object kinds were deleted with it, so the property is
+        stated over a rubric that declares one kind and is asked about the
+        other -- the same guarantee, without a kind that no longer exists.
+        """
+        one_kind = fin.Rubric(version="fixture.v1", checks=(
+            fin.RubricCheck(check_id="file.only", question="q",
+                            applies_to=(fin.ObjectKind.CHANGED_FILE,),
+                            severity=fin.Severity.BLOCKING),))
         matrix = fin.compute_matrix(
-            cr.CODE_RUBRIC, "c" * 64,
-            (fin.ReviewObject(object_id="plan", kind=fin.ObjectKind.PLAN),))
+            one_kind, "c" * 64,
+            (fin.ReviewObject(object_id="diff:abc",
+                              kind=fin.ObjectKind.DIFF),))
         self.assertEqual(matrix.graded_cells, ())
 
 
@@ -1016,95 +1064,6 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 self.assertTrue(Path(path).is_relative_to(review_root), key)
                 self.assertFalse(Path(path).is_relative_to(repo), key)
             self.assertEqual(spec.worktree, Path(str(repo)))
-
-    def test_the_plan_finalize_reviewer_launch_carries_every_redirection(self):
-        """The same omission, at the reviewer `plan finalize` builds.
-
-        It allocates its own launcher rather than sharing the node runner's, so
-        it is a second construction of the same `LaunchSpec` and failed the same
-        way — the refusal simply waits until the verb is exercised.
-        """
-        import argparse
-        from unittest import mock
-
-        import maestro
-        from adw_modules import launcher as lch
-        from adw_modules import route_receipts as rr
-
-        fixtures = Path(__file__).parent / "fixtures" / "step8"
-        key = rr.load_public_key(fixtures / "route_receipts.pub")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            repo.mkdir()
-            state = root / "state"
-            session_dir = state / "finalize-session"
-            args = argparse.Namespace(
-                herdr="/bin/true", omp="/bin/true", claude="/bin/true",
-                repo=str(repo), reviewer_route="omp", reviewer_model="m",
-                reviewer_effort="high", reviewer_profile="p",
-                reviewer_session_dir=str(session_dir),
-                reviewer_report_file=str(state / "review" / "report.json"),
-                route_verify_key=[key.hex()],
-                route_receipt=["omp={}".format(fixtures / "omp.json")],
-                finalization_timeout_s=60, reviewer_turn_timeout_s=20,
-                reviewer_poll_interval_s=1)
-
-            captured = {}
-
-            class FakeLauncher:
-                def __init__(self, **_kwargs):
-                    pass
-
-                def launch(self, spec):
-                    captured["spec"] = spec
-                    return lch.LaunchHandle(
-                        correlation_token=spec.correlation_token,
-                        pane_id="w1:p2", agent_name="reviewer",
-                        launched_cwd=spec.worktree,
-                        environment=spec.environment)
-
-                def cancel(self, handle, deadline):
-                    return None
-
-            windows = []
-
-            class CapturedWindow:
-                def __init__(self, **kwargs):
-                    self.launch = kwargs["launch"]
-                    windows.append(self)
-
-            matrix = fin.compute_matrix(
-                cr.CODE_RUBRIC, "c" * 64,
-                cr.review_objects(("a.py",), OUTPUT_SHA))
-            with mock.patch.object(maestro.launcher, "HerdrLauncher",
-                                   FakeLauncher), \
-                    mock.patch.object(maestro.agent_pi, "catalog",
-                                      lambda: (("stub", "m", 400_000),)), \
-                    mock.patch.object(maestro.finalization_window,
-                                      "FinalizationWindow", CapturedWindow):
-                maestro._reviewer_window_factory(args)(matrix)
-                # Inside the patch: the launch now resolves the reviewer's
-                # context window from the catalog to put it on the spec (B13 at
-                # the launcher chokepoint), so the stub has to still be in
-                # place when the spec is built, not only when it is assembled.
-                windows[0].launch()
-
-            spec = captured["spec"]
-            pane_env = _pane_env(lch.pane_env_flags(spec.environment))
-            self.assertEqual(set(pane_env), set(lch.SCRATCH_ENV_KEYS))
-            # A sibling of the session directory the operator named, so it
-            # lands wherever that reviewer's own state does — never in the
-            # repository under review.
-            for key_name, value in pane_env.items():
-                path = (value.split("cache_dir=", 1)[-1]
-                        if key_name == "PYTEST_ADDOPTS" else value)
-                self.assertTrue(Path(path).is_relative_to(
-                    session_dir.with_name(session_dir.name + ".scratch")),
-                    key_name)
-                self.assertFalse(Path(path).is_relative_to(repo), key_name)
-
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

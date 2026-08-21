@@ -1,4 +1,4 @@
-"""The twelve deterministic obligations, and the typed blockers (§6.4).
+"""The fourteen deterministic obligations, and the typed blockers (§6.4).
 
 `maestro plan validate` runs every obligation and emits exactly one outcome
 (§11.1). `FINALIZATION_ELIGIBLE` carries the canonical digest and publishes
@@ -7,7 +7,9 @@ the plan, launches no reviewer, and publishes nothing — the blocked result
 has no digest field to publish, so "publishes nothing" is a shape rather
 than a promise.
 
-Eleven of the twelve are computed from git objects alone. The two facts that
+Thirteen of the fourteen are computed from the stored bytes and git objects
+alone — the last two of the fourteen need neither, being pure functions over
+the parsed plan. The two facts that
 are not git facts enter through injected protocol seams rather than being
 reached for directly:
 
@@ -33,9 +35,34 @@ and §6.4 fixes both:
   nothing to do. Every other gate is checked for the collection count as
   stated. Both arms require a selector to exist at all.
 
+Two more obligations are gate *scope* rather than gate executability, and
+they were checks a prose reviewer used to be asked (§3.6 B12's rubric,
+`gate.selector_is_scoped_to_this_node` and
+`gate.selector_covers_the_merged_surface`). A reviewer answering them was
+answering a question a pure function over `Gate.argv` and the nodes'
+declared `outputs` decides exactly, so they are refusals here instead:
+
+* **`GATE_SELECTOR_NODE_SCOPED`** — a node's gate selector may name that
+  node's own outputs, or paths no node in the plan claims; it may not reach
+  into a *sibling's* declared output. The literal rubric question was
+  stricter — selector paths a subset of this node's outputs — and would
+  refuse plans `GATE_EXECUTABLE` deliberately admits, where a gate names a
+  test file that already exists at base and no node owns. This is the weaker
+  form, and it still convicts the defect the rubric was written for: a node
+  accepting on a lane it does not build.
+* **`INTEGRATION_GATE_COVERS_LANES`** — the integration gate is the plan's
+  one whole-suite gate (§6.2, §8.8), so a selector naming *no* path covers
+  the merged surface by construction and passes. A selector naming paths
+  must contain every node gate's selector paths under posix prefix
+  containment; a node gate whose own selector names no path is covered only
+  by the whole-suite case, because there is no path to contain. Each lane's
+  own gate selector is the definition of that lane's test surface: deciding
+  which of a node's `outputs` is a *test* output would need a naming
+  heuristic, which is the judgment this promotion exists to remove.
+
 Blockers are collected rather than raised one at a time: §11.1 emits typed
-blockers, plural, and a fail-fast validator makes an author fix twelve plans
-instead of one. The single exception is a plan that does not parse, where
+blockers, plural, and a fail-fast validator makes an author fix fourteen
+plans instead of one. The single exception is a plan that does not parse, where
 nothing downstream has a model to run against.
 """
 
@@ -62,7 +89,13 @@ from . import runner_resolution as rr
 
 
 class Obligation(str, Enum):
-    """The twelve, in §6.4's order."""
+    """The fourteen, in §6.4's order.
+
+    The last two arrived from the plan-review rubric rather than from §6.4's
+    original list: they were the only two of its eleven checks that a pure
+    function over the stored plan decides with no judgment about prose, so
+    they are stated here as refusals instead of being asked of a reviewer.
+    """
 
     CLOSED_PARSE = "CLOSED_PARSE"
     REFERENCES_RESOLVE_ONCE = "REFERENCES_RESOLVE_ONCE"
@@ -76,9 +109,11 @@ class Obligation(str, Enum):
     REVIEW_PAYLOAD_BUDGET = "REVIEW_PAYLOAD_BUDGET"
     LINEAGE_RESOLVES = "LINEAGE_RESOLVES"
     GATE_CORE_UNSHARED = "GATE_CORE_UNSHARED"
+    GATE_SELECTOR_NODE_SCOPED = "GATE_SELECTOR_NODE_SCOPED"
+    INTEGRATION_GATE_COVERS_LANES = "INTEGRATION_GATE_COVERS_LANES"
 
 
-#: Named as a tuple as well as an enum so "twelve" is a checkable count
+#: Named as a tuple as well as an enum so "fourteen" is a checkable count
 #: rather than a sentence in a docstring.
 OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.CLOSED_PARSE,
@@ -93,6 +128,8 @@ OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.REVIEW_PAYLOAD_BUDGET,
     Obligation.LINEAGE_RESOLVES,
     Obligation.GATE_CORE_UNSHARED,
+    Obligation.GATE_SELECTOR_NODE_SCOPED,
+    Obligation.INTEGRATION_GATE_COVERS_LANES,
 )
 
 
@@ -175,7 +212,7 @@ class SubprocessCollector:
 
     The runner is **resolved**, never inherited. `resolver` is the single
     producer `runner_resolution.resolve`, memoised per `(runner, cwd)` so the
-    twelve obligations pay the capability probe once for a plan rather than
+    fourteen obligations pay the capability probe once for a plan rather than
     once per gate. A resolution that refuses becomes `CollectorUnavailable` —
     which is a reuse, not a new type: this module's own docstring already
     states that a collector which cannot run is "an operational refusal with
@@ -667,6 +704,114 @@ def _gate_core_unshared(plan: "pm.Plan") -> List[Blocker]:
     return blockers
 
 
+def _path_under(path: str, prefix: str) -> bool:
+    """Posix prefix containment over two already-normalized paths.
+
+    `.` is the whole tree, which `posixpath.normpath` produces for an argv
+    token of `.` or `./`, and a normalized path never carries the `./` a
+    naive `startswith` would need.
+    """
+    if prefix == ".":
+        return True
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def _gate_selector_node_scoped(plan: "pm.Plan") -> List[Blocker]:
+    """A node gate may not accept on a sibling lane's declared output.
+
+    The weak form of the rubric's question (see the module docstring): a
+    selector path passes if it is one of this node's own normalized outputs,
+    or if it is under no *other* node's declared output. A selector naming a
+    pre-existing file no node claims stays admitted, which is what keeps
+    `GATE_EXECUTABLE`'s all-existing and mixed arms reachable.
+
+    Ownership is resolved in declaration order, so the sibling a message
+    names is the same one on every run over the same bytes. A path claimed by
+    two nodes is `SINGLE_OUTPUT_OWNER`'s defect, not this one's.
+    """
+    owners: List[Tuple[str, str]] = []
+    claimed: Set[str] = set()
+    for node in plan.nodes:
+        for path in node.outputs:
+            normalized = _norm(path)
+            if normalized in claimed:
+                continue
+            claimed.add(normalized)
+            owners.append((normalized, node.node_id))
+
+    blockers: List[Blocker] = []
+    for index, node in enumerate(plan.nodes):
+        if not isinstance(node, pm.AgentNode):
+            continue
+        own = {_norm(path) for path in node.outputs}
+        for path in pm.selector_paths(node.gate):
+            if path in own:
+                continue
+            for owned, owner_id in owners:
+                if owner_id == node.node_id:
+                    continue
+                if not _path_under(path, owned):
+                    continue
+                blockers.append(Blocker(
+                    Obligation.GATE_SELECTOR_NODE_SCOPED,
+                    "/nodes/{0}/gate/argv".format(index),
+                    "{0}'s gate selects {1}, which {2} declares as its output "
+                    "({3}); a node's gate is scoped to that node's own work "
+                    "(§6.2), so accepting on a sibling lane's output is that "
+                    "lane's acceptance wearing this node's name".format(
+                        node.node_id, path, owner_id, owned)))
+                break
+    return blockers
+
+
+def _integration_gate_covers_lanes(plan: "pm.Plan") -> List[Blocker]:
+    """The integration gate names the whole surface the plan produces.
+
+    Two arms, and the empty selector is the permissive one. An integration
+    gate whose argv names no path falls back to the runner's whole-tree
+    collection — which is what the integration gate is for (§6.2, §8.8) — and
+    covers every lane by construction.
+
+    Otherwise every agent node's gate selector paths must sit under some
+    integration-gate selector path. A node gate that itself names no path is
+    covered **only** in the whole-suite case just described: there is no path
+    to contain, so a narrowed integration gate cannot be shown to reach it,
+    and the message says so rather than passing it silently. Such a gate is
+    already `GATE_EXECUTABLE`'s defect; blockers are collected, so it is
+    reported by both.
+    """
+    covers = pm.selector_paths(plan.merge_policy.integration_gate)
+    if not covers:
+        return []
+
+    pointer = "/merge_policy/integration_gate/argv"
+    blockers: List[Blocker] = []
+    for node in plan.nodes:
+        if not isinstance(node, pm.AgentNode):
+            continue
+        paths = pm.selector_paths(node.gate)
+        if not paths:
+            blockers.append(Blocker(
+                Obligation.INTEGRATION_GATE_COVERS_LANES, pointer,
+                "{0}'s gate selector names no path, so nothing states the "
+                "surface it produces; only a whole-suite integration gate "
+                "covers such a lane, and this one names {1}".format(
+                    node.node_id, ", ".join(covers))))
+            continue
+        uncovered = tuple(
+            path for path in paths
+            if not any(_path_under(path, prefix) for prefix in covers))
+        if uncovered:
+            blockers.append(Blocker(
+                Obligation.INTEGRATION_GATE_COVERS_LANES, pointer,
+                "the integration gate selects {0}, which does not name {1}'s "
+                "gate surface: {2}. A gate over a subset of the lanes it must "
+                "integrate passes without ever collecting the lanes it "
+                "omits (§8.8)".format(
+                    ", ".join(covers), node.node_id, ", ".join(uncovered))))
+    return blockers
+
+
 def validate_plan(stored: bytes, repo: Union[str, Path], *,
                   receipts: ReceiptIndex, collector: GateCollector,
                   config: Optional[ValidationConfig] = None) -> ValidationResult:
@@ -732,6 +877,8 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
                 plan.supersedes)))
 
     blockers.extend(_gate_core_unshared(plan))
+    blockers.extend(_gate_selector_node_scoped(plan))
+    blockers.extend(_integration_gate_covers_lanes(plan))
 
     if blockers:
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))
@@ -741,9 +888,10 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
 
 # ── contract-IR admission ───────────────────────────────────────────────────
 #
-# Two obligations over a `plan-contract.v1` IR, over two domains, asked at the
-# same moment: can any correct attempt satisfy this lane's contract, and does
-# any requirement prescribe an effect the plan forbids.
+# Three obligations over a `plan-contract.v1` IR, over three domains, asked at
+# the same moment: can any correct attempt satisfy this lane's contract, does
+# any requirement prescribe an effect the plan forbids, and can any fixture
+# the gate runs witness what a claim asserts.
 #
 # ## What the run cost, and why prose could not decide it
 #
@@ -816,11 +964,11 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
 
 
 class AdmissionObligation(str, Enum):
-    """The obligations over a `plan-contract.v1` IR, at admission.
+    """The seven obligations over a `plan-contract.v1` IR, at admission.
 
-    Named `Admission*` rather than `Surface*` because the set now spans two
+    Named `Admission*` rather than `Surface*` because the set now spans three
     domains. A class called `Surface…` carrying `EFFECT_AUTHORIZED` is how
-    "the twelve" stops being a checkable count and becomes a sentence in a
+    "the fourteen" stops being a checkable count and becomes a sentence in a
     docstring — the failure `OBLIGATIONS` above carries a comment about.
     """
 
@@ -837,6 +985,10 @@ class AdmissionObligation(str, Enum):
     EFFECT_DISCHARGED = "EFFECT_DISCHARGED"
     #: Requirements bound to one lane agree about that lane's effects.
     EFFECT_CONSISTENT = "EFFECT_CONSISTENT"
+    #: Every claim states the boundary its behaviour crosses and the store its
+    #: state lives in, and no claim asserts what only a second invocation
+    #: could observe over a store that dies with the first.
+    CLAIM_UNWITNESSABLE = "CLAIM_UNWITNESSABLE"
 
 
 #: Named as a tuple as well as an enum so the count is checkable rather than a
@@ -850,6 +1002,7 @@ ADMISSION_OBLIGATIONS: Tuple[AdmissionObligation, ...] = (
     AdmissionObligation.EFFECT_AUTHORIZED,
     AdmissionObligation.EFFECT_DISCHARGED,
     AdmissionObligation.EFFECT_CONSISTENT,
+    AdmissionObligation.CLAIM_UNWITNESSABLE,
 )
 
 
@@ -930,15 +1083,59 @@ DISPOSITIONS: Tuple[str, ...] = ("performed", "planned", "fake_only", "none")
 _EXECUTING_DISPOSITIONS: frozenset = frozenset({"performed", "fake_only"})
 
 
+#: The boundary a claim's behaviour crosses — what a fixture would have to span
+#: to observe the claim at all.
+#:
+#: * ``in_process`` — everything one invocation of the verifier can observe.
+#:   In-process ordering, a "second run" driven inside one pytest process, and
+#:   any state one interpreter holds from start to finish are all this.
+#: * ``cross_invocation`` — behaviour only a *second* invocation can observe:
+#:   survival across a restart or a process death, cross-process ordering, a
+#:   cursor read back by something that did not write it.
+#:
+#: Two members and not three. `cross_process` was proposed and refused: under
+#: this lattice it decides exactly what `cross_invocation` decides, and a
+#: member that changes no decision is §3.6 B15 — the defect this module's own
+#: docstring cites — arriving on its first commit.
+WITNESS_SCOPES: Tuple[str, ...] = ("in_process", "cross_invocation")
+
+
+#: Where the state a claim is about lives while the verifier runs.
+#:
+#: * ``none`` — the claim is about no stored state at all. A pure function's
+#:   return value.
+#: * ``in_memory`` — one interpreter's own objects: a dict, an in-memory
+#:   SQLite session, a fake injected for the duration of one test.
+#: * ``tmp_path`` — a filesystem location the run creates and can read back.
+#: * ``repository`` — a tracked path in the worktree.
+#: * ``external`` — a store outside the run entirely: a real database, a
+#:   bucket, a queue.
+#:
+#: The vocabulary names *where the bytes are*, not what writes them, for the
+#: reason `EFFECTS` names acts rather than mechanisms: a mechanism name lets a
+#: lane use the mechanism without committing to the fact the cell asserts, and
+#: the author's declaration stops being falsifiable.
+WITNESS_STORES: Tuple[str, ...] = ("none", "in_memory", "tmp_path",
+                                   "repository", "external")
+
+
+#: The stores that outlive one invocation, and so can be read by a second one.
+#: A claim scoped `cross_invocation` over anything else asserts something no
+#: fixture the gate runs can witness: no correct attempt produces the evidence,
+#: and the reviewer is asked to judge what the gate never shows it.
+_WITNESSING_STORES: frozenset = frozenset({"tmp_path", "repository",
+                                           "external"})
+
+
 @dataclass(frozen=True)
 class AdmissionBlocker:
     """One typed blocker with a JSON pointer into the authored IR.
 
-    Deliberately not `Blocker`: those twelve are obligations over
-    `maestro-plan.v1` stored bytes and their count is asserted as twelve.
+    Deliberately not `Blocker`: those fourteen are obligations over
+    `maestro-plan.v1` stored bytes and their count is asserted as fourteen.
     These are obligations over the contract IR, which is a different document
-    with different pointers, and merging the two enums would make "the twelve"
-    a sentence again rather than a checkable count.
+    with different pointers, and merging the two enums would make "the
+    fourteen" a sentence again rather than a checkable count.
     """
 
     obligation: AdmissionObligation
@@ -1520,12 +1717,124 @@ def validate_effect_authorization(ir: Mapping[str, Any]
     return tuple(blockers)
 
 
+def validate_claim_witness(ir: Mapping[str, Any]
+                           ) -> Tuple[AdmissionBlocker, ...]:
+    """Refuse a claim no fixture the gate runs could witness.
+
+    A claim states what the run has to show. A verifier shows it by running
+    one command, once, and reporting what it observed. When the claim is about
+    a boundary that command never crosses, no correct attempt produces the
+    evidence: the builder writes the behaviour, the gate cannot see it, and
+    the reviewer is asked to judge something the gate never showed it. That is
+    the same class as an unreachable write surface — a contract no correct
+    attempt satisfies — one domain over, so it is refused at the same moment
+    rather than discovered after a node has spent its retry budget.
+
+    The decision reads two enumerated cells and nothing else. `witness.scope`
+    is the boundary the claim's behaviour crosses; `witness.store` is where
+    the state it is about lives while the verifier runs. A claim scoped
+    `cross_invocation` over a store that dies with the invocation is the
+    refusal; every `in_process` claim is admitted under every store, because
+    an author who says the behaviour is within one invocation has said
+    something a single command can check.
+
+    Nothing here reads `requirements[].text`, `claims[].object`,
+    `verifiers[].oracle`, `seams[].contract`, or any other free-text field. A
+    requirement whose prose says "survives a restart" while its claim declares
+    `in_process` is admitted, and a claim whose prose says nothing about
+    persistence is refused when its declared cells say it crosses an
+    invocation over an in-memory store. An admission decision is a lifecycle
+    transition and §1.2 forbids one caused by free text; whether the declared
+    cells are *true* is the plan-contract reviewer's to falsify (§3.6 B12),
+    exactly as it is for `surface` and `effects`.
+
+    A `claims` key that is absent or not a list yields nothing here. The
+    authoring schema requires the array and `planctl validate` refuses a
+    malformed one in its own vocabulary; reporting the same defect twice makes
+    one plan error look like two.
+    """
+    blockers: List[AdmissionBlocker] = []
+
+    claims = ir.get("claims")
+    if not isinstance(claims, list):
+        return ()
+
+    for index, claim in enumerate(claims):
+        pointer = "/claims/{0}/witness".format(index)
+        if not isinstance(claim, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE,
+                "/claims/{0}".format(index),
+                "a claim is an object carrying a {scope, store} witness"))
+            continue
+        label = claim.get("claim_id")
+        if not isinstance(label, str) or not label:
+            label = "at index {0}".format(index)
+
+        declared = claim.get("witness")
+        if declared is None:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer,
+                "claim {0} declares no witness; a claim states the boundary "
+                "its behaviour crosses and the store its state lives in, so a "
+                "gate that cannot observe what the claim asserts is refused "
+                "before a run starts rather than after a node has spent its "
+                "retry budget. Declare {{\"scope\": one of {1}, \"store\": "
+                "one of {2}}}".format(
+                    label, ", ".join(WITNESS_SCOPES),
+                    ", ".join(WITNESS_STORES))))
+            continue
+        if not isinstance(declared, dict):
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer,
+                "claim {0} declares a witness that is not a {{scope, store}} "
+                "object".format(label)))
+            continue
+
+        scope = declared.get("scope")
+        store = declared.get("store")
+        well_formed = True
+        if scope not in WITNESS_SCOPES:
+            well_formed = False
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer + "/scope",
+                "claim {0} declares scope {1!r}, which is not one of "
+                "{2}".format(label, scope, ", ".join(WITNESS_SCOPES))))
+        if store not in WITNESS_STORES:
+            well_formed = False
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer + "/store",
+                "claim {0} declares store {1!r}, which is not one of "
+                "{2}".format(label, store, ", ".join(WITNESS_STORES))))
+        if not well_formed:
+            continue
+
+        if scope == "cross_invocation" and store not in _WITNESSING_STORES:
+            blockers.append(AdmissionBlocker(
+                AdmissionObligation.CLAIM_UNWITNESSABLE, pointer,
+                "claim {0} is scoped cross_invocation over store {1}, which "
+                "does not outlive the invocation that creates it, so no "
+                "fixture this plan's gate can run observes the second "
+                "invocation the claim is about and no correct attempt "
+                "produces the evidence. A witnessing store is one of {2}: "
+                "give the claim a store the run can read back, or scope it "
+                "in_process and state the within-invocation behaviour the "
+                "gate actually shows".format(
+                    label, store,
+                    ", ".join(sorted(_WITNESSING_STORES)))))
+
+    return tuple(blockers)
+
+
 def validate_admission(ir: Mapping[str, Any]) -> Tuple[AdmissionBlocker, ...]:
-    """Both admission predicates, in one pass, collecting every blocker.
+    """All three admission predicates, in one pass, collecting every blocker.
 
     Not short-circuiting, for §11.1's reason: an author sent back twice for
     two admission defects in one document is the fail-fast validator this
-    design already refuses.
+    design already refuses. The three are over three domains — repository
+    paths, external acts, and the boundary a gate can observe — so a document
+    carrying one of each is refused once, naming all three.
     """
     return (tuple(validate_contract_surface(ir))
-            + tuple(validate_effect_authorization(ir)))
+            + tuple(validate_effect_authorization(ir))
+            + tuple(validate_claim_witness(ir)))

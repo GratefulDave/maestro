@@ -18,11 +18,13 @@ persistent change made to express a one-run intent.
 
 Two halves, tested here in that order:
 
-* the partition — a flag that names a *setting* binds; a flag that names a
-  *path, key or executable* still disables binding, because that is the
-  disagreement the rule exists to refuse; and an explicit setting wins over the
-  configured one, which is `_bind_salvage_configuration`'s rule (#83) applied
-  to the run verbs;
+* the partition — a flag that names a *setting* binds; a flag that names an
+  operator *decision* about this one invocation (`_RUN_ESCAPE_OPTIONS`, which
+  is how §3.6 B10's escape from a refusal stays reachable on a configured
+  repository) binds too; a flag that names a *path, key or executable* still
+  disables binding, because that is the disagreement the rule exists to
+  refuse; and an explicit setting wins over the configured one, which is
+  `_bind_salvage_configuration`'s rule (#83) applied to the run verbs;
 * the refusal — when binding *is* disabled, the message names the flag that
   did it and the two ways out. This is #78's correction: the refusal was right
   and its vocabulary named a consequence rather than the rule.
@@ -407,6 +409,25 @@ class TheTuningPartitionIsTotalTest(unittest.TestCase):
             maestro._RUN_SELECTION_OPTIONS
             & frozenset(maestro._RUN_TUNING_OPTIONS))
         self.assertFalse(IDENTITY_OPTIONS & frozenset(maestro._RUN_TUNING_OPTIONS))
+        self.assertFalse(
+            maestro._RUN_ESCAPE_OPTIONS & frozenset(maestro._RUN_TUNING_OPTIONS))
+        self.assertFalse(maestro._RUN_ESCAPE_OPTIONS & IDENTITY_OPTIONS)
+        self.assertFalse(
+            maestro._RUN_ESCAPE_OPTIONS & maestro._RUN_SELECTION_OPTIONS)
+
+    def test_no_escape_flag_names_a_path_key_or_executable(self):
+        """The fourth set, and the boundary that keeps it safe.
+
+        An escape flag names an operator *decision* about this one invocation
+        — which node to admit past a refusal — and binds configuration like a
+        tuning flag does. It may therefore never name a path, a key or an
+        executable: those are the half-disagreement the all-or-nothing rule
+        exists to refuse, and an escape flag that located something would
+        reintroduce it under a name that sounds harmless.
+        """
+        self.assertTrue(maestro._RUN_ESCAPE_OPTIONS)
+        for option in maestro._RUN_ESCAPE_OPTIONS:
+            self.assertNotIn(option, IDENTITY_OPTIONS)
 
     def test_the_partition_covers_every_flag_resume_declares(self):
         """Not an assertion that the union is total — an unclassified flag is
@@ -417,6 +438,7 @@ class TheTuningPartitionIsTotalTest(unittest.TestCase):
             set(self._declared())
             - maestro._RUN_SELECTION_OPTIONS
             - frozenset(maestro._RUN_TUNING_OPTIONS)
+            - maestro._RUN_ESCAPE_OPTIONS
             - IDENTITY_OPTIONS)
         self.assertEqual(unclassified, [])
 

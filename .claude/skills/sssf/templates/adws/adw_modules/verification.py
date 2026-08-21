@@ -35,8 +35,9 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from . import reachability as rc
 from . import scheduler_types as st
 from . import worktree as wt
 
@@ -217,6 +218,11 @@ class VerificationVerdict:
     block_reason: Optional[st.BlockReason] = None
     retry_class: Optional[st.RetryClass] = None
     offending_paths: Tuple[str, ...] = ()
+    #: Located `path:line:name` records for symbols the attempt defined that
+    #: nothing references. Typed rather than folded into `reason`, for the same
+    #: cause `offending_paths` is: the retry prompt has to name every one of
+    #: them, and a prose sentence a later reader has to re-parse is not a list.
+    unreferenced_symbols: Tuple[str, ...] = ()
 
     @property
     def asserts_repository_wide(self) -> bool:
@@ -233,14 +239,53 @@ def _permission_paths(permission: "wt.PermissionVerdict") -> Tuple[str, ...]:
     return tuple(permission.conjunct1_violations) + tuple(permission.conjunct2_violations)
 
 
+def pre_gate_not_falsifiable(pre_gate: GateVerdict,
+                             repairing: bool = False) -> bool:
+    """§7.4 clause 2, as the one predicate every caller asks.
+
+    The rule is unchanged for every attempt that opens at the integration
+    head: a green pre-gate cannot witness this node's behaviour, so it is
+    `GATE_NOT_FALSIFIABLE` — terminal and non-retryable, since re-running an
+    agent cannot make a gate falsifiable.
+
+    **A repair attempt is the one attempt whose base is not the head, and
+    evaluating this rule there is unsatisfiable by construction.** A repair
+    bases on the rejected attempt's *output* commit, and review only ever
+    runs on an attempt whose post-node gate already PASSED — so the tree a
+    repair starts from is one where this node's gate is green, always. Asked
+    at the repair base, clause 2 blocked every repair attempt before the
+    agent was launched, which made the repair loop unreachable and regressed
+    the node to a hard block where a fresh base had previously retried.
+
+    The witness is not re-established per attempt; it is **inherited from the
+    chain root**. A repair chain descends by construction from an attempt
+    that branched from the integration head and passed clause 2 there —
+    `decide_repair` admits a basis only over a *proven* output commit of the
+    prior attempt at a head that has not moved — so `repairing` asserts a fact
+    already established, not a fact waived. It needs no new persisted field:
+    `extra_json.repair_of.integration_head` already records the base the
+    witness was taken at, and `AttemptRecord.integration_head` already reads it.
+
+    A **red** pre-gate at a repair base is untouched: an ordinary falsifiable
+    attempt, and the caller proceeds as it does for any other. An unparseable
+    pre-gate is not this predicate's business at all — that is a fact about
+    the runner rather than about the witness, and stays ENVIRONMENTAL for
+    repair and non-repair alike (§10.2).
+    """
+    return pre_gate.green and not repairing
+
+
 def verify_agent_node(envelope_parsed: bool,
                       pre_gate: GateVerdict,
                       post_gate: GateVerdict,
-                      permission: "wt.PermissionVerdict") -> VerificationVerdict:
+                      permission: "wt.PermissionVerdict",
+                      repairing: bool = False) -> VerificationVerdict:
     """§7.3's four clauses for an agent node.
 
     1. the terminal envelope **parses** as a typed envelope (§10.1);
-    2. the **pre-node gate FAILED** at this attempt's actual base (§7.4);
+    2. the **pre-node gate FAILED** at this attempt's actual base (§7.4) —
+       or, for a repair attempt, at the base its chain root took the witness
+       at, which is what `repairing` carries (`pre_gate_not_falsifiable`);
     3. the **post-node gate PASSED** under §10.2's counting rule;
     4. the worktree delta passes §8.3's two-conjunct permission check.
 
@@ -268,7 +313,7 @@ def verify_agent_node(envelope_parsed: bool,
         return VerificationVerdict(
             verified=False, failed_clause=2, reason=pre_gate.reason,
             retry_class=st.RetryClass.ENVIRONMENTAL)
-    if pre_gate.green:
+    if pre_gate_not_falsifiable(pre_gate, repairing):
         return VerificationVerdict(
             verified=False, failed_clause=2,
             reason=("the pre-node gate passed at this attempt's base, so it "
@@ -338,6 +383,130 @@ def verify_code_node(exit_code: int,
             block_reason=st.BlockReason.CODE_NODE_NO_EFFECT)
 
     return VerificationVerdict(verified=True)
+
+
+def adjudicate_reachability(symbols: Sequence["rc.ProducedSymbol"],
+                            node_kind: st.NodeKind) -> VerificationVerdict:
+    """Refuse an attempt that shipped machinery nothing references.
+
+    `min_cases` is a floor with no ceiling: it asserts that at least N cases
+    ran and nothing asserts that what shipped beside them is reachable. An
+    observed lane merged three green attempts carrying a document-locator
+    persistence layer no path ever called, its reviewer graded the finding
+    non-blocking, and the merged surface grew past every requirement that
+    described it. The count of unreachable produced symbols is the counted
+    fact that refuses the next one — no model is asked, and §1.2 is satisfied
+    because the transition keys on that count rather than on anyone's prose.
+
+    The consequence splits by node kind for the same reason §7.5 splits the
+    permission failure. An agent is not deterministic, and a retry prompt
+    naming the symbols to remove is genuinely new instructions, so its refusal
+    is SEMANTIC. A code node's command is deterministic and re-running it
+    against an unchanged base emits the same unreachable symbols, so its
+    refusal is terminal and names the plan defect instead of a spent budget.
+    """
+    if not symbols:
+        return VerificationVerdict(verified=True)
+    located = tuple(symbol.located() for symbol in symbols)
+    reason = (f"the attempt defined {len(located)} symbol"
+              f"{'' if len(located) == 1 else 's'} nothing on the merged "
+              "surface references, from production or from a test")
+    if node_kind is st.NodeKind.CODE:
+        return VerificationVerdict(
+            verified=False, reason=reason,
+            block_reason=st.BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
+            unreferenced_symbols=located)
+    return VerificationVerdict(
+        verified=False, reason=reason,
+        retry_class=st.RetryClass.SEMANTIC,
+        unreferenced_symbols=located)
+
+
+# ── §7.4's other half: the gate must still be falsifiable *after* the work ──
+
+
+def _gate_names(relpath: str, gate_argv: Sequence[str]) -> bool:
+    """Does the gate's own argv select `relpath`?
+
+    A token is compared with any `::` node-id suffix removed, because
+    `tests/t.py::TestX::test_y` selects `tests/t.py`. A token and a path match
+    when they are equal or when either is a directory prefix of the other:
+    `tests/unit` selects `tests/unit/test_x.py`, and a declared output of
+    `tests/` is selected by an argv naming a file beneath it. Both directions
+    matter and only one of them is obvious — the second is what stops a
+    broadly-declared output from being reverted out from under the very gate
+    that reads it.
+    """
+    path = relpath.strip("/")
+    for token in gate_argv:
+        candidate = str(token).split("::", 1)[0].strip("/")
+        if not candidate or candidate.startswith("-"):
+            continue
+        if candidate == path:
+            return True
+        if path.startswith(candidate + "/") or candidate.startswith(path + "/"):
+            return True
+    return False
+
+
+def outputs_unnamed_by_gate(written: Sequence[str],
+                            gate_argv: Sequence[str]) -> Tuple[str, ...]:
+    """The paths this attempt wrote that its own gate's argv does not select.
+
+    §7.4's pre-node gate proves the node's behaviour was *absent* before the
+    agent ran. It cannot prove the gate is the thing that observes it, because
+    a node's declared outputs include the test file its own gate counts: the
+    thing being satisfied is written by the thing satisfying it, and
+    `min_cases` counts cases, not assertions. Nine tests that never import the
+    production module pass the pre-gate (the file does not exist), pass the
+    post-gate (they never needed it), and merge.
+
+    The paths returned here are the other half of the node's own declaration —
+    everything it wrote that its gate does not select, which for every node in
+    a `test file + production file` plan is exactly the production file. Revert
+    those and the gate must go red. That is a count over two fields the plan
+    already carries, `outputs` and `gate`, and no model is asked anything.
+
+    `written` is the attempt's measured `added + changed`, not `node.outputs`
+    verbatim. The two agree on everything that matters and the measured form is
+    the usable one: §8.3's permission check has already proven the delta is a
+    subset of the declaration, a declared output the agent never wrote is
+    already at its base content so reverting it is a no-op, and a declaration
+    written as a glob expands here for free instead of being skipped as
+    unrevertable.
+    """
+    return tuple(rel for rel in written if not _gate_names(rel, gate_argv))
+
+
+def adjudicate_output_falsification(
+        gate: GateVerdict, reverted: Sequence[str]) -> VerificationVerdict:
+    """Refuse an attempt whose gate passes without the code it is meant to prove.
+
+    The predicate is `adjudicate_gate`'s own — the same §10.2 counting rule
+    that admitted the post-node gate, re-asked over the same selector against a
+    tree with `reverted` put back to the attempt's base. A gate that still
+    satisfies that rule with its subject removed was never observing the
+    subject, and the attempt is refused whatever the reviewer thought of it.
+
+    This is the same shape as §7.4's pre-node clause, taken from the other
+    side: clause 2 asks the gate to be red before the work exists, and this
+    asks it to be red again once the work is taken back out. Both are one
+    command, one exit, one count.
+
+    SEMANTIC, never terminal. Unlike `GATE_NOT_FALSIFIABLE`, a retry can
+    genuinely change this answer: the agent wrote the test, so new
+    instructions naming the paths its tests must exercise are new
+    instructions. It spends `semantic_ceiling` like any other content failure.
+    """
+    if not reverted or not gate.green:
+        return VerificationVerdict(verified=True)
+    return VerificationVerdict(
+        verified=False,
+        reason=("the node's gate still passed with {0} reverted to this "
+                "attempt's base — the declared tests do not exercise the code "
+                "they are supposed to prove".format(", ".join(reverted))),
+        retry_class=st.RetryClass.SEMANTIC,
+        offending_paths=tuple(reverted))
 
 
 # ── §7.3's review-node predicate lives in the review path, not here ─────────

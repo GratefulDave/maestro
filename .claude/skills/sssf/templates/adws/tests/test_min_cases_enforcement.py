@@ -95,8 +95,13 @@ class MinCasesFixture(unittest.TestCase):
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
 
         def run_gate(attempt, plan_node, phase, cancelled):
-            return gate_result(pre_passed if phase == "pre" else post_passed,
-                               label=phase)
+            if phase == "pre":
+                return gate_result(pre_passed, label=phase)
+            if phase == "falsify":
+                # §7.4's post-work half: red, so this fixture measures
+                # `min_cases` and nothing else.
+                return gate_result(False, label=phase)
+            return gate_result(post_passed, label=phase)
 
         deps = sch.SchedulerDeps(
             store=self.store, repo=repo, integration_path=integration,

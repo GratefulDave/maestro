@@ -1,0 +1,379 @@
+{
+  "schema_version": "plan-contract.v1",
+  "plan_id": "cmo-consolidation-l-r5",
+  "title": "MDL/CMO consolidation: section L phases 5 to 7, the lanes run-2a44d226e75a4be391a14f02b78a6d25 did not merge, over the merged phase 1 to 4 tree",
+  "plan_kind": "brownfield",
+  "author": {
+    "id": "claude-opus-5-dag-author",
+    "vendor": "anthropic"
+  },
+  "source_artifacts": [
+    {
+      "source_id": "src-section-l-audit",
+      "path": "docs/MDL_CMO_DATA_ARCHITECTURE_AUDIT.html",
+      "sha256": "f4490def3796b70fa55734c93b26a86ebd8418d961396ca352f80eb5031a4643",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    },
+    {
+      "source_id": "src-pdf-refetch",
+      "path": "src/lexgenius_pipeline/cli/pdf_refetch.py",
+      "sha256": "51145ee05b9bc324a9c510bad72ed1f70edd19e975b252b1f4f82149f38f6c65",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    },
+    {
+      "source_id": "src-cmo-consolidation-models",
+      "path": "src/lexgenius_pipeline/db/models/cmo_consolidation.py",
+      "sha256": "1e9df315b3605c462feb51efd8bc42d604081ede0b2e5bfa300b67893bea7b3a",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    },
+    {
+      "source_id": "src-enrichment-gate",
+      "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/enrichment_gate.py",
+      "sha256": "e7e4f28af6d1b96d3e8e6d0c3c5bc4839deacf98535baa576eed3f787f9d5dde",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    },
+    {
+      "source_id": "src-pdf-validation",
+      "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/pdf_validation.py",
+      "sha256": "05608c537359b07fdee3ccc4d763910a20dfa00b8344bedff8bd241991affe90",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    },
+    {
+      "source_id": "src-source-hierarchy",
+      "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/source_hierarchy.py",
+      "sha256": "50d61a4e7eb98c032bd5c84755452179acb0702c36d6a4fbe15d4a2c28e001dd",
+      "required": true,
+      "access": {
+        "kind": "local"
+      }
+    }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-p5-gap-policy",
+      "text": "Section L Phase 5 of the MDL/CMO consolidation plan. Add src/lexgenius_pipeline/ingestion/judicial/cmo/gap_policy.py querying, for each unresolved or missing CMO, PTO or PPO candidate, in this order: district court, then CourtListener lead, then GovInfo, then third party, then CourtListener JPML. It stops at the first source yielding a provider observation and retrieves a PDF only if no existing locator or hash exists. PacerDockets and ordinary PACER filings are excluded as a separate normal-filing workstream. It persists a per-source cursor, the last successful entry and date, a failure count, the next retry, and the source response fingerprint, and emits a gap report separating not_found, known_paid_source, blocked, retryable and complete. This lane depends on both Phase 4 lanes, whose Exit is: all documents are validated, metadata_unverified, conflicted, or unresolved; 423 existing unresolved rows are triaged rather than re-downloaded blindly. It drives injected fake sources and an injected fake retrieval client, so no query and no retrieval leaves the gate. No production migration, object mutation, or backfill execution is authorized against a real source, bucket or database: the lane produces code and tests only, and its gate runs entirely against the in-memory SQLite session fixture and those injected fakes. At least 9 test functions.",
+      "source_ids": [
+        "src-cmo-consolidation-models",
+        "src-enrichment-gate",
+        "src-pdf-refetch",
+        "src-pdf-validation",
+        "src-section-l-audit",
+        "src-source-hierarchy"
+      ],
+      "surface": [
+        {
+          "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/gap_policy.py",
+          "mutation": "written"
+        },
+        {
+          "path": "tests/unit/ingestion/test_cmo_gap_policy.py",
+          "mutation": "written"
+        },
+        {
+          "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/pdf_validation.py",
+          "mutation": "unmodified"
+        },
+        {
+          "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/enrichment_gate.py",
+          "mutation": "unmodified"
+        },
+        {
+          "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/source_hierarchy.py",
+          "mutation": "unmodified"
+        },
+        {
+          "path": "src/lexgenius_pipeline/cli/pdf_refetch.py",
+          "mutation": "unmodified"
+        },
+        {
+          "path": "src/lexgenius_pipeline/db/models/cmo_consolidation.py",
+          "mutation": "unmodified"
+        }
+      ],
+      "effects": [
+        {
+          "effect": "canonical_object_write",
+          "disposition": "none"
+        },
+        {
+          "effect": "source_object_delete",
+          "disposition": "none"
+        },
+        {
+          "effect": "catalog_projection_write",
+          "disposition": "none"
+        },
+        {
+          "effect": "source_backfill",
+          "disposition": "fake_only"
+        },
+        {
+          "effect": "migration_execution",
+          "disposition": "none"
+        }
+      ]
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim-p5-gap-policy",
+      "kind": "static_artifact_contract",
+      "subject": "tests/unit/ingestion/test_cmo_gap_policy.py",
+      "predicate": "exercises",
+      "object": "The new module drives fake sources and asserts the five-step query order, that the walk stops at the first provider observation, that no PDF is retrieved when a locator or hash exists, that PacerDockets and ordinary PACER filings are excluded, that the cursor persists the last successful entry and date, that a failure increments the count and sets the next retry, that the response fingerprint is recorded, that the report emits exactly the five statuses, and that a second incremental run repeats no full historical scan. Nine behaviours, floor 9.",
+      "polarity": "positive",
+      "source_requirement_ids": [
+        "req-p5-gap-policy"
+      ],
+      "source_ids": [
+        "src-pdf-refetch",
+        "src-source-hierarchy"
+      ],
+      "value": 9,
+      "unit": "test functions minimum",
+      "verifier_ids": [
+        "verify-p5-gap-policy"
+      ],
+      "rendered_binding_ids": [
+        "bind-claim-p5-gap-policy"
+      ],
+      "mutation_kinds": [
+        "actor-replacement",
+        "predicate-replacement",
+        "object-replacement",
+        "polarity-inversion",
+        "value-replacement",
+        "unit-replacement"
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "fx-source-hierarchy-tiers",
+      "source_id": "src-source-hierarchy",
+      "path": "src/lexgenius_pipeline/ingestion/judicial/cmo/source_hierarchy.py",
+      "record_selector": "line 68 source_tier",
+      "observed_value": "def source_tier(source: MdlSource) -> int:",
+      "producer_metadata": {
+        "model": "MdlSource"
+      },
+      "meaning": "The pipeline already ranks CMO sources into tiers.",
+      "consumer_obligation": "The gap policy queries district court, then CourtListener lead, then GovInfo, then third party, then CourtListener JPML, and stops at the first provider observation.",
+      "prohibited_behavior": "PacerDockets and ordinary PACER filings must not enter this policy.",
+      "seam_ids": [
+        "seam-p5-gap-policy"
+      ],
+      "affected_lane_ids": [
+        "lane-p5-gap-policy"
+      ],
+      "verifier_ids": [
+        "verify-p5-gap-policy"
+      ]
+    },
+    {
+      "fixture_id": "fx-refetch-source-walk",
+      "source_id": "src-pdf-refetch",
+      "path": "src/lexgenius_pipeline/cli/pdf_refetch.py",
+      "record_selector": "module docstring, hierarchy walk",
+      "observed_value": "district court parser → govinfo_search → courtlistener → nighgoldenberg → mdlcentrality",
+      "producer_metadata": {
+        "console_script": "pdf-refetch"
+      },
+      "meaning": "pdf_refetch already walks the source hierarchy for rows whose S3 object is missing or a stub.",
+      "consumer_obligation": "The gap policy must add the persisted cursor, last successful entry and date, failure count, next retry, and source response fingerprint that pdf_refetch does not keep.",
+      "prohibited_behavior": "A full historical scan must not repeat during an incremental run.",
+      "seam_ids": [
+        "seam-p5-gap-policy"
+      ],
+      "affected_lane_ids": [
+        "lane-p5-gap-policy"
+      ],
+      "verifier_ids": [
+        "verify-p5-gap-policy"
+      ]
+    }
+  ],
+  "seams": [
+    {
+      "seam_id": "seam-p5-gap-policy",
+      "producer": "the gap report and source_sync_cursor rows",
+      "consumer": "the projections, which materialize only what the gap report marks complete",
+      "contract": "Candidates are queried in the fixed source order, a PDF is retrieved only with no existing locator or hash, cursors persist, and the gap report carries exactly the five statuses.",
+      "requirement_ids": [
+        "req-p5-gap-policy"
+      ],
+      "source_ids": [
+        "src-pdf-refetch",
+        "src-source-hierarchy"
+      ],
+      "fixture_ids": [
+        "fx-source-hierarchy-tiers",
+        "fx-refetch-source-walk"
+      ],
+      "claim_ids": [
+        "claim-p5-gap-policy"
+      ],
+      "verifier_ids": [
+        "verify-p5-gap-policy"
+      ]
+    }
+  ],
+  "lanes": [
+    {
+      "lane_id": "lane-p5-gap-policy",
+      "title": "Add the source-cost gap policy with per-source cursors and the gap report that separates not_found, known_paid_source, blocked, retryable and complete",
+      "execution_context": ".",
+      "requirement_ids": [
+        "req-p5-gap-policy"
+      ],
+      "claim_ids": [
+        "claim-p5-gap-policy"
+      ],
+      "seam_ids": [
+        "seam-p5-gap-policy"
+      ],
+      "fixture_ids": [
+        "fx-source-hierarchy-tiers",
+        "fx-refetch-source-walk"
+      ],
+      "verifier_ids": [
+        "verify-p5-gap-policy"
+      ],
+      "depends_on": []
+    }
+  ],
+  "verifiers": [
+    {
+      "verifier_id": "verify-p5-gap-policy",
+      "lane_ids": [
+        "lane-p5-gap-policy"
+      ],
+      "requirement_ids": [
+        "req-p5-gap-policy"
+      ],
+      "source_ids": [
+        "src-pdf-refetch",
+        "src-source-hierarchy"
+      ],
+      "fixture_ids": [
+        "fx-source-hierarchy-tiers",
+        "fx-refetch-source-walk"
+      ],
+      "seam_ids": [
+        "seam-p5-gap-policy"
+      ],
+      "claim_ids": [
+        "claim-p5-gap-policy"
+      ],
+      "command": "python3 -m pytest tests/unit/ingestion/test_cmo_gap_policy.py",
+      "min_executed": 9,
+      "oracle": "The new module drives fake sources and asserts the five-step query order, that the walk stops at the first provider observation, that no PDF is retrieved when a locator or hash exists, that PacerDockets and ordinary PACER filings are excluded, that the cursor persists the last successful entry and date, that a failure increments the count and sets the next retry, that the response fingerprint is recorded, that the report emits exactly the five statuses, and that a second incremental run repeats no full historical scan. Nine behaviours, floor 9. The pipeline pyproject sets addopts to --strict-config --strict-markers with pythonpath src, so a collection count needs no override. Enumeration at commit d2a7456: python3 -m pytest --collect-only -q tests/unit/ingestion/test_cmo_gap_policy.py prints \"ERROR: file or directory not found: tests/unit/ingestion/test_cmo_gap_policy.py\" and \"no tests collected\", because the file does not exist yet, which is unbuilt work rather than baseline-red; the same invocation after the lane must collect at least 9 items.",
+      "falsifiability": {
+        "mutation": "query GovInfo before CourtListener lead, or retrieve a PDF when a readable locator already exists",
+        "expected_failure": "the source-order case and the no-redundant-retrieval case fail"
+      },
+      "independent": true
+    }
+  ],
+  "traceability": [
+    {
+      "requirement_id": "req-p5-gap-policy",
+      "lane_ids": [
+        "lane-p5-gap-policy"
+      ],
+      "verifier_ids": [
+        "verify-p5-gap-policy"
+      ],
+      "claim_ids": [
+        "claim-p5-gap-policy"
+      ],
+      "source_ids": [
+        "src-cmo-consolidation-models",
+        "src-enrichment-gate",
+        "src-pdf-refetch",
+        "src-pdf-validation",
+        "src-section-l-audit",
+        "src-source-hierarchy"
+      ]
+    }
+  ],
+  "rendered_bindings": [
+    {
+      "binding_id": "bind-claim-p5-gap-policy",
+      "claim_id": "claim-p5-gap-policy",
+      "element_id": "claim-p5-gap-policy",
+      "text": "tests/unit/ingestion/test_cmo_gap_policy.py exercises The new module drives fake sources and asserts the five-step query order, that the walk stops at the first provider observation, that no PDF is retrieved when a locator or hash exists, that PacerDockets and ordinary PACER filings are excluded, that the cursor persists the last successful entry and date, that a failure increments the count and sets the next retry, that the response fingerprint is recorded, that the report emits exactly the five statuses, and that a second incremental run repeats no full historical scan. Nine behaviours, floor 9..",
+      "text_sha256": "d74ac6afde0844b0664f4f106db9fefbf61c43cc5655bd0e2989c26e6b35e988",
+      "claim_sha256": "449067f63b800b1f68bfe23a4cf33a862ac127a8f7718e04a9ff5d532ff3475b"
+    }
+  ],
+  "links": [
+    {
+      "link_id": "link-postgres-writer-cmo-repo",
+      "source_path": "src/lexgenius_pipeline/ingestion/judicial/cmo/postgres_writer.py",
+      "href": "../../../db/repositories/cmo_repo.py",
+      "canonical_target": "src/lexgenius_pipeline/db/repositories/cmo_repo.py"
+    }
+  ],
+  "approval": {
+    "required": true,
+    "receipt_path": "cmo-consolidation-l-r5.plan-review.json"
+  },
+  "extensions": {
+    "maestro": {
+      "repo": "lexgenius-pipeline",
+      "outputs": {
+        "lane-p5-gap-policy": [
+          "src/lexgenius_pipeline/ingestion/judicial/cmo/gap_policy.py",
+          "tests/unit/ingestion/test_cmo_gap_policy.py"
+        ]
+      },
+      "integration_branch": "integration/cmo-consolidation-l-r5",
+      "integration_gate": {
+        "runner": "pytest",
+        "argv": [
+          "tests/unit/ingestion/test_cmo_gap_policy.py"
+        ],
+        "cwd": ".",
+        "min_cases": 9
+      },
+      "prohibited_effects": [
+        {
+          "effect": "canonical_object_write",
+          "meaning": "Writing or server-side copying a PDF to the canonical object key s3://lexgenius-dockets/case-management-orders/sha256/{first2}/{sha256}.pdf. Section L Phase 1: \"Write every in-scope CMO/PTO/PPO PDF's canonical object to s3://lexgenius-dockets/case-management-orders/sha256/{first2}/{sha256}.pdf. For a readable existing S3 object, first verify/read and hash it, then server-side copy it to this canonical key\"; prohibited by the closing line's \"object mutation\" and Phase 1 Exit's \"no legacy object/DynamoDB write changes\"."
+        },
+        {
+          "effect": "source_object_delete",
+          "meaning": "Deleting, moving or replacing an original source object. Section L Phase 1: \"preserve its original bucket/key/version as a source locator and never delete, move, or replace it during reconciliation\"; Phase 3: \"Never delete duplicate S3 objects in this phase; mark survivor locator and orphan candidates after durable reference counts prove zero live readers\"; Phase 7: \"Do not delete either legacy DynamoDB data or legacy S3 objects without separate approval\"."
+        },
+        {
+          "effect": "catalog_projection_write",
+          "meaning": "Writing the DynamoDB catalog or compatibility projection. Section L Phase 6: \"materialize DynamoDB MDLDocumentCatalog as the terminal CMO/PTO/PPO catalog projection. Write one SUMMARY record plus resolved catalog rows per MDL\", and the shadow \"CaseManagementOrdersV2 compatibility projection\"; prohibited by Phase 1 Exit's \"no legacy object/DynamoDB write changes\"."
+        },
+        {
+          "effect": "source_backfill",
+          "meaning": "Retrieving a source artifact the system does not already hold, under the source-cost policy. Section L Phase 2: \"Backfill a non-S3 record only after no readable S3 locator is verified, according to the source-cost policy\"; Phase 5: \"Stop at the first source yielding a provider observation and only retrieve a PDF if no existing locator/hash exists\"; prohibited by the closing line's \"backfill execution\"."
+        },
+        {
+          "effect": "migration_execution",
+          "meaning": "Executing a schema migration against a deployed database. Section L Phase 1: \"Add migrations for content_blob, source_observation, document_locator, ingestion_run, source_sync_cursor, validation_result, and dedup_decision\", whose Exit is only \"migrations applied locally\"; prohibited by the closing line: \"No production migration, object mutation, or backfill execution is authorized by this plan.\""
+        }
+      ]
+    }
+  }
+}
