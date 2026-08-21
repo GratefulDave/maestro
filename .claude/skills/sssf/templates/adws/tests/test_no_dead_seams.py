@@ -213,21 +213,6 @@ ALLOWED: Dict[str, str] = {
     "FailureSignal.code_effect": "DEFERRED: launcher-classification lane",
     "CodeEffect.exit_zero": "DEFERRED: launcher-classification lane",
 
-    # The finalization window's two failed-review deadlines (#89). Both branch
-    # in production and both are reachable there — on their dataclass default,
-    # which is the whole design: an installation's `maestro.config.yaml`
-    # predates them, and a key that had to be present would refuse to start
-    # every existing deployment. What has no production writer is the operator
-    # *override*: `maestro.py` builds `FinalizationConfig` from `args` and
-    # passes neither, so no config value can currently reach either field.
-    # That wiring is a maestro.py change and is tracked as #100, where the two
-    # flags have to land on the tuning side of `_RUN_TUNING_OPTIONS`.
-    "FinalizationConfig.start_deadline_s": "DEFERRED #100: reachable on its "
-                                           "default; the operator override "
-                                           "needs a maestro.py writer",
-    "FinalizationConfig.quiescence_confirm_s": "DEFERRED #100: reachable on its "
-                                               "default; the operator override "
-                                               "needs a maestro.py writer",
 
     # Constructor slots whose every production call site is `lambda ...: None`.
     # The field check cannot see these: the lambda *is* a writer. Naming them

@@ -910,6 +910,8 @@ _RUN_TUNING_OPTIONS: Dict[str, str] = {
     "--backstop-t-s": "backstop_t_s",
     "--semantic-ceiling": "semantic_ceiling",
     "--review-ceiling": "review_ceiling",
+    "--review-start-deadline-s": "review_start_deadline_s",
+    "--review-quiescence-confirm-s": "review_quiescence_confirm_s",
     "--environmental-retries": "environmental_retries",
     "--launcher-retries": "launcher_retries",
     "--credential-retries": "credential_retries",
@@ -1716,7 +1718,17 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                 config=finalization_window.FinalizationConfig(
                     finalization_timeout_s=args.review_timeout_s,
                     turn_timeout_s=args.reviewer_turn_timeout_s,
-                    poll_interval_s=args.reviewer_poll_interval_s),
+                    poll_interval_s=args.reviewer_poll_interval_s,
+                    start_deadline_s=(
+                        args.review_start_deadline_s
+                        if getattr(args, "review_start_deadline_s", None)
+                        is not None
+                        else finalization_window.DEFAULT_START_DEADLINE_S),
+                    quiescence_confirm_s=(
+                        args.review_quiescence_confirm_s
+                        if getattr(args, "review_quiescence_confirm_s", None)
+                        is not None
+                        else finalization_window.DEFAULT_QUIESCENCE_CONFIRM_S)),
                 launch=launch_reviewer, poll_report=poll_report,
                 record_reviewer_session=lambda _s: None,
                 kill=kill_reviewer,
@@ -5985,6 +5997,8 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-model")
     parser.add_argument("--agent-effort")
     parser.add_argument("--agent-profile")
+    parser.add_argument("--review-start-deadline-s", type=float)
+    parser.add_argument("--review-quiescence-confirm-s", type=float)
     parser.add_argument("--route-receipt", action="append")
     parser.add_argument("--route-verify-key", action="append")
 
