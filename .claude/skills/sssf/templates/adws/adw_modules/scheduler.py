@@ -1276,25 +1276,28 @@ class Scheduler:
         """
         store = self.deps.store
         repo = Path(self.deps.repo)
-        attempts = store.attempts_for(self.run_id, node.node_id)
+        attempts = tuple(store.attempts_for(self.run_id, node.node_id))
         prior = max(attempts, key=lambda row: row.attempt_no, default=None)
+        subject = rp.repair_subject(attempts)
+        prove = subject if subject is not None else prior
         rejected_ref_sha: Optional[str] = None
         output_proven = False
-        if prior is not None:
+        if prove is not None:
             rejected_ref_sha = wt.attempt_ref_commit(
-                repo, self.run_id, node.node_id, prior.attempt_no)
-            rejected_sha = (prior.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
+                repo, self.run_id, node.node_id, prove.attempt_no)
+            rejected_sha = (prove.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
             if isinstance(rejected_sha, str) and rejected_sha:
                 output_proven = wt.is_attempt_output_commit(
                     repo, rejected_sha, run_id=self.run_id,
-                    node_id=node.node_id, attempt_no=prior.attempt_no,
-                    expected_base=prior.base_sha)
+                    node_id=node.node_id, attempt_no=prove.attempt_no,
+                    expected_base=prove.base_sha)
         return rp.decide_repair(rp.RepairFacts(
             integration_head=head,
             prior=prior,
             rejected_ref_sha=rejected_ref_sha,
             output_proven=output_proven,
-            repaired_findings=rp.repaired_findings_count(attempts, prior)))
+            repaired_findings=rp.repaired_findings_count(attempts, subject),
+            attempts=attempts))
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
@@ -1534,6 +1537,22 @@ class Scheduler:
             self._settle_verdict(node, verdict, execution, record)
             return
 
+        if basis is not None and measured.is_empty:
+            # #113: an empty repair mints no new sha. Classified rather than
+            # committed, so review_digest cannot key a byte-identical tree
+            # under a new commit and re-ask the reviewer. Non-repair empty
+            # deltas still go through commit_measured_delta unchanged.
+            self._settle_context(context)
+            self._settle_verdict(
+                node,
+                vf.VerificationVerdict(
+                    verified=False,
+                    reason=rp.REPAIR_DIFF_EMPTY,
+                    retry_class=st.RetryClass.SEMANTIC),
+                execution, record,
+                extra_facts={rp.REPAIR_DIFF_EMPTY_KEY: True})
+            return
+
         with self._lock:
             self._require_running(record)
             output_sha = wt.commit_measured_delta(
@@ -1704,20 +1723,17 @@ class Scheduler:
 
         The check has no subject when every path the attempt wrote is selected
         by the node's own gate — a node that produced nothing but the files its
-        gate counts. That shape is the defect in its purest form and is
-        **reported, not refused**: no plan this runtime has executed contains
-        one, so a refusal would be a rule with no measured case behind it, and
-        this design does not ship those (§16.3).
+        gate counts. That is a count (`len(unnamed) == 0`), the same hollow
+        class `TESTS_HOLLOW_AT_PARENT` convicts for tests nodes. Refused as
+        SEMANTIC, never reported as `verified=True` (#123). Tests nodes do
+        not reach this method.
         """
         argv = tuple(node.gate_command)[1:]
         written = wt.paths_written_since(attempt, falsify_base)
         unnamed = vf.outputs_unnamed_by_gate(written, argv)
         if not unnamed:
-            self._report_hygiene(node.node_id, (
-                "falsification-unrevertable: every path this node wrote is "
-                "selected by the node's own gate, so the gate could not be "
-                "re-asked without its subject",))
-            return vf.VerificationVerdict(verified=True)
+            return vf.adjudicate_output_falsification(
+                vf.GateVerdict(green=False, unparseable=False, counts=None), ())
         reverted = wt.revert_paths_to(attempt, falsify_base, unnamed)
         try:
             result = self.deps.run_gate(
@@ -1978,13 +1994,10 @@ class Scheduler:
         """Turn a failed VERIFIED predicate into a classification (§7.5).
 
         `extra_facts` is merged onto the failing attempt's row beside the
-        guidance entry. Exactly one caller passes it and it carries exactly one
-        fact: the output commit of an attempt that failed §7.4's post-work
-        falsification refusal, which reached that failure with a sealed commit
-        in hand. `decide_repair` proves the repair basis against that commit,
-        so an attempt that failed without recording it is re-implemented from
-        the integration head rather than repaired — which is the discard §7.5's
-        repair chain exists to prevent.
+        guidance entry. Two callers pass it. Falsification refusal carries
+        the sealed output commit `decide_repair` proves against. Empty
+        repair carries `REPAIR_DIFF_EMPTY_KEY`, so `repair_subject` can
+        walk past a row that minted no tree.
         """
         if verdict.block_reason is not None:
             self._settle_failure(

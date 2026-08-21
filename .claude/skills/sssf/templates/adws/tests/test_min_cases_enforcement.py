@@ -92,6 +92,11 @@ class MinCasesFixture(unittest.TestCase):
 
         def run_node(attempt, plan_node, record, retry_prompt, on_launch, cancelled):
             on_launch(None)
+            # Write the declared output so falsification has a subject. A
+            # node that writes nothing used to merge as verified (#123).
+            # No definitions: #118 refuses an unreferenced produced symbol.
+            rel = plan_node.outputs[0]
+            (attempt.path / rel).write_text("# subject\n")
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
 
         def run_gate(attempt, plan_node, phase, cancelled):

@@ -929,7 +929,9 @@ def commit_measured_delta(attempt: AttemptWorktree, measured: InventoryDelta,
     construction rather than by hygiene: the merge consumes committed objects.
 
     A node with an empty delta commits an empty commit on purpose, so every
-    node has an output SHA and the merge guard stays uniform (§8.4).
+    node has an output SHA and the merge guard stays uniform (§8.4). A
+    *repair* attempt with an empty delta is classified before this function
+    is called, so it never mints a new sha for a byte-identical tree (#113).
     """
     if attempt.baseline is None:
         raise WorktreeError("commit_measured_delta before take_baseline")
