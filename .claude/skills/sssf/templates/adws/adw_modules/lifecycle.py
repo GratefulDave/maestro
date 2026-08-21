@@ -207,6 +207,14 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   -- invents no facts, and reading an unrecorded merge as a run-merged one
   -- would have every older row assert an evidence chain nobody checked.
   merge_cause            TEXT,
+  -- How this node reached PENDING after leaving it (`st.PendingCause`),
+  -- NULL in every other state and on a seeded PENDING that never left
+  -- the frontier. The twin of `merge_cause` one state earlier: PENDING
+  -- was one word carrying three facts (operator retry, resume reopen,
+  -- scheduler fail_attempt), and the distinction lived only in
+  -- transition prose (#103). NULL on a PENDING row written before this
+  -- column means *unrecorded*, never `SCHEDULER`.
+  pending_cause          TEXT,
   output_sha             TEXT,
   granted_extra_attempts INTEGER NOT NULL DEFAULT 0,
   -- The attempt number this node's retry-class spend is counted *from*.
@@ -353,6 +361,7 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
 _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("cancel_cause", "TEXT"),
     ("merge_cause", "TEXT"),
+    ("pending_cause", "TEXT"),
     ("retry_spend_floor", "INTEGER"),
 )
 
@@ -1636,6 +1645,7 @@ class LifecycleStore:
         detail: Optional[Mapping[str, Any]] = None,
         cancel_cause: Optional[st.CancelCause] = None,
         merge_cause: Optional[st.MergeCause] = None,
+        pending_cause: Optional[st.PendingCause] = None,
         extra_writes: Optional[Callable[[st.NodeLifecycle], Sequence[Tuple[str, Tuple]]]] = None,
     ) -> st.NodeLifecycle:
         """Guard, then write the lifecycle row, the audit row, and the run's
@@ -1687,17 +1697,25 @@ class LifecycleStore:
             # node carrying a merge cause for a merge it is no longer under.
             new_merge_cause = (merge_cause
                                if to_state is st.NodeState.MERGED else None)
+            # Scoped to PENDING exactly as the two lines above are scoped to
+            # CANCELLED and MERGED. A seeded PENDING never left the frontier
+            # and keeps NULL; a transition *to* PENDING stamps who wrote it;
+            # a transition *out* of PENDING clears the cause with the state
+            # that made it meaningful (#103).
+            new_pending_cause = (pending_cause
+                                 if to_state is st.NodeState.PENDING else None)
             now = now_iso()
             self.conn.execute(
                 "UPDATE node_lifecycle SET state=?, attempt_no=?, block_reason=?,"
                 " output_sha=?, granted_extra_attempts=?, cancel_cause=?,"
-                " merge_cause=?, updated_at=?"
+                " merge_cause=?, pending_cause=?, updated_at=?"
                 " WHERE run_id=? AND node_id=?",
                 (lifecycle.state.value, lifecycle.attempt_no,
                  lifecycle.block_reason.value if lifecycle.block_reason else None,
                  lifecycle.output_sha, lifecycle.granted_extra_attempts,
                  new_cancel_cause.value if new_cancel_cause else None,
-                 new_merge_cause.value if new_merge_cause else None, now,
+                 new_merge_cause.value if new_merge_cause else None,
+                 new_pending_cause.value if new_pending_cause else None, now,
                  run_id, node_id))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
@@ -1894,6 +1912,7 @@ class LifecycleStore:
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="scheduler",
             reason=f"retry:{retry_class.value}", require_state=(st.NodeState.RUNNING,),
+            pending_cause=st.PendingCause.SCHEDULER,
             detail=detail, extra_writes=extra)
 
     # ── run-level: cancellation, outcome, resume ────────────────────────────
@@ -2208,6 +2227,7 @@ class LifecycleStore:
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="operator",
             reason="resume:run-cancel",
+            pending_cause=st.PendingCause.OPERATOR_RESUME,
             require_state=(st.NodeState.CANCELLED,))
 
     def resume_run(self, run_id: str) -> Tuple[str, ...]:
@@ -2350,6 +2370,7 @@ class LifecycleStore:
         return self._transition_node(
             run_id, node_id, st.NodeState.PENDING, actor="scheduler",
             reason="resume:result-declared",
+            pending_cause=st.PendingCause.SCHEDULER,
             require_state=(st.NodeState.RUNNING,), extra_writes=extra)
 
     # ── operator escapes (§11.3) ────────────────────────────────────────────
@@ -2514,6 +2535,7 @@ class LifecycleStore:
             run_id, node_id, st.NodeState.PENDING, actor="operator", reason=reason,
             require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
             granted_extra_delta=delta,
+            pending_cause=st.PendingCause.OPERATOR_RETRY,
             detail=detail or None, extra_writes=extra)
 
     def _merge_evidence(self, run_id: str, node_id: str) -> MergeEvidence:
@@ -2718,11 +2740,22 @@ class NodeRow:
     #: `cancel_cause`'s are, and `st.merge_cause_label` is the one place that
     #: does it — a reader must not re-derive the pair (RC1).
     merge_cause: Optional[st.MergeCause] = None
+    #: How this node reached PENDING after leaving it (#103), and `None`
+    #: both for a node that is not PENDING, for a seeded PENDING that never
+    #: left the frontier, and for a PENDING row written before the column
+    #: existed. `st.pending_cause_label` is the one derivation — a reader
+    #: must not guess `SCHEDULER` from a NULL (RC1).
+    pending_cause: Optional[st.PendingCause] = None
 
     @property
     def merge_provenance(self) -> Optional[str]:
         """`SCHEDULER`, `OPERATOR_ACCEPTED`, `UNRECORDED`, or `None`."""
         return st.merge_cause_label(self.state, self.merge_cause)
+
+    @property
+    def pending_provenance(self) -> Optional[str]:
+        """`SCHEDULER`, `OPERATOR_RETRY`, `OPERATOR_RESUME`, or `None`."""
+        return st.pending_cause_label(self.state, self.pending_cause)
 
 
 # ── the run's live state, derived rather than remembered (§7.3, §11.2) ───────
@@ -3041,18 +3074,23 @@ class LifecycleReader:
 
     def nodes(self, run_id: str) -> Tuple[NodeRow, ...]:
         # `mode=ro`, so this reader cannot migrate a ledger that predates
-        # `merge_cause` and must not refuse to read one either — the same
-        # rule `runs()` follows for the scheduler-ownership columns. An
-        # absent column is simply not selected and reads back `None`, which
-        # `st.merge_cause_label` renders as `UNRECORDED` for a MERGED row
-        # rather than guessing `SCHEDULER`.
+        # `merge_cause` / `pending_cause` and must not refuse to read one
+        # either — the same rule `runs()` follows for the scheduler-ownership
+        # columns. An absent column is simply not selected and reads back
+        # `None`, which `st.merge_cause_label` renders as `UNRECORDED` for a
+        # MERGED row rather than guessing `SCHEDULER`, and which
+        # `st.pending_cause_label` leaves as `None` rather than guessing
+        # `SCHEDULER` for a PENDING row.
         available = set(_table_columns(self.conn, "node_lifecycle"))
         merge_cause_sql = (" l.merge_cause,"
                            if "merge_cause" in available else " NULL AS merge_cause,")
+        pending_cause_sql = (" l.pending_cause,"
+                             if "pending_cause" in available
+                             else " NULL AS pending_cause,")
         rows = self._rows(
             "SELECT d.node_id, d.kind, d.depth, d.needs_json, l.state,"
             " l.attempt_no, l.block_reason, l.output_sha,"
-            + merge_cause_sql +
+            + merge_cause_sql + pending_cause_sql +
             " l.granted_extra_attempts, l.updated_at"
             " FROM dag_nodes d JOIN node_lifecycle l"
             " ON l.run_id = d.run_id AND l.node_id = d.node_id"
@@ -3067,6 +3105,8 @@ class LifecycleReader:
                 output_sha=row["output_sha"],
                 merge_cause=(st.MergeCause(row["merge_cause"])
                              if row["merge_cause"] else None),
+                pending_cause=(st.PendingCause(row["pending_cause"])
+                               if row["pending_cause"] else None),
                 granted_extra_attempts=row["granted_extra_attempts"],
                 updated_at=row["updated_at"])
             for row in rows)

@@ -3943,6 +3943,23 @@ def _merge_cause_prefix(merge_cause: Optional[str]) -> str:
     return "output "
 
 
+def _pending_cause_detail(pending_cause: Optional[str]) -> str:
+    """What `run status` puts in DETAIL for a PENDING node that was reopened.
+
+    Seeded PENDING keeps an empty DETAIL: the node never left the frontier,
+    so there is no writer to name. A reopened PENDING used to look the same,
+    which is the defect (#103). The state stays PENDING; the column says who
+    wrote it.
+    """
+    if pending_cause == scheduler_types.PendingCause.OPERATOR_RETRY.value:
+        return "operator retry"
+    if pending_cause == scheduler_types.PendingCause.OPERATOR_RESUME.value:
+        return "operator resume"
+    if pending_cause == scheduler_types.PendingCause.SCHEDULER.value:
+        return "scheduler retry"
+    return ""
+
+
 def _merge_evidence_lines(node: Mapping[str, Any]) -> List[str]:
     """The evidence-chain reading for a node an operator accepted.
 
@@ -4088,6 +4105,11 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             # used to render identically here, which is what left the git log
             # as the only place the difference was visible (#93).
             "merge_cause": node.merge_provenance,
+            # How the node reached PENDING after leaving it: `SCHEDULER`,
+            # `OPERATOR_RETRY`, `OPERATOR_RESUME`, or `null` where the node
+            # never left the frontier or the column was never recorded.
+            # The three PENDING writers used to render identically here (#103).
+            "pending_cause": node.pending_provenance,
             # What the ledger could show about the evidence chain when the
             # operator accepted it — present only on a node `skip` wrote.
             "merge_evidence": merge_evidence.get(node.node_id),
@@ -4198,6 +4220,8 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         if live:
             detail = "in flight {}, {} turns".format(
                 _duration(live[0]["elapsed_s"]), live[0]["turn_count"])
+        elif node.get("pending_cause"):
+            detail = _pending_cause_detail(node["pending_cause"])
         elif node["output_sha"]:
             detail = "{}{}".format(_merge_cause_prefix(node["merge_cause"]),
                                    node["output_sha"][:12])
