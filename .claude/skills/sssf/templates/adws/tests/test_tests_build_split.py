@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -279,6 +280,55 @@ class PlanV3PairTests(unittest.TestCase):
         self.assertIs(kinds["build"], st.NodeKind.AGENT)
         build = next(n for n in nodes if n.node_id == "build")
         self.assertEqual(("tests",), build.needs)
+
+    def test_a_v3_plan_with_tests_nodes_still_runs_unscoped_integration_argv(self):
+        """Intersection of plan v3 and G1: tests nodes do not re-scope acceptance.
+
+        Branch 5 strips paths and `-k` from the integration gate. Branch 6
+        adds tests nodes whose files are the natural thing to name in that
+        gate. Neither lane could see the other. A v3 plan that names the
+        tests node's files (and a `-k` selector) still executes as
+        whole-tree collection, and the lane-union `specs` argument is
+        still ignored.
+        """
+        import maestro
+        from adw_modules import runner_resolution as rr
+
+        data = _pair_mapping()
+        data["merge_policy"]["integration_gate"]["argv"] = [
+            "-q", "-k", "refund", "tests/test_refund.py",
+        ]
+        plan = pm.parse_mapping(data)
+        self.assertEqual(pm.SCHEMA_V3, plan.schema_version)
+        self.assertEqual(1, len(plan.tests_nodes))
+        self.assertEqual(
+            ("-q",),
+            pm.unscoped_argv(plan.merge_policy.integration_gate.argv),
+        )
+
+        runner = rr.ResolvedRunner(
+            runner="pytest", executable="/abs/.venv/bin/pytest",
+            origin="declared", probe_exit=5, version="stub")
+        captured = {}
+
+        def fake_run(worktree_path, resolved, argv, scratch, cancel_requested,
+                     label="integration-gate"):
+            captured["argv"] = tuple(argv)
+            captured["label"] = label
+            return None
+
+        lane_union = ("tests/test_refund.py", "tests/lane_only.py")
+        with mock.patch.object(
+                maestro.worktree, "run_integration_gate", side_effect=fake_run):
+            _, run_ig = maestro._scheduler_gate_deps(plan, {"pytest": runner})
+            run_ig(Path("/tmp/integration"), lane_union, lambda: False)
+
+        self.assertEqual(captured["argv"], ("-q",))
+        self.assertNotIn("tests/test_refund.py", captured["argv"])
+        self.assertNotIn("-k", captured["argv"])
+        self.assertNotIn("refund", captured["argv"])
+        self.assertNotIn("tests/lane_only.py", captured["argv"])
+        self.assertEqual(captured["label"], "integration-gate")
 
     def test_v2_refuses_a_tests_kind(self):
         data = _pair_mapping()
