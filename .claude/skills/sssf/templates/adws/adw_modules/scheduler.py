@@ -404,12 +404,16 @@ class Scheduler:
 
     def __init__(self, run_id: str, nodes: Sequence[st.PlanNode],
                  config: st.SchedulerConfig, deps: SchedulerDeps,
-                 plan_digest: str = "") -> None:
+                 plan_digest: str = "",
+                 time_source: Callable[[], float] = time.time) -> None:
         self.run_id = run_id
         self.nodes: Dict[str, st.PlanNode] = {n.node_id: n for n in nodes}
         self.config = config
         self.deps = deps
         self.plan_digest = plan_digest
+        # Defaults to `time.time` so it matches `started_at` and
+        # `last_transition_at` (epoch seconds). Tests inject a fake.
+        self._time_source = time_source
 
         self._cancelled = threading.Event()
         #: Set beside `_cancelled`, never instead of it. The run loop's whole
@@ -983,8 +987,8 @@ class Scheduler:
         to `time.monotonic`, while the store's `last_transition_at` returns
         epoch seconds — subtracting one from the other yields a number with no
         meaning, and on this machine a large negative one, so the backstop
-        would simply never fire. The timer is therefore given `time.time`,
-        matching the column it reads.
+        would simply never fire. Both timers therefore read `self._time_source`,
+        which production defaults to `time.time`, matching the column they read.
         """
         store = self.deps.store
 
@@ -1126,14 +1130,14 @@ class Scheduler:
             declared_result_observed=declared_result_observed,
             actor_status=self.deps.actor_status,
             preserve_unpublished=preserve_unpublished,
-            time_source=time.time)
+            time_source=self._time_source)
 
         backstop = wd.RunBackstop(
             config=self.config,
             last_transition_at=lambda: store.last_transition_at(self.run_id),
             on_stuck=lambda diagnostic: None,
             diagnostic=self.status_diagnostic,
-            time_source=time.time)
+            time_source=self._time_source)
         return watchdog, backstop
 
     def status_diagnostic(self) -> str:
@@ -1881,13 +1885,14 @@ class Scheduler:
         would refuse every re-dispatch on a ledger old enough to lack it.
         Unmeasured is not zero.
 
-        `time.time()` and not `time.monotonic()`: `start_attempt` writes
+        `self._time_source()` and not a second clock: `start_attempt` writes
         `started_at` with `time.time()`, and subtracting one clock's reading
-        from another's is a number with no meaning.
+        from another's is a number with no meaning. Production therefore
+        defaults the seam to `time.time`.
         """
         if record.started_at <= 0:
             return None
-        return self.config.node_timeout_s - (time.time() - record.started_at)
+        return self.config.node_timeout_s - (self._time_source() - record.started_at)
 
     # ── settling a failed attempt ───────────────────────────────────────────
 
@@ -2443,7 +2448,7 @@ class Scheduler:
             return AcceptanceResult(
                 green=False, specs=(), reason="cancellation requested before acceptance")
         store.acceptance_started(self.run_id)
-        deadline = time.monotonic() + self.config.final_acceptance_timeout_s
+        deadline = self._time_source() + self.config.final_acceptance_timeout_s
 
         with self._lock:
             shas = {n: self._output_shas[n] for n in merged if n in self._output_shas}
@@ -2456,7 +2461,7 @@ class Scheduler:
             return AcceptanceResult(
                 green=False, specs=(), ancestry=ancestry,
                 reason="the final ancestry sweep did not re-prove every merged node")
-        if time.monotonic() > deadline:
+        if self._time_source() > deadline:
             return AcceptanceResult(green=False, specs=(), ancestry=ancestry,
                                     reason="final-acceptance timeout during the sweep")
 
@@ -2473,7 +2478,7 @@ class Scheduler:
                 green=False, specs=specs, gate=gate, ancestry=ancestry,
                 reason="cancellation requested during the final integration gate")
         verdict = vf.adjudicate_gate(gate, self.deps.integration_min_cases)
-        if time.monotonic() > deadline:
+        if self._time_source() > deadline:
             return AcceptanceResult(green=False, specs=specs, gate=gate,
                                     ancestry=ancestry,
                                     reason="final-acceptance timeout during the gate")

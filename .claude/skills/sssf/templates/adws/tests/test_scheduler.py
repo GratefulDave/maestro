@@ -54,13 +54,14 @@ from unittest import mock
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import watchdog as wd  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
-
+from test_watchdog import FakeClock  # noqa: E402
 
 # How long a test here waits for the scheduler's watchdog to *arrive* at a
 # quiescence phase. Every wait expressed in terms of this constant is a
@@ -159,6 +160,12 @@ class SchedulerFixture(unittest.TestCase):
         self.raise_for = {}        # node_id -> exception to raise, once
         self.exit_codes = {}       # node_id -> exit code for a code node
         self.quiesce_calls = []    # (attempt identity, phase) -> []
+        # Epoch-based, frozen until a test advances it. Production watchdog
+        # and backstop compare against `started_at` / `last_transition_at`
+        # (also epoch). Starting at 0.0 would silently disarm the backstop
+        # tests that backdate `last_transition_at` to 1990.
+        self.clock = FakeClock(time.time())
+
 
     def config(self, **kw) -> st.SchedulerConfig:
         base = dict(concurrency=2, node_timeout_s=60.0, turn_timeout_s=30.0,
@@ -233,9 +240,25 @@ class SchedulerFixture(unittest.TestCase):
         scheduler = sch.Scheduler(run_id=run_id, nodes=list(nodes),
                                   config=config or self.config(),
                                   deps=deps or self.deps(),
-                                  plan_digest="digest-" + run_id)
+                                  plan_digest="digest-" + run_id,
+                                  time_source=self.clock)
         self.addCleanup(scheduler.shutdown)
         return scheduler
+
+    def expire_running_attempts(self, extra_s: float, run_id: str = "run1") -> None:
+        """Jump the injected clock past every RUNNING attempt's `started_at`.
+
+        Watchdog elapsed time is `time_source() - started_at`. `started_at`
+        is the store's real epoch, so `clock.advance(timeout)` from the
+        freeze point is not enough on a slow machine: the attempt may have
+        started after the freeze by more than `timeout`. Set relative to
+        the attempt itself.
+        """
+        running = [a for a in self.store.attempts_for(run_id)
+                   if a.state is st.NodeState.RUNNING]
+        self.assertTrue(running, "no RUNNING attempt to expire")
+        latest = max(a.started_at for a in running)
+        self.clock.set(latest + extra_s)
 
     def states(self, run_id="run1"):
         return {r.node_id: r.state for r in self.store.node_records(run_id)}
@@ -734,6 +757,9 @@ class QuiescenceTests(SchedulerFixture):
         watchdog_quiesced = threading.Event()
 
         def provision(_path):
+            # The watchdog reads the injected clock. Jump past the 0.01s
+            # node timeout; do not wait it out on the machine.
+            self.expire_running_attempts(1.0)
             self.assertTrue(watchdog_quiesced.wait(ARRIVAL_TIMEOUT_S))
 
         def kill_attempt(_record):
@@ -810,11 +836,16 @@ class GenerationFenceTests(SchedulerFixture):
         def provision(path):
             provision_calls.append(path)
             if len(provision_calls) == 1:
-                # Long enough that the watchdog, not this timeout, is what
-                # releases attempt 1. The node timeout below must expire while
-                # provision is still inside this wait, or the fence under test
-                # is never exercised.
+                # The watchdog, not this wait, must release attempt 1.
+                # Jump the injected clock past node_timeout_s; waiting
+                # four real seconds is the flake this suite is closing.
+                self.expire_running_attempts(5.0)
                 self.assertTrue(watchdog_quiesced.wait(ARRIVAL_TIMEOUT_S))
+            else:
+                # Attempt 2 needs headroom. The jump above left the clock
+                # ~5s past attempt 1, which is also past attempt 2's
+                # 4s node timeout.
+                self.clock.set(time.time())
 
         def quiesce(record, phase):
             if phase == "watchdog":
