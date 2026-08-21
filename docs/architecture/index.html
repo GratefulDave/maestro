@@ -372,7 +372,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Plan ship flowchart</h3>
               </div>
-              <p>Plan ship: author, validate, finalize to a signed PASS or FAIL receipt.</p>
+              <p>Plan ship: author, validate, finalize — a signed PASS receipt on validation alone.</p>
             </a>
           </li>
           <li>
@@ -383,6 +383,26 @@
                 <h3>Operator escape flowchart</h3>
               </div>
               <p>Escapes from BLOCKED: retry, skip --accept-sha, and abandon.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="33-flow-commit.html">
+              <p class="card-file">33-flow-commit.html</p>
+              <div class="card-header">
+                <span class="card-dot link" aria-hidden="true"></span>
+                <h3>Pre-commit refusal flowchart</h3>
+              </div>
+              <p>Two counted refusals over the measured delta before the commit is taken.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="34-flow-repair-chain.html">
+              <p class="card-file">34-flow-repair-chain.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Repair chain flowchart</h3>
+              </div>
+              <p>A repair inherits its falsifiability witness from the chain root, bounded by REPAIR_CHAIN_LIMIT.</p>
             </a>
           </li>
         </ul>
@@ -427,7 +447,7 @@
 
     <footer class="footer">
       <a href="../index.html">Maestro docs home</a>
-      <span>15 diagrams · Architecture gallery</span>
+      <span>17 diagrams · Architecture gallery</span>
     </footer>
   </div>
 </body>
