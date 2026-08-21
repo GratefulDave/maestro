@@ -739,6 +739,25 @@ def _remove_acceptance_path(checkout: Path) -> None:
         raise CleanupError("cannot remove partial acceptance checkout: {0}".format(exc))
 
 
+def _unforced_worktree_remove(source: Path, checkout: Path) -> None:
+    """Remove a registered acceptance worktree without ``--force``.
+
+    Git's refusal is the in-use check: dirty or locked content stays, and
+    the error names what should not have been there. ``--force`` followed
+    by ``rmtree`` was the silent data-loss path #98 records.
+
+    Write bits are restored first so a *clean* read-only checkout can be
+    deleted; they do not make a dirty tree look clean.
+    """
+    if checkout.exists():
+        _checkout_writable_for_removal(checkout)
+    result = _git(source, "worktree", "remove", str(checkout))
+    if result.returncode:
+        raise CleanupError(_git_error(
+            source, ("worktree", "remove", str(checkout)), result))
+
+
+
 def reclaim_acceptance(run_id: str, workspace: wm.WorkspacePlan,
                       repository_paths: Mapping[str, Path],
                       state_root: Path) -> None:
@@ -747,6 +766,13 @@ def reclaim_acceptance(run_id: str, workspace: wm.WorkspacePlan,
     Only declared acceptance checkout paths are removed.  A missing linked
     worktree is reconciled by deleting its own Git administration directory,
     never by a broad ``git worktree prune`` that could affect candidates.
+
+    This module owns filesystem and Git state only; the coordinator that
+    calls this is still inside the same live run, so "the run is over" is
+    the wrong in-use predicate — it would refuse the rebuild this function
+    exists for. In-use is git's own refusal of an unforced
+    ``worktree remove``: dirty or locked content is reported rather than
+    destroyed. ``--force`` is how #88's class of silent data loss happens.
     """
     _, root = _acceptance_root(state_root, run_id, CleanupError)
     source_by_id = {}
@@ -772,11 +798,7 @@ def reclaim_acceptance(run_id: str, workspace: wm.WorkspacePlan,
         registered = set(_registered_worktrees(source))
         if checkout.resolve() in registered:
             if checkout.exists():
-                _checkout_writable_for_removal(checkout)
-                removed = _git(source, "worktree", "remove", "--force", str(checkout))
-                if removed.returncode:
-                    _remove_acceptance_path(checkout)
-                    _remove_stale_worktree_registration(source, checkout)
+                _unforced_worktree_remove(source, checkout)
             else:
                 _remove_stale_worktree_registration(source, checkout)
         elif checkout.exists():
@@ -791,9 +813,11 @@ def reclaim_acceptance(run_id: str, workspace: wm.WorkspacePlan,
     if not root.exists():
         return
     try:
+        _checkout_writable_for_removal(root)
         shutil.rmtree(str(root))
     except OSError as exc:
         raise CleanupError("cannot remove acceptance root: {0}".format(exc))
+
 
 def run_global_gates(
         acceptance: AcceptanceWorkspace,
@@ -853,7 +877,15 @@ def run_global_gates(
 
 
 def cleanup_acceptance(acceptance: AcceptanceWorkspace) -> None:
-    """Remove only this deterministic acceptance object's detached worktrees."""
+    """Remove only this deterministic acceptance object's detached worktrees.
+
+    Possession of the ``AcceptanceWorkspace`` object is how the caller
+    names *which* tree. Whether that tree is still in use is git's: an
+    unforced ``worktree remove`` refuses dirty or locked content instead
+    of destroying it. The coordinator invokes this after the gates of
+    *this* run, so consulting ``runs.latest_outcome`` would be the wrong
+    predicate — the run is live by construction.
+    """
     if not isinstance(acceptance, AcceptanceWorkspace):
         raise CleanupError("cleanup requires an AcceptanceWorkspace")
     declared_root = Path(acceptance.root)
@@ -880,15 +912,12 @@ def cleanup_acceptance(acceptance: AcceptanceWorkspace) -> None:
         except RepositoryPathError as exc:
             raise CleanupError(str(exc))
         if checkout_path.exists():
-            _checkout_writable_for_removal(checkout_path)
-            result = _git(source_path, "worktree", "remove", "--force", str(checkout_path))
-            if result.returncode:
-                raise CleanupError(_git_error(
-                    source_path,
-                    ("worktree", "remove", "--force", str(checkout_path)), result))
+            _unforced_worktree_remove(source_path, checkout_path)
         else:
             _remove_stale_worktree_registration(source_path, checkout_path)
     try:
+        _checkout_writable_for_removal(root)
         shutil.rmtree(str(root))
     except OSError as exc:
         raise CleanupError("cannot remove acceptance root: {0}".format(exc))
+
