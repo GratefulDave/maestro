@@ -378,6 +378,14 @@ export interface MaestroTransition {
   detail: Record<string, unknown>;
 }
 
+/** One blocking finding copied from ``attempts.extra_json.guidance.findings``. */
+export interface MaestroReviewFinding {
+  check_id: string;
+  object_id: string;
+  message: string;
+  blocking: boolean;
+}
+
 export interface MaestroAttempt {
   node_id: string;
   attempt_no: number;
@@ -397,6 +405,12 @@ export interface MaestroAttempt {
   /** The structured verdict recorded against this attempt's failure, if any. */
   verdict: string | null;
   transitions: MaestroTransition[];
+  /**
+   * Blocking review findings on this attempt. Empty when the reviewer
+   * agreed, when the attempt was never reviewed, or when every stored
+   * finding was advisory. Never fails the attempt — visibility only.
+   */
+  review_findings: MaestroReviewFinding[];
 }
 
 export interface MaestroNode {

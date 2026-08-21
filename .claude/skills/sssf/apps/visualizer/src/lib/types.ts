@@ -30,6 +30,7 @@ export type {
   MaestroRunDetail,
   MaestroNode,
   MaestroAttempt,
+  MaestroReviewFinding,
   MaestroTransition,
   MaestroResult,
   MaestroIntegration,

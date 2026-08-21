@@ -45,6 +45,7 @@ from adw_modules import publication
 from adw_modules import receipt_crypto
 from adw_modules import retry_policy
 from adw_modules import review_convergence
+from adw_modules import review_findings
 from adw_modules import route_admission
 from adw_modules import route_receipts
 from adw_modules import scheduler
@@ -865,7 +866,7 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 #: receipt or launches anything, so none of them needs key material — asking
 #: `run status` for a signing seed is how a read verb becomes unusable on a
 #: machine that merely wants to watch a run.
-_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence")
+_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence", "findings")
 
 #: Flags that select *which* run to read and how to print it. They are the only
 #: flags a configured run verb accepts, because they override no derived path;
@@ -3907,6 +3908,10 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             "session_path": attempt.extra.get(watchdog.SESSION_PATH_KEY),
             "verdict": _attempt_verdict(entries),
             "transitions": entries,
+            "review_findings": [
+                finding.as_dict()
+                for finding in review_findings.blocking_findings_from_extra(
+                    attempt.extra)],
         }
         by_node.setdefault(attempt.node_id, []).append(projected)
         if running:
@@ -3977,6 +3982,12 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
         "integration": integration,
         "in_flight": in_flight,
         "nodes": projected_nodes,
+        "review_findings": [
+            node.as_dict()
+            for node in review_findings.run_findings(
+                record.run_id, nodes, attempts,
+                declared_outcome=(record.latest_outcome.value
+                                  if record.latest_outcome else None)).nodes],
         "results": [
             {"node_id": row.get("node_id"), "attempt_no": row.get("attempt_no"),
              "adjudication": row.get("adjudication"),
@@ -3996,6 +4007,10 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         "" if declared is None
         else "   (last declared outcome {} at {})".format(
             declared, progress["declared_outcome_at"])))
+    findings = progress.get("review_findings") or []
+    if findings:
+        lines.append("  findings     {} merged node{} carried rejecting findings".format(
+            len(findings), "" if len(findings) == 1 else "s"))
     lines.append("  plan digest  {}".format(progress["plan_digest"]))
     lines.append("  started      {}   ({} ago)".format(
         progress["created_at"], _duration(progress["elapsed_s"])))
@@ -4041,6 +4056,19 @@ def _render_progress(progress: Dict[str, Any]) -> str:
                                    node["output_sha"][:12])
         lines.append("  {:<44} {:<10} {:>8}  {}".format(
             node["node_id"][:44], node["state"], node["attempt_no"], detail))
+    if findings:
+        lines.append("")
+        lines.append("  rejecting findings on merged nodes")
+        for node in findings:
+            lines.append("  {}  a{}  {} blocking".format(
+                node["node_id"], node["attempt_no"],
+                len(node.get("findings") or ())))
+            for finding in node.get("findings") or ():
+                lines.append("    {}  {}".format(
+                    finding.get("check_id") or "",
+                    finding.get("object_id") or ""))
+                if finding.get("message"):
+                    lines.append("      {}".format(finding["message"]))
 
     for node in progress["nodes"]:
         if not node["attempts"]:
@@ -4058,6 +4086,10 @@ def _render_progress(progress: Dict[str, Any]) -> str:
             if attempt["session_path"]:
                 lines.append("         session: {}".format(
                     attempt["session_path"]))
+            for finding in attempt.get("review_findings") or ():
+                lines.append("         finding: {}  {}".format(
+                    finding.get("check_id") or "",
+                    finding.get("object_id") or ""))
         if node["block_reason"]:
             lines.append("    BLOCKED: {}".format(node["block_reason"]))
         for line in _merge_evidence_lines(node):
@@ -4172,6 +4204,39 @@ def _run_convergence(args: argparse.Namespace) -> int:
     else:
         print(review_convergence.render(profile))
     return 0
+
+
+def _run_findings(args: argparse.Namespace) -> int:
+    """Merged nodes that carried rejecting findings, for any run the ledger holds.
+
+    The scheduler prints ``review_findings`` once, in the process-exit JSON.
+    After that process is gone the findings still sit on the attempt row and
+    on disk, and nothing read them — so a run could declare ACCEPTED with
+    BLOCKING findings on every merged lane and an operator the next morning
+    had no verb that would say so.
+
+    Same reader, same tables, same query path as ``run status`` (§10.6). It
+    writes nothing and decides nothing; the ledger it opens is ``mode=ro``.
+    Findings never fail an attempt, block a node, or stop a merge (§19 M35).
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        record = _select_run(reader, args)
+        profile = review_findings.run_findings(
+            record.run_id, reader.nodes(record.run_id),
+            reader.attempts(record.run_id),
+            declared_outcome=(record.latest_outcome.value
+                              if record.latest_outcome else None))
+    finally:
+        reader.close()
+    if getattr(args, "as_json", False):
+        print(json.dumps(profile.as_dict(), sort_keys=True))
+    else:
+        print(review_findings.render(profile))
+    return 0
+
 
 
 def _run_pause(args: argparse.Namespace) -> int:
@@ -6148,6 +6213,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_selection(convergence)
     _add_db(convergence)
     convergence.set_defaults(handler=_run_convergence)
+    findings_cmd = run_sub.add_parser("findings")
+    findings_cmd.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    _add_run_selection(findings_cmd)
+    _add_db(findings_cmd)
+    findings_cmd.set_defaults(handler=_run_findings)
 
     def _positive_grant(value: str) -> int:
         """`--grant 0` and `--grant -2` are refused at parse time rather than
