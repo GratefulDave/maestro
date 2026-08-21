@@ -3593,6 +3593,18 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             _code_review_runner(args, route_runner)
             if route_runner is not None and getattr(args, "review_root", None)
             else None)
+
+        def actor_status(attempt):
+            """Raw per-pane status for the watchdog turn clock. Never observe()."""
+            key = (attempt.node_id, attempt.attempt_no)
+            with handles_lock:
+                handle = handles.get(key)
+            if handle is None or isinstance(handle, subprocess.Popen):
+                return None
+            if route_runner is None:
+                return None
+            return route_runner.agent_status(handle)
+
         deps = scheduler.SchedulerDeps(
             store=store, repo=Path(args.repo),
             integration_path=Path(args.integration_path),
@@ -3613,7 +3625,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             # missing work.
             provision=_run_provisioner(args, route_runner),
             kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
-            review_attempt=review_attempt)
+            review_attempt=review_attempt,
+            actor_status=actor_status)
         try:
             report = scheduler.Scheduler(
                 args.run_id, plan.to_plan_nodes(), config, deps,

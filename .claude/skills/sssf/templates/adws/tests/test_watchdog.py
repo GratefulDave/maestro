@@ -294,24 +294,33 @@ class TurnCountSignalTests(unittest.TestCase):
         self.addCleanup(self.tmpdir.cleanup)
         self.transcript = Path(self.tmpdir.name) / "session.jsonl"
 
-    def _watchdog(self, attempts):
+    def _watchdog(self, attempts, actor_status=None, preserve=None, config=None):
         watchdog = wd.Watchdog(
-            config=self.config,
+            config=config or self.config,
             attempts_provider=lambda: attempts,
             write_heartbeat=self.heartbeat,
             kill=self.kill,
             fail_attempt=self.fail,
+            actor_status=actor_status,
+            preserve_unpublished=preserve,
             time_source=self.clock,
         )
         watchdog._process_alive = lambda pid: True  # isolate the turn signal
         return watchdog
 
     def test_no_turn_completed_within_turn_timeout_stalls(self):
+        """Changed law (#107): silence convicts when the route is not
+        reporting the actor live. A missing reader is not an observation
+        of work, so the clock still fires — it is gated, not disabled.
+
+        Previously this test pinned elapsed silence alone as sufficient,
+        which is the defect: a builder thinking inside one turn.
+        """
         write_jsonl(self.transcript, [])  # nothing written yet
         attempt = make_attempt(
             started_at=0.0, launched_at=0.0, pid=1,
             extra={wd.SESSION_PATH_KEY: str(self.transcript)})
-        watchdog = self._watchdog([attempt])
+        watchdog = self._watchdog([attempt], actor_status=lambda _a: "idle")
 
         self.clock.set(11.0)  # > turn_timeout_s since launch
         watchdog.check_once()
@@ -319,6 +328,72 @@ class TurnCountSignalTests(unittest.TestCase):
         self.assertEqual(len(self.fail.calls), 1)
         (fail_args, _) = self.fail.calls[0]
         self.assertEqual(fail_args[2], wd.StallReason.TURN_TIMEOUT.value)
+
+    def test_a_live_actor_silent_past_the_turn_timeout_is_not_stalled(self):
+        """#107: a builder the route reports working, with no transcript
+        growth and no result row, past many multiples of turn_timeout_s.
+        Elapsed silence is not quiescence."""
+        write_jsonl(self.transcript, [])
+        attempt = make_attempt(
+            started_at=0.0, launched_at=0.0, pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+        watchdog = self._watchdog(
+            [attempt], actor_status=lambda _a: "working")
+
+        for _ in range(40):
+            self.clock.advance(25.0)
+            watchdog.check_once()
+            self.assertEqual(self.fail.calls, [])
+        self.assertGreaterEqual(self.clock(), 100 * 10.0)
+
+    def test_a_blocked_actor_is_treated_as_live(self):
+        """`blocked` is a live working status — an agent inside a tool
+        call is working, and its transcript does not grow while it waits.
+        `idle` is a heartbeat, not this."""
+        write_jsonl(self.transcript, [])
+        attempt = make_attempt(
+            started_at=0.0, launched_at=0.0, pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+        watchdog = self._watchdog(
+            [attempt], actor_status=lambda _a: "blocked")
+        self.clock.set(500.0)
+        watchdog.check_once()
+        self.assertEqual(self.fail.calls, [])
+
+    def test_an_actor_that_went_live_then_quiesced_is_still_stalled(self):
+        """The clock is not disabled. Working, then idle past the turn
+        timeout, with no declared result: TURN_TIMEOUT."""
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        attempt = make_attempt(
+            started_at=0.0, launched_at=0.0, pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+        status = {"v": "working"}
+        watchdog = self._watchdog(
+            [attempt], actor_status=lambda _a: status["v"])
+        watchdog.check_once()
+        self.clock.set(500.0)
+        watchdog.check_once()
+        self.assertEqual(self.fail.calls, [])
+        status["v"] = "idle"
+        self.clock.advance(11.0)
+        watchdog.check_once()
+        self.assertEqual(len(self.fail.calls), 1)
+        (fail_args, _) = self.fail.calls[0]
+        self.assertEqual(fail_args[2], wd.StallReason.TURN_TIMEOUT.value)
+
+    def test_an_unreadable_status_does_not_clear_a_live_observation(self):
+        write_jsonl(self.transcript, [])
+        attempt = make_attempt(
+            started_at=0.0, launched_at=0.0, pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+        status = {"v": "working"}
+        watchdog = self._watchdog(
+            [attempt], actor_status=lambda _a: status["v"])
+        watchdog.check_once()
+        status["v"] = None
+        self.clock.set(500.0)
+        watchdog.check_once()
+        self.assertEqual(self.fail.calls, [])
 
     def test_healthy_agent_midturn_is_not_stalled(self):
         """omp/Claude both write their transcript at turn granularity
@@ -354,30 +429,62 @@ class TurnCountSignalTests(unittest.TestCase):
         self.assertEqual(self.fail.calls, [])
 
     def test_elapsed_wall_clock_beyond_node_timeout_times_out_regardless(self):
-        """Even a steadily advancing turn count cannot outrun the node
-        timeout (§7.6)."""
+        """Changed law (#97): advancing turns defer NODE_TIMEOUT. The
+        previous assertion — that a steadily advancing turn count still
+        died at the wall clock — is the discard of 163 turns of unpublished
+        work. A silent attempt past the bound still times out.
+        """
         config = make_config(node_timeout_s=20.0, turn_timeout_s=1000.0)
         write_jsonl(self.transcript, ['{"n": 1}'])
         attempt = make_attempt(
             started_at=0.0, launched_at=0.0, pid=1,
             extra={wd.SESSION_PATH_KEY: str(self.transcript)})
-        watchdog = wd.Watchdog(
-            config=config,
-            attempts_provider=lambda: [attempt],
-            write_heartbeat=self.heartbeat,
-            kill=self.kill,
-            fail_attempt=self.fail,
-            time_source=self.clock,
-        )
-        watchdog._process_alive = lambda pid: True
+        watchdog = self._watchdog([attempt], config=config)
 
         watchdog.check_once()
-        self.clock.set(21.0)  # > node_timeout_s, turn count still "fresh"
+        write_jsonl(self.transcript, ['{"n": 1}', '{"n": 2}'])
+        self.clock.set(21.0)
         watchdog.check_once()
+        self.assertEqual(self.fail.calls, [])
 
+        # No further turn, not live: the clock still convicts.
+        self.clock.set(22.0)
+        watchdog.check_once()
         self.assertEqual(len(self.fail.calls), 1)
         (fail_args, _) = self.fail.calls[0]
         self.assertEqual(fail_args[2], wd.StallReason.NODE_TIMEOUT.value)
+
+    def test_node_timeout_preserves_unpublished_work_before_fail(self):
+        """#97: work produced before NODE_TIMEOUT is handed to the
+        preserver, then the attempt is still convicted. The callback is
+        how the attempt ref becomes referenceable; kill runs first so
+        the writer is stopped."""
+        preserved = []
+
+        def preserve(attempt):
+            preserved.append(attempt.key)
+            attempt.extra["salvage_output_sha"] = "abc123"
+
+        config = make_config(node_timeout_s=20.0, turn_timeout_s=1000.0)
+        write_jsonl(self.transcript, ['{"n": 1}'])
+        attempt = make_attempt(
+            started_at=0.0, launched_at=0.0, pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+        watchdog = self._watchdog(
+            [attempt], preserve=preserve, config=config)
+
+        watchdog.check_once()
+        self.clock.set(21.0)
+        watchdog.check_once()
+
+        self.assertEqual(preserved, [attempt.key])
+        self.assertEqual(attempt.extra.get("salvage_output_sha"), "abc123")
+        self.assertEqual(len(self.kill.calls), 1)
+        self.assertEqual(len(self.fail.calls), 1)
+        self.assertEqual(self.fail.calls[0][0][2],
+                         wd.StallReason.NODE_TIMEOUT.value)
+        # kill before preserve: the recorder saw kill first.
+        self.assertEqual(self.kill.calls[0][0][0].key, attempt.key)
 
 
 # ── §9.7 a declared result outranks both of the watchdog's clocks ───────────
@@ -423,7 +530,7 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
         self.addCleanup(self.tmpdir.cleanup)
         self.transcript = Path(self.tmpdir.name) / "session.jsonl"
 
-    def _watchdog(self, attempts, declared, config=None):
+    def _watchdog(self, attempts, declared, config=None, actor_status=None):
         watchdog = wd.Watchdog(
             config=config or self.config,
             attempts_provider=lambda: attempts,
@@ -431,6 +538,7 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
             kill=self.kill,
             fail_attempt=self.fail,
             declared_result_observed=lambda attempt: declared,
+            actor_status=actor_status,
             time_source=self.clock,
         )
         watchdog._process_alive = lambda pid: True  # isolate the clock signals
@@ -458,14 +566,15 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
         self.assertEqual(self.fail.calls, [])
 
     def test_no_result_row_flatlined_past_the_turn_timeout_is_still_convicted(self):
-        """The inverse, and the reason the guard reads a typed row rather
-        than assuming completion. Real fixture: lane-p2-s3-inventory a1 had
-        no envelope, no results row, and a worktree HEAD equal to its
-        `base_sha` -- nothing was ever committed. An attempt in that shape
-        must still be convicted or the guard has only turned a false kill
-        into a missed one."""
+        """Changed law (#107): no result row is still not completion, but
+        elapsed silence is no longer enough. This attempt is idle — the
+        route is not reporting it live — so TURN_TIMEOUT still fires.
+        A working builder with the same empty result row is the other test.
+        """
         write_jsonl(self.transcript, ['{"n": 1}'])
-        watchdog = self._watchdog([self._attempt()], declared=False)
+        watchdog = self._watchdog(
+            [self._attempt()], declared=False,
+            actor_status=lambda _a: "idle")
 
         watchdog.check_once()
         self.clock.set(500.0)
@@ -950,6 +1059,63 @@ class ThreadWrapperTests(unittest.TestCase):
             stop_elapsed, 1.0, "stop() did not join within the bound")
         self.assertIsNone(watchdog._thread)
         self.assertFalse(thread_ref.is_alive())
+
+
+class ProductionWiresTheStatusSeamTests(unittest.TestCase):
+    """#107 / M30: a None-defaulted keyword that nobody passes is the
+    failure mode. The run-side clock must actually receive a reader.
+    """
+
+    def test_watchdog_constructor_names_the_actor_status_seam(self):
+        init = next(
+            n for n in ast.parse(WATCHDOG_SOURCE).body
+            if isinstance(n, ast.ClassDef) and n.name == "Watchdog")
+        ctor = next(
+            n for n in init.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        self.assertIn("actor_status", {a.arg for a in ctor.args.args})
+        self.assertIn("preserve_unpublished", {a.arg for a in ctor.args.args})
+
+    def test_scheduler_passes_actor_status_and_preserve_into_the_watchdog(self):
+        src = (ADWS / "adw_modules" / "scheduler.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        keywords = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = None
+            if isinstance(func, ast.Attribute) and func.attr == "Watchdog":
+                name = "Watchdog"
+            if name != "Watchdog":
+                continue
+            keywords.update(kw.arg for kw in node.keywords if kw.arg)
+        self.assertIn("actor_status", keywords)
+        self.assertIn("preserve_unpublished", keywords)
+
+    def test_maestro_supplies_the_actor_status_reader_on_scheduler_deps(self):
+        src = (ADWS / "maestro.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute)
+                    and func.attr == "SchedulerDeps"):
+                continue
+            names = {kw.arg for kw in node.keywords if kw.arg}
+            if "actor_status" in names:
+                found = True
+        self.assertTrue(
+            found,
+            "maestro run start must pass actor_status into SchedulerDeps")
+
+    def test_idle_is_not_a_live_working_status(self):
+        """Known trap: idle_notification is a heartbeat, not completion
+        and not a stall."""
+        self.assertEqual(wd.LIVE_WORKING_STATUSES, frozenset({"working", "blocked"}))
+        self.assertNotIn("idle", wd.LIVE_WORKING_STATUSES)
 
 
 if __name__ == "__main__":

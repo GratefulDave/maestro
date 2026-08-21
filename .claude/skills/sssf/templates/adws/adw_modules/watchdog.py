@@ -109,6 +109,13 @@ class StallReason(str, Enum):
     NODE_TIMEOUT = "NODE_TIMEOUT"
 
 
+#: Herdr statuses that mean the agent is alive and doing something. `idle` is
+#: deliberately absent: it is a heartbeat, not completion and not a stall.
+#: B14 arms on these, never on elapsed silence. Same set FinalizationWindow
+#: uses — one vocabulary, so the two clocks cannot drift apart.
+LIVE_WORKING_STATUSES = frozenset({"working", "blocked"})
+
+
 # ── the watchdog's private heartbeat cache ───────────────────────────────────
 
 class _HeartbeatState(NamedTuple):
@@ -118,11 +125,14 @@ class _HeartbeatState(NamedTuple):
     method that lets anything but the watchdog's own polling loop write an
     entry here -- that is the whole of what "the watchdog is the only
     heartbeat writer" means at the code level.
+
+    `actor_status_current` is the last *readable* route status. An unreadable
+    poll leaves it alone: a hiccup is a missing observation, not a stall.
     """
 
     turn_count: int
     observed_at: float
-
+    actor_status_current: Optional[str] = None
 
 # ── injected collaborators (Protocols; the lead wires these to lane w1) ─────
 
@@ -152,6 +162,32 @@ class AttemptFailer(Protocol):
 
     def __call__(self, attempt: st.AttemptRecord, retry_class: st.RetryClass,
                  reason: str) -> None: ...
+
+
+class ActorStatusReader(Protocol):
+    """The route's raw per-pane agent status, uncollapsed.
+
+    B14's fix depends on the *raw* status. `observe()` collapses idle into
+    RUNNING and cannot express "went live, then stopped". Returns `None`
+    when the status cannot be read, which is never a stall: an unreadable
+    status is a missing observation.
+
+    The reader is a typed route report, never scraped pane text. This
+    module never reads `agent_status` off a pane object.
+    """
+
+    def __call__(self, attempt: st.AttemptRecord) -> Optional[str]: ...
+
+
+class UnpublishedWorkPreserver(Protocol):
+    """Publish unpublished builder work onto the attempt's durable ref.
+
+    Called on NODE_TIMEOUT *before* kill, so a retry can find the tree
+    rather than starting blind. The watchdog does not own git; the caller
+    supplies this. A no-op default would re-install the discard.
+    """
+
+    def __call__(self, attempt: st.AttemptRecord) -> None: ...
 
 
 class LastTransitionReader(Protocol):
@@ -343,6 +379,8 @@ class Watchdog:
             lambda attempt: False),
         transcript_record_count: Callable[[st.AttemptRecord], int] = (
             _default_transcript_record_count),
+        actor_status: Optional[ActorStatusReader] = None,
+        preserve_unpublished: Optional[UnpublishedWorkPreserver] = None,
         time_source: Callable[[], float] = time.monotonic,
         on_error: Callable[[BaseException], None] = lambda exc: None,
     ) -> None:
@@ -356,6 +394,8 @@ class Watchdog:
         self._exit_status_observed = exit_status_observed
         self._declared_result_observed = declared_result_observed
         self._transcript_record_count = transcript_record_count
+        self._actor_status = actor_status
+        self._preserve_unpublished = preserve_unpublished
         self._time_source = time_source
         self._on_error = on_error
         # Private: the only writer of this cache is _check_attempt, below.
@@ -404,18 +444,13 @@ class Watchdog:
     def _check_attempt(self, attempt: st.AttemptRecord, now: float) -> None:
         key = attempt.key
 
-        # Wall clock applies across the whole attempt window, pre-launch
-        # and post-launch alike, and wins over the other two signals
-        # whatever they say (§7.6).
-        #
-        # §9.7 moves this bound for an attempt that has already declared a
-        # result; it does not remove it, and the difference is the whole of
-        # the judgement here. This is the last bound an agent attempt is
-        # GUARANTEED -- the turn clock below is disarmed by the same result
-        # row, so an unconditional exemption would trade a false kill for a
-        # hang, and the only thing left watching would be §11.2's run-level
-        # backstop, which a sibling node's transitions keep refreshing
-        # indefinitely.
+        # Wall clock applies across the whole attempt window. Pre-launch it
+        # is the only signal: no process and no transcript exist yet.
+        # Post-launch it no longer wins over a live observation — B14, #97.
+        # A builder still completing turns, or one the route reports working,
+        # is not discarded on elapsed time. The clock still convicts a
+        # genuinely silent attempt; it is not removed. A declared result
+        # still defers it to `backstop_t_s` (§9.7).
         #
         # PROCESS_DEAD is no longer structurally unreachable for an agent
         # node: `attempt.pid` now takes `LaunchHandle.liveness_pid` -- the
@@ -441,18 +476,16 @@ class Watchdog:
         # RUNNING attempt, and the overwhelmingly common case is an attempt
         # nowhere near either horizon, which must not cost a ledger read.
         elapsed = now - attempt.started_at
-        if elapsed > self._config.node_timeout_s:
-            bound = (self._config.backstop_t_s
-                     if self._declared_result_observed(attempt)
-                     else self._config.node_timeout_s)
-            if elapsed > bound:
-                self._heartbeats.pop(key, None)
-                self._stall(attempt, StallReason.NODE_TIMEOUT)
-                return
-
         if not attempt.armed:
             # Pre-launch: no process and no transcript exist yet, by
-            # construction. Only the wall-clock check above applies.
+            # construction. Only the wall-clock check applies.
+            if elapsed > self._config.node_timeout_s:
+                bound = (self._config.backstop_t_s
+                         if self._declared_result_observed(attempt)
+                         else self._config.node_timeout_s)
+                if elapsed > bound:
+                    self._heartbeats.pop(key, None)
+                    self._stall(attempt, StallReason.NODE_TIMEOUT)
             return
 
         # §9.7's rule, which this site was the last of three to apply: **an
@@ -511,18 +544,53 @@ class Watchdog:
             return
 
         record_count = self._transcript_record_count(attempt)
-        state = self._heartbeats.get(key)
-        if state is None:
+        prev = self._heartbeats.get(key)
+        turns_advanced = prev is not None and record_count > prev.turn_count
+        if prev is None:
             # First observation since arming: the turn clock starts at
             # launch, not at attempt start and not at this first poll.
             state = _HeartbeatState(
                 turn_count=record_count, observed_at=attempt.launched_at)
             self._heartbeats[key] = state
             self._write_heartbeat(attempt, state.turn_count, state.observed_at)
-        elif record_count > state.turn_count:
-            state = _HeartbeatState(turn_count=record_count, observed_at=now)
+        elif turns_advanced:
+            state = _HeartbeatState(
+                turn_count=record_count, observed_at=now,
+                actor_status_current=prev.actor_status_current)
             self._heartbeats[key] = state
             self._write_heartbeat(attempt, state.turn_count, state.observed_at)
+        else:
+            state = prev
+
+        # Raw per-pane status, never observe(). Unreadable leaves the last
+        # readable value: a hiccup is not a stall. Absence of a reader is
+        # not an observation of work.
+        if self._actor_status is not None:
+            raw = self._actor_status(attempt)
+            if raw is not None:
+                status = raw.strip().casefold()
+                if status:
+                    state = state._replace(actor_status_current=status)
+                    self._heartbeats[key] = state
+
+        route_reports_working = (
+            self._actor_status is not None
+            and state.actor_status_current in LIVE_WORKING_STATUSES)
+
+        # Armed wall clock. Defer while turns advance or the route reports
+        # the actor live — that is the 163-turn discard. Convict when
+        # neither is true. A declared result still defers to backstop_t_s.
+        if elapsed > self._config.node_timeout_s:
+            bound = (self._config.backstop_t_s
+                     if self._declared_result_observed(attempt)
+                     else self._config.node_timeout_s)
+            if elapsed > bound:
+                declared = bound is self._config.backstop_t_s
+                if not declared and (turns_advanced or route_reports_working):
+                    return
+                self._heartbeats.pop(key, None)
+                self._stall(attempt, StallReason.NODE_TIMEOUT)
+                return
 
         # §9.7 again, and this is the site that fired. The worker quiesces
         # the builder BEFORE it commits the work, runs the post gate, and
@@ -547,14 +615,37 @@ class Watchdog:
         # The predicate is asked only once a clock would otherwise fire: it
         # reaches the ledger, and this loop runs once a second over every
         # RUNNING attempt.
+        #
+        # #107 / M30: silence convicts only where the route is *not*
+        # reporting the actor working. A builder thinking inside one long
+        # turn produces no transcript growth and no result row; elapsed
+        # silence is not quiescence. Absence of a reader is not an
+        # observation of work, so the clock still fires there.
         since_progress = now - state.observed_at
         if (since_progress > self._config.turn_timeout_s
-                and not self._declared_result_observed(attempt)):
+                and not self._declared_result_observed(attempt)
+                and not route_reports_working):
             self._stall(attempt, StallReason.TURN_TIMEOUT)
 
     def _stall(self, attempt: st.AttemptRecord, reason: StallReason) -> None:
         self._kill(attempt)
+        if reason is StallReason.NODE_TIMEOUT:
+            self._preserve_unpublished_work(attempt)
         self._fail_attempt(attempt, st.RetryClass.ENVIRONMENTAL, reason.value)
+
+    def _preserve_unpublished_work(self, attempt: st.AttemptRecord) -> None:
+        """Commit unpublished builder work onto the attempt ref before fail.
+
+        Kill already ran, so the writer is stopped. A missing callback is
+        a missing wire, not a skip of the stall. Preserve errors are
+        observed, never used to dodge the timeout.
+        """
+        if self._preserve_unpublished is None:
+            return
+        try:
+            self._preserve_unpublished(attempt)
+        except Exception as exc:  # noqa: BLE001 — stall must still complete
+            self._on_error(exc)
 
 
 # ── the run-level backstop ───────────────────────────────────────────────────
