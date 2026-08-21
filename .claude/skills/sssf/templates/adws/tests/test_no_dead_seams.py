@@ -94,18 +94,7 @@ ALLOWED: Dict[str, str] = {
                                   "and the test asserts the two agree",
     "finalization.graded_cells": "derived view of the matrix, asserted in tests",
 
-    # Its one production caller was plan finalization's `finalize`, deleted
-    # when `plan finalize` became deterministic and stopped dispatching a
-    # reviewer. It is not orphaned by accident: `code_review.grade_verdict`
-    # says in its own docstring that it is "deliberately a second function
-    # rather than a threshold parameter on it", because plan finalization's
-    # verdicts had to stay unthresholded. There is no unthresholded review
-    # left, so the two should collapse into one -- a code-review-path change,
-    # not a plan-path one, which is why it is named here rather than done in
-    # the same breath as the removal.
-    "finalization.derive_verdict": "DEFERRED: sole production caller deleted "
-                                   "with the plan reviewer; collapse it into "
-                                   "code_review.grade_verdict",
+
     "finalization_window.opened_at_monotonic": "accessor over the private "
                                                "_opened_at_monotonic that "
                                                "production maintains",
