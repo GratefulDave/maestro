@@ -111,3 +111,9 @@ execution:
   #
   # Use the ecosystem's concurrency-safe install invocation. Up to
   # `concurrency` provisions may share the download cache at once.
+tester:
+  route: omp
+  model: grok-4.6
+  effort: high
+  profile: tester
+  vendor: xai

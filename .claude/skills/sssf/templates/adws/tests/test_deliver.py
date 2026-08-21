@@ -751,7 +751,7 @@ class DeliverVerbTest(unittest.TestCase):
 
     def test_the_author_block_is_optional_so_installed_configs_keep_working(self):
         source = Path(maestro.__file__).read_text(encoding="utf-8")
-        self.assertIn('("plan_contract", "author", "runners")', source)
+        self.assertIn('("plan_contract", "author", "runners", "tester")', source)
 
 
 class AuthorConfigurationTest(unittest.TestCase):

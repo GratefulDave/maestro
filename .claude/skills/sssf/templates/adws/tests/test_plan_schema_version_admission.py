@@ -237,7 +237,7 @@ class TheRunStartVersionGuardTest(unittest.TestCase):
         refusal = self._refusal_for(_downgraded_to_v1(self.v2))
         self.assertEqual(pm.SCHEMA_V1,
                          refusal.fields["declared_schema_version"])
-        self.assertEqual([pm.SCHEMA_V2],
+        self.assertEqual([pm.SCHEMA_V2, pm.SCHEMA_V3],
                          refusal.fields["runnable_schema_versions"])
 
     def test_the_refusal_names_the_plan_the_version_and_the_remedy(self):

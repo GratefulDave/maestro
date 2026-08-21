@@ -69,6 +69,7 @@ from . import reachability as rc
 from . import retry_policy as rp
 from . import scheduler_types as st
 from . import verification as vf
+from . import tests_chain as tc
 from . import watchdog as wd
 from . import worktree as wt
 
@@ -1419,6 +1420,12 @@ class Scheduler:
                 exit_code=execution.exit_code, permission=permission,
                 diff_empty=not measured.touched,
                 expects_changes=node.expects_changes)
+        elif node.kind is st.NodeKind.TESTS:
+            verdict = tc.verify_tests_node(
+                envelope_parsed=execution.envelope_parsed,
+                permission=permission,
+                written=measured.touched,
+                new_case_count=0)
         else:
             # Clause 4 is evaluated here, at measurement, and the commit
             # follows it immediately (§8.4). Clause 3 is evaluated after the
@@ -1475,6 +1482,15 @@ class Scheduler:
             if not verdict.verified:
                 self._settle_context(context)
                 self._settle_verdict(node, verdict, execution, record)
+                return
+        elif node.kind is st.NodeKind.TESTS:
+            self._require_running(record)
+            parent_red = self._prove_tests_red_at_parent(
+                node, attempt, measured)
+            self._require_running(record)
+            if not parent_red.verified:
+                self._settle_context(context)
+                self._settle_verdict(node, parent_red, execution, record)
                 return
 
         # The final proof covers post-gates as well as every failure path
@@ -1617,6 +1633,33 @@ class Scheduler:
             wt.restore_paths_from_head(attempt, reverted)
         return vf.adjudicate_output_falsification(
             vf.adjudicate_gate(result, node.gate_min_cases), reverted)
+
+    def _prove_tests_red_at_parent(
+            self, node: st.PlanNode, attempt: wt.AttemptWorktree,
+            measured: "wt.InventoryDelta") -> "vf.VerificationVerdict":
+        """Tests-node evidence: new cases, each red at this attempt's base.
+
+        The worktree *is* the parent commit plus the tests this node wrote,
+        so running the new nodeids here is the parent-red check. Collection
+        uses `--collect-only -q -o addopts=`; a collection error or import
+        crash is not a satisfying red. Newly created test files have no
+        parent nodeids, which is the ordinary case this chain is for.
+        """
+        del node  # selector lives on the written test files, not the command
+        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
+        current = tc.collect_nodeids(attempt.path, test_paths)
+        try:
+            parent = tc.collect_parent_nodeids(
+                attempt.path, attempt.base, test_paths)
+        except tc.TestsGitReadFailed as exc:
+            return vf.VerificationVerdict(
+                verified=False, failed_clause=3,
+                reason="{0}: {1}".format(
+                    tc.TestsRefusal.COLLECTION_FAILED.value, exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL)
+        new = tc.new_nodeids(parent, current)
+        parent_run = tc.run_cases(attempt.path, new)
+        return tc.adjudicate_parent_red(parent_run, len(new))
 
     def _review_with_redispatch(self, node: st.PlanNode, record: st.AttemptRecord,
                                 attempt: wt.AttemptWorktree, head: str,

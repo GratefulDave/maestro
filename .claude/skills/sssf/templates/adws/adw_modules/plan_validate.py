@@ -86,15 +86,21 @@ from . import plan_canonical as pc
 from . import plan_digest as pd
 from . import plan_model as pm
 from . import runner_resolution as rr
+from . import tests_chain as tc
 
 
 class Obligation(str, Enum):
-    """The fourteen, in §6.4's order.
+    """The fourteen from §6.4, plus the tests/build pair.
 
-    The last two arrived from the plan-review rubric rather than from §6.4's
-    original list: they were the only two of its eleven checks that a pure
-    function over the stored plan decides with no judgment about prose, so
-    they are stated here as refusals instead of being asked of a reviewer.
+    The last two of the original fourteen arrived from the plan-review rubric
+    rather than from §6.4's original list: they were the only two of its
+    eleven checks that a pure function over the stored plan decides with no
+    judgment about prose, so they are stated here as refusals instead of
+    being asked of a reviewer.
+
+    `TESTS_BUILD_PAIRED` is the fifteenth: a `tests` node is not an agent
+    node, and without this check a tests node with no dependent, or a build
+    node that still owns the test files, would parse.
     """
 
     CLOSED_PARSE = "CLOSED_PARSE"
@@ -111,10 +117,11 @@ class Obligation(str, Enum):
     GATE_CORE_UNSHARED = "GATE_CORE_UNSHARED"
     GATE_SELECTOR_NODE_SCOPED = "GATE_SELECTOR_NODE_SCOPED"
     INTEGRATION_GATE_COVERS_LANES = "INTEGRATION_GATE_COVERS_LANES"
+    TESTS_BUILD_PAIRED = "TESTS_BUILD_PAIRED"
 
 
-#: Named as a tuple as well as an enum so "fourteen" is a checkable count
-#: rather than a sentence in a docstring.
+#: Named as a tuple as well as an enum so the count is checkable rather than
+#: a sentence in a docstring.
 OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.CLOSED_PARSE,
     Obligation.REFERENCES_RESOLVE_ONCE,
@@ -130,6 +137,7 @@ OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.GATE_CORE_UNSHARED,
     Obligation.GATE_SELECTOR_NODE_SCOPED,
     Obligation.INTEGRATION_GATE_COVERS_LANES,
+    Obligation.TESTS_BUILD_PAIRED,
 )
 
 
@@ -667,7 +675,7 @@ def _gate_executable(plan: "pm.Plan", repo: Path,
                     label, collected, gate.min_cases)))
 
     for index, node in enumerate(plan.nodes):
-        if isinstance(node, pm.AgentNode):
+        if isinstance(node, (pm.AgentNode, pm.TestsNode)):
             check(node.gate, "/nodes/{0}/gate".format(index), node.node_id,
                   selector_required=True)
     # The integration gate is the plan's one whole-suite gate (§6.2, §8.8),
@@ -682,8 +690,9 @@ def _gate_core_unshared(plan: "pm.Plan") -> List[Blocker]:
     blockers: List[Blocker] = []
     integration_core = pm.command_core(plan.merge_policy.integration_gate)
     seen: Dict[Any, Tuple[int, str]] = {}
+    by_id = plan.node_by_id()
     for index, node in enumerate(plan.nodes):
-        if not isinstance(node, pm.AgentNode):
+        if not isinstance(node, (pm.AgentNode, pm.TestsNode)):
             continue
         core = pm.command_core(node.gate)
         pointer = "/nodes/{0}/gate".format(index)
@@ -694,6 +703,9 @@ def _gate_core_unshared(plan: "pm.Plan") -> List[Blocker]:
                 "acceptance; a whole-suite gate cannot pass while a sibling "
                 "is unmerged (§7.4)".format(node.node_id)))
         if core in seen:
+            other = by_id[seen[core][1]]
+            if _tests_build_may_share_gate(node, other):
+                continue
             blockers.append(Blocker(
                 Obligation.GATE_CORE_UNSHARED, pointer,
                 "{0} and {1} share a gate command core; two agent nodes "
@@ -702,6 +714,20 @@ def _gate_core_unshared(plan: "pm.Plan") -> List[Blocker]:
         else:
             seen[core] = (index, node.node_id)
     return blockers
+
+
+def _tests_build_may_share_gate(left: Any, right: Any) -> bool:
+    """A tests node and the one agent that needs it may share a gate core.
+
+    That shared command is the pair's contract: the tests node writes the
+    cases, the build node makes them pass. Two tests nodes, or two agents,
+    still may not share.
+    """
+    if isinstance(left, pm.TestsNode) and isinstance(right, pm.AgentNode):
+        return left.node_id in right.needs
+    if isinstance(right, pm.TestsNode) and isinstance(left, pm.AgentNode):
+        return right.node_id in left.needs
+    return False
 
 
 def _path_under(path: str, prefix: str) -> bool:
@@ -740,15 +766,20 @@ def _gate_selector_node_scoped(plan: "pm.Plan") -> List[Blocker]:
             owners.append((normalized, node.node_id))
 
     blockers: List[Blocker] = []
+    by_id = plan.node_by_id()
     for index, node in enumerate(plan.nodes):
-        if not isinstance(node, pm.AgentNode):
+        if not isinstance(node, (pm.AgentNode, pm.TestsNode)):
             continue
         own = {_norm(path) for path in node.outputs}
+        needed = set(node.needs)
         for path in pm.selector_paths(node.gate):
             if path in own:
                 continue
             for owned, owner_id in owners:
                 if owner_id == node.node_id:
+                    continue
+                if (owner_id in needed
+                        and isinstance(by_id.get(owner_id), pm.TestsNode)):
                     continue
                 if not _path_under(path, owned):
                     continue
@@ -787,7 +818,7 @@ def _integration_gate_covers_lanes(plan: "pm.Plan") -> List[Blocker]:
     pointer = "/merge_policy/integration_gate/argv"
     blockers: List[Blocker] = []
     for node in plan.nodes:
-        if not isinstance(node, pm.AgentNode):
+        if not isinstance(node, (pm.AgentNode, pm.TestsNode)):
             continue
         paths = pm.selector_paths(node.gate)
         if not paths:
@@ -810,6 +841,56 @@ def _integration_gate_covers_lanes(plan: "pm.Plan") -> List[Blocker]:
                 "omits (§8.8)".format(
                     ", ".join(covers), node.node_id, ", ".join(uncovered))))
     return blockers
+
+def _tests_build_paired(plan: "pm.Plan") -> List[Blocker]:
+    """A tests node is one half of a pair: exactly one agent depends on it,
+    that agent does not own the test files, and the tests node's outputs
+    are test paths.
+
+    Absent tests nodes, this is a no-op — v1/v2 plans stay valid.
+    """
+    blockers: List[Blocker] = []
+    dependents: Dict[str, List[str]] = {n.node_id: [] for n in plan.nodes
+                                        if isinstance(n, pm.TestsNode)}
+    if not dependents:
+        return blockers
+    by_id = plan.node_by_id()
+    for node in plan.nodes:
+        if not isinstance(node, pm.AgentNode):
+            continue
+        for needed in node.needs:
+            if needed in dependents:
+                dependents[needed].append(node.node_id)
+    for index, node in enumerate(plan.nodes):
+        if not isinstance(node, pm.TestsNode):
+            continue
+        pointer = "/nodes/{0}".format(index)
+        not_tests = [p for p in node.outputs if not tc.is_test_path(p)]
+        if not_tests:
+            blockers.append(Blocker(
+                Obligation.TESTS_BUILD_PAIRED, pointer + "/outputs",
+                "{0} is a tests node but declares non-test outputs: {1}"
+                .format(node.node_id, ", ".join(not_tests))))
+        builders = dependents[node.node_id]
+        if len(builders) != 1:
+            blockers.append(Blocker(
+                Obligation.TESTS_BUILD_PAIRED, pointer,
+                "{0} must be needed by exactly one agent (build) node; "
+                "dependents: {1}".format(
+                    node.node_id,
+                    ", ".join(builders) if builders else "(none)")))
+            continue
+        builder = by_id[builders[0]]
+        overlap = sorted(set(_norm(p) for p in node.outputs)
+                         & set(_norm(p) for p in builder.outputs))
+        if overlap:
+            blockers.append(Blocker(
+                Obligation.TESTS_BUILD_PAIRED, pointer + "/outputs",
+                "{0}'s test files are also outputs of {1}: {2}; the build "
+                "node's write scope must exclude the tests node files"
+                .format(node.node_id, builder.node_id, ", ".join(overlap))))
+    return blockers
+
 
 
 def validate_plan(stored: bytes, repo: Union[str, Path], *,
@@ -879,6 +960,7 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
     blockers.extend(_gate_core_unshared(plan))
     blockers.extend(_gate_selector_node_scoped(plan))
     blockers.extend(_integration_gate_covers_lanes(plan))
+    blockers.extend(_tests_build_paired(plan))
 
     if blockers:
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))
