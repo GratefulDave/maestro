@@ -481,20 +481,25 @@ class RepairFacts:
     typed marker on the attempt row and as an integer count of findings.
 
     `prior` is the node's highest-numbered attempt row, which is the attempt
-    the one being opened directly succeeds.
+    the one being opened directly succeeds. `attempts` is the node's full
+    attempt history, newest not required first. When it is non-empty,
+    `decide_repair` walks it past ENVIRONMENTAL and LAUNCHER_TRANSIENT rows
+    to the last attempt that carried a verdict; `prior` still supplies
+    `chain_length`, which must strictly increase even across a machine fault.
 
-    `rejected_ref_sha` is what that attempt's own durable ref holds *now*, read
-    back from git rather than remembered, and `output_proven` is
+    `rejected_ref_sha` is what the *subject* attempt's own durable ref holds
+    *now*, read back from git rather than remembered, and `output_proven` is
     `worktree.is_attempt_output_commit` over it: the shape test, the object
     test, the descent-from-its-own-base test, and the exact-ref test, all four.
     A repair that branched from anything else would be repairing a tree the
     evidence chain does not name.
 
-    `repaired_findings` is the findings count of the rejection that `prior`
-    itself was repairing, or `None` when `prior` repaired nothing or when the
-    count was never stored. `None` is "unknown" and never zero, for the reason
-    `review_convergence_from_attempts` skips it: zero would read as "the
-    reviewer found nothing", which is the one thing a rejection cannot mean.
+    `repaired_findings` is the findings count of the rejection that the
+    subject itself was repairing, or `None` when it repaired nothing or when
+    the count was never stored. `None` is "unknown" and never zero, for the
+    reason `review_convergence_from_attempts` skips it: zero would read as
+    "the reviewer found nothing", which is the one thing a rejection cannot
+    mean.
     """
 
     integration_head: str
@@ -502,6 +507,7 @@ class RepairFacts:
     rejected_ref_sha: Optional[str] = None
     output_proven: bool = False
     repaired_findings: Optional[int] = None
+    attempts: Tuple[AttemptRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -574,6 +580,24 @@ def repaired_findings_count(
     return None
 
 
+def repair_subject(
+        attempts: Iterable[AttemptRecord]) -> Optional[AttemptRecord]:
+    """The last attempt that carried a verdict, walking past machine faults.
+
+    ENVIRONMENTAL and LAUNCHER_TRANSIENT rows are not judgements about the
+    artifact. Walking past them is bounded: one pass over the attempt list,
+    newest first, stop at the first row that is not a machine fault. A
+    SEMANTIC row without a stored output commit still ends the walk, so a
+    red gate still restarts.
+    """
+    for row in sorted(attempts, key=lambda r: r.attempt_no, reverse=True):
+        if row.retry_class in (RetryClass.ENVIRONMENTAL,
+                               RetryClass.LAUNCHER_TRANSIENT):
+            continue
+        return row
+    return None
+
+
 def decide_repair(facts: RepairFacts) -> RepairDecision:
     """Whether the attempt being opened repairs the rejected diff, or restarts.
 
@@ -581,16 +605,20 @@ def decide_repair(facts: RepairFacts) -> RepairDecision:
     order is the order in which a fact becomes knowable rather than a
     preference:
 
-    1. **The previous attempt produced nothing worth repairing.** Both halves
-       are read: the row's `retry_class` must be SEMANTIC *and* it must carry
-       a stored output commit (`REVIEW_OUTPUT_SHA_KEY`). Either alone is the
-       wrong predicate — a red gate is SEMANTIC without having produced a
-       tree, and the commit without the class would admit a row `mark_blocked`
-       wrote. A gate failure leaves nothing to repair: the tree it produced
-       never passed its own gate, so the next attempt restarts from the
-       integration head exactly as it always has. An ENVIRONMENTAL or
-       LAUNCHER_TRANSIENT failure fails the same test and is untouched by any
-       of this.
+    1. **The previous verdict produced nothing worth repairing.** Both halves
+       are read: the subject's `retry_class` must be SEMANTIC *and* it must
+       carry a stored output commit (`REVIEW_OUTPUT_SHA_KEY`). Either alone
+       is the wrong predicate — a red gate is SEMANTIC without having
+       produced a tree, and the commit without the class would admit a row
+       `mark_blocked` wrote. A gate failure leaves nothing to repair: the
+       tree it produced never passed its own gate, so the next attempt
+       restarts from the integration head exactly as it always has.
+
+       An ENVIRONMENTAL or LAUNCHER_TRANSIENT row is not that subject. Those
+       classes are machine faults, and `repair_subject` walks past them to
+       the last attempt that carried a verdict. A lone ENVIRONMENTAL row,
+       or an ENVIRONMENTAL row whose only predecessors also failed the
+       machine, still returns `REPAIR_NO_PRIOR_REJECTION`.
 
        The predicate used to be `REVIEW_REJECTED_KEY`, which was the same set
        while a review rejection was the only way an attempt could fail *after*
@@ -605,20 +633,23 @@ def decide_repair(facts: RepairFacts) -> RepairDecision:
        `is_attempt_output_commit` means the subject of the repair cannot be
        named, and branching from a tree the evidence chain does not name is
        worse than starting over.
-    3. **The integration head moved.** §8.1 puts attempt worktrees on the
-       integration head, and a repair honours that by branching from a commit
-       that *descends* from the head the rejection was measured against — which
-       is only the current head while no sibling has merged. When one has, the
-       rejected commit descends from a head that is no longer integration's,
-       and branching from it would silently hand the builder a tree missing the
-       sibling's work. The same equality also expires the findings, and it is
-       the expiry `AttemptRecord.guidance_key` already performs, so the two
-       cannot disagree: a base the guidance is invalid at is a base the repair
-       is refused at.
-    4. **The chain reached `REPAIR_CHAIN_LIMIT`.** A rejected diff that is
-       fundamentally wrong must not be repaired forever; after three
-       consecutive repairs the node is re-derived from the integration head
-       with the findings still in the prompt.
+    3. **The integration head moved.** Evaluated against the head *now* and
+       the subject's recorded head, not against a machine-fault row. §8.1
+       puts attempt worktrees on the integration head, and a repair honours
+       that by branching from a commit that *descends* from the head the
+       rejection was measured against — which is only the current head while
+       no sibling has merged. When one has, the rejected commit descends from
+       a head that is no longer integration's, and branching from it would
+       silently hand the builder a tree missing the sibling's work. The same
+       equality also expires the findings, and it is the expiry
+       `AttemptRecord.guidance_key` already performs, so the two cannot
+       disagree: a base the guidance is invalid at is a base the repair is
+       refused at.
+    4. **The chain reached `REPAIR_CHAIN_LIMIT`.** `chain_length` strictly
+       increases off the immediate predecessor, including an ENVIRONMENTAL
+       predecessor that was itself a repair, so a blip cannot reset the
+       bound. After three consecutive repairs the node is re-derived from
+       the integration head with the findings still in the prompt.
     5. **The last repair made it worse.** Findings rising across a repair — the
        repaired rejection raised fewer than the repair did — is the ledger
        saying the diff in hand is not the thing to keep. Both counts are
@@ -629,22 +660,25 @@ def decide_repair(facts: RepairFacts) -> RepairDecision:
     that existed before this function did, which is the fresh base the
     scheduler would have used anyway.
     """
-    prior = facts.prior
-    if (prior is None
-            or prior.retry_class is not RetryClass.SEMANTIC
-            or not (prior.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)):
+    latest = facts.prior
+    subject = (repair_subject(facts.attempts)
+               if facts.attempts else latest)
+    if (subject is None
+            or subject.retry_class is not RetryClass.SEMANTIC
+            or not (subject.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)):
         return RepairDecision(None, REPAIR_NO_PRIOR_REJECTION)
-    rejected_sha = (prior.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)
+    rejected_sha = (subject.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)
     if (not isinstance(rejected_sha, str) or not rejected_sha
             or not facts.output_proven
             or facts.rejected_ref_sha != rejected_sha):
         return RepairDecision(None, REPAIR_OUTPUT_UNPROVEN)
-    if prior.integration_head != facts.integration_head:
+    if subject.integration_head != facts.integration_head:
         return RepairDecision(None, REPAIR_HEAD_MOVED)
-    chain_length = prior.repair_chain_length + 1
+    chain_source = latest if latest is not None else subject
+    chain_length = chain_source.repair_chain_length + 1
     if chain_length > REPAIR_CHAIN_LIMIT:
         return RepairDecision(None, REPAIR_CHAIN_EXHAUSTED)
-    prior_findings = (prior.extra or {}).get(REVIEW_FINDINGS_COUNT_KEY)
+    prior_findings = (subject.extra or {}).get(REVIEW_FINDINGS_COUNT_KEY)
     if (isinstance(prior_findings, int)
             and facts.repaired_findings is not None
             and prior_findings > facts.repaired_findings):
@@ -652,7 +686,7 @@ def decide_repair(facts: RepairFacts) -> RepairDecision:
     return RepairDecision(
         RepairBasis(base_sha=rejected_sha,
                     integration_head=facts.integration_head,
-                    repair_of_attempt=prior.attempt_no,
+                    repair_of_attempt=subject.attempt_no,
                     chain_length=chain_length),
         REPAIR_ADMITTED)
 

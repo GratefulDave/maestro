@@ -1183,25 +1183,28 @@ class Scheduler:
         """
         store = self.deps.store
         repo = Path(self.deps.repo)
-        attempts = store.attempts_for(self.run_id, node.node_id)
+        attempts = tuple(store.attempts_for(self.run_id, node.node_id))
         prior = max(attempts, key=lambda row: row.attempt_no, default=None)
+        subject = rp.repair_subject(attempts)
+        prove = subject if subject is not None else prior
         rejected_ref_sha: Optional[str] = None
         output_proven = False
-        if prior is not None:
+        if prove is not None:
             rejected_ref_sha = wt.attempt_ref_commit(
-                repo, self.run_id, node.node_id, prior.attempt_no)
-            rejected_sha = (prior.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
+                repo, self.run_id, node.node_id, prove.attempt_no)
+            rejected_sha = (prove.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
             if isinstance(rejected_sha, str) and rejected_sha:
                 output_proven = wt.is_attempt_output_commit(
                     repo, rejected_sha, run_id=self.run_id,
-                    node_id=node.node_id, attempt_no=prior.attempt_no,
-                    expected_base=prior.base_sha)
+                    node_id=node.node_id, attempt_no=prove.attempt_no,
+                    expected_base=prove.base_sha)
         return rp.decide_repair(rp.RepairFacts(
             integration_head=head,
             prior=prior,
             rejected_ref_sha=rejected_ref_sha,
             output_proven=output_proven,
-            repaired_findings=rp.repaired_findings_count(attempts, prior)))
+            repaired_findings=rp.repaired_findings_count(attempts, subject),
+            attempts=attempts))
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store

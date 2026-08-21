@@ -282,6 +282,45 @@ class RepairBaseSelectionTests(RepairFixture):
         # prompt is rendered from a ledger that holds the rejection.
         self.assertEqual(rows[0].guidance_key, rows[1].guidance_key)
 
+    def test_rejection_then_environmental_then_repair_keeps_the_basis(self):
+        """A machine hiccup after a rejection must not discard the narrowed
+        diff. Attempt 3 branches from attempt 1's output, and chain_length
+        strictly increases across the blip.
+        """
+        reviews = [reject(2, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
+        seen = {}
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
+            if record.attempt_no == 2:
+                raise RuntimeError("the machine, not the code")
+            target = attempt.path / "a.py"
+            seen[record.attempt_no] = (
+                target.read_text() if target.exists() else None)
+            target.write_text("A{0}\n".format(record.attempt_no))
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(review_ceiling=4, semantic_ceiling=4),
+            deps=self.deps(run_node=run_node,
+                           review_attempt=self.scripted_reviewer(reviews))
+        ).run()
+
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        rows = sorted(self.store.attempts_for("run1", "a"),
+                      key=lambda row: row.attempt_no)
+        self.assertEqual([row.attempt_no for row in rows], [1, 2, 3])
+        self.assertIs(rows[1].retry_class, st.RetryClass.ENVIRONMENTAL)
+        rejected_sha = rows[0].extra[rp.REVIEW_OUTPUT_SHA_KEY]
+        self.assertEqual(rows[2].base_sha, rejected_sha)
+        self.assertEqual(rows[2].repair_of_attempt, 1)
+        self.assertEqual(rows[2].repair_chain_length, 2)
+        self.assertEqual(seen[3], "A1\n")
+
 
 # ── the failures that must NOT repair ───────────────────────────────────────
 
@@ -592,6 +631,22 @@ def _facts(prior, head: str = "h" * 40, **kw) -> rp.RepairFacts:
     return rp.RepairFacts(**base)
 
 
+def _environmental(attempt_no: int = 2, base: str = "o" * 40,
+                   chain_length: int = 1,
+                   integration_head: str = "h" * 40) -> st.AttemptRecord:
+    extra = {}
+    if chain_length:
+        extra[st.REPAIR_KEY] = {
+            "attempt_no": attempt_no - 1,
+            "integration_head": integration_head,
+            "chain_length": chain_length,
+        }
+    return st.AttemptRecord(
+        run_id="run1", node_id="a", attempt_no=attempt_no, base_sha=base,
+        state=st.NodeState.PENDING,
+        retry_class=st.RetryClass.ENVIRONMENTAL, extra=extra)
+
+
 class DecideRepairTests(unittest.TestCase):
     """Unit coverage of the refusals, each named by its own reason constant."""
 
@@ -673,6 +728,35 @@ class DecideRepairTests(unittest.TestCase):
         self.assertEqual(basis.chain_length, 1)
         self.assertEqual(rp.repair_extra(basis), {st.REPAIR_KEY: {
             "attempt_no": 1, "integration_head": "h" * 40, "chain_length": 1}})
+
+    def test_walking_past_environmental_keeps_the_chain(self):
+        """Rejection, environmental blip, next attempt: same repair basis."""
+        first = _rejected(attempt_no=1)
+        blip = _environmental(attempt_no=2, chain_length=1)
+        decision = rp.decide_repair(_facts(
+            blip, attempts=(first, blip),
+            rejected_ref_sha="o" * 40, output_proven=True))
+        self.assertEqual(decision.reason, rp.REPAIR_ADMITTED)
+        self.assertEqual(decision.basis.base_sha, "o" * 40)
+        self.assertEqual(decision.basis.repair_of_attempt, 1)
+        self.assertEqual(decision.basis.chain_length, 2)
+
+    def test_walking_past_environmental_still_refuses_a_moved_head(self):
+        first = _rejected(attempt_no=1)
+        blip = _environmental(attempt_no=2, chain_length=1)
+        self.assertEqual(
+            rp.decide_repair(_facts(
+                blip, head="n" * 40, attempts=(first, blip),
+                rejected_ref_sha="o" * 40, output_proven=True)).reason,
+            rp.REPAIR_HEAD_MOVED)
+
+    def test_a_semantic_row_without_the_commit_still_stops_the_walk(self):
+        first = _rejected()
+        del first.extra[rp.REVIEW_OUTPUT_SHA_KEY]
+        blip = _environmental(attempt_no=2, chain_length=1)
+        self.assertEqual(
+            rp.decide_repair(_facts(blip, attempts=(first, blip))).reason,
+            rp.REPAIR_NO_PRIOR_REJECTION)
 
 
 class AttemptRowReadersTests(unittest.TestCase):
