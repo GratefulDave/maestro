@@ -426,9 +426,9 @@ class LaunchSpec:
     #: be read. Empty names this launcher's default group -- the lanes that
     #: are not a node's, such as the plan author.
     pane_group: str = ""
-    #: This agent's part in that node: `builder`, `reviewer`. Display only,
-    #: and part of the pane's stored label so a pane says what it is without
-    #: anyone reading its working directory.
+    #: This agent's part in that node: `builder`, `reviewer`, `tester`. Display
+    #: only, and part of the pane's stored label so a pane says what it is
+    #: without anyone reading its working directory.
     pane_role: str = ""
     #: How many agent panes the caller expects this tab to hold. The tab's
     #: column count is computed from it and then only ever grows, so a

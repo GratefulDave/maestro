@@ -426,7 +426,7 @@ class ResultRecord:
 # ── §7.1 the node the scheduler consumes directly ───────────────────────────
 
 class NodeKind(str, Enum):
-    """Three kinds, each with its own VERIFIED predicate (§7.3).
+    """Four kinds, each with its own VERIFIED predicate (§7.3, §1.1 item 4).
 
     `REVIEW` is a kind at the type level and never an authored one. B11's
     lesson is that reviewing and producing must be separated in the *type*
@@ -446,11 +446,17 @@ class NodeKind(str, Enum):
     the graph — the build node must be VERIFIED before its review can start,
     and a review FAIL sends the build node back to PENDING — which is a
     scheduler loop, not a dependency. `PlanNode` refuses this kind outright.
+
+    `TESTS` is authored. It writes the test files a later `AGENT` (build)
+    node must make pass, and it carries its own evidence chain: test files
+    only, at least one new collected case, each new case red at the parent
+    commit. Reusing the agent chain here is how hollow tests shipped.
     """
 
     AGENT = "agent"
     CODE = "code"
     REVIEW = "review"
+    TESTS = "tests"
 
 
 @dataclass(frozen=True)
@@ -584,6 +590,32 @@ class PlanNode:
                     "a goal -- it is a projection that dropped one, and the "
                     "reviewer would be handed a goal derived from the very gate "
                     "it is meant to judge independently")
+        elif self.kind is NodeKind.TESTS:
+            if not self.gate_command:
+                raise ValueError(
+                    f"{self.node_id}: a tests node's evidence chain counts "
+                    "cases from its gate; without a command there is nothing "
+                    "to collect")
+            if not (self.gate_selector or "").strip():
+                raise ValueError(
+                    f"{self.node_id}: a tests node needs its own gate selector "
+                    "so new cases can be counted against that selector")
+            if self.command:
+                raise ValueError(
+                    f"{self.node_id}: a tests node's work is the agent's, not a "
+                    "command; a command here would be a second execution path")
+            if self.expects_changes:
+                raise ValueError(
+                    f"{self.node_id}: expects_changes is a code-node clause "
+                    "(§7.3); on a tests node it is a field nothing reads")
+            if self.gate_min_cases < 1:
+                raise ValueError(
+                    f"{self.node_id}: a tests node counts `new cases >= 1`; a "
+                    "gate demanding zero cases cannot refuse a hollow file")
+            if not self.instruction.strip():
+                raise ValueError(
+                    f"{self.node_id}: a tests node carries the instruction the "
+                    "plan declared for it (§3.6 B9)")
         else:
             if self.instruction:
                 raise ValueError(

@@ -526,7 +526,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         raw, "maestro configuration",
         ("schema", "plans_dir", "state_root", "keys", "executables",
          "route_receipts", "reviewer", "execution"),
-        ("plan_contract", "author", "runners"))
+        ("plan_contract", "author", "runners", "tester"))
     if root["schema"] != _MAESTRO_SCHEMA:
         raise _MaestroConfigurationError(
             "schema must be " + _MAESTRO_SCHEMA)
@@ -735,9 +735,27 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
                 author_raw["poll_interval_s"], "author.poll_interval_s"),
         }
 
+    tester = None
+    if "tester" in root:
+        tester_raw = _config_mapping(
+            root["tester"], "tester",
+            ("route", "model", "effort"),
+            ("profile", "vendor"))
+        tester = {
+            "route": _config_string(tester_raw["route"], "tester.route"),
+            "model": _config_string(tester_raw["model"], "tester.model"),
+            "effort": _config_string(tester_raw["effort"], "tester.effort"),
+            "profile": (_config_string(tester_raw["profile"], "tester.profile")
+                        if "profile" in tester_raw else None),
+            "vendor": (_config_string(tester_raw["vendor"], "tester.vendor")
+                       if "vendor" in tester_raw else None),
+        }
+
     sections = [("reviewer", reviewer), ("execution", execution)]
     if author is not None:
         sections.append(("author", author))
+    if tester is not None:
+        sections.append(("tester", tester))
     for label, section in sections:
         if section["route"] not in route_paths:
             raise _MaestroConfigurationError(
@@ -797,6 +815,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "reviewer": reviewer,
         "execution": execution,
         "author": author,
+        "tester": tester,
     }
 
 
@@ -1167,6 +1186,12 @@ def _apply_repository_config(
         args.reviewer_profile = reviewer["profile"]
         args.reviewer_vendor = reviewer["vendor"]
         args.execution_vendor = execution["vendor"]
+        tester = config.get("tester") or {}
+        args.tester_route = tester.get("route")
+        args.tester_model = tester.get("model")
+        args.tester_effort = tester.get("effort")
+        args.tester_profile = tester.get("profile")
+        args.tester_vendor = tester.get("vendor")
         # Per-attempt subdirectories are minted under this root by the runner;
         # each review gets a fresh session directory, because §6.5's structural
         # half of "independent review is recorded" refuses a reused one.
@@ -1830,6 +1855,72 @@ def _agent_node_prompt(node: Any, envelope: Path,
         AGENT_DISCOVERY_ROUTING,
     ])
     return "\n".join(lines)
+
+
+def _tests_node_prompt(node: Any, envelope: Path,
+                       retry_prompt: Optional[str]) -> str:
+    """Goal, produces, acceptance — tests only, no implementation."""
+    lines = [node.instruction, ""]
+    outputs = list(getattr(node, "outputs", ()) or ())
+    if outputs:
+        lines.append(
+            "Write only these test files, relative to the repository root. "
+            "Do not write implementation. A change to anything else fails "
+            "the attempt:")
+        lines.extend("  " + path for path in outputs)
+        lines.append("")
+    gate = getattr(node, "gate", None)
+    if gate is not None:
+        lines.append(
+            "Maestro will collect these tests and require every new case to "
+            "fail at the parent commit (implementation does not exist yet). "
+            "A case that passes at the parent is refused. A collection "
+            "error or an import crash of the test file is not a red:")
+        lines.append("  " + " ".join([gate.runner, *gate.argv]))
+        lines.append("")
+    if retry_prompt:
+        lines.extend(["Retry guidance:", retry_prompt, ""])
+    lines.extend([
+        "When you have finished, write this file and then stop:",
+        "  " + str(envelope),
+        '  {"success": true, "summary": "<what you did>"}',
+        "",
+        AGENT_DISCOVERY_ROUTING,
+    ])
+    return "\n".join(lines)
+
+
+def _append_needed_tests(prompt: str, worktree: Path, node: Any,
+                         plan: Any) -> str:
+    """Attach already-merged test file bytes to a build node's handoff.
+
+    The tests node merged first; those files sit in this worktree and are
+    not this node's outputs. Size-checked by the existing B13 chokepoint
+    after this function returns.
+    """
+    from adw_modules.tests_chain import is_test_path
+    by_id = plan.node_by_id()
+    chunks = []
+    for need in getattr(node, "needs", ()) or ():
+        needed = by_id.get(need)
+        if not isinstance(needed, plan_model.TestsNode):
+            continue
+        for rel in needed.outputs:
+            if not is_test_path(rel):
+                continue
+            target = Path(worktree) / rel
+            if not target.is_file():
+                continue
+            chunks.append("### " + rel)
+            chunks.append(target.read_text(encoding="utf-8"))
+    if not chunks:
+        return prompt
+    return (
+        prompt
+        + "\nThe tests you must make pass are already in the tree:\n\n"
+        + "\n".join(chunks)
+        + "\n"
+    )
 
 
 def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
@@ -2668,7 +2759,8 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
 #: version produces instructions a reviewer can judge against — that is the
 #: whole content of the v1/v2 distinction, and no structural check can
 #: substitute for it.
-_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({plan_model.SCHEMA_V2})
+_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({
+    plan_model.SCHEMA_V2, plan_model.SCHEMA_V3})
 
 
 def _refuse_unrunnable_plan_schema(args: argparse.Namespace,
@@ -3350,6 +3442,8 @@ def _resolve_run_runners(
     scratch = Path(args.scratch_root) / "runner-probe"
     env = worktree.launch_env(scratch)
     wanted = {node.gate.runner for node in plan.agent_nodes}
+    wanted.update(node.gate.runner
+                  for node in getattr(plan, "tests_nodes", ()) or ())
     wanted.add(plan.merge_policy.integration_gate.runner)
     return {
         runner: runner_resolution.resolve(
@@ -3387,7 +3481,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         # stderr, because this verb's stdout is one JSON document and an
         # operator hint is not part of it.
         print(notice, file=sys.stderr)
-    route_runner = _runtime_launcher(args) if plan.agent_nodes else None
+    tests_nodes = getattr(plan, "tests_nodes", ()) or ()
+    route_runner = (_runtime_launcher(args)
+                    if plan.agent_nodes or tests_nodes else None)
     store = lc.LifecycleStore(args.db)
     handles = {}
     proven_absent = set()
@@ -3473,47 +3569,51 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             assert route_runner is not None
             prompt = attempt.scratch / "agent-prompt.txt"
             envelope = attempt.scratch / "agent-envelope.json"
-            prompt_text = _agent_node_prompt(
-                plan.node_by_id()[node.node_id], envelope, retry_prompt)
-            # B13 for the builder. A retry prompt carries guidance derived from
-            # the previous attempt's measured failure, so its size is a runtime
-            # quantity and not an authored one; dispatching one that cannot fit
-            # produces an attempt about a different task rather than an error.
-            _preflight_prompt(prompt_text, args.agent_route, args.agent_model)
+            plan_node = plan.node_by_id()[node.node_id]
+            if node.kind is scheduler_types.NodeKind.TESTS:
+                prompt_text = _tests_node_prompt(
+                    plan_node, envelope, retry_prompt)
+                lane_route = getattr(args, "tester_route", None) or args.agent_route
+                lane_model = getattr(args, "tester_model", None) or args.agent_model
+                lane_effort = getattr(args, "tester_effort", None) or args.agent_effort
+                lane_profile = getattr(args, "tester_profile", None) or args.agent_profile
+                # B15: tester.vendor is loaded onto args and read here. The
+                # information barrier is the node split, not a B12 vendor
+                # pair, and LaunchSpec has no vendor field.
+                getattr(args, "tester_vendor", None)
+            else:
+                prompt_text = _agent_node_prompt(
+                    plan_node, envelope, retry_prompt)
+                prompt_text = _append_needed_tests(
+                    prompt_text, attempt.path, node, plan)
+                lane_route = args.agent_route
+                lane_model = args.agent_model
+                lane_effort = args.agent_effort
+                lane_profile = args.agent_profile
+            # B13: the build handoff now carries the tests as well as the
+            # goal, so it is strictly larger. Same chokepoint as before.
+            _preflight_prompt(prompt_text, lane_route, lane_model)
             prompt.write_text(prompt_text, encoding="utf-8")
-            # Through `_typed_launch_pane` like every other dispatch, so the
-            # builder's spec is given its route's window on the same path the
-            # reviewers' are. Called directly against `runner.launch` before,
-            # which meant one of this module's dispatch sites would have reached the
-            # launcher's B13 check with nothing measured on its spec.
             handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
                     args.run_id, node.node_id, record.attempt_no),
                 worktree=attempt.path, prompt_path=prompt,
-                envelope_path=envelope, route=args.agent_route,
-                model=args.agent_model, effort=args.agent_effort,
-                profile=args.agent_profile,
+                envelope_path=envelope, route=lane_route,
+                model=lane_model, effort=lane_effort,
+                profile=lane_profile,
                 session_dir=attempt.scratch / "session",
                 context_window_tokens=_route_context_window(
-                    args.agent_route, args.agent_model),
-                # This node's own tab, with room for the reviewer that will
-                # judge it: two panes side by side rather than a builder and a
-                # reviewer in unrelated corners of a flat tab.
-                pane_group=node.node_id, pane_role="builder",
+                    lane_route, lane_model),
+                pane_group=node.node_id,
+                pane_role=("tester"
+                           if node.kind is scheduler_types.NodeKind.TESTS
+                           else "builder"),
                 pane_group_size=2,
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
                 proven_absent.discard(key)
             _require_session_path(handle, node.node_id, record.attempt_no)
-            # `process_group` first because a harness-spawned launch owns its
-            # group outright; `liveness_pid` is the herdr-spawned fallback that
-            # makes §7.6's PROCESS_DEAD signal reachable for an agent node at
-            # all (#20). Both land in `attempts.pid`, which has exactly one
-            # reader — the watchdog's `process_is_alive` check — while the kill
-            # path below reads `handle.process_group` from `handles` and is
-            # deliberately not given the fallback: see `LaunchHandle`, §8.3 and
-            # §16.3 items 17 and 30.
             liveness_pid = handle.process_group
             if liveness_pid is None:
                 liveness_pid = handle.liveness_pid
