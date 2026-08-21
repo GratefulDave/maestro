@@ -29,7 +29,10 @@ to remove:
   nothing reaches still counts as a writer here. `LaunchHandle.process_group`
   is that shape and needed a human to see it.
 * **Semantic deadness.** A field written only with its own default, or an enum
-  member constructed only on a path that cannot be taken, reads as live.
+  member constructed only on a path that cannot be taken, still reads as live.
+  A constructor argument whose *every* production site is a no-op lambda used
+  to sit in this bucket too — the lambda counted as a writer — and is now a
+  separate check. A named no-op (`def _drop(...): return None`) is not.
 
 Each of those needs a reader, not a sweep. The complementary check — driving a
 real node attempt through the production `run_node` adapter rather than a
@@ -236,6 +239,22 @@ ALLOWED: Dict[str, str] = {
     "FinalizationConfig.quiescence_confirm_s": "DEFERRED #100: reachable on its "
                                                "default; the operator override "
                                                "needs a maestro.py writer",
+
+    # Constructor slots whose every production call site is `lambda ...: None`.
+    # The field check cannot see these: the lambda *is* a writer. Naming them
+    # here is the point of #99 — a deliberate or deferred no-op must be stated
+    # rather than look wired. The `maestro.py` call site is left for a follow-up
+    # because that file is partly owned by a concurrent lane.
+    "FinalizationWindow.record_reviewer_session": "DEFERRED #99: production "
+                                                  "constructor in maestro.py:"
+                                                  "_code_review_runner still "
+                                                  "passes lambda _s: None; "
+                                                  "this lane names the seam "
+                                                  "rather than colliding on "
+                                                  "maestro.py",
+    "RunBackstop.on_stuck": "DEFERRED: production constructor in scheduler.py "
+                            "passes lambda diagnostic: None; watchdog.py is "
+                            "owned by a concurrent lane",
 }
 
 
@@ -279,6 +298,36 @@ def _callee_name(node: ast.Call) -> Optional[str]:
         return func.attr
     return getattr(func, "id", None)
 
+def _is_noop_lambda(node: ast.AST) -> bool:
+    """`lambda ...: None` — the writer that is not a writer (#99).
+
+    A named function that returns None is a different shape and is not this
+    check: the point is the anonymous slot that reads as wired at the call
+    site while implementing nothing.
+    """
+    if not isinstance(node, ast.Lambda):
+        return False
+    body = node.body
+    return isinstance(body, ast.Constant) and body.value is None
+
+
+def _noop_lambda_offenders(prod: "_Index") -> List[str]:
+    """Constructor parameters whose every production pass is a no-op lambda."""
+    offenders: List[str] = []
+    for (cls, param), writes in sorted(prod.constructor_args.items()):
+        key = f"{cls}.{param}"
+        if key in ALLOWED or not writes:
+            continue
+        if all(_is_noop_lambda(value) for _loc, value in writes):
+            locs = [loc for loc, _ in writes]
+            offenders.append(
+                f"{key} is passed a no-op lambda at every production call "
+                f"site {locs[:3]}; the seam reads as wired and records "
+                "nothing. Wire a real callable, delete the parameter, or "
+                "add it to ALLOWED with the reason the no-op is stated.")
+    return offenders
+
+
 
 class _Index:
     """Definitions and usages over one file set."""
@@ -303,22 +352,40 @@ class _Index:
         #: A call site cannot be a local binding, so this is what the converse
         #: check keys on.
         self.calls: Dict[str, Set[str]] = {}
+        #: Production constructor arguments, keyed by (Class, param). The
+        #: field check counts any keyword as a writer; this is what lets a
+        #: `lambda ...: None` be seen as the absence it actually is.
+        self.constructors: Dict[str, List[str]] = {}
+        self.constructor_args: Dict[Tuple[str, str], List[Tuple[str, ast.AST]]] = {}
 
     def define(self, path: Path, tree: ast.Module) -> None:
         module = path.stem
         for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and _is_dataclass(node):
-                fields = self.fields.setdefault(node.name, {})
-                order: List[str] = []
-                for stmt in node.body:
-                    if not (isinstance(stmt, ast.AnnAssign)
-                            and isinstance(stmt.target, ast.Name)):
-                        continue
-                    order.append(stmt.target.id)
-                    if _has_default_factory(stmt):
-                        continue
-                    fields[stmt.target.id] = f"{path.name}:{stmt.lineno}"
-                self.field_order[node.name] = order
+            if isinstance(node, ast.ClassDef):
+                if _is_dataclass(node):
+                    fields = self.fields.setdefault(node.name, {})
+                    order: List[str] = []
+                    for stmt in node.body:
+                        if not (isinstance(stmt, ast.AnnAssign)
+                                and isinstance(stmt.target, ast.Name)):
+                            continue
+                        order.append(stmt.target.id)
+                        if _has_default_factory(stmt):
+                            continue
+                        fields[stmt.target.id] = f"{path.name}:{stmt.lineno}"
+                    self.field_order[node.name] = order
+                init = next(
+                    (stmt for stmt in node.body
+                     if isinstance(stmt, (ast.FunctionDef,
+                                          ast.AsyncFunctionDef))
+                     and stmt.name == "__init__"),
+                    None)
+                if init is not None:
+                    self.constructors[node.name] = [
+                        arg.arg for arg in init.args.args if arg.arg != "self"]
+                elif node.name in self.field_order:
+                    self.constructors[node.name] = list(
+                        self.field_order[node.name])
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.callables.setdefault(f"{module}.{node.name}",
                                           f"{path.name}:{node.lineno}")
@@ -336,6 +403,19 @@ class _Index:
                 # `Cls(**payload)` writes an unknowable set of fields.
                 self.splatted.add(owner)
 
+    def _record_constructor_args(self, owner: str, call: ast.Call,
+                                 loc: str) -> None:
+        params = self.constructors.get(owner)
+        if not params:
+            return
+        for param, arg in zip(params, call.args):
+            self.constructor_args.setdefault((owner, param), []).append(
+                (loc, arg))
+        for kw in call.keywords:
+            if kw.arg:
+                self.constructor_args.setdefault((owner, kw.arg), []).append(
+                    (loc, kw.value))
+
     def use(self, path: Path, tree: ast.Module) -> None:
         # A classmethod builds its own class as `cls(...)`. Resolve that first,
         # or every field a `parse`/`from_row` constructor writes reads as
@@ -343,12 +423,16 @@ class _Index:
         for outer in ast.walk(tree):
             if not isinstance(outer, ast.ClassDef):
                 continue
-            if outer.name not in self.field_order:
-                continue
+            loc = f"{path.name}:{{0}}"
             for inner in ast.walk(outer):
-                if isinstance(inner, ast.Call) and _callee_name(inner) == "cls":
-                    self._record_construction(
-                        outer.name, inner, f"{path.name}:{inner.lineno}")
+                if not (isinstance(inner, ast.Call)
+                        and _callee_name(inner) == "cls"):
+                    continue
+                site = loc.format(inner.lineno)
+                if outer.name in self.field_order:
+                    self._record_construction(outer.name, inner, site)
+                if outer.name in self.constructors:
+                    self._record_constructor_args(outer.name, inner, site)
 
         for node in ast.walk(tree):
             loc = f"{path.name}:{getattr(node, 'lineno', 0)}"
@@ -374,6 +458,8 @@ class _Index:
                     for kw in node.keywords:
                         if kw.arg:
                             self.writes.setdefault(kw.arg, set()).add(loc)
+                if name in self.constructors:
+                    self._record_constructor_args(name or "", node, loc)
 
 
 def _build() -> Tuple[_Index, _Index]:
@@ -457,6 +543,53 @@ class DeadSeamTest(unittest.TestCase):
             "it, or it is dead and should go with its tests, or it is "
             "deliberately test-only and belongs in ALLOWED with a reason.\n"
             + "\n".join(offenders))
+
+    def test_no_constructor_parameter_is_only_fed_a_noop_lambda(self) -> None:
+        """#99: a `lambda ...: None` is not a writer, even though it is a
+        keyword argument the field check counts as one."""
+        prod, _test = _build()
+        self.assertEqual(
+            [], _noop_lambda_offenders(prod),
+            "a constructor parameter whose every production call site is a "
+            "no-op lambda. The field check cannot see this — the lambda is "
+            "the writer it counts. Wire a real callable, delete the "
+            "parameter, or add it to ALLOWED with the reason the no-op is "
+            "stated.\n" + "\n".join(_noop_lambda_offenders(prod)))
+
+    def test_a_noop_lambda_writer_is_now_convicted_and_was_not(self) -> None:
+        """§13.4 / §16.3: the extension convicts a planted slot the field
+        check acquits, because the lambda counted as a writer."""
+        planted = ast.parse(
+            "class Window:\n"
+            "    def __init__(self, record_reviewer_session):\n"
+            "        self._r = record_reviewer_session\n"
+            "Window(record_reviewer_session=lambda _s: None)\n")
+        idx = _Index()
+        idx.define(Path("planted.py"), planted)
+        idx.use(Path("planted.py"), planted)
+        # The field check keys on dataclass fields. Window is not one, so
+        # it is silent — and even if the slot were a field, the lambda
+        # would count as a write.
+        self.assertNotIn("Window", idx.fields)
+        self.assertTrue(idx.writes.get("record_reviewer_session"),
+                        "the old check's write bucket saw the lambda")
+        offenders = _noop_lambda_offenders(idx)
+        self.assertTrue(
+            any("Window.record_reviewer_session" in row for row in offenders),
+            "planted no-op lambda was not convicted: " + repr(offenders))
+        # Control: a real callable at the same slot is not a dead seam.
+        live = ast.parse(
+            "class Window:\n"
+            "    def __init__(self, record_reviewer_session):\n"
+            "        self._r = record_reviewer_session\n"
+            "def record(session):\n"
+            "    persist(session)\n"
+            "Window(record_reviewer_session=record)\n")
+        live_idx = _Index()
+        live_idx.define(Path("live.py"), live)
+        live_idx.use(Path("live.py"), live)
+        self.assertEqual([], _noop_lambda_offenders(live_idx))
+
 
     def test_no_allowlist_entry_has_acquired_a_production_caller(self) -> None:
         """The allowlist read in one direction only, and that is how an entry
