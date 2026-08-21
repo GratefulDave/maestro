@@ -40,6 +40,7 @@ Run with:  uv run adws/adw_test.py        (the whole suite; `-k` filters on
 
 from __future__ import annotations
 
+import io
 import os
 import signal
 import subprocess
@@ -998,7 +999,156 @@ class CancellationTests(SchedulerFixture):
             scheduler.run()
         self.assertIs(signal.getsignal(signal.SIGINT), previous)
 
+    def test_a_real_sigint_during_an_in_flight_attempt_quiesces(self):
+        """Issue #110 — deliver signal.SIGINT, not a direct request_pause()."""
+        started = threading.Event()
+        release = threading.Event()
 
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            on_launch(None)
+            started.set()
+            deadline = time.time() + ARRIVAL_TIMEOUT_S
+            while time.time() < deadline:
+                if release.is_set() or cancel_requested():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("in-flight run_node was not released")
+            (attempt.path / "a.py").write_text("A\n")
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        scheduler = self.schedule(
+            [self.agent("a")], deps=self.deps(run_node=run_node))
+
+        def fire():
+            self.assertTrue(started.wait(ARRIVAL_TIMEOUT_S))
+            os.kill(os.getpid(), signal.SIGINT)
+            release.set()
+
+        waiter = threading.Thread(target=fire)
+        waiter.start()
+        with self.assertRaises(sch.RunPaused):
+            scheduler.run()
+        waiter.join(timeout=ARRIVAL_TIMEOUT_S)
+
+        self.assertTrue(scheduler._sigint_pause_latched)
+        self.assertFalse(scheduler._sigint_escalated)
+        self.assertIsNone(self.store.latest_outcome("run1"))
+        self.assertIsNot(self.store.get_node("run1", "a").state,
+                         st.NodeState.CANCELLED)
+        self.assertFalse(self.store.conn.execute(
+            "SELECT cancel_requested FROM runs WHERE run_id=?",
+            ("run1",)).fetchone()[0])
+
+    def test_a_real_sigint_between_attempts_does_not_start_the_next_node(self):
+        """Issue #110 — SIGINT after one attempt has merged, before the next."""
+        entered = []
+        orig_ready = self.store.ready_nodes
+        sent = []
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            entered.append(node.node_id)
+            on_launch(None)
+            (attempt.path / f"{node.node_id}.py").write_text(
+                node.node_id.upper() + "\n")
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        def ready_nodes(run_id):
+            nodes = orig_ready(run_id)
+            if (not sent
+                    and self.store.get_node("run1", "a").state
+                    is st.NodeState.MERGED):
+                sent.append(1)
+                os.kill(os.getpid(), signal.SIGINT)
+            return nodes
+
+        self.store.ready_nodes = ready_nodes
+        self.written = {"a": {"a.py": "A\n"}, "b": {"b.py": "B\n"}}
+        scheduler = self.schedule(
+            [self.agent("a"), self.agent("b")],
+            config=self.config(concurrency=1),
+            deps=self.deps(run_node=run_node))
+        with self.assertRaises(sch.RunPaused):
+            scheduler.run()
+
+        self.assertEqual(entered, ["a"])
+        self.assertIsNone(self.store.latest_outcome("run1"))
+        self.assertNotIn("b", [
+            r.node_id for r in self.store.node_records("run1")
+            if r.state == st.NodeState.RUNNING.value])
+
+    def test_a_second_sigint_escalates_past_a_hung_quiesce(self):
+        """Issue #110 — second SIGINT is stronger than another polite request."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            on_launch(None)
+            started.set()
+            deadline = time.time() + ARRIVAL_TIMEOUT_S
+            while time.time() < deadline:
+                if release.is_set() or cancel_requested():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("escalation run_node was not released")
+            (attempt.path / "a.py").write_text("A\n")
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        def quiesce(record, phase):
+            self.assertIsInstance(record, st.AttemptRecord)
+            self.quiesce_calls.append((record.key, phase))
+            if threading.current_thread() is not threading.main_thread():
+                return
+            # Escalation is armed just before this call. A second SIGINT
+            # here must raise KeyboardInterrupt rather than request_pause.
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(ARRIVAL_TIMEOUT_S)
+            self.fail("second SIGINT did not interrupt hung quiesce")
+
+        def fire():
+            self.assertTrue(started.wait(ARRIVAL_TIMEOUT_S))
+            os.kill(os.getpid(), signal.SIGINT)
+            release.set()
+
+        scheduler = self.schedule(
+            [self.agent("a")],
+            deps=self.deps(run_node=run_node, quiesce_attempt=quiesce))
+        self.addCleanup(release.set)
+        waiter = threading.Thread(target=fire, daemon=True)
+        waiter.start()
+        with self.assertRaises(sch.RunPaused):
+            scheduler.run()
+        waiter.join(timeout=ARRIVAL_TIMEOUT_S)
+
+        self.assertTrue(scheduler._sigint_escalated)
+        self.assertIsNone(self.store.latest_outcome("run1"))
+        self.assertFalse(self.store.conn.execute(
+            "SELECT cancel_requested FROM runs WHERE run_id=?",
+            ("run1",)).fetchone()[0])
+
+    def test_failed_sigint_handler_install_is_surfaced(self):
+        """Issue #110 / brief — ValueError on install is not swallowed."""
+        self.written = {"a": {"a.py": "A\n"}}
+        scheduler = self.schedule([self.agent("a")])
+        real = signal.signal
+
+        def wrapped(sig, handler):
+            if getattr(handler, "__self__", None) is scheduler:
+                raise ValueError(
+                    "signal only works in main thread of the main interpreter")
+            return real(sig, handler)
+
+        buf = io.StringIO()
+        with mock.patch("adw_modules.scheduler.signal.signal", wrapped):
+            with mock.patch("adw_modules.scheduler.sys.stderr", buf):
+                report = scheduler.run()
+        self.assertIn("SIGINT_HANDLER_NOT_INSTALLED", buf.getvalue())
+        self.assertFalse(scheduler._sigint_handler_installed)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
     def test_cancellation_during_the_pre_node_gate_cannot_run_the_node(self):
         holder = {}

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import posixpath
 import signal
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -184,6 +185,16 @@ class RunPaused(RuntimeError):
     paused run is indistinguishable in the ledger from one whose scheduler
     process simply stopped, and `run resume` is legal against it for exactly
     that reason (§1.2, §7.8).
+    """
+
+
+class SigintInterrupt(BaseException):
+    """Injected by the SIGINT handler so a blocking wait unblocks.
+
+    Not `KeyboardInterrupt`: pytest treats that as a session abort, so a
+    test that delivers a real SIGINT would never get to assert the pause.
+    `BaseException` so `except Exception` cannot swallow it. The handler
+    is the only raiser; the run loop is the only catcher.
     """
 
 
@@ -407,6 +418,16 @@ class Scheduler:
         #: tells the loop not to write `cancel_run` on the way out, and the
         #: exit to raise `RunPaused` rather than declare.
         self._paused = threading.Event()
+        #: Signal-handler-safe latches. The handler must not take `_lock` or
+        #: call `Event.set`: either deadlocks if the interrupted thread holds
+        #: the matching lock. One Ctrl-C under `uv run` delivers SIGINT twice
+        #: (process-group + uv forward), so escalation is armed only after the
+        #: run loop has observed the pause, never on the second delivery of
+        #: the same chord.
+        self._sigint_pause_latched = False
+        self._sigint_escalate_armed = False
+        self._sigint_escalated = False
+        self._sigint_handler_installed = False
         self._lock = threading.RLock()
         # A watchdog timeout revokes a generation before quiescence can
         # complete and release its retry. The durable row remains RUNNING
@@ -557,26 +578,84 @@ class Scheduler:
         the run loop already reads; `_paused` is what makes the difference
         between the two stops. Nothing durable is written here or by the loop
         it stops — that is the property `run resume` depends on.
+
+        Not for the SIGINT handler: `Event.set` and `_lock` are not
+        signal-safe. The handler raises `KeyboardInterrupt`; this method
+        runs on the main thread after that interrupt is caught.
         """
         with self._lock:
             self._paused.set()
             self._cancelled.set()
 
     def _handle_sigint(self, signum, frame) -> None:
-        """SIGINT is a pause request, not a kill.
+        """SIGINT is a pause request; a later SIGINT after pause is armed
+        escalates by raising KeyboardInterrupt so a hung wait unblocks.
 
         `run pause` signals the claiming process rather than writing a row,
         because the process is the thing that has to stop — its `finally`
         releases the integration checkout, and a row could not have done that.
-        The handler latches and returns; the loop is what quiesces, so no
-        durable state is touched from inside a signal handler.
+        The handler latches a bool and raises; the loop is what quiesces, so
+        no durable state is touched from inside a signal handler. A second
+        SIGINT after the loop has armed escalation still writes nothing
+        (§1.2) — it only refuses to wait forever for a hung quiesce.
         """
-        self.request_pause()
+        if self._sigint_escalate_armed:
+            self._sigint_escalated = True
+            raise SigintInterrupt
+        self._sigint_pause_latched = True
+        raise SigintInterrupt
 
     def shutdown(self) -> None:
         pool, self._pool = self._pool, None
         if pool is not None:
             pool.shutdown(wait=True)
+
+    def _shutdown_escalated(self) -> None:
+        """Second SIGINT: do not wait for workers that have already hung."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _preserve_unpublished_work(
+            self, attempt: st.AttemptRecord,
+            reason: str = "NODE_TIMEOUT") -> None:
+        """Publish unpublished builder work onto the attempt ref (#97, #110).
+
+        Empty delta is a no-op — nothing to salvage. Errors propagate to the
+        caller: the watchdog still fails the attempt, and SIGINT escalate
+        still leaves the pause-shaped ledger.
+        """
+        with self._lock:
+            worktree = self._attempt_worktrees.get(attempt.node_id)
+        if (worktree is None
+                or worktree.attempt_no != attempt.attempt_no
+                or worktree.baseline is None):
+            return
+        after = wt.inventory(worktree.path)
+        measured = wt.delta(worktree.baseline, after)
+        if measured.is_empty:
+            return
+        wt.commit_measured_delta(
+            worktree, measured, after,
+            "{} attempt {} {}".format(
+                attempt.node_id, attempt.attempt_no, reason))
+
+    def _preserve_running_unpublished(self) -> None:
+        """PR #124's preserve step, for every RUNNING node, before escalate."""
+        for row in self.deps.store.node_records(self.run_id):
+            if row.state != st.NodeState.RUNNING.value:
+                continue
+            lifecycle = self.deps.store.get_node(self.run_id, row.node_id)
+            try:
+                attempt = self.deps.store.get_attempt(
+                    self.run_id, row.node_id, lifecycle.attempt_no)
+            except lc.UnknownNode:
+                continue
+            try:
+                self._preserve_unpublished_work(
+                    attempt, reason="SIGINT_ESCALATED")
+            except Exception:
+                continue
 
     def _owns_running(self, record: st.AttemptRecord) -> bool:
         lifecycle = self.deps.store.get_node(self.run_id, record.node_id)
@@ -628,6 +707,8 @@ class Scheduler:
             return
         try:
             self.deps.quiesce_attempt(record, phase)
+        except (KeyboardInterrupt, SigintInterrupt):
+            raise
         except BaseException as exc:
             raise QuiescenceFailure(phase, exc) from exc
 
@@ -730,21 +811,30 @@ class Scheduler:
         stays PENDING forever and is exactly the shape the run must stop on.
 
         One exit does not declare: a pause. `run pause` SIGINTs this process,
-        `_handle_sigint` latches `_paused`, and the loop stops the same way a
-        cancel stops it — except that nothing durable is written and the exit
-        raises `RunPaused` instead. The handler is installed for the duration
-        of the loop and the previous one restored on every path out, including
+        `_handle_sigint` raises `KeyboardInterrupt`, the loop latches
+        `_paused`, and the loop stops the same way a cancel stops it —
+        except that nothing durable is written and the exit raises
+        `RunPaused` instead. The handler is installed for the duration of
+        the loop and the previous one restored on every path out, including
         the exceptional ones, so a scheduler embedded in a longer-lived
         process does not leave its SIGINT behind. Installing it can fail
-        outright off the main thread, and that is not an error — a scheduler
-        that cannot receive the signal simply cannot be paused by it.
+        outright off the main thread; that is printed as
+        `SIGINT_HANDLER_NOT_INSTALLED` rather than swallowed, and a
+        scheduler that cannot receive the signal simply cannot be paused by
+        it.
         """
         previous_sigint = None
         try:
             previous_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
-        except ValueError:
+            self._sigint_handler_installed = True
+        except ValueError as exc:
             previous_sigint = None
+            self._sigint_handler_installed = False
+            print("SIGINT_HANDLER_NOT_INSTALLED: {0}".format(exc),
+                  file=sys.stderr)
         self.project()
+        if self._sigint_pause_latched:
+            self.request_pause()
         if self._paused.is_set():
             return self._finish_paused(previous_sigint)
         if self._cancelled.is_set():
@@ -758,98 +848,114 @@ class Scheduler:
         watchdog.start()
         try:
             while True:
-                if self._cancelled.is_set():
-                    # A Future cannot interrupt a running worker. Quiesce its
-                    # owned execution first, then wait for the worker to stop
-                    # observing its RUNNING lease before cancelling durable
-                    # state. Otherwise a late worker could commit into a retry.
-                    self._interrupt_in_flight(in_flight, cancellation_requested)
-                    if in_flight:
-                        done, _ = _wait_any(list(in_flight.items()))
-                        for node_id in done:
-                            in_flight.pop(node_id, None)
-                        continue
-                    # A pause takes this same path to quiesce, and writes
-                    # nothing on the way out: `cancel_run` is a lifecycle
-                    # transition, and a pause makes none (§1.2).
-                    if not self._paused.is_set():
-                        self.deps.store.cancel_run(self.run_id)
-                    break
-
-                if backstop.check():
-                    # §11.2 — the backstop's domain is the run's stopping
-                    # point, not quiescence: both hang shapes it exists for
-                    # have something in flight and nothing transitioning, so
-                    # STUCK is declared about a run that still has workers.
-                    #
-                    # It still has to *stop* those workers, and `Future.cancel`
-                    # does not: a running worker is not cancellable, and the
-                    # `finally` below already waits on the pool. Cancelling
-                    # only the futures therefore left the run blocked in
-                    # `shutdown(wait=True)` until each worker reached its own
-                    # node timeout — the backstop fired and nothing stopped.
-                    # Quiescing owned execution first is what makes the
-                    # workers return; the outcome is STUCK either way.
-                    self._stuck = True
-                    self._interrupt_in_flight(in_flight, cancellation_requested)
-                    if in_flight:
-                        done, _ = _wait_any(list(in_flight.items()))
-                        for node_id in done:
-                            in_flight.pop(node_id, None)
-                        continue
-                    break
-
-                self._merge_frontier()
-                if self._cancelled.is_set():
-                    continue
-
-                ready = [node_id for node_id in self.deps.store.ready_nodes(self.run_id)
-                         if node_id not in in_flight]
-                for node_id in ready:
-                    if (self._cancelled.is_set()
-                            or len(in_flight) >= self.config.concurrency):
+                try:
+                    if self._cancelled.is_set():
+                        # A Future cannot interrupt a running worker. Quiesce its
+                        # owned execution first, then wait for the worker to stop
+                        # observing its RUNNING lease before cancelling durable
+                        # state. Otherwise a late worker could commit into a retry.
+                        # Arm escalation only here, after the loop has observed
+                        # the pause: a single Ctrl-C under `uv run` delivers
+                        # SIGINT twice, and that burst must not escalate.
+                        if self._paused.is_set() or self._sigint_pause_latched:
+                            self._sigint_escalate_armed = True
+                        self._interrupt_in_flight(in_flight, cancellation_requested)
+                        if in_flight:
+                            done, _ = _wait_any(list(in_flight.items()))
+                            for node_id in done:
+                                in_flight.pop(node_id, None)
+                            continue
+                        # A pause takes this same path to quiesce, and writes
+                        # nothing on the way out: `cancel_run` is a lifecycle
+                        # transition, and a pause makes none (§1.2).
+                        if not self._paused.is_set():
+                            self.deps.store.cancel_run(self.run_id)
                         break
-                    in_flight[node_id] = self._pool.submit(self._attempt, node_id)
 
-                if not in_flight:
-                    # Nothing running. If the frontier produced nothing to
-                    # start either, no node can progress and the run is
-                    # quiescent.
-                    self._merge_frontier()
-                    if self.deps.store.ready_nodes(self.run_id):
-                        continue
-                    if self._settling():
-                        # Not quiescent — mid-verdict. `ready_nodes` returns
-                        # only PENDING nodes, so a node whose durable row still
-                        # says RUNNING while no worker holds it is invisible to
-                        # the readiness check AND to the blocked set. The loop
-                        # therefore declared the residual BLOCKED naming
-                        # nothing: `{"blocked": [], "merged": [], "outcome":
-                        # "BLOCKED"}`, with the node still PENDING at attempt 2
-                        # and no block_reason — a run that stops with work left
-                        # to do and reports it as a mystery. Reproduced 8 times
-                        # in 40 whenever a worker returned before the
-                        # watchdog's verdict committed.
+                    if backstop.check():
+                        # §11.2 — the backstop's domain is the run's stopping
+                        # point, not quiescence: both hang shapes it exists for
+                        # have something in flight and nothing transitioning, so
+                        # STUCK is declared about a run that still has workers.
                         #
-                        # Waiting is bounded rather than open-ended: if no
-                        # verdict ever lands, §11.2's backstop declares STUCK,
-                        # which is the truthful answer for a run that stopped
-                        # with something in flight. The wait is on the
-                        # cancellation event so a cancel stays responsive.
-                        self._cancelled.wait(_SETTLING_POLL_S)
-                        continue
-                    break
+                        # It still has to *stop* those workers, and `Future.cancel`
+                        # does not: a running worker is not cancellable, and the
+                        # `finally` below already waits on the pool. Cancelling
+                        # only the futures therefore left the run blocked in
+                        # `shutdown(wait=True)` until each worker reached its own
+                        # node timeout — the backstop fired and nothing stopped.
+                        # Quiescing owned execution first is what makes the
+                        # workers return; the outcome is STUCK either way.
+                        self._stuck = True
+                        self._interrupt_in_flight(in_flight, cancellation_requested)
+                        if in_flight:
+                            done, _ = _wait_any(list(in_flight.items()))
+                            for node_id in done:
+                                in_flight.pop(node_id, None)
+                            continue
+                        break
 
-                done, _ = _wait_any(list(in_flight.items()))
-                for node_id in done:
-                    in_flight.pop(node_id, None)
+                    self._merge_frontier()
+                    if self._cancelled.is_set():
+                        continue
+
+                    ready = [node_id for node_id in self.deps.store.ready_nodes(self.run_id)
+                             if node_id not in in_flight]
+                    for node_id in ready:
+                        if (self._cancelled.is_set()
+                                or len(in_flight) >= self.config.concurrency):
+                            break
+                        in_flight[node_id] = self._pool.submit(self._attempt, node_id)
+
+                    if not in_flight:
+                        # Nothing running. If the frontier produced nothing to
+                        # start either, no node can progress and the run is
+                        # quiescent.
+                        self._merge_frontier()
+                        if self.deps.store.ready_nodes(self.run_id):
+                            continue
+                        if self._settling():
+                            # Not quiescent — mid-verdict. `ready_nodes` returns
+                            # only PENDING nodes, so a node whose durable row still
+                            # says RUNNING while no worker holds it is invisible to
+                            # the readiness check AND to the blocked set. The loop
+                            # therefore declared the residual BLOCKED naming
+                            # nothing: `{"blocked": [], "merged": [], "outcome":
+                            # "BLOCKED"}`, with the node still PENDING at attempt 2
+                            # and no block_reason — a run that stops with work left
+                            # to do and reports it as a mystery. Reproduced 8 times
+                            # in 40 whenever a worker returned before the
+                            # watchdog's verdict committed.
+                            #
+                            # Waiting is bounded rather than open-ended: if no
+                            # verdict ever lands, §11.2's backstop declares STUCK,
+                            # which is the truthful answer for a run that stopped
+                            # with something in flight. The wait is on the
+                            # cancellation event so a cancel stays responsive.
+                            self._cancelled.wait(_SETTLING_POLL_S)
+                            continue
+                        break
+
+                    done, _ = _wait_any(list(in_flight.items()))
+                    for node_id in done:
+                        in_flight.pop(node_id, None)
+                except (KeyboardInterrupt, SigintInterrupt):
+                    if self._sigint_escalated:
+                        self.request_pause()
+                        break
+                    self.request_pause()
+                    continue
         finally:
             watchdog.stop()
-            self.shutdown()
+            if self._sigint_escalated:
+                self._preserve_running_unpublished()
+                self._shutdown_escalated()
+            else:
+                self.shutdown()
             if previous_sigint is not None:
                 signal.signal(signal.SIGINT, previous_sigint)
 
-        if self._paused.is_set():
+        if self._paused.is_set() or self._sigint_pause_latched:
             raise RunPaused(self.run_id)
         return self._declare()
 
@@ -1008,20 +1114,7 @@ class Scheduler:
             Errors propagate to the watchdog's preserve wrapper, which still
             fails the attempt.
             """
-            with self._lock:
-                worktree = self._attempt_worktrees.get(attempt.node_id)
-            if (worktree is None
-                    or worktree.attempt_no != attempt.attempt_no
-                    or worktree.baseline is None):
-                return
-            after = wt.inventory(worktree.path)
-            measured = wt.delta(worktree.baseline, after)
-            if measured.is_empty:
-                return
-            wt.commit_measured_delta(
-                worktree, measured, after,
-                "{} attempt {} NODE_TIMEOUT".format(
-                    attempt.node_id, attempt.attempt_no))
+            self._preserve_unpublished_work(attempt)
 
         watchdog = wd.Watchdog(
             config=self.config,
