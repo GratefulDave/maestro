@@ -133,7 +133,19 @@ def finalize(store, review, *, digest=DIGEST, clock=lambda: 1_760_000_000.0):
         return Outcome(stored.verdict, stored, True)
     review.launches += 1
     matrix = matrix_for(digest=digest)
-    report = cr.CodeReviewerReport.model_validate(review.report)
+    payload = review.report
+    if isinstance(payload, dict):
+        cells = []
+        for cell in payload.get("cells", ()):
+            cell = dict(cell)
+            if cell.get("status") == "finding":
+                cell.setdefault("grade", "error")
+                cell.setdefault("grade_rationale", "fixture finding")
+                cell.setdefault("scope", "in_scope")
+            cells.append(cell)
+        payload = dict(payload)
+        payload["cells"] = cells
+    report = cr.CodeReviewerReport.model_validate(payload)
     fin.verify_report(matrix, report)
     derived = cr.grade_verdict(
         matrix, report, FIXTURE_RUBRIC, cr.FindingGrade.ERROR).derived()
