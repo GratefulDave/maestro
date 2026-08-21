@@ -12,16 +12,21 @@ below fixed that. Emitting `maestro-plan.v1` afterwards would have left a plan
 projected before the fix byte-indistinguishable *in version* from one
 projected after it, and a fully-fixed runtime would have executed the
 degenerate one without a word: the field is populated either way, so no
-consumer, no totality guard, and no reader sweep can separate them. The
-version string is the only channel that carries this, and
+consumer and no reader sweep can separate them. The version string is
+the only channel that carries this, and
 `maestro._RUNNABLE_PLAN_SCHEMA_VERSIONS` is the reader that acts on it.
+
+`_assert_ingress_projection_is_total` now guards this projection the
+way `plan_model._assert_projection_is_total` guards the next one: a
+lane-bound IR field with no destination and no named exemption is a
+raise, not a silent drop (§3.6 B15, §19 M1, §19 M26, issue #96).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from . import plan_author
 from . import plan_model
@@ -49,6 +54,15 @@ class IngressError(plan_author.AuthoringError):
         super().__init__(message)
         self.blockers: Tuple["plan_validate.AdmissionBlocker", ...] = tuple(
             blockers)
+
+
+class IngressProjectionIncomplete(RuntimeError):
+    """`project_draft` did not account for a field the IR declares.
+
+    The same shape as `plan_model.ProjectionIncomplete`, one projection
+    earlier. A declared field with no destination reads as a default
+    downstream instead of failing here (§3.6 B15, §19 M1, §19 M26).
+    """
 
 
 def _sha256(data: bytes) -> str:
@@ -345,6 +359,407 @@ def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
             for effect in sorted(dispositions)]
 
 
+#: Kind this projection emits. `maestro-plan.v3` added `tests`, but
+#: plan-contract.v1 has no tests/build split, and inventing one here would
+#: change every shipped lane's graph (`plan_model.SCHEMA_V3`).
+_EMITTED_NODE_KIND = "agent"
+
+#: Node kinds a `maestro-plan` can declare that this projection does not
+#: emit, each with the reason. Checked so a kind PR #124 added cannot hide
+#: from the guard by not being the one kind we currently write.
+_UNEMITTED_NODE_KINDS: Dict[str, str] = {
+    "tests": ("plan-contract.v1 has no tests/build split; SCHEMA_V3 is "
+              "authored in maestro-plan, not projected from the IR"),
+    "code": ("a plan-contract lane is agent work; a code node's command is "
+             "not a lane and has no IR binding to project"),
+}
+
+#: Destination node types the next projection (`to_plan_nodes`) accepts.
+#: The guard covers every kind, not only `agent`, so a TestsNode field
+#: cannot be dropped by being out of this module's current emit set.
+_DESTINATION_NODE_TYPES: Tuple[type, ...] = (
+    plan_model.AgentNode, plan_model.CodeNode, plan_model.TestsNode)
+
+
+#: Lane fields this projection carries onto the node, or `None` if dropped.
+#: Completeness is this table, not a list of the six known drops: a field
+#: added to a lane later with neither a destination nor an exemption
+#: raises. Follows `_GATE_PROJECTION`.
+_LANE_PROJECTION: Dict[str, Optional[str]] = {
+    "lane_id": "node_id",
+    "title": "instruction",
+    "execution_context": "cwd",
+    "depends_on": "needs",
+    "requirement_ids": "instruction",
+    "verifier_ids": None,
+    "claim_ids": None,
+    "seam_ids": None,
+    "fixture_ids": None,
+}
+
+_LANE_PROJECTION_EXEMPT: Dict[str, str] = {
+    "verifier_ids": (
+        "the gate is bound by verifiers[].lane_ids, which this "
+        "projection already requires to name exactly one verifier; "
+        "lane.verifier_ids is the reverse index and carrying both would "
+        "be two answers for one fact"),
+    "claim_ids": (
+        "consumed by plan_validate's CLAIM_UNWITNESSABLE obligation at "
+        "admission, deliberately not carried into the plan"),
+    "seam_ids": (
+        "seams are authoring-time producer/consumer/contract prose; "
+        "maestro-plan has no seam type, and pasting them into a prompt "
+        "is a channel with no runtime reader (§3.6 B15 the other way)"),
+    "fixture_ids": (
+        "fixtures are authoring-time records; CLAIM_UNWITNESSABLE reads "
+        "typed witness cells, not fixture prose, and maestro-plan has "
+        "no fixture type to carry one into"),
+}
+
+
+#: Bound `requirements[]` fields. `source_ids` lands on `reads` so a
+#: requirement cannot name evidence its node then silently cannot read.
+_REQUIREMENT_PROJECTION: Dict[str, Optional[str]] = {
+    "requirement_id": "requirement_ids",
+    "text": "instruction",
+    "source_ids": "reads",
+    "surface": None,
+    "effects": "effects",
+}
+
+_REQUIREMENT_PROJECTION_EXEMPT: Dict[str, str] = {
+    "surface": (
+        "consumed by admission SURFACE_DECLARED and SURFACE_REACHABLE; "
+        "maestro-plan has no surface field, and the reader is admission "
+        "rather than the node"),
+}
+
+
+#: Bound `verifiers[]` fields. Gate carries runner, argv, cwd, min_cases
+#: only; oracle/falsifiability/independent have no destination there.
+_VERIFIER_PROJECTION: Dict[str, Optional[str]] = {
+    "verifier_id": "gate",
+    "lane_ids": "gate",
+    "command": "gate",
+    "min_executed": "min_cases",
+    "source_ids": "reads",
+    "oracle": None,
+    "falsifiability": None,
+    "independent": None,
+    "requirement_ids": None,
+    "fixture_ids": None,
+    "seam_ids": None,
+    "claim_ids": None,
+}
+
+_VERIFIER_NOT_CARRIED = (
+    "Gate carries runner, argv, cwd and min_cases only. This field is "
+    "free text or an authoring reverse-index; §1.2 forbids a transition "
+    "keyed on prose, and CLAIM_UNWITNESSABLE is the typed stand-in for "
+    "falsifiability at admission")
+
+_VERIFIER_PROJECTION_EXEMPT: Dict[str, str] = {
+    "oracle": _VERIFIER_NOT_CARRIED,
+    "falsifiability": _VERIFIER_NOT_CARRIED,
+    "independent": _VERIFIER_NOT_CARRIED,
+    "requirement_ids": (
+        "reverse index of the lane's requirement_ids, already carried "
+        "via instruction, effects and reads; a second copy is two answers"),
+    "fixture_ids": (
+        "reverse index of the lane's fixture_ids, which are themselves "
+        "exempt; carrying the copy would be a destination the original "
+        "binding does not have"),
+    "seam_ids": (
+        "reverse index of the lane's seam_ids, which are themselves "
+        "exempt; carrying the copy would be a destination the original "
+        "binding does not have"),
+    "claim_ids": (
+        "reverse index of the lane's claim_ids, consumed at admission "
+        "by CLAIM_UNWITNESSABLE and not carried into the plan"),
+}
+
+
+_CLAIM_NOT_CARRIED = (
+    "consumed by plan_validate's CLAIM_UNWITNESSABLE obligation at "
+    "admission, deliberately not carried into the plan")
+
+_CLAIM_PROJECTION: Dict[str, Optional[str]] = {
+    "claim_id": None,
+    "kind": None,
+    "mutation_kinds": None,
+    "object": None,
+    "polarity": None,
+    "predicate": None,
+    "rendered_binding_ids": None,
+    "source_ids": None,
+    "source_requirement_ids": None,
+    "subject": None,
+    "unit": None,
+    "value": None,
+    "verifier_ids": None,
+    "witness": None,
+}
+_CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
+    name: _CLAIM_NOT_CARRIED for name in _CLAIM_PROJECTION}
+
+
+_SEAM_NOT_CARRIED = (
+    "seams are authoring-time producer/consumer/contract prose; "
+    "maestro-plan has no seam type, and pasting them into a prompt is "
+    "a channel with no runtime reader (§3.6 B15 the other way)")
+
+_SEAM_PROJECTION: Dict[str, Optional[str]] = {
+    "seam_id": None,
+    "contract": None,
+    "producer": None,
+    "consumer": None,
+    "claim_ids": None,
+    "fixture_ids": None,
+    "requirement_ids": None,
+    "source_ids": None,
+    "verifier_ids": None,
+}
+_SEAM_PROJECTION_EXEMPT: Dict[str, str] = {
+    name: _SEAM_NOT_CARRIED for name in _SEAM_PROJECTION}
+
+
+_FIXTURE_NOT_CARRIED = (
+    "fixtures are authoring-time records; CLAIM_UNWITNESSABLE reads "
+    "typed witness cells, not fixture prose, and maestro-plan has no "
+    "fixture type to carry one into")
+
+_FIXTURE_PROJECTION: Dict[str, Optional[str]] = {
+    "fixture_id": None,
+    "affected_lane_ids": None,
+    "consumer_obligation": None,
+    "meaning": None,
+    "observed_value": None,
+    "path": None,
+    "producer_metadata": None,
+    "prohibited_behavior": None,
+    "record_selector": None,
+    "seam_ids": None,
+    "source_id": None,
+    "verifier_ids": None,
+}
+_FIXTURE_PROJECTION_EXEMPT: Dict[str, str] = {
+    name: _FIXTURE_NOT_CARRIED for name in _FIXTURE_PROJECTION}
+
+
+def _records_by_id(ir: Mapping[str, Any], collection: str,
+                   id_key: str) -> dict:
+    declared = ir.get(collection)
+    index: dict = {}
+    for item in declared if isinstance(declared, list) else ():
+        if not isinstance(item, dict):
+            continue
+        record_id = item.get(id_key)
+        if isinstance(record_id, str) and record_id:
+            index.setdefault(record_id, item)
+    return index
+
+
+def _bound_records(ir: Mapping[str, Any], lane: Mapping[str, Any],
+                   ids_key: str, collection: str, id_key: str) -> list:
+    ids = lane.get(ids_key)
+    if not isinstance(ids, list):
+        return []
+    index = _records_by_id(ir, collection, id_key)
+    records = []
+    seen = set()
+    for record_id in ids:
+        if not isinstance(record_id, str) or record_id in seen:
+            continue
+        seen.add(record_id)
+        item = index.get(record_id)
+        if isinstance(item, dict):
+            records.append(item)
+    return records
+
+
+def _extend_unique(target: list, values: Sequence[str],
+                   seen: set) -> None:
+    for item in values:
+        if item not in seen:
+            seen.add(item)
+            target.append(item)
+
+
+def _lane_source_reads(ir: Mapping[str, Any], lane: Mapping[str, Any],
+                       verifier: Mapping[str, Any], lane_id: str) -> list:
+    """Union of the verifier's source_ids and each bound requirement's.
+
+    `reads` used to be built from the verifier alone, so a requirement
+    that named evidence its node then could not read was invisible:
+    the field was populated, and `reads_are_sufficient` passed on the
+    ids that did arrive (issue #96 instance 2, the #87 sub-shape).
+    """
+    reads: list = []
+    seen: set = set()
+    _extend_unique(reads, _require_id_list(
+        verifier.get("source_ids"), "UNMAPPABLE_VERIFIERS",
+        "{}.source_ids".format(lane_id)), seen)
+    index = _requirements_by_id(ir)
+    for requirement_id in _require_id_list(
+            lane.get("requirement_ids"), "UNMAPPABLE_LANES",
+            "{}.requirement_ids".format(lane_id)):
+        requirement = index.get(requirement_id)
+        if not isinstance(requirement, dict):
+            continue
+        _extend_unique(reads, _require_id_list(
+            requirement.get("source_ids"), "UNMAPPABLE_REQUIREMENTS",
+            "{}.source_ids".format(requirement_id)), seen)
+    return reads
+
+
+def _assert_table_reasons(projection: Dict[str, Optional[str]],
+                          exempt: Dict[str, str], table: str) -> None:
+    """Every dropped field has a reason; a carried field is not also exempt."""
+    for name, dest in projection.items():
+        if dest is None:
+            reason = exempt.get(name, "")
+            if not str(reason).strip():
+                raise IngressProjectionIncomplete(
+                    "{0}: {1} is listed as dropped with no reason; an "
+                    "empty reason cannot distinguish decided from "
+                    "forgotten.".format(table, name))
+        elif name in exempt:
+            raise IngressProjectionIncomplete(
+                "{0}: {1} has a destination ({2}) and an exemption; "
+                "those are two answers for one field.".format(
+                    table, name, dest))
+    extra_exempt = sorted(set(exempt) - set(projection))
+    if extra_exempt:
+        raise IngressProjectionIncomplete(
+            "{0}: exemption {1} names a field the projection table "
+            "does not declare; the table is the schema.".format(
+                table, ", ".join(extra_exempt)))
+
+
+def _assert_payload_accounted(payload: Mapping[str, Any],
+                              projection: Dict[str, Optional[str]],
+                              exempt: Dict[str, str], table: str,
+                              label: str) -> None:
+    _assert_table_reasons(projection, exempt, table)
+    unaccounted = sorted(set(payload) - set(projection))
+    if unaccounted:
+        raise IngressProjectionIncomplete(
+            "{0}: {1} is declared in the IR but project_draft neither "
+            "carries it onto the node nor lists it in {2} with a "
+            "reason. A dropped field reads as a default somewhere "
+            "downstream instead of failing here.".format(
+                label, ", ".join(unaccounted), table))
+
+
+def _assert_ingress_projection_is_total(
+        ir: Mapping[str, Any], lane: Mapping[str, Any],
+        verifier: Mapping[str, Any], node: Mapping[str, Any]) -> None:
+    """Raise unless every field this lane binds is carried or exempted."""
+    lane_id = node.get("node_id")
+    _assert_payload_accounted(
+        lane, _LANE_PROJECTION, _LANE_PROJECTION_EXEMPT,
+        "_LANE_PROJECTION", "lane {}".format(lane_id))
+    _assert_payload_accounted(
+        verifier, _VERIFIER_PROJECTION, _VERIFIER_PROJECTION_EXEMPT,
+        "_VERIFIER_PROJECTION",
+        "verifier {}".format(verifier.get("verifier_id")))
+
+    for requirement in _bound_records(
+            ir, lane, "requirement_ids", "requirements", "requirement_id"):
+        _assert_payload_accounted(
+            requirement, _REQUIREMENT_PROJECTION,
+            _REQUIREMENT_PROJECTION_EXEMPT, "_REQUIREMENT_PROJECTION",
+            "requirement {}".format(requirement.get("requirement_id")))
+    for claim in _bound_records(
+            ir, lane, "claim_ids", "claims", "claim_id"):
+        _assert_payload_accounted(
+            claim, _CLAIM_PROJECTION, _CLAIM_PROJECTION_EXEMPT,
+            "_CLAIM_PROJECTION", "claim {}".format(claim.get("claim_id")))
+    for seam in _bound_records(
+            ir, lane, "seam_ids", "seams", "seam_id"):
+        _assert_payload_accounted(
+            seam, _SEAM_PROJECTION, _SEAM_PROJECTION_EXEMPT,
+            "_SEAM_PROJECTION", "seam {}".format(seam.get("seam_id")))
+    for fixture in _bound_records(
+            ir, lane, "fixture_ids", "fixtures", "fixture_id"):
+        _assert_payload_accounted(
+            fixture, _FIXTURE_PROJECTION, _FIXTURE_PROJECTION_EXEMPT,
+            "_FIXTURE_PROJECTION",
+            "fixture {}".format(fixture.get("fixture_id")))
+
+    kind = node.get("kind")
+    if kind != _EMITTED_NODE_KIND:
+        reason = _UNEMITTED_NODE_KINDS.get(kind, "")
+        raise IngressProjectionIncomplete(
+            "lane {0}: project_draft emitted kind {1!r}, which is not "
+            "{2!r}. Unemitted kinds are named in _UNEMITTED_NODE_KINDS"
+            "{3}.".format(
+                lane_id, kind, _EMITTED_NODE_KIND,
+                (": " + reason) if reason else " (this one is not)"))
+
+    # AgentNode and TestsNode share a launch shape; a field TestsNode
+    # declares that the emitted node does not carry is the #96 drop
+    # arriving on a kind this projection does not yet emit.
+    emitted_names = set(node)
+    for cls in (plan_model.AgentNode, plan_model.TestsNode):
+        if cls not in _DESTINATION_NODE_TYPES:
+            raise IngressProjectionIncomplete(
+                "{0} is not in _DESTINATION_NODE_TYPES; the guard must "
+                "cover every node kind, including those PR #124 "
+                "added.".format(cls.__name__))
+        missing = sorted(set(cls.model_fields) - emitted_names)
+        if missing:
+            raise IngressProjectionIncomplete(
+                "lane {0}: {1} declares {2} which the emitted node "
+                "does not carry. A new field on a destination kind is "
+                "a raise, not a silent drop.".format(
+                    lane_id, cls.__name__, ", ".join(missing)))
+
+    if node.get("node_id") != lane.get("lane_id"):
+        raise IngressProjectionIncomplete(
+            "lane {0}: lane_id is {1!r} in the IR but node_id is {2!r} "
+            "on the projected node; the projection carries the field "
+            "name and not its value.".format(
+                lane_id, lane.get("lane_id"), node.get("node_id")))
+    title = lane.get("title")
+    instruction = node.get("instruction") or ""
+    if isinstance(title, str) and title and title not in instruction:
+        raise IngressProjectionIncomplete(
+            "lane {0}: title {1!r} is not in the projected "
+            "instruction; the projection carries the field name and "
+            "not its value.".format(lane_id, title))
+    needs = node.get("needs")
+    declared_needs = _require_id_list(
+        lane.get("depends_on"), "UNMAPPABLE_LANES",
+        "{}.depends_on".format(lane_id))
+    if list(needs) != declared_needs:
+        raise IngressProjectionIncomplete(
+            "lane {0}: depends_on is {1!r} in the IR but needs is {2!r} "
+            "on the projected node; the projection carries the field "
+            "name and not its value.".format(
+                lane_id, declared_needs, needs))
+    cwd = (node.get("gate") or {}).get("cwd")
+    if cwd != lane.get("execution_context"):
+        raise IngressProjectionIncomplete(
+            "lane {0}: execution_context is {1!r} in the IR but "
+            "gate.cwd is {2!r} on the projected node; the projection "
+            "carries the field name and not its value.".format(
+                lane_id, lane.get("execution_context"), cwd))
+    expected_reads = _lane_source_reads(ir, lane, verifier, lane_id)
+    if list(node.get("reads") or []) != expected_reads:
+        raise IngressProjectionIncomplete(
+            "lane {0}: bound source_ids union to {1!r} but the "
+            "projected node carries reads {2!r}; the projection "
+            "carries the field name and not its value.".format(
+                lane_id, expected_reads, node.get("reads")))
+    min_cases = (node.get("gate") or {}).get("min_cases")
+    if min_cases != verifier.get("min_executed"):
+        raise IngressProjectionIncomplete(
+            "lane {0}: the verifier declares min_executed={1}, the "
+            "projected node carries min_cases={2}.".format(
+                lane_id, verifier.get("min_executed"), min_cases))
+
+
 def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     """Map one approved executable Plan IR onto a Maestro draft mapping."""
     if ir.get("schema_version") != "plan-contract.v1":
@@ -486,9 +901,7 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             raise IngressError("BROAD_GATE:{}".format(verifier.get("verifier_id")))
         min_cases = _require_count(
             verifier.get("min_executed"), "UNMAPPABLE_VERIFIERS", lane_id)
-        source_reads = _require_id_list(
-            verifier.get("source_ids"), "UNMAPPABLE_VERIFIERS",
-            "{}.source_ids".format(lane_id))
+        source_reads = _lane_source_reads(ir, lane, verifier, lane_id)
         needs = _require_id_list(
             lane.get("depends_on"), "UNMAPPABLE_LANES",
             "{}.depends_on".format(lane_id))
@@ -502,8 +915,8 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         # beneath it; `_node_instruction` records why, and why the two
         # cheaper shapes were declined.
         instruction = _node_instruction(ir, lane, lane_id)
-        nodes.append({
-            "kind": "agent",
+        node = {
+            "kind": _EMITTED_NODE_KIND,
             "node_id": lane_id,
             "needs": needs,
             "reads": source_reads,
@@ -521,7 +934,9 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             # node told only "make the gate pass over these outputs" judged an
             # executing materializer compliant.
             "effects": _node_effects(ir, lane),
-        })
+        }
+        _assert_ingress_projection_is_total(ir, lane, verifier, node)
+        nodes.append(node)
 
     # Admission, before anything is written and therefore before a run can
     # start. Two predicates over two domains, both answering "can any correct
