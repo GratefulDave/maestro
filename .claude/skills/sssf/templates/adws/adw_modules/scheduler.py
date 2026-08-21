@@ -1611,20 +1611,17 @@ class Scheduler:
 
         The check has no subject when every path the attempt wrote is selected
         by the node's own gate — a node that produced nothing but the files its
-        gate counts. That shape is the defect in its purest form and is
-        **reported, not refused**: no plan this runtime has executed contains
-        one, so a refusal would be a rule with no measured case behind it, and
-        this design does not ship those (§16.3).
+        gate counts. That is a count (`len(unnamed) == 0`), the same hollow
+        class `TESTS_HOLLOW_AT_PARENT` convicts for tests nodes. Refused as
+        SEMANTIC, never reported as `verified=True` (#123). Tests nodes do
+        not reach this method.
         """
         argv = tuple(node.gate_command)[1:]
         written = wt.paths_written_since(attempt, falsify_base)
         unnamed = vf.outputs_unnamed_by_gate(written, argv)
         if not unnamed:
-            self._report_hygiene(node.node_id, (
-                "falsification-unrevertable: every path this node wrote is "
-                "selected by the node's own gate, so the gate could not be "
-                "re-asked without its subject",))
-            return vf.VerificationVerdict(verified=True)
+            return vf.adjudicate_output_falsification(
+                vf.GateVerdict(green=False, unparseable=False, counts=None), ())
         reverted = wt.revert_paths_to(attempt, falsify_base, unnamed)
         try:
             result = self.deps.run_gate(
