@@ -1444,6 +1444,22 @@ class Scheduler:
             self._settle_verdict(node, verdict, execution, record)
             return
 
+        if basis is not None and measured.is_empty:
+            # #113: an empty repair mints no new sha. Classified rather than
+            # committed, so review_digest cannot key a byte-identical tree
+            # under a new commit and re-ask the reviewer. Non-repair empty
+            # deltas still go through commit_measured_delta unchanged.
+            self._settle_context(context)
+            self._settle_verdict(
+                node,
+                vf.VerificationVerdict(
+                    verified=False,
+                    reason=rp.REPAIR_DIFF_EMPTY,
+                    retry_class=st.RetryClass.SEMANTIC),
+                execution, record,
+                extra_facts={rp.REPAIR_DIFF_EMPTY_KEY: True})
+            return
+
         with self._lock:
             self._require_running(record)
             output_sha = wt.commit_measured_delta(
@@ -1885,13 +1901,10 @@ class Scheduler:
         """Turn a failed VERIFIED predicate into a classification (§7.5).
 
         `extra_facts` is merged onto the failing attempt's row beside the
-        guidance entry. Exactly one caller passes it and it carries exactly one
-        fact: the output commit of an attempt that failed §7.4's post-work
-        falsification refusal, which reached that failure with a sealed commit
-        in hand. `decide_repair` proves the repair basis against that commit,
-        so an attempt that failed without recording it is re-implemented from
-        the integration head rather than repaired — which is the discard §7.5's
-        repair chain exists to prevent.
+        guidance entry. Two callers pass it. Falsification refusal carries
+        the sealed output commit `decide_repair` proves against. Empty
+        repair carries `REPAIR_DIFF_EMPTY_KEY`, so `repair_subject` can
+        walk past a row that minted no tree.
         """
         if verdict.block_reason is not None:
             self._settle_failure(

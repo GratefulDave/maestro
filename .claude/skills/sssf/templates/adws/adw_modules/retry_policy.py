@@ -435,6 +435,14 @@ def review_convergence_from_attempts(
 #: `ReviewStallFacts` keeps `output_sha` and `surviving_sha` as two fields.
 REVIEW_OUTPUT_SHA_KEY = "review_output_sha"
 
+#: Typed marker on a repair attempt that measured an empty delta (#113).
+#: Reader: `repair_subject`, which walks past it the same way it walks past
+#: ENVIRONMENTAL — the row is not a judgement about a new tree.
+REPAIR_DIFF_EMPTY_KEY = "repair_diff_empty"
+REPAIR_DIFF_EMPTY = (
+    "REPAIR_DIFF_EMPTY: a repair attempt wrote nothing, so the tree is "
+    "byte-identical to the rejected attempt and is not a candidate for review")
+
 #: At most this many *consecutive* repair attempts before the chain breaks and
 #: the node is re-derived from the integration head.
 #:
@@ -585,14 +593,17 @@ def repair_subject(
     """The last attempt that carried a verdict, walking past machine faults.
 
     ENVIRONMENTAL and LAUNCHER_TRANSIENT rows are not judgements about the
-    artifact. Walking past them is bounded: one pass over the attempt list,
-    newest first, stop at the first row that is not a machine fault. A
-    SEMANTIC row without a stored output commit still ends the walk, so a
-    red gate still restarts.
+    artifact. A repair that wrote nothing (`REPAIR_DIFF_EMPTY_KEY`) is not
+    one either: it produced no new tree. Walking past them is bounded: one
+    pass over the attempt list, newest first, stop at the first row that is
+    not a machine fault and not an empty repair. A SEMANTIC row without a
+    stored output commit still ends the walk, so a red gate still restarts.
     """
     for row in sorted(attempts, key=lambda r: r.attempt_no, reverse=True):
         if row.retry_class in (RetryClass.ENVIRONMENTAL,
                                RetryClass.LAUNCHER_TRANSIENT):
+            continue
+        if (row.extra or {}).get(REPAIR_DIFF_EMPTY_KEY):
             continue
         return row
     return None

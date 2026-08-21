@@ -283,12 +283,23 @@ class BlockPayloadTests(SchedulerFixture):
         review = FakeReview([False, False, False])
         # §7.4's post-work falsification refuses every attempt: the gate stays
         # green with the production file reverted, so the node spends its
-        # fix-loop budget and blocks on it.
+        # fix-loop budget and blocks on it. Each attempt must write a real
+        # delta; the same bytes would be an empty repair (#113) and never
+        # reach the reviewer.
         self.gate_script[("build", "falsify")] = [green(), green(), green()]
-        self.written["build"] = {"build.py": "ok\n"}
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
+            (attempt.path / "build.py").write_text(
+                "ok-{0}\n".format(record.attempt_no))
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
         report = self.schedule([self.agent("build")],
                                config=self.config(semantic_ceiling=3),
-                               deps=self.deps(review_attempt=review)).run()
+                               deps=self.deps(run_node=run_node,
+                                              review_attempt=review)).run()
         self.assertEqual(
             self.store.get_node("run1", "build").block_reason,
             st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)

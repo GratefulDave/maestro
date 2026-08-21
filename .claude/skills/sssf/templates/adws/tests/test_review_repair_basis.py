@@ -321,6 +321,45 @@ class RepairBaseSelectionTests(RepairFixture):
         self.assertEqual(rows[2].repair_chain_length, 2)
         self.assertEqual(seen[3], "A1\n")
 
+    def test_an_empty_repair_does_not_dispatch_a_reviewer(self):
+        """Byte-identical tree, no new sha, reviewer asked zero times (#113).
+
+        Attempt 1 is reviewed then refused by falsification. Attempt 2
+        writes nothing. Attempt 3 writes again and is the next review.
+        """
+        reviews = [reject(1, "d1"), _Review(True, digest="d2")]
+        self.refuse_falsification(1)
+
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
+            target = attempt.path / "a.py"
+            if record.attempt_no == 1:
+                target.write_text("A1\n")
+            elif record.attempt_no >= 3:
+                target.write_text("A{0}\n".format(record.attempt_no))
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(review_ceiling=4, semantic_ceiling=4),
+            deps=self.deps(run_node=run_node,
+                           review_attempt=self.scripted_reviewer(reviews))
+        ).run()
+
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        reviewed_attempts = [n for n, _, _ in self.reviewed]
+        self.assertNotIn(2, reviewed_attempts)
+        self.assertEqual(reviewed_attempts, [1, 3])
+        rows = sorted(self.store.attempts_for("run1", "a"),
+                      key=lambda row: row.attempt_no)
+        self.assertTrue(rows[1].extra.get(rp.REPAIR_DIFF_EMPTY_KEY))
+        self.assertIs(rows[1].retry_class, st.RetryClass.SEMANTIC)
+        self.assertNotIn(rp.REVIEW_OUTPUT_SHA_KEY, rows[1].extra or {})
+        self.assertEqual(rows[2].base_sha,
+                         rows[0].extra[rp.REVIEW_OUTPUT_SHA_KEY])
+
 
 # ── the failures that must NOT repair ───────────────────────────────────────
 
@@ -757,6 +796,23 @@ class DecideRepairTests(unittest.TestCase):
         self.assertEqual(
             rp.decide_repair(_facts(blip, attempts=(first, blip))).reason,
             rp.REPAIR_NO_PRIOR_REJECTION)
+
+    def test_walking_past_an_empty_repair_keeps_the_chain(self):
+        first = _rejected(attempt_no=1)
+        empty = st.AttemptRecord(
+            run_id="run1", node_id="a", attempt_no=2, base_sha="o" * 40,
+            state=st.NodeState.PENDING, retry_class=st.RetryClass.SEMANTIC,
+            extra={rp.REPAIR_DIFF_EMPTY_KEY: True,
+                   st.REPAIR_KEY: {
+                       "attempt_no": 1,
+                       "integration_head": "h" * 40,
+                       "chain_length": 1}})
+        decision = rp.decide_repair(_facts(
+            empty, attempts=(first, empty),
+            rejected_ref_sha="o" * 40, output_proven=True))
+        self.assertEqual(decision.reason, rp.REPAIR_ADMITTED)
+        self.assertEqual(decision.basis.repair_of_attempt, 1)
+        self.assertEqual(decision.basis.chain_length, 2)
 
 
 class AttemptRowReadersTests(unittest.TestCase):
