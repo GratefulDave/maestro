@@ -525,10 +525,9 @@ def adjudicate_output_falsification(
 #                             over the persisted bytes on load
 #
 # Clauses 1 and 4 name `code_review`'s own report model and derivation rather
-# than `finalization`'s. That is the isolation A9's grading is confined by:
-# plan finalization keeps `fin.ReviewerReport` and `fin.derive_verdict`, which
-# have no grade to read and no threshold to be handed, so grading a node's
-# findings cannot change a plan's verdict.
+# than `finalization`'s. Plan finalization no longer dispatches a reviewer,
+# so there is no unthresholded `derive_verdict` left to isolate from. Grading
+# a node's findings cannot change a plan's verdict because a plan has none.
 #
 # all sequenced by `code_review.review_attempt`, whose `ReviewOutcome.passed` is
 # what the scheduler's review branch actually reads. Two expressions of one rule

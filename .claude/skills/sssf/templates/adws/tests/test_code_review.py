@@ -507,7 +507,7 @@ class ActorAbandonedTests(unittest.TestCase):
 # which production never called. Both are gone: the five clauses are enforced
 # along the review path itself and are covered by the tests over that path —
 # report parsing and the matrix by `verify_report`'s tests, occupancy by
-# `check_occupancy`'s, the derived verdict by `derive_verdict`'s, and the signed
+# `check_occupancy`'s, the derived verdict by `grade_verdict`'s, and the signed
 # receipt by the `ReceiptStore` signature tests. Keeping a second predicate
 # green proved only that the copy nobody ran still worked.
 

@@ -1041,6 +1041,90 @@ class TheTurnClockHasOneInCodeDefault(unittest.TestCase):
                                 fw.DEFAULT_TURN_TIMEOUT_S)
 
 
+class TheFailedStartClocksAreOperatorTunable(unittest.TestCase):
+    """#100: start_deadline_s and quiescence_confirm_s are settings, so they
+    belong on the tuning side of `_RUN_TUNING_OPTIONS`, and the review
+    stage must actually read the override — a flag nothing consumes is
+    B15 again."""
+
+    CLOCKS = (
+        ("--review-start-deadline-s", "review_start_deadline_s",
+         "start_deadline_s"),
+        ("--review-quiescence-confirm-s", "review_quiescence_confirm_s",
+         "quiescence_confirm_s"),
+    )
+
+    def _config_call(self, tree: ast.AST) -> ast.Call:
+        runner = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_code_review_runner")
+        calls = [
+            node for node in ast.walk(runner)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name)
+                 and node.func.id == "FinalizationConfig")
+                or (isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "FinalizationConfig"))]
+        self.assertEqual(1, len(calls), "expected one FinalizationConfig")
+        return calls[0]
+
+    def test_each_clock_is_a_tuning_flag_the_parser_declares(self):
+        flags = _every_flag(maestro.build_parser())
+        for option, dest, _field in self.CLOCKS:
+            self.assertIn(option, flags, option + " is not a CLI flag")
+            self.assertEqual(maestro._RUN_TUNING_OPTIONS[option], dest)
+
+    def test_the_review_stage_reads_each_override_from_arguments(self):
+        source = Path(maestro.__file__).read_text(encoding="utf-8")
+        passed = {kw.arg: kw.value
+                  for kw in self._config_call(ast.parse(source)).keywords}
+        for _option, dest, field in self.CLOCKS:
+            self.assertIn(field, passed, field + " is not passed")
+            names = [node.attr for node in ast.walk(passed[field])
+                     if isinstance(node, ast.Attribute)]
+            self.assertIn(dest, names,
+                          field + " is not read from args." + dest)
+
+    def test_the_detector_convicts_a_config_that_dropped_them(self):
+        planted = ast.parse(
+            "def _code_review_runner(args, runner):\n"
+            "    return FinalizationConfig(\n"
+            "        finalization_timeout_s=args.review_timeout_s,\n"
+            "        turn_timeout_s=args.reviewer_turn_timeout_s)\n")
+        keywords = {kw.arg for kw in self._config_call(planted).keywords}
+        self.assertNotIn("start_deadline_s", keywords)
+        self.assertNotIn("quiescence_confirm_s", keywords)
+
+    def test_a_short_start_override_is_the_number_never_started_reads(self):
+        h = Harness(config=make_config(finalization_timeout_s=600.0,
+                                       turn_timeout_s=1_000.0,
+                                       start_deadline_s=7.0),
+                    status="idle", pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.monotonic.advance(7.1)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.NEVER_STARTED)
+        self.assertLess(outcome.elapsed_s, 30.0)
+
+    def test_a_short_quiescence_override_is_the_number_abandoned_reads(self):
+        h = Harness(config=make_config(turn_timeout_s=1_000.0,
+                                       start_deadline_s=100_000.0,
+                                       quiescence_confirm_s=4.0),
+                    status="working", pid=5)
+        h.window.open()
+        h.window.report_launched(pid=5)
+        h.records = 1
+        h.window.poll()
+        h.status = "idle"
+        h.window.poll()
+        h.monotonic.advance(4.1)
+        outcome = h.window.poll()
+        self.assertEqual(outcome.signal, fw.FinalizationSignal.ACTOR_ABANDONED)
+
+
 def _every_flag(parser) -> "set[str]":
     """Every option string the CLI exposes, subparsers included."""
     flags = set()

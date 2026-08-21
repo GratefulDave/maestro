@@ -10,9 +10,10 @@ That is why the rubric these tests range over is defined in this file. It used
 to be `finalization.DEFAULT_RUBRIC`, the plan rubric, which was deleted with
 the review it served. A fixture rubric is the honest replacement: every
 property below is a property of `compute_matrix`, `verify_report`,
-`derive_verdict` and `Receipt` for *any* rubric, and asserting them against
-code review's production rubric would restate `test_code_review.py` while
-tying this file to whichever questions that rubric happens to ask this week.
+`code_review.grade_verdict` and `Receipt` for *any* rubric, and asserting
+them against code review's production rubric would restate
+`test_code_review.py` while tying this file to whichever questions that
+rubric happens to ask this week.
 
 What each block settles:
 
@@ -61,6 +62,7 @@ sys.path.insert(0, str(ADWS))
 
 import pydantic  # noqa: E402
 
+from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import finalization as fin  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
@@ -131,6 +133,26 @@ def clean_report(matrix, *, digest=None, pair_count=None,
     }
 
 
+def graded_payload(matrix, **kwargs) -> dict:
+    """`clean_report` plus the grade/scope a node-review finding must carry."""
+    payload = clean_report(matrix, **kwargs)
+    for cell in payload["cells"]:
+        if cell.get("status") == "finding":
+            cell.setdefault("grade", "error")
+            cell.setdefault("grade_rationale", "fixture finding")
+            cell.setdefault("scope", "in_scope")
+    return payload
+
+
+def derived_verdict(matrix, *, findings=()):
+    """The one remaining kernel, projected onto the receipt's cell shape."""
+    report = cr.CodeReviewerReport.model_validate(
+        graded_payload(matrix, findings=findings))
+    return cr.grade_verdict(
+        matrix, report, FIXTURE_RUBRIC, cr.FindingGrade.ERROR).derived()
+
+
+
 def written_receipt(store, *, digest=DIGEST, findings=()):
     """One receipt, written by the same three calls every review path makes.
 
@@ -140,9 +162,10 @@ def written_receipt(store, *, digest=DIGEST, findings=()):
     and the signature are all real.
     """
     matrix = matrix_for(digest=digest)
-    report = fin.ReviewerReport.model_validate(
-        clean_report(matrix, findings=findings))
-    derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
+    report = cr.CodeReviewerReport.model_validate(
+        graded_payload(matrix, findings=findings))
+    derived = cr.grade_verdict(
+        matrix, report, FIXTURE_RUBRIC, cr.FindingGrade.ERROR).derived()
     receipt = fin.Receipt(
         plan_digest=digest,
         rubric_version=FIXTURE_RUBRIC.version,
@@ -253,8 +276,7 @@ class VerdictAndSeverityAreUnrepresentable(unittest.TestCase):
 
     def test_severity_comes_from_the_rubric_not_the_report(self):
         matrix = matrix_for()
-        report = fin.ReviewerReport.model_validate(clean_report(matrix))
-        derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
+        derived = derived_verdict(matrix)
         for cell in derived.cells:
             if cell.canary is not None:
                 continue
@@ -339,8 +361,7 @@ class TheCanaryIsAPair(unittest.TestCase):
     def test_the_known_bad_canarys_finding_never_reaches_the_verdict(self):
         """Excluded from verdict derivation -- otherwise every plan
         FAILs, since the known-bad cell is always answered `finding`."""
-        report = fin.ReviewerReport.model_validate(clean_report(self.matrix))
-        derived = fin.derive_verdict(self.matrix, report, FIXTURE_RUBRIC)
+        derived = derived_verdict(self.matrix)
         self.assertEqual(derived.verdict, fin.Verdict.PASS)
         canaries = [c for c in derived.cells if c.canary is not None]
         self.assertEqual(len(canaries), 2)
@@ -366,22 +387,17 @@ class TheOccupancyGate(unittest.TestCase):
 class VerdictDerivation(unittest.TestCase):
 
     def test_all_clear_is_a_pass(self):
-        matrix = matrix_for()
-        report = fin.ReviewerReport.model_validate(clean_report(matrix))
-        self.assertEqual(
-            fin.derive_verdict(matrix, report, FIXTURE_RUBRIC).verdict,
-            fin.Verdict.PASS)
+        self.assertEqual(derived_verdict(matrix_for()).verdict, fin.Verdict.PASS)
 
     def test_a_blocking_finding_is_a_fail(self):
         matrix = matrix_for()
         blocking = next(c for c in matrix.graded_cells
                         if FIXTURE_RUBRIC.check(c.check_id).severity
                         is fin.Severity.BLOCKING)
-        payload = clean_report(
-            matrix, findings=((blocking.check_id, blocking.object_id),))
-        report = fin.ReviewerReport.model_validate(payload)
         self.assertEqual(
-            fin.derive_verdict(matrix, report, FIXTURE_RUBRIC).verdict,
+            derived_verdict(
+                matrix,
+                findings=((blocking.check_id, blocking.object_id),)).verdict,
             fin.Verdict.FAIL)
 
     def test_an_advisory_finding_alone_is_still_a_pass(self):
@@ -389,12 +405,9 @@ class VerdictDerivation(unittest.TestCase):
         advisory = next(c for c in matrix.graded_cells
                         if FIXTURE_RUBRIC.check(c.check_id).severity
                         is fin.Severity.ADVISORY)
-        payload = clean_report(
+        derived = derived_verdict(
             matrix, findings=((advisory.check_id, advisory.object_id),))
-        report = fin.ReviewerReport.model_validate(payload)
-        derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
         self.assertEqual(derived.verdict, fin.Verdict.PASS)
-
 
 class TheStoreLocationInvariant(unittest.TestCase):
     """§6.6: receipts live outside both the repository and the SSSF data
@@ -430,8 +443,7 @@ class ReceiptIntegrity(unittest.TestCase):
 
     def _receipt(self, verdict=fin.Verdict.PASS, digest=DIGEST):
         matrix = matrix_for(digest=digest)
-        report = fin.ReviewerReport.model_validate(clean_report(matrix))
-        derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
+        derived = derived_verdict(matrix)
         return fin.Receipt(
             plan_digest=digest,
             rubric_version=FIXTURE_RUBRIC.version,

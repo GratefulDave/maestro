@@ -35,9 +35,9 @@ What each group below settles:
   §6.2 the threshold is a property of the installation, not of the plan
 
 The last group is the regression control: plan finalization shares
-`ObjectKind`, `compute_matrix`, `verify_report` and `derive_verdict` with node
-review, and its verdicts must be **unchanged** by every one of the above. If
-grading leaks across that boundary this file fails.
+`ObjectKind`, `compute_matrix` and `verify_report` with node review. Verdict
+derivation is `code_review.grade_verdict` alone; there is no unthresholded
+sibling whose answers grading could leak into.
 """
 
 from __future__ import annotations

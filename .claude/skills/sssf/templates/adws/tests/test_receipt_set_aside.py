@@ -66,11 +66,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import maestro  # noqa: E402
 
+from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import finalization as fin  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 
 from test_finalization import (  # noqa: E402
-    DIGEST, FIXTURE_RUBRIC, clean_report, make_store, matrix_for)
+    DIGEST, FIXTURE_RUBRIC, graded_payload, make_store, matrix_for)
 
 INVOKER = "operator:david"
 REASON = ("the BLOCKING cell was a projection defect in Maestro "
@@ -83,7 +84,7 @@ def failing_report(matrix=None):
     blocking = next(cell for cell in matrix.graded_cells
                     if FIXTURE_RUBRIC.check(cell.check_id).severity
                     is fin.Severity.BLOCKING)
-    return clean_report(
+    return graded_payload(
         matrix, findings=((blocking.check_id, blocking.object_id),))
 
 
@@ -132,9 +133,22 @@ def finalize(store, review, *, digest=DIGEST, clock=lambda: 1_760_000_000.0):
         return Outcome(stored.verdict, stored, True)
     review.launches += 1
     matrix = matrix_for(digest=digest)
-    report = fin.ReviewerReport.model_validate(review.report)
+    payload = review.report
+    if isinstance(payload, dict):
+        cells = []
+        for cell in payload.get("cells", ()):
+            cell = dict(cell)
+            if cell.get("status") == "finding":
+                cell.setdefault("grade", "error")
+                cell.setdefault("grade_rationale", "fixture finding")
+                cell.setdefault("scope", "in_scope")
+            cells.append(cell)
+        payload = dict(payload)
+        payload["cells"] = cells
+    report = cr.CodeReviewerReport.model_validate(payload)
     fin.verify_report(matrix, report)
-    derived = fin.derive_verdict(matrix, report, FIXTURE_RUBRIC)
+    derived = cr.grade_verdict(
+        matrix, report, FIXTURE_RUBRIC, cr.FindingGrade.ERROR).derived()
     receipt = fin.Receipt(
         plan_digest=digest,
         rubric_version=FIXTURE_RUBRIC.version,
@@ -174,7 +188,7 @@ class TheEscapeAdmitsAFreshReview(unittest.TestCase):
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             self.assertFalse(store.has(DIGEST))
 
-            second = Review(report=clean_report(matrix_for()),
+            second = Review(report=graded_payload(matrix_for()),
                                    session_id="sess-2")
             outcome = finalize(store, second)
 
@@ -271,7 +285,7 @@ class TheEscapeRefuses(unittest.TestCase):
         machine's mistake."""
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, Review(report=clean_report(matrix_for())))
+            finalize(store, Review(report=graded_payload(matrix_for())))
             with self.assertRaises(fin.SetAsideRefused) as caught:
                 store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
             self.assertIn("PASS", str(caught.exception))
@@ -321,7 +335,7 @@ class ReplayIsUnchanged(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
             finalize(store, Review(report=failing_report()))
-            replay = Review(report=clean_report(matrix_for()))
+            replay = Review(report=graded_payload(matrix_for()))
             outcome = finalize(store, replay)
             self.assertTrue(outcome.replayed)
             self.assertEqual(replay.launches, 0)
@@ -330,7 +344,7 @@ class ReplayIsUnchanged(unittest.TestCase):
     def test_an_unescaped_pass_still_short_circuits_with_no_reviewer(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, _repo, _data, _seed = make_store(Path(tmp))
-            finalize(store, Review(report=clean_report(matrix_for())))
+            finalize(store, Review(report=graded_payload(matrix_for())))
             replay = Review(report=failing_report())
             outcome = finalize(store, replay)
             self.assertTrue(outcome.replayed)
@@ -347,7 +361,7 @@ class ReplayIsUnchanged(unittest.TestCase):
 
             store.set_aside(DIGEST, invoked_by=INVOKER, reason=REASON)
 
-            replay = Review(report=clean_report(matrix_for(digest=other)))
+            replay = Review(report=graded_payload(matrix_for(digest=other)))
             outcome = finalize(store, replay, digest=other)
             self.assertTrue(outcome.replayed)
             self.assertEqual(replay.launches, 0)
