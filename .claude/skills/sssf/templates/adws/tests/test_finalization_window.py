@@ -172,6 +172,8 @@ class VocabularyIsSharedWithTheWatchdog(unittest.TestCase):
         self.assertIs(fw.DEFAULT_TRANSCRIPT_RECORD_COUNT,
                       wd.count_complete_transcript_records)
         self.assertIs(fw.SESSION_PATH_KEY, wd.SESSION_PATH_KEY)
+        self.assertIs(fw.LIVE_WORKING_STATUSES, wd.LIVE_WORKING_STATUSES)
+        self.assertNotIn("idle", wd.LIVE_WORKING_STATUSES)
 
 
 class TheTimeoutIsConfigurationNotPlanContent(unittest.TestCase):
