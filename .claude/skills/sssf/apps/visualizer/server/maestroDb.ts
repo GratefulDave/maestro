@@ -34,6 +34,14 @@ import type {
   MaestroRunSummary,
   MaestroTransition,
 } from "../shared/types.ts";
+import {
+  loadDeclaredRoles,
+  resolveAttemptIdentity,
+  roleForNode,
+  type DeclaredConfig,
+  type ObservedModel,
+} from "./attemptIdentity.ts";
+import { observeAttemptLiveness } from "./attemptObservation.ts";
 
 /** The tables that identify a ledger as Maestro's rather than the tracer's. */
 export const MAESTRO_TABLES = ["runs", "dag_nodes", "node_lifecycle", "attempts"];
@@ -100,6 +108,7 @@ interface RunRow {
   latest_outcome_at: string | null;
   cancel_cause: string | null;
   cancel_requested: number | null;
+  scheduler_host: string | null;
 }
 
 interface NodeRow {
@@ -129,6 +138,8 @@ interface AttemptRow {
   turn_count: number | null;
   retry_class: string | null;
   extra_json: string | null;
+  attempt_host: string | null;
+  attempt_start_epoch: number | null;
 }
 
 interface TransitionRow {
@@ -201,6 +212,7 @@ export class MaestroDb {
   /** digest → plan name, rebuilt whenever the plans directory changes on disk. */
   private planNames = new Map<string, string>();
   private planNamesStamp = 0;
+  private declaredConfig: DeclaredConfig;
 
   constructor(path: string, plansDir: string | null = null) {
     if (!existsSync(path)) {
@@ -209,6 +221,7 @@ export class MaestroDb {
     this.path = path;
     this.runsDir = resolve(dirname(path), "runs");
     this.plansDir = plansDir;
+    this.declaredConfig = loadDeclaredRoles(path, plansDir);
     const opened = openLedgerReadonly(path);
     this.db = opened.db;
     this.immutable = opened.immutable;
@@ -328,9 +341,10 @@ export class MaestroDb {
   private runRows(runId?: string): RunRow[] {
     const db = this.freshDb();
     const cause = this.optionalColumn(db, "runs", "runs", "cancel_cause");
+    const host = this.optionalColumn(db, "runs", "runs", "scheduler_host");
     const sql =
       `SELECT run_id, plan_digest, created_at, last_transition_at,
-              latest_outcome, latest_outcome_at, ${cause}, cancel_requested
+              latest_outcome, latest_outcome_at, ${cause}, cancel_requested, ${host}
          FROM runs`;
     return runId
       ? db.query<RunRow, [string]>(`${sql} WHERE run_id = ?`).all(runId)
@@ -400,10 +414,14 @@ export class MaestroDb {
     // Same open-or-reopened connection nodeRows() just settled on: mtime
     // cannot have moved again between these calls in this one request.
     const db = this.freshDb();
+    const hostCol = this.optionalColumn(db, "attempts", "attempts", "attempt_host");
+    const epochCol = this.optionalColumn(
+      db, "attempts", "attempts", "attempt_start_epoch",
+    );
     const attemptRows = db
       .query<AttemptRow, [string]>(
         `SELECT node_id, attempt_no, base_sha, state, started_at, launched_at,
-                pid, turn_count, retry_class, extra_json
+                pid, turn_count, retry_class, extra_json, ${hostCol}, ${epochCol}
            FROM attempts WHERE run_id = ? ORDER BY node_id, attempt_no`,
       )
       .all(runId);
@@ -422,11 +440,39 @@ export class MaestroDb {
       )
       .all(runId);
 
+    const acceptedAttempts = new Set<string>();
+    for (const result of resultRows) {
+      if (
+        result.adjudication === "ACCEPTED"
+        && result.node_id
+        && result.attempt_no != null
+      ) {
+        acceptedAttempts.add(`${result.node_id}#${result.attempt_no}`);
+      }
+    }
     const history = attemptHistory(transitionRows);
+    const kindByNode = new Map(nodeRows.map((node) => [node.node_id, node.kind]));
+    const observedCache = new Map<string, ObservedModel>();
     const attemptsByNode = new Map<string, MaestroAttempt[]>();
     for (const attempt of attemptRows) {
-      const entries = history.get(`${attempt.node_id}#${attempt.attempt_no}`) ?? [];
+      const attemptKey = `${attempt.node_id}#${attempt.attempt_no}`;
+      const entries = history.get(attemptKey) ?? [];
       const extra = parseJson<Record<string, unknown>>(attempt.extra_json, {});
+      const session_path =
+        typeof extra.session_path === "string" ? extra.session_path : null;
+      const observed = observeAttemptLiveness(attempt.state, attempt.pid, {
+        attemptHost: attempt.attempt_host,
+        attemptStartEpoch: attempt.attempt_start_epoch,
+        reviewDispatches: extra.review_dispatches,
+        declaredAccepted: acceptedAttempts.has(attemptKey),
+      });
+      const role = roleForNode(attempt.node_id, kindByNode.get(attempt.node_id) ?? null);
+      const identity = resolveAttemptIdentity(
+        session_path,
+        role ? this.declaredConfig.roles[role] : null,
+        observedCache,
+        this.declaredConfig.path,
+      );
       const projected: MaestroAttempt = {
         node_id: attempt.node_id,
         attempt_no: attempt.attempt_no,
@@ -439,9 +485,14 @@ export class MaestroDb {
         // in milliseconds, and converting once here keeps that seam in one place.
         started_at_ms: attempt.started_at == null ? null : attempt.started_at * 1000,
         launched_at_ms: attempt.launched_at == null ? null : attempt.launched_at * 1000,
-        running: attempt.state === "RUNNING",
-        session_path:
-          typeof extra.session_path === "string" ? extra.session_path : null,
+        running: observed.running,
+        liveness: observed.liveness,
+        model: identity.model,
+        vendor: identity.vendor,
+        model_source: identity.model_source,
+        vendor_source: identity.vendor_source,
+        declared_config_path: identity.declared_config_path,
+        session_path,
         verdict: firstVerdict(entries),
         transitions: entries,
         review_findings: reviewFindingsFromExtra(extra),

@@ -40,6 +40,18 @@ export interface MaestroReviewFinding {
   blocking: boolean;
 }
 
+export type AttemptLiveness =
+  | "running"
+  | "stale"
+  | "not_recorded"
+  | "not_running"
+  | "unknown";
+export type AttemptIdentitySource =
+  | "observed"
+  | "observed_head"
+  | "declared"
+  | "not_recorded";
+
 export interface MaestroAttempt {
   node_id: string;
   attempt_no: number;
@@ -50,7 +62,17 @@ export interface MaestroAttempt {
   pid: number | null;
   started_at_ms: number | null;
   launched_at_ms: number | null;
+  /**
+   * Proven live or sitting in review. Unknown host/epoch, a foreign
+   * host, or a reused pid is false — unprovable, not dead.
+   */
   running: boolean;
+  liveness: AttemptLiveness;
+  model: string | null;
+  vendor: string | null;
+  model_source: AttemptIdentitySource;
+  vendor_source: AttemptIdentitySource;
+  declared_config_path: string | null;
   session_path: string | null;
   verdict: string | null;
   transitions: MaestroTransition[];

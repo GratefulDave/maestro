@@ -19,7 +19,7 @@ export default async function RunPage({
   const { run } = loaded;
   const blocked = run.nodes.filter((node) => nodeNeedsAttention(node)).length;
   const merged = run.nodes.filter((node) => node.state === "MERGED").length;
-  const running = run.nodes.filter((node) => node.state === "RUNNING").length;
+  const running = run.nodes.flatMap((node) => node.attempts).filter((attempt) => attempt.running).length;
 
   return (
     <RunChrome run={run} runId={runId} sourceId={sourceId}>
@@ -35,10 +35,14 @@ export default async function RunPage({
         />
       )}
       <div className="stat-grid">
-        <StatCard label="Nodes" value={run.nodes.length} />
-        <StatCard label="Merged" value={merged} />
-        <StatCard label="Running" value={running} />
-        <StatCard label="Needs attention" value={blocked} />
+        <StatCard label="Nodes" value={run.nodes.length} detail="dag nodes" />
+        <StatCard label="Merged" value={merged} detail="nodes" />
+        <StatCard
+          label="Running"
+          value={running}
+          detail="attempts proven live or sitting in review"
+        />
+        <StatCard label="Needs attention" value={blocked} detail="nodes" />
       </div>
       {run.integration && (
         <section className="panel section-panel">

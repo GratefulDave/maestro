@@ -386,6 +386,18 @@ export interface MaestroReviewFinding {
   blocking: boolean;
 }
 
+export type AttemptLiveness =
+  | "running"
+  | "stale"
+  | "not_recorded"
+  | "not_running"
+  | "unknown";
+export type AttemptIdentitySource =
+  | "observed"
+  | "observed_head"
+  | "declared"
+  | "not_recorded";
+
 export interface MaestroAttempt {
   node_id: string;
   attempt_no: number;
@@ -399,7 +411,27 @@ export interface MaestroAttempt {
   /** Epoch milliseconds; the ledger stores seconds and the server converts. */
   started_at_ms: number | null;
   launched_at_ms: number | null;
+  /**
+   * True when the attempt is proven live, or is in its review window.
+   * Proven live requires (pid, attempt_host, attempt_start_epoch) to
+   * identify a process on this host. A review-window attempt stays true
+   * after the builder pid exits. Unknown / not recorded are false.
+   */
   running: boolean;
+  /**
+   * Read-side observation, never a transition. `stale` = proven dead on
+   * this host. `unknown` = cannot be said (no host/epoch, foreign host,
+   * pid reuse). `not_recorded` = no pid. Review window reads `running`
+   * even when the builder pid is gone.
+   */
+  liveness: AttemptLiveness;
+  /** Observed from session jsonl, else declared from maestro.config.yaml. */
+  model: string | null;
+  vendor: string | null;
+  model_source: AttemptIdentitySource;
+  vendor_source: AttemptIdentitySource;
+  /** Config file that supplied a declared answer, when one was found. */
+  declared_config_path: string | null;
   /** The agent's transcript on disk, once the launcher has reported it. */
   session_path: string | null;
   /** The structured verdict recorded against this attempt's failure, if any. */

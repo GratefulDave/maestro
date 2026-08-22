@@ -4,11 +4,17 @@ import { PageHeader } from "@/components/PageHeader";
 import { RunCard } from "@/components/RunCard";
 import { SourceBanner } from "@/components/SourceBanner";
 import { StatCard } from "@/components/StatCard";
-import { isInFlight, loadFleetSummaries, needsAttention } from "@/lib/api";
+import { decodeRouteParam, isInFlight, loadFleetSummaries, needsAttention } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
-export default async function RunsPage() {
+export default async function RunsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ source?: string }>;
+}) {
+  const { source } = await searchParams;
+  const sourceFilter = source ? decodeRouteParam(source) : null;
   const fleet = await loadFleetSummaries();
   if (!fleet.ok) {
     return (
@@ -23,9 +29,17 @@ export default async function RunsPage() {
     );
   }
 
-  const { maestro, runs } = fleet;
+  const { sources, maestro, runs: allRuns } = fleet;
+  const runs = sourceFilter
+    ? allRuns.filter((run) => run.source_id === sourceFilter)
+    : allRuns;
   const active = runs.filter((run) => isInFlight(run.state));
   const attention = runs.filter((run) => needsAttention(run));
+  const filteredSource = sourceFilter
+    ? sources.find((item) => item.id === sourceFilter)
+    : null;
+  const notMaestro = Boolean(filteredSource && filteredSource.kind !== "maestro");
+  const unknownSource = Boolean(sourceFilter && !filteredSource);
 
   return (
     <section className="page-stack">
@@ -35,7 +49,11 @@ export default async function RunsPage() {
         description="Every Maestro run across registered lifecycle ledgers. Progress strips use node_states on the summary."
       />
       <SourceBanner
-        label={`${maestro.length} maestro source${maestro.length === 1 ? "" : "s"}`}
+        label={
+          sourceFilter
+            ? sourceFilter
+            : `${maestro.length} maestro source${maestro.length === 1 ? "" : "s"}`
+        }
         detail={`${runs.length} run${runs.length === 1 ? "" : "s"} via GET /api/sources and GET /api/sources/:id/runs`}
       />
       <div className="stat-grid">
@@ -44,7 +62,17 @@ export default async function RunsPage() {
         <StatCard label="Needs attention" value={attention.length} />
         <StatCard label="Sources" value={maestro.length} />
       </div>
-      {maestro.length === 0 ? (
+      {notMaestro ? (
+        <EmptyState
+          title="Not a Maestro ledger"
+          description={`${sourceFilter} is registered as kind=${filteredSource?.kind}. /runs only lists maestro sources.`}
+        />
+      ) : unknownSource ? (
+        <EmptyState
+          title="Unknown source"
+          description={`${sourceFilter} is not in GET /api/sources.`}
+        />
+      ) : maestro.length === 0 ? (
         <EmptyState
           title="No Maestro sources"
           description="The Bun API is reachable, but GET /api/sources listed no kind=maestro ledger."
@@ -52,7 +80,11 @@ export default async function RunsPage() {
       ) : runs.length === 0 ? (
         <EmptyState
           title="No runs in the ledger"
-          description="Registered Maestro sources answered, and their run indexes are empty."
+          description={
+            sourceFilter
+              ? `${sourceFilter} is a maestro source, and its run index is empty.`
+              : "Registered Maestro sources answered, and their run indexes are empty."
+          }
         />
       ) : (
         <>
