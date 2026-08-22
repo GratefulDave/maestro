@@ -25,8 +25,9 @@ export default async function RunPage({
     <RunChrome run={run} runId={runId} sourceId={sourceId}>
       <SourceBanner
         label={`live ${run.state}`}
-        detail={`server_now_ms ${run.server_now_ms} · ${run.nodes.length} nodes · digest ${run.plan_digest}`}
+        detail={`scheduler_liveness ${run.scheduler_liveness} · server_now_ms ${run.server_now_ms} · ${run.nodes.length} nodes · digest ${run.plan_digest}`}
       />
+
       {run.cancel_cause && (
         <SourceBanner
           label={`cancel_cause ${run.cancel_cause}`}

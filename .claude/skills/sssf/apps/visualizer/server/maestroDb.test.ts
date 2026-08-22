@@ -8,10 +8,13 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MaestroDb, discoverMaestroLedger, mergeProvenance } from "./maestroDb.ts";
+import { processStartEpoch } from "./attemptObservation.ts";
+
 import { probeKind, resolveSources } from "./sources.ts";
 
 /** `<visualizer>/../../templates/adws/adw_modules/lifecycle.py`. */
@@ -58,22 +61,29 @@ function insertRun(
     latest_outcome: string | null;
     cancel_cause: string | null;
     cancel_requested: number;
+    scheduler_pid: number | null;
+    scheduler_host: string | null;
+    scheduler_start_epoch: number | null;
   }> = {},
 ) {
   const row = {
     plan_digest: "d".repeat(64),
     created_at: "2026-08-17T06:00:00+00:00",
     last_transition_at: "2026-08-17T06:05:00+00:00",
-    latest_outcome: null,
+    latest_outcome: null as string | null,
     cancel_cause: null as string | null,
     cancel_requested: 0,
+    scheduler_pid: null as number | null,
+    scheduler_host: null as string | null,
+    scheduler_start_epoch: null as number | null,
     ...overrides,
   };
   db.query(
     `INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,
                        latest_outcome, latest_outcome_at, cancel_cause,
-                       cancel_requested)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                       cancel_requested, scheduler_pid, scheduler_host,
+                       scheduler_start_epoch)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     runId,
     row.plan_digest,
@@ -83,6 +93,9 @@ function insertRun(
     row.latest_outcome === null ? null : row.last_transition_at,
     row.cancel_cause,
     row.cancel_requested,
+    row.scheduler_pid,
+    row.scheduler_host,
+    row.scheduler_start_epoch,
   );
 }
 
@@ -942,3 +955,106 @@ describe("merge provenance", () => {
     expect(mergeProvenance("VERIFIED", null)).toBeNull();
   });
 });
+
+describe("run scheduler liveness", () => {
+  const host = hostname();
+  const liveEpoch = processStartEpoch(process.pid);
+
+  test("dead pid, matching host and epoch, no outcome → abandoned, not RUNNING", () => {
+    const path = ledger("sched-dead", (seed) => {
+      insertRun(seed, "run-dead", {
+        scheduler_pid: 2_000_000_000,
+        scheduler_host: host,
+        scheduler_start_epoch: 1.0,
+      });
+      insertNode(seed, "run-dead", "lane-a", "RUNNING");
+    });
+    const db = new MaestroDb(path);
+    const run = db.run("run-dead");
+    expect(run?.state).toBe("ABANDONED");
+    expect(run?.scheduler_liveness).toBe("abandoned");
+    expect(run?.declared_outcome).toBeNull();
+    expect(db.runs()[0]?.state).toBe("ABANDONED");
+    db.close();
+  });
+
+  test("live scheduler still reads RUNNING", () => {
+    expect(liveEpoch).not.toBeNull();
+    const path = ledger("sched-live", (seed) => {
+      insertRun(seed, "run-live", {
+        scheduler_pid: process.pid,
+        scheduler_host: host,
+        scheduler_start_epoch: liveEpoch,
+      });
+      insertNode(seed, "run-live", "lane-a", "RUNNING");
+    });
+    const db = new MaestroDb(path);
+    const run = db.run("run-live");
+    expect(run?.state).toBe("RUNNING");
+    expect(run?.scheduler_liveness).toBe("running");
+    db.close();
+  });
+
+  test("null scheduler fields → unknown, still RUNNING", () => {
+    const path = ledger("sched-null", (seed) => {
+      insertRun(seed, "run-old");
+      insertNode(seed, "run-old", "lane-a", "RUNNING");
+    });
+    const db = new MaestroDb(path);
+    const run = db.run("run-old");
+    expect(run?.state).toBe("RUNNING");
+    expect(run?.scheduler_liveness).toBe("unknown");
+    db.close();
+  });
+
+
+  test("foreign host → unknown, not abandoned", () => {
+    const path = ledger("sched-foreign", (seed) => {
+      insertRun(seed, "run-x", {
+        scheduler_pid: process.pid,
+        scheduler_host: "other-box",
+        scheduler_start_epoch: 1.0,
+      });
+      insertNode(seed, "run-x", "lane-a", "RUNNING");
+    });
+    const db = new MaestroDb(path);
+    const run = db.run("run-x");
+    expect(run?.state).toBe("RUNNING");
+    expect(run?.scheduler_liveness).toBe("unknown");
+    db.close();
+  });
+
+  test("epoch mismatch → unknown, not abandoned", () => {
+    const path = ledger("sched-epoch", (seed) => {
+      insertRun(seed, "run-x", {
+        scheduler_pid: process.pid,
+        scheduler_host: host,
+        scheduler_start_epoch: 1.0,
+      });
+      insertNode(seed, "run-x", "lane-a", "RUNNING");
+    });
+    const db = new MaestroDb(path);
+    const run = db.run("run-x");
+    expect(run?.state).toBe("RUNNING");
+    expect(run?.scheduler_liveness).toBe("unknown");
+    db.close();
+  });
+
+  test("pipeline ledger run-774cb… is abandoned, not RUNNING", () => {
+    const real = join(
+      homedir(),
+      "PycharmProjects/.maestro-state/lexgenius-pipeline/lifecycle.sqlite3",
+    );
+    if (!existsSync(real)) return;
+    const db = new MaestroDb(real);
+    const run = db.runs().find((row) =>
+      row.run_id.startsWith("run-774cb4967117"),
+    );
+    expect(run).toBeDefined();
+    expect(run?.state).toBe("ABANDONED");
+    expect(run?.scheduler_liveness).toBe("abandoned");
+    expect(run?.declared_outcome).toBeNull();
+    db.close();
+  });
+});
+

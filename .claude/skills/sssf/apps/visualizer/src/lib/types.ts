@@ -37,4 +37,6 @@ export type {
   MaestroNodeState,
   MaestroRunOutcome,
   MaestroLiveState,
+  RunLiveness,
+
 } from '@shared/types'

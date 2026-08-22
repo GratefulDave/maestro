@@ -166,21 +166,7 @@ export async function loadFleetDetails(): Promise<
   };
 }
 
-export function isInFlight(state: string): boolean {
-  return ["RUNNING", "CANCELLING", "PENDING"].includes(state);
-}
-
-export function needsAttention(run: MaestroRunSummary): boolean {
-  if (["BLOCKED", "CANCELLED", "STUCK"].includes(run.state)) return true;
-  if (run.declared_outcome === "BLOCKED" || run.declared_outcome === "STUCK") return true;
-  return run.node_states.some((node) =>
-    ["BLOCKED", "CANCELLED"].includes(node.state),
-  );
-}
-
-export function mergedCount(run: MaestroRunSummary): number {
-  return run.node_states.filter((node) => node.state === "MERGED").length;
-}
+export { isInFlight, mergedCount, needsAttention } from "@/lib/runVisibility";
 
 export function elapsedLabel(startedAtMs: number | null, serverNowMs: number): string {
   if (startedAtMs == null) return "—";

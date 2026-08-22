@@ -332,9 +332,22 @@ export type MaestroRunOutcome = string;
 /**
  * What the run is doing now, derived from its node states — never stored.
  * RUNNING · CANCELLING · CANCELLED · BLOCKED · PENDING · MERGED · QUIESCENT ·
- * EMPTY.
+ * EMPTY · ABANDONED (scheduler proven gone; display only).
  */
 export type MaestroLiveState = string;
+
+/**
+ * Read-side observation of the run's scheduler. Never a bare boolean.
+ * `abandoned` is a dead pid on this host with a matching start epoch.
+ * `unknown` is every decline: missing columns, foreign host, epoch mismatch.
+ * Collapsing unknown into abandoned is the §1.2 conviction this exists to stop.
+ */
+export type RunLiveness =
+  | "running"
+  | "abandoned"
+  | "unknown"
+  | "not_running";
+
 
 /**
  * `cancel_cause` — why a CANCELLED run or node is cancelled.
@@ -493,6 +506,9 @@ export interface MaestroRunSummary {
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;
+  /** Read-side scheduler observation. Display only; never a transition. */
+  scheduler_liveness: RunLiveness;
+
   declared_outcome: MaestroRunOutcome | null;
   declared_outcome_at: string | null;
   /** Why the declared outcome was CANCELLED; null for every other outcome. */
@@ -513,6 +529,9 @@ export interface MaestroRunDetail {
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;
+  /** Read-side scheduler observation. Display only; never a transition. */
+  scheduler_liveness: RunLiveness;
+
   declared_outcome: MaestroRunOutcome | null;
   declared_outcome_at: string | null;
   /** Why the declared outcome was CANCELLED; null for every other outcome. */

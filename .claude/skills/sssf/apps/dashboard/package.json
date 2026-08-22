@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start -p 4317",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
   },
   "dependencies": {
     "@xyflow/react": "12.5.5",

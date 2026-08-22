@@ -19,10 +19,15 @@ const TONES: Record<string, 'good' | 'bad' | 'live' | 'idle' | 'warn'> = {
   VERIFIED: 'good',
   ACCEPTED: 'good',
   RUNNING: 'live',
+  running: 'live',
   CANCELLING: 'warn',
+  ABANDONED: 'warn',
+  abandoned: 'warn',
   PENDING: 'idle',
   QUIESCENT: 'idle',
   EMPTY: 'idle',
+  unknown: 'idle',
+  not_running: 'idle',
   BLOCKED: 'bad',
   CANCELLED: 'bad',
   STUCK: 'bad',
@@ -34,10 +39,12 @@ const ICONS: Record<string, unknown> = {
   ACCEPTED: Check,
   RUNNING: LoaderCircle,
   CANCELLING: Ban,
+  ABANDONED: Ban,
   CANCELLED: Ban,
   BLOCKED: OctagonX,
   STUCK: OctagonX,
 }
+
 
 const tone = computed(() => TONES[props.state] ?? 'idle')
 const icon = computed(() => ICONS[props.state] ?? CircleDashed)

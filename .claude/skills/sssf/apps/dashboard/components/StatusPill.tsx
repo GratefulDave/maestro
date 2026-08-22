@@ -25,9 +25,11 @@ const STATUS_ICONS: Record<string, LucideIcon> = {
   stuck: XCircle,
   failed: XCircle,
   stale: Clock,
+  abandoned: Clock,
   unknown: Clock,
   not_recorded: Circle,
   not_running: Circle,
+
 };
 
 const STATUS_TONES: Record<string, string> = {
@@ -48,9 +50,11 @@ const STATUS_TONES: Record<string, string> = {
   stuck: "err",
   failed: "err",
   stale: "warn",
+  abandoned: "warn",
   unknown: "pending",
   not_recorded: "pending",
   not_running: "pending",
+
 };
 
 export function StatusPill({
