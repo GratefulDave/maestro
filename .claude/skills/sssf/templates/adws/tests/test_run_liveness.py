@@ -399,10 +399,16 @@ class TheOwnerIsWrittenToTheLedger(unittest.TestCase):
         store = lc.LifecycleStore(self.db)
         try:
             columns = lc._table_columns(store.conn, "runs")
+            old_name = store.conn.execute(
+                "SELECT plan_name FROM runs WHERE run_id=?",
+                ("old",)).fetchone()[0]
         finally:
             store.close()
         for name, _kind in lc._RUNS_ADDED_COLUMNS:
             self.assertIn(name, columns)
+        self.assertIn("plan_name", columns)
+        # Migration adds the column and invents no name for a pre-column row.
+        self.assertIsNone(old_name)
         reader = lc.LifecycleReader.open(self.db)
         try:
             rec = reader.run("old")

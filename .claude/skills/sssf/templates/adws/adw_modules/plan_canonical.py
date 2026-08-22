@@ -33,6 +33,11 @@ def canonicalize(plan: Plan) -> bytes:
     to produce the input to a digest at run time — see the module docstring.
     """
     payload = plan.model_dump(mode="json")
+    # `title` was added after the first plans shipped. Dumping None would
+    # rewrite every pre-field file as `"title":null` and break `is_canonical`
+    # — two identities for one plan. Absent stays absent.
+    if payload.get("title") is None:
+        payload.pop("title", None)
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False)
     return text.encode("utf-8") + b"\n"

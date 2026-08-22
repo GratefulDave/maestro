@@ -502,7 +502,7 @@ export interface MaestroResult {
 /** GET /api/sources/:id/runs — the index, one row per run. */
 export interface MaestroRunSummary {
   run_id: string;
-  /** Resolved by hashing the installed plan files; null when none matches. */
+  /** Stored `runs.plan_name` when present; else digest lookup; null if neither. */
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;

@@ -64,6 +64,7 @@ function insertRun(
     scheduler_pid: number | null;
     scheduler_host: string | null;
     scheduler_start_epoch: number | null;
+    plan_name: string | null;
   }> = {},
 ) {
   const row = {
@@ -76,14 +77,15 @@ function insertRun(
     scheduler_pid: null as number | null,
     scheduler_host: null as string | null,
     scheduler_start_epoch: null as number | null,
+    plan_name: null as string | null,
     ...overrides,
   };
   db.query(
     `INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,
                        latest_outcome, latest_outcome_at, cancel_cause,
                        cancel_requested, scheduler_pid, scheduler_host,
-                       scheduler_start_epoch)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                       scheduler_start_epoch, plan_name)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     runId,
     row.plan_digest,
@@ -96,6 +98,7 @@ function insertRun(
     row.scheduler_pid,
     row.scheduler_host,
     row.scheduler_start_epoch,
+    row.plan_name,
   );
 }
 
@@ -762,6 +765,59 @@ describe("plan names", () => {
     expect(byId.get("run-named")!.plan_name).toBe("my-plan");
     // Honest about a plan edited since the run: no name rather than a guess.
     expect(byId.get("run-stale")!.plan_name).toBeNull();
+    db.close();
+  });
+
+  test("a stored plan_name wins over the digest lookup", () => {
+    const plans = join(root, "plans-stored");
+    mkdirSync(join(plans, "directory-name"), { recursive: true });
+    const bytes = '{"plan":"other bytes"}\n';
+    writeFileSync(join(plans, "directory-name", "maestro-plan.v1"), bytes);
+    const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+
+    const db = new MaestroDb(
+      ledger("stored-name", (seed) => {
+        insertRun(seed, "run-stored", {
+          plan_digest: digest,
+          plan_name: "IR title from the ledger",
+        });
+        insertNode(seed, "run-stored", "lane", "MERGED", { plan_digest: digest });
+        insertRun(seed, "run-null", { plan_digest: digest, plan_name: null });
+        insertNode(seed, "run-null", "lane", "MERGED", { plan_digest: digest });
+      }),
+      plans,
+    );
+    const byId = new Map(db.runs().map((r) => [r.run_id, r]));
+    expect(byId.get("run-stored")!.plan_name).toBe("IR title from the ledger");
+    expect(byId.get("run-null")!.plan_name).toBe("directory-name");
+    expect(db.run("run-stored")!.plan_name).toBe("IR title from the ledger");
+    expect(db.run("run-null")!.plan_name).toBe("directory-name");
+    db.close();
+  });
+
+  test("a ledger without the plan_name column still opens and falls back", () => {
+    const plans = join(root, "plans-old-col");
+    mkdirSync(join(plans, "my-plan"), { recursive: true });
+    const bytes = '{"plan":"old ledger"}\n';
+    writeFileSync(join(plans, "my-plan", "maestro-plan.v1"), bytes);
+    const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+
+    const path = ledger("old-plan-name", (seed) => {
+      seed.exec("ALTER TABLE runs DROP COLUMN plan_name");
+      seed
+        .query(
+          `INSERT INTO runs (run_id, plan_digest, created_at,
+                             last_transition_at, latest_outcome,
+                             latest_outcome_at, cancel_requested)
+           VALUES (?, ?, '2026-08-17T06:00:00+00:00',
+                   '2026-08-17T06:05:00+00:00', NULL, NULL, 0)`,
+        )
+        .run("run-old", digest);
+      insertNode(seed, "run-old", "lane", "MERGED", { plan_digest: digest });
+    });
+    const db = new MaestroDb(path, plans);
+    expect(db.runs()[0]!.plan_name).toBe("my-plan");
+    expect(db.run("run-old")!.plan_name).toBe("my-plan");
     db.close();
   });
 });

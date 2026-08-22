@@ -405,12 +405,14 @@ class Scheduler:
     def __init__(self, run_id: str, nodes: Sequence[st.PlanNode],
                  config: st.SchedulerConfig, deps: SchedulerDeps,
                  plan_digest: str = "",
+                 plan_name: Optional[str] = None,
                  time_source: Callable[[], float] = time.time) -> None:
         self.run_id = run_id
         self.nodes: Dict[str, st.PlanNode] = {n.node_id: n for n in nodes}
         self.config = config
         self.deps = deps
         self.plan_digest = plan_digest
+        self.plan_name = plan_name
         # Defaults to `time.time` so it matches `started_at` and
         # `last_transition_at` (epoch seconds). Tests inject a fake.
         self._time_source = time_source
@@ -507,7 +509,8 @@ class Scheduler:
             return
         try:
             self.deps.store.create_run(self.run_id, self.plan_digest,
-                                       list(self.nodes.values()))
+                                       list(self.nodes.values()),
+                                       plan_name=self.plan_name)
         except lc.RunAlreadyExists:
             pass
         # This process now owns the run, whether it just projected the plan or

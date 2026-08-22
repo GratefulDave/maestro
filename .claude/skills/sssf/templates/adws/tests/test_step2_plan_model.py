@@ -281,7 +281,15 @@ class CanonicalBytesTests(unittest.TestCase):
     def test_stored_bytes_round_trip_through_the_parser_unchanged(self):
         stored = stored_bytes(plan_mapping())
         self.assertEqual(pc.canonicalize(pm.parse_bytes(stored)), stored)
+
+    def test_a_plan_file_written_before_title_stays_canonical(self):
+        """Dumping None as `"title":null` would mint a new identity for every
+        already-shipped file. Absent stays absent."""
+        stored = stored_bytes(plan_mapping())
+        self.assertNotIn(b'"title"', stored)
         self.assertTrue(pc.is_canonical(stored))
+        self.assertIsNone(pm.parse_bytes(stored).title)
+        self.assertEqual(pc.canonicalize(pm.parse_bytes(stored)), stored)
 
     def test_non_canonical_bytes_are_detectable_without_being_rewritten(self):
         stored = stored_bytes(plan_mapping())
