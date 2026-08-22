@@ -33,6 +33,7 @@ from pathlib import Path
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
+from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import watchdog as wd  # noqa: E402
 
@@ -219,7 +220,8 @@ class ProcessAliveSignalTests(unittest.TestCase):
             self.assertFalse(wd.process_is_alive(proc.pid))
 
             attempt = make_attempt(
-                started_at=0.0, launched_at=0.0, pid=proc.pid)
+                started_at=0.0, launched_at=0.0, pid=proc.pid,
+                attempt_host=lc.scheduler_host(), attempt_start_epoch=1.0)
             watchdog = self._watchdog([attempt])
             self.clock.set(0.001)  # barely any wall clock elapsed
 
@@ -239,7 +241,9 @@ class ProcessAliveSignalTests(unittest.TestCase):
             self.assertTrue(wd.process_is_alive(proc.pid))
 
             attempt = make_attempt(
-                started_at=0.0, launched_at=0.0, pid=proc.pid)
+                started_at=0.0, launched_at=0.0, pid=proc.pid,
+                attempt_host=lc.scheduler_host(),
+                attempt_start_epoch=wd.process_start_epoch(proc.pid))
             watchdog = self._watchdog([attempt])
             self.clock.set(0.5)
 

@@ -195,9 +195,10 @@ class _ConfiguredRepository:
             "UPDATE runs SET scheduler_pid=?, scheduler_host=? WHERE run_id=?",
             (DEAD_PID, lc.scheduler_host(), RUN_ID))
         self.store.conn.execute(
-            "UPDATE attempts SET launched_at=?, pid=? "
-            "WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (1.0, DEAD_PID, RUN_ID, NODE_ID, 1))
+            "UPDATE attempts SET launched_at=?, pid=?,"
+            " attempt_host=?, attempt_start_epoch=?"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (1.0, DEAD_PID, lc.scheduler_host(), 1.0, RUN_ID, NODE_ID, 1))
         self.store.conn.commit()
 
     # ── invocation ───────────────────────────────────────────────────────────

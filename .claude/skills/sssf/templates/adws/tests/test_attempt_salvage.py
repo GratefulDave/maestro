@@ -37,6 +37,7 @@ from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import receipt_crypto as rc  # noqa: E402
 from adw_modules import salvage  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import watchdog as wd  # noqa: E402
 from adw_modules import worktree as wt  # noqa: E402
 
 
@@ -114,9 +115,10 @@ def _strand(store: lc.LifecycleStore, *,
         (pid, lc.scheduler_host(), RUN_ID))
     if launched:
         store.conn.execute(
-            "UPDATE attempts SET launched_at=?, pid=? "
-            "WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (1.0, pid, RUN_ID, NODE_ID, 1))
+            "UPDATE attempts SET launched_at=?, pid=?,"
+            " attempt_host=?, attempt_start_epoch=?"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (1.0, pid, lc.scheduler_host(), 1.0, RUN_ID, NODE_ID, 1))
 
 
 def _write_deliverables(path: Path) -> Tuple[str, str]:
@@ -313,9 +315,13 @@ class SalvageRefuses(unittest.TestCase):
 
     def test_a_live_attempt_is_refused(self):
         with _Harness() as h:
+            started = wd.process_start_epoch(os.getpid())
             h.store.conn.execute(
-                "UPDATE attempts SET pid=? WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (os.getpid(), RUN_ID, NODE_ID, 1))
+                "UPDATE attempts SET pid=?, attempt_host=?,"
+                " attempt_start_epoch=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (os.getpid(), lc.scheduler_host(), started,
+                 RUN_ID, NODE_ID, 1))
             with self.assertRaises(salvage.SalvageRefused) as caught:
                 h.salvage()
             self.assertEqual(caught.exception.outcome, "SALVAGE_ATTEMPT_LIVE")
@@ -332,6 +338,12 @@ class SalvageRefuses(unittest.TestCase):
             h.store.start_attempt(RUN_ID, NODE_ID, base_sha=h.base)
             h.store.record_baseline(
                 RUN_ID, NODE_ID, 2, wt.take_baseline(a2))
+            h.store.conn.execute(
+                "UPDATE attempts SET launched_at=?, pid=?,"
+                " attempt_host=?, attempt_start_epoch=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (1.0, DEAD_PID, lc.scheduler_host(), 1.0,
+                 RUN_ID, NODE_ID, 2))
 
             with self.assertRaises(salvage.SalvageRefused) as caught:
                 h.salvage(attempt_no=2)

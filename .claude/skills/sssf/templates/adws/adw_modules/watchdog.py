@@ -383,6 +383,8 @@ class Watchdog:
         preserve_unpublished: Optional[UnpublishedWorkPreserver] = None,
         time_source: Callable[[], float] = time.monotonic,
         on_error: Callable[[BaseException], None] = lambda exc: None,
+        start_epoch: Callable[[int], Optional[float]] = process_start_epoch,
+        host: Optional[str] = None,
     ) -> None:
         self._config = config
         self._attempts_provider = attempts_provider
@@ -398,6 +400,8 @@ class Watchdog:
         self._preserve_unpublished = preserve_unpublished
         self._time_source = time_source
         self._on_error = on_error
+        self._start_epoch = start_epoch
+        self._host = host
         # Private: the only writer of this cache is _check_attempt, below.
         self._heartbeats: Dict[Tuple[str, str, int], _HeartbeatState] = {}
         self._stop_event = threading.Event()
@@ -538,7 +542,7 @@ class Watchdog:
         if (attempt.pid is not None
                 and not self._exit_status_observed(attempt)
                 and not self._declared_result_observed(attempt)
-                and not self._process_alive(attempt.pid)):
+                and self._attempt_process_dead(attempt)):
             self._heartbeats.pop(key, None)
             self._stall(attempt, StallReason.PROCESS_DEAD)
             return
@@ -626,6 +630,22 @@ class Watchdog:
                 and not self._declared_result_observed(attempt)
                 and not route_reports_working):
             self._stall(attempt, StallReason.TURN_TIMEOUT)
+
+
+    def _attempt_process_dead(self, attempt: st.AttemptRecord) -> bool:
+        """True only when this attempt's own process is proven absent.
+
+        Lazy import: this module must not import `lifecycle` at load time
+        (`sqlite3` is a store driver; the store is injected). The predicate
+        itself lives in `lifecycle.attempt_liveness` so watchdog and salvage
+        cannot drift into two answers.
+        """
+        from . import lifecycle as lc
+        return lc.attempt_liveness(
+            attempt,
+            is_alive=self._process_alive,
+            start_epoch=self._start_epoch,
+            host=self._host) is False
 
     def _stall(self, attempt: st.AttemptRecord, reason: StallReason) -> None:
         self._kill(attempt)

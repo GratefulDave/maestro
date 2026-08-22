@@ -237,22 +237,26 @@ def _recorded_ignored_at_base(store: lc.LifecycleStore, run_id: str,
             run_id=run_id, node_id=node_id, attempt_no=attempt_no) from exc
 
 
-def _refuse_if_live(store: lc.LifecycleStore, attempt: st.AttemptRecord) -> None:
+def _refuse_if_live(
+        store: lc.LifecycleStore, attempt: st.AttemptRecord, *,
+        is_alive: Callable[[int], bool] = wd.process_is_alive,
+        start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
+        host: Optional[str] = None) -> None:
     if attempt.state is not st.NodeState.RUNNING:
         return
     store._require_scheduler_dead(attempt.run_id)
-    if attempt.pid is not None:
-        if wd.process_is_alive(attempt.pid):
-            raise SalvageRefused(
-                "SALVAGE_ATTEMPT_LIVE",
-                f"{attempt.run_id}/{attempt.node_id}#{attempt.attempt_no} "
-                f"still has live pid {attempt.pid}")
-        return
-    if attempt.launched_at is not None:
+    verdict = lc.attempt_liveness(
+        attempt, is_alive=is_alive, start_epoch=start_epoch, host=host)
+    if verdict is True:
         raise SalvageRefused(
             "SALVAGE_ATTEMPT_LIVE",
             f"{attempt.run_id}/{attempt.node_id}#{attempt.attempt_no} "
-            "launched but recorded no pid; refusing rather than guessing "
+            f"still has live pid {attempt.pid}")
+    if verdict is None:
+        raise SalvageRefused(
+            "SALVAGE_ATTEMPT_LIVENESS_UNKNOWN",
+            f"{attempt.run_id}/{attempt.node_id}#{attempt.attempt_no} "
+            "liveness cannot be proven; refusing rather than guessing "
             "the process is dead")
 
 
