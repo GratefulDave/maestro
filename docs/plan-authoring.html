@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#090b10">
+  <title>Plan authoring — Maestro</title>
+  <style>
+    :root { color-scheme: dark; --bg:#090b10; --panel:#10141c; --line:#273143; --line-soft:#1b2330; --text:#edf2f7; --muted:#9aa8ba; --faint:#657286; --cyan:#59d7e8; --cyan-soft:rgba(89,215,232,.11); --amber:#f3c76b; --green:#63d99b; --mono:"SFMono-Regular",Consolas,monospace; --sans:Inter,ui-sans-serif,system-ui,sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; background:var(--bg); color:var(--text); font-family:var(--sans); line-height:1.65; }
+    a { color: var(--cyan); }
+    code, pre { font-family: var(--mono); }
+    code { color:#d8e5f3; }
+    .shell { display:grid; grid-template-columns:17rem minmax(0,1fr); min-height:100vh; }
+    .sidebar { position:sticky; top:0; height:100vh; padding:2rem 1.5rem; border-right:1px solid var(--line-soft); background:rgba(9,11,16,.86); }
+    .brand { display:flex; align-items:center; gap:.8rem; margin-bottom:2.25rem; text-decoration:none; color:inherit; }
+    .mark { display:grid; place-items:center; width:2.35rem; height:2.35rem; border:1px solid #344258; border-radius:.7rem; color:var(--cyan); font:700 1.1rem var(--mono); }
+    .brand small { display:block; color:var(--faint); font:.67rem var(--mono); letter-spacing:.12em; }
+    .nav-label { margin:1.4rem 0 .45rem; color:var(--faint); font:600 .66rem var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    nav a { display:block; padding:.46rem .65rem; border-left:1px solid var(--line); color:var(--muted); font-size:.84rem; text-decoration:none; }
+    nav a:hover, nav a.current { border-color:var(--cyan); background:var(--cyan-soft); color:var(--text); }
+    main { width:min(52rem,100%); padding:4rem clamp(1.5rem,5vw,4rem) 6rem; }
+    .eyebrow { color:var(--cyan); font:600 .72rem var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+    h1 { margin:.75rem 0 1rem; font-size:clamp(2rem,4vw,3rem); letter-spacing:-.04em; line-height:1.1; }
+    h2 { margin:2.5rem 0 .8rem; font-size:1.45rem; }
+    p, li { color:var(--muted); }
+    .lede { font-size:1.15rem; }
+    pre { padding:1.15rem; overflow-x:auto; border:1px solid var(--line); border-radius:.8rem; background:#07090d; color:#c9d5e3; font-size:.8rem; }
+    .table-wrap { overflow-x:auto; border:1px solid var(--line-soft); border-radius:.8rem; margin:1rem 0; }
+    table { width:100%; border-collapse:collapse; font-size:.84rem; }
+    th, td { padding:.8rem 1rem; border-bottom:1px solid var(--line-soft); text-align:left; vertical-align:top; }
+    th { color:var(--faint); font:600 .66rem var(--mono); letter-spacing:.09em; text-transform:uppercase; }
+    ol { padding-left:1.3rem; }
+    .callout { margin:1rem 0; padding:1rem 1.15rem; border-left:2px solid var(--amber); background:rgba(243,199,107,.06); color:var(--muted); }
+    footer { margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--line-soft); color:var(--faint); font:.72rem var(--mono); }
+    @media (max-width:920px) { .shell { display:block; } .sidebar { position:relative; height:auto; } .sidebar nav { display:none; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="index.html"><span class="mark">M</span><span><strong>Maestro</strong><small>software factory</small></span></a>
+      <nav>
+        <p class="nav-label">Diagrams</p>
+        <a href="index.html#architecture">Architecture</a>
+        <a href="architecture/index.html">Gallery</a>
+        <p class="nav-label">Authoring</p>
+        <a class="current" href="plan-authoring.html">Plan authoring</a>
+        <a href="deployment-drift.html">Deployment drift</a>
+        <a href="split-test-authoring-from-building.html">Spec / build split</a>
+        <p class="nav-label">System</p>
+        <a href="index.html#overview">Overview</a>
+        <a href="index.html#cli">Operator CLI</a>
+      </nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Contract / plan-authoring.md</p>
+      <h1>From a source document to an executable plan</h1>
+      <p class="lede">Maestro executes <code>maestro-plan.v2</code>. It does not read audits, interviews, or HTML specs. Those documents enter only as hash-pinned <code>source_artifacts</code> inside a <code>plan-contract.v1</code> IR that already has a bound HTML view and a PASS review receipt.</p>
+      <pre>source documents ──► plan-contract.v1 Plan IR  ──► maestro-plan.v2 ──► run
+   (audit HTML,       + extensions.maestro          (projection)
+    interview,        + bound HTML view
+    arch deck)        + PASS review receipt</pre>
+      <p>Supporting a new kind of input never means a new adapter. It means citing that document as a source in a plan. Markdown source of this page: <a href="plan-authoring.md">plan-authoring.md</a>.</p>
+
+      <h2>The projection boundary</h2>
+      <p><code>plan_contract_ingress.author_from_plan_contract</code> verifies the receipt against the exact IR bytes, then projects. It refuses anything it cannot execute.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Contract element</th><th>Becomes</th></tr></thead>
+        <tbody>
+          <tr><td>lanes[]</td><td>plan nodes</td></tr>
+          <tr><td>lane.depends_on</td><td>node needs</td></tr>
+          <tr><td>lane.execution_context</td><td>gate cwd</td></tr>
+          <tr><td>verifiers[]</td><td>node gates (runner, argv, min_cases)</td></tr>
+          <tr><td>source_artifacts[]</td><td>observed evidence</td></tr>
+          <tr><td>extensions.maestro.outputs</td><td>produced evidence</td></tr>
+          <tr><td>extensions.maestro.integration_gate</td><td>merge-policy integration gate</td></tr>
+        </tbody>
+      </table></div>
+      <ul>
+        <li><code>extensions.maestro</code> must exist before render and review. Adding it later is <code>RECEIPT_IR_MISMATCH</code>.</li>
+        <li>Repair means re-render, re-validate, new receipt. Never edit an approved IR in place.</li>
+        <li>An <code>architecture</code> plan is refused (<code>ARCHITECTURE_NOT_EXECUTABLE</code>). It is an anchor, not a run.</li>
+      </ul>
+
+      <h2>Single repository</h2>
+      <ol>
+        <li><code>/arch-review &lt;master-spec&gt;</code> — architecture IR, HTML view, review receipt under <code>.maestro/</code>.</li>
+        <li><code>/plan-brownfield "what to build" &lt;master-spec&gt;</code> — one work package per reviewable unit, each with <code>extensions.maestro</code>.</li>
+        <li><code>maestro plan gate &lt;plan-name&gt;</code> — author renders, validates, mutates. Refuses if the reviewer HMAC is in the environment.</li>
+        <li><code>maestro plan review &lt;plan-name&gt;</code> — a second person, reviewer key, no model. Receipt bound to <code>ir_sha256</code>.</li>
+        <li><code>maestro plan ship &lt;plan-name&gt;</code> — project to <code>maestro-plan.v2</code>, validate, finalize. Finalize is deterministic (<code>maestro-deterministic.v1</code>). No pane reviewer.</li>
+      </ol>
+      <div class="callout"><strong>v1 plans do not run.</strong> <code>_load_runnable_plan</code> allowlists <code>maestro-plan.v2</code>. Re-ship from the same IR and receipt. There is no upgrade function.</div>
+      <p>Bootstrap writes two files: <code>maestro.env</code> (author) and <code>reviewer-hmac.env</code> (reviewer only). Source the first. Maestro never reads the second on the supported path.</p>
+      <pre># maestro plan gate
+planctl render / validate / mutate
+
+# maestro plan review  — reviewer key, never author key
+planctl review
+planctl validate --require-approved
+
+# maestro plan ship
+maestro plan author --from-plan-contract …
+maestro plan validate
+maestro plan finalize</pre>
+      <p>Every <code>planctl</code> call uses <code>--repo-root .</code> so IR paths in <code>.maestro/</code> can cite repo-relative sources without <code>..</code>.</p>
+
+      <h2>Verifier commands</h2>
+      <p><code>Gate.runner</code> is <code>Literal["pytest", "vitest"]</code>. Maestro counts executed cases against <code>min_cases</code>. A shell script, Makefile, <code>psql</code>, or <code>curl</code> is <code>maestro.command</code>.</p>
+      <ul>
+        <li>Pass real argv, never <code>npm test</code> / <code>make test</code>.</li>
+        <li>One verifier per lane (<code>maestro.lane_gate</code> otherwise).</li>
+        <li>Playwright and Cypress cannot be gates today.</li>
+      </ul>
+
+      <h2>Outputs are write permission</h2>
+      <p>Exactly one lane may own a path (<code>SINGLE_OUTPUT_OWNER</code>). Ask: could an agent satisfy this instruction by changing only these files? If not, the lane will burn its review budget between “instruction not met” and “undeclared write.” Finalize no longer judges that; a person must, at <code>maestro plan review</code>.</p>
+
+      <h2>Review rejection</h2>
+      <p>The next attempt repairs the rejected commit unless a sibling merge moved the integration head. <code>REPAIR_CHAIN_LIMIT</code> and <code>review_ceiling</code> bound the chain. <code>maestro run convergence</code> reports findings per attempt and will not call a live run finished.</p>
+
+      <h2>Several repositories</h2>
+      <p>No multi-repo Plan IR. Each repo finishes to a PASS finalization receipt, then a <code>maestro-workspace.v1</code> manifest binds participation and order.</p>
+      <pre>maestro workspace author --from workspace-draft.json --out workspace.json --root .
+maestro workspace validate --manifest-file workspace.json</pre>
+
+      <h2>Which skill authors what</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Input</th><th>Skill</th><th>Emits</th><th>Runs?</th></tr></thead>
+        <tbody>
+          <tr><td>mapped codebase / master spec</td><td>arch-review</td><td>architecture IR</td><td>no</td></tr>
+          <tr><td>approved architecture + change</td><td>plan-brownfield</td><td>brownfield IR</td><td>yes</td></tr>
+          <tr><td>greenfield request</td><td>planf3</td><td>implementation IR</td><td>yes</td></tr>
+          <tr><td>finalized plans in several repos</td><td>plan-workspace</td><td>maestro-workspace.v1</td><td>yes</td></tr>
+        </tbody>
+      </table></div>
+      <footer>Keep plan-authoring.md as the agent contract. This page is the dark HTML view.</footer>
+    </main>
+  </div>
+</body>
+</html>

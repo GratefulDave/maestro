@@ -241,6 +241,7 @@
         <li><a href="#classes">Classes</a></li>
         <li><a href="#state">State</a></li>
         <li><a href="#flow">Flow</a></li>
+        <li><a href="#sequence">Sequence</a></li>
         <li><a href="#mindmaps">Mindmaps</a></li>
       </ul>
     </nav>
@@ -279,6 +280,16 @@
               <p>Where adws, lifecycle SQLite, worktrees, Herdr panes, and the visualizer live on the host.</p>
             </a>
           </li>
+          <li>
+            <a class="card" href="04-data-flow-receipts.html">
+              <p class="card-file">04-data-flow-receipts.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Receipt data flow</h3>
+              </div>
+              <p>Only typed records and signed receipts may cause a lifecycle transition.</p>
+            </a>
+          </li>
         </ul>
       </section>
 
@@ -313,6 +324,16 @@
                 <h3>Envelope ADW classes</h3>
               </div>
               <p>EnvelopeBase, BuildOutput, ReviewOutput, AgentCall, GateReport, and PhaseParams.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="13-uml-runtime.html">
+              <p class="card-file">13-uml-runtime.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Runtime UML</h3>
+              </div>
+              <p>Scheduler, store, plan nodes, and the transport-only launcher.</p>
             </a>
           </li>
         </ul>
@@ -405,6 +426,22 @@
                 <h3>Repair chain flowchart</h3>
               </div>
               <p>A repair inherits its falsifiability witness from the chain root, bounded by REPAIR_CHAIN_LIMIT.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
+      <section class="group" id="sequence" aria-labelledby="sequence-heading">
+        <h2 id="sequence-heading">Sequence</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="50-sequence-attempt.html">
+              <p class="card-file">50-sequence-attempt.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Attempt sequence</h3>
+              </div>
+              <p>One agent attempt: isolate, launch, typed envelope, gate, merge or SEMANTIC retry.</p>
             </a>
           </li>
         </ul>
