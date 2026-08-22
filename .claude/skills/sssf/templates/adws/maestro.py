@@ -1735,7 +1735,8 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     pane_group=node.node_id, pane_role="reviewer",
                     pane_group_size=2,
                     restrict_tools=getattr(args, "restrict_actor_tools", False),
-                    environment=worktree.launch_env(scratch_dir)))
+                    environment=worktree.launch_env(
+                        scratch_dir, concurrency=getattr(args, "concurrency", None))))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
                     route=args.reviewer_route, model=args.reviewer_model,
@@ -3482,7 +3483,7 @@ def _resolve_run_runners(
     """
     declared = dict(getattr(args, "runners", {}) or {})
     scratch = Path(args.scratch_root) / "runner-probe"
-    env = worktree.launch_env(scratch)
+    env = worktree.launch_env(scratch, concurrency=getattr(args, "concurrency", None))
     wanted = {node.gate.runner for node in plan.agent_nodes}
     wanted.update(node.gate.runner
                   for node in getattr(plan, "tests_nodes", ()) or ())
@@ -3496,302 +3497,311 @@ def _resolve_run_runners(
 
 
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
-    from threading import RLock
-
-    config = _run_configuration(args)
-    plan = _load_runnable_plan(args)
-    # Before the ledger is opened for writing and before any worktree exists,
-    # because a run refused for a spent cross-run review budget must leave
-    # nothing behind (§3.6 B10's escape is the only way past it).
-    _refuse_cross_run_node_budget(args, plan)
-    _validate_run_paths(args, plan)
-    # A run precondition, in the same family as the integration branch already
-    # being checked out: decided before the scheduler exists, so an unusable
-    # runner launches no pane, writes no attempt row, and reaches no retry
-    # classifier. Discovering it at attempt time instead is what made a
-    # permanently wrong interpreter look like a transient environmental fault
-    # and burn a node's whole environmental budget on identical re-runs.
+    worktree.bind_lane_concurrency(getattr(args, "concurrency", None))
     try:
-        resolved_runners = _resolve_run_runners(args, plan)
-    except runner_resolution.RunnerUnusable as exc:
-        return _typed_refusal(exc.payload(), exc.detail)
-    runner_resolution.write_record(
-        Path(args.integration_path).parent / "runner-resolution.json",
-        resolved_runners.values())
-    notice = runner_resolution.adoption_notice(resolved_runners.values())
-    if notice:
-        # stderr, because this verb's stdout is one JSON document and an
-        # operator hint is not part of it.
-        print(notice, file=sys.stderr)
-    tests_nodes = getattr(plan, "tests_nodes", ()) or ()
-    route_runner = (_runtime_launcher(args)
-                    if plan.agent_nodes or tests_nodes else None)
-    store = lc.LifecycleStore(args.db)
-    handles = {}
-    proven_absent = set()
-    handles_lock = RLock()
-    # The integration checkout this invocation added, and nothing else. The
-    # refusal below returns while another worktree still holds the branch, and
-    # a release that did not distinguish the two would delete that worktree --
-    # which may be the operator's own. `None` until `worktree add` succeeds.
-    created_integration_path: Optional[Path] = None
-    try:
-        if resuming:
-            store.resume_run(args.run_id)
-        else:
-            refused = _refuse_base_commit_divergence(args, plan)
-            if refused is not None:
-                return refused
-            refused = _refuse_uncommittable_outputs(args, plan)
-            if refused is not None:
-                return refused
-        # Not `elif`: a resumed run whose predecessor released the checkout has
-        # to take the branch back, because every attempt is based on its head.
-        if not Path(args.integration_path).exists():
-            branch = plan.merge_policy.integration_branch
-            # A previous run's integration checkout is this system's own litter,
-            # and telling an operator to go clean it up by hand is a refusal
-            # over a state Maestro created and can prove it created. Reclaim it
-            # under exactly the boundary the release verb already applies -- and
-            # under no other -- so an operator's checkout of the same branch
-            # still reaches the refusal below untouched.
-            try:
-                _reclaim_stranded_integration_worktree(
-                    Path(args.repo), _configured_runs_root(args), branch,
-                    getattr(args, "db", None))
-            except _RunStateStillHeld as held:
-                # The same defect at the same seam: whose was checked here
-                # from the day this reclaim was written, whether-in-use never
-                # was. A run this one is about to start has no more right to
-                # take another run's merges than the release verb does, so it
-                # gets the same predicate and a refusal that names the run
-                # holding the branch rather than the generic one below, which
-                # would say "not among them" about a worktree that is.
-                return _refusal("INTEGRATION_WORKTREE_RUN_NOT_OVER",
-                                str(held))
-            occupant = _worktree_holding_branch(Path(args.repo), branch)
-            if occupant is not None:
-                return _refusal(
-                    "INTEGRATION_BRANCH_CHECKED_OUT",
-                    "the integration branch " + branch + " is checked out at "
-                    + str(occupant) + ", and git gives a branch to one worktree "
-                    "at a time. The run's integration worktree must hold it, "
-                    "because every attempt is based on that branch's head and a "
-                    "detached copy would never advance it. Maestro reclaims the "
-                    "stranded integration checkouts inside its own run root "
-                    "without asking, and this one is not among them, so it has "
-                    "been left exactly as it is. Move that checkout to another "
-                    "branch and start the run again")
-            subprocess.run(
-                ("git", "-C", str(args.repo), "worktree", "add",
-                 str(args.integration_path), branch),
-                check=True, capture_output=True, text=True)
-            created_integration_path = Path(args.integration_path)
 
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
-            key = (node.node_id, record.attempt_no)
-            launch_environment = worktree.launch_env(attempt.scratch)
-            if node.kind is scheduler_types.NodeKind.CODE:
-                process = subprocess.Popen(
-                    node.command, cwd=attempt.path, env=launch_environment,
-                    start_new_session=True)
-                with handles_lock:
-                    handles[key] = process
-                    proven_absent.discard(key)
-                on_launch(process.pid)
-                while process.poll() is None:
-                    if cancel_requested():
-                        quiesce_attempt(record, "cancel")
-                        process.wait(timeout=1)
-                        return scheduler.NodeExecution(
-                            exit_code=process.returncode or 1)
-                    time.sleep(0.05)
-                return scheduler.NodeExecution(exit_code=process.returncode or 0)
-            assert route_runner is not None
-            prompt = attempt.scratch / "agent-prompt.txt"
-            envelope = attempt.scratch / "agent-envelope.json"
-            plan_node = plan.node_by_id()[node.node_id]
-            if node.kind is scheduler_types.NodeKind.TESTS:
-                prompt_text = _tests_node_prompt(
-                    plan_node, envelope, retry_prompt)
-                lane_route = getattr(args, "tester_route", None) or args.agent_route
-                lane_model = getattr(args, "tester_model", None) or args.agent_model
-                lane_effort = getattr(args, "tester_effort", None) or args.agent_effort
-                lane_profile = getattr(args, "tester_profile", None) or args.agent_profile
-                # B15: tester.vendor is loaded onto args and recorded here.
-                # The information barrier is the node split, not a B12 vendor
-                # pair, and LaunchSpec has no vendor field.
-                lane_vendor = getattr(args, "tester_vendor", None)
+        from threading import RLock
+
+        config = _run_configuration(args)
+        plan = _load_runnable_plan(args)
+
+        # Before the ledger is opened for writing and before any worktree exists,
+        # because a run refused for a spent cross-run review budget must leave
+        # nothing behind (§3.6 B10's escape is the only way past it).
+        _refuse_cross_run_node_budget(args, plan)
+        _validate_run_paths(args, plan)
+        # A run precondition, in the same family as the integration branch already
+        # being checked out: decided before the scheduler exists, so an unusable
+        # runner launches no pane, writes no attempt row, and reaches no retry
+        # classifier. Discovering it at attempt time instead is what made a
+        # permanently wrong interpreter look like a transient environmental fault
+        # and burn a node's whole environmental budget on identical re-runs.
+        try:
+            resolved_runners = _resolve_run_runners(args, plan)
+        except runner_resolution.RunnerUnusable as exc:
+            return _typed_refusal(exc.payload(), exc.detail)
+        runner_resolution.write_record(
+            Path(args.integration_path).parent / "runner-resolution.json",
+            resolved_runners.values())
+        notice = runner_resolution.adoption_notice(resolved_runners.values())
+        if notice:
+            # stderr, because this verb's stdout is one JSON document and an
+            # operator hint is not part of it.
+            print(notice, file=sys.stderr)
+        tests_nodes = getattr(plan, "tests_nodes", ()) or ()
+        route_runner = (_runtime_launcher(args)
+                        if plan.agent_nodes or tests_nodes else None)
+        store = lc.LifecycleStore(args.db)
+        handles = {}
+        proven_absent = set()
+        handles_lock = RLock()
+        # The integration checkout this invocation added, and nothing else. The
+        # refusal below returns while another worktree still holds the branch, and
+        # a release that did not distinguish the two would delete that worktree --
+        # which may be the operator's own. `None` until `worktree add` succeeds.
+        created_integration_path: Optional[Path] = None
+        try:
+            if resuming:
+                store.resume_run(args.run_id)
             else:
-                prompt_text = _agent_node_prompt(
-                    plan_node, envelope, retry_prompt)
-                prompt_text = _append_needed_tests(
-                    prompt_text, attempt.path, node, plan)
-                lane_route = args.agent_route
-                lane_model = args.agent_model
-                lane_effort = args.agent_effort
-                lane_profile = args.agent_profile
-                lane_vendor = getattr(args, "execution_vendor", None)
-            # B13: the build handoff now carries the tests as well as the
-            # goal, so it is strictly larger. Same chokepoint as before.
-            _preflight_prompt(prompt_text, lane_route, lane_model)
-            prompt.write_text(prompt_text, encoding="utf-8")
-            handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
-                correlation_token="{}-{}-{}".format(
-                    args.run_id, node.node_id, record.attempt_no),
-                worktree=attempt.path, prompt_path=prompt,
-                envelope_path=envelope, route=lane_route,
-                model=lane_model, effort=lane_effort,
-                profile=lane_profile,
-                session_dir=attempt.scratch / "session",
-                context_window_tokens=_route_context_window(
-                    lane_route, lane_model),
-                pane_group=node.node_id,
-                pane_role=("tester"
-                           if node.kind is scheduler_types.NodeKind.TESTS
-                           else "builder"),
-                pane_group_size=2,
-                restrict_tools=getattr(args, "restrict_actor_tools", False),
-                environment=launch_environment))
-            with handles_lock:
-                handles[key] = handle
-                proven_absent.discard(key)
-            _require_session_path(handle, node.node_id, record.attempt_no)
-            liveness_pid = handle.process_group
-            if liveness_pid is None:
-                liveness_pid = handle.liveness_pid
-            store.mark_launched(
-                args.run_id, node.node_id, record.attempt_no,
-                liveness_pid,
-                extra=_launch_attempt_extra(
-                    str(handle.transcript_path),
-                    vendor=lane_vendor, model=lane_model, route=lane_route))
-            on_launch(liveness_pid)
-            return _poll_agent_execution(
-                route_runner, handle, envelope, record, cancel_requested,
-                quiesce_attempt)
+                refused = _refuse_base_commit_divergence(args, plan)
+                if refused is not None:
+                    return refused
+                refused = _refuse_uncommittable_outputs(args, plan)
+                if refused is not None:
+                    return refused
+            # Not `elif`: a resumed run whose predecessor released the checkout has
+            # to take the branch back, because every attempt is based on its head.
+            if not Path(args.integration_path).exists():
+                branch = plan.merge_policy.integration_branch
+                # A previous run's integration checkout is this system's own litter,
+                # and telling an operator to go clean it up by hand is a refusal
+                # over a state Maestro created and can prove it created. Reclaim it
+                # under exactly the boundary the release verb already applies -- and
+                # under no other -- so an operator's checkout of the same branch
+                # still reaches the refusal below untouched.
+                try:
+                    _reclaim_stranded_integration_worktree(
+                        Path(args.repo), _configured_runs_root(args), branch,
+                        getattr(args, "db", None))
+                except _RunStateStillHeld as held:
+                    # The same defect at the same seam: whose was checked here
+                    # from the day this reclaim was written, whether-in-use never
+                    # was. A run this one is about to start has no more right to
+                    # take another run's merges than the release verb does, so it
+                    # gets the same predicate and a refusal that names the run
+                    # holding the branch rather than the generic one below, which
+                    # would say "not among them" about a worktree that is.
+                    return _refusal("INTEGRATION_WORKTREE_RUN_NOT_OVER",
+                                    str(held))
+                occupant = _worktree_holding_branch(Path(args.repo), branch)
+                if occupant is not None:
+                    return _refusal(
+                        "INTEGRATION_BRANCH_CHECKED_OUT",
+                        "the integration branch " + branch + " is checked out at "
+                        + str(occupant) + ", and git gives a branch to one worktree "
+                        "at a time. The run's integration worktree must hold it, "
+                        "because every attempt is based on that branch's head and a "
+                        "detached copy would never advance it. Maestro reclaims the "
+                        "stranded integration checkouts inside its own run root "
+                        "without asking, and this one is not among them, so it has "
+                        "been left exactly as it is. Move that checkout to another "
+                        "branch and start the run again")
+                subprocess.run(
+                    ("git", "-C", str(args.repo), "worktree", "add",
+                     str(args.integration_path), branch),
+                    check=True, capture_output=True, text=True)
+                created_integration_path = Path(args.integration_path)
 
-        def quiesce_attempt(record, phase):
-            key = (record.node_id, record.attempt_no)
-            with handles_lock:
-                if key in proven_absent:
-                    return
-                handle = handles.get(key)
-                if handle is None:
-                    if phase == "pre-baseline":
-                        return
-                    raise RuntimeError(
-                        "PROCESS_GROUP_UNTRACKED:{}:{}#{}".format(
-                            phase, record.node_id, record.attempt_no))
-                if isinstance(handle, subprocess.Popen):
-                    process_group = handle.pid
-                    launcher.quiesce_process_group(
-                        process_group, time.monotonic() + 1.0)
-                    if not launcher._process_group_absent(process_group):
-                        raise RuntimeError(
-                            "PROCESS_GROUP_STILL_OWNED:{}:{}".format(
-                                phase, process_group))
+            def run_node(attempt, node, record, retry_prompt, on_launch,
+                         cancel_requested):
+                key = (node.node_id, record.attempt_no)
+                launch_environment = worktree.launch_env(
+                    attempt.scratch, concurrency=getattr(args, "concurrency", None))
+                if node.kind is scheduler_types.NodeKind.CODE:
+                    process = subprocess.Popen(
+                        node.command, cwd=attempt.path, env=launch_environment,
+                        start_new_session=True)
+                    with handles_lock:
+                        handles[key] = process
+                        proven_absent.discard(key)
+                    on_launch(process.pid)
+                    while process.poll() is None:
+                        if cancel_requested():
+                            quiesce_attempt(record, "cancel")
+                            process.wait(timeout=1)
+                            return scheduler.NodeExecution(
+                                exit_code=process.returncode or 1)
+                        time.sleep(0.05)
+                    return scheduler.NodeExecution(exit_code=process.returncode or 0)
+                assert route_runner is not None
+                prompt = attempt.scratch / "agent-prompt.txt"
+                envelope = attempt.scratch / "agent-envelope.json"
+                plan_node = plan.node_by_id()[node.node_id]
+                if node.kind is scheduler_types.NodeKind.TESTS:
+                    prompt_text = _tests_node_prompt(
+                        plan_node, envelope, retry_prompt)
+                    lane_route = getattr(args, "tester_route", None) or args.agent_route
+                    lane_model = getattr(args, "tester_model", None) or args.agent_model
+                    lane_effort = getattr(args, "tester_effort", None) or args.agent_effort
+                    lane_profile = getattr(args, "tester_profile", None) or args.agent_profile
+                    # B15: tester.vendor is loaded onto args and recorded here.
+                    # The information barrier is the node split, not a B12 vendor
+                    # pair, and LaunchSpec has no vendor field.
+                    lane_vendor = getattr(args, "tester_vendor", None)
                 else:
-                    if route_runner is None:
+                    prompt_text = _agent_node_prompt(
+                        plan_node, envelope, retry_prompt)
+                    prompt_text = _append_needed_tests(
+                        prompt_text, attempt.path, node, plan)
+                    lane_route = args.agent_route
+                    lane_model = args.agent_model
+                    lane_effort = args.agent_effort
+                    lane_profile = args.agent_profile
+                    lane_vendor = getattr(args, "execution_vendor", None)
+                # B13: the build handoff now carries the tests as well as the
+                # goal, so it is strictly larger. Same chokepoint as before.
+                _preflight_prompt(prompt_text, lane_route, lane_model)
+                prompt.write_text(prompt_text, encoding="utf-8")
+                handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
+                    correlation_token="{}-{}-{}".format(
+                        args.run_id, node.node_id, record.attempt_no),
+                    worktree=attempt.path, prompt_path=prompt,
+                    envelope_path=envelope, route=lane_route,
+                    model=lane_model, effort=lane_effort,
+                    profile=lane_profile,
+                    session_dir=attempt.scratch / "session",
+                    context_window_tokens=_route_context_window(
+                        lane_route, lane_model),
+                    pane_group=node.node_id,
+                    pane_role=("tester"
+                               if node.kind is scheduler_types.NodeKind.TESTS
+                               else "builder"),
+                    pane_group_size=2,
+                    restrict_tools=getattr(args, "restrict_actor_tools", False),
+                    environment=launch_environment))
+                with handles_lock:
+                    handles[key] = handle
+                    proven_absent.discard(key)
+                _require_session_path(handle, node.node_id, record.attempt_no)
+                liveness_pid = handle.process_group
+                if liveness_pid is None:
+                    liveness_pid = handle.liveness_pid
+                store.mark_launched(
+                    args.run_id, node.node_id, record.attempt_no,
+                    liveness_pid,
+                    extra=_launch_attempt_extra(
+                        str(handle.transcript_path),
+                        vendor=lane_vendor, model=lane_model, route=lane_route))
+                on_launch(liveness_pid)
+                return _poll_agent_execution(
+                    route_runner, handle, envelope, record, cancel_requested,
+                    quiesce_attempt)
+
+            def quiesce_attempt(record, phase):
+                key = (record.node_id, record.attempt_no)
+                with handles_lock:
+                    if key in proven_absent:
+                        return
+                    handle = handles.get(key)
+                    if handle is None:
+                        if phase == "pre-baseline":
+                            return
                         raise RuntimeError(
                             "PROCESS_GROUP_UNTRACKED:{}:{}#{}".format(
                                 phase, record.node_id, record.attempt_no))
-                    route_runner.cancel(handle, time.monotonic() + 1.0)
-                    if route_runner.reclaim(handle.correlation_token):
-                        raise RuntimeError(
-                            "PROCESS_GROUP_STILL_OWNED:{}:{}".format(
-                                phase, handle.correlation_token))
-                handles.pop(key)
-                proven_absent.add(key)
+                    if isinstance(handle, subprocess.Popen):
+                        process_group = handle.pid
+                        launcher.quiesce_process_group(
+                            process_group, time.monotonic() + 1.0)
+                        if not launcher._process_group_absent(process_group):
+                            raise RuntimeError(
+                                "PROCESS_GROUP_STILL_OWNED:{}:{}".format(
+                                    phase, process_group))
+                    else:
+                        if route_runner is None:
+                            raise RuntimeError(
+                                "PROCESS_GROUP_UNTRACKED:{}:{}#{}".format(
+                                    phase, record.node_id, record.attempt_no))
+                        route_runner.cancel(handle, time.monotonic() + 1.0)
+                        if route_runner.reclaim(handle.correlation_token):
+                            raise RuntimeError(
+                                "PROCESS_GROUP_STILL_OWNED:{}:{}".format(
+                                    phase, handle.correlation_token))
+                    handles.pop(key)
+                    proven_absent.add(key)
 
-        run_gate, run_integration_gate = _scheduler_gate_deps(
-            plan, resolved_runners)
-        review_attempt = (
-            _code_review_runner(args, route_runner)
-            if route_runner is not None and getattr(args, "review_root", None)
-            else None)
+            run_gate, run_integration_gate = _scheduler_gate_deps(
+                plan, resolved_runners)
+            review_attempt = (
+                _code_review_runner(args, route_runner)
+                if route_runner is not None and getattr(args, "review_root", None)
+                else None)
 
-        def actor_status(attempt):
-            """Raw per-pane status for the watchdog turn clock. Never observe()."""
-            key = (attempt.node_id, attempt.attempt_no)
-            with handles_lock:
-                handle = handles.get(key)
-            if handle is None or isinstance(handle, subprocess.Popen):
-                return None
-            if route_runner is None:
-                return None
-            return route_runner.agent_status(handle)
+            def actor_status(attempt):
+                """Raw per-pane status for the watchdog turn clock. Never observe()."""
+                key = (attempt.node_id, attempt.attempt_no)
+                with handles_lock:
+                    handle = handles.get(key)
+                if handle is None or isinstance(handle, subprocess.Popen):
+                    return None
+                if route_runner is None:
+                    return None
+                return route_runner.agent_status(handle)
 
-        deps = scheduler.SchedulerDeps(
-            store=store, repo=Path(args.repo),
-            integration_path=Path(args.integration_path),
-            integration_branch=plan.merge_policy.integration_branch,
-            worktrees_root=Path(args.worktrees_root),
-            scratch_root=Path(args.scratch_root), run_node=run_node,
-            run_gate=run_gate, run_integration_gate=run_integration_gate,
-            quiesce_attempt=quiesce_attempt,
-            # §8.8's single integration gate, adjudicated at the number the
-            # plan declared for it. Omitting this is what left final
-            # acceptance counting to 1 while the plan asked for 70.
-            integration_min_cases=(
-                plan.merge_policy.integration_gate.min_cases),
-            # §8.3's provision step, which the scheduler has always called and
-            # nothing had ever supplied. Omitting it measured every baseline
-            # against an unprovisioned tree and left §7.4's pre-gate red for
-            # the ecosystem's missing install rather than for the node's
-            # missing work.
-            provision=_run_provisioner(args, route_runner),
-            kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
-            review_attempt=review_attempt,
-            actor_status=actor_status)
-        try:
-            report = scheduler.Scheduler(
-                args.run_id, plan.to_plan_nodes(), config, deps,
-                plan_digest=args.digest).run()
-        except scheduler.RunPaused:
-            # Not an outcome, and deliberately not printed as one: nothing was
-            # declared, no node moved, and `run resume` is legal from here.
-            print(json.dumps({
-                "outcome": "PAUSED", "run_id": args.run_id,
-            }, sort_keys=True))
-            return 0
-    finally:
-        # Nested so that a failing close still releases the checkout, and a
-        # failing release still leaves the store closed. Neither may become the
-        # reason the run's own outcome goes unreported.
-        try:
-            store.close()
+            deps = scheduler.SchedulerDeps(
+                store=store, repo=Path(args.repo),
+                integration_path=Path(args.integration_path),
+                integration_branch=plan.merge_policy.integration_branch,
+                worktrees_root=Path(args.worktrees_root),
+                scratch_root=Path(args.scratch_root), run_node=run_node,
+                run_gate=run_gate, run_integration_gate=run_integration_gate,
+                quiesce_attempt=quiesce_attempt,
+                # §8.8's single integration gate, adjudicated at the number the
+                # plan declared for it. Omitting this is what left final
+                # acceptance counting to 1 while the plan asked for 70.
+                integration_min_cases=(
+                    plan.merge_policy.integration_gate.min_cases),
+                # §8.3's provision step, which the scheduler has always called and
+                # nothing had ever supplied. Omitting it measured every baseline
+                # against an unprovisioned tree and left §7.4's pre-gate red for
+                # the ecosystem's missing install rather than for the node's
+                # missing work.
+                provision=_run_provisioner(args, route_runner),
+                kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
+                review_attempt=review_attempt,
+                actor_status=actor_status)
+            try:
+                report = scheduler.Scheduler(
+                    args.run_id, plan.to_plan_nodes(), config, deps,
+                    plan_digest=args.digest).run()
+            except scheduler.RunPaused:
+                # Not an outcome, and deliberately not printed as one: nothing was
+                # declared, no node moved, and `run resume` is legal from here.
+                print(json.dumps({
+                    "outcome": "PAUSED", "run_id": args.run_id,
+                }, sort_keys=True))
+                return 0
         finally:
-            _release_run_integration_worktree(
-                Path(args.repo), created_integration_path)
-    print(json.dumps({"outcome": report.outcome.value,
-                      "run_id": args.run_id,
-                      "merged": list(report.merged),
-                      "blocked": [
-                          {"node_id": node, "reason": reason.value}
-                          for node, reason in report.blocked],
-                      # The findings that exhausted a node's review budget. A
-                      # bare REVIEW_BUDGET_EXHAUSTED names the rule that fired
-                      # and nothing an operator can act on. Read defensively:
-                      # the scheduler is a seam tests substitute, and a run's
-                      # exit status must not depend on a stand-in carrying
-                      # every field of the real report.
-                      "review_findings": dict(
-                          getattr(report, "review_findings", {}) or {}),
-                      # Findings-per-attempt for every reviewed node, in
-                      # order. `review_findings` answers "what did the
-                      # reviewer object to"; this answers "was it objecting
-                      # less each time", which is the question behind
-                      # `review_ceiling` and the one nothing in the run
-                      # could answer once the process exited.
-                      "review_convergence": {
-                          node_id: list(counts)
-                          for node_id, counts in dict(
-                              getattr(report, "review_convergence", {})
-                              or {}).items()}},
-                     sort_keys=True))
-    return 0
+            # Nested so that a failing close still releases the checkout, and a
+            # failing release still leaves the store closed. Neither may become the
+            # reason the run's own outcome goes unreported.
+            try:
+                store.close()
+            finally:
+                _release_run_integration_worktree(
+                    Path(args.repo), created_integration_path)
+        print(json.dumps({"outcome": report.outcome.value,
+                          "run_id": args.run_id,
+                          "merged": list(report.merged),
+                          "blocked": [
+                              {"node_id": node, "reason": reason.value}
+                              for node, reason in report.blocked],
+                          # The findings that exhausted a node's review budget. A
+                          # bare REVIEW_BUDGET_EXHAUSTED names the rule that fired
+                          # and nothing an operator can act on. Read defensively:
+                          # the scheduler is a seam tests substitute, and a run's
+                          # exit status must not depend on a stand-in carrying
+                          # every field of the real report.
+                          "review_findings": dict(
+                              getattr(report, "review_findings", {}) or {}),
+                          # Findings-per-attempt for every reviewed node, in
+                          # order. `review_findings` answers "what did the
+                          # reviewer object to"; this answers "was it objecting
+                          # less each time", which is the question behind
+                          # `review_ceiling` and the one nothing in the run
+                          # could answer once the process exited.
+                          "review_convergence": {
+                              node_id: list(counts)
+                              for node_id, counts in dict(
+                                  getattr(report, "review_convergence", {})
+                                  or {}).items()}},
+                         sort_keys=True))
+        return 0
+
+    finally:
+        worktree.bind_lane_concurrency(None)
+
 
 
 def _scheduler_gate_deps(plan: plan_model.Plan, runners):
@@ -3827,6 +3837,7 @@ def _scheduler_gate_deps(plan: plan_model.Plan, runners):
             cancel_requested, label="integration-gate")
 
     return run_gate, run_integration_gate
+
 
 
 def _epoch(stamp: Optional[str]) -> Optional[float]:
@@ -5453,7 +5464,9 @@ def _deliver_author_turn(config: Dict[str, Any],
             restrict_tools=bool(
                 config.get("execution", {}).get("restrict_actor_tools", False)),
             environment=worktree.launch_env(
-                session_root / (token + ".scratch"))))
+                session_root / (token + ".scratch"),
+                concurrency=config.get("execution", {}).get("concurrency"))))
+
         deadline = time.monotonic() + lane.author_timeout_s
         state = None
         try:

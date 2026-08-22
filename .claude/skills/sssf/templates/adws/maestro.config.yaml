@@ -46,9 +46,10 @@ reviewer:
   effort: high
   id: maestro-independent-reviewer
   vendor: anthropic
-  finalization_timeout_s: 600
-  turn_timeout_s: 120
+  finalization_timeout_s: 2400
+  turn_timeout_s: 1800
   poll_interval_s: 1
+
 execution:
   route: omp
   model: xai-oauth/grok-4.6
