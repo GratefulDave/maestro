@@ -51,7 +51,7 @@ reviewer:
   poll_interval_s: 1
 execution:
   route: omp
-  model: grok-4.6
+  model: xai-oauth/grok-4.6
   effort: high
   profile: grok
   # Secondary hatch. Default off: this profile is the tool policy. Maestro
