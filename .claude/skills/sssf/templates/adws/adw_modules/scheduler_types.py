@@ -848,6 +848,12 @@ class AttemptRecord:
     turn_count: int = 0
     retry_class: Optional[RetryClass] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+    #: Host whose pid namespace `pid` belongs to, and the start time of
+    #: that process. `None` on a ledger written before the columns and
+    #: when no pid was recorded. `attempt_liveness` reads both as
+    #: unknown, never as dead and never as alive.
+    attempt_host: Optional[str] = None
+    attempt_start_epoch: Optional[float] = None
 
     @property
     def armed(self) -> bool:

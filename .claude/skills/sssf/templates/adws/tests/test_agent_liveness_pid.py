@@ -285,11 +285,15 @@ class ProcessDeadIsReachableForAnAgentAttemptTests(unittest.TestCase):
         watchdog = wd.Watchdog(
             config=make_config(node_timeout_s=1000.0, turn_timeout_s=1000.0),
             attempts_provider=lambda: [
-                make_attempt(started_at=0.0, launched_at=0.0, pid=pid)],
+                make_attempt(
+                    started_at=0.0, launched_at=0.0, pid=pid,
+                    attempt_host="test-host", attempt_start_epoch=1.0)],
             write_heartbeat=Recorder(),
             kill=Recorder(),
             fail_attempt=fail,
             process_alive=lambda _pid: alive,
+            start_epoch=lambda _pid: 1.0,
+            host="test-host",
             declared_result_observed=lambda _attempt: declared_result,
             time_source=clock,
         )

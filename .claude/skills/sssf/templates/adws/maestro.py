@@ -53,6 +53,7 @@ from adw_modules import scheduler_types
 from adw_modules import watchdog
 from adw_modules import worktree
 from adw_modules import salvage
+from adw_modules import attempt_identity
 
 from adw_modules import workspace_author
 from adw_modules import workspace_canonical
@@ -3273,6 +3274,20 @@ def _require_session_path(handle: Any, node_id: str, attempt_no: int) -> None:
         "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no))
 
 
+def _launch_attempt_extra(session_path: str, *, vendor: object = None,
+                          model: object = None,
+                          route: object = None) -> Dict[str, str]:
+    """session_path plus the identity keys the launcher holds at dispatch.
+
+    Adds to the existing mapping. Replacing it would drop
+    `watchdog.SESSION_PATH_KEY` and break the transcript signal.
+    """
+    extra = {watchdog.SESSION_PATH_KEY: session_path}
+    extra.update(attempt_identity.launch_identity_extra(
+        vendor=vendor, model=model, route=route))
+    return extra
+
+
 def _preflight_prompt(text: str, route: str, model_spec: str) -> Optional[int]:
     """Size-check one assembled prompt against its target's window (B13).
 
@@ -3604,10 +3619,10 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 lane_model = getattr(args, "tester_model", None) or args.agent_model
                 lane_effort = getattr(args, "tester_effort", None) or args.agent_effort
                 lane_profile = getattr(args, "tester_profile", None) or args.agent_profile
-                # B15: tester.vendor is loaded onto args and read here. The
-                # information barrier is the node split, not a B12 vendor
+                # B15: tester.vendor is loaded onto args and recorded here.
+                # The information barrier is the node split, not a B12 vendor
                 # pair, and LaunchSpec has no vendor field.
-                getattr(args, "tester_vendor", None)
+                lane_vendor = getattr(args, "tester_vendor", None)
             else:
                 prompt_text = _agent_node_prompt(
                     plan_node, envelope, retry_prompt)
@@ -3617,6 +3632,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 lane_model = args.agent_model
                 lane_effort = args.agent_effort
                 lane_profile = args.agent_profile
+                lane_vendor = getattr(args, "execution_vendor", None)
             # B13: the build handoff now carries the tests as well as the
             # goal, so it is strictly larger. Same chokepoint as before.
             _preflight_prompt(prompt_text, lane_route, lane_model)
@@ -3648,7 +3664,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             store.mark_launched(
                 args.run_id, node.node_id, record.attempt_no,
                 liveness_pid,
-                extra={watchdog.SESSION_PATH_KEY: str(handle.transcript_path)})
+                extra=_launch_attempt_extra(
+                    str(handle.transcript_path),
+                    vendor=lane_vendor, model=lane_model, route=lane_route))
             on_launch(liveness_pid)
             return _poll_agent_execution(
                 route_runner, handle, envelope, record, cancel_requested,
@@ -4056,6 +4074,7 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
         entries = history.get((attempt.node_id, attempt.attempt_no), [])
         started = attempt.launched_at or attempt.started_at or None
         running = attempt.state is scheduler_types.NodeState.RUNNING
+        identity = attempt_identity.identity_from_record(attempt)
         projected = {
             "attempt_no": attempt.attempt_no,
             "state": attempt.state.value,
@@ -4070,6 +4089,9 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             "elapsed_s": (max(0.0, now - started)
                           if running and started else None),
             "session_path": attempt.extra.get(watchdog.SESSION_PATH_KEY),
+            "vendor": identity.vendor,
+            "model": identity.model,
+            "route": identity.route,
             "verdict": _attempt_verdict(entries),
             "transitions": entries,
             "review_findings": [
@@ -4257,6 +4279,12 @@ def _render_progress(progress: Dict[str, Any]) -> str:
             if attempt["session_path"]:
                 lines.append("         session: {}".format(
                     attempt["session_path"]))
+            lines.append("         vendor: {}".format(
+                attempt_identity.display(attempt.get("vendor"))))
+            lines.append("         model: {}".format(
+                attempt_identity.display(attempt.get("model"))))
+            lines.append("         route: {}".format(
+                attempt_identity.display(attempt.get("route"))))
             for finding in attempt.get("review_findings") or ():
                 lines.append("         finding: {}  {}".format(
                     finding.get("check_id") or "",

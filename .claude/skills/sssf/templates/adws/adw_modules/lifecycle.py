@@ -246,6 +246,15 @@ CREATE TABLE IF NOT EXISTS attempts (
   started_at  REAL,
   launched_at REAL,
   pid         INTEGER,
+  -- The host whose pid namespace `pid` was taken from, and the start
+  -- time of that process. A pid is not an identity: it is only
+  -- meaningful on the machine that issued it, and the kernel reuses it.
+  -- Recorded beside the pid so `attempt_liveness` can *decline* rather
+  -- than answer wrongly. NULL on a ledger written before these columns,
+  -- and when no pid was recorded -- both read as unknown, never as
+  -- dead and never as alive.
+  attempt_host TEXT,
+  attempt_start_epoch REAL,
   turn_count  INTEGER NOT NULL DEFAULT 0,
   retry_class TEXT,
   extra_json  TEXT NOT NULL DEFAULT '{}',
@@ -374,10 +383,22 @@ _ATTEMPT_BASELINE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("ignored_json", "TEXT"),
 )
 
+#: The same, for `attempts`. Nullable with no default, so a ledger written
+#: before these columns existed reads NULL -- no host, no start epoch --
+#: and `attempt_liveness` answers unknown rather than guessing the pid
+#: is this attempt's own process. A foreign pid that happens to be
+#: absent here must not convict a live attempt; a reused pid that
+#: happens to be present must not block salvage forever.
+_ATTEMPTS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("attempt_host", "TEXT"),
+    ("attempt_start_epoch", "REAL"),
+)
+
 _ADDED_COLUMNS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...] = (
     ("runs", _RUNS_ADDED_COLUMNS),
     ("node_lifecycle", _NODE_LIFECYCLE_ADDED_COLUMNS),
     ("attempt_baselines", _ATTEMPT_BASELINE_ADDED_COLUMNS),
+    ("attempts", _ATTEMPTS_ADDED_COLUMNS),
 )
 
 #: Raise a node's retry-budget floor to the highest of its attempts that has
@@ -935,18 +956,21 @@ class LifecycleStore:
     def get_attempt(self, run_id: str, node_id: str, attempt_no: int) -> st.AttemptRecord:
         row = self.conn.execute(
             "SELECT base_sha, state, started_at, launched_at, pid, turn_count,"
-            " retry_class, extra_json FROM attempts"
+            " retry_class, extra_json, attempt_host, attempt_start_epoch"
+            " FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
             (run_id, node_id, attempt_no)).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
-        base_sha, state, started_at, launched_at, pid, turn_count, retry_class, extra_json = row
+        (base_sha, state, started_at, launched_at, pid, turn_count,
+         retry_class, extra_json, attempt_host, attempt_start_epoch) = row
         return st.AttemptRecord(
             run_id=run_id, node_id=node_id, attempt_no=attempt_no, base_sha=base_sha,
             state=st.NodeState(state), started_at=started_at or 0.0, launched_at=launched_at,
             pid=pid, turn_count=turn_count,
             retry_class=st.RetryClass(retry_class) if retry_class else None,
-            extra=json.loads(extra_json))
+            extra=json.loads(extra_json),
+            attempt_host=attempt_host, attempt_start_epoch=attempt_start_epoch)
 
     @serialized
     def node_outputs(self, run_id: str, node_id: str) -> Tuple[str, ...]:
@@ -1335,7 +1359,8 @@ class LifecycleStore:
         from here is the rows themselves and nothing more (§7.5).
         """
         sql = ("SELECT run_id, node_id, attempt_no, base_sha, state, started_at,"
-               " launched_at, pid, turn_count, retry_class, extra_json"
+               " launched_at, pid, turn_count, retry_class, extra_json,"
+               " attempt_host, attempt_start_epoch"
                " FROM attempts WHERE run_id=?")
         params: Tuple[Any, ...] = (run_id,)
         if node_id is not None:
@@ -1347,7 +1372,8 @@ class LifecycleStore:
                 state=st.NodeState(r[4]), started_at=r[5] or 0.0,
                 launched_at=r[6], pid=r[7], turn_count=r[8] or 0,
                 retry_class=st.RetryClass(r[9]) if r[9] else None,
-                extra=json.loads(r[10]))
+                extra=json.loads(r[10]),
+                attempt_host=r[11], attempt_start_epoch=r[12])
             for r in self.conn.execute(sql + " ORDER BY attempt_no", params).fetchall())
 
     @serialized
@@ -1383,11 +1409,19 @@ class LifecycleStore:
         payload = json.loads(row[0] or "{}")
         if extra:
             payload.update(extra)
+        attempt_host = None
+        attempt_start_epoch = None
+        if pid is not None:
+            labelled = scheduler_host()
+            attempt_host = labelled or None
+            attempt_start_epoch = wd.process_start_epoch(int(pid))
         self.conn.execute(
-            "UPDATE attempts SET launched_at=?, pid=?, extra_json=?"
+            "UPDATE attempts SET launched_at=?, pid=?, extra_json=?,"
+            " attempt_host=?, attempt_start_epoch=?"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
             (launched_at if launched_at is not None else time.time(), pid,
-             json.dumps(payload), run_id, node_id, attempt_no))
+             json.dumps(payload), attempt_host, attempt_start_epoch,
+             run_id, node_id, attempt_no))
 
     @serialized
     def record_heartbeat(self, attempt: st.AttemptRecord, turn_count: int,
@@ -2853,6 +2887,47 @@ def scheduler_signal_pid(
     return pid
 
 
+def attempt_liveness(
+        attempt: st.AttemptRecord, *,
+        is_alive: Callable[[int], bool] = wd.process_is_alive,
+        start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
+        host: Optional[str] = None) -> Optional[bool]:
+    """Is this attempt's own process still there? `None` = cannot be said.
+
+    Three answers, and the third is the one that keeps this honest:
+
+    * `True` — a pid was recorded on this host with a start epoch, and the
+      live process at that pid started at that instant. Identity is proven.
+    * `False` — a pid was recorded on this host with a start epoch, and no
+      such process exists. Absence on the host that issued the pid is a
+      structural fact about the process table, read with `os.kill(pid, 0)`.
+    * `None` — no pid was recorded; or no host or no start epoch was
+      recorded (a ledger older than the columns); or the pid was recorded
+      on another host, whose pid namespace this machine cannot be asked
+      about; or a process exists at the pid but its start epoch does not
+      equal the recorded one (kernel reuse, #37). Callers must treat
+      `None` as "unknown" and never as "dead": a watchdog stall is a
+      lifecycle transition, and §1.2 forbids one caused by an unproven
+      pid. Salvage treats `None` as refuse-closed, with a distinct code.
+    """
+    pid = attempt.pid
+    if not pid or pid <= 0:
+        return None
+    recorded_host = attempt.attempt_host
+    recorded_epoch = attempt.attempt_start_epoch
+    if not recorded_host or recorded_epoch is None:
+        return None
+    current_host = host if host is not None else scheduler_host()
+    if not _same_scheduler_host(recorded_host, current_host):
+        return None
+    if not is_alive(int(pid)):
+        return False
+    started = start_epoch(int(pid))
+    if started is None or started != recorded_epoch:
+        return None
+    return True
+
+
 def derive_run_state(
         record: RunRecord, nodes: Sequence[NodeRow], *,
         is_alive: Callable[[int], bool] = wd.process_is_alive,
@@ -3112,10 +3187,20 @@ class LifecycleReader:
             for row in rows)
 
     def attempts(self, run_id: str) -> Tuple[st.AttemptRecord, ...]:
+        # `mode=ro`, so this reader cannot migrate a ledger that predates
+        # the attempt-identity columns and must not refuse to read one
+        # either — the same rule `runs()` follows for the scheduler-
+        # ownership columns. An absent column is simply not selected and
+        # reads back `None`, which `attempt_liveness` already treats as
+        # "cannot be said".
+        available = set(_table_columns(self.conn, "attempts"))
+        optional = tuple(name for name, _ in _ATTEMPTS_ADDED_COLUMNS
+                         if name in available)
         rows = self._rows(
             "SELECT node_id, attempt_no, base_sha, state, started_at,"
             " launched_at, pid, turn_count, retry_class, extra_json"
-            " FROM attempts WHERE run_id=? ORDER BY node_id, attempt_no",
+            + "".join(", " + name for name in optional)
+            + " FROM attempts WHERE run_id=? ORDER BY node_id, attempt_no",
             (run_id,))
         return tuple(
             st.AttemptRecord(
@@ -3127,7 +3212,12 @@ class LifecycleReader:
                 turn_count=row["turn_count"] or 0,
                 retry_class=(st.RetryClass(row["retry_class"])
                              if row["retry_class"] else None),
-                extra=json.loads(row["extra_json"]))
+                extra=json.loads(row["extra_json"]),
+                attempt_host=(row["attempt_host"]
+                              if "attempt_host" in optional else None),
+                attempt_start_epoch=(row["attempt_start_epoch"]
+                                     if "attempt_start_epoch" in optional
+                                     else None))
             for row in rows)
 
     def attempts_by_run_for_plan(

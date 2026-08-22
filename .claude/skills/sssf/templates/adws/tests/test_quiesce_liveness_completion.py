@@ -55,7 +55,8 @@ from test_scheduler import SchedulerFixture      # noqa: E402
 def attempt(node_id: str = "a", pid: int = 4242) -> st.AttemptRecord:
     return st.AttemptRecord(
         run_id="run1", node_id=node_id, attempt_no=1, base_sha="b" * 40,
-        started_at=0.0, launched_at=0.0, pid=pid)
+        started_at=0.0, launched_at=0.0, pid=pid,
+        attempt_host="test-host", attempt_start_epoch=1.0)
 
 
 class _Recorder:
@@ -83,6 +84,8 @@ def watchdog_over(att, *, alive: bool, observed: bool, recorder: _Recorder,
         kill=recorder.kill,
         fail_attempt=recorder.fail,
         process_alive=lambda pid: alive,
+        start_epoch=lambda pid: 1.0,
+        host="test-host",
         exit_status_observed=lambda a: observed,
         transcript_record_count=lambda a: 0,
         time_source=lambda: 1.0)
