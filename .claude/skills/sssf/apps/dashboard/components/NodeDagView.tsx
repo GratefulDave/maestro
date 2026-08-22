@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { Background, Controls, MarkerType, ReactFlow, type Edge, type Node } from "@xyflow/react";
 import { Activity, GitFork } from "@/lib/icons";
+import { runHref } from "@/lib/href";
 import type { MaestroNode } from "@/lib/types";
 import { StatusPill } from "./StatusPill";
 
@@ -17,8 +18,7 @@ export function NodeDagView({
   nodes: MaestroNode[];
 }) {
   const [mode, setMode] = useState<"table" | "dag">("table");
-  const base = `/runs/${encodeURIComponent(sourceId)}/${encodeURIComponent(runId)}/lanes`;
-
+  const base = `${runHref(sourceId, runId)}/lanes`;
   const flow = useMemo(() => {
     const byDepth = new Map<number, MaestroNode[]>();
     for (const node of nodes) {

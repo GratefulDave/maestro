@@ -133,13 +133,24 @@ function insertAttempt(
   nodeId: string,
   attemptNo: number,
   state: string,
-  opts: Partial<{ retry_class: string | null; turn_count: number; extra: object }> = {},
+  opts: Partial<{
+    retry_class: string | null;
+    turn_count: number;
+    extra: object;
+    pid: number | null;
+  }> = {},
 ) {
-  const o = { retry_class: null as string | null, turn_count: 0, extra: {}, ...opts };
+  const o = {
+    retry_class: null as string | null,
+    turn_count: 0,
+    extra: {},
+    pid: null as number | null,
+    ...opts,
+  };
   db.query(
     `INSERT INTO attempts (run_id, node_id, attempt_no, base_sha, state, started_at,
                            launched_at, pid, turn_count, retry_class, extra_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     runId,
     nodeId,
@@ -148,6 +159,7 @@ function insertAttempt(
     state,
     1_786_948_000 + attemptNo,
     1_786_948_010 + attemptNo,
+    o.pid,
     o.turn_count,
     o.retry_class,
     JSON.stringify(o.extra),
@@ -568,16 +580,15 @@ describe("the DAG and its attempts", () => {
 
   test("the in-flight attempt is the one marked RUNNING, with its turn count", () => {
     const db = new MaestroDb(build());
-    const inFlight = db
-      .run("run-dag")!
-      .nodes.flatMap((n) => n.attempts)
-      .filter((a) => a.running);
-    expect(inFlight).toHaveLength(1);
-    expect(inFlight[0]!.attempt_no).toBe(2);
-    expect(inFlight[0]!.turn_count).toBe(17);
-    expect(inFlight[0]!.session_path).toBe("/tmp/a2.jsonl");
+    const ingest = db.run("run-dag")!.nodes.find((n) => n.node_id === "lane-ingest")!;
+    const inFlight = ingest.attempts.find((a) => a.state === "RUNNING")!;
+    expect(inFlight.attempt_no).toBe(2);
+    expect(inFlight.turn_count).toBe(17);
+    expect(inFlight.session_path).toBe("/tmp/a2.jsonl");
+    expect(inFlight.running).toBe(false);
+    expect(inFlight.liveness).toBe("not_recorded");
     // Seconds in the ledger, milliseconds out of the reader.
-    expect(inFlight[0]!.launched_at_ms).toBeGreaterThan(1_700_000_000_000);
+    expect(inFlight.launched_at_ms).toBeGreaterThan(1_700_000_000_000);
     db.close();
   });
 
@@ -591,6 +602,22 @@ describe("the DAG and its attempts", () => {
   test("the server stamps its own clock so elapsed time is not the browser's", () => {
     const db = new MaestroDb(build());
     expect(db.run("run-dag")!.server_now_ms).toBeGreaterThan(1_700_000_000_000);
+    db.close();
+  });
+});
+
+describe("attempt liveness uses the run host", () => {
+  test("a live pid recorded on another host is unknown, not running", () => {
+    const path = ledger("foreign-host", (seed) => {
+      insertRun(seed, "run-x");
+      seed.query("UPDATE runs SET scheduler_host = 'other-box'").run();
+      insertNode(seed, "run-x", "lane-a", "RUNNING", { attempt_no: 1 });
+      insertAttempt(seed, "run-x", "lane-a", 1, "RUNNING", { pid: process.pid });
+    });
+    const db = new MaestroDb(path);
+    const attempt = db.run("run-x")!.nodes[0]!.attempts[0]!;
+    expect(attempt.running).toBe(false);
+    expect(attempt.liveness).toBe("unknown");
     db.close();
   });
 });

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { runHref } from "@/lib/href";
 
 const TABS = [
   { suffix: "", label: "Report" },
@@ -13,7 +14,7 @@ const TABS = [
 
 export function RunTabs({ sourceId, runId }: { sourceId: string; runId: string }) {
   const pathname = usePathname();
-  const base = `/runs/${encodeURIComponent(sourceId)}/${encodeURIComponent(runId)}`;
+  const base = runHref(sourceId, runId);
   return (
     <nav className="run-tabs" aria-label="Run detail">
       {TABS.map((tab) => {

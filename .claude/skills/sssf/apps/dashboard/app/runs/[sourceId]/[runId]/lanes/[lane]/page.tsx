@@ -53,7 +53,7 @@ export default async function RunLanePage({
         <div className="section-heading">
           <div>
             <h2>Attempts</h2>
-            <p>pid, liveness, session_path, turn_count. No vendor or model identity is in the ledger.</p>
+            <p>pid liveness is a read-side probe. Model is observed or declared, never invented.</p>
           </div>
         </div>
         {node.attempts.length === 0 ? (
@@ -65,8 +65,10 @@ export default async function RunLanePage({
                 <tr>
                   <th>#</th>
                   <th>State</th>
-                  <th>Running</th>
+                  <th>Liveness</th>
                   <th>PID</th>
+                  <th>Model</th>
+                  <th>Vendor</th>
                   <th>Turns</th>
                   <th>Elapsed</th>
                   <th>Retry</th>
@@ -81,8 +83,30 @@ export default async function RunLanePage({
                     <td>
                       <StatusPill status={attempt.state} />
                     </td>
-                    <td>{attempt.running ? "yes" : "no"}</td>
+                    <td>
+                      <StatusPill status={attempt.liveness} />
+                    </td>
                     <td>{attempt.pid ?? "—"}</td>
+                    <td>
+                      {attempt.model ? (
+                        <>
+                          <code title={attempt.declared_config_path ?? undefined}>{attempt.model}</code>
+                          <span className="muted"> {attempt.model_source.replaceAll("_", " ")}</span>
+                        </>
+                      ) : (
+                        <span className="muted">not recorded</span>
+                      )}
+                    </td>
+                    <td>
+                      {attempt.vendor ? (
+                        <>
+                          <code>{attempt.vendor}</code>
+                          <span className="muted"> {attempt.vendor_source.replaceAll("_", " ")}</span>
+                        </>
+                      ) : (
+                        <span className="muted">not recorded</span>
+                      )}
+                    </td>
                     <td>{attempt.turn_count}</td>
                     <td>{elapsedLabel(attempt.started_at_ms, run.server_now_ms)}</td>
                     <td>{attempt.retry_class ?? "—"}</td>

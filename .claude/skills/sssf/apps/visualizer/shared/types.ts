@@ -386,6 +386,18 @@ export interface MaestroReviewFinding {
   blocking: boolean;
 }
 
+export type AttemptLiveness =
+  | "running"
+  | "stale"
+  | "not_recorded"
+  | "not_running"
+  | "unknown";
+export type AttemptIdentitySource =
+  | "observed"
+  | "observed_head"
+  | "declared"
+  | "not_recorded";
+
 export interface MaestroAttempt {
   node_id: string;
   attempt_no: number;
@@ -399,7 +411,26 @@ export interface MaestroAttempt {
   /** Epoch milliseconds; the ledger stores seconds and the server converts. */
   started_at_ms: number | null;
   launched_at_ms: number | null;
+  /**
+   * True when ledger RUNNING and a process with this pid exists on this host.
+   * That is process-table existence, not attempt identity: attempts have no
+   * start-epoch, so a reused pid can read running. Unknown host / invalid pid
+   * are not running.
+   */
   running: boolean;
+  /**
+   * Read-side pid probe. `stale` = ledger RUNNING and this host has no such
+   * process. `unknown` = cannot be said (foreign host, pid <= 0). Not a
+   * lifecycle transition — the ledger is left unchanged.
+   */
+  liveness: AttemptLiveness;
+  /** Observed from session jsonl, else declared from maestro.config.yaml. */
+  model: string | null;
+  vendor: string | null;
+  model_source: AttemptIdentitySource;
+  vendor_source: AttemptIdentitySource;
+  /** Config file that supplied a declared answer, when one was found. */
+  declared_config_path: string | null;
   /** The agent's transcript on disk, once the launcher has reported it. */
   session_path: string | null;
   /** The structured verdict recorded against this attempt's failure, if any. */

@@ -6,7 +6,7 @@ import { RunTabs } from "@/components/RunTabs";
 import { SourceBanner } from "@/components/SourceBanner";
 import { StatusPill } from "@/components/StatusPill";
 import { ApiUnavailable } from "@/components/ApiUnavailable";
-import { getRun } from "@/lib/api";
+import { decodeRouteParam, getRun } from "@/lib/api";
 import type { MaestroRunDetail } from "@/lib/types";
 
 export async function loadRunOrBanner(
@@ -71,12 +71,13 @@ export function RunChrome({
   run: MaestroRunDetail;
   children: ReactNode;
 }) {
+  const sourceLabel = decodeRouteParam(sourceId);
   return (
     <section className="page-stack">
       <Breadcrumbs
         items={[
           { label: "Runs", href: "/runs" },
-          { label: sourceId, href: "/runs" },
+          { label: sourceLabel, href: "/runs" },
           { label: runId },
         ]}
       />

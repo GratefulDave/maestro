@@ -1,5 +1,6 @@
 import "server-only";
 
+import { decodeRouteParam, runHref } from "@/lib/href";
 import type {
   FleetRun,
   FleetRunDetail,
@@ -61,7 +62,7 @@ export function getSources(): Promise<ApiResult<SourceInfo[]>> {
 
 export function getRuns(sourceId: string): Promise<ApiResult<MaestroRunSummary[]>> {
   return apiGet<MaestroRunSummary[]>(
-    `/api/sources/${encodeURIComponent(sourceId)}/runs`,
+    `/api/sources/${encodeURIComponent(decodeRouteParam(sourceId))}/runs`,
   );
 }
 
@@ -70,7 +71,7 @@ export function getRun(
   runId: string,
 ): Promise<ApiResult<MaestroRunDetail>> {
   return apiGet<MaestroRunDetail>(
-    `/api/sources/${encodeURIComponent(sourceId)}/runs/${encodeURIComponent(runId)}`,
+    `/api/sources/${encodeURIComponent(decodeRouteParam(sourceId))}/runs/${encodeURIComponent(decodeRouteParam(runId))}`,
   );
 }
 
@@ -192,9 +193,7 @@ export function elapsedLabel(startedAtMs: number | null, serverNowMs: number): s
   return rest ? `${hours}h ${rest}m` : `${hours}h`;
 }
 
-export function runHref(sourceId: string, runId: string, suffix = ""): string {
-  return `/runs/${encodeURIComponent(sourceId)}/${encodeURIComponent(runId)}${suffix}`;
-}
+export { decodeRouteParam, runHref };
 
 export function nodeNeedsAttention(node: {
   state: string;

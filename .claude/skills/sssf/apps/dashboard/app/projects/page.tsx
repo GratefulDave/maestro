@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { ApiUnavailable } from "@/components/ApiUnavailable";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
@@ -58,7 +59,13 @@ export default async function ProjectsPage() {
                 {sources.data.map((source) => (
                   <tr key={source.id}>
                     <td>
-                      <code>{source.id}</code>
+                      {source.kind === "maestro" ? (
+                        <Link className="lane-link" href={`/runs?source=${encodeURIComponent(source.id)}`}>
+                          {source.id}
+                        </Link>
+                      ) : (
+                        <code>{source.id}</code>
+                      )}
                     </td>
                     <td>{source.kind}</td>
                     <td>{source.label}</td>
