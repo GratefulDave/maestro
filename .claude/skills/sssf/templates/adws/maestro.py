@@ -45,6 +45,7 @@ from adw_modules import publication
 from adw_modules import receipt_crypto
 from adw_modules import retry_policy
 from adw_modules import review_convergence
+from adw_modules import review_findings
 from adw_modules import route_admission
 from adw_modules import route_receipts
 from adw_modules import scheduler
@@ -233,6 +234,12 @@ def _config_nonnegative_integer(value, label):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise _MaestroConfigurationError(
             label + " must be a non-negative integer")
+    return value
+
+
+def _config_bool(value, label):
+    if not isinstance(value, bool):
+        raise _MaestroConfigurationError(label + " must be a boolean")
     return value
 
 
@@ -526,7 +533,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         raw, "maestro configuration",
         ("schema", "plans_dir", "state_root", "keys", "executables",
          "route_receipts", "reviewer", "execution"),
-        ("plan_contract", "author", "runners"))
+        ("plan_contract", "author", "runners", "tester"))
     if root["schema"] != _MAESTRO_SCHEMA:
         raise _MaestroConfigurationError(
             "schema must be " + _MAESTRO_SCHEMA)
@@ -615,7 +622,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
          "semantic_ceiling"),
         ("profile", "vendor", "review_ceiling", "review_reject_grade",
          "provision", "environmental_retries", "launcher_retries",
-         "credential_retries"))
+         "credential_retries", "restrict_actor_tools"))
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
@@ -656,6 +663,12 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             execution_raw["semantic_ceiling"], "execution.semantic_ceiling"),
         "vendor": (_config_string(execution_raw["vendor"], "execution.vendor")
                    if "vendor" in execution_raw else None),
+        # Secondary hatch. Default off: the omp profile is the tool policy.
+        # True appends permissions.route_capability_argv on every launch.
+        "restrict_actor_tools": (
+            _config_bool(execution_raw["restrict_actor_tools"],
+                         "execution.restrict_actor_tools")
+            if "restrict_actor_tools" in execution_raw else False),
         # Separate from the semantic ceiling by construction. Defaulted rather
         # than required so an existing config keeps working, but the default is
         # a real bound, not "unlimited".
@@ -735,9 +748,27 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
                 author_raw["poll_interval_s"], "author.poll_interval_s"),
         }
 
+    tester = None
+    if "tester" in root:
+        tester_raw = _config_mapping(
+            root["tester"], "tester",
+            ("route", "model", "effort"),
+            ("profile", "vendor"))
+        tester = {
+            "route": _config_string(tester_raw["route"], "tester.route"),
+            "model": _config_string(tester_raw["model"], "tester.model"),
+            "effort": _config_string(tester_raw["effort"], "tester.effort"),
+            "profile": (_config_string(tester_raw["profile"], "tester.profile")
+                        if "profile" in tester_raw else None),
+            "vendor": (_config_string(tester_raw["vendor"], "tester.vendor")
+                       if "vendor" in tester_raw else None),
+        }
+
     sections = [("reviewer", reviewer), ("execution", execution)]
     if author is not None:
         sections.append(("author", author))
+    if tester is not None:
+        sections.append(("tester", tester))
     for label, section in sections:
         if section["route"] not in route_paths:
             raise _MaestroConfigurationError(
@@ -797,6 +828,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "reviewer": reviewer,
         "execution": execution,
         "author": author,
+        "tester": tester,
     }
 
 
@@ -865,7 +897,7 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 #: receipt or launches anything, so none of them needs key material — asking
 #: `run status` for a signing seed is how a read verb becomes unusable on a
 #: machine that merely wants to watch a run.
-_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence")
+_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence", "findings")
 
 #: Flags that select *which* run to read and how to print it. They are the only
 #: flags a configured run verb accepts, because they override no derived path;
@@ -910,6 +942,8 @@ _RUN_TUNING_OPTIONS: Dict[str, str] = {
     "--backstop-t-s": "backstop_t_s",
     "--semantic-ceiling": "semantic_ceiling",
     "--review-ceiling": "review_ceiling",
+    "--review-start-deadline-s": "review_start_deadline_s",
+    "--review-quiescence-confirm-s": "review_quiescence_confirm_s",
     "--environmental-retries": "environmental_retries",
     "--launcher-retries": "launcher_retries",
     "--credential-retries": "credential_retries",
@@ -1153,6 +1187,7 @@ def _apply_repository_config(
         args.agent_model = execution["model"]
         args.agent_effort = execution["effort"]
         args.agent_profile = execution["profile"]
+        args.restrict_actor_tools = execution["restrict_actor_tools"]
 
         # The reviewer bindings, which until now existed only in the `plan
         # finalize` branch above. That asymmetry was the whole defect: the run
@@ -1167,6 +1202,12 @@ def _apply_repository_config(
         args.reviewer_profile = reviewer["profile"]
         args.reviewer_vendor = reviewer["vendor"]
         args.execution_vendor = execution["vendor"]
+        tester = config.get("tester") or {}
+        args.tester_route = tester.get("route")
+        args.tester_model = tester.get("model")
+        args.tester_effort = tester.get("effort")
+        args.tester_profile = tester.get("profile")
+        args.tester_vendor = tester.get("vendor")
         # Per-attempt subdirectories are minted under this root by the runner;
         # each review gets a fresh session directory, because §6.5's structural
         # half of "independent review is recorded" refuses a reused one.
@@ -1692,6 +1733,7 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     # opened.
                     pane_group=node.node_id, pane_role="reviewer",
                     pane_group_size=2,
+                    restrict_tools=getattr(args, "restrict_actor_tools", False),
                     environment=worktree.launch_env(scratch_dir)))
                 handle_box["handle"] = handle
                 return finalization_window.ReviewerSession(
@@ -1716,7 +1758,17 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                 config=finalization_window.FinalizationConfig(
                     finalization_timeout_s=args.review_timeout_s,
                     turn_timeout_s=args.reviewer_turn_timeout_s,
-                    poll_interval_s=args.reviewer_poll_interval_s),
+                    poll_interval_s=args.reviewer_poll_interval_s,
+                    start_deadline_s=(
+                        args.review_start_deadline_s
+                        if getattr(args, "review_start_deadline_s", None)
+                        is not None
+                        else finalization_window.DEFAULT_START_DEADLINE_S),
+                    quiescence_confirm_s=(
+                        args.review_quiescence_confirm_s
+                        if getattr(args, "review_quiescence_confirm_s", None)
+                        is not None
+                        else finalization_window.DEFAULT_QUIESCENCE_CONFIRM_S)),
                 launch=launch_reviewer, poll_report=poll_report,
                 record_reviewer_session=lambda _s: None,
                 kill=kill_reviewer,
@@ -1830,6 +1882,72 @@ def _agent_node_prompt(node: Any, envelope: Path,
         AGENT_DISCOVERY_ROUTING,
     ])
     return "\n".join(lines)
+
+
+def _tests_node_prompt(node: Any, envelope: Path,
+                       retry_prompt: Optional[str]) -> str:
+    """Goal, produces, acceptance — tests only, no implementation."""
+    lines = [node.instruction, ""]
+    outputs = list(getattr(node, "outputs", ()) or ())
+    if outputs:
+        lines.append(
+            "Write only these test files, relative to the repository root. "
+            "Do not write implementation. A change to anything else fails "
+            "the attempt:")
+        lines.extend("  " + path for path in outputs)
+        lines.append("")
+    gate = getattr(node, "gate", None)
+    if gate is not None:
+        lines.append(
+            "Maestro will collect these tests and require every new case to "
+            "fail at the parent commit (implementation does not exist yet). "
+            "A case that passes at the parent is refused. A collection "
+            "error or an import crash of the test file is not a red:")
+        lines.append("  " + " ".join([gate.runner, *gate.argv]))
+        lines.append("")
+    if retry_prompt:
+        lines.extend(["Retry guidance:", retry_prompt, ""])
+    lines.extend([
+        "When you have finished, write this file and then stop:",
+        "  " + str(envelope),
+        '  {"success": true, "summary": "<what you did>"}',
+        "",
+        AGENT_DISCOVERY_ROUTING,
+    ])
+    return "\n".join(lines)
+
+
+def _append_needed_tests(prompt: str, worktree: Path, node: Any,
+                         plan: Any) -> str:
+    """Attach already-merged test file bytes to a build node's handoff.
+
+    The tests node merged first; those files sit in this worktree and are
+    not this node's outputs. Size-checked by the existing B13 chokepoint
+    after this function returns.
+    """
+    from adw_modules.tests_chain import is_test_path
+    by_id = plan.node_by_id()
+    chunks = []
+    for need in getattr(node, "needs", ()) or ():
+        needed = by_id.get(need)
+        if not isinstance(needed, plan_model.TestsNode):
+            continue
+        for rel in needed.outputs:
+            if not is_test_path(rel):
+                continue
+            target = Path(worktree) / rel
+            if not target.is_file():
+                continue
+            chunks.append("### " + rel)
+            chunks.append(target.read_text(encoding="utf-8"))
+    if not chunks:
+        return prompt
+    return (
+        prompt
+        + "\nThe tests you must make pass are already in the tree:\n\n"
+        + "\n".join(chunks)
+        + "\n"
+    )
 
 
 def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
@@ -2668,7 +2786,8 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
 #: version produces instructions a reviewer can judge against — that is the
 #: whole content of the v1/v2 distinction, and no structural check can
 #: substitute for it.
-_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({plan_model.SCHEMA_V2})
+_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({
+    plan_model.SCHEMA_V2, plan_model.SCHEMA_V3})
 
 
 def _refuse_unrunnable_plan_schema(args: argparse.Namespace,
@@ -3350,6 +3469,8 @@ def _resolve_run_runners(
     scratch = Path(args.scratch_root) / "runner-probe"
     env = worktree.launch_env(scratch)
     wanted = {node.gate.runner for node in plan.agent_nodes}
+    wanted.update(node.gate.runner
+                  for node in getattr(plan, "tests_nodes", ()) or ())
     wanted.add(plan.merge_policy.integration_gate.runner)
     return {
         runner: runner_resolution.resolve(
@@ -3387,7 +3508,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         # stderr, because this verb's stdout is one JSON document and an
         # operator hint is not part of it.
         print(notice, file=sys.stderr)
-    route_runner = _runtime_launcher(args) if plan.agent_nodes else None
+    tests_nodes = getattr(plan, "tests_nodes", ()) or ()
+    route_runner = (_runtime_launcher(args)
+                    if plan.agent_nodes or tests_nodes else None)
     store = lc.LifecycleStore(args.db)
     handles = {}
     proven_absent = set()
@@ -3473,47 +3596,52 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             assert route_runner is not None
             prompt = attempt.scratch / "agent-prompt.txt"
             envelope = attempt.scratch / "agent-envelope.json"
-            prompt_text = _agent_node_prompt(
-                plan.node_by_id()[node.node_id], envelope, retry_prompt)
-            # B13 for the builder. A retry prompt carries guidance derived from
-            # the previous attempt's measured failure, so its size is a runtime
-            # quantity and not an authored one; dispatching one that cannot fit
-            # produces an attempt about a different task rather than an error.
-            _preflight_prompt(prompt_text, args.agent_route, args.agent_model)
+            plan_node = plan.node_by_id()[node.node_id]
+            if node.kind is scheduler_types.NodeKind.TESTS:
+                prompt_text = _tests_node_prompt(
+                    plan_node, envelope, retry_prompt)
+                lane_route = getattr(args, "tester_route", None) or args.agent_route
+                lane_model = getattr(args, "tester_model", None) or args.agent_model
+                lane_effort = getattr(args, "tester_effort", None) or args.agent_effort
+                lane_profile = getattr(args, "tester_profile", None) or args.agent_profile
+                # B15: tester.vendor is loaded onto args and read here. The
+                # information barrier is the node split, not a B12 vendor
+                # pair, and LaunchSpec has no vendor field.
+                getattr(args, "tester_vendor", None)
+            else:
+                prompt_text = _agent_node_prompt(
+                    plan_node, envelope, retry_prompt)
+                prompt_text = _append_needed_tests(
+                    prompt_text, attempt.path, node, plan)
+                lane_route = args.agent_route
+                lane_model = args.agent_model
+                lane_effort = args.agent_effort
+                lane_profile = args.agent_profile
+            # B13: the build handoff now carries the tests as well as the
+            # goal, so it is strictly larger. Same chokepoint as before.
+            _preflight_prompt(prompt_text, lane_route, lane_model)
             prompt.write_text(prompt_text, encoding="utf-8")
-            # Through `_typed_launch_pane` like every other dispatch, so the
-            # builder's spec is given its route's window on the same path the
-            # reviewers' are. Called directly against `runner.launch` before,
-            # which meant one of this module's dispatch sites would have reached the
-            # launcher's B13 check with nothing measured on its spec.
             handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
                 correlation_token="{}-{}-{}".format(
                     args.run_id, node.node_id, record.attempt_no),
                 worktree=attempt.path, prompt_path=prompt,
-                envelope_path=envelope, route=args.agent_route,
-                model=args.agent_model, effort=args.agent_effort,
-                profile=args.agent_profile,
+                envelope_path=envelope, route=lane_route,
+                model=lane_model, effort=lane_effort,
+                profile=lane_profile,
                 session_dir=attempt.scratch / "session",
                 context_window_tokens=_route_context_window(
-                    args.agent_route, args.agent_model),
-                # This node's own tab, with room for the reviewer that will
-                # judge it: two panes side by side rather than a builder and a
-                # reviewer in unrelated corners of a flat tab.
-                pane_group=node.node_id, pane_role="builder",
+                    lane_route, lane_model),
+                pane_group=node.node_id,
+                pane_role=("tester"
+                           if node.kind is scheduler_types.NodeKind.TESTS
+                           else "builder"),
                 pane_group_size=2,
+                restrict_tools=getattr(args, "restrict_actor_tools", False),
                 environment=launch_environment))
             with handles_lock:
                 handles[key] = handle
                 proven_absent.discard(key)
             _require_session_path(handle, node.node_id, record.attempt_no)
-            # `process_group` first because a harness-spawned launch owns its
-            # group outright; `liveness_pid` is the herdr-spawned fallback that
-            # makes §7.6's PROCESS_DEAD signal reachable for an agent node at
-            # all (#20). Both land in `attempts.pid`, which has exactly one
-            # reader — the watchdog's `process_is_alive` check — while the kill
-            # path below reads `handle.process_group` from `handles` and is
-            # deliberately not given the fallback: see `LaunchHandle`, §8.3 and
-            # §16.3 items 17 and 30.
             liveness_pid = handle.process_group
             if liveness_pid is None:
                 liveness_pid = handle.liveness_pid
@@ -3565,6 +3693,18 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             _code_review_runner(args, route_runner)
             if route_runner is not None and getattr(args, "review_root", None)
             else None)
+
+        def actor_status(attempt):
+            """Raw per-pane status for the watchdog turn clock. Never observe()."""
+            key = (attempt.node_id, attempt.attempt_no)
+            with handles_lock:
+                handle = handles.get(key)
+            if handle is None or isinstance(handle, subprocess.Popen):
+                return None
+            if route_runner is None:
+                return None
+            return route_runner.agent_status(handle)
+
         deps = scheduler.SchedulerDeps(
             store=store, repo=Path(args.repo),
             integration_path=Path(args.integration_path),
@@ -3585,7 +3725,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             # missing work.
             provision=_run_provisioner(args, route_runner),
             kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
-            review_attempt=review_attempt)
+            review_attempt=review_attempt,
+            actor_status=actor_status)
         try:
             report = scheduler.Scheduler(
                 args.run_id, plan.to_plan_nodes(), config, deps,
@@ -3654,9 +3795,16 @@ def _scheduler_gate_deps(plan: plan_model.Plan, runners):
             cancel_requested, label="{}-{}".format(node.node_id, phase))
 
     def run_integration_gate(integration_path, specs, cancel_requested):
+        # `specs` is the union of merged node specs, recorded on the
+        # acceptance result. It is not the integration command: appending
+        # it would make this gate the union of what the lanes already ran,
+        # which is the §8.8 gap. The executed argv is the plan's command
+        # with every selector stripped, so a named subset cannot hide a
+        # test no lane owned.
+        del specs
         return worktree.run_integration_gate(
             integration_path, runners[integration_gate.runner],
-            tuple(integration_gate.argv),
+            plan_model.unscoped_argv(integration_gate.argv),
             Path(integration_path).parent / ".maestro",
             cancel_requested, label="integration-gate")
 
@@ -3795,6 +3943,23 @@ def _merge_cause_prefix(merge_cause: Optional[str]) -> str:
     return "output "
 
 
+def _pending_cause_detail(pending_cause: Optional[str]) -> str:
+    """What `run status` puts in DETAIL for a PENDING node that was reopened.
+
+    Seeded PENDING keeps an empty DETAIL: the node never left the frontier,
+    so there is no writer to name. A reopened PENDING used to look the same,
+    which is the defect (#103). The state stays PENDING; the column says who
+    wrote it.
+    """
+    if pending_cause == scheduler_types.PendingCause.OPERATOR_RETRY.value:
+        return "operator retry"
+    if pending_cause == scheduler_types.PendingCause.OPERATOR_RESUME.value:
+        return "operator resume"
+    if pending_cause == scheduler_types.PendingCause.SCHEDULER.value:
+        return "scheduler retry"
+    return ""
+
+
 def _merge_evidence_lines(node: Mapping[str, Any]) -> List[str]:
     """The evidence-chain reading for a node an operator accepted.
 
@@ -3907,6 +4072,10 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             "session_path": attempt.extra.get(watchdog.SESSION_PATH_KEY),
             "verdict": _attempt_verdict(entries),
             "transitions": entries,
+            "review_findings": [
+                finding.as_dict()
+                for finding in review_findings.blocking_findings_from_extra(
+                    attempt.extra)],
         }
         by_node.setdefault(attempt.node_id, []).append(projected)
         if running:
@@ -3936,6 +4105,11 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             # used to render identically here, which is what left the git log
             # as the only place the difference was visible (#93).
             "merge_cause": node.merge_provenance,
+            # How the node reached PENDING after leaving it: `SCHEDULER`,
+            # `OPERATOR_RETRY`, `OPERATOR_RESUME`, or `null` where the node
+            # never left the frontier or the column was never recorded.
+            # The three PENDING writers used to render identically here (#103).
+            "pending_cause": node.pending_provenance,
             # What the ledger could show about the evidence chain when the
             # operator accepted it — present only on a node `skip` wrote.
             "merge_evidence": merge_evidence.get(node.node_id),
@@ -3977,6 +4151,12 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
         "integration": integration,
         "in_flight": in_flight,
         "nodes": projected_nodes,
+        "review_findings": [
+            node.as_dict()
+            for node in review_findings.run_findings(
+                record.run_id, nodes, attempts,
+                declared_outcome=(record.latest_outcome.value
+                                  if record.latest_outcome else None)).nodes],
         "results": [
             {"node_id": row.get("node_id"), "attempt_no": row.get("attempt_no"),
              "adjudication": row.get("adjudication"),
@@ -3996,6 +4176,10 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         "" if declared is None
         else "   (last declared outcome {} at {})".format(
             declared, progress["declared_outcome_at"])))
+    findings = progress.get("review_findings") or []
+    if findings:
+        lines.append("  findings     {} merged node{} carried rejecting findings".format(
+            len(findings), "" if len(findings) == 1 else "s"))
     lines.append("  plan digest  {}".format(progress["plan_digest"]))
     lines.append("  started      {}   ({} ago)".format(
         progress["created_at"], _duration(progress["elapsed_s"])))
@@ -4036,11 +4220,26 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         if live:
             detail = "in flight {}, {} turns".format(
                 _duration(live[0]["elapsed_s"]), live[0]["turn_count"])
+        elif node.get("pending_cause"):
+            detail = _pending_cause_detail(node["pending_cause"])
         elif node["output_sha"]:
             detail = "{}{}".format(_merge_cause_prefix(node["merge_cause"]),
                                    node["output_sha"][:12])
         lines.append("  {:<44} {:<10} {:>8}  {}".format(
             node["node_id"][:44], node["state"], node["attempt_no"], detail))
+    if findings:
+        lines.append("")
+        lines.append("  rejecting findings on merged nodes")
+        for node in findings:
+            lines.append("  {}  a{}  {} blocking".format(
+                node["node_id"], node["attempt_no"],
+                len(node.get("findings") or ())))
+            for finding in node.get("findings") or ():
+                lines.append("    {}  {}".format(
+                    finding.get("check_id") or "",
+                    finding.get("object_id") or ""))
+                if finding.get("message"):
+                    lines.append("      {}".format(finding["message"]))
 
     for node in progress["nodes"]:
         if not node["attempts"]:
@@ -4058,6 +4257,10 @@ def _render_progress(progress: Dict[str, Any]) -> str:
             if attempt["session_path"]:
                 lines.append("         session: {}".format(
                     attempt["session_path"]))
+            for finding in attempt.get("review_findings") or ():
+                lines.append("         finding: {}  {}".format(
+                    finding.get("check_id") or "",
+                    finding.get("object_id") or ""))
         if node["block_reason"]:
             lines.append("    BLOCKED: {}".format(node["block_reason"]))
         for line in _merge_evidence_lines(node):
@@ -4172,6 +4375,39 @@ def _run_convergence(args: argparse.Namespace) -> int:
     else:
         print(review_convergence.render(profile))
     return 0
+
+
+def _run_findings(args: argparse.Namespace) -> int:
+    """Merged nodes that carried rejecting findings, for any run the ledger holds.
+
+    The scheduler prints ``review_findings`` once, in the process-exit JSON.
+    After that process is gone the findings still sit on the attempt row and
+    on disk, and nothing read them — so a run could declare ACCEPTED with
+    BLOCKING findings on every merged lane and an operator the next morning
+    had no verb that would say so.
+
+    Same reader, same tables, same query path as ``run status`` (§10.6). It
+    writes nothing and decides nothing; the ledger it opens is ``mode=ro``.
+    Findings never fail an attempt, block a node, or stop a merge (§19 M35).
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        record = _select_run(reader, args)
+        profile = review_findings.run_findings(
+            record.run_id, reader.nodes(record.run_id),
+            reader.attempts(record.run_id),
+            declared_outcome=(record.latest_outcome.value
+                              if record.latest_outcome else None))
+    finally:
+        reader.close()
+    if getattr(args, "as_json", False):
+        print(json.dumps(profile.as_dict(), sort_keys=True))
+    else:
+        print(review_findings.render(profile))
+    return 0
+
 
 
 def _run_pause(args: argparse.Namespace) -> int:
@@ -5186,6 +5422,8 @@ def _deliver_author_turn(config: Dict[str, Any],
             # (`handoff_budget.ROUTES_PUBLISHING_A_WINDOW`), so the day the
             # route publishes a catalog this site is covered with no edit.
             context_window_tokens=_route_context_window(lane.route, lane.model),
+            restrict_tools=bool(
+                config.get("execution", {}).get("restrict_actor_tools", False)),
             environment=worktree.launch_env(
                 session_root / (token + ".scratch"))))
         deadline = time.monotonic() + lane.author_timeout_s
@@ -5985,6 +6223,8 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--agent-model")
     parser.add_argument("--agent-effort")
     parser.add_argument("--agent-profile")
+    parser.add_argument("--review-start-deadline-s", type=float)
+    parser.add_argument("--review-quiescence-confirm-s", type=float)
     parser.add_argument("--route-receipt", action="append")
     parser.add_argument("--route-verify-key", action="append")
 
@@ -6148,6 +6388,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_selection(convergence)
     _add_db(convergence)
     convergence.set_defaults(handler=_run_convergence)
+    findings_cmd = run_sub.add_parser("findings")
+    findings_cmd.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    _add_run_selection(findings_cmd)
+    _add_db(findings_cmd)
+    findings_cmd.set_defaults(handler=_run_findings)
 
     def _positive_grant(value: str) -> int:
         """`--grant 0` and `--grant -2` are refused at parse time rather than

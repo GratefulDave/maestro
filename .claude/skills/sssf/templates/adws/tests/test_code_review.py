@@ -507,7 +507,7 @@ class ActorAbandonedTests(unittest.TestCase):
 # which production never called. Both are gone: the five clauses are enforced
 # along the review path itself and are covered by the tests over that path —
 # report parsing and the matrix by `verify_report`'s tests, occupancy by
-# `check_occupancy`'s, the derived verdict by `derive_verdict`'s, and the signed
+# `check_occupancy`'s, the derived verdict by `grade_verdict`'s, and the signed
 # receipt by the `ReceiptStore` signature tests. Keeping a second predicate
 # green proved only that the copy nobody ran still worked.
 
@@ -689,6 +689,23 @@ class ReviewStageTests(SchedulerFixture):
         kw.setdefault("review_ceiling", 3)
         return super().config(**kw)
 
+    def write_build_each_attempt(self):
+        """A builder whose bytes differ per attempt.
+
+        Writing the same `build.py` on a repair used to mint a new sha for a
+        byte-identical tree and re-ask the reviewer (#113). These tests pin
+        review-stage behaviour, not that hole, so each attempt must produce
+        a real delta.
+        """
+        def run_node(attempt, node, record, retry_prompt, on_launch,
+                     cancel_requested):
+            self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            on_launch(None)
+            (attempt.path / "build.py").write_text(
+                "ok-{0}\n".format(record.attempt_no))
+            return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+        return run_node
+
     def test_a_reviewed_pass_merges_exactly_as_before(self):
         review = FakeReview([True])
         node = self.agent("build")
@@ -729,9 +746,9 @@ class ReviewStageTests(SchedulerFixture):
         builder in the repair prompt rather than being discarded."""
         review = FakeReview([False, True])
         self.gate_script[("build", "falsify")] = [green()]
-        self.written["build"] = {"build.py": "ok\n"}
         self.schedule([self.agent("build")],
-                      deps=self.deps(review_attempt=review)).run()
+                      deps=self.deps(run_node=self.write_build_each_attempt(),
+                                     review_attempt=review)).run()
 
         self.assertEqual(self.states()["build"], st.NodeState.MERGED.value)
         prompts = self.prompts["build"]
@@ -747,11 +764,11 @@ class ReviewStageTests(SchedulerFixture):
         prompt without ever being the thing that stopped it."""
         review = FakeReview([False, False, False])
         self.gate_script[("build", "falsify")] = [green(), green(), green()]
-        self.written["build"] = {"build.py": "ok\n"}
         report = self.schedule(
             [self.agent("build")],
             config=self.config(semantic_ceiling=3),
-            deps=self.deps(review_attempt=review)).run()
+            deps=self.deps(run_node=self.write_build_each_attempt(),
+                           review_attempt=review)).run()
 
         self.assertEqual(self.states()["build"], st.NodeState.BLOCKED.value)
         self.assertEqual(
@@ -775,11 +792,11 @@ class ReviewStageTests(SchedulerFixture):
         """
         review = FakeReview([False, False, False])
         self.gate_script[("build", "falsify")] = [green(), green(), green()]
-        self.written["build"] = {"build.py": "ok\n"}
         self.schedule(
             [self.agent("build")],
             config=self.config(semantic_ceiling=3),
-            deps=self.deps(review_attempt=review)).run()
+            deps=self.deps(run_node=self.write_build_each_attempt(),
+                           review_attempt=review)).run()
         rebuilt = rp.review_convergence_from_attempts(
             self.store.attempts_for("run1"))
         self.assertEqual(rebuilt["build"], [1, 1, 1])
@@ -793,11 +810,11 @@ class ReviewStageTests(SchedulerFixture):
         attempted; nobody is asked about it again."""
         review = FakeReview([False, False])
         self.gate_script[("build", "falsify")] = [green(), green(), green()]
-        self.written["build"] = {"build.py": "ok\n"}
         self.schedule([self.agent("build")],
                       config=self.config(review_ceiling=2,
                                          semantic_ceiling=3),
-                      deps=self.deps(review_attempt=review)).run()
+                      deps=self.deps(run_node=self.write_build_each_attempt(),
+                                     review_attempt=review)).run()
 
         self.assertEqual(self.states()["build"], st.NodeState.BLOCKED.value)
         self.assertEqual(

@@ -675,6 +675,34 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
         self.assertTrue(candidate.candidate_worktree.is_dir())
         self.assertEqual(_git(self.api, "rev-parse", candidate.candidate_branch), accepted)
 
+    def test_cleanup_refuses_a_worktree_that_is_in_use(self) -> None:
+        api, paths, candidate, accepted = self._accepted_candidate()
+        workspace = self._workspace((api, self._read_only()))
+        acceptance = wr.assemble_acceptance("run-1", workspace, paths,
+                                             {"api": accepted}, self.state_root)
+        checkout = acceptance.repository_paths["api"]
+        wr._checkout_writable_for_removal(checkout)
+        (checkout / "in-use.txt").write_text("live work\n", encoding="utf-8")
+
+        with self.assertRaises(wr.CleanupError):
+            wr.cleanup_acceptance(acceptance)
+        self.assertTrue(acceptance.root.exists())
+        self.assertTrue(checkout.is_dir())
+        self.assertTrue((checkout / "in-use.txt").is_file())
+        self.assertTrue(candidate.candidate_worktree.is_dir())
+
+    def test_cleanup_still_succeeds_on_a_tree_that_is_not_in_use(self) -> None:
+        api, paths, candidate, accepted = self._accepted_candidate()
+        workspace = self._workspace((api, self._read_only()))
+        acceptance = wr.assemble_acceptance("run-1", workspace, paths,
+                                             {"api": accepted}, self.state_root)
+
+        wr.cleanup_acceptance(acceptance)
+
+        self.assertFalse(acceptance.root.exists())
+        self.assertTrue(candidate.candidate_worktree.is_dir())
+
+
 
     def test_failed_assembly_cleanup_retains_root_for_reclaim(self) -> None:
         api, paths, candidate, accepted = self._accepted_candidate()
@@ -775,6 +803,22 @@ class WorkspaceRuntimeTestCase(unittest.TestCase):
                                          {"api": accepted}, self.state_root)
         self.assertEqual(rebuilt.repository_shas,
                          {"api": accepted, "docs": self.docs_base})
+
+    def test_reclaim_refuses_a_worktree_that_is_in_use(self) -> None:
+        api, paths, candidate, accepted = self._accepted_candidate()
+        workspace = self._workspace((api, self._read_only()))
+        acceptance = wr.assemble_acceptance("run-1", workspace, paths,
+                                             {"api": accepted}, self.state_root)
+        checkout = acceptance.repository_paths["api"]
+        wr._checkout_writable_for_removal(checkout)
+        (checkout / "in-use.txt").write_text("live work\n", encoding="utf-8")
+
+        with self.assertRaises(wr.CleanupError):
+            wr.reclaim_acceptance("run-1", workspace, paths, self.state_root)
+        self.assertTrue(acceptance.root.exists())
+        self.assertTrue((checkout / "in-use.txt").is_file())
+        self.assertTrue(candidate.candidate_worktree.is_dir())
+
 
     def test_reclaim_refuses_acceptance_root_or_repository_identity_escape(self) -> None:
         api, paths, candidate, accepted = self._accepted_candidate()

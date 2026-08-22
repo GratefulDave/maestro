@@ -220,6 +220,56 @@ def merge_cause_label(state: NodeState,
     return merge_cause.value if merge_cause else MERGE_CAUSE_UNRECORDED
 
 
+
+class PendingCause(str, Enum):
+    """How a node reached `PENDING` after leaving it — the same shape as
+    `CancelCause` and `MergeCause`, one column over.
+
+    `PENDING` was one word carrying three facts. A node reaches it down one
+    of three paths after it has already left the frontier, and a reader of
+    `node_lifecycle` could not tell which (#103):
+
+    * `SCHEDULER` — `fail_attempt`, or the resume path that closes an
+      inherited RUNNING attempt. The machine put the node back on the
+      frontier. Nothing about the operator is in this write.
+    * `OPERATOR_RETRY` — `retry` / `retry --force` / `retry --grant`. The
+      operator handed the node back. A grant's magnitude stays on
+      `granted_extra_attempts`; this member is the identity of the writer,
+      so a plain retry (delta 0) is no longer indistinguishable from a
+      scheduler write. The grant column is not reused as a proxy for who.
+    * `OPERATOR_RESUME` — `_reopen_run_cancelled_node`, the resume half of
+      `run cancel`. The operator withdrew a stop request. Nothing was
+      adjudicated about the node, which is why the reopen exists; the cause
+      still has to say so, because PENDING itself does not.
+
+    Seeded PENDING — `create_run`'s initial row — never left the frontier,
+    so the question does not arise and the column stays NULL. NULL on a
+    PENDING row written before this column is the same absence, never
+    `SCHEDULER`: the migration invents no facts.
+
+    Stored typed on `node_lifecycle.pending_cause`, because §1.2 forbids a
+    reader reconstructing a lifecycle fact from transition prose.
+    """
+
+    SCHEDULER = "SCHEDULER"
+    OPERATOR_RETRY = "OPERATOR_RETRY"
+    OPERATOR_RESUME = "OPERATOR_RESUME"
+
+
+def pending_cause_label(state: NodeState,
+                        pending_cause: Optional[PendingCause]) -> Optional[str]:
+    """The one derivation of "who put this node on the frontier".
+
+    Four answers: the three `PendingCause` members, and `None` both for a
+    node that is not `PENDING` and for a `PENDING` row that never left the
+    frontier (or whose cause was never recorded). `run status` and the
+    tests read this function rather than each re-deriving the pair (RC1).
+    A reader must not guess `SCHEDULER` from a NULL.
+    """
+    if state is not NodeState.PENDING:
+        return None
+    return pending_cause.value if pending_cause else None
+
 # ── §7.5 retry classes ──────────────────────────────────────────────────────
 
 class RetryClass(str, Enum):
@@ -426,7 +476,7 @@ class ResultRecord:
 # ── §7.1 the node the scheduler consumes directly ───────────────────────────
 
 class NodeKind(str, Enum):
-    """Three kinds, each with its own VERIFIED predicate (§7.3).
+    """Four kinds, each with its own VERIFIED predicate (§7.3, §1.1 item 4).
 
     `REVIEW` is a kind at the type level and never an authored one. B11's
     lesson is that reviewing and producing must be separated in the *type*
@@ -446,11 +496,17 @@ class NodeKind(str, Enum):
     the graph — the build node must be VERIFIED before its review can start,
     and a review FAIL sends the build node back to PENDING — which is a
     scheduler loop, not a dependency. `PlanNode` refuses this kind outright.
+
+    `TESTS` is authored. It writes the test files a later `AGENT` (build)
+    node must make pass, and it carries its own evidence chain: test files
+    only, at least one new collected case, each new case red at the parent
+    commit. Reusing the agent chain here is how hollow tests shipped.
     """
 
     AGENT = "agent"
     CODE = "code"
     REVIEW = "review"
+    TESTS = "tests"
 
 
 @dataclass(frozen=True)
@@ -584,6 +640,32 @@ class PlanNode:
                     "a goal -- it is a projection that dropped one, and the "
                     "reviewer would be handed a goal derived from the very gate "
                     "it is meant to judge independently")
+        elif self.kind is NodeKind.TESTS:
+            if not self.gate_command:
+                raise ValueError(
+                    f"{self.node_id}: a tests node's evidence chain counts "
+                    "cases from its gate; without a command there is nothing "
+                    "to collect")
+            if not (self.gate_selector or "").strip():
+                raise ValueError(
+                    f"{self.node_id}: a tests node needs its own gate selector "
+                    "so new cases can be counted against that selector")
+            if self.command:
+                raise ValueError(
+                    f"{self.node_id}: a tests node's work is the agent's, not a "
+                    "command; a command here would be a second execution path")
+            if self.expects_changes:
+                raise ValueError(
+                    f"{self.node_id}: expects_changes is a code-node clause "
+                    "(§7.3); on a tests node it is a field nothing reads")
+            if self.gate_min_cases < 1:
+                raise ValueError(
+                    f"{self.node_id}: a tests node counts `new cases >= 1`; a "
+                    "gate demanding zero cases cannot refuse a hollow file")
+            if not self.instruction.strip():
+                raise ValueError(
+                    f"{self.node_id}: a tests node carries the instruction the "
+                    "plan declared for it (§3.6 B9)")
         else:
             if self.instruction:
                 raise ValueError(

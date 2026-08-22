@@ -629,14 +629,23 @@ class LayoutWiringTest(unittest.TestCase):
 
     def test_the_node_dispatch_sites_name_the_node_and_the_role(self):
         roles = set()
+
+        def collect(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                roles.add(node.value)
+            elif isinstance(node, ast.IfExp):
+                collect(node.body)
+                collect(node.orelse)
+
         for keywords in self._launch_specs():
             role = keywords.get("pane_role")
-            if isinstance(role, ast.Constant):
-                roles.add(role.value)
-                # A role without a group would label a pane with no node.
-                self.assertIn("pane_group", keywords)
-                self.assertIn("pane_group_size", keywords)
-        self.assertEqual(roles, {"builder", "reviewer"})
+            if role is None:
+                continue
+            collect(role)
+            # A role without a group would label a pane with no node.
+            self.assertIn("pane_group", keywords)
+            self.assertIn("pane_group_size", keywords)
+        self.assertEqual(roles, {"builder", "reviewer", "tester"})
 
     def test_the_runs_launcher_is_given_a_workspace_label(self):
         labelled = []

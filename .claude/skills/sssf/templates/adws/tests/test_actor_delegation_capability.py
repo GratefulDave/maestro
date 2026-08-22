@@ -1,37 +1,26 @@
-"""No Maestro-launched actor may delegate the work its signature attests to.
+"""Tool policy is the omp profile. Maestro does not deny tools by default.
 
-§3.6 B12 says no actor signs off on its own output and review is cross-vendor
-over the merged surface. §1.2 says no lifecycle transition may be caused by an
-agent's claim about its own work. A reviewer that spawns a sub-task, blocks on
-it, and relays its conclusion breaks both at once — and breaks them invisibly,
-because the transcript, the receipt and the signature all name the actor
-Maestro launched, not the model that produced the judgement.
-
-`run-2a44d226e75a4be391a14f02b78a6d25` is the incident these tests exist for.
-23 of its 39 launched reviews spawned a named sub-task through omp's
-`hub`/`task` tools; 17 of those wrote a signed receipt attesting
-`{"model": "openai-codex/gpt-5.6-luna", "route": "omp"}` over a verdict
-produced by a `gpt-5.6-terra` sub-task, three of them PASS. The other six were
-SIGHUPed still holding `hub op=wait`, wrote no receipt, and were absorbed as
-environmental stalls that cancelled and rebuilt the builder.
-
-The tests below assert over the **real** argv builders rather than over a
-re-implementation of them, because the defect was never in a policy — there
-was no policy — but in what the launcher actually put on the command line.
+`--tools` / `--disallowedTools` is a secondary hatch behind
+`execution.restrict_actor_tools`, default off. `argv_denies_delegation` is
+an observation about an argv, not a launch gate.
 
 Run:  uv run adw_test.py -k delegation_capability
 """
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
+import maestro
 from adw_modules import launcher as lch
 from adw_modules import permissions
 from adw_modules import route_admission
 
 
-def _spec(route: str, session_dir: Path, prompt: Path) -> lch.LaunchSpec:
+def _spec(route: str, session_dir: Path, prompt: Path,
+          restrict_tools: bool = False) -> lch.LaunchSpec:
     return lch.LaunchSpec(
         correlation_token="cap-test",
         worktree=session_dir,
@@ -43,6 +32,7 @@ def _spec(route: str, session_dir: Path, prompt: Path) -> lch.LaunchSpec:
         profile="openai-performance" if route == "omp" else None,
         session_dir=session_dir,
         pane_role="reviewer",
+        restrict_tools=restrict_tools,
     )
 
 
@@ -102,41 +92,54 @@ class BuiltArgvTests(unittest.TestCase):
         self.session = self.root / "no-such-session-dir"
 
     def test_the_omp_argv_denies_delegation(self) -> None:
+        """Default launch passes no `--tools`. The profile is the policy.
+
+        This test previously asserted the detector True on an argv that still
+        listed `eval`. That pinned an inaccurate observation. The law is now
+        that a reviewer launch grants every tool the profile provides, and
+        the detector reports that as not-denied.
+        """
         argv = lch.build_omp_argv(
             Path("/usr/local/bin/omp"),
             _spec("omp", self.session, self.prompt))
-        self.assertIn("--tools", argv)
-        self.assertTrue(permissions.argv_denies_delegation("omp", argv))
+        self.assertIn("--pm-profile", argv)
+        self.assertEqual(argv[argv.index("--pm-profile") + 1],
+                         "openai-performance")
+        self.assertNotIn("--tools", argv)
+        self.assertFalse(permissions.argv_denies_delegation("omp", argv))
 
     def test_the_claude_argv_denies_delegation(self) -> None:
         argv = lch.build_claude_argv(
             Path("/usr/local/bin/claude"),
             _spec("claude", self.session, self.prompt))
-        self.assertIn("--disallowedTools", argv)
-        self.assertTrue(permissions.argv_denies_delegation("claude", argv))
+        self.assertNotIn("--disallowedTools", argv)
+        self.assertNotIn("--disallowed-tools", argv)
+        self.assertFalse(permissions.argv_denies_delegation("claude", argv))
 
     def test_the_prompt_positional_stays_last_on_the_omp_argv(self) -> None:
         """omp delivers the prompt as its `MESSAGES` positional.
 
-        The capability flag is inserted mid-argv, and an insertion after the
-        `@prompt` would turn the prompt path into a value for `--tools` — the
-        launch would start an agent with no prompt, which presents as the
-        silent stall §9.6 removed by putting the prompt on the command line in
-        the first place.
+        When the hatch is on, the capability flag is inserted mid-argv, and
+        an insertion after the `@prompt` would turn the prompt path into a
+        value for `--tools`.
         """
         argv = lch.build_omp_argv(
             Path("/usr/local/bin/omp"),
-            _spec("omp", self.session, self.prompt))
+            _spec("omp", self.session, self.prompt, restrict_tools=True))
         self.assertTrue(argv[-1].startswith("@"))
         self.assertLess(argv.index("--tools"), len(argv) - 1)
 
-    def test_the_admission_capture_argv_denies_delegation(self) -> None:
-        """The second production caller, and the one nobody would think of.
+    def test_the_restriction_hatch_actually_restricts(self) -> None:
+        argv = lch.build_omp_argv(
+            Path("/usr/local/bin/omp"),
+            _spec("omp", self.session, self.prompt, restrict_tools=True))
+        self.assertIn("--tools", argv)
+        granted = argv[argv.index("--tools") + 1].split(",")
+        self.assertNotIn("task", granted)
+        self.assertNotIn("hub", granted)
 
-        Route admission builds its own argv through the same builders. An
-        admission agent that could delegate would prove a route's continuity
-        under a capability set the run then does not use.
-        """
+    def test_the_admission_capture_argv_denies_delegation(self) -> None:
+        """Admission uses the same builders. Default: no `--tools` hatch."""
         spec = route_admission.RouteCaptureSpec(
             route="omp", cwd=self.root, herdr=Path("/usr/local/bin/herdr"),
             binary=Path("/usr/local/bin/omp"),
@@ -145,7 +148,8 @@ class BuiltArgvTests(unittest.TestCase):
             timeout_s=60.0)
         argv = route_admission._route_argv(
             spec, continuing=False, session_id=None)
-        self.assertTrue(permissions.argv_denies_delegation("omp", argv))
+        self.assertNotIn("--tools", argv)
+        self.assertFalse(permissions.argv_denies_delegation("omp", argv))
 
 
 class DetectorTests(unittest.TestCase):
@@ -176,6 +180,65 @@ class DetectorTests(unittest.TestCase):
         # constrained argv as unconstrained.
         argv = ("/usr/local/bin/claude", "--disallowed-tools", "Task", "Agent")
         self.assertTrue(permissions.argv_denies_delegation("claude", argv))
+
+    def test_an_argv_that_grants_eval_does_not_deny_delegation(self) -> None:
+        planted = (
+            "/usr/local/bin/omp", "--tools",
+            "read,write,edit,bash,grep,glob,todo,eval",
+            "@/tmp/prompt.md")
+        self.assertFalse(permissions.argv_denies_delegation("omp", planted))
+
+
+class RestrictActorToolsConfigTests(unittest.TestCase):
+    """The hatch is reachable from maestro.config.yaml, default off."""
+
+    def test_the_shipped_config_leaves_the_hatch_off(self) -> None:
+        raw = (Path(__file__).resolve().parent.parent
+               / "maestro.config.yaml").read_text(encoding="utf-8")
+        self.assertIn("restrict_actor_tools: false", raw)
+
+    def test_the_config_switch_reaches_the_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "project"
+            (repo / "adws").mkdir(parents=True)
+            (repo / "plans").mkdir()
+            (repo / ".git").mkdir()
+            binaries = {}
+            for name in ("herdr", "omp", "claude"):
+                binary = root / name
+                binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                binary.chmod(0o755)
+                binaries[name] = str(binary)
+            config = {
+                "schema": "maestro-config.v1",
+                "plans_dir": "plans",
+                "state_root": "../maestro-state",
+                "keys": {
+                    "verify_key_env": "MAESTRO_TEST_VERIFY_KEY",
+                    "signing_seed_env": "MAESTRO_TEST_SIGNING_SEED",
+                    "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
+                },
+                "executables": binaries,
+                "route_receipts": {"omp": "route-receipts/omp.json"},
+                "reviewer": {
+                    "route": "omp", "model": "review-model", "effort": "high",
+                    "finalization_timeout_s": 60, "turn_timeout_s": 20,
+                    "poll_interval_s": 1,
+                },
+                "execution": {
+                    "route": "omp", "model": "execution-model",
+                    "effort": "medium", "concurrency": 2,
+                    "node_timeout_s": 120, "turn_timeout_s": 30,
+                    "final_acceptance_timeout_s": 45, "backstop_t_s": 600,
+                    "semantic_ceiling": 3,
+                    "restrict_actor_tools": True,
+                },
+            }
+            path = repo / "adws" / "maestro.config.yaml"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            layout = maestro._load_maestro_layout(repo.resolve(), path)
+        self.assertTrue(layout["execution"]["restrict_actor_tools"])
 
 
 if __name__ == "__main__":

@@ -82,6 +82,14 @@ SCHEMA_V1 = "maestro-plan.v1"
 #: "a populated field cannot be audited by its consumers").
 SCHEMA_V2 = "maestro-plan.v2"
 
+#: The version that can declare a `tests` node. v1 and v2 stay frozen
+#: without that kind: a tests node under those versions cannot parse, so
+#: the pair cannot silently become two agent nodes. v2 remains runnable;
+#: v3 is runnable as well. Plan-contract projection still emits v2 — the
+#: IR has no tests/build split yet, and inventing one at projection would
+#: change every shipped lane's graph.
+SCHEMA_V3 = "maestro-plan.v3"
+
 #: The closed set of gate runners. §6.2 deleted the plain-argv arm for agent
 #: nodes: an exit-code-only gate cannot satisfy the counting rule.
 RUNNERS = ("pytest", "vitest")
@@ -316,6 +324,40 @@ def restrict_selector(gate: Gate, keep: Iterable[str]) -> Gate:
     return gate.model_copy(update={"argv": tuple(argv)})
 
 
+def unscoped_argv(argv: Sequence[str]) -> Tuple[str, ...]:
+    """Flags only: drop every token that selects cases.
+
+    The integration gate is the plan's one unscoped command (§8.8). A plan
+    that named paths or `-k` expressions still executes as the runner's
+    default whole-tree collection. Concatenating lane specs is the other
+    defect this function exists not to become: the union of what the lanes
+    already ran cannot see a test no lane owned.
+
+    Value flags travel with their values. Selector flags and path-shaped
+    tokens are dropped. Nothing here injects `-o addopts=`; that flag is a
+    collection-count concern and a full-suite integration run must not
+    carry it.
+    """
+    ordered = tuple(argv)
+    kept: List[str] = []
+    index = 0
+    while index < len(ordered):
+        token = ordered[index]
+        if token in SELECTOR_FLAGS and index + 1 < len(ordered):
+            index += 2
+            continue
+        if token in VALUE_FLAGS and index + 1 < len(ordered):
+            kept.extend(ordered[index:index + 2])
+            index += 2
+            continue
+        if token.startswith("-"):
+            kept.append(token)
+            index += 1
+            continue
+        index += 1
+    return tuple(kept)
+
+
 def _is_noise(token: str) -> bool:
     return token in NOISE_FLAGS or token.startswith(NOISE_PREFIXES)
 
@@ -438,7 +480,25 @@ class CodeNode(_NodeBase):
     expects_changes: bool
 
 
+class TestsNode(_NodeBase):
+    """Authored tests, written before the implementation they will judge.
+
+    Same fields as `AgentNode` because the agent is launched the same way.
+    The kind is the evidence-chain discriminator (§1.1 item 4): this node
+    is verified by new cases being red at the parent commit, never by a
+    green post-gate of tests it authored itself.
+    """
+
+    kind: Literal["tests"]
+    instruction: str = Field(min_length=1)
+    gate: Gate
+    prompt_assets: Tuple[PromptAsset, ...] = ()
+    effects: Tuple[NodeEffect, ...] = ()
+
+
 Node = Annotated[Union[AgentNode, CodeNode], Field(discriminator="kind")]
+V3Node = Annotated[Union[AgentNode, CodeNode, TestsNode],
+                   Field(discriminator="kind")]
 
 
 class MergePolicy(BaseModel):
@@ -480,6 +540,10 @@ class Plan(BaseModel):
     @property
     def code_nodes(self) -> Tuple[CodeNode, ...]:
         return tuple(n for n in self.nodes if isinstance(n, CodeNode))
+
+    @property
+    def tests_nodes(self) -> Tuple["TestsNode", ...]:
+        return tuple(n for n in self.nodes if isinstance(n, TestsNode))
 
     def node_by_id(self) -> Dict[str, Any]:
         return {node.node_id: node for node in self.nodes}
@@ -568,6 +632,14 @@ class Plan(BaseModel):
                     # check below compares the same objects by value and there
                     # is one representation of the fact.
                     effects=tuple(node.effects), **common)
+            elif isinstance(node, TestsNode):
+                result = st.PlanNode(
+                    kind=st.NodeKind.TESTS,
+                    gate_command=(node.gate.runner,) + tuple(node.gate.argv),
+                    gate_selector=selector_of(node.gate),
+                    gate_min_cases=node.gate.min_cases,
+                    instruction=node.instruction,
+                    effects=tuple(node.effects), **common)
             else:
                 result = st.PlanNode(
                     kind=st.NodeKind.CODE, command=tuple(node.command),
@@ -606,6 +678,22 @@ class PlanV2(Plan):
     model_config = _STRICT
 
     schema_version: Literal["maestro-plan.v2"]
+
+
+class PlanV3(Plan):
+    """`maestro-plan.v3`. Adds the authored `tests` node kind.
+
+    v1 and v2 stay frozen: their `nodes` union cannot represent `TestsNode`,
+    so a tests/build pair cannot parse as two agent nodes under those
+    versions. Methods are inherited; `nodes` is the structural difference
+    §6.3 said a v3 would carry, and the version string is how a runtime
+    that does not know this kind refuses rather than guessing.
+    """
+
+    model_config = _STRICT
+
+    schema_version: Literal["maestro-plan.v3"]
+    nodes: Tuple[V3Node, ...]  # type: ignore[assignment]
 
 
 # ── the projection is total, or it raises (§6.2, §3.6 B15) ─────────────────
@@ -650,7 +738,8 @@ def _normalized(value: Any) -> Any:
 #: distinction is written down and reviewed.
 _NODE_PROJECTION_EXEMPT: Dict[str, str] = {
     "kind": ("carried as `st.NodeKind`, which the projection sets explicitly "
-             "on each branch; the two enums are the same two kinds"),
+             "on each branch; the enums now include tests as well as "
+             "agent/code/review"),
     "gate": ("decomposed rather than dropped, into gate_command, "
              "gate_selector and gate_min_cases; `_GATE_PROJECTION` below "
              "accounts for every one of its own fields"),
@@ -723,7 +812,7 @@ def _assert_projection_is_total(node: "_NodeBase", projected: st.PlanNode) -> No
 
 IN_PLAN_TYPES: Tuple[Type[BaseModel], ...] = (
     Plan, Observed, Produced, Hypothesis, Gate, AgentNode, CodeNode,
-    MergePolicy, PromptAsset, NodeEffect)
+    TestsNode, MergePolicy, PromptAsset, NodeEffect)
 
 
 # ── the append-only parser registry (§6.3) ──────────────────────────────────
@@ -758,6 +847,7 @@ def registered_versions() -> Tuple[str, ...]:
 
 register_parser(SCHEMA_V1, Plan)
 register_parser(SCHEMA_V2, PlanV2)
+register_parser(SCHEMA_V3, PlanV3)
 
 
 def _pointer(loc: Sequence[Any]) -> str:

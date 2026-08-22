@@ -54,6 +54,9 @@ execution:
   model: grok-4.6
   effort: high
   profile: grok
+  # Secondary hatch. Default off: this profile is the tool policy. Maestro
+  # does not pass --tools unless this is true.
+  restrict_actor_tools: false
   # Compared against reviewer.vendor at preflight so no actor reviews its own
   # output (B12). Config-derived, not receipt-proven: route receipts are keyed
   # by route, and both profiles ride the same admitted `omp` receipt.
@@ -108,3 +111,9 @@ execution:
   #
   # Use the ecosystem's concurrency-safe install invocation. Up to
   # `concurrency` provisions may share the download cache at once.
+tester:
+  route: omp
+  model: grok-4.6
+  effort: high
+  profile: tester
+  vendor: xai

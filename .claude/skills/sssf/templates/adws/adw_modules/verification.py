@@ -478,6 +478,19 @@ def outputs_unnamed_by_gate(written: Sequence[str],
     return tuple(rel for rel in written if not _gate_names(rel, gate_argv))
 
 
+#: Counted predicate for the empty-revert-set case (#123). Zero unnamed
+#: paths means the gate's argv selected every path the node wrote — the
+#: hollow shape in its purest form, and the same defect class
+#: `TESTS_HOLLOW_AT_PARENT` convicts from the authoring side. The count
+#: is `len(reverted) == 0`. Honest agent nodes write a production file
+#: the gate does not select; tests nodes skip this path and use their
+#: own chain. SEMANTIC, never terminal: the agent can still write the
+#: missing subject.
+FALSIFICATION_NO_SUBJECT = (
+    "FALSIFICATION_NO_SUBJECT: every path this node wrote is selected by "
+    "its own gate, so the gate was never shown to observe anything else")
+
+
 def adjudicate_output_falsification(
         gate: GateVerdict, reverted: Sequence[str]) -> VerificationVerdict:
     """Refuse an attempt whose gate passes without the code it is meant to prove.
@@ -487,6 +500,10 @@ def adjudicate_output_falsification(
     tree with `reverted` put back to the attempt's base. A gate that still
     satisfies that rule with its subject removed was never observing the
     subject, and the attempt is refused whatever the reviewer thought of it.
+
+    An empty `reverted` is a counted no-subject, not a pass. `verified=True`
+    would report a check that never ran as a check that succeeded (#123).
+    Tests nodes do not come through here; they have `TESTS_HOLLOW_AT_PARENT`.
 
     This is the same shape as §7.4's pre-node clause, taken from the other
     side: clause 2 asks the gate to be red before the work exists, and this
@@ -498,7 +515,12 @@ def adjudicate_output_falsification(
     instructions naming the paths its tests must exercise are new
     instructions. It spends `semantic_ceiling` like any other content failure.
     """
-    if not reverted or not gate.green:
+    if not reverted:
+        return VerificationVerdict(
+            verified=False,
+            reason=FALSIFICATION_NO_SUBJECT,
+            retry_class=st.RetryClass.SEMANTIC)
+    if not gate.green:
         return VerificationVerdict(verified=True)
     return VerificationVerdict(
         verified=False,
@@ -525,10 +547,9 @@ def adjudicate_output_falsification(
 #                             over the persisted bytes on load
 #
 # Clauses 1 and 4 name `code_review`'s own report model and derivation rather
-# than `finalization`'s. That is the isolation A9's grading is confined by:
-# plan finalization keeps `fin.ReviewerReport` and `fin.derive_verdict`, which
-# have no grade to read and no threshold to be handed, so grading a node's
-# findings cannot change a plan's verdict.
+# than `finalization`'s. Plan finalization no longer dispatches a reviewer,
+# so there is no unthresholded `derive_verdict` left to isolate from. Grading
+# a node's findings cannot change a plan's verdict because a plan has none.
 #
 # all sequenced by `code_review.review_attempt`, whose `ReviewOutcome.passed` is
 # what the scheduler's review branch actually reads. Two expressions of one rule

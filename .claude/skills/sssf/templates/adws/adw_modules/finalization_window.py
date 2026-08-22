@@ -161,8 +161,9 @@ class FinalizationSignal(str, Enum):
 #: deliberately absent: it is a *live* status, and `launch()` returns while an
 #: agent still sits at a fresh prompt having done nothing, so treating idle as
 #: liveness is what made B14 undetectable. Quiescence detection arms only after
-#: one of these has been observed at least once.
-LIVE_WORKING_STATUSES = frozenset({"working", "blocked"})
+#: one of these has been observed at least once. Owned by the watchdog so the
+#: run-side clock (#107) and this window cannot drift apart.
+LIVE_WORKING_STATUSES = wd.LIVE_WORKING_STATUSES
 
 #: The status that means "back at the composer, not doing anything". After the
 #: reviewer has been observed working, this means it stopped without declaring

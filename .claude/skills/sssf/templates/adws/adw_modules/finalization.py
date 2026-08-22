@@ -95,10 +95,12 @@ class ObjectKind(str, Enum):
     that could still name a plan object would let the removed review be
     rebuilt by configuration.
 
-    The kernel below -- `compute_matrix`, `verify_report`, `derive_verdict`,
-    `Receipt`, `ReceiptStore` -- is written against this enum rather than
-    against code review, so it serves any rubric whose checks declare the
-    kinds it ranges over.
+    The kernel below -- `compute_matrix`, `verify_report`, `Receipt`,
+    `ReceiptStore` -- is written against this enum rather than against
+    code review, so it serves any rubric whose checks declare the kinds
+    it ranges over. Verdict derivation lives in `code_review.grade_verdict`;
+    plan finalization no longer dispatches a reviewer, so there is no
+    unthresholded second kernel.
     """
 
     DIFF = "diff"
@@ -469,34 +471,6 @@ class DerivedVerdict:
     verdict: Verdict
     cells: Tuple[DerivedCell, ...]
 
-
-def derive_verdict(matrix: ApplicabilityMatrix, report: ReviewerReport,
-                   rubric: Rubric) -> DerivedVerdict:
-    """FAIL if any graded cell carries a `finding` whose check is
-    BLOCKING; PASS otherwise.
-
-    Canary cells are carried into the receipt — coverage is auditable —
-    but take no part in this decision. They must not: the known-bad cell
-    is always answered `finding`, so counting it would fail every plan.
-    """
-    answered = {(c.check_id, c.object_id): c for c in report.cells}
-    cells: List[DerivedCell] = []
-    failed = False
-    for cell in matrix.cells:
-        answer = answered[cell.key]
-        if cell.is_canary:
-            severity = Severity.ADVISORY
-        else:
-            severity = rubric.check(cell.check_id).severity
-            if (answer.status is CellStatus.FINDING
-                    and severity is Severity.BLOCKING):
-                failed = True
-        cells.append(DerivedCell(
-            check_id=cell.check_id, object_id=cell.object_id,
-            status=answer.status, severity=severity, message=answer.message,
-            canary=cell.canary))
-    return DerivedVerdict(verdict=Verdict.FAIL if failed else Verdict.PASS,
-                          cells=tuple(cells))
 
 
 # ── the receipt and its store (§6.6) ────────────────────────────────────────

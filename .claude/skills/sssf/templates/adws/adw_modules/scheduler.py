@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import posixpath
 import signal
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -69,6 +70,7 @@ from . import reachability as rc
 from . import retry_policy as rp
 from . import scheduler_types as st
 from . import verification as vf
+from . import tests_chain as tc
 from . import watchdog as wd
 from . import worktree as wt
 
@@ -183,6 +185,16 @@ class RunPaused(RuntimeError):
     paused run is indistinguishable in the ledger from one whose scheduler
     process simply stopped, and `run resume` is legal against it for exactly
     that reason (§1.2, §7.8).
+    """
+
+
+class SigintInterrupt(BaseException):
+    """Injected by the SIGINT handler so a blocking wait unblocks.
+
+    Not `KeyboardInterrupt`: pytest treats that as a session abort, so a
+    test that delivers a real SIGINT would never get to assert the pause.
+    `BaseException` so `except Exception` cannot swallow it. The handler
+    is the only raiser; the run loop is the only catcher.
     """
 
 
@@ -307,6 +319,11 @@ class SchedulerDeps:
     #: unreviewed path is reachable only by a caller that constructs
     #: `SchedulerDeps` itself and omits it.
     review_attempt: Optional[ReviewRunner] = None
+    #: Raw per-pane agent status for the watchdog's turn clock (#107 / B14).
+    #: Never `observe()` — that call collapses idle into RUNNING. `None` is
+    #: not an observation of work: the clock still fires. `maestro run start`
+    #: supplies the reader; omitting it is the M30 failure mode.
+    actor_status: Optional[Callable[[st.AttemptRecord], Optional[str]]] = None
 
     def __post_init__(self) -> None:
         if self.quiesce_attempt is None:
@@ -387,12 +404,16 @@ class Scheduler:
 
     def __init__(self, run_id: str, nodes: Sequence[st.PlanNode],
                  config: st.SchedulerConfig, deps: SchedulerDeps,
-                 plan_digest: str = "") -> None:
+                 plan_digest: str = "",
+                 time_source: Callable[[], float] = time.time) -> None:
         self.run_id = run_id
         self.nodes: Dict[str, st.PlanNode] = {n.node_id: n for n in nodes}
         self.config = config
         self.deps = deps
         self.plan_digest = plan_digest
+        # Defaults to `time.time` so it matches `started_at` and
+        # `last_transition_at` (epoch seconds). Tests inject a fake.
+        self._time_source = time_source
 
         self._cancelled = threading.Event()
         #: Set beside `_cancelled`, never instead of it. The run loop's whole
@@ -401,6 +422,16 @@ class Scheduler:
         #: tells the loop not to write `cancel_run` on the way out, and the
         #: exit to raise `RunPaused` rather than declare.
         self._paused = threading.Event()
+        #: Signal-handler-safe latches. The handler must not take `_lock` or
+        #: call `Event.set`: either deadlocks if the interrupted thread holds
+        #: the matching lock. One Ctrl-C under `uv run` delivers SIGINT twice
+        #: (process-group + uv forward), so escalation is armed only after the
+        #: run loop has observed the pause, never on the second delivery of
+        #: the same chord.
+        self._sigint_pause_latched = False
+        self._sigint_escalate_armed = False
+        self._sigint_escalated = False
+        self._sigint_handler_installed = False
         self._lock = threading.RLock()
         # A watchdog timeout revokes a generation before quiescence can
         # complete and release its retry. The durable row remains RUNNING
@@ -551,26 +582,84 @@ class Scheduler:
         the run loop already reads; `_paused` is what makes the difference
         between the two stops. Nothing durable is written here or by the loop
         it stops — that is the property `run resume` depends on.
+
+        Not for the SIGINT handler: `Event.set` and `_lock` are not
+        signal-safe. The handler raises `KeyboardInterrupt`; this method
+        runs on the main thread after that interrupt is caught.
         """
         with self._lock:
             self._paused.set()
             self._cancelled.set()
 
     def _handle_sigint(self, signum, frame) -> None:
-        """SIGINT is a pause request, not a kill.
+        """SIGINT is a pause request; a later SIGINT after pause is armed
+        escalates by raising KeyboardInterrupt so a hung wait unblocks.
 
         `run pause` signals the claiming process rather than writing a row,
         because the process is the thing that has to stop — its `finally`
         releases the integration checkout, and a row could not have done that.
-        The handler latches and returns; the loop is what quiesces, so no
-        durable state is touched from inside a signal handler.
+        The handler latches a bool and raises; the loop is what quiesces, so
+        no durable state is touched from inside a signal handler. A second
+        SIGINT after the loop has armed escalation still writes nothing
+        (§1.2) — it only refuses to wait forever for a hung quiesce.
         """
-        self.request_pause()
+        if self._sigint_escalate_armed:
+            self._sigint_escalated = True
+            raise SigintInterrupt
+        self._sigint_pause_latched = True
+        raise SigintInterrupt
 
     def shutdown(self) -> None:
         pool, self._pool = self._pool, None
         if pool is not None:
             pool.shutdown(wait=True)
+
+    def _shutdown_escalated(self) -> None:
+        """Second SIGINT: do not wait for workers that have already hung."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _preserve_unpublished_work(
+            self, attempt: st.AttemptRecord,
+            reason: str = "NODE_TIMEOUT") -> None:
+        """Publish unpublished builder work onto the attempt ref (#97, #110).
+
+        Empty delta is a no-op — nothing to salvage. Errors propagate to the
+        caller: the watchdog still fails the attempt, and SIGINT escalate
+        still leaves the pause-shaped ledger.
+        """
+        with self._lock:
+            worktree = self._attempt_worktrees.get(attempt.node_id)
+        if (worktree is None
+                or worktree.attempt_no != attempt.attempt_no
+                or worktree.baseline is None):
+            return
+        after = wt.inventory(worktree.path)
+        measured = wt.delta(worktree.baseline, after)
+        if measured.is_empty:
+            return
+        wt.commit_measured_delta(
+            worktree, measured, after,
+            "{} attempt {} {}".format(
+                attempt.node_id, attempt.attempt_no, reason))
+
+    def _preserve_running_unpublished(self) -> None:
+        """PR #124's preserve step, for every RUNNING node, before escalate."""
+        for row in self.deps.store.node_records(self.run_id):
+            if row.state != st.NodeState.RUNNING.value:
+                continue
+            lifecycle = self.deps.store.get_node(self.run_id, row.node_id)
+            try:
+                attempt = self.deps.store.get_attempt(
+                    self.run_id, row.node_id, lifecycle.attempt_no)
+            except lc.UnknownNode:
+                continue
+            try:
+                self._preserve_unpublished_work(
+                    attempt, reason="SIGINT_ESCALATED")
+            except Exception:
+                continue
 
     def _owns_running(self, record: st.AttemptRecord) -> bool:
         lifecycle = self.deps.store.get_node(self.run_id, record.node_id)
@@ -622,6 +711,8 @@ class Scheduler:
             return
         try:
             self.deps.quiesce_attempt(record, phase)
+        except (KeyboardInterrupt, SigintInterrupt):
+            raise
         except BaseException as exc:
             raise QuiescenceFailure(phase, exc) from exc
 
@@ -724,21 +815,30 @@ class Scheduler:
         stays PENDING forever and is exactly the shape the run must stop on.
 
         One exit does not declare: a pause. `run pause` SIGINTs this process,
-        `_handle_sigint` latches `_paused`, and the loop stops the same way a
-        cancel stops it — except that nothing durable is written and the exit
-        raises `RunPaused` instead. The handler is installed for the duration
-        of the loop and the previous one restored on every path out, including
+        `_handle_sigint` raises `KeyboardInterrupt`, the loop latches
+        `_paused`, and the loop stops the same way a cancel stops it —
+        except that nothing durable is written and the exit raises
+        `RunPaused` instead. The handler is installed for the duration of
+        the loop and the previous one restored on every path out, including
         the exceptional ones, so a scheduler embedded in a longer-lived
         process does not leave its SIGINT behind. Installing it can fail
-        outright off the main thread, and that is not an error — a scheduler
-        that cannot receive the signal simply cannot be paused by it.
+        outright off the main thread; that is printed as
+        `SIGINT_HANDLER_NOT_INSTALLED` rather than swallowed, and a
+        scheduler that cannot receive the signal simply cannot be paused by
+        it.
         """
         previous_sigint = None
         try:
             previous_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
-        except ValueError:
+            self._sigint_handler_installed = True
+        except ValueError as exc:
             previous_sigint = None
+            self._sigint_handler_installed = False
+            print("SIGINT_HANDLER_NOT_INSTALLED: {0}".format(exc),
+                  file=sys.stderr)
         self.project()
+        if self._sigint_pause_latched:
+            self.request_pause()
         if self._paused.is_set():
             return self._finish_paused(previous_sigint)
         if self._cancelled.is_set():
@@ -752,98 +852,114 @@ class Scheduler:
         watchdog.start()
         try:
             while True:
-                if self._cancelled.is_set():
-                    # A Future cannot interrupt a running worker. Quiesce its
-                    # owned execution first, then wait for the worker to stop
-                    # observing its RUNNING lease before cancelling durable
-                    # state. Otherwise a late worker could commit into a retry.
-                    self._interrupt_in_flight(in_flight, cancellation_requested)
-                    if in_flight:
-                        done, _ = _wait_any(list(in_flight.items()))
-                        for node_id in done:
-                            in_flight.pop(node_id, None)
-                        continue
-                    # A pause takes this same path to quiesce, and writes
-                    # nothing on the way out: `cancel_run` is a lifecycle
-                    # transition, and a pause makes none (§1.2).
-                    if not self._paused.is_set():
-                        self.deps.store.cancel_run(self.run_id)
-                    break
-
-                if backstop.check():
-                    # §11.2 — the backstop's domain is the run's stopping
-                    # point, not quiescence: both hang shapes it exists for
-                    # have something in flight and nothing transitioning, so
-                    # STUCK is declared about a run that still has workers.
-                    #
-                    # It still has to *stop* those workers, and `Future.cancel`
-                    # does not: a running worker is not cancellable, and the
-                    # `finally` below already waits on the pool. Cancelling
-                    # only the futures therefore left the run blocked in
-                    # `shutdown(wait=True)` until each worker reached its own
-                    # node timeout — the backstop fired and nothing stopped.
-                    # Quiescing owned execution first is what makes the
-                    # workers return; the outcome is STUCK either way.
-                    self._stuck = True
-                    self._interrupt_in_flight(in_flight, cancellation_requested)
-                    if in_flight:
-                        done, _ = _wait_any(list(in_flight.items()))
-                        for node_id in done:
-                            in_flight.pop(node_id, None)
-                        continue
-                    break
-
-                self._merge_frontier()
-                if self._cancelled.is_set():
-                    continue
-
-                ready = [node_id for node_id in self.deps.store.ready_nodes(self.run_id)
-                         if node_id not in in_flight]
-                for node_id in ready:
-                    if (self._cancelled.is_set()
-                            or len(in_flight) >= self.config.concurrency):
+                try:
+                    if self._cancelled.is_set():
+                        # A Future cannot interrupt a running worker. Quiesce its
+                        # owned execution first, then wait for the worker to stop
+                        # observing its RUNNING lease before cancelling durable
+                        # state. Otherwise a late worker could commit into a retry.
+                        # Arm escalation only here, after the loop has observed
+                        # the pause: a single Ctrl-C under `uv run` delivers
+                        # SIGINT twice, and that burst must not escalate.
+                        if self._paused.is_set() or self._sigint_pause_latched:
+                            self._sigint_escalate_armed = True
+                        self._interrupt_in_flight(in_flight, cancellation_requested)
+                        if in_flight:
+                            done, _ = _wait_any(list(in_flight.items()))
+                            for node_id in done:
+                                in_flight.pop(node_id, None)
+                            continue
+                        # A pause takes this same path to quiesce, and writes
+                        # nothing on the way out: `cancel_run` is a lifecycle
+                        # transition, and a pause makes none (§1.2).
+                        if not self._paused.is_set():
+                            self.deps.store.cancel_run(self.run_id)
                         break
-                    in_flight[node_id] = self._pool.submit(self._attempt, node_id)
 
-                if not in_flight:
-                    # Nothing running. If the frontier produced nothing to
-                    # start either, no node can progress and the run is
-                    # quiescent.
-                    self._merge_frontier()
-                    if self.deps.store.ready_nodes(self.run_id):
-                        continue
-                    if self._settling():
-                        # Not quiescent — mid-verdict. `ready_nodes` returns
-                        # only PENDING nodes, so a node whose durable row still
-                        # says RUNNING while no worker holds it is invisible to
-                        # the readiness check AND to the blocked set. The loop
-                        # therefore declared the residual BLOCKED naming
-                        # nothing: `{"blocked": [], "merged": [], "outcome":
-                        # "BLOCKED"}`, with the node still PENDING at attempt 2
-                        # and no block_reason — a run that stops with work left
-                        # to do and reports it as a mystery. Reproduced 8 times
-                        # in 40 whenever a worker returned before the
-                        # watchdog's verdict committed.
+                    if backstop.check():
+                        # §11.2 — the backstop's domain is the run's stopping
+                        # point, not quiescence: both hang shapes it exists for
+                        # have something in flight and nothing transitioning, so
+                        # STUCK is declared about a run that still has workers.
                         #
-                        # Waiting is bounded rather than open-ended: if no
-                        # verdict ever lands, §11.2's backstop declares STUCK,
-                        # which is the truthful answer for a run that stopped
-                        # with something in flight. The wait is on the
-                        # cancellation event so a cancel stays responsive.
-                        self._cancelled.wait(_SETTLING_POLL_S)
-                        continue
-                    break
+                        # It still has to *stop* those workers, and `Future.cancel`
+                        # does not: a running worker is not cancellable, and the
+                        # `finally` below already waits on the pool. Cancelling
+                        # only the futures therefore left the run blocked in
+                        # `shutdown(wait=True)` until each worker reached its own
+                        # node timeout — the backstop fired and nothing stopped.
+                        # Quiescing owned execution first is what makes the
+                        # workers return; the outcome is STUCK either way.
+                        self._stuck = True
+                        self._interrupt_in_flight(in_flight, cancellation_requested)
+                        if in_flight:
+                            done, _ = _wait_any(list(in_flight.items()))
+                            for node_id in done:
+                                in_flight.pop(node_id, None)
+                            continue
+                        break
 
-                done, _ = _wait_any(list(in_flight.items()))
-                for node_id in done:
-                    in_flight.pop(node_id, None)
+                    self._merge_frontier()
+                    if self._cancelled.is_set():
+                        continue
+
+                    ready = [node_id for node_id in self.deps.store.ready_nodes(self.run_id)
+                             if node_id not in in_flight]
+                    for node_id in ready:
+                        if (self._cancelled.is_set()
+                                or len(in_flight) >= self.config.concurrency):
+                            break
+                        in_flight[node_id] = self._pool.submit(self._attempt, node_id)
+
+                    if not in_flight:
+                        # Nothing running. If the frontier produced nothing to
+                        # start either, no node can progress and the run is
+                        # quiescent.
+                        self._merge_frontier()
+                        if self.deps.store.ready_nodes(self.run_id):
+                            continue
+                        if self._settling():
+                            # Not quiescent — mid-verdict. `ready_nodes` returns
+                            # only PENDING nodes, so a node whose durable row still
+                            # says RUNNING while no worker holds it is invisible to
+                            # the readiness check AND to the blocked set. The loop
+                            # therefore declared the residual BLOCKED naming
+                            # nothing: `{"blocked": [], "merged": [], "outcome":
+                            # "BLOCKED"}`, with the node still PENDING at attempt 2
+                            # and no block_reason — a run that stops with work left
+                            # to do and reports it as a mystery. Reproduced 8 times
+                            # in 40 whenever a worker returned before the
+                            # watchdog's verdict committed.
+                            #
+                            # Waiting is bounded rather than open-ended: if no
+                            # verdict ever lands, §11.2's backstop declares STUCK,
+                            # which is the truthful answer for a run that stopped
+                            # with something in flight. The wait is on the
+                            # cancellation event so a cancel stays responsive.
+                            self._cancelled.wait(_SETTLING_POLL_S)
+                            continue
+                        break
+
+                    done, _ = _wait_any(list(in_flight.items()))
+                    for node_id in done:
+                        in_flight.pop(node_id, None)
+                except (KeyboardInterrupt, SigintInterrupt):
+                    if self._sigint_escalated:
+                        self.request_pause()
+                        break
+                    self.request_pause()
+                    continue
         finally:
             watchdog.stop()
-            self.shutdown()
+            if self._sigint_escalated:
+                self._preserve_running_unpublished()
+                self._shutdown_escalated()
+            else:
+                self.shutdown()
             if previous_sigint is not None:
                 signal.signal(signal.SIGINT, previous_sigint)
 
-        if self._paused.is_set():
+        if self._paused.is_set() or self._sigint_pause_latched:
             raise RunPaused(self.run_id)
         return self._declare()
 
@@ -871,8 +987,8 @@ class Scheduler:
         to `time.monotonic`, while the store's `last_transition_at` returns
         epoch seconds — subtracting one from the other yields a number with no
         meaning, and on this machine a large negative one, so the backstop
-        would simply never fire. The timer is therefore given `time.time`,
-        matching the column it reads.
+        would simply never fire. Both timers therefore read `self._time_source`,
+        which production defaults to `time.time`, matching the column they read.
         """
         store = self.deps.store
 
@@ -995,6 +1111,15 @@ class Scheduler:
                 self.run_id, attempt.node_id,
                 attempt.attempt_no) is st.Adjudication.ACCEPTED
 
+        def preserve_unpublished(attempt: st.AttemptRecord) -> None:
+            """Publish unpublished builder work onto the attempt ref (#97).
+
+            Kill already ran. Empty delta is a no-op — nothing to salvage.
+            Errors propagate to the watchdog's preserve wrapper, which still
+            fails the attempt.
+            """
+            self._preserve_unpublished_work(attempt)
+
         watchdog = wd.Watchdog(
             config=self.config,
             attempts_provider=running_attempts,
@@ -1003,14 +1128,16 @@ class Scheduler:
             fail_attempt=fail,
             exit_status_observed=exit_status_observed,
             declared_result_observed=declared_result_observed,
-            time_source=time.time)
+            actor_status=self.deps.actor_status,
+            preserve_unpublished=preserve_unpublished,
+            time_source=self._time_source)
 
         backstop = wd.RunBackstop(
             config=self.config,
             last_transition_at=lambda: store.last_transition_at(self.run_id),
             on_stuck=lambda diagnostic: None,
             diagnostic=self.status_diagnostic,
-            time_source=time.time)
+            time_source=self._time_source)
         return watchdog, backstop
 
     def status_diagnostic(self) -> str:
@@ -1153,25 +1280,28 @@ class Scheduler:
         """
         store = self.deps.store
         repo = Path(self.deps.repo)
-        attempts = store.attempts_for(self.run_id, node.node_id)
+        attempts = tuple(store.attempts_for(self.run_id, node.node_id))
         prior = max(attempts, key=lambda row: row.attempt_no, default=None)
+        subject = rp.repair_subject(attempts)
+        prove = subject if subject is not None else prior
         rejected_ref_sha: Optional[str] = None
         output_proven = False
-        if prior is not None:
+        if prove is not None:
             rejected_ref_sha = wt.attempt_ref_commit(
-                repo, self.run_id, node.node_id, prior.attempt_no)
-            rejected_sha = (prior.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
+                repo, self.run_id, node.node_id, prove.attempt_no)
+            rejected_sha = (prove.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
             if isinstance(rejected_sha, str) and rejected_sha:
                 output_proven = wt.is_attempt_output_commit(
                     repo, rejected_sha, run_id=self.run_id,
-                    node_id=node.node_id, attempt_no=prior.attempt_no,
-                    expected_base=prior.base_sha)
+                    node_id=node.node_id, attempt_no=prove.attempt_no,
+                    expected_base=prove.base_sha)
         return rp.decide_repair(rp.RepairFacts(
             integration_head=head,
             prior=prior,
             rejected_ref_sha=rejected_ref_sha,
             output_proven=output_proven,
-            repaired_findings=rp.repaired_findings_count(attempts, prior)))
+            repaired_findings=rp.repaired_findings_count(attempts, subject),
+            attempts=attempts))
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
@@ -1390,6 +1520,12 @@ class Scheduler:
                 exit_code=execution.exit_code, permission=permission,
                 diff_empty=not measured.touched,
                 expects_changes=node.expects_changes)
+        elif node.kind is st.NodeKind.TESTS:
+            verdict = tc.verify_tests_node(
+                envelope_parsed=execution.envelope_parsed,
+                permission=permission,
+                written=measured.touched,
+                new_case_count=0)
         else:
             # Clause 4 is evaluated here, at measurement, and the commit
             # follows it immediately (§8.4). Clause 3 is evaluated after the
@@ -1403,6 +1539,22 @@ class Scheduler:
         if not verdict.verified and verdict.failed_clause != 3:
             self._settle_context(context)
             self._settle_verdict(node, verdict, execution, record)
+            return
+
+        if basis is not None and measured.is_empty:
+            # #113: an empty repair mints no new sha. Classified rather than
+            # committed, so review_digest cannot key a byte-identical tree
+            # under a new commit and re-ask the reviewer. Non-repair empty
+            # deltas still go through commit_measured_delta unchanged.
+            self._settle_context(context)
+            self._settle_verdict(
+                node,
+                vf.VerificationVerdict(
+                    verified=False,
+                    reason=rp.REPAIR_DIFF_EMPTY,
+                    retry_class=st.RetryClass.SEMANTIC),
+                execution, record,
+                extra_facts={rp.REPAIR_DIFF_EMPTY_KEY: True})
             return
 
         with self._lock:
@@ -1446,6 +1598,15 @@ class Scheduler:
             if not verdict.verified:
                 self._settle_context(context)
                 self._settle_verdict(node, verdict, execution, record)
+                return
+        elif node.kind is st.NodeKind.TESTS:
+            self._require_running(record)
+            parent_red = self._prove_tests_red_at_parent(
+                node, attempt, measured)
+            self._require_running(record)
+            if not parent_red.verified:
+                self._settle_context(context)
+                self._settle_verdict(node, parent_red, execution, record)
                 return
 
         # The final proof covers post-gates as well as every failure path
@@ -1566,20 +1727,17 @@ class Scheduler:
 
         The check has no subject when every path the attempt wrote is selected
         by the node's own gate — a node that produced nothing but the files its
-        gate counts. That shape is the defect in its purest form and is
-        **reported, not refused**: no plan this runtime has executed contains
-        one, so a refusal would be a rule with no measured case behind it, and
-        this design does not ship those (§16.3).
+        gate counts. That is a count (`len(unnamed) == 0`), the same hollow
+        class `TESTS_HOLLOW_AT_PARENT` convicts for tests nodes. Refused as
+        SEMANTIC, never reported as `verified=True` (#123). Tests nodes do
+        not reach this method.
         """
         argv = tuple(node.gate_command)[1:]
         written = wt.paths_written_since(attempt, falsify_base)
         unnamed = vf.outputs_unnamed_by_gate(written, argv)
         if not unnamed:
-            self._report_hygiene(node.node_id, (
-                "falsification-unrevertable: every path this node wrote is "
-                "selected by the node's own gate, so the gate could not be "
-                "re-asked without its subject",))
-            return vf.VerificationVerdict(verified=True)
+            return vf.adjudicate_output_falsification(
+                vf.GateVerdict(green=False, unparseable=False, counts=None), ())
         reverted = wt.revert_paths_to(attempt, falsify_base, unnamed)
         try:
             result = self.deps.run_gate(
@@ -1588,6 +1746,33 @@ class Scheduler:
             wt.restore_paths_from_head(attempt, reverted)
         return vf.adjudicate_output_falsification(
             vf.adjudicate_gate(result, node.gate_min_cases), reverted)
+
+    def _prove_tests_red_at_parent(
+            self, node: st.PlanNode, attempt: wt.AttemptWorktree,
+            measured: "wt.InventoryDelta") -> "vf.VerificationVerdict":
+        """Tests-node evidence: new cases, each red at this attempt's base.
+
+        The worktree *is* the parent commit plus the tests this node wrote,
+        so running the new nodeids here is the parent-red check. Collection
+        uses `--collect-only -q -o addopts=`; a collection error or import
+        crash is not a satisfying red. Newly created test files have no
+        parent nodeids, which is the ordinary case this chain is for.
+        """
+        del node  # selector lives on the written test files, not the command
+        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
+        current = tc.collect_nodeids(attempt.path, test_paths)
+        try:
+            parent = tc.collect_parent_nodeids(
+                attempt.path, attempt.base, test_paths)
+        except tc.TestsGitReadFailed as exc:
+            return vf.VerificationVerdict(
+                verified=False, failed_clause=3,
+                reason="{0}: {1}".format(
+                    tc.TestsRefusal.COLLECTION_FAILED.value, exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL)
+        new = tc.new_nodeids(parent, current)
+        parent_run = tc.run_cases(attempt.path, new)
+        return tc.adjudicate_parent_red(parent_run, len(new))
 
     def _review_with_redispatch(self, node: st.PlanNode, record: st.AttemptRecord,
                                 attempt: wt.AttemptWorktree, head: str,
@@ -1700,13 +1885,14 @@ class Scheduler:
         would refuse every re-dispatch on a ledger old enough to lack it.
         Unmeasured is not zero.
 
-        `time.time()` and not `time.monotonic()`: `start_attempt` writes
+        `self._time_source()` and not a second clock: `start_attempt` writes
         `started_at` with `time.time()`, and subtracting one clock's reading
-        from another's is a number with no meaning.
+        from another's is a number with no meaning. Production therefore
+        defaults the seam to `time.time`.
         """
         if record.started_at <= 0:
             return None
-        return self.config.node_timeout_s - (time.time() - record.started_at)
+        return self.config.node_timeout_s - (self._time_source() - record.started_at)
 
     # ── settling a failed attempt ───────────────────────────────────────────
 
@@ -1813,13 +1999,10 @@ class Scheduler:
         """Turn a failed VERIFIED predicate into a classification (§7.5).
 
         `extra_facts` is merged onto the failing attempt's row beside the
-        guidance entry. Exactly one caller passes it and it carries exactly one
-        fact: the output commit of an attempt that failed §7.4's post-work
-        falsification refusal, which reached that failure with a sealed commit
-        in hand. `decide_repair` proves the repair basis against that commit,
-        so an attempt that failed without recording it is re-implemented from
-        the integration head rather than repaired — which is the discard §7.5's
-        repair chain exists to prevent.
+        guidance entry. Two callers pass it. Falsification refusal carries
+        the sealed output commit `decide_repair` proves against. Empty
+        repair carries `REPAIR_DIFF_EMPTY_KEY`, so `repair_subject` can
+        walk past a row that minted no tree.
         """
         if verdict.block_reason is not None:
             self._settle_failure(
@@ -2265,7 +2448,7 @@ class Scheduler:
             return AcceptanceResult(
                 green=False, specs=(), reason="cancellation requested before acceptance")
         store.acceptance_started(self.run_id)
-        deadline = time.monotonic() + self.config.final_acceptance_timeout_s
+        deadline = self._time_source() + self.config.final_acceptance_timeout_s
 
         with self._lock:
             shas = {n: self._output_shas[n] for n in merged if n in self._output_shas}
@@ -2278,7 +2461,7 @@ class Scheduler:
             return AcceptanceResult(
                 green=False, specs=(), ancestry=ancestry,
                 reason="the final ancestry sweep did not re-prove every merged node")
-        if time.monotonic() > deadline:
+        if self._time_source() > deadline:
             return AcceptanceResult(green=False, specs=(), ancestry=ancestry,
                                     reason="final-acceptance timeout during the sweep")
 
@@ -2295,7 +2478,7 @@ class Scheduler:
                 green=False, specs=specs, gate=gate, ancestry=ancestry,
                 reason="cancellation requested during the final integration gate")
         verdict = vf.adjudicate_gate(gate, self.deps.integration_min_cases)
-        if time.monotonic() > deadline:
+        if self._time_source() > deadline:
             return AcceptanceResult(green=False, specs=specs, gate=gate,
                                     ancestry=ancestry,
                                     reason="final-acceptance timeout during the gate")

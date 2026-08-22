@@ -80,7 +80,7 @@ from . import scheduler_types as st
 #: A diff and each changed file are review objects in exactly the sense
 #: `finalization.ObjectKind` already means. Extending that enum rather than
 #: minting a parallel one is what lets `compute_matrix`, `verify_report`,
-#: `derive_verdict`, `Receipt`, and `ReceiptStore` be reused verbatim.
+#: `grade_verdict`, `Receipt`, and `ReceiptStore` be reused verbatim.
 DIFF = fin.ObjectKind.DIFF
 CHANGED_FILE = fin.ObjectKind.CHANGED_FILE
 
@@ -542,12 +542,10 @@ def grade_verdict(matrix: fin.ApplicabilityMatrix,
     """FAIL iff some graded cell is a BLOCKING finding graded at or above
     `reject_at`. PASS otherwise.
 
-    The same shape as `finalization.derive_verdict`, and deliberately a second
-    function rather than a threshold parameter on it: plan finalization's
-    verdicts are **unchanged** by this file, and the way to keep them unchanged
-    is for its derivation to have no threshold to be handed. Canary cells take
-    no part here for the reason they take none there — the known-bad control is
-    answered `finding` by construction, so counting it would fail every diff.
+    This is the one verdict kernel. Plan finalization no longer dispatches
+    a reviewer, so there is no unthresholded sibling to keep unchanged.
+    Canary cells take no part: the known-bad control is answered `finding`
+    by construction, so counting it would fail every diff.
     """
     answered = {(c.check_id, c.object_id): c for c in report.cells}
     cells: List[GradedCell] = []

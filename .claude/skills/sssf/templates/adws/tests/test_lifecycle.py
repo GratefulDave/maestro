@@ -317,6 +317,17 @@ class RunOutcomeTotalityTests(unittest.TestCase):
             stuck=False, cancel_requested=False, acceptance_result=True)
         self.assertEqual(report.outcome, st.RunOutcome.ACCEPTED)
         self.assertEqual(report.abandoned_nodes, ("b",))
+        self.assertIs(report.acceptance_result, True)
+
+    def test_accepted_records_the_green_acceptance_result(self):
+        """G3 — ACCEPTED keys on `acceptance_result is True`, then used to
+        construct the report without that field, so the ledger persisted
+        null. The r7 `acceptance_result: null` is this, not a skipped gate."""
+        report = lc.total_run_outcome(
+            [("a", st.NodeState.MERGED, None)], stuck=False,
+            cancel_requested=False, acceptance_result=True)
+        self.assertEqual(report.outcome, st.RunOutcome.ACCEPTED)
+        self.assertIs(report.acceptance_result, True)
 
     def test_accepted_refused_when_acceptance_is_not_green(self):
         report = lc.total_run_outcome(
@@ -369,6 +380,25 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
                 " ('BLOCKED','ACCEPTED','CANCELLED','STUCK') AND node_id IS NULL",
                 ("run1",)).fetchone()[0]
             self.assertEqual(declared, 2)
+
+    def test_declare_outcome_persists_the_green_acceptance_on_accepted(self):
+        """G3 — `declare_outcome` writes `report.acceptance_result` into the
+        transition detail. Before the ACCEPTED arm carried the field, this
+        was null on a green run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.mark_verified("run1", "a", output_sha="sha_a")
+            store.mark_merged("run1", "a")
+            report = store.declare_outcome("run1", acceptance_result=True)
+            self.assertEqual(report.outcome, st.RunOutcome.ACCEPTED)
+            self.assertIs(report.acceptance_result, True)
+            declared = [
+                row for row in store.audit_transitions("run1")
+                if row.get("reason") == "declare-outcome"]
+            self.assertEqual(len(declared), 1)
+            self.assertIs(declared[0]["detail"]["acceptance_result"], True)
 
     def test_resume_is_legal_against_blocked_stuck_and_null(self):
         with tempfile.TemporaryDirectory() as tmp:

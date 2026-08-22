@@ -237,9 +237,9 @@ class TheGreenControl(ValidationTestCase):
         self.assertEqual(result.outcome, pv.Outcome.AUTHORING_BLOCKED)
         self.assertIsNone(result.digest)
 
-    def test_there_are_exactly_fourteen_obligations(self):
-        self.assertEqual(len(pv.OBLIGATIONS), 14)
-        self.assertEqual(len(set(pv.OBLIGATIONS)), 14)
+    def test_there_are_exactly_fifteen_obligations(self):
+        self.assertEqual(len(pv.OBLIGATIONS), 15)
+        self.assertEqual(len(set(pv.OBLIGATIONS)), 15)
         self.assertEqual(set(pv.OBLIGATIONS), set(pv.Obligation))
 
     def test_every_obligation_is_reported_not_only_the_first(self):

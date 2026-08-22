@@ -141,12 +141,19 @@ class AdjudicateOutputFalsificationTests(unittest.TestCase):
         self.assertFalse(vf.adjudicate_output_falsification(
             vf.adjudicate_gate(green(9), 9), ("src/a.py",)).verified)
 
-    def test_nothing_to_revert_is_not_a_refusal(self):
-        """The check has no subject when every path the node wrote is selected
-        by its own gate. Reported by the scheduler, never convicted here —
-        a refusal with no measured case behind it is not shipped (§16.3)."""
-        self.assertTrue(vf.adjudicate_output_falsification(
-            vf.adjudicate_gate(green(9), 9), ()).verified)
+    def test_nothing_to_revert_is_not_verified(self):
+        """Empty `reverted` is a counted no-subject, not a pass (#123).
+
+        The old claim was `verified=True` for a check that never ran. Honest
+        nodes have a production path the gate does not select; that path is
+        the green control in `TheLoopTests`. Tests nodes never reach this
+        adjudicator.
+        """
+        verdict = vf.adjudicate_output_falsification(
+            vf.adjudicate_gate(green(9), 9), ())
+        self.assertFalse(verdict.verified)
+        self.assertIs(verdict.retry_class, st.RetryClass.SEMANTIC)
+        self.assertIn("FALSIFICATION_NO_SUBJECT", verdict.reason)
 
 
 # ── the git mechanics, over a real worktree ─────────────────────────────────
@@ -389,10 +396,8 @@ class TheLoopTests(GateReadsTheTreeFixture):
 class TheCheckHasNoSubjectTests(GateReadsTheTreeFixture):
     """A node that wrote nothing outside its own gate's selector.
 
-    This is the hollow shape in its purest form and it is **reported, not
-    refused**: no plan this runtime has executed contains one, so a refusal
-    here would be a rule with no measured case behind it. The residual is
-    stated rather than closed, and the report is where an operator finds it.
+    The hollow shape in its purest form. The count is `len(unnamed) == 0`.
+    It must not merge while claiming it was verified (#123).
     """
 
     def builder(self, hollow=True):
@@ -405,19 +410,25 @@ class TheCheckHasNoSubjectTests(GateReadsTheTreeFixture):
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
         return run_node
 
-    def test_it_merges_and_says_so_on_the_hygiene_channel(self):
-        report = self.schedule(
+    def test_it_does_not_merge_claiming_it_was_verified(self):
+        self.schedule(
             [self.agent()],
+            config=self.config(semantic_ceiling=1),
             deps=self.deps(run_node=self.builder(),
                            run_gate=self.tree_reading_gate())).run()
 
-        self.assertEqual(self.states()["p5"], st.NodeState.MERGED.value)
-        entries = report.adapter_hygiene["p5"]
+        self.assertNotEqual(self.states()["p5"], st.NodeState.MERGED.value)
+        self.assertIs(self.store.get_node("run1", "p5").state,
+                      st.NodeState.BLOCKED)
+        rows = sorted(self.store.attempts_for("run1", "p5"),
+                      key=lambda row: row.attempt_no)
+        self.assertIs(rows[0].retry_class, st.RetryClass.SEMANTIC)
+        audits = self.store.audit_transitions("run1", "p5")
         self.assertTrue(
-            any("falsification-unrevertable" in entry for entry in entries),
-            entries)
-        # The gate was asked twice, not three times: there was nothing to
-        # take out, so no third run was paid for.
+            any("FALSIFICATION_NO_SUBJECT" in str(row.get("detail"))
+                for row in audits),
+            audits)
+        # Nothing to take out, so the third gate run is still not paid for.
         self.assertEqual(["pre", "post"], self.gate_calls)
 
 
