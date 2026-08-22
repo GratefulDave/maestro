@@ -105,7 +105,9 @@ function dotClass(state: string): string {
         <div class="row top">
           <span class="plan">{{ run.plan_name ?? 'plan not installed' }}</span>
           <MaestroStateChip :state="run.state" />
+          <MaestroStateChip :state="run.scheduler_liveness" small />
         </div>
+
 
         <!-- The digest is the plan's identity in the ledger; the name only
              exists when the plan files are still installed and unchanged, so

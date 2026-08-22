@@ -12,7 +12,9 @@ export function RunCard({ run }: { run: FleetRun }) {
       <div className="run-card-head">
         <span className="run-repo">{run.source_label}</span>
         <StatusPill status={run.state} />
+        <StatusPill status={run.scheduler_liveness} />
       </div>
+
       <strong className="run-id">{run.plan_name ?? run.plan_digest}</strong>
       <div className="run-progress" aria-label={`${complete} of ${laneCount} nodes merged`}>
         <span style={{ width: laneCount ? `${(complete / laneCount) * 100}%` : "0%" }} />

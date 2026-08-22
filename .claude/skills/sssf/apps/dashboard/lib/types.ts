@@ -20,7 +20,13 @@ export type SourcesResponse = SourceInfo[];
 export type MaestroNodeState = string;
 export type MaestroRunOutcome = string;
 export type MaestroLiveState = string;
+export type RunLiveness =
+  | "running"
+  | "abandoned"
+  | "unknown"
+  | "not_running";
 export type MaestroCancelCause = string;
+
 export type MaestroMergeCause = string;
 
 export interface MaestroTransition {
@@ -117,6 +123,8 @@ export interface MaestroRunSummary {
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;
+  scheduler_liveness: RunLiveness;
+
   declared_outcome: MaestroRunOutcome | null;
   declared_outcome_at: string | null;
   cancel_cause: MaestroCancelCause | null;
@@ -133,6 +141,8 @@ export interface MaestroRunDetail {
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;
+  scheduler_liveness: RunLiveness;
+
   declared_outcome: MaestroRunOutcome | null;
   declared_outcome_at: string | null;
   cancel_cause: MaestroCancelCause | null;

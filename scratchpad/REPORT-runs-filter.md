@@ -126,3 +126,64 @@ hub start dash-4318 -p 4318 MAESTRO_API_PORT=4600
 ```
 
 No `run start` / `run resume`. No ledger writes.
+
+# Follow-up — D1 + filter retune (2026-08-22)
+
+## Task A — run scheduler liveness
+
+Read-side only. `observeRunLiveness` mirrors #127: `running` / `abandoned` /
+`unknown` (plus `not_running` when liveState is already terminal). Never a
+bare boolean. Unknown is not dead.
+
+`run-774cb49671174be9a6862de721da1394` API detail:
+
+```
+state: ABANDONED
+scheduler_liveness: abandoned
+declared_outcome: null
+```
+
+No ledger write. Counts after still `11 / 88 / 88 / 129`.
+
+Tests: `server/runObservation.test.ts` (10) + maestroDb scheduler describe
+(dead → abandoned, live → RUNNING, null fields → unknown, foreign host →
+unknown, epoch mismatch → unknown, real 774cb → abandoned). Full visualizer
+suite `89 pass / 0 fail`.
+
+## Task B — hide terminal barren
+
+`shouldHideBarrenRun`: hide zero-merge when not in-flight, including
+declared CANCELLED/BLOCKED. Genuinely in-flight (RUNNING/CANCELLING/PENDING)
+stays. `?all=1` still shows all. Direct detail links still render.
+
+## Live ledger predicate (API GET /api/sources/maestro:lexgenius-pipeline/runs)
+
+total 11 · hidden 6 · shown 5 · `?all=1` 11
+
+| run | state | liveness | outcome | merged | hide |
+|---|---|---|---|---|---|
+| `c0523695` | MERGED | not_running | ACCEPTED | 6 | no |
+| `9f76fa05` | BLOCKED | not_running | BLOCKED | 0 | **yes** |
+| `3fcd8c75` | MERGED | not_running | ACCEPTED | 5 | no |
+| `c8910572` | ABANDONED | abandoned | null | 0 | **yes** |
+| `774cb496` | ABANDONED | abandoned | null | 0 | **yes** |
+| `7034bdf9` | BLOCKED | not_running | BLOCKED | 0 | **yes** |
+| `fb997364` | CANCELLED | not_running | CANCELLED | 0 | **yes** |
+| `2a44d226` | ABANDONED | abandoned | BLOCKED | 7 | no |
+| `75b96fd1` | CANCELLED | not_running | CANCELLED | 0 | **yes** |
+| `9e9ac412` | CANCELLED | not_running | CANCELLED | 1 | no |
+| `0120c320` | BLOCKED | not_running | BLOCKED | 1 | no |
+
+Dashboard HTML:
+
+- `/runs?source=maestro%3Alexgenius-pipeline` — Published 11, In flight 0,
+  banner `6 runs with no merged nodes hidden`, 5 cards, 774 absent
+- `?all=1` — 11 cards, banner `6 … shown`, 774 present
+- `/runs/…/run-774cb4967117…` — 200, renders, `abandoned`
+
+`2a44d226` is another dead-scheduler run (7 merges) — shown because not barren.
+
+Ledger after: `runs|11 dag_nodes|88 node_lifecycle|88 attempts|129`
+
+Dashboard tests: `11 pass`. `bunx tsc --noEmit` exit 0. `bun run build` exit 0.
+

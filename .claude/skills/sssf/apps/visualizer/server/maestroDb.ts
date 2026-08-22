@@ -42,6 +42,8 @@ import {
   type ObservedModel,
 } from "./attemptIdentity.ts";
 import { observeAttemptLiveness } from "./attemptObservation.ts";
+import { displayRunState, observeRunLiveness } from "./runObservation.ts";
+
 
 /** The tables that identify a ledger as Maestro's rather than the tracer's. */
 export const MAESTRO_TABLES = ["runs", "dag_nodes", "node_lifecycle", "attempts"];
@@ -109,6 +111,9 @@ interface RunRow {
   cancel_cause: string | null;
   cancel_requested: number | null;
   scheduler_host: string | null;
+  scheduler_pid: number | null;
+  scheduler_start_epoch: number | null;
+
 }
 
 interface NodeRow {
@@ -342,9 +347,12 @@ export class MaestroDb {
     const db = this.freshDb();
     const cause = this.optionalColumn(db, "runs", "runs", "cancel_cause");
     const host = this.optionalColumn(db, "runs", "runs", "scheduler_host");
+    const pid = this.optionalColumn(db, "runs", "runs", "scheduler_pid");
+    const epoch = this.optionalColumn(db, "runs", "runs", "scheduler_start_epoch");
     const sql =
       `SELECT run_id, plan_digest, created_at, last_transition_at,
-              latest_outcome, latest_outcome_at, ${cause}, cancel_requested, ${host}
+              latest_outcome, latest_outcome_at, ${cause}, cancel_requested,
+              ${host}, ${pid}, ${epoch}
          FROM runs`;
     return runId
       ? db.query<RunRow, [string]>(`${sql} WHERE run_id = ?`).all(runId)
@@ -383,12 +391,21 @@ export class MaestroDb {
   runs(): MaestroRunSummary[] {
     return this.runRows().map((row) => {
       const nodes = this.nodeRows(row.run_id);
-      const state = liveState(row, nodes);
+      const live = liveState(row, nodes);
+      const scheduler_liveness = observeRunLiveness({
+        liveState: live,
+        schedulerPid: row.scheduler_pid,
+        schedulerHost: row.scheduler_host,
+        schedulerStartEpoch: row.scheduler_start_epoch,
+      });
+
+      const state = displayRunState(live, scheduler_liveness);
       return {
         run_id: row.run_id,
         plan_name: this.planNameFor(row.plan_digest),
         plan_digest: row.plan_digest,
         state,
+        scheduler_liveness,
         declared_outcome: row.latest_outcome,
         declared_outcome_at: row.latest_outcome_at,
         cancel_cause: row.cancel_cause,
@@ -404,6 +421,7 @@ export class MaestroDb {
       } satisfies MaestroRunSummary;
     });
   }
+
 
   /** One run, whole: DAG shape, node lifecycle, every attempt, every verdict. */
   run(runId: string): MaestroRunDetail | null {
@@ -519,17 +537,27 @@ export class MaestroDb {
       attempts: attemptsByNode.get(node.node_id) ?? [],
     }));
 
-    const state = liveState(row, nodeRows);
+    const live = liveState(row, nodeRows);
+    const scheduler_liveness = observeRunLiveness({
+      liveState: live,
+      schedulerPid: row.scheduler_pid,
+      schedulerHost: row.scheduler_host,
+      schedulerStartEpoch: row.scheduler_start_epoch,
+    });
+
+    const state = displayRunState(live, scheduler_liveness);
     return {
       run_id: row.run_id,
       plan_name: this.planNameFor(row.plan_digest),
       plan_digest: row.plan_digest,
       state,
+      scheduler_liveness,
       declared_outcome: row.latest_outcome,
       declared_outcome_at: row.latest_outcome_at,
       cancel_cause: row.cancel_cause,
       resumable: isResumable(row, state),
       cancel_requested: Boolean(row.cancel_requested),
+
       created_at: row.created_at,
       last_transition_at: row.last_transition_at,
       // Wall clock as the SERVER sees it, so the browser can render elapsed
@@ -674,6 +702,7 @@ export function mergeProvenance(
  * statement that it is).
  */
 function liveState(row: RunRow, nodes: { state: string }[]): string {
+
   if (nodes.length === 0) return "EMPTY";
   const states = nodes.map((node) => node.state);
   if (states.every((state) => ABSOLUTELY_TERMINAL.has(state))) {

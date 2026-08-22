@@ -17,8 +17,9 @@ export function mergedCount(run: MaestroRunSummary): number {
 }
 
 /**
- * Hide finished barren runs from the list. In-flight and needs-attention
- * stay visible even at zero merges. `showAll` is the `?all=1` escape.
+ * Hide barren runs that are not genuinely in flight.
+ * Terminal CANCELLED/BLOCKED with zero merges hide even if needsAttention.
+ * Abandoned (not RUNNING) zero-merge runs hide. `?all=1` shows everything.
  */
 export function shouldHideBarrenRun(
   run: MaestroRunSummary,
@@ -26,9 +27,14 @@ export function shouldHideBarrenRun(
 ): boolean {
   if (showAll) return false;
   if (isInFlight(run.state)) return false;
+  if (mergedCount(run) !== 0) return false;
+  if (run.declared_outcome === "CANCELLED" || run.declared_outcome === "BLOCKED") {
+    return true;
+  }
   if (needsAttention(run)) return false;
-  return mergedCount(run) === 0;
+  return true;
 }
+
 
 export function runsListHref(opts: {
   source?: string | null;

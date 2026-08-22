@@ -9,6 +9,7 @@ function summary(
     plan_name: null,
     plan_digest: "digest",
     state: "SUCCEEDED",
+    scheduler_liveness: "not_running",
     declared_outcome: "SUCCEEDED",
     declared_outcome_at: "2026-08-22T00:00:00Z",
     cancel_cause: null,
@@ -34,6 +35,7 @@ const finishedBarren = summary({
 const inFlightBarren = summary({
   run_id: "inflight-zero",
   state: "RUNNING",
+  scheduler_liveness: "running",
   declared_outcome: null,
   declared_outcome_at: null,
   node_count: 5,
@@ -43,6 +45,7 @@ const inFlightBarren = summary({
 const pendingBarren = summary({
   run_id: "pending-zero",
   state: "PENDING",
+  scheduler_liveness: "running",
   declared_outcome: null,
   declared_outcome_at: null,
   node_states: [{ node_id: "a", state: "PENDING" }],
@@ -51,6 +54,7 @@ const pendingBarren = summary({
 const cancellingBarren = summary({
   run_id: "cancelling-zero",
   state: "CANCELLING",
+  scheduler_liveness: "running",
   declared_outcome: null,
   declared_outcome_at: null,
   node_states: [{ node_id: "a", state: "RUNNING" }],
@@ -68,6 +72,24 @@ const cancelledBarren = summary({
   state: "CANCELLED",
   declared_outcome: "CANCELLED",
   node_states: [{ node_id: "a", state: "CANCELLED" }],
+});
+
+const abandonedBarren = summary({
+  run_id: "abandoned-zero",
+  state: "ABANDONED",
+  scheduler_liveness: "abandoned",
+  declared_outcome: null,
+  declared_outcome_at: null,
+  node_states: [{ node_id: "a", state: "RUNNING" }],
+});
+
+const unknownStillRunning = summary({
+  run_id: "unknown-running",
+  state: "RUNNING",
+  scheduler_liveness: "unknown",
+  declared_outcome: null,
+  declared_outcome_at: null,
+  node_states: [{ node_id: "a", state: "RUNNING" }],
 });
 
 const nodeBlockedBarren = summary({
@@ -113,6 +135,121 @@ const fleet: MaestroRunSummary[] = [
   }),
 ];
 
+/** Shapes from lexgenius-pipeline 2026-08-22 after D1 observation. */
+const pipelineLedger: MaestroRunSummary[] = [
+  summary({
+    run_id: "run-c0523695712b495eac9b1f4b311e9d50",
+    state: "MERGED",
+    declared_outcome: "ACCEPTED",
+    node_states: Array.from({ length: 6 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: "MERGED",
+    })),
+  }),
+  summary({
+    run_id: "run-9f76fa05879f49fb98199da59fd5848e",
+    state: "BLOCKED",
+    declared_outcome: "BLOCKED",
+    node_states: Array.from({ length: 6 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: "PENDING",
+    })),
+  }),
+  summary({
+    run_id: "run-3fcd8c7517a54d07ae4265205166bde6",
+    state: "MERGED",
+    declared_outcome: "ACCEPTED",
+    node_states: Array.from({ length: 5 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: "MERGED",
+    })),
+  }),
+  summary({
+    run_id: "run-c8910572828c4f5bb5c60c0582dd4be5",
+    state: "ABANDONED",
+    scheduler_liveness: "abandoned",
+    declared_outcome: null,
+    declared_outcome_at: null,
+    node_states: Array.from({ length: 5 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: i === 0 ? "RUNNING" : "PENDING",
+    })),
+  }),
+  summary({
+    run_id: "run-774cb49671174be9a6862de721da1394",
+    state: "ABANDONED",
+    scheduler_liveness: "abandoned",
+    declared_outcome: null,
+    declared_outcome_at: null,
+    node_states: Array.from({ length: 5 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: i === 0 ? "RUNNING" : "PENDING",
+    })),
+  }),
+  summary({
+    run_id: "run-7034bdf98d5342acafc61c439c2caa58",
+    state: "BLOCKED",
+    declared_outcome: "BLOCKED",
+    node_states: Array.from({ length: 5 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: "PENDING",
+    })),
+  }),
+  summary({
+    run_id: "run-fb9973646d344400a9e4f4d7818d00f2",
+    state: "CANCELLED",
+    declared_outcome: "CANCELLED",
+    node_states: Array.from({ length: 5 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: "CANCELLED",
+    })),
+  }),
+  summary({
+    run_id: "run-2a44d226e75a4be391a14f02b78a6d25",
+    state: "ABANDONED",
+    scheduler_liveness: "abandoned",
+    declared_outcome: "BLOCKED",
+    node_states: [
+      ...Array.from({ length: 7 }, (_, i) => ({ node_id: `m${i}`, state: "MERGED" })),
+      ...Array.from({ length: 5 }, (_, i) => ({ node_id: `r${i}`, state: "RUNNING" })),
+    ],
+  }),
+  summary({
+    run_id: "run-75b96fd1f01e46989671771645ee6acc",
+    state: "CANCELLED",
+    declared_outcome: "CANCELLED",
+    node_states: Array.from({ length: 12 }, (_, i) => ({
+      node_id: `n${i}`,
+      state: "CANCELLED",
+    })),
+  }),
+
+  summary({
+    run_id: "run-9e9ac412669140039ae078601048f6c7",
+    state: "CANCELLED",
+    declared_outcome: "CANCELLED",
+    node_states: [
+      { node_id: "m0", state: "MERGED" },
+      ...Array.from({ length: 12 }, (_, i) => ({
+        node_id: `n${i}`,
+        state: "CANCELLED",
+      })),
+    ],
+  }),
+  summary({
+    run_id: "run-0120c32064d144c2aa55c344087e0b0a",
+    state: "BLOCKED",
+    declared_outcome: "BLOCKED",
+    node_states: [
+      { node_id: "m0", state: "MERGED" },
+      ...Array.from({ length: 13 }, (_, i) => ({
+        node_id: `n${i}`,
+        state: "BLOCKED",
+      })),
+    ],
+  }),
+];
+
 describe("shouldHideBarrenRun", () => {
   test("zero-merged finished run is hidden", () => {
     expect(shouldHideBarrenRun(finishedBarren, false)).toBe(true);
@@ -124,9 +261,20 @@ describe("shouldHideBarrenRun", () => {
     expect(shouldHideBarrenRun(cancellingBarren, false)).toBe(false);
   });
 
-  test("zero-merged needs-attention run is shown", () => {
-    expect(shouldHideBarrenRun(blockedBarren, false)).toBe(false);
-    expect(shouldHideBarrenRun(cancelledBarren, false)).toBe(false);
+  test("unknown liveness that still reads RUNNING is shown", () => {
+    expect(shouldHideBarrenRun(unknownStillRunning, false)).toBe(false);
+  });
+
+  test("zero-merged terminal CANCELLED/BLOCKED is hidden", () => {
+    expect(shouldHideBarrenRun(blockedBarren, false)).toBe(true);
+    expect(shouldHideBarrenRun(cancelledBarren, false)).toBe(true);
+  });
+
+  test("zero-merged abandoned run is hidden", () => {
+    expect(shouldHideBarrenRun(abandonedBarren, false)).toBe(true);
+  });
+
+  test("zero-merged needs-attention without a terminal outcome is shown", () => {
     expect(shouldHideBarrenRun(nodeBlockedBarren, false)).toBe(false);
   });
 
@@ -140,11 +288,42 @@ describe("shouldHideBarrenRun", () => {
     expect(fleet.filter((run) => !shouldHideBarrenRun(run, true))).toHaveLength(11);
   });
 
-  test("default hide drops only finished barren runs", () => {
+  test("default hide drops finished and terminal barren runs", () => {
     expect(
       fleet.filter((run) => shouldHideBarrenRun(run, false)).map((run) => run.run_id),
-    ).toEqual(["finished-zero", "finished-barren-2"]);
-    expect(fleet.filter((run) => !shouldHideBarrenRun(run, false))).toHaveLength(9);
+    ).toEqual([
+      "finished-zero",
+      "blocked-zero",
+      "cancelled-zero",
+      "finished-barren-2",
+    ]);
+  });
+});
+
+describe("pipeline ledger shapes", () => {
+  test("hides the six barren runs and keeps the five that merged or are live", () => {
+    const hidden = pipelineLedger
+      .filter((run) => shouldHideBarrenRun(run, false))
+      .map((run) => run.run_id.slice(0, 12));
+    const shown = pipelineLedger
+      .filter((run) => !shouldHideBarrenRun(run, false))
+      .map((run) => run.run_id.slice(0, 12));
+    expect(hidden).toEqual([
+      "run-9f76fa05",
+      "run-c8910572",
+      "run-774cb496",
+      "run-7034bdf9",
+      "run-fb997364",
+      "run-75b96fd1",
+    ]);
+    expect(shown).toEqual([
+      "run-c0523695",
+      "run-3fcd8c75",
+      "run-2a44d226",
+      "run-9e9ac412",
+      "run-0120c320",
+    ]);
+    expect(pipelineLedger.filter((run) => !shouldHideBarrenRun(run, true))).toHaveLength(11);
   });
 });
 
