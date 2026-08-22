@@ -66,79 +66,76 @@ assuming it is current against a deployment** — run `runtime_sync.py check` ag
 rather than trusting this file, which can itself go stale. When landing a change, say explicitly which copies
 you touched, and mirror deliberately rather than assuming a mirror already happened.
 
-**State as of 2026-08-20, re-derived by running both the tool and the test.**
-`tests/test_template_parity.py` **passes** from this repo — both assertions, same-files and
-byte-identical-contents — and `runtime_sync.py check` agrees: template and the-library are level
-over **201** compared files. That is after five branches landed here today (#104, the
-`maestro-plan.v2` bump and the pre-v2 run refusal; #105, the reviewer-key environment split; #106,
-the finalization turn clock gated on route liveness; PR #111, a review rejection repairing the
-diff it rejected instead of re-implementing the node; PR #112, `run convergence` no longer
-reporting a live run as one that already ended) and the-library was brought level by
-`runtime_sync.py mirror --apply` in its PR #121. Earlier readings recorded here (189, then 200
-files) are superseded rather than wrong: the count moves whenever a test file is added, which is
+**State as of 2026-08-22, re-derived by running both the tool and the test.**
+`tests/test_template_parity.py` **passes** from this repo — 2 passed in 0.32s,
+both assertions, same-files and byte-identical-contents — and
+`runtime_sync.py check` agrees: template and the-library are level over **214**
+compared files. That is after #127 (console stops reading an in-review attempt
+as dead), #128 (`attempts.attempt_host` + `attempt_start_epoch`; attempt
+liveness declinable; `tester_vendor` bound to `lane_vendor`), and #130
+(per-lane `PYTEST_ADDOPTS` worker cap; `reviewer.turn_timeout_s` raised) landed
+on maestro `main` at `f89e0bf`, and the-library was brought level by
+`runtime_sync.py mirror --apply` in its #128 (`46111a9`) and #129 (`5400993`).
+Earlier readings recorded here (189, then 200, then 201 files) are superseded
+rather than wrong: the count moves whenever a test file is added, which is
 exactly why it dates a snapshot instead of describing an invariant.
 
-Two qualifications outrank any such snapshot, this one included. **the-library's mirror can be
-uncommitted there.** It is committed as of 2026-08-20 — 201 tracked files under
-`skills/sssf/templates/adws/`, nothing modified or untracked under that path, and `main` level with
-its remote after PR #121 — but it has been uncommitted before, and the check that would catch it is
-not the parity test. A green parity run or a `runtime_sync check` says the bytes on disk agree; it
-says nothing about whether they are committed, and an agent that resets or checks out in that
-repository takes an uncommitted mirror with it. Confirm with `git status` there, not with parity.
-That repository also carries unrelated work — 14 modified and 10 untracked files elsewhere in its
-tree, identical sets before and after this mirror, verified by diffing the two `git status` outputs.
-Stage only the paths the mirror wrote — `git add skills/sssf/templates/adws` — which is what
-preserves them; a `git add -A` in that repo would sweep them into a commit claiming to be a
-mirror. And the differing set moves while it is being measured, because other lanes
-write into this template concurrently: an earlier observation watched
-`test_agent_start_busy_retry.py` go from clean to modified minutes apart. Any comparison between
-these copies is a reading of a moving tree — run the test, do not trust this paragraph.
+Two qualifications outrank any such snapshot, this one included. **the-library's
+mirror can be uncommitted there.** It is committed as of 2026-08-22 — 214
+tracked files under `skills/sssf/templates/adws/`, nothing modified or untracked
+under that path, and `main` at `5400993` equal to `origin/main` — but it has
+been uncommitted before, and the check that would catch it is not the parity
+test. A green parity run or a `runtime_sync check` says the bytes on disk
+agree; it says nothing about whether they are committed, and an agent that
+resets or checks out in that repository takes an uncommitted mirror with it.
+Confirm with `git status` there, not with parity. That repository also carries
+unrelated work — 5 modified files and 1 untracked path elsewhere in its tree
+(`library.yaml`, three plan-contract/plan-brownfield files, and
+`skills/install-anti-slop/`). Stage only the paths the mirror wrote —
+`git add skills/sssf/templates/adws` — which is what preserves them; a
+`git add -A` in that repo would sweep them into a commit claiming to be a
+mirror. And the differing set moves while it is being measured. Any comparison
+between these copies is a reading of a moving tree — run the test, do not
+trust this paragraph.
 
-Both deployments **track** `adws/` in git — `lexgenius` at 211 files on branch
-`chore/mirror-adws-runtime`, `lexgenius-pipeline` at 208 on `parked/cmo-consolidation-l-run`, each
-under a commit named "Mirror the ADW runtime from maestro into this deployment". The earlier
-reading here recorded `adws/` as
-*entirely untracked* in lexgenius-pipeline, which meant git would neither preserve nor notice a
-change to it; that hazard is closed for both, and a mirror there is now a reviewable diff rather
-than an invisible overwrite.
+Both deployments **track** `adws/` in git — `lexgenius` at 213 files on
+`main`, `lexgenius-pipeline` at 209 on `save/repair-chain-falsifiability`,
+each still under a commit named "Mirror the ADW runtime from maestro into this
+deployment". Tracking is not levelness. The 2026-08-20 reading that recorded
+those copies as level is superseded by the 2026-08-22 check below.
 
-Re-derived 2026-08-20 with `runtime_sync.py check`, which is the tool to use — not `diff -rq`, which
-reports a filename without saying which side is ahead:
+Re-derived 2026-08-22 with `runtime_sync.py check`, which is the tool to use —
+not `diff -rq`, which reports a filename without saying which side is ahead:
 
 | comparison | result |
 | --- | --- |
-| template ↔ the-library | level over 201 files |
-| template ↔ `lexgenius/adws/` | level over 200 files (`maestro.config.yaml` held out) |
-| template ↔ `lexgenius-pipeline/adws/` | level over 200 files (`maestro.config.yaml` held out) |
+| template ↔ the-library | level over 214 files |
+| template ↔ `lexgenius/adws/` | **not level**: 10 files present only in the template, 46 content diffs, `maestro.config.yaml` held out. The deployment's `adws/` tree is otherwise clean. |
+| template ↔ `lexgenius-pipeline/adws/` | **not level**: the same 10-absent / 46-diff shape, `maestro.config.yaml` held out. That tree is also dirty under `adws/` (modified `scheduler_types.py`, `maestro.config.yaml`, `tests/test_scheduler_types.py`; untracked `reachability.py` and its test), so the check is a reading of a dirty deployment, not only of its last mirror commit. |
 
-All three were brought level on 2026-08-20, and both deployments' mirrors are committed on their
-own branches. The run that had been executing in lexgenius-pipeline is dead — its scheduler was
-killed and its panes closed — so that repository was writable again and was mirrored with the
-others.
+The 2026-08-20 episode that brought all three level is history, not the current
+state. Issue #71's per-file question was answered in that episode — the
+deployment-ahead files were read and, where the template was a strict
+superset, overwritten with `--overwrite-ahead` after reading the line. That
+flag's only use remains that one. The copies have since drifted again, which
+is what §16.3 item 50 said would happen: nothing schedules a reconciliation.
 
-`lexgenius` was the one that needed a decision, and issue #71's per-file question is now answered.
-The three files it had genuinely been ahead on are no longer ahead: `adw_modules/deliver.py` and
-`tests/test_step10_cli.py` were already byte-identical, and the template's `tests/test_deliver.py`
-turned out to be a strict superset of the deployment's — zero lines existed only there, and
-`DeliverReleaseSafetyTest`, the class issue #95 records a previous mirror destroying, is present in
-the template. Exactly one file was still ahead in the deployment, `tests/test_node_write_scope.py`
-by a single line: a `record_stall` keyword argument the template deliberately removed when the
-re-dispatch lock test stopped taking a stall recorder. Keeping it would have failed against the
-runtime now in that tree, so it was overwritten with `--overwrite-ahead`, which is the only use of
-that flag here and was taken after reading the line rather than in place of reading it.
+Mirroring a deployment still costs what #104 added. A `maestro-plan.v1` plan is
+**unrunnable** at run start (`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`); the remedy
+is to re-ship the plan from its IR, which is cheap but is not nothing, and it
+cannot be done while that plan is mid-run. Mirroring this template into a
+deployment that holds shipped v1 plans refuses those plans until they are
+re-shipped, so sequence the mirror against what is running there rather than
+treating it as a neutral copy.
 
-Mirroring a deployment costs something it did not cost before. #104 makes a `maestro-plan.v1` plan
-**unrunnable** at run start (`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`); the remedy is to re-ship the plan
-from its IR, which is cheap but is not nothing, and it cannot be done while that plan is mid-run.
-Mirroring this template into a deployment that holds shipped v1 plans refuses those plans until they
-are re-shipped, so sequence the mirror against what is running there rather than treating it as a
-neutral copy.
-
-`_node_goal` answers `1` in **both** deployments as of 2026-08-20, so no deployment's reviewers are
-judging against the placeholder. lexgenius-pipeline was brought level by hand on 2026-08-18, after the divergence had already been paid for by run
-`run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told "Make the gate '…' pass over
-selector '…', changing only the declared outputs" verbatim while the plan it was running carried the
-correct instruction (§19 M13).
+`_node_goal` answers `1` in **both** deployments as of 2026-08-22, so no
+deployment's reviewers are judging against the placeholder. That is the cheap
+check, not a substitute for the table. The 2026-08-18 hand-level of
+lexgenius-pipeline remains the episode that cost
+`run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told "Make
+the gate '…' pass over selector '…', changing only the declared outputs"
+verbatim while the plan it was running carried the correct instruction
+(§19 M13).
 
 Nothing enforces any of this and nothing would notice it drifting again (§16.3 item 50). Do not read
 "level" as a state anything maintains, and do not read a differing filename as a cost — `code_review.py`
