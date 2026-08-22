@@ -1,20 +1,29 @@
+import Link from "next/link";
 import { ApiUnavailable } from "@/components/ApiUnavailable";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { RunCard } from "@/components/RunCard";
 import { SourceBanner } from "@/components/SourceBanner";
 import { StatCard } from "@/components/StatCard";
-import { decodeRouteParam, isInFlight, loadFleetSummaries, needsAttention } from "@/lib/api";
+import { decodeRouteParam, loadFleetSummaries } from "@/lib/api";
+import {
+  isInFlight,
+  needsAttention,
+  runsListHref,
+  shouldHideBarrenRun,
+} from "@/lib/runVisibility";
 
 export const dynamic = "force-dynamic";
 
 export default async function RunsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ source?: string }>;
+  searchParams: Promise<{ source?: string; all?: string }>;
 }) {
-  const { source } = await searchParams;
+  const { source, all } = await searchParams;
   const sourceFilter = source ? decodeRouteParam(source) : null;
+  const showAll = all === "1";
+
   const fleet = await loadFleetSummaries();
   if (!fleet.ok) {
     return (
@@ -30,11 +39,14 @@ export default async function RunsPage({
   }
 
   const { sources, maestro, runs: allRuns } = fleet;
-  const runs = sourceFilter
+  const listed = sourceFilter
     ? allRuns.filter((run) => run.source_id === sourceFilter)
     : allRuns;
-  const active = runs.filter((run) => isInFlight(run.state));
-  const attention = runs.filter((run) => needsAttention(run));
+  const hidden = listed.filter((run) => shouldHideBarrenRun(run, false));
+  const runs = listed.filter((run) => !shouldHideBarrenRun(run, showAll));
+  const active = listed.filter((run) => isInFlight(run.state));
+  const attention = listed.filter((run) => needsAttention(run));
+
   const filteredSource = sourceFilter
     ? sources.find((item) => item.id === sourceFilter)
     : null;
@@ -54,14 +66,29 @@ export default async function RunsPage({
             ? sourceFilter
             : `${maestro.length} maestro source${maestro.length === 1 ? "" : "s"}`
         }
-        detail={`${runs.length} run${runs.length === 1 ? "" : "s"} via GET /api/sources and GET /api/sources/:id/runs`}
+        detail={`${listed.length} run${listed.length === 1 ? "" : "s"} via GET /api/sources and GET /api/sources/:id/runs`}
       />
+      {hidden.length > 0 && (
+        <SourceBanner
+          tone={showAll ? "info" : "warning"}
+          label={`${hidden.length} run${hidden.length === 1 ? "" : "s"} with no merged nodes ${showAll ? "shown" : "hidden"}`}
+          detail={
+            <Link
+              className="lane-link"
+              href={runsListHref({ source: sourceFilter, all: !showAll })}
+            >
+              {showAll ? "Hide them" : "Show them"}
+            </Link>
+          }
+        />
+      )}
       <div className="stat-grid">
-        <StatCard label="Published runs" value={runs.length} />
+        <StatCard label="Published runs" value={listed.length} />
         <StatCard label="In flight" value={active.length} />
         <StatCard label="Needs attention" value={attention.length} />
         <StatCard label="Sources" value={maestro.length} />
       </div>
+
       {notMaestro ? (
         <EmptyState
           title="Not a Maestro ledger"
@@ -77,7 +104,7 @@ export default async function RunsPage({
           title="No Maestro sources"
           description="The Bun API is reachable, but GET /api/sources listed no kind=maestro ledger."
         />
-      ) : runs.length === 0 ? (
+      ) : listed.length === 0 ? (
         <EmptyState
           title="No runs in the ledger"
           description={
