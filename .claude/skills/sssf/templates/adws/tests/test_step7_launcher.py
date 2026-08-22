@@ -322,13 +322,18 @@ class LauncherContractTest(unittest.TestCase):
             self.assertFalse(Path(path).is_relative_to(self.worktree), key)
 
     def test_pane_env_flags_survive_values_carrying_equals_and_spaces(self):
-        # `PYTEST_ADDOPTS="-o cache_dir=<path>"` carries both a space and a
+        # `PYTEST_ADDOPTS="-n 1 -o cache_dir=<path>"` carries both a space and a
         # second `=`. Measured against herdr 0.8.0 on 2026-08-17: `--env`
         # splits on the first `=` only, so the value arrives whole.
         flags = launcher.pane_env_flags(worktree_module.scratch_env(self.scratch))
         pane_env = self.pane_environment(("pane", "split") + flags)
-        self.assertEqual(pane_env["PYTEST_ADDOPTS"],
-                         "-o cache_dir={}".format(self.scratch / "pytest_cache"))
+        self.assertEqual(
+            pane_env["PYTEST_ADDOPTS"],
+            "-o cache_dir={}".format(self.scratch / "pytest_cache"))
+
+
+
+
 
     def test_launch_refuses_when_herdr_cannot_name_the_current_pane(self):
         """No pane to split from is a refusal, not a fall back to `--current`.

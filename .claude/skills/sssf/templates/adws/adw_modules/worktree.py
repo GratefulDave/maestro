@@ -66,6 +66,7 @@ from .launcher import (
     SCRATCH_ENV_KEYS,
     HarnessCancelled,
     HarnessQuiescenceError,
+    pytest_worker_cap,
     run_harness_process,
 )
 from . import runner_resolution as rr
@@ -652,10 +653,32 @@ def expected_inventory(baseline: Inventory, measured: InventoryDelta,
         expected.pop(rel, None)
     return expected
 
-
 # ── §8.3 cache redirection ──────────────────────────────────────────────────
 
-def scratch_env(scratch: Path) -> Dict[str, str]:
+#: Configured lane count for this run. ``None`` means ``PYTEST_ADDOPTS``
+#: carries only the cache redirect — ``-n`` requires pytest-xdist, and a
+#: nested collection in a tree that does not install it must still probe.
+_lane_concurrency: Optional[int] = None
+
+
+def bind_lane_concurrency(concurrency: Optional[int]) -> None:
+    """Record the run's lane count so gates inherit the worker cap.
+
+    Unset (``None``) is the default and the test-isolation reset. A positive
+    integer is the configured ``execution.concurrency``.
+    """
+    global _lane_concurrency
+    if concurrency is not None and concurrency < 1:
+        raise ValueError("concurrency is ≥ 1")
+    _lane_concurrency = concurrency
+
+
+def scratch_env(
+        scratch: Path,
+        *,
+        concurrency: Optional[int] = None,
+        cpu_count: Optional[int] = None,
+) -> Dict[str, str]:
     """Point every cache this harness knows about at the attempt's scratch (§8.3).
 
     Byproducts are redirected out of the worktree, not suppressed tool by tool:
@@ -681,13 +704,29 @@ def scratch_env(scratch: Path) -> Dict[str, str]:
     variable added here and not there is redirected for the gates and ignored
     by the agent — the asymmetry that convicted a node on 2026-08-17 — so the
     two sets are asserted equal on every call rather than left to review.
+
+    ``PYTEST_ADDOPTS`` carries the per-lane xdist cap only when a lane
+    count is known. Unspecified concurrency keeps the cache redirect alone,
+    because ``-n`` is an xdist flag and a tree without that plugin must
+    still collect.
+
     """
     scratch = Path(scratch)
+    cores = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+    if cores < 1:
+        cores = 1
+    lanes = concurrency if concurrency is not None else _lane_concurrency
+    cache_dir = scratch / "pytest_cache"
+    if lanes is None:
+        addopts = "-o cache_dir={}".format(cache_dir)
+    else:
+        addopts = "-n {} -o cache_dir={}".format(
+            pytest_worker_cap(lanes, cores), cache_dir)
     values = {
         "XDG_CACHE_HOME": str(scratch / "xdg"),
         "TMPDIR": str(scratch / "tmp"),
         "PYTHONPYCACHEPREFIX": str(scratch / "pycache"),
-        "PYTEST_ADDOPTS": f"-o cache_dir={scratch / 'pytest_cache'}",
+        "PYTEST_ADDOPTS": addopts,
         "COVERAGE_FILE": str(scratch / "coverage"),
         "RUFF_CACHE_DIR": str(scratch / "ruff"),
         "npm_config_cache": str(scratch / "npm"),
@@ -703,7 +742,13 @@ def scratch_env(scratch: Path) -> Dict[str, str]:
     return values
 
 
-def launch_env(scratch: Path, base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+def launch_env(
+        scratch: Path,
+        base: Optional[Mapping[str, str]] = None,
+        *,
+        concurrency: Optional[int] = None,
+        cpu_count: Optional[int] = None,
+) -> Dict[str, str]:
     """A complete environment for anything launched inside the bracket.
 
     The scratch subdirectories are created here because a redirection to a
@@ -712,12 +757,15 @@ def launch_env(scratch: Path, base: Optional[Mapping[str, str]] = None) -> Dict[
     convicts someone.
     """
     env = dict(os.environ if base is None else base)
-    redirected = scratch_env(scratch)
+    redirected = scratch_env(
+        scratch, concurrency=concurrency, cpu_count=cpu_count)
     for key in ("XDG_CACHE_HOME", "TMPDIR", "PYTHONPYCACHEPREFIX", "npm_config_cache"):
         Path(redirected[key]).mkdir(parents=True, exist_ok=True)
-    Path(redirected["PYTEST_ADDOPTS"].split("=", 1)[1]).mkdir(parents=True, exist_ok=True)
+    cache_dir = redirected["PYTEST_ADDOPTS"].split("cache_dir=", 1)[1].split()[0]
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
     env.update(redirected)
     return env
+
 
 
 # ── §8.3 the two-conjunct permission check ──────────────────────────────────
@@ -1310,9 +1358,9 @@ def check_pre_merge(attempt: AttemptWorktree, expected: Inventory) -> CheckResul
     """
     branch_ok, head_ok, ancestor_ok, detail = _git_checks(attempt)
     cleanliness = compare_to_expected(attempt.path, expected, "report")
-    git_ok = branch_ok and head_ok and ancestor_ok
+    ok = branch_ok and head_ok and ancestor_ok and cleanliness.clean
     return CheckResult("pre-merge", branch_ok, head_ok, ancestor_ok, cleanliness,
-                       git_ok, git_ok, detail,
+                       ok, True, detail,
                        unprovisioned_worktrees(attempt))
 
 

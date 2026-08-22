@@ -273,6 +273,22 @@ SCRATCH_ENV_KEYS: Tuple[str, ...] = (
 )
 
 
+def pytest_worker_cap(concurrency: int, cpu_count: Optional[int] = None) -> int:
+    """Per-lane xdist workers: ``max(1, cores // concurrency)``.
+
+    ``pytest.ini`` defaults to ``-n auto``. Six concurrent lanes each inheriting
+    that on an 18-core box is 108 workers. A red final integration gate has no
+    retry, so the oversubscription costs whole runs rather than minutes.
+    """
+    if concurrency < 1:
+        raise ValueError("concurrency is ≥ 1")
+    cores = os.cpu_count() if cpu_count is None else cpu_count
+    if cores is None or cores < 1:
+        cores = 1
+    return max(1, int(cores) // concurrency)
+
+
+
 def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
     """`--env KEY=VALUE` flags carrying §8.3's redirection into the pane shell.
 
