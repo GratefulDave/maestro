@@ -63,8 +63,8 @@ export interface MaestroAttempt {
   started_at_ms: number | null;
   launched_at_ms: number | null;
   /**
-   * Process-table existence on this host, not attempt identity. A reused
-   * pid can read true. Unknown host / invalid pid are false.
+   * Proven live or sitting in review. Unknown host/epoch, a foreign
+   * host, or a reused pid is false — unprovable, not dead.
    */
   running: boolean;
   liveness: AttemptLiveness;

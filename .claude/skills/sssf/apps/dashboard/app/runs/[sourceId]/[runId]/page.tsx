@@ -40,7 +40,7 @@ export default async function RunPage({
         <StatCard
           label="Running"
           value={running}
-          detail="attempts whose pid exists on this host"
+          detail="attempts proven live or sitting in review"
         />
         <StatCard label="Needs attention" value={blocked} detail="nodes" />
       </div>

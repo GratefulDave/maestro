@@ -138,6 +138,8 @@ function insertAttempt(
     turn_count: number;
     extra: object;
     pid: number | null;
+    attempt_host: string | null;
+    attempt_start_epoch: number | null;
   }> = {},
 ) {
   const o = {
@@ -145,12 +147,15 @@ function insertAttempt(
     turn_count: 0,
     extra: {},
     pid: null as number | null,
+    attempt_host: null as string | null,
+    attempt_start_epoch: null as number | null,
     ...opts,
   };
   db.query(
     `INSERT INTO attempts (run_id, node_id, attempt_no, base_sha, state, started_at,
-                           launched_at, pid, turn_count, retry_class, extra_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                           launched_at, pid, turn_count, retry_class, extra_json,
+                           attempt_host, attempt_start_epoch)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     runId,
     nodeId,
@@ -163,6 +168,8 @@ function insertAttempt(
     o.turn_count,
     o.retry_class,
     JSON.stringify(o.extra),
+    o.attempt_host,
+    o.attempt_start_epoch,
   );
 }
 
@@ -606,18 +613,60 @@ describe("the DAG and its attempts", () => {
   });
 });
 
-describe("attempt liveness uses the run host", () => {
+describe("attempt liveness uses attempt identity", () => {
   test("a live pid recorded on another host is unknown, not running", () => {
     const path = ledger("foreign-host", (seed) => {
       insertRun(seed, "run-x");
-      seed.query("UPDATE runs SET scheduler_host = 'other-box'").run();
       insertNode(seed, "run-x", "lane-a", "RUNNING", { attempt_no: 1 });
-      insertAttempt(seed, "run-x", "lane-a", 1, "RUNNING", { pid: process.pid });
+      insertAttempt(seed, "run-x", "lane-a", 1, "RUNNING", {
+        pid: process.pid,
+        attempt_host: "other-box",
+        attempt_start_epoch: 1.0,
+      });
     });
     const db = new MaestroDb(path);
     const attempt = db.run("run-x")!.nodes[0]!.attempts[0]!;
     expect(attempt.running).toBe(false);
     expect(attempt.liveness).toBe("unknown");
+    db.close();
+  });
+
+  test("an old ledger row with no host/epoch is unknown, not dead", () => {
+    const path = ledger("old-row", (seed) => {
+      insertRun(seed, "run-old");
+      insertNode(seed, "run-old", "lane-a", "RUNNING", { attempt_no: 1 });
+      insertAttempt(seed, "run-old", "lane-a", 1, "RUNNING", {
+        pid: 2_000_000_000,
+      });
+    });
+    const db = new MaestroDb(path);
+    const attempt = db.run("run-old")!.nodes[0]!.attempts[0]!;
+    expect(attempt.running).toBe(false);
+    expect(attempt.liveness).toBe("unknown");
+    db.close();
+  });
+
+  test("dead builder pid in review (ACCEPTED result) reads alive", () => {
+    const path = ledger("review-window", (seed) => {
+      insertRun(seed, "run-rev");
+      insertNode(seed, "run-rev", "lane-a", "RUNNING", { attempt_no: 1 });
+      insertAttempt(seed, "run-rev", "lane-a", 1, "RUNNING", {
+        pid: 2_000_000_000,
+        attempt_host: "this-box",
+        attempt_start_epoch: 1.0,
+      });
+      seed.query(
+        `INSERT INTO results (run_id, node_id, attempt_no, subject_sha,
+                              payload_json, adjudication, created_at)
+         VALUES (?, ?, ?, ?, '{}', 'ACCEPTED', '2026-08-17T06:05:00+00:00')`,
+      ).run("run-rev", "lane-a", 1, "a".repeat(40));
+    });
+    const db = new MaestroDb(path);
+    const attempt = db.run("run-rev")!.nodes[0]!.attempts[0]!;
+    expect(attempt.state).toBe("RUNNING");
+    expect(attempt.pid).toBe(2_000_000_000);
+    expect(attempt.running).toBe(true);
+    expect(attempt.liveness).toBe("running");
     db.close();
   });
 });

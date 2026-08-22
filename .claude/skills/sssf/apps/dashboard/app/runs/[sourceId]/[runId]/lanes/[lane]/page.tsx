@@ -53,7 +53,7 @@ export default async function RunLanePage({
         <div className="section-heading">
           <div>
             <h2>Attempts</h2>
-            <p>pid liveness is a read-side probe. Model is observed or declared, never invented.</p>
+            <p>Liveness is a read-side observation: proven live, proven dead, or unprovable. A review-window attempt stays alive after the builder pid exits.</p>
           </div>
         </div>
         {node.attempts.length === 0 ? (

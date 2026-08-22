@@ -412,16 +412,17 @@ export interface MaestroAttempt {
   started_at_ms: number | null;
   launched_at_ms: number | null;
   /**
-   * True when ledger RUNNING and a process with this pid exists on this host.
-   * That is process-table existence, not attempt identity: attempts have no
-   * start-epoch, so a reused pid can read running. Unknown host / invalid pid
-   * are not running.
+   * True when the attempt is proven live, or is in its review window.
+   * Proven live requires (pid, attempt_host, attempt_start_epoch) to
+   * identify a process on this host. A review-window attempt stays true
+   * after the builder pid exits. Unknown / not recorded are false.
    */
   running: boolean;
   /**
-   * Read-side pid probe. `stale` = ledger RUNNING and this host has no such
-   * process. `unknown` = cannot be said (foreign host, pid <= 0). Not a
-   * lifecycle transition — the ledger is left unchanged.
+   * Read-side observation, never a transition. `stale` = proven dead on
+   * this host. `unknown` = cannot be said (no host/epoch, foreign host,
+   * pid reuse). `not_recorded` = no pid. Review window reads `running`
+   * even when the builder pid is gone.
    */
   liveness: AttemptLiveness;
   /** Observed from session jsonl, else declared from maestro.config.yaml. */

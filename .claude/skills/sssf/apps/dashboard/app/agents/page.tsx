@@ -70,7 +70,7 @@ export default async function AgentsPage() {
       <PageHeader
         eyebrow="Fleet"
         title="Agents"
-        description="pid liveness is a read-side probe. Model is observed from session jsonl when readable, otherwise declared from maestro.config.yaml."
+        description="Liveness is a read-side observation, not a transition. Review-window attempts stay live after the builder exits. Model is observed from session jsonl when readable, otherwise declared from maestro.config.yaml."
       />
       <SourceBanner
         label={`${assignments.length} attempt${assignments.length === 1 ? "" : "s"}`}
