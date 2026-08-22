@@ -9,6 +9,7 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
+      color-scheme: dark;
       --color-paper:   #2d3142;   /* deep warm charcoal */
       --color-ink:     #f5f5f5;   /* warm off-white */
       --color-muted:   #bfc0c0;   /* silver */
@@ -18,6 +19,7 @@
       --font-mono:     'Geist Mono', ui-monospace, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -61,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="34-flow-repair-chain-title 34-flow-repair-chain-desc">
       <title id="34-flow-repair-chain-title">Repair chain · Witness inherited from the root</title>
-      <desc id="34-flow-repair-chain-desc">Flowchart of a repair chain: the chain root opens at the integration head with a FAILED pre-node gate — the falsifiability witness — then a SEMANTIC rejection with a proven output commit lets decide_repair admit a RepairBasis; the repair attempt bases on the rejected attempt's output commit rather than the integration head, so pre_gate_not_falsifiable is asked with repairing=True and is inherited from the chain root rather than re-evaluated, never raising GATE_NOT_FALSIFIABLE. Five refusals — no prior rejection, an unproven output, a moved integration head, REPAIR_CHAIN_LIMIT exceeded, or findings that rose — restart the node at the integration head instead.</desc>
+      <desc id="34-flow-repair-chain-desc">Flowchart of a repair chain: the chain root opens at the integration head with a FAILED pre-node gate — the falsifiability witness — then a SEMANTIC failure with a proven output commit lets decide_repair admit a RepairBasis. Review records advisory and does not recycle. The repair attempt bases on the prior output commit rather than the integration head, so pre_gate_not_falsifiable is asked with repairing=True and is inherited from the chain root. Five refusals — no SEMANTIC row with a stored output SHA, an unproven output, a moved integration head, REPAIR_CHAIN_LIMIT exceeded, or findings that rose — restart the node at the integration head instead.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -87,7 +89,7 @@
       <text x="484" y="330" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ADMITTED</text>
 
       <rect x="80" y="298" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="120" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REJECTED AGAIN</text>
+      <text x="120" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SEMANTIC AGAIN</text>
 
       <!-- chain root attempt -->
       <rect x="300" y="56" width="280" height="48" rx="6" fill="#2d3142"/>
@@ -95,11 +97,11 @@
       <text x="440" y="76" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt a1 · chain root</text>
       <text x="440" y="92" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">base = head · pre RED, post GREEN</text>
 
-      <!-- REJECTED · SEMANTIC -->
+      <!-- SEMANTIC with stored output SHA (review does not recycle) -->
       <rect x="300" y="136" width="280" height="48" rx="6" fill="#2d3142"/>
       <rect x="300" y="136" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="440" y="156" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">REJECTED · SEMANTIC</text>
-      <text x="440" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">output commit proven</text>
+      <text x="440" y="156" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SEMANTIC · output SHA</text>
+      <text x="440" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">review is advisory, not the trigger</text>
 
       <!-- decide_repair admits? (focal) -->
       <polygon points="440,216 560,264 440,312 320,264" fill="#2d3142"/>

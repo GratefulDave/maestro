@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Architecture HTML brought level with the working-tree runtime.** Dark tokens
+  were already correct. The diagrams were not: PlanV3/`TestsNode` were missing;
+  `derive_run_state` was drawn as PENDING→RUNNING instead of the first-match
+  predicate stack; `Scheduler.run` sent quiescence to ACCEPTED and verify-fail
+  to BLOCKED; falsify sat after VERIFIED; repair keyed on review REJECTED;
+  the commit chart stopped at two counts; plan validate said 14 obligations;
+  worktrees were `runs/run_id`; AttemptRecord was owned by PlanNode; CLI trees
+  omitted most subverbs. On-disk plan filename is still `maestro-plan.v1`;
+  the visualizer was not changed. Every `docs/**/*.html` now sets CSS
+  `color-scheme: dark` on `:root` and `html` (meta alone left the canvas
+  light on a light OS).
 - **Node code review no longer blocks a merge** (§19 M35). It still runs, its findings still
   reach the retry prompt, the attempt row and the run report, and its verdict no longer fails
   an attempt. `execution.review_ceiling` now bounds how many reviews of one node the scheduler

@@ -9,6 +9,7 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
+      color-scheme: dark;
       --color-paper:   #2d3142;   /* deep warm charcoal */
       --color-ink:     #f5f5f5;   /* warm off-white */
       --color-muted:   #bfc0c0;   /* silver */
@@ -18,6 +19,7 @@
       --font-mono:     'Geist Mono', ui-monospace, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -61,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="31-flow-plan-title 31-flow-plan-desc">
       <title id="31-flow-plan-title">Maestro plan flow · Deterministic PASS receipt</title>
-      <desc id="31-flow-plan-desc">Flowchart of Maestro plan verbs: gate and review prepare a Plan IR, then ship composes author, validate, and finalize. Contract admission refuses a claim no declared fixture can witness with CLAIM_UNWITNESSABLE; an ineligible plan stops at AUTHORING_BLOCKED with no receipt; and finalize dispatches no reviewer, writing the signed PASS receipt on deterministic validation alone under rubric maestro-deterministic.v1.</desc>
+      <desc id="31-flow-plan-desc">Flowchart of Maestro plan verbs: gate and review operate on a Plan IR already on disk, then ship composes author, validate, and finalize. Contract admission runs inside project_draft during author/ship and refuses a claim no declared fixture can witness with CLAIM_UNWITNESSABLE; an ineligible plan stops at AUTHORING_BLOCKED with no receipt; validate runs 15 obligations including TESTS_BUILD_PAIRED; finalize dispatches no reviewer, writing the signed PASS receipt on deterministic validation alone under rubric maestro-deterministic.v1.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -101,7 +103,7 @@
       <rect x="470" y="40" width="180" height="48" rx="6" fill="#2d3142"/>
       <rect x="470" y="40" width="180" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="560" y="60" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">gate</text>
-      <text x="560" y="74" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">render + mutate</text>
+      <text x="560" y="74" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">IR already on disk</text>
 
       <!-- review -->
       <rect x="470" y="112" width="180" height="48" rx="6" fill="#2d3142"/>
@@ -119,7 +121,7 @@
       <polygon points="560,272 660,308 560,344 460,308" fill="#2d3142"/>
       <polygon points="560,272 660,308 560,344 460,308" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="560" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">admit?</text>
-      <text x="560" y="320" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">claims[].witness</text>
+      <text x="560" y="320" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">inside project_draft</text>
 
       <!-- ADMISSION_REFUSED -->
       <rect x="800" y="284" width="240" height="48" rx="24" fill="#2d3142"/>
@@ -131,7 +133,7 @@
       <polygon points="560,368 660,404 560,440 460,404" fill="#2d3142"/>
       <polygon points="560,368 660,404 560,440 460,404" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="560" y="400" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">validate</text>
-      <text x="560" y="416" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">14 obligations</text>
+      <text x="560" y="416" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">15 obligations</text>
 
       <!-- AUTHORING_BLOCKED -->
       <rect x="800" y="380" width="240" height="48" rx="24" fill="#2d3142"/>

@@ -9,6 +9,7 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
+      color-scheme: dark;
       --color-paper:   #2d3142;
       --color-ink:     #f5f5f5;
       --color-muted:   #bfc0c0;
@@ -18,6 +19,7 @@
       --font-mono:     'Geist Mono', ui-monospace, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -61,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="20-state-node-title 20-state-node-desc">
       <title id="20-state-node-title">NodeState lifecycle</title>
-      <desc id="20-state-node-desc">Maestro NodeState machine: PENDING to RUNNING to VERIFIED to MERGED on the scheduler path, RUNNING to BLOCKED, operator retry back to PENDING, skip --accept-sha to MERGED, and abandon to CANCELLED.</desc>
+      <desc id="20-state-node-desc">Maestro NodeState machine: PENDING to RUNNING to VERIFIED to MERGED on the scheduler path, fail_attempt RUNNING back to PENDING, RUNNING or VERIFIED to BLOCKED, operator retry back to PENDING, skip --accept-sha to MERGED, and abandon to CANCELLED. run cancel maps any non-absolute terminal to CANCELLED; resume reopens RUN_CANCEL to PENDING.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -81,8 +83,14 @@
       <line x1="808" y1="200" x2="856" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- MERGED → end -->
       <line x1="1016" y1="200" x2="1080" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- RUNNING → PENDING  fail_attempt actor=scheduler -->
+      <path d="M 456,240 V 268 H 312 V 240"
+            fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- RUNNING → BLOCKED  mark_blocked actor=scheduler -->
       <line x1="520" y1="240" x2="520" y2="360" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- VERIFIED → BLOCKED  mark_blocked at merge-time -->
+      <path d="M 728,240 V 400 H 600"
+            fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- BLOCKED → PENDING  retry actor=operator Escape.RETRY -->
       <path d="M 464,360 V 308 Q 464,300 456,300 H 320 Q 312,300 312,292 V 240"
             fill="none" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
@@ -104,8 +112,14 @@
       <rect x="812" y="180" width="40" height="12" rx="2" fill="#2d3142"/>
       <text x="832" y="190" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGED</text>
 
+      <rect x="348" y="248" width="80" height="12" rx="2" fill="#2d3142"/>
+      <text x="388" y="258" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FAIL_ATTEMPT</text>
+
       <rect x="532" y="292" width="44" height="12" rx="2" fill="#2d3142"/>
       <text x="554" y="302" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BLOCKED</text>
+
+      <rect x="640" y="320" width="72" height="12" rx="2" fill="#2d3142"/>
+      <text x="676" y="330" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED TOO</text>
 
       <rect x="368" y="280" width="40" height="12" rx="2" fill="#2d3142"/>
       <text x="388" y="290" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RETRY</text>
@@ -196,6 +210,7 @@
       <circle cx="920" cy="672" r="8" fill="none" stroke="#f5f5f5" stroke-width="1"/>
       <circle cx="920" cy="672" r="5" fill="#f5f5f5"/>
       <text x="936" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ABSOLUTELY_TERMINAL</text>
+      <text x="40" y="708" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">retry/skip also admit stranded RUNNING · cancel_run → CANCELLED · resume reopens RUN_CANCEL to PENDING</text>
     </svg>
   </div>
 </body>

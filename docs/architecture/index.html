@@ -11,6 +11,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
+      color-scheme: dark;
       --color-paper:       #2d3142;
       --color-paper-2:     #393e53;
       --color-ink:         #f5f5f5;
@@ -25,6 +26,7 @@
       --font-mono:   'Geist Mono', ui-monospace, Menlo, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -290,7 +292,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Plan model classes</h3>
               </div>
-              <p>Plan and PlanV2, AgentNode versus CodeNode, and MergePolicy’s integration gate.</p>
+              <p>Plan, PlanV2, PlanV3, AgentNode, TestsNode, CodeNode, and MergePolicy’s integration gate.</p>
             </a>
           </li>
           <li>
@@ -300,7 +302,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Scheduler lifecycle classes</h3>
               </div>
-              <p>Scheduler, SchedulerDeps, LifecycleStore, PlanNode, and AttemptRecord.</p>
+              <p>Scheduler, SchedulerDeps, LifecycleStore owning AttemptRecord, and PlanNode.</p>
             </a>
           </li>
           <li>
@@ -336,7 +338,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Derived run state</h3>
               </div>
-              <p>What the run is, from node rows, cancel_requested, and scheduler_liveness.</p>
+              <p>Predicate stack of derive_run_state, first match wins; not PENDING→RUNNING sequential.</p>
             </a>
           </li>
           <li>
@@ -362,7 +364,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Run start flowchart</h3>
               </div>
-              <p>Scheduler.run loop: ready_nodes until ACCEPTED or BLOCKED.</p>
+              <p>Scheduler.run loop: ready_nodes, falsify before VERIFIED, then _declare.</p>
             </a>
           </li>
           <li>
@@ -382,7 +384,7 @@
                 <span class="card-dot soft" aria-hidden="true"></span>
                 <h3>Operator escape flowchart</h3>
               </div>
-              <p>Escapes from BLOCKED: retry, skip --accept-sha, and abandon.</p>
+              <p>Escapes from BLOCKED: retry / --force --grant, skip --accept-sha, and abandon.</p>
             </a>
           </li>
           <li>
@@ -392,7 +394,7 @@
                 <span class="card-dot link" aria-hidden="true"></span>
                 <h3>Pre-commit refusal flowchart</h3>
               </div>
-              <p>Two counted refusals over the measured delta before the commit is taken.</p>
+              <p>Two counted refusals, then permission_check, then the private-index commit.</p>
             </a>
           </li>
           <li>
@@ -418,7 +420,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Runtime module tree</h3>
               </div>
-              <p>maestro.py collapsing live adw_modules into Plan, Run, Workspace, and ADW clusters.</p>
+              <p>maestro.py clusters: Plan, Run (incl. finalization review kernel), Workspace, ADW leftover.</p>
             </a>
           </li>
           <li>
@@ -428,7 +430,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Verb groups (plan/run/workspace)</h3>
               </div>
-              <p>Operator verbs with plan, run, and workspace expanded; run start is the focal command.</p>
+              <p>plan / run / workspace subverbs listed; run start is the focal command.</p>
             </a>
           </li>
           <li>
