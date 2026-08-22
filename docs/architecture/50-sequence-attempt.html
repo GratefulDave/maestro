@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>One agent attempt · Envelope then gate</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:      #2d3142;
+      --color-paper-2:    #393e53;
+      --color-ink:        #f5f5f5;
+      --color-muted:      #bfc0c0;
+      --color-soft:       #8e98ac;
+      --color-accent:     #f08a59;
+      --color-accent-tint: rgba(240,138,89,0.08);
+      --color-link:       #6a95d8;
+      --font-sans:        'Geist', system-ui, sans-serif;
+      --font-serif:       'Instrument Serif', serif;
+      --font-mono:        'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .lede {
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      color: var(--color-muted);
+      margin-bottom: 1.5rem;
+      max-width: 44rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Sequence · Maestro</p>
+    <h1>One agent attempt · Envelope then gate</h1>
+    <p class="lede">Scheduler owns the attempt. HerdrLauncher is transport only. The typed envelope and post-node gate decide merge or SEMANTIC retry.</p>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="50-sequence-attempt-title 50-sequence-attempt-desc">
+      <title id="50-sequence-attempt-title">One agent attempt · Envelope then gate</title>
+      <desc id="50-sequence-attempt-desc">Scheduler opens a live attempt, isolates a worktree, and uses HerdrLauncher only as transport into an agent pane; the typed envelope and post-node gate decide whether the attempt merges or retries as SEMANTIC.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/>
+        </marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#f08a59"/>
+        </marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/>
+        </marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- Lifelines: Scheduler 140, Store 392, Worktree 644, Launcher 896, Agent 1148 -->
+      <line x1="140" y1="104" x2="140" y2="600" stroke="rgba(245,245,245,0.22)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="392" y1="104" x2="392" y2="600" stroke="rgba(245,245,245,0.22)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="644" y1="104" x2="644" y2="600" stroke="rgba(245,245,245,0.22)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="896" y1="104" x2="896" y2="600" stroke="rgba(245,245,245,0.22)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="1148" y1="104" x2="1148" y2="600" stroke="rgba(245,245,245,0.22)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- ALT frame under messages so fill does not cover arrows -->
+      <rect x="112" y="384" width="560" height="192" rx="4"
+            fill="rgba(245,245,245,0.04)" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <rect x="112" y="384" width="40" height="16" rx="2"
+            fill="#2d3142" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="132" y="396" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">ALT</text>
+      <text x="124" y="412" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[verified]</text>
+      <line x1="120" y1="496" x2="664" y2="496" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="124" y="520" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[else · SEMANTIC]</text>
+
+      <!-- Activation bars -->
+      <rect x="136" y="148" width="8" height="408" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <rect x="388" y="148" width="8" height="32" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <rect x="388" y="436" width="8" height="120" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <rect x="640" y="196" width="8" height="168" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <rect x="640" y="460" width="8" height="16" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <rect x="892" y="244" width="8" height="32" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <rect x="1144" y="268" width="8" height="48" fill="rgba(245,245,245,0.06)" stroke="#bfc0c0" stroke-width="0.8"/>
+
+
+      <!-- Messages -->
+      <line x1="144" y1="152" x2="388" y2="152" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="388" y1="176" x2="144" y2="176" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <line x1="144" y1="200" x2="640" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="144" y1="224" x2="640" y2="224" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="144" y1="248" x2="892" y2="248" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="900" y1="272" x2="1144" y2="272" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1144" y1="312" x2="144" y2="312" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <line x1="144" y1="356" x2="640" y2="356" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+
+      <line x1="144" y1="440" x2="388" y2="440" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="144" y1="464" x2="640" y2="464" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="144" y1="548" x2="388" y2="548" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+
+      <!-- Labels — 8px gap above stroke -->
+      <rect x="214" y="132" width="104" height="12" rx="2" fill="#2d3142"/>
+      <text x="266" y="142" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">START_ATTEMPT</text>
+
+      <rect x="238" y="156" width="56" height="12" rx="2" fill="#2d3142"/>
+      <text x="266" y="166" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RUNNING</text>
+
+      <rect x="490" y="180" width="56" height="12" rx="2" fill="#2d3142"/>
+      <text x="518" y="190" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ISOLATE</text>
+
+      <rect x="486" y="204" width="64" height="12" rx="2" fill="#2d3142"/>
+      <text x="518" y="214" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PRE-GATE</text>
+
+      <rect x="746" y="228" width="48" height="12" rx="2" fill="#2d3142"/>
+      <text x="770" y="238" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LAUNCH</text>
+
+      <rect x="982" y="252" width="80" height="12" rx="2" fill="#2d3142"/>
+      <text x="1022" y="262" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SPAWN PANE</text>
+
+      <rect x="714" y="292" width="112" height="12" rx="2" fill="#2d3142"/>
+      <text x="770" y="302" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TYPED ENVELOPE</text>
+
+      <rect x="482" y="336" width="72" height="12" rx="2" fill="#2d3142"/>
+      <text x="518" y="346" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POST-GATE</text>
+
+      <rect x="214" y="420" width="104" height="12" rx="2" fill="#2d3142"/>
+      <text x="266" y="430" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MARK_VERIFIED</text>
+
+      <rect x="490" y="444" width="56" height="12" rx="2" fill="#2d3142"/>
+      <text x="518" y="454" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGE SHA</text>
+
+      <rect x="214" y="528" width="104" height="12" rx="2" fill="#2d3142"/>
+      <text x="266" y="538" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MUTATES_PROMPT</text>
+
+
+      <!-- Actors -->
+      <rect x="60" y="48" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="60" y="48" width="160" height="56" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="68" y="56" width="40" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
+      <text x="88" y="65" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">AUTH</text>
+      <text x="140" y="80" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Scheduler</text>
+      <text x="140" y="96" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">owns attempt</text>
+
+      <rect x="312" y="48" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="312" y="48" width="160" height="56" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <rect x="320" y="56" width="40" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
+      <text x="340" y="65" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LEDG</text>
+      <text x="392" y="80" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LifecycleStore</text>
+      <text x="392" y="96" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">attempt row</text>
+
+      <rect x="564" y="48" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="564" y="48" width="160" height="56" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="572" y="56" width="36" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
+      <text x="590" y="65" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">TREE</text>
+      <text x="644" y="80" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Worktree</text>
+      <text x="644" y="96" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">isolate · gate</text>
+
+      <rect x="816" y="48" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="816" y="48" width="160" height="56" rx="6" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="824" y="56" width="36" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.20)" stroke-width="0.8"/>
+      <text x="842" y="65" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">TRAN</text>
+      <text x="896" y="80" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">HerdrLauncher</text>
+      <text x="896" y="96" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">transport only</text>
+
+      <rect x="1068" y="48" width="160" height="56" rx="6" fill="#2d3142"/>
+      <rect x="1068" y="48" width="160" height="56" rx="6" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <rect x="1076" y="56" width="36" height="12" rx="2" fill="transparent" stroke="rgba(142,152,172,0.40)" stroke-width="0.8"/>
+      <text x="1094" y="65" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PANE</text>
+      <text x="1148" y="80" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Agent pane</text>
+      <text x="1148" y="96" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">typed envelope</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="624" x2="1240" y2="624" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <text x="40" y="648" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="160" y="640" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="184" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">AUTHORITY</text>
+
+      <rect x="320" y="640" width="16" height="12" rx="2" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="344" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">TRANSPORT</text>
+
+      <line x1="488" y1="646" x2="520" y2="646" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <text x="528" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ENVELOPE / GATE</text>
+
+      <line x1="720" y1="646" x2="752" y2="646" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <text x="760" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">RETURN</text>
+
+      <rect x="864" y="638" width="28" height="16" rx="2" fill="rgba(245,245,245,0.04)" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="878" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ALT</text>
+      <text x="900" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">MERGE OR RETRY</text>
+    </svg>
+  </div>
+</body>
+</html>

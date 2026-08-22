@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Live runtime · UML class diagram</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:       #2d3142;
+      --color-paper-2:     #393e53;
+      --color-ink:         #f5f5f5;
+      --color-muted:       #bfc0c0;
+      --color-soft:        #8e98ac;
+      --color-accent:      #f08a59;
+      --color-accent-tint: rgba(240,138,89,0.08);
+      --color-link:        #6a95d8;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">UML class · live ADW runtime</p>
+    <h1>One run · classes that execute a plan</h1>
+
+    <svg viewBox="0 0 1280 768" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="13-uml-runtime-title 13-uml-runtime-desc">
+      <title id="13-uml-runtime-title">Live runtime · UML class diagram</title>
+      <desc id="13-uml-runtime-desc">Class diagram of the live ADW runtime: Scheduler owns SchedulerDeps, uses LifecycleStore and HerdrLauncher as transport, and consumes Plan / PlanV2, which owns AgentNode and CodeNode.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/>
+        </marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#f08a59"/>
+        </marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/>
+        </marker>
+        <marker id="runtime-uml-triangle" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
+          <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+        </marker>
+        <marker id="runtime-uml-diamond-filled" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f5f5f5"/>
+        </marker>
+        <marker id="runtime-uml-diamond-hollow" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+        </marker>
+        <marker id="runtime-uml-open" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#bfc0c0" stroke-width="1"/>
+        </marker>
+        <marker id="runtime-uml-open-accent" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#f08a59" stroke-width="1"/>
+        </marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- Relationships (drawn before boxes) -->
+      <!-- Scheduler owns SchedulerDeps -->
+      <line x1="440" y1="80" x2="400" y2="80" stroke="#bfc0c0" stroke-width="1" marker-start="url(#runtime-uml-diamond-filled)"/>
+      <!-- Scheduler uses LifecycleStore -->
+      <line x1="840" y1="80" x2="880" y2="80" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <!-- Scheduler uses HerdrLauncher (transport) -->
+      <path d="M 520,320 V 332 Q 520,340 512,340 H 228 Q 220,340 220,348 V 360" fill="none" stroke="#f08a59" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open-accent)"/>
+      <!-- Scheduler consumes Plan / PlanV2 -->
+      <line x1="640" y1="320" x2="640" y2="360" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <!-- Plan owns AgentNode -->
+      <line x1="800" y1="420" x2="840" y2="420" stroke="#bfc0c0" stroke-width="1" marker-start="url(#runtime-uml-diamond-filled)"/>
+      <!-- Plan owns CodeNode -->
+      <path d="M 800,500 H 812 Q 820,500 820,508 V 580 Q 820,588 828,588 H 840" fill="none" stroke="#bfc0c0" stroke-width="1" marker-start="url(#runtime-uml-diamond-filled)"/>
+
+      <!-- Relationship labels -->
+      <rect x="844" y="60" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="860" y="69" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">USES</text>
+
+      <rect x="332" y="322" width="76" height="12" rx="2" fill="#2d3142"/>
+      <text x="370" y="331" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TRANSPORT</text>
+
+      <rect x="652" y="334" width="64" height="12" rx="2" fill="#2d3142"/>
+      <text x="684" y="343" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CONSUMES</text>
+
+      <!-- Composition multiplicities -->
+      <rect x="424" y="60" width="12" height="12" rx="2" fill="#2d3142"/>
+      <text x="430" y="69" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="404" y="60" width="12" height="12" rx="2" fill="#2d3142"/>
+      <text x="410" y="69" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+
+      <rect x="804" y="400" width="12" height="12" rx="2" fill="#2d3142"/>
+      <text x="810" y="409" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="816" y="400" width="24" height="12" rx="2" fill="#2d3142"/>
+      <text x="828" y="409" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">0..*</text>
+
+      <rect x="804" y="480" width="12" height="12" rx="2" fill="#2d3142"/>
+      <text x="810" y="489" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="784" y="568" width="24" height="12" rx="2" fill="#2d3142"/>
+      <text x="796" y="577" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">0..*</text>
+
+      <!-- Class: SchedulerDeps -->
+      <rect x="40" y="40" width="360" height="160" rx="6" fill="#2d3142"/>
+      <rect x="40" y="40" width="360" height="160" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <line x1="40" y1="80" x2="400" y2="80" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="220" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SchedulerDeps</text>
+      <text x="56" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ store: LifecycleStore</text>
+      <text x="56" y="120" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ repo: Path</text>
+      <text x="56" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ run_node: NodeRunner</text>
+      <text x="56" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ quiesce_attempt: QuiesceAttempt</text>
+      <text x="56" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ review_attempt: Optional[ReviewRunner]</text>
+
+      <!-- Class: Scheduler (focal) -->
+      <rect x="440" y="40" width="400" height="280" rx="6" fill="#2d3142"/>
+      <rect x="440" y="40" width="400" height="280" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="440" y="40" width="400" height="40" rx="6" fill="rgba(240,138,89,0.12)"/>
+      <rect x="440" y="72" width="400" height="8" fill="rgba(240,138,89,0.12)"/>
+      <line x1="440" y1="80" x2="840" y2="80" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
+      <line x1="440" y1="200" x2="840" y2="200" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
+      <text x="640" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Scheduler</text>
+      <text x="456" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ run_id: str</text>
+      <text x="456" y="120" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Dict[str, PlanNode]</text>
+      <text x="456" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ config: SchedulerConfig</text>
+      <text x="456" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ deps: SchedulerDeps</text>
+      <text x="456" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ plan_digest: str</text>
+      <text x="456" y="220" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ project(): None</text>
+      <text x="456" y="240" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ run(): RunReport</text>
+      <text x="456" y="260" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ cancel(): None</text>
+      <text x="456" y="280" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ request_pause(): None</text>
+      <text x="456" y="300" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ shutdown(): None</text>
+
+      <!-- Class: LifecycleStore -->
+      <rect x="880" y="40" width="360" height="200" rx="6" fill="#2d3142"/>
+      <rect x="880" y="40" width="360" height="200" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <line x1="880" y1="80" x2="1240" y2="80" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <line x1="880" y1="120" x2="1240" y2="120" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="1060" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LifecycleStore</text>
+      <text x="896" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ db_path: str</text>
+      <text x="896" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ create_run(id, digest, nodes): None</text>
+      <text x="896" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ start_attempt(id, node, sha): int</text>
+      <text x="896" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_verified(id, node, sha): NodeLifecycle</text>
+      <text x="896" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_merged(id, node): NodeLifecycle</text>
+      <text x="896" y="220" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ declare_outcome(id): OutcomeReport</text>
+
+      <!-- Class: HerdrLauncher -->
+      <rect x="40" y="360" width="360" height="200" rx="6" fill="#2d3142"/>
+      <rect x="40" y="360" width="360" height="200" rx="6" fill="#393e53" stroke="#8e98ac" stroke-width="1"/>
+      <line x1="40" y1="400" x2="400" y2="400" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <line x1="40" y1="460" x2="400" y2="460" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="220" y="384" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">HerdrLauncher</text>
+      <text x="56" y="420" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ herdr_path: Path</text>
+      <text x="56" y="440" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ admitted_routes: AdmittedRouteSet</text>
+      <text x="56" y="480" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ launch(spec): LaunchHandle</text>
+      <text x="56" y="500" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ poll(handle): PollResult</text>
+      <text x="56" y="520" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ cancel(handle, deadline): None</text>
+      <text x="56" y="540" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ provision(worktree): None</text>
+
+      <!-- Class: Plan / PlanV2 -->
+      <rect x="440" y="360" width="360" height="180" rx="6" fill="#2d3142"/>
+      <rect x="440" y="360" width="360" height="180" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <line x1="440" y1="400" x2="800" y2="400" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <line x1="440" y1="500" x2="800" y2="500" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="620" y="384" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan / PlanV2</text>
+      <text x="456" y="420" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: v1 | v2</text>
+      <text x="456" y="440" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ plan_id: str</text>
+      <text x="456" y="460" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Tuple[Node, ...]</text>
+      <text x="456" y="480" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ merge_policy: MergePolicy</text>
+      <text x="456" y="520" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ to_plan_nodes(): Tuple[PlanNode, ...]</text>
+
+      <!-- Class: AgentNode -->
+      <rect x="840" y="360" width="400" height="160" rx="6" fill="#2d3142"/>
+      <rect x="840" y="360" width="400" height="160" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <line x1="840" y1="400" x2="1240" y2="400" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="1040" y="384" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentNode</text>
+      <text x="856" y="420" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ kind: Literal["agent"]</text>
+      <text x="856" y="440" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ instruction: str</text>
+      <text x="856" y="460" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ gate: Gate</text>
+      <text x="856" y="480" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ prompt_assets: Tuple[PromptAsset, ...]</text>
+      <text x="856" y="500" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ effects: Tuple[NodeEffect, ...]</text>
+
+      <!-- Class: CodeNode -->
+      <rect x="840" y="548" width="400" height="140" rx="6" fill="#2d3142"/>
+      <rect x="840" y="548" width="400" height="140" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <line x1="840" y1="588" x2="1240" y2="588" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
+      <text x="1040" y="572" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CodeNode</text>
+      <text x="856" y="608" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ kind: Literal["code"]</text>
+      <text x="856" y="628" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ command: Tuple[str, ...]</text>
+      <text x="856" y="648" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ cwd: str</text>
+      <text x="856" y="668" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ expects_changes: bool</text>
+
+      <!-- Legend: relationship vocabulary -->
+      <line x1="40" y1="708" x2="1240" y2="708" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <text x="40" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
+
+      <line x1="40" y1="748" x2="68" y2="748" stroke="#f5f5f5" stroke-width="1" marker-end="url(#runtime-uml-triangle)"/>
+      <text x="76" y="752" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
+
+      <line x1="200" y1="748" x2="228" y2="748" stroke="#f5f5f5" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#runtime-uml-triangle)"/>
+      <text x="236" y="752" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Realization</text>
+
+      <line x1="360" y1="748" x2="388" y2="748" stroke="#f5f5f5" stroke-width="1" marker-start="url(#runtime-uml-diamond-filled)"/>
+      <text x="396" y="752" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
+
+      <line x1="548" y1="748" x2="576" y2="748" stroke="#f5f5f5" stroke-width="1" marker-start="url(#runtime-uml-diamond-hollow)"/>
+      <text x="584" y="752" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
+
+      <line x1="736" y1="748" x2="764" y2="748" stroke="#bfc0c0" stroke-width="1" marker-end="url(#runtime-uml-open)"/>
+      <text x="772" y="752" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Association</text>
+
+      <line x1="900" y1="748" x2="928" y2="748" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <text x="936" y="752" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
+    </svg>
+  </div>
+</body>
+</html>
