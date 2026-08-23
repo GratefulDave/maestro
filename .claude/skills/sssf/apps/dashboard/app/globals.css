@@ -123,15 +123,9 @@ code,
   height: 34px;
   place-items: center;
   border-radius: 10px;
-  background: var(--color-panel-2);
-  border: 1px solid var(--color-border);
-  overflow: hidden;
-}
-
-.brand-mark img {
-  width: 22px;
-  height: 22px;
-  display: block;
+  background: linear-gradient(135deg, var(--color-accent), #8a63ff);
+  color: white;
+  font-weight: 800;
 }
 
 .brand strong,
@@ -753,6 +747,104 @@ code,
 
 .dag-node-content small {
   color: var(--color-faint);
+}
+
+.cockpit-header {
+  margin-bottom: 12px;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+/* Sidecar palette (pane-sidecar.svg): #101318 bg, #87d787 ok,
+   #5fd7ff working, #ff875f fail, #af87ff review, #87afd7 ready. */
+.cockpit-ledger {
+  display: flex;
+  flex-direction: column;
+  background: #101318;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 12px 8px;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.7;
+  overflow-x: auto;
+}
+
+.cockpit-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 6px;
+  white-space: pre;
+  color: #d0d0d0;
+}
+
+.cockpit-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.cockpit-branch {
+  color: #585858;
+  user-select: none;
+}
+
+.cockpit-marker {
+  width: 1.2em;
+  flex: none;
+}
+
+.cockpit-id {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  color: #e6e6e6;
+}
+
+.cockpit-kind,
+.cockpit-meta {
+  color: #8a8a8a;
+  flex: none;
+}
+
+.cockpit-state {
+  flex: none;
+  margin-left: auto;
+}
+
+.cockpit-row-ok .cockpit-marker,
+.cockpit-row-ok .cockpit-state {
+  color: #87d787;
+}
+
+.cockpit-row-info .cockpit-marker,
+.cockpit-row-info .cockpit-state {
+  color: #5fd7ff;
+  font-weight: 700;
+}
+
+.cockpit-row-err .cockpit-marker,
+.cockpit-row-err .cockpit-state {
+  color: #ff875f;
+}
+
+.cockpit-row-review .cockpit-marker,
+.cockpit-row-review .cockpit-state {
+  color: #af87ff;
+}
+
+.cockpit-row-ready .cockpit-marker,
+.cockpit-row-ready .cockpit-state {
+  color: #87afd7;
+}
+
+.cockpit-row-warn .cockpit-marker,
+.cockpit-row-warn .cockpit-state {
+  color: #e0a64b;
+}
+
+.cockpit-row-pending .cockpit-marker,
+.cockpit-row-pending .cockpit-state {
+  color: #8a8a8a;
 }
 
 .integration-summary {

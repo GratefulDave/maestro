@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { AutoRefresh } from "@/components/AutoRefresh";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
@@ -7,6 +8,7 @@ import { SourceBanner } from "@/components/SourceBanner";
 import { StatusPill } from "@/components/StatusPill";
 import { ApiUnavailable } from "@/components/ApiUnavailable";
 import { decodeRouteParam, getRun } from "@/lib/api";
+import { isInFlight } from "@/lib/runVisibility";
 import type { MaestroRunDetail } from "@/lib/types";
 
 export async function loadRunOrBanner(
@@ -74,6 +76,7 @@ export function RunChrome({
   const sourceLabel = decodeRouteParam(sourceId);
   return (
     <section className="page-stack">
+      <AutoRefresh isInFlight={isInFlight(run.state)} />
       <Breadcrumbs
         items={[
           { label: "Runs", href: "/runs" },

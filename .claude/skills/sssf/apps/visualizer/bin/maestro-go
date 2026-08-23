@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+#
+# Start a Maestro plan and everything you watch it with, in one command.
+#
+# Three things have to be running to work a run: the run itself, the visualizer
+# on :4601, and the terminal monitor. Starting them by hand is three commands in
+# three tabs, and the run is the only one of the three that is hard to restart,
+# so it is the one that gets started without the other two. This starts all
+# three: the visualizer detached, the run detached with its output on disk, and
+# the monitor in the foreground where the operator already is.
+#
+#   just -g go <plan-name>            start the plan and watch it
+#   just -g go <plan-name> <secs>     set the monitor's refresh interval
+#
+# MAESTRO_REPO points it at a deployment other than the default.
+# The run keeps going if the monitor is closed; stop it with `maestro run pause`.
+set -uo pipefail
+
+DEFAULT_REPO="/Users/davidandrews/PycharmProjects/lexgenius-pipeline"
+REPO="${MAESTRO_REPO:-$DEFAULT_REPO}"
+STATE_ROOT="/Users/davidandrews/PycharmProjects/.maestro-state"
+DB="$STATE_ROOT/$(basename "$REPO")/lifecycle.sqlite3"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${TMPDIR:-/tmp}/maestro-go"
+
+PLAN="${1:-}"
+INTERVAL="${2:-10}"
+
+if [[ -z $PLAN ]]; then
+  printf 'usage: just -g go <plan-name> [refresh-seconds]\n' >&2
+  printf 'plans in %s:\n' "$REPO/.maestro/plans" >&2
+  ls -1 "$REPO/.maestro/plans" 2>/dev/null | grep -v '\.' | sed 's/^/  /' >&2
+  exit 2
+fi
+
+if [[ ! -d "$REPO/.maestro/plans/$PLAN" ]]; then
+  printf 'maestro-go: no shipped plan %s in %s\n' "$PLAN" "$REPO/.maestro/plans" >&2
+  exit 1
+fi
+
+# The author-side keys. `maestro bootstrap` writes these three into maestro.env
+# and keeps PLANCTL_REVIEWER_HMAC_KEY in a separate reviewer-hmac.env, because
+# `plan gate` refuses to run while the reviewer key is in its environment. So
+# this sources the author file and nothing else — there is no variable for the
+# operator to remember, and none to unset.
+ENV_FILE="$STATE_ROOT/$(basename "$REPO")/keys/maestro.env"
+if [[ -f $ENV_FILE ]]; then
+  set -a; . "$ENV_FILE"; set +a
+fi
+unset PLANCTL_REVIEWER_HMAC_KEY
+
+mkdir -p "$LOG_DIR"
+RUN_LOG="$LOG_DIR/$PLAN.log"
+
+# The visualizer first, because it is the slowest to come up and the run does
+# not depend on it. maestro-viz frees its own ports and is safe to re-run.
+plan_file="$REPO/.maestro/plans/$PLAN/maestro-plan.v1"
+digest=$(shasum -a 256 "$plan_file" | cut -d' ' -f1)
+# The newest run of this plan before we start, so the new one is told apart from
+# an earlier run of the same plan by identity rather than by timestamp.
+before=$(sqlite3 "$DB" "SELECT run_id FROM runs WHERE plan_digest='$digest' ORDER BY created_at DESC LIMIT 1;" 2>/dev/null)
+
+printf 'maestro-go: starting visualizer\n'
+"$HERE/maestro-viz" "$REPO" 2>&1 | sed 's/^/  /'
+
+# The newest run of this plan before we start, so we can tell the new one apart
+# from any earlier run of the same plan rather than guessing by time.
+# A plan without a finalization receipt cannot run. Shipping is resumable — it
+# skips author and picks up at validate/finalize — so running it here is cheap
+# when the receipt exists and is the missing step when it does not.
+RECEIPT="$STATE_ROOT/$(basename "$REPO")/receipts/$digest.json"
+if [[ ! -f $RECEIPT ]]; then
+  printf 'maestro-go: %s has no finalization receipt; shipping it first\n' "$PLAN"
+  printf 'maestro-go: this dispatches the independent reviewer and takes a few minutes\n'
+  ( cd "$REPO" && .venv/bin/python adws/maestro.py plan ship "$PLAN" ) 2>&1 | tail -3
+  if [[ ! -f $RECEIPT ]]; then
+    printf '\nmaestro-go: the plan is still not finalized, so the run cannot start.\n' >&2
+    printf 'maestro-go: a FINALIZATION_STALLED outcome writes no receipt and re-running is legal.\n' >&2
+    exit 1
+  fi
+  printf 'maestro-go: finalized\n'
+fi
+
+# A run of this plan that stopped BLOCKED is resumed rather than duplicated, and
+# every node it blocked on is handed back to the scheduler first. Starting a
+# second run instead would rebuild the lanes the first one already merged, so
+# the operator would pay again for work that is already on the integration
+# branch. `retry` refuses a node that is not blocked, which is why its failure
+# is tolerated here: the loop is a sweep over whatever the run left behind, not
+# an assertion that each node needed unblocking.
+blocked_outcome=$(sqlite3 "$DB" "SELECT latest_outcome FROM runs WHERE run_id='$before';" 2>/dev/null)
+if [[ -n $before && $blocked_outcome == "BLOCKED" ]]; then
+  blocked_nodes=$(sqlite3 "$DB" "SELECT node_id FROM node_lifecycle WHERE run_id='$before' AND state='BLOCKED';" 2>/dev/null)
+  if [[ -n $blocked_nodes ]]; then
+    printf 'maestro-go: run %s stopped BLOCKED; unblocking its nodes\n' "$before"
+    while IFS= read -r node; do
+      [[ -z $node ]] && continue
+      printf '  retry %s\n' "$node"
+      ( cd "$REPO" && uv run python adws/maestro.py retry --db "$DB" "$before" "$node" ) 2>&1 | tail -1 | sed 's/^/    /'
+    done <<< "$blocked_nodes"
+  fi
+  printf 'maestro-go: resuming run %s\n' "$before"
+  ( cd "$REPO" && nohup uv run python adws/maestro.py run resume "$PLAN" >"$RUN_LOG" 2>&1 & )
+  printf 'maestro-go: run %s\n' "$before"
+  printf 'maestro-go: visualizer http://localhost:4601/\n'
+  printf 'maestro-go: run log %s\n' "$RUN_LOG"
+  printf 'maestro-go: closing this monitor does not stop the run\n\n'
+  sleep 2
+  exec "$HERE/maestro-mon" "$before" "$INTERVAL"
+fi
+
+printf 'maestro-go: starting run of %s\n' "$PLAN"
+( cd "$REPO" && nohup uv run python adws/maestro.py run start "$PLAN" >"$RUN_LOG" 2>&1 & )
+
+# Wait for the scheduler to record its run row. A refusal never writes one, so
+# a plan that will not start surfaces its own error here instead of leaving the
+# operator watching an empty monitor.
+RUN=""
+for _ in $(seq 1 60); do
+  sleep 1
+  RUN=$(sqlite3 "$DB" "SELECT run_id FROM runs WHERE plan_digest='$digest' ORDER BY created_at DESC LIMIT 1;" 2>/dev/null)
+  [[ -n $RUN && $RUN != "$before" ]] && break
+  RUN=""
+  if ! pgrep -f "maestro.py run start $PLAN" >/dev/null 2>&1; then
+    printf 'maestro-go: the run exited before recording a run row.\n' >&2
+    printf 'maestro-go: %s\n' "$RUN_LOG" >&2
+    tail -20 "$RUN_LOG" >&2
+    exit 1
+  fi
+done
+
+if [[ -z $RUN ]]; then
+  printf 'maestro-go: no run row after 60s; the run may still be starting.\n' >&2
+  printf 'maestro-go: %s\n' "$RUN_LOG" >&2
+  exit 1
+fi
+
+printf 'maestro-go: run %s\n' "$RUN"
+printf 'maestro-go: visualizer http://localhost:4601/\n'
+printf 'maestro-go: run log %s\n' "$RUN_LOG"
+printf 'maestro-go: closing this monitor does not stop the run\n\n'
+sleep 2
+
+exec "$HERE/maestro-mon" "$RUN" "$INTERVAL"

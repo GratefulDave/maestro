@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { Background, Controls, MarkerType, ReactFlow, type Edge, type Node } from "@xyflow/react";
-import { Activity, GitFork } from "@/lib/icons";
+import { Activity, GitFork, Terminal } from "@/lib/icons";
 import { runHref } from "@/lib/href";
 import type { MaestroNode } from "@/lib/types";
+import { DagCockpit } from "./DagCockpit";
 import { StatusPill } from "./StatusPill";
 
 export function NodeDagView({
@@ -17,7 +18,7 @@ export function NodeDagView({
   runId: string;
   nodes: MaestroNode[];
 }) {
-  const [mode, setMode] = useState<"table" | "dag">("table");
+  const [mode, setMode] = useState<"table" | "dag" | "text">("table");
   const base = `${runHref(sourceId, runId)}/lanes`;
   const flow = useMemo(() => {
     const byDepth = new Map<number, MaestroNode[]>();
@@ -79,6 +80,13 @@ export function NodeDagView({
           >
             <GitFork size={14} /> DAG
           </button>
+          <button
+            className={mode === "text" ? "view-toggle-active" : undefined}
+            onClick={() => setMode("text")}
+            type="button"
+          >
+            <Terminal size={14} /> Text
+          </button>
         </div>
       </div>
       {mode === "dag" ? (
@@ -95,6 +103,8 @@ export function NodeDagView({
             <Controls />
           </ReactFlow>
         </div>
+      ) : mode === "text" ? (
+        <DagCockpit base={base} nodes={nodes} />
       ) : (
         <div className="table-wrap">
           <table className="data-table">
