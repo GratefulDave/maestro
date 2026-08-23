@@ -113,7 +113,7 @@ interface RunRow {
   scheduler_host: string | null;
   scheduler_pid: number | null;
   scheduler_start_epoch: number | null;
-
+  plan_name: string | null;
 }
 
 interface NodeRow {
@@ -314,14 +314,12 @@ export class MaestroDb {
   }
 
   /**
-   * digest → plan name.
+   * digest → plan name from the plans directory.
    *
-   * The ledger stores a plan DIGEST and has never heard of a plan name, so
-   * this map is the whole bridge between the two. It is recomputed whenever
-   * the plans directory's mtime moves, because a plan edited between runs
-   * changes its digest and a stale entry would label a run with the wrong
-   * plan. A run whose plan bytes have since changed simply has no name here,
-   * which is the honest answer rather than a guess.
+   * Fallback only. New runs store `runs.plan_name` at creation; this map
+   * names pre-column rows whose plan file is still on this machine. A run
+   * whose plan bytes have since changed simply has no name here, which is
+   * the honest answer rather than a guess.
    */
   private planNameFor(digest: string): string | null {
     if (!this.plansDir || !existsSync(this.plansDir)) return null;
@@ -343,16 +341,18 @@ export class MaestroDb {
     return this.planNames.get(digest) ?? null;
   }
 
+
   private runRows(runId?: string): RunRow[] {
     const db = this.freshDb();
     const cause = this.optionalColumn(db, "runs", "runs", "cancel_cause");
     const host = this.optionalColumn(db, "runs", "runs", "scheduler_host");
     const pid = this.optionalColumn(db, "runs", "runs", "scheduler_pid");
     const epoch = this.optionalColumn(db, "runs", "runs", "scheduler_start_epoch");
+    const storedName = this.optionalColumn(db, "runs", "runs", "plan_name");
     const sql =
       `SELECT run_id, plan_digest, created_at, last_transition_at,
               latest_outcome, latest_outcome_at, ${cause}, cancel_requested,
-              ${host}, ${pid}, ${epoch}
+              ${host}, ${pid}, ${epoch}, ${storedName}
          FROM runs`;
     return runId
       ? db.query<RunRow, [string]>(`${sql} WHERE run_id = ?`).all(runId)
@@ -402,7 +402,9 @@ export class MaestroDb {
       const state = displayRunState(live, scheduler_liveness);
       return {
         run_id: row.run_id,
-        plan_name: this.planNameFor(row.plan_digest),
+        plan_name: (typeof row.plan_name === "string" && row.plan_name)
+          ? row.plan_name
+          : this.planNameFor(row.plan_digest),
         plan_digest: row.plan_digest,
         state,
         scheduler_liveness,
@@ -548,7 +550,9 @@ export class MaestroDb {
     const state = displayRunState(live, scheduler_liveness);
     return {
       run_id: row.run_id,
-      plan_name: this.planNameFor(row.plan_digest),
+      plan_name: (typeof row.plan_name === "string" && row.plan_name)
+        ? row.plan_name
+        : this.planNameFor(row.plan_digest),
       plan_digest: row.plan_digest,
       state,
       scheduler_liveness,

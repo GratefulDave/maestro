@@ -106,6 +106,23 @@ class StoreConstructionTests(unittest.TestCase):
                 ("run1", "a")).fetchone()
             self.assertEqual(row[0], "digest-abc")
 
+    def test_create_run_writes_the_plan_name(self):
+        """The INSERT is the only writer. A name that never reaches this
+        statement is the §16.3 item 61 reverse-hash forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "digest-abc", [make_node("a", 0)],
+                             plan_name="Phase 1 freeze")
+            row = store.conn.execute(
+                "SELECT plan_name FROM runs WHERE run_id=?",
+                ("run1",)).fetchone()
+            self.assertEqual(row[0], "Phase 1 freeze")
+            store.create_run("run2", "digest-def", [make_node("b", 0)])
+            unnamed = store.conn.execute(
+                "SELECT plan_name FROM runs WHERE run_id=?",
+                ("run2",)).fetchone()
+            self.assertIsNone(unnamed[0])
+
     def test_create_run_seeds_every_node_pending(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))

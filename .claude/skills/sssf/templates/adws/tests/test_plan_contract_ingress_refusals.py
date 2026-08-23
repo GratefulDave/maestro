@@ -125,7 +125,8 @@ class IngressFixture(unittest.TestCase):
         draft = self.project()
         self.assertEqual(self.gate(draft)["min_cases"], 1)
         self.assertEqual(draft["nodes"][0]["node_id"], "lane-freeze")
-
+        self.assertEqual(draft["title"], "Phase 1 freeze")
+        self.assertEqual(draft["intent"], "Phase 1 freeze")
 
 def _integration(ir: dict) -> dict:
     return ir["extensions"]["maestro"]["integration_gate"]

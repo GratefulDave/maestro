@@ -143,6 +143,11 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
   run_id             TEXT PRIMARY KEY,
   plan_digest        TEXT NOT NULL,
+  -- The plan's title, written at run creation so the console does not have
+  -- to re-hash plan files to name a run (§16.3 item 61). NULL on a ledger
+  -- written before the column and on a run of a plan that predates the
+  -- field: both read as "no stored name", never as a name invented here.
+  plan_name          TEXT,
   created_at         TEXT NOT NULL,
   last_transition_at TEXT NOT NULL,
   latest_outcome     TEXT,              -- NULL = no scheduler ever declared quiescence
@@ -362,6 +367,7 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("scheduler_claimed_at", "TEXT"),
     ("cancel_cause", "TEXT"),
     ("scheduler_start_epoch", "REAL"),
+    ("plan_name", "TEXT"),
 )
 
 #: The same, for `node_lifecycle`. Kept as a second list rather than folded
@@ -901,7 +907,8 @@ class LifecycleStore:
 
     @serialized
     def create_run(self, run_id: str, plan_digest: str,
-                    nodes: Sequence[st.PlanNode]) -> None:
+                    nodes: Sequence[st.PlanNode],
+                    plan_name: Optional[str] = None) -> None:
         """Project the plan's nodes into `dag_nodes`, seed every node PENDING,
         in one transaction (§7.1)."""
         existing = self.conn.execute(
@@ -915,11 +922,11 @@ class LifecycleStore:
                 "INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,"
                 " latest_outcome, latest_outcome_at, cancel_requested,"
                 " scheduler_pid, scheduler_host, scheduler_claimed_at,"
-                " scheduler_start_epoch)"
-                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?,?)",
+                " scheduler_start_epoch, plan_name)"
+                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?,?,?)",
                 (run_id, plan_digest, now, now,
                  os.getpid(), scheduler_host(), now,
-                 wd.process_start_epoch(os.getpid())))
+                 wd.process_start_epoch(os.getpid()), plan_name))
             for node in nodes:
                 self.conn.execute(
                     "INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind, depth,"

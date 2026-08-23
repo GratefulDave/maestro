@@ -1018,13 +1018,21 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     ig_min = _require_count(
         integration[declared[0]], "UNMAPPABLE_INTEGRATION", declared[0])
     plan_id = _require_text(ir.get("plan_id"), "IR_SCHEMA", "plan_id")
+    # Title is its own field. It used to be consumed only into `intent` and
+    # emitted nowhere else, so nothing downstream could recover it as a name
+    # (§16.3 item 61). `intent` keeps its meaning and its readers; title is
+    # an addition. Ship refuses an untitled IR here — a field added later
+    # is optional forever on the model (§3.6 B8), so the refusal lives at
+    # this chokepoint rather than as a required parse field.
+    title = _require_text(ir.get("title"), "IR_SCHEMA", "title")
     draft = {
         # Read from the model rather than spelled here: the constant and the
         # registered parser class are the same fact, and a literal beside
         # them is a second place for it to be wrong.
         "schema_version": plan_model.SCHEMA_V2,
         "plan_id": plan_id,
-        "intent": _require_text(ir.get("title"), "IR_SCHEMA", "title"),
+        "title": title,
+        "intent": title,
         "evidence": evidence,
         "nodes": nodes,
         "merge_policy": {

@@ -524,6 +524,12 @@ class Plan(BaseModel):
     repo: str = Field(min_length=1)
     base_commit: str = Field(min_length=1)
     intent: str = Field(min_length=1)
+    #: The plan's name. Optional on the model because a field added later is
+    #: optional forever (§3.6 B8); ship refuses an untitled plan instead of
+    #: making this required, which would unparse every already-shipped file.
+    #: Default None so a file written before the field still parses. Omitted
+    #: from canonical bytes when absent — see `plan_canonical.canonicalize`.
+    title: Optional[str] = None
     evidence: Tuple[Evidence, ...]
     nodes: Tuple[Node, ...]
     merge_policy: MergePolicy

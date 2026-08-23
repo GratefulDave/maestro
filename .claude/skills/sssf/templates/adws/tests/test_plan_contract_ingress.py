@@ -129,9 +129,40 @@ class PlanContractIngressTest(unittest.TestCase):
         plan = pm.parse_bytes(stored)
         self.assertTrue(pc.is_canonical(stored))
         self.assertEqual(plan.plan_id, "phase-1")
+        self.assertEqual(plan.title, ir["title"])
+        self.assertEqual(plan.intent, ir["title"])
         self.assertEqual(plan.nodes[0].node_id, "lane-freeze")
         self.assertEqual(trace["lanes"], ["lane-freeze"])
         self.assertEqual(pd.digest_of(stored), hashlib.sha256(stored).hexdigest())
+
+    def test_project_canonical_plan_refuses_an_untitled_ir(self):
+        """Ship's first production call. Untitled is IR_SCHEMA:title, not a
+        parse default — B8 makes a later field optional forever."""
+        ir = _ir()
+        ir.pop("title")
+        ir_path = _write(self.root / "untitled.plan.json", ir)
+        receipt_path = _write(
+            self.root / "untitled.plan-review.json",
+            _receipt(ir_path.read_bytes()))
+        with self.assertRaisesRegex(pci.IngressError, "IR_SCHEMA:title"):
+            pci.project_canonical_plan(
+                ir_path, receipt_path, self.repo)
+
+    def test_a_real_ir_projects_its_title_onto_the_plan(self):
+        """The recorded p5 IR. Admission later required a witness the file
+        predates; that one field is filled so `project_draft` can run. Title
+        is untouched."""
+        ir_path = TESTS / "fixtures" / "cmo-consolidation-l-r6-p5.plan.json"
+        if not ir_path.is_file():
+            self.skipTest("the recorded p5 IR is not checked out")
+        ir = json.loads(ir_path.read_text(encoding="utf-8"))
+        recorded_title = ir["title"]
+        for claim in ir.get("claims") or []:
+            if isinstance(claim, dict) and "witness" not in claim:
+                claim["witness"] = {"scope": "in_process", "store": "in_memory"}
+        draft = pci.project_draft(ir, self.repo)
+        self.assertEqual(draft["title"], recorded_title)
+        self.assertEqual(draft["intent"], recorded_title)
 
     def test_refuses_receiptless_and_stale_digest(self):
         ir_path = _write(self.root / "ir.json", _ir())

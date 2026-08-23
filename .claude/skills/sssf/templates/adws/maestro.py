@@ -3754,7 +3754,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             try:
                 report = scheduler.Scheduler(
                     args.run_id, plan.to_plan_nodes(), config, deps,
-                    plan_digest=args.digest).run()
+                    plan_digest=args.digest,
+                    plan_name=getattr(plan, "title", None)).run()
             except scheduler.RunPaused:
                 # Not an outcome, and deliberately not printed as one: nothing was
                 # declared, no node moved, and `run resume` is legal from here.
