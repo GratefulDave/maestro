@@ -15,6 +15,7 @@ import {
   PlayCircle,
   RotateCcw,
   Shield,
+  Terminal,
   User,
   XCircle,
   type LucideIcon,
@@ -48,6 +49,7 @@ export {
   PlayCircle,
   RotateCcw,
   Shield,
+  Terminal,
   User,
   XCircle,
 };

@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { NAV_ICONS } from "@/lib/icons";
@@ -42,9 +41,7 @@ export function Sidebar() {
   return (
     <aside className="sidebar">
       <Link className="brand" href="/runs" aria-label="maestro console home">
-        <span className="brand-mark">
-          <Image alt="" height={22} src="/logo.svg" unoptimized width={22} />
-        </span>
+        <span className="brand-mark">S</span>
         <span>
           <strong>maestro</strong>
           <small>operator console</small>

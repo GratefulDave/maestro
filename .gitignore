@@ -156,6 +156,7 @@ sssf.db*
 
 # demo app runtime (example branch)
 apps/inkwell/inkwell.db*
+scratchpad/*
 
 *.mov
 .agent_memory.json
