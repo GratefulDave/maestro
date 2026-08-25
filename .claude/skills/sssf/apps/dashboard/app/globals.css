@@ -806,6 +806,11 @@ code,
   flex: none;
 }
 
+.cockpit-dependency {
+  color: #686868;
+  flex: none;
+}
+
 .cockpit-state {
   flex: none;
   margin-left: auto;
