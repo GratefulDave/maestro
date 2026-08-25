@@ -233,6 +233,19 @@ class PlanContractIngressTest(unittest.TestCase):
         with self.assertRaisesRegex(pci.IngressError, "UNMAPPABLE_OUTPUTS"):
             pci.project_draft(ir, self.repo)
 
+    def test_projects_a_tests_lane_as_maestro_plan_v3(self):
+        ir = _ir()
+        ir["lanes"][0]["lane_kind"] = "tests"
+        ir["requirements"][0]["surface"][0]["path"] = (
+            "tests/test_existing.py")
+        ir["extensions"]["maestro"]["outputs"]["lane-freeze"] = [
+            "tests/test_existing.py"]
+
+        draft = pci.project_draft(ir, self.repo)
+
+        self.assertEqual(pm.SCHEMA_V3, draft["schema_version"])
+        self.assertEqual("tests", draft["nodes"][0]["kind"])
+
 
 if __name__ == "__main__":
     unittest.main()

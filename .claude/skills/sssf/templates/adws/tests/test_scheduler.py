@@ -1256,6 +1256,121 @@ class ResumeTests(SchedulerFixture):
         self.assertGreater(self.store.get_node("run1", "a").attempt_no, 1)
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
+    def test_late_success_recovers_same_attempt_without_relaunch(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo, "run1", "a", attempt_no, base, self.root / "wt",
+            self.root / "scratch")
+        baseline = wt.take_baseline(attempt)
+        self.store.record_baseline(
+            "run1", "a", attempt_no, baseline, attempt.ignored_at_base)
+        (attempt.path / "a.py").write_text("late\n")
+        self.store.mark_blocked(
+            "run1", "a", st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.store.declare_outcome("run1")
+        self.store.resume_run("run1")
+        self.store.prepare_late_envelope_recovery(
+            "run1", "a", attempt_no)
+
+        recovered = []
+
+        def recover(reopened, record):
+            recovered.append(record.key)
+            return sch.NodeExecution(
+                envelope_parsed=True, envelope_payload={"success": True},
+                exit_code=0)
+
+        report = self.schedule(
+            [node], deps=self.deps(
+                run_node=mock.Mock(side_effect=AssertionError("relaunch")),
+                recover_node=recover)).run()
+
+        self.assertEqual(recovered, [("run1", "a", attempt_no)])
+        self.assertEqual(self.store.get_node("run1", "a").attempt_no, attempt_no)
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.MERGED)
+        self.assertEqual((self.integration / "a.py").read_text(), "late\n")
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_post_gate_failure_after_late_recovery_relaunches_once(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo, "run1", "a", attempt_no, base, self.root / "wt",
+            self.root / "scratch")
+        baseline = wt.take_baseline(attempt)
+        self.store.record_baseline(
+            "run1", "a", attempt_no, baseline, attempt.ignored_at_base)
+        (attempt.path / "a.py").write_text("late\n")
+        self.store.mark_blocked(
+            "run1", "a", st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.store.declare_outcome("run1")
+        self.store.resume_run("run1")
+        self.store.prepare_late_envelope_recovery(
+            "run1", "a", attempt_no)
+
+        self.written = {"a": {"a.py": "fresh\n"}}
+        self.gate_script[("a", "post")] = [red(), green()]
+        recover = mock.Mock(return_value=sch.NodeExecution(
+            envelope_parsed=True, envelope_payload={"success": True},
+            exit_code=0))
+        relaunch = mock.Mock(side_effect=self.run_node)
+        report = self.schedule(
+            [node], deps=self.deps(
+                run_node=relaunch, recover_node=recover)).run()
+
+        self.assertEqual(recover.call_count, 1)
+        self.assertEqual(relaunch.call_count, 1)
+        self.assertEqual(self.store.get_node("run1", "a").attempt_no,
+                         attempt_no + 1)
+        self.assertNotIn(
+            lc.LATE_ENVELOPE_RECOVERY_KEY,
+            self.store.get_attempt("run1", "a", attempt_no).extra)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_late_recovery_failure_consumes_marker_then_relaunches(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo, "run1", "a", attempt_no, base, self.root / "wt",
+            self.root / "scratch")
+        baseline = wt.take_baseline(attempt)
+        self.store.record_baseline(
+            "run1", "a", attempt_no, baseline, attempt.ignored_at_base)
+        self.store.mark_blocked(
+            "run1", "a", st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.store.declare_outcome("run1")
+        self.store.resume_run("run1")
+        self.store.prepare_late_envelope_recovery(
+            "run1", "a", attempt_no)
+        self.written = {"a": {"a.py": "fresh\n"}}
+
+        recover = mock.Mock(side_effect=RuntimeError("unreadable envelope"))
+        relaunch = mock.Mock(side_effect=self.run_node)
+        report = self.schedule(
+            [node], deps=self.deps(
+                run_node=relaunch, recover_node=recover)).run()
+
+        self.assertEqual(recover.call_count, 1)
+        self.assertEqual(relaunch.call_count, 1)
+        self.assertEqual(
+            self.store.get_node("run1", "a").attempt_no, attempt_no + 1)
+        self.assertNotIn(
+            lc.LATE_ENVELOPE_RECOVERY_KEY,
+            self.store.get_attempt("run1", "a", attempt_no).extra)
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+
+
 
 
     def test_crash_after_verification_rehydrates_the_verified_sha_and_merges_once(self):

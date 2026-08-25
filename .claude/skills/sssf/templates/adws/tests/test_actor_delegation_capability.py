@@ -102,8 +102,8 @@ class BuiltArgvTests(unittest.TestCase):
         argv = lch.build_omp_argv(
             Path("/usr/local/bin/omp"),
             _spec("omp", self.session, self.prompt))
-        self.assertIn("--pm-profile", argv)
-        self.assertEqual(argv[argv.index("--pm-profile") + 1],
+        self.assertIn("--profile", argv)
+        self.assertEqual(argv[argv.index("--profile") + 1],
                          "openai-performance")
         self.assertNotIn("--tools", argv)
         self.assertFalse(permissions.argv_denies_delegation("omp", argv))
@@ -116,18 +116,15 @@ class BuiltArgvTests(unittest.TestCase):
         self.assertNotIn("--disallowed-tools", argv)
         self.assertFalse(permissions.argv_denies_delegation("claude", argv))
 
-    def test_the_prompt_positional_stays_last_on_the_omp_argv(self) -> None:
-        """omp delivers the prompt as its `MESSAGES` positional.
-
-        When the hatch is on, the capability flag is inserted mid-argv, and
-        an insertion after the `@prompt` would turn the prompt path into a
-        value for `--tools`.
-        """
+    def test_the_omp_argv_keeps_capability_flags_before_session_state(self) -> None:
+        """Interactive OMP receives its prompt through ``agent prompt``."""
         argv = lch.build_omp_argv(
             Path("/usr/local/bin/omp"),
             _spec("omp", self.session, self.prompt, restrict_tools=True))
-        self.assertTrue(argv[-1].startswith("@"))
-        self.assertLess(argv.index("--tools"), len(argv) - 1)
+        self.assertNotIn("@{}".format(self.prompt), argv)
+        self.assertEqual(
+            argv[argv.index("--tools") + 1],
+            "read,write,edit,bash,grep,glob,todo,eval")
 
     def test_the_restriction_hatch_actually_restricts(self) -> None:
         argv = lch.build_omp_argv(
@@ -156,9 +153,9 @@ class DetectorTests(unittest.TestCase):
     """§13.4: convict the planted violation, acquit the real tree."""
 
     def test_an_argv_with_no_containment_at_all_is_convicted(self) -> None:
-        # This is verbatim what `build_omp_argv` produced before this change.
+        # This is verbatim what `build_omp_argv` produces.
         unconstrained = (
-            "/usr/local/bin/omp", "--pm-profile", "openai-performance",
+            "/usr/local/bin/omp", "--profile", "openai-performance",
             "--session-dir", "/tmp/s", "@/tmp/prompt.md")
         self.assertFalse(
             permissions.argv_denies_delegation("omp", unconstrained))

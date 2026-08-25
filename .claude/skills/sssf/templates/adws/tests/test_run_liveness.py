@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -363,6 +364,26 @@ class TheOwnerIsWrittenToTheLedger(unittest.TestCase):
                  and isinstance(node.func, ast.Attribute)}
         self.assertIn("claim_run", calls)
         self.assertIn("create_run", calls)
+
+    def test_resume_refuses_a_scheduler_that_is_still_alive(self):
+        store = lc.LifecycleStore(self.db)
+        try:
+            store.create_run("run1", "d" * 64, [self._node()])
+            with mock.patch.object(
+                    lc.os, "getpid", return_value=os.getpid() + 1):
+                with self.assertRaises(lc.SchedulerStillAlive):
+                    store.resume_run("run1")
+            record = store.conn.execute(
+                "SELECT scheduler_pid, last_transition_at FROM runs "
+                "WHERE run_id='run1'").fetchone()
+            self.assertEqual(record[0], os.getpid())
+            self.assertEqual(
+                store.conn.execute(
+                    "SELECT COUNT(*) FROM transitions "
+                    "WHERE run_id='run1' AND reason='resume'").fetchone()[0],
+                0)
+        finally:
+            store.close()
 
     def test_resume_takes_ownership_from_the_process_that_died(self):
         store = lc.LifecycleStore(self.db)

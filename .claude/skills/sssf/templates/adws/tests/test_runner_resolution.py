@@ -232,15 +232,15 @@ class ProbeTest(unittest.TestCase):
         self.assertIn(".venv", " ".join(caught.exception.candidates))
         self.assertIn("/venv", " ".join(caught.exception.candidates))
 
-    def test_a_runner_with_no_measured_probe_is_refused(self):
-        """`vitest` is installed nowhere on the machine this was written on,
-        so its probe argv and capable exit are unmeasured. They are not
-        guessed: an unmeasured runner refuses, by the same rule, not by an
-        exception to it."""
-        self.assertNotIn("vitest", rr.CAPABLE_EXIT)
-        with self.assertRaises(rr.RunnerUnusable) as caught:
-            rr.resolve("vitest", self.repo)
-        self.assertIs(caught.exception.reason, rr.Reason.UNRESOLVED)
+    def test_vitest_uses_its_measured_zero_case_probe(self):
+        (self.repo / "node_modules" / ".bin").mkdir(parents=True)
+        runner = _script(
+            self.repo / "node_modules" / ".bin" / "vitest", "exit 0")
+
+        resolved = rr.resolve("vitest", self.repo)
+
+        self.assertEqual(Path(resolved.executable).resolve(), runner.resolve())
+        self.assertEqual(resolved.probe_exit, 0)
 
     def test_the_refusal_payload_carries_every_discriminating_fact(self):
         """§3.6 B15: a field with no reader is a build failure. Each of these

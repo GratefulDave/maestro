@@ -49,10 +49,11 @@ class FakeHerdr:
     """
 
     def __init__(self, stalls: int = 0, status_ok: bool = True,
-                 revision: object = 0):
+                 revision: object = 0, agent_status: str = "idle"):
         self.stalls = stalls
         self.status_ok = status_ok
         self.revision = revision
+        self.agent_status = agent_status
         self.calls: list = []
 
     def __call__(self, *argv, **_kwargs):
@@ -60,6 +61,8 @@ class FakeHerdr:
         verb = argv[:2]
         if verb == ("pane", "get"):
             return {"result": {"pane": {"revision": self.revision}}}
+        if verb == ("agent", "get"):
+            return {"result": {"agent": {"status": self.agent_status}}}
         if verb in (("agent", "prompt"), ("agent", "send-keys")):
             if self.stalls > 0:
                 self.stalls -= 1
@@ -85,6 +88,22 @@ class SubmissionProof(unittest.TestCase):
         herdr = FakeHerdr()
         lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
                                 until=("working", "idle"), sleep=lambda _s: None)
+        self.assertEqual(herdr.count("agent", "send-keys"), 0)
+
+    def test_a_working_agent_proves_acceptance_when_revision_is_static(self):
+        class StaticWorking(FakeHerdr):
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("agent", "prompt"):
+                    self.calls.append(argv)
+                    return {}
+                return super().__call__(*argv, **kwargs)
+
+        herdr = StaticWorking(revision=41, agent_status="working")
+        lch.submit_agent_prompt(
+            herdr, "w1:p1", "@prompt", "agent",
+            until=("working", "idle"), working_proves=True,
+            sleep=lambda _s: None)
+        self.assertEqual(herdr.revision, 41)
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
     def test_a_swallowed_prompt_is_not_believed_because_the_pane_says_idle(self):
@@ -215,14 +234,12 @@ class SubmissionProof(unittest.TestCase):
         self.assertIn("pane_not_found", str(caught.exception))
 
 
-class OmpCarriesItsPromptInArgv(unittest.TestCase):
-    """The stall is deleted rather than mitigated for the omp route.
+class OmpSubmitsPromptAfterReadiness(unittest.TestCase):
+    """OMP starts empty; the complete node prompt follows readiness.
 
-    run-d7c242809fe74e74b7368393fa4de6de blocked both depth-0 lanes at 0 turns
-    with `AGENT_PROMPT_UNSUBMITTED ... after 4 submit attempts`: Enter was
-    pressed four times each at a composer that would not take the text. omp
-    documents a `MESSAGES` positional that accepts `@<file>`, so the process
-    that starts the agent delivers the prompt and no composer is involved.
+    Startup positional delivery races OMP initialization and can execute only
+    the prompt's leading command. The argv therefore contains configuration
+    only; `HerdrLauncher.launch` owns post-readiness atomic submission.
     """
 
     def _spec(self, tmp):
@@ -231,21 +248,22 @@ class OmpCarriesItsPromptInArgv(unittest.TestCase):
             envelope_path=Path(tmp) / "e.json", route="omp", model="x-ai/grok-4.6",
             effort="high", profile="grok", session_dir=Path(tmp) / "session")
 
-    def test_the_prompt_is_the_last_argument(self):
+    def test_startup_argv_contains_no_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
-            argv = lch.build_omp_argv(Path("/bin/omp"), self._spec(tmp))
-            self.assertEqual(argv[-1], "@{0}".format((Path(tmp) / "p.txt").resolve()))
-            self.assertIn("--pm-profile", argv)
-            self.assertEqual(argv[argv.index("--pm-profile") + 1], "grok")
+            spec = self._spec(tmp)
+            argv = lch.build_omp_argv(Path("/bin/omp"), spec)
+            self.assertNotIn("@{0}".format(spec.prompt_path.resolve()), argv)
+            self.assertIn("--profile", argv)
+            self.assertEqual(argv[argv.index("--profile") + 1], "grok")
 
-    def test_a_resumed_session_still_carries_it_after_the_continuation_flag(self):
+    def test_a_resumed_session_restores_before_prompt_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = self._spec(tmp)
             spec.session_dir.mkdir(parents=True)
             (spec.session_dir / "prior.jsonl").write_text("{}\n", encoding="utf-8")
             argv = lch.build_omp_argv(Path("/bin/omp"), spec)
-            self.assertIn("-c", argv)
-            self.assertEqual(argv[-1], "@{0}".format(spec.prompt_path.resolve()))
+            self.assertEqual(argv[-1], "-c")
+            self.assertFalse(any(arg.startswith("@") for arg in argv))
 
 
 class PaneRevision(unittest.TestCase):

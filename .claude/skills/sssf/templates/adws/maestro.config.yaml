@@ -1,6 +1,6 @@
 schema: maestro-config.v1
 plans_dir: .maestro/plans
-state_root: ../.maestro-state
+state_root: ~/.maestro
 keys:
   verify_key_env: MAESTRO_VERIFY_KEY
   signing_seed_env: MAESTRO_SIGNING_SEED

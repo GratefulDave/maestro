@@ -842,6 +842,8 @@ MERGE_EVIDENCE_KEY = "merge_evidence"
 #: two, so a baseline swapped in that table without the attempt row's consent
 #: fails to verify instead of quietly redefining what the attempt started from.
 ATTEMPT_BASELINE_DIGEST_KEY = "baseline_digest"
+LATE_ENVELOPE_RECOVERY_KEY = "late_envelope_recovery"
+
 
 
 def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
@@ -2164,42 +2166,51 @@ class LifecycleStore:
 
     @serialized
     def _write_resume_transition(self, run_id: str) -> None:
-        """The resume boundary, in one transaction (§7.8, §11.2).
+        """Atomically claim a dead run and write its resume boundary.
 
-        `cancel_requested` is cleared here, and it is not bookkeeping: the
-        flag is the outcome function's input for the `CANCELLED` arm (§7.3),
-        so a resumed run that left it set would declare `CANCELLED` again at
-        the quiescence it reaches after doing all of its remaining work — and
-        `derive_run_state` would report it `CANCELLING` for the whole of that
-        life. The operator withdrew the stop request by resuming; the request
-        stops standing at that instant.
+        `cancel_requested` is cleared here because the operator withdrew the
+        stop request. `cancel_cause` remains historical until the next declared
+        outcome rewrites it.
 
-        `cancel_cause` is deliberately *not* cleared. It is an attribute of
-        the latest declared outcome, which this resume supersedes but does not
-        erase, and the next `declare_outcome` rewrites it. Clearing it here
-        would strand the next resume: a scheduler that dies before declaring
-        leaves `latest_outcome` at `CANCELLED`, and a `CANCELLED` with no
-        cause is refused.
+        The ownership check and claim share this `BEGIN IMMEDIATE`
+        transaction. Two concurrent `run resume` processes therefore cannot
+        both observe the old scheduler as dead: the first writes its own pid
+        before releasing the database lock, and the second then refuses that
+        live owner. Re-entry by the already-recorded process is idempotent and
+        remains legal. A recorded owner on another host is unknown, never dead.
 
-        **Every node's retry-budget floor is raised here, in the same
-        transaction, for the same reason `cancel_requested` is cleared.** A
-        resume is a boundary or it is nothing: the operator is stating that the
-        conditions the run failed under have been dealt with, and a budget
-        that carried every attempt the run ever spent contradicted that
-        statement on the next line — a node whose launcher budget went to a
-        defect that has since been fixed was scheduled by the resume only to
-        block again on first contact (#92). The floor is a per-node column
-        rather than a run-level one because the count it bounds is per-node,
-        and it is written by one correlated UPDATE rather than a loop so a run
-        with a hundred nodes crosses the boundary in one statement.
-
-        It is raised to the highest attempt *already classified*, so the
-        inherited-attempt accounting below is untouched: an attempt this
-        resume charges ENVIRONMENTAL is still charged, against the refreshed
-        budget, and an attempt spared as UNCLASSIFIED still costs nothing.
+        Every node's retry-budget floor is raised in the same transaction to
+        the highest attempt already classified. The inherited-attempt
+        accounting below remains separate: a newly classified inherited
+        attempt is still charged against the refreshed floor, while an
+        UNCLASSIFIED attempt costs nothing.
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            claim = self.conn.execute(
+                "SELECT scheduler_pid, scheduler_host FROM runs WHERE run_id=?",
+                (run_id,)).fetchone()
+            if claim is None:
+                raise UnknownNode(f"run {run_id} does not exist")
+            prior_pid = int(claim[0]) if claim[0] is not None else None
+            prior_host = claim[1]
+            if prior_pid is not None:
+                prior = RunRecord(
+                    run_id=run_id, plan_digest="", created_at="",
+                    last_transition_at="", latest_outcome=None,
+                    latest_outcome_at=None, cancel_requested=False,
+                    scheduler_pid=prior_pid, scheduler_host=prior_host)
+                alive = scheduler_liveness(prior)
+                if alive is True and prior_pid != os.getpid():
+                    raise SchedulerStillAlive(
+                        f"{run_id}: scheduler pid {prior_pid} is still alive on "
+                        f"{prior_host or scheduler_host()}; resume refused "
+                        "without changing the live run")
+                if alive is None:
+                    raise SchedulerLivenessUnknown(
+                        f"{run_id}: scheduler pid {prior_pid} was recorded on "
+                        f"{prior_host or 'an unknown host'}; resume cannot prove "
+                        "that owner is dead")
             now = now_iso()
             self.conn.execute(
                 "UPDATE runs SET last_transition_at=?, cancel_requested=0,"
@@ -2217,6 +2228,83 @@ class LifecycleStore:
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+    @serialized
+    def quiescence_blocked_attempts(
+            self, run_id: str) -> Tuple[Tuple[str, int], ...]:
+        """Blocked attempts `run resume` may recover after agent absence."""
+        rows = self.conn.execute(
+            "SELECT node_id, attempt_no FROM node_lifecycle "
+            "WHERE run_id=? AND state=? AND block_reason=? ORDER BY node_id",
+            (run_id, st.NodeState.BLOCKED.value,
+             st.BlockReason.QUIESCENCE_UNPROVEN.value)).fetchall()
+        return tuple((str(row[0]), int(row[1])) for row in rows)
+
+
+    @serialized
+    def prepare_late_envelope_recovery(
+            self, run_id: str, node_id: str,
+            attempt_no: int) -> st.NodeLifecycle:
+        """Return a completed generation to the frontier without retrying it."""
+        def extra(lifecycle: st.NodeLifecycle):
+            if lifecycle.attempt_no != attempt_no:
+                raise IllegalTransition(
+                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current")
+            row = self.conn.execute(
+                "SELECT extra_json FROM attempts"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (run_id, node_id, attempt_no)).fetchone()
+            if row is None:
+                raise UnknownNode(
+                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent")
+            payload = json.loads(row[0] or "{}")
+            if not isinstance(payload, dict):
+                payload = {}
+            payload[LATE_ENVELOPE_RECOVERY_KEY] = True
+            return [(
+                "UPDATE attempts SET extra_json=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (json.dumps(payload, sort_keys=True),
+                 run_id, node_id, attempt_no))]
+
+        return self._transition_node(
+            run_id, node_id, st.NodeState.PENDING, actor="operator",
+            reason="resume:late-envelope",
+            pending_cause=st.PendingCause.OPERATOR_RESUME,
+            require_state=(st.NodeState.BLOCKED,), extra_writes=extra)
+
+    @serialized
+    def claim_late_envelope_attempt(
+            self, run_id: str, node_id: str,
+            attempt_no: int) -> st.NodeLifecycle:
+        """PENDING -> RUNNING and consume the one-shot recovery marker."""
+        def extra(lifecycle: st.NodeLifecycle):
+            if lifecycle.attempt_no != attempt_no:
+                raise IllegalTransition(
+                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current")
+            row = self.conn.execute(
+                "SELECT extra_json FROM attempts"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (run_id, node_id, attempt_no)).fetchone()
+            if row is None:
+                raise UnknownNode(
+                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent")
+            payload = json.loads(row[0] or "{}")
+            if not isinstance(payload, dict) or payload.pop(
+                    LATE_ENVELOPE_RECOVERY_KEY, None) is not True:
+                raise IllegalTransition(
+                    f"{run_id}/{node_id}#{attempt_no}: late recovery is not pending")
+            return [(
+                "UPDATE attempts SET state=?, extra_json=?"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (st.NodeState.RUNNING.value,
+                 json.dumps(payload, sort_keys=True),
+                 run_id, node_id, attempt_no))]
+
+        return self._transition_node(
+            run_id, node_id, st.NodeState.RUNNING, actor="scheduler",
+            reason="attempt-recover:late-envelope",
+            require_state=(st.NodeState.PENDING,), extra_writes=extra)
+
 
     @serialized
     def _running_node_ids(self, run_id: str) -> Tuple[str, ...]:

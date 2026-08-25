@@ -20,7 +20,9 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ["FAKE_CLAUDE_ARGV"], "w") as handle:
     json.dump(sys.argv[1:], handle)
-_ = sys.stdin.read()
+prompt = sys.stdin.read()
+with open(os.environ["FAKE_CLAUDE_PROMPT"], "w") as handle:
+    handle.write(prompt)
 stderr_bytes = int(os.environ.get("FAKE_CLAUDE_STDERR_BYTES", "0"))
 if stderr_bytes:
     sys.stderr.write("x" * stderr_bytes)
@@ -45,6 +47,7 @@ class ClaudeRouteTest(unittest.TestCase):
         self._before = dict(os.environ)
         os.environ["CLAUDE_PATH"] = str(self.binary)
         os.environ["FAKE_CLAUDE_ARGV"] = str(self.root / "argv.json")
+        os.environ["FAKE_CLAUDE_PROMPT"] = str(self.root / "prompt.txt")
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -77,6 +80,9 @@ class ClaudeRouteTest(unittest.TestCase):
         self.assertEqual(result.text, "done")
         self.assertEqual(result.model_ran, "claude/claude-opus-5")
         self.assertEqual(result.cost, 0.02)
+        submitted = (self.root / "prompt.txt").read_text(encoding="utf-8")
+        self.assertEqual(
+            submitted, agent_cc.prepare_route_prompt_text("claude", "work"))
 
     def test_permission_bypass_is_explicitly_opt_in(self):
         request = self.request()

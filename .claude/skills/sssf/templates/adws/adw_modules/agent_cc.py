@@ -20,7 +20,7 @@ from typing import Callable, Optional, Tuple
 from .agent_pi import ModelBindingError
 from .data_types import PiRequest, PiResult, UsageBreakdown
 from .launcher import (HarnessQuiescenceError, _process_group_absent,
-                       quiesce_process_group)
+                       prepare_route_prompt_text, quiesce_process_group)
 from .utils import operator_env
 
 
@@ -350,7 +350,9 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
         name="claude-stderr-drain",
     )
     stdin_thread = threading.Thread(
-        target=_write_prompt, args=(process.stdin, request.prompt, state),
+        target=_write_prompt,
+        args=(process.stdin,
+              prepare_route_prompt_text("claude", request.prompt), state),
         name="claude-stdin-write",
     )
     stdout_thread.start()

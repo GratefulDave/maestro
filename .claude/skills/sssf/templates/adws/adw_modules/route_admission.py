@@ -341,6 +341,9 @@ def capture_route(
     """Execute first turn + continuation in a visible pane and prove cancel."""
     if spec.route not in MARKERS:
         raise AdmissionError("ROUTE_NOT_ADMITTED:{}".format(spec.route))
+    # Validate immutable route requirements before creating a capture directory
+    # or asking Herdr to split a pane.
+    _route_argv(spec, continuing=False, session_id=None)
     call = herdr or (lambda *args, timeout=None: _herdr(spec.herdr, *args, timeout=timeout))
     _require_herdr_session(call)
     cwd = Path(spec.cwd).resolve()
@@ -354,9 +357,11 @@ def capture_route(
     continuation_handle = None
     try:
         first_handle = _start_visible_agent(call, spec, cwd, continuing=False)
-        first_prompt = FIRST_PROMPT.format(marker=marker)
+        first_prompt = launcher.prepare_route_prompt_text(
+            spec.route, FIRST_PROMPT.format(marker=marker))
         first_records = _prompt_turn(
-            call, first_handle, first_prompt, timeout_ms, marker)
+            call, first_handle, first_prompt, timeout_ms, marker,
+            working_proves=spec.route == "claude")
         first_turn, session_id, reported = _parse_turn(
             spec.route, first_records, marker, first_prompt)
         if spec.route == "claude" and not session_id:
@@ -366,10 +371,13 @@ def capture_route(
         continuation_handle = _start_visible_agent(
             call, spec, cwd, continuing=True, session_id=session_id)
         continued_with = "-c" if spec.route == "omp" else "--resume"
+        continuation_prompt = launcher.prepare_route_prompt_text(
+            spec.route, CONTINUATION_PROMPT)
         continuation_records = _prompt_turn(
-            call, continuation_handle, CONTINUATION_PROMPT, timeout_ms, marker)
+            call, continuation_handle, continuation_prompt, timeout_ms, marker,
+            working_proves=spec.route == "claude")
         continuation, _, _ = _parse_turn(
-            spec.route, continuation_records, marker, CONTINUATION_PROMPT)
+            spec.route, continuation_records, marker, continuation_prompt)
         if continuation["text"] != first_turn["text"]:
             raise AdmissionError("ROUTE_CONTINUITY_UNPROVEN")
         _stop_agent(call, continuation_handle)
@@ -515,15 +523,17 @@ def _start_visible_agent(
 def _prompt_turn(
         call: Callable[..., dict], handle: Mapping[str, str],
         prompt: str, timeout_ms: str, marker: str,
+        *, working_proves: bool = False,
 ) -> Tuple[dict, ...]:
     timeout_s = max(0.001, int(timeout_ms) / 1000.0)
     try:
-        # The admission turn is a single short answer, so wait for the agent to
-        # settle back at idle: that is the proof the prompt was submitted and
-        # answered rather than left sitting in the composer.
+        # Claude's composer can accept a prompt without advancing the pane
+        # revision. Its typed working state is equivalent consumption proof.
         launcher.submit_agent_prompt(
             call, handle["pane_id"], prompt, handle["name"],
-            timeout_s=timeout_s)
+            timeout_s=timeout_s,
+            until=("working", "idle") if working_proves else ("idle",),
+            working_proves=working_proves)
     except RuntimeError as exc:
         raise AdmissionError(str(exc)) from exc
     deadline = time.monotonic() + timeout_s

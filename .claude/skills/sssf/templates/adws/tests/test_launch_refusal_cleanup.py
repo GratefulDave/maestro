@@ -69,8 +69,10 @@ class FakeHerdr:
         #: cwd `pane get` reports, per call index, falling back to the last.
         self.get_cwds = [str(worktree)]
         self.start_error = None
+        self.prompt_error = None
         self.close_error = None
         self.closed = []
+        self.revision = 1
 
     def __call__(self, *args, env=None, timeout=30.0):
         self.calls.append(list(args))
@@ -88,7 +90,8 @@ class FakeHerdr:
             index = min(len([c for c in self.calls if c[:2] == ["pane", "get"]]),
                         len(self.get_cwds)) - 1
             return {"result": {"pane": {"pane_id": self.split_pane_id,
-                                        "cwd": self.get_cwds[index]}}}
+                                        "cwd": self.get_cwds[index],
+                                        "revision": self.revision}}}
         if head == ("pane", "process-info"):
             return {"result": {"process_info": {
                 "pane_id": self.split_pane_id,
@@ -105,6 +108,11 @@ class FakeHerdr:
             return {"result": {"agent": {
                 "name": args[2], "status": "idle",
                 "transcript_path": str(self.transcript)}}}
+        if head in (("agent", "prompt"), ("agent", "send-keys")):
+            if self.prompt_error is not None:
+                raise self.prompt_error
+            self.revision += 1
+            return {"result": {"ok": True}}
         if head == ("agent", "wait"):
             return {"result": {"ok": True, "status": "idle"}}
         if head == ("agent", "get"):
@@ -196,6 +204,20 @@ class RefusalCleanupTest(unittest.TestCase):
         self.assertFalse(refusal.pane_created)
         self.assertIs(refusal.__cause__, fake.start_error)
 
+    def test_prompt_submission_failure_cancels_the_started_agent(self):
+        harness, fake = self.build()
+        fake.prompt_error = lch.PromptSubmissionUnobservable("no revision")
+        with self.assertRaises(lch.LaunchRefused) as caught:
+            harness.launch(self.spec())
+        refusal = caught.exception
+        self.assertIs(
+            refusal.refusal, lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED)
+        self.assertFalse(refusal.pane_created)
+        self.assertEqual(fake.closed, ["w0:p2"])
+        self.assertEqual(harness.reclaim(self.spec().correlation_token), ())
+        self.assertIs(
+            harness.classify(refusal), lch.ErrorClass.TRANSIENT)
+
     def test_the_refusal_stays_a_retryable_launch_failure(self):
         """The end of the causal chain the incident took.
 
@@ -252,15 +274,22 @@ class RefusalCleanupTest(unittest.TestCase):
 
     # ── the other three post-split exits ────────────────────────────────────
 
-    def test_unsupported_route_after_the_split_reaps_its_pane(self):
+    def test_unsupported_route_is_refused_before_the_split(self):
         harness, fake = self.build(admitted=object.__new__(_AnyRoute))
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(replace(self.spec(), route="gemini"))
         self.assertIs(caught.exception.refusal,
                       lch.LaunchRefusal.UNSUPPORTED_ROUTE)
-        # The pane leak this exit used to be: it raised `ValueError` with the
-        # split's pane still open and nothing tracking it.
-        self.assertEqual(fake.closed, ["w0:p2"])
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(caught.exception.pane_created)
+
+    def test_missing_omp_profile_is_refused_before_the_split(self):
+        harness, fake = self.build()
+        with self.assertRaises(lch.LaunchRefused) as caught:
+            harness.launch(replace(self.spec(), profile=None))
+        self.assertIs(caught.exception.refusal,
+                      lch.LaunchRefusal.OMP_PROFILE_REQUIRED)
+        self.assertEqual(fake.calls, [])
         self.assertFalse(caught.exception.pane_created)
 
     def test_binding_mismatch_before_the_agent_is_a_typed_refusal(self):

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { useMemo } from "react";
 import { STATUS_TONES } from "@/lib/status";
+import { buildDagTextRows } from "@/lib/dagText";
 import type { MaestroNode } from "@/lib/types";
 
 const TONE_ORDER = ["ok", "info", "warn", "err", "review", "ready", "pending"];
@@ -22,10 +23,6 @@ function stateLabel(state: string, tone: string) {
   return text;
 }
 
-function branchPrefix(depth: number) {
-  if (depth <= 0) return "";
-  return "│  ".repeat(depth - 1) + "├─ ";
-}
 
 export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string }) {
   const rollup = useMemo(() => {
@@ -48,17 +45,7 @@ export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string
     );
   }, [nodes]);
 
-  const ordered = useMemo(() => {
-    const depthMap = new Map<number, MaestroNode[]>();
-    for (const node of nodes) {
-      const group = depthMap.get(node.depth) ?? [];
-      group.push(node);
-      depthMap.set(node.depth, group);
-    }
-    return [...depthMap.entries()]
-      .sort(([a], [b]) => a - b)
-      .flatMap(([, group]) => group);
-  }, [nodes]);
+  const ordered = useMemo(() => buildDagTextRows(nodes), [nodes]);
 
   return (
     <div className="cockpit">
@@ -75,7 +62,7 @@ export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string
         )}
       </p>
       <div className="cockpit-ledger">
-        {ordered.map((node) => {
+        {ordered.map(({ node, rail, offTreeNeeds }) => {
           const tone = STATUS_TONES[node.state.toLowerCase()] ?? "pending";
           const note = node.block_reason ?? node.cancel_cause;
           return (
@@ -84,12 +71,17 @@ export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string
               href={`${base}/${encodeURIComponent(node.node_id)}`}
               key={`${node.node_id}:${node.attempt_no}`}
             >
-              <span className="cockpit-branch">{branchPrefix(node.depth)}</span>
+              <span className="cockpit-branch">{rail}</span>
               <span aria-hidden className="cockpit-marker">
                 {TONE_MARKERS[tone] ?? "○"}
               </span>
               <strong className="cockpit-id">{node.node_id}</strong>
               <span className="cockpit-kind">{node.kind ?? "node"}</span>
+              {offTreeNeeds.map((need) => (
+                <span className="cockpit-dependency" key={need}>
+                  ⇠ {need}
+                </span>
+              ))}
               <span className="cockpit-state">{stateLabel(node.state, tone)}</span>
               <span className="cockpit-meta">
                 {node.attempt_no > 1 ? `a${node.attempt_no} ` : ""}
