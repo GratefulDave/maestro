@@ -19,7 +19,7 @@ Starting from Maestro’s current SSSF fork, design the smallest robust software
 3. isolate every work node in its own Git worktree and merge completed work deterministically;
 4. launch every agent node in a visible **Herdr** pane through an explicit launcher abstraction:
    - Claude directly;
-   - OMP only with explicit `--pm-profile`;
+   - OMP only with explicit `--profile`;
    - Kimi and Grok only through explicit configured routes;
 5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session retries, and SQLite trace.
 
@@ -321,7 +321,7 @@ Fable must verify each and either preserve it or explicitly reject it:
 - merge success requires Git ancestry, not only tests;
 - all tests use fake launchers/Herdr seams, never real agents;
 - Claude launches directly;
-- OMP receives exactly configured `--pm-profile`;
+- the interactive Herdr OMP launcher receives exactly configured `--profile`;
 - dependency readiness and merge order are deterministic;
 - current and future evidence are different types.
 
@@ -397,6 +397,7 @@ Add the smallest explicit DAG extension to SSSF. Specify:
 - bounded retry classes;
 - cancellation propagation;
 - stale result rejection;
+- completed-generation recovery after `QUIESCENCE_UNPROVEN`: only after agent absence is proved, continue the original attempt from a successful identity-bound late envelope without relaunching its builder; otherwise force a fresh retry or refuse unchanged according to the evidence;
 - dependency output acceptance before launch;
 - one understandable node primitive for code and agents;
 - SQLite representation of decisions/transitions.
@@ -414,6 +415,7 @@ Specify:
 - Herdr pane cwd exactly equal to node worktree;
 - allowed writes;
 - envelope and commit SHA binding;
+- recovery binding to the exact recorded token, worktree, branch/base, baseline inventory, and ignored-at-base evidence before any lifecycle mutation;
 - dirty/unauthorized-write handling;
 - cleanup;
 - deterministic merge-ready ordering despite nondeterministic finish order;
@@ -448,11 +450,12 @@ Required routes:
 - explicit model and effort/thinking;
 - exact argv and PTY contract;
 - session resume/correction;
+- every direct Claude prompt starts with the universal `/team` delegation instruction before the node-specific text;
 - never route Claude through OMP.
 
 ### OMP
 
-- exact `--pm-profile <profile>` from config;
+- exact `--profile <profile>` from config;
 - no default/fallback profile;
 - exact argv/session/readiness/failure behavior.
 
@@ -475,6 +478,7 @@ Preserve SSSF boundaries but make them DAG/Herdr safe:
 - gates prove behavior/outputs, not existence only;
 - known commands are code nodes;
 - bounded same-session correction through the same Herdr agent session;
+- a successful late envelope may continue only its original attempt through the ordinary gates, review, merge, and downstream DAG; it never waives acceptance or mints a replacement attempt;
 - budgets per attempt/failure class;
 - raw output and pane text are evidence only;
 - SQLite records plan digest, run, nodes, edges, attempts, launcher routes/sessions, Herdr panes/agents, processes, envelopes, gate items, worktrees, commits, merges, costs, and events;
@@ -533,8 +537,9 @@ The architecture and implementation plan must prove this using fake Herdr/launch
 16. commits merge in deterministic order with ancestry proof;
 17. conflict enters one explicit blocked/resolution state;
 18. post-merge acceptance proves nonzero real checks;
-19. SQLite reconstructs identical run/node/attempt/pane/merge state after restart;
-20. run accepts only after DAG completion, merge, and integration gates.
+19. after restart, a proven-absent completed generation with a successful identity-bound late envelope continues the same attempt through verification and merge without another builder launch;
+20. SQLite reconstructs identical run/node/attempt/pane/merge state after quiescent restart;
+21. run accepts only after DAG completion, merge, and integration gates.
 
 # Required negatives and anti-inert cases
 
@@ -558,6 +563,7 @@ At minimum:
 - same-identity replay; changed bytes with stale receipt;
 - key rotation with unchanged plan;
 - crash during node; crash between completion and durable transition;
+- late-envelope recovery matrix: absent envelope forces a fresh retry; malformed, unsuccessful, or identity-mismatched envelope fails closed before mutation; live or unreadable agent refuses with the run unchanged;
 - remove scheduler edge, gate invocation, publication wiring, ancestry guard, profile propagation, pane/worktree binding, or one SQLite transition write.
 
 For every mutation name the deterministic diagnostic/state/test that goes red and one unrelated control that remains green.

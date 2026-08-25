@@ -261,6 +261,28 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(handle.launched_cwd, self.worktree.resolve())
         self.assertEqual(handle.pane_id, "w1:p2")
 
+    def test_claude_prompt_has_the_required_team_prefix(self):
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes)
+        launcher.launch(self.spec("claude"))
+        self.assertEqual(
+            self.prompt.read_text(),
+            launcher_module.CLAUDE_TEAM_PROMPT_PREFIX + "do the work")
+
+    def test_claude_prompt_prefix_is_idempotent(self):
+        spec = self.spec("claude")
+        launcher_module.prepare_route_prompt(spec)
+        launcher_module.prepare_route_prompt(spec)
+        self.assertEqual(
+            self.prompt.read_text().count(
+                launcher_module.CLAUDE_TEAM_PROMPT_PREFIX), 1)
+
+    def test_omp_prompt_does_not_get_the_claude_team_prefix(self):
+        launcher_module.prepare_route_prompt(self.spec("omp"))
+        self.assertEqual(self.prompt.read_text(), "do the work")
+
     def test_read_commands_accept_raw_text_output(self):
         # `herdr agent read` / `pane read` print the snapshot as raw text; they
         # have no JSON output mode. Rejecting that as PROTOCOL_INVALID_JSON
@@ -455,13 +477,10 @@ class LauncherContractTest(unittest.TestCase):
              "--pane", "w1:p2", "--timeout", "180000"])
         self.assertEqual(start[9], "--")
         self.assertEqual(calls[start_indexes[0] + 1][:2], ["pane", "get"])
-        # The coder must still be waited for with the documented readiness
-        # gate. What changed on 2026-08-18 (`7f03ee2`) is where the prompt
-        # travels: omp documents a `MESSAGES` positional that accepts
-        # `@<file>`, so the process that starts the agent carries the prompt
-        # and there is no composer in the path at all. Typing it stalled
-        # against omp roughly half the time -- run-d7c242809fe74e74b7368393fa4de6de
-        # blocked both depth-0 lanes at 0 turns on exactly that.
+        # The coder is waited to its interactive composer before the complete
+        # node prompt is submitted. Startup argv must not carry `@<file>`:
+        # that races OMP initialization and can execute only the prompt's
+        # leading command.
         wait_indexes = [
             index for index, call in enumerate(calls)
             if call[:2] == ["agent", "wait"]
@@ -471,9 +490,13 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(wait[:5], ["agent", "wait", start[2], "--until", "idle"])
         self.assertIn("--timeout", wait)
         route_argv = start[start.index("--") + 1:]
-        self.assertEqual(route_argv[-1], "@{0}".format(self.prompt.resolve()))
+        self.assertFalse(any(arg.startswith("@") for arg in route_argv))
+        prompts = [call for call in calls
+                   if call[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1)
         self.assertEqual(
-            [call for call in calls if call[:2] == ["agent", "prompt"]], [])
+            prompts[0][3], "@{0}".format(self.prompt.resolve()))
+        self.assertLess(wait_indexes[0], calls.index(prompts[0]))
         self.assertFalse(any(
             call[:2] in (["pane", "run"], ["pane", "send-keys"],
                          ["agent", "send-keys"])
@@ -520,9 +543,8 @@ class LauncherContractTest(unittest.TestCase):
         self.assertLess(elapsed, 30.0)
 
     def test_the_transcript_wait_reads_the_typed_field_and_terminates(self):
-        # The signal is `agent_session.kind`, a typed field, never pane text
-        # (§1.2). A route reporting an id rather than a path has no transcript
-        # here, and that is an answer the deadline is allowed to reach.
+        # A typed ID without a route source or launched cwd cannot be invented
+        # into a path, and the bounded wait must terminate honestly.
         calls = []
 
         def herdr_call(*args, **kwargs):
@@ -534,6 +556,27 @@ class LauncherContractTest(unittest.TestCase):
         self.assertIsNone(launcher.wait_for_agent_transcript(
             herdr_call, "a", 0.0, poll_interval_s=0.0, sleep=slept.append))
         self.assertEqual(calls, [("agent", "get", "a")])
+
+    def test_claude_session_id_resolves_the_exact_cwd_transcript(self):
+        config = self.root / "claude"
+        project = "".join(
+            character if character.isalnum() or character == "-" else "-"
+            for character in str(self.worktree.resolve()))
+        transcript = config / "projects" / project / "session-123.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}\n")
+        agent = {
+            "agent_session": {
+                "kind": "id",
+                "source": "herdr:claude",
+                "value": "session-123",
+            },
+        }
+
+        self.assertEqual(
+            launcher_module._agent_transcript_path(
+                agent, self.worktree, {"CLAUDE_CONFIG_DIR": str(config)}),
+            transcript)
 
     def test_launch_refusal_closes_the_allocated_pane(self):
         os.environ["FAKE_HERDR_REFUSE"] = "1"
@@ -646,6 +689,7 @@ class LauncherContractTest(unittest.TestCase):
 
     def test_launch_sends_bounded_prompt_bootstrap_not_prompt_bytes(self):
         prompt_bytes = "sensitive prompt bytes " * 2048
+        os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
         self.prompt.write_text(prompt_bytes, encoding="utf-8")
         launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
                                  claude_path=Path("/opt/claude"),
@@ -657,18 +701,76 @@ class LauncherContractTest(unittest.TestCase):
                  for line in (self.root / "argv.jsonl").read_text().splitlines()]
         prompt_calls = [call for call in calls if call[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompt_calls), 1)
-        bootstrap = prompt_calls[0][-1]
+        bootstrap = prompt_calls[0][3]
+        self.assertEqual(bootstrap, "@{0}".format(self.prompt.resolve()))
         self.assertNotIn(prompt_bytes, json.dumps(calls))
-        self.assertLess(len(bootstrap), len(str(self.prompt.resolve())) + 2)
+        wait_index = next(index for index, call in enumerate(calls)
+                          if call[:2] == ["agent", "wait"])
+        prompt_index = next(index for index, call in enumerate(calls)
+                            if call[:2] == ["agent", "prompt"])
+        transcript_index = next(index for index, call in enumerate(calls)
+                                if call[:2] == ["agent", "get"])
+        self.assertLess(wait_index, prompt_index)
+        self.assertLess(prompt_index, transcript_index)
+
+    def test_every_claude_launch_including_retry_gets_one_ready_prompt(self):
+        for attempt in (1, 2):
+            runtime = HerdrLauncher(
+                herdr_path=self.herdr,
+                omp_path=Path("/opt/omp"),
+                claude_path=Path("/opt/claude"),
+                admitted_routes=self.admitted_routes)
+            runtime.launch(replace(
+                self.spec("claude"),
+                correlation_token="run1-node_a-{}".format(attempt)))
+
+        calls = self.recorded_calls()
+        starts = [index for index, call in enumerate(calls)
+                  if call[:2] == ["agent", "start"]]
+        waits = [index for index, call in enumerate(calls)
+                 if call[:2] == ["agent", "wait"]]
+        prompts = [index for index, call in enumerate(calls)
+                   if call[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(waits), 2)
+        self.assertEqual(len(prompts), 2)
+        for start, ready, prompt in zip(starts, waits, prompts):
+            self.assertLess(start, ready)
+            self.assertLess(ready, prompt)
+
+    def test_every_omp_launch_including_retry_gets_one_ready_prompt(self):
+        for attempt in (1, 2):
+            runtime = HerdrLauncher(
+                herdr_path=self.herdr,
+                omp_path=Path("/opt/omp"),
+                claude_path=Path("/opt/claude"),
+                admitted_routes=self.admitted_routes)
+            runtime.launch(replace(
+                self.spec("omp"),
+                correlation_token="run1-node_a-{}".format(attempt)))
+
+        calls = self.recorded_calls()
+        starts = [index for index, call in enumerate(calls)
+                  if call[:2] == ["agent", "start"]]
+        waits = [index for index, call in enumerate(calls)
+                 if call[:2] == ["agent", "wait"]]
+        prompts = [index for index, call in enumerate(calls)
+                   if call[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(waits), 2)
+        self.assertEqual(len(prompts), 2)
+        for start, ready, prompt in zip(starts, waits, prompts):
+            self.assertLess(start, ready)
+            self.assertLess(ready, prompt)
+
 
     def test_a_claude_composer_that_stalls_is_recovered_with_enter(self):
-        """The composer route still exists, so its stall must still be caught.
+        """A composer that swallows the prompt must still be caught.
 
-        Only omp carries its prompt in argv; the claude route hands `@<path>`
-        to a composer, and a composer that swallows the text reports `idle`
-        exactly like one that took it. The pane's monotonic `revision` is the
-        only thing that separates them, so this drives the real recovery loop
-        in `submit_agent_prompt` through `launch` rather than in isolation.
+        Both routes hand `@<path>` to a ready composer. A composer that
+        swallows the text reports `idle` exactly like one that took it. The
+        pane's monotonic `revision` is the only thing that separates them, so
+        this drives the real recovery loop through `launch`.
         """
         os.environ["FAKE_PROMPT_STALLS"] = "1"
         runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
@@ -693,6 +795,7 @@ class LauncherContractTest(unittest.TestCase):
         that was never given any work.
         """
         os.environ["FAKE_PANE_WITHOUT_REVISION"] = "1"
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
         runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
                                 claude_path=Path("/opt/claude"),
                                 admitted_routes=self.admitted_routes)
@@ -855,6 +958,20 @@ class LauncherContractTest(unittest.TestCase):
                 self.assertEqual(state.exit_code, 1)
                 self.assertEqual(state.detail, "ENVELOPE_FAILURE")
 
+    def test_resume_probe_reads_live_agent_from_herdr(self):
+        route = self._launcher()
+        self.assertIs(route.agent_presence("run-node-1"), True)
+
+    def test_resume_probe_requires_typed_agent_absence(self):
+        route = self._launcher()
+        os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
+        self.assertIs(route.agent_presence("run-node-1"), False)
+
+    def test_resume_probe_keeps_transport_failure_unknown(self):
+        route = self._launcher()
+        os.environ["FAKE_HERDR_GET_FAILURE"] = "1"
+        self.assertIsNone(route.agent_presence("run-node-1"))
+
     def test_agent_absence_is_read_from_the_code_not_the_message(self):
         # §1.2: `agent_not_found` is a typed field. A refusal whose prose
         # merely contains the word is a different refusal and must surface.
@@ -916,12 +1033,12 @@ class TranscriptAndRouteTest(unittest.TestCase):
         empty.read_new()
         self.assertEqual(empty.synthesized_exit(), (1, "NO_ENVELOPE"))
 
-    def test_omp_argv_uses_pm_profile_and_session_only(self):
+    def test_omp_argv_uses_profile_and_session_only(self):
         spec = LaunchSpec("t", self.root, self.root / "p", self.root / "e", "omp", "provider/model", "high", "latest-profile", self.root / "s")
         argv = build_omp_argv(Path("/bin/omp"), spec)
         self.assertEqual(argv[0], "/bin/omp")
-        self.assertIn("--pm-profile", argv)
-        self.assertEqual(argv[argv.index("--pm-profile") + 1], "latest-profile")
+        self.assertIn("--profile", argv)
+        self.assertEqual(argv[argv.index("--profile") + 1], "latest-profile")
         self.assertIn("--session-dir", argv)
         self.assertNotIn("--model", argv)
         self.assertNotIn("--effort", argv)

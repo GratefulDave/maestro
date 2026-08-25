@@ -286,6 +286,10 @@ class SchedulerDeps:
     run_gate: GateRunner
     run_integration_gate: IntegrationGateRunner
     quiesce_attempt: QuiesceAttempt
+    #: Re-read a declaration from an existing attempt; never launches.
+    recover_node: Optional[Callable[
+        [wt.AttemptWorktree, st.AttemptRecord], Optional[NodeExecution]]] = None
+
     #: §10.2's threshold for the ONE integration gate this run ends with
     #: (§8.8), taken from `merge_policy.integration_gate.min_cases`.
     #:
@@ -1308,6 +1312,13 @@ class Scheduler:
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
+        lifecycle = store.get_node(self.run_id, node.node_id)
+        if lifecycle.attempt_no:
+            existing = store.get_attempt(
+                self.run_id, node.node_id, lifecycle.attempt_no)
+            if existing.extra.get(lc.LATE_ENVELOPE_RECOVERY_KEY) is True:
+                self._recover_attempt_body(node, context, existing)
+                return
         head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
 
         # A rejected diff is repaired rather than re-implemented. `basis` is
@@ -1476,6 +1487,76 @@ class Scheduler:
             # Classification cannot release or block the attempt until its
             # owned group is absent.
             self._quiesce(record, "pre-inventory")
+        self._complete_attempt(
+            node, context, attempt, record, basis, pre_verdict, baseline,
+            execution, head)
+
+    def _recover_attempt_body(
+            self, node: st.PlanNode, context: _AttemptContext,
+            stranded: st.AttemptRecord) -> None:
+        """Continue one declared generation without relaunching its builder."""
+        store = self.deps.store
+        store.claim_late_envelope_attempt(
+            self.run_id, node.node_id, stranded.attempt_no)
+        record = store.get_attempt(
+            self.run_id, node.node_id, stranded.attempt_no)
+        context.record = record
+        with self._lock:
+            self._attempt_dispatch[(node.node_id, record.attempt_no)] = False
+        self._require_running(record)
+
+        if self.deps.recover_node is None:
+            raise DurableOutputIdentityError(
+                f"{stranded.node_id}#{stranded.attempt_no}: "
+                "no late-envelope reader")
+        attempt = wt.reopen_attempt_worktree(
+            self.deps.repo, self.run_id, node.node_id, stranded.attempt_no,
+            stranded.base_sha, Path(self.deps.worktrees_root),
+            Path(self.deps.scratch_root))
+        identity = wt.check_at_create(attempt)
+        if not identity.ok:
+            raise DurableOutputIdentityError(
+                f"{stranded.node_id}#{stranded.attempt_no}: "
+                + "; ".join(identity.detail))
+        baseline = store.attempt_baseline(
+            self.run_id, node.node_id, stranded.attempt_no)
+        ignored = store.attempt_ignored_at_base(
+            self.run_id, node.node_id, stranded.attempt_no)
+        if ignored is None:
+            raise lc.BaselineUnrecorded(
+                f"{self.run_id}/{node.node_id}#{stranded.attempt_no}: "
+                "ignored-at-base evidence was not recorded")
+        attempt.baseline = baseline
+        attempt.ignored_at_base = ignored
+        with self._lock:
+            self._attempt_worktrees[node.node_id] = attempt
+
+        execution = self.deps.recover_node(attempt, stranded)
+        if execution is None or not execution.envelope_parsed:
+            raise DurableOutputIdentityError(
+                f"{stranded.node_id}#{stranded.attempt_no}: "
+                "late envelope is not usable")
+        pre_verdict = vf.GateVerdict(
+            green=False, unparseable=False, counts=None,
+            reason="recovered generation crossed pre-gate before baseline")
+        basis = None
+        if record.repair_of_attempt is not None:
+            basis = rp.RepairBasis(
+                base_sha=record.base_sha,
+                integration_head=record.integration_head,
+                repair_of_attempt=record.repair_of_attempt,
+                chain_length=record.repair_chain_length)
+        self._complete_attempt(
+            node, context, attempt, record, basis, pre_verdict, baseline,
+            execution, record.integration_head)
+
+    def _complete_attempt(
+            self, node: st.PlanNode, context: _AttemptContext,
+            attempt: wt.AttemptWorktree, record: st.AttemptRecord,
+            basis: Optional[rp.RepairBasis], pre_verdict: vf.GateVerdict,
+            baseline: wt.Inventory, execution: NodeExecution,
+            head: str) -> None:
+        store = self.deps.store
         self._record_result(node, record, execution)
         self._require_running(record)
         if execution.launched_pid is not None:
@@ -1483,8 +1564,9 @@ class Scheduler:
             # signals, just late — recorded so the row is complete either way.
             with self._lock:
                 self._require_running(record)
-                store.mark_launched(self.run_id, node.node_id, attempt_no,
-                                    execution.launched_pid)
+                store.mark_launched(
+                    self.run_id, node.node_id, record.attempt_no,
+                    execution.launched_pid)
 
         after = wt.inventory(attempt.path)
         self._require_running(record)
@@ -1564,7 +1646,7 @@ class Scheduler:
             self._require_running(record)
             output_sha = wt.commit_measured_delta(
                 attempt, measured, after,
-                f"{node.node_id} attempt {attempt_no}")
+                f"{node.node_id} attempt {record.attempt_no}")
         self._require_running(record)
         expected = wt.expected_inventory(baseline, measured, after)
         committed = wt.check_post_commit(attempt, expected)

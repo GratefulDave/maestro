@@ -106,6 +106,35 @@ class PollCarriesTheEnvelopeTests(unittest.TestCase):
         self.assertIsNone(execution.envelope_payload)
 
 
+class LateEnvelopeRecoveryParserTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.tmp = self.enterContext(__import__("tempfile").TemporaryDirectory())
+        self.scratch = Path(self.tmp)
+        self.attempt = type("Attempt", (), {"scratch": self.scratch})()
+
+    def _read(self):
+        return maestro._late_agent_execution(self.attempt, record=None)
+
+    def test_only_an_explicit_success_is_recoverable(self):
+        payload = {"success": True, "summary": "finished"}
+        (self.scratch / "agent-envelope.json").write_text(
+            json.dumps(payload), encoding="utf-8")
+        execution = self._read()
+        self.assertIsNotNone(execution)
+        self.assertTrue(execution.envelope_parsed)
+        self.assertEqual(execution.envelope_payload, payload)
+        self.assertEqual(execution.exit_code, 0)
+
+    def test_a_failed_or_malformed_declaration_is_not_recoverable(self):
+        envelope = self.scratch / "agent-envelope.json"
+        for content in ('{"success": false}', '{"summary": "missing"}',
+                        "[1, 2]", "{broken"):
+            with self.subTest(content=content):
+                envelope.write_text(content, encoding="utf-8")
+                self.assertIsNone(self._read())
+
+
 # ── the scheduler half: one adjudicated row per result ──────────────────────
 
 class ResultRowsAreWrittenTests(SchedulerFixture):

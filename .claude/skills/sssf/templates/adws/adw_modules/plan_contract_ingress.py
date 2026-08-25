@@ -359,17 +359,16 @@ def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
             for effect in sorted(dispositions)]
 
 
-#: Kind this projection emits. `maestro-plan.v3` added `tests`, but
-#: plan-contract.v1 has no tests/build split, and inventing one here would
-#: change every shipped lane's graph (`plan_model.SCHEMA_V3`).
-_EMITTED_NODE_KIND = "agent"
+#: Plan Contract names authoring roles; Maestro names runtime node kinds.
+#: Absent `lane_kind` remains a build lane for older Plan IR.
+_LANE_KIND_TO_NODE_KIND: Dict[str, str] = {
+    "build": "agent",
+    "tests": "tests",
+}
 
-#: Node kinds a `maestro-plan` can declare that this projection does not
-#: emit, each with the reason. Checked so a kind PR #124 added cannot hide
-#: from the guard by not being the one kind we currently write.
+
+#: Node kinds a plan-contract lane cannot emit.
 _UNEMITTED_NODE_KINDS: Dict[str, str] = {
-    "tests": ("plan-contract.v1 has no tests/build split; SCHEMA_V3 is "
-              "authored in maestro-plan, not projected from the IR"),
     "code": ("a plan-contract lane is agent work; a code node's command is "
              "not a lane and has no IR binding to project"),
 }
@@ -388,6 +387,7 @@ _DESTINATION_NODE_TYPES: Tuple[type, ...] = (
 _LANE_PROJECTION: Dict[str, Optional[str]] = {
     "lane_id": "node_id",
     "title": "instruction",
+    "lane_kind": "kind",
     "execution_context": "cwd",
     "depends_on": "needs",
     "requirement_ids": "instruction",
@@ -688,14 +688,11 @@ def _assert_ingress_projection_is_total(
             "fixture {}".format(fixture.get("fixture_id")))
 
     kind = node.get("kind")
-    if kind != _EMITTED_NODE_KIND:
+    if kind not in set(_LANE_KIND_TO_NODE_KIND.values()):
         reason = _UNEMITTED_NODE_KINDS.get(kind, "")
         raise IngressProjectionIncomplete(
-            "lane {0}: project_draft emitted kind {1!r}, which is not "
-            "{2!r}. Unemitted kinds are named in _UNEMITTED_NODE_KINDS"
-            "{3}.".format(
-                lane_id, kind, _EMITTED_NODE_KIND,
-                (": " + reason) if reason else " (this one is not)"))
+            "lane {0}: project_draft emitted unsupported kind {1!r}{2}.".format(
+                lane_id, kind, (": " + reason) if reason else ""))
 
     # AgentNode and TestsNode share a launch shape; a field TestsNode
     # declares that the emitted node does not carry is the #96 drop
@@ -915,8 +912,14 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         # beneath it; `_node_instruction` records why, and why the two
         # cheaper shapes were declined.
         instruction = _node_instruction(ir, lane, lane_id)
+        lane_kind = lane.get("lane_kind", "build")
+        try:
+            node_kind = _LANE_KIND_TO_NODE_KIND[lane_kind]
+        except (KeyError, TypeError):
+            raise IngressError(
+                "UNMAPPABLE_LANE_KIND:{}".format(lane_id)) from None
         node = {
-            "kind": _EMITTED_NODE_KIND,
+            "kind": node_kind,
             "node_id": lane_id,
             "needs": needs,
             "reads": source_reads,
@@ -1029,7 +1032,10 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         # Read from the model rather than spelled here: the constant and the
         # registered parser class are the same fact, and a literal beside
         # them is a second place for it to be wrong.
-        "schema_version": plan_model.SCHEMA_V2,
+        "schema_version": (
+            plan_model.SCHEMA_V3
+            if any(node["kind"] == "tests" for node in nodes)
+            else plan_model.SCHEMA_V2),
         "plan_id": plan_id,
         "title": title,
         "intent": title,
@@ -1084,7 +1090,7 @@ def project_canonical_plan(
 def author_from_plan_contract(
         ir_path: Path, receipt_path: Path, destination: Path, repo: Path,
         rendered_path: Optional[Path] = None) -> Tuple[bytes, dict]:
-    """Verify the receipt, project, canonicalize, and write maestro-plan.v2."""
+    """Verify the receipt, project, canonicalize, and write a Maestro plan."""
     stored, draft, ir = project_canonical_plan(
         ir_path, receipt_path, repo, rendered_path)
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")

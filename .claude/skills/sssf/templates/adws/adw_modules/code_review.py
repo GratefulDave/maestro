@@ -781,7 +781,7 @@ def require_distinct_vendor(builder_vendor: str, reviewer_vendor: str) -> None:
 
     **This check is config-derived, not receipt-proven, and the difference is
     load-bearing.** `route_receipts` admits routes, and on the omp route only
-    `profile` selects the model — `build_omp_argv` emits `--pm-profile` and
+    `profile` selects the model — `build_omp_argv` emits `--profile` and
     `--session-dir` and passes neither model nor vendor. So a grok builder and
     an openai reviewer ride the *same* admitted `omp` route receipt, and no
     receipt anywhere can distinguish them. What is compared here is what the

@@ -86,6 +86,10 @@ class LaunchRefusal(Enum):
     SCRATCH_REDIRECT_MISSING = ("SCRATCH_REDIRECT_MISSING", False, True)
     #: Refused before any herdr call, against the verified admitted-route set.
     ROUTE_NOT_ADMITTED = ("ROUTE_NOT_ADMITTED", False, True)
+    #: OMP cannot launch without the configured execution profile. Refused
+    #: before any pane is created because the profile belongs to the immutable
+    #: launch spec and retrying cannot supply it.
+    OMP_PROFILE_REQUIRED = ("OMP_PROFILE_REQUIRED", False, True)
     #: The split returned without a pane id. §16.3 item 45 names this among
     #: the post-split refusals: herdr may hold a pane it did not report.
     NO_PANE = ("NO_PANE", None, False)
@@ -98,15 +102,18 @@ class LaunchRefusal(Enum):
     #: which is not a `LaunchRefused` and therefore says nothing about the
     #: pane the handler just closed.
     AGENT_START_REFUSED = ("AGENT_START_REFUSED", None, False)
+    #: An agent started but its interactive composer or prompt submission did
+    #: not complete. The launch path cancels that agent before reporting the
+    #: refusal; another attempt may succeed.
+    PROMPT_SUBMISSION_REFUSED = ("PROMPT_SUBMISSION_REFUSED", False, False)
     #: The pane herdr split is not bound to the worktree the spec named.
     #: Non-deterministic: the binding is herdr's to get right and another
     #: split may land correctly.
     BINDING_MISMATCH = ("BINDING_MISMATCH", None, False)
-    #: The spec named a route this launcher cannot build an argv for. The
-    #: pane is already open by the time that is discovered, so it is reaped
-    #: and the refusal states the reap -- and it is deterministic, because the
-    #: route is a property of the spec and identical on every attempt.
-    UNSUPPORTED_ROUTE = ("UNSUPPORTED_ROUTE", None, True)
+    #: The spec named a route this launcher cannot build an argv for. Refused
+    #: before any pane is created, and deterministic because the route is a
+    #: property of the immutable spec.
+    UNSUPPORTED_ROUTE = ("UNSUPPORTED_ROUTE", False, True)
     #: herdr could not say which pane this launcher splits from. Raised
     #: before any split, so no pane exists. **Non**-deterministic: the answer
     #: is herdr's to give and the next attempt may get it, and the launcher
@@ -454,11 +461,36 @@ class LaunchSpec:
     #: wider than the table for 4 and 5.
     pane_group_size: int = 0
     #: Secondary escape hatch, default off. The operator's tool policy is the
-    #: omp profile (`--pm-profile`). True appends
+    #: omp profile (`--profile`). True appends
     #: `permissions.route_capability_argv`; False passes no `--tools` /
     #: `--disallowedTools`. Maestro does not editorialise about tools unless
     #: asked.
     restrict_tools: bool = False
+
+#: Direct Claude sessions must delegate substantial work rather than silently
+#: duplicating a spawned subagent's task in the parent. This is part of every
+#: Claude prompt, at the universal launch chokepoint rather than at individual
+#: scheduler call sites.
+CLAUDE_TEAM_PROMPT_PREFIX = (
+    "/team spawn subagents for tasks. If you get impatient do not duplicate "
+    "the work yourself. Poll them. Make sure they use SendMessage to respond "
+    "back to you. "
+)
+
+
+def prepare_route_prompt_text(route: str, prompt: str) -> str:
+    """Apply route-wide prompt policy to an arbitrary prompt."""
+    if route != "claude" or prompt.startswith(CLAUDE_TEAM_PROMPT_PREFIX):
+        return prompt
+    return CLAUDE_TEAM_PROMPT_PREFIX + prompt
+
+
+def prepare_route_prompt(spec: LaunchSpec) -> None:
+    """Apply route-owned prompt text exactly once before size preflight."""
+    text = spec.prompt_path.read_text(encoding="utf-8")
+    prepared = prepare_route_prompt_text(spec.route, text)
+    if prepared != text:
+        spec.prompt_path.write_text(prepared, encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -572,36 +604,29 @@ def preflight_launch_prompt(spec: LaunchSpec) -> Optional[int]:
 
 
 def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
-    """omp's argv, carrying the prompt as a message rather than as typing.
+    """omp's argv, without the node prompt.
 
-    The trailing `@<prompt-path>` is omp's documented `MESSAGES` positional
-    ("prefix files with @"), so the prompt is delivered by the process that
-    starts the agent instead of being typed into its composer afterwards.
+    OMP must first reach its interactive composer. Passing `@<prompt-path>` as
+    a startup positional races that readiness boundary: the process can consume
+    only the prompt's first command (for example `/team`) before the full node
+    instruction is available. `launch` therefore starts an empty interactive
+    session, waits for Herdr to prove it is ready, and only then submits the
+    prompt atomically through `herdr agent prompt`.
 
-    That deletes a failure class rather than mitigating it. Typing into the
-    composer stalls against omp roughly half the time -- the text lands and is
-    never submitted -- and run-d7c242809fe74e74b7368393fa4de6de is what that
-    costs: both depth-0 lanes blocked at 0 turns with
-    `AGENT_PROMPT_UNSUBMITTED ... after 4 submit attempts`, having pressed
-    Enter four times each at a composer that would not take it. A message on
-    the command line has no composer to swallow it.
-
-    Tool policy is the configured `--pm-profile`. `--tools` is a secondary
-    hatch, off unless `spec.restrict_tools` is set. The flag, when present,
-    precedes `-c` and the `@prompt` positional because omp's `MESSAGES`
-    positional must stay last.
+    Tool policy is the configured `--profile`. `--tools` is a secondary hatch,
+    off unless `spec.restrict_tools` is set. Continuation remains an argv flag;
+    it restores the session before the same post-readiness prompt submission.
     """
     if not spec.profile:
         raise ValueError("OMP_PROFILE_REQUIRED")
     argv = [
-        str(binary), "--pm-profile", spec.profile,
+        str(binary), "--profile", spec.profile,
         "--session-dir", str(spec.session_dir),
     ]
     if spec.restrict_tools:
         argv.extend(permissions.route_capability_argv(spec.route))
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
         argv.append("-c")
-    argv.append("@{0}".format(spec.prompt_path.resolve()))
     return tuple(argv)
 
 
@@ -902,14 +927,18 @@ def _is_text_read(args: Sequence[str]) -> bool:
     return len(args) >= 2 and args[0] in ("agent", "pane") and args[1] == "read"
 
 
-def _agent_transcript_path(agent: object) -> Optional[Path]:
-    """Where herdr says this agent's transcript lives.
+def _agent_transcript_path(
+        agent: object,
+        launched_cwd: Optional[Path] = None,
+        environment: Optional[Mapping[str, str]] = None,
+) -> Optional[Path]:
+    """Resolve the transcript Herdr identifies for an agent.
 
-    `agent start` and `agent get` report it as `agent_session`, a tagged value
-    whose `kind` says how to read `value` -- `path` for the routes that write a
-    JSONL transcript. Reading only a flat `transcript_path` key, which herdr
-    does not send, left every launch without a session path and failed the node
-    with SESSION_PATH_MISSING before its first turn.
+    Herdr reports JSONL-writing routes as ``agent_session.kind == "path"``.
+    Claude remote-control sessions instead report a typed session ``id`` even
+    though Claude writes the ordinary project JSONL under its config root. The
+    ID is not itself a path, so resolve it only for Herdr's Claude source and
+    only when the exact cwd-derived file exists.
     """
     if not isinstance(agent, dict):
         return None
@@ -917,11 +946,26 @@ def _agent_transcript_path(agent: object) -> Optional[Path]:
     if direct:
         return Path(str(direct))
     session = agent.get("agent_session")
-    if isinstance(session, dict) and session.get("kind") == "path":
-        value = session.get("value")
-        if value:
-            return Path(str(value))
-    return None
+    if not isinstance(session, dict):
+        return None
+    value = session.get("value")
+    if not value:
+        return None
+    if session.get("kind") == "path":
+        return Path(str(value))
+    if (session.get("kind") != "id"
+            or session.get("source") != "herdr:claude"
+            or launched_cwd is None):
+        return None
+    supplied = environment or {}
+    config_root = (supplied.get("CLAUDE_CONFIG_DIR")
+                   or os.environ.get("CLAUDE_CONFIG_DIR"))
+    root = Path(config_root).expanduser() if config_root else Path.home() / ".claude"
+    project = "".join(
+        character if character.isalnum() or character == "-" else "-"
+        for character in str(launched_cwd.resolve()))
+    candidate = root / "projects" / project / (str(value) + ".jsonl")
+    return candidate if candidate.is_file() else None
 
 
 class PromptNotSubmitted(RuntimeError):
@@ -988,6 +1032,7 @@ def submit_agent_prompt(
         timeout_s: float = 30.0,
         until: Sequence[str] = ("idle",),
         attempts: int = SUBMIT_ATTEMPTS,
+        working_proves: bool = False,
         sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Submit one atomic prompt and prove the agent actually accepted it.
@@ -1022,8 +1067,9 @@ def submit_agent_prompt(
     until_argv: List[str] = []
     for status in until:
         until_argv.extend(["--until", status])
-    # What the pane had consumed before the prompt was offered. Everything
-    # below compares against this rather than against a status word.
+    # What the pane had consumed before the prompt was offered. A revision
+    # advance proves consumption; a typed `working` agent status is independent
+    # positive proof for routes whose pane revision remains static.
     baseline = pane_revision(herdr_call, pane_id)
     # Every legible reading taken *after* the prompt was offered. Emptiness is
     # the structural fact D9 turns on: it says the meter was never readable,
@@ -1031,27 +1077,28 @@ def submit_agent_prompt(
     readings: List[int] = []
 
     def consumed() -> bool:
-        """Whether the pane has taken anything since the prompt was offered.
+        """Whether the pane or agent proves it accepted the offered prompt.
 
-        `idle` is worthless as proof here and was the whole defect: a composer
-        holding an unsubmitted `@<path>` reports `idle`, so waiting for it
-        succeeded instantly against exactly the failure it existed to catch,
-        and the Enter recovery below never ran once. The revision counter
-        cannot be satisfied that way -- an unsubmitted composer does not
-        advance it.
-
-        Unreadable on either side means unproven, and unproven is never
-        submitted: the caller's next move is to press Enter again, which is
-        harmless against a prompt that did go through. What the unreadable case
-        does *not* do any more is decide the terminal outcome -- see
-        `PromptSubmissionUnobservable`.
+        `idle` is worthless: a composer holding an unsubmitted `@<path>` also
+        reports idle. A pane revision advance proves consumption for fast turns.
+        A typed `working` agent status proves the same fact for direct Claude
+        sessions whose revision may remain static after accepting the prompt.
+        Missing, malformed, or any other status remains unproven.
         """
         current = pane_revision(herdr_call, pane_id)
         if current is not None:
             readings.append(current)
-        if baseline is None or current is None:
-            return False
-        return current > baseline
+        if baseline is not None and current is not None and current > baseline:
+            return True
+        if working_proves and agent_name:
+            try:
+                payload = herdr_call("agent", "get", agent_name)
+            except Exception:
+                return False
+            agent = _extract(payload, "agent")
+            if isinstance(agent, dict) and agent.get("status") == "working":
+                return True
+        return False
 
     def wait_for(budget_s: float) -> bool:
         argv = ["agent", "wait", target, *until_argv,
@@ -1120,11 +1167,10 @@ def wait_for_interactive_agent(
             "AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
 
 
-#: How long `launch` waits for herdr to report where the agent's transcript is.
-#: Bounded at the prompt submission's own 60s rather than the 180s readiness
-#: gate: by the time this runs the agent has already been waited to idle at its
-#: composer, so a session file that has not appeared within a minute is absent
-#: rather than late, and the caller's SESSION_PATH_MISSING is then correct.
+#: How long `launch` waits for Herdr to report the agent's transcript.
+#: Bounded at the prompt submission's own 60s. This runs only after the coder
+#: is ready and has been given its prompt, so a JSONL path or Claude session ID
+#: that cannot resolve within a minute is absent rather than merely early.
 TRANSCRIPT_PATH_TIMEOUT_S = 60.0
 
 
@@ -1132,20 +1178,16 @@ def wait_for_agent_transcript(
         herdr_call: Callable[..., dict], name: str, timeout_s: float,
         poll_interval_s: float = 0.25,
         sleep: Callable[[float], None] = time.sleep,
+        launched_cwd: Optional[Path] = None,
+        environment: Optional[Mapping[str, str]] = None,
 ) -> Optional[Path]:
-    """Poll `agent get` until herdr reports this agent's transcript path.
+    """Poll until Herdr's typed session value resolves to a transcript.
 
-    `agent start` returns once herdr holds the process, which for a route that
-    writes a JSONL transcript is before the coder has created the file. herdr
-    then omits `agent_session` entirely, and reading the start payload alone
-    made SESSION_PATH_MISSING a race: of three attempts on one node on
-    2026-08-17, the one that happened to win it ran 61 turns and the two that
-    lost it died at turn zero.
-
-    Whether the path has arrived is read from the typed `agent_session.kind`
-    field, never from the pane (§1.2). `None` at the deadline rather than a
-    raise: the absence is the caller's to classify, and a route that writes no
-    transcript at all is not an error here.
+    A path-valued session may arrive after ``agent start``. Claude
+    remote-control instead keeps an ID-valued session; after the first prompt
+    creates its JSONL, ``_agent_transcript_path`` resolves that exact ID under
+    the launched cwd's Claude project directory. ``None`` at the deadline
+    leaves absence for the caller to classify.
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
@@ -1156,26 +1198,19 @@ def wait_for_agent_transcript(
             # missing observation and not an answer. Keep polling to the
             # deadline rather than converting it into a decision.
             payload = {}
-        transcript = _agent_transcript_path(_extract(payload, "agent"))
+        transcript = _agent_transcript_path(
+            _extract(payload, "agent"), launched_cwd, environment)
         if transcript is not None:
             return transcript
         if time.monotonic() >= deadline:
             return None
         sleep(poll_interval_s)
 
-
 def _wait_for_available_shell(
         herdr_call: Callable[..., dict], pane_id: str, timeout_s: float = 30.0,
         settle_polls: int = 5,
 ) -> None:
-    """Give the pane a chance to settle into an interactive shell. Advisory.
-
-    A single ready snapshot is not enough: a freshly split pane can look like a
-    lone zsh in the gap before login hooks (direnv, keychain lookups) spawn
-    their own foreground processes. Starting an agent in that gap makes Herdr
-    report `agent_pane_busy`, so several consecutive ready snapshots are worth
-    waiting for.
-
+    """
     Worth waiting for, and nothing more. This used to *gate* the launch,
     raising `SHELL_NOT_READY` at its deadline, and a wall clock over a
     separate RPC cannot prove what it was asked to prove: the last snapshot is
@@ -1728,12 +1763,23 @@ class HerdrLauncher:
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         if not self.admitted_routes.admits(spec.route):
             raise LaunchRefused(LaunchRefusal.ROUTE_NOT_ADMITTED, spec.route)
-        # B13, before anything is created. An overflowing agent does not error:
-        # it compaction-loops and answers about a different task, which costs a
-        # pane, an attempt, and a plausible-looking wrong result. Refusing here
-        # rather than after the split keeps `pane_created=False` true by
-        # construction.
+        # B13 and route argv validation both happen before anything is created.
+        # An overflowing agent compaction-loops and answers about another task;
+        # an invalid immutable launch spec cannot become valid on retry.
+        prepare_route_prompt(spec)
         preflight_launch_prompt(spec)
+        if spec.route == "omp":
+            try:
+                route_argv = build_omp_argv(self.omp_path, spec)
+            except ValueError as exc:
+                if str(exc) != "OMP_PROFILE_REQUIRED":
+                    raise
+                raise LaunchRefused(
+                    LaunchRefusal.OMP_PROFILE_REQUIRED, spec.route) from exc
+        elif spec.route == "claude":
+            route_argv = build_claude_argv(self.claude_path, spec)
+        else:
+            raise LaunchRefused(LaunchRefusal.UNSUPPORTED_ROUTE, spec.route)
         worktree = spec.worktree.resolve()
         environment = MappingProxyType(dict(spec.environment))
         # The pane shell is forked by the herdr server, not by the CLI process
@@ -1766,16 +1812,6 @@ class HerdrLauncher:
                 pane_created=not closed)
         self._label_pane(pane_id, spec, environment)
         name = _agent_name(spec.correlation_token)
-        route_argv = (build_omp_argv(self.omp_path, spec) if spec.route == "omp"
-                      else build_claude_argv(self.claude_path, spec)
-                      if spec.route == "claude" else None)
-        if route_argv is None:
-            # The pane is already open. Raising here without closing it leaked
-            # one pane per refusal and told the scheduler nothing typed about
-            # what it had left behind.
-            closed = self._reap_pane(pane_id, environment)
-            raise LaunchRefused(LaunchRefusal.UNSUPPORTED_ROUTE, spec.route,
-                                pane_created=not closed)
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
         actual = (Path(str(bound.get("cwd"))).resolve()
@@ -1830,7 +1866,7 @@ class HerdrLauncher:
                 LaunchRefusal.BINDING_MISMATCH,
                 "{}!={}".format(actual, worktree), pane_created=False)
         agent = _extract(started, "agent")
-        transcript = _agent_transcript_path(agent)
+        transcript = _agent_transcript_path(agent, worktree, environment)
         handle = LaunchHandle(spec.correlation_token, pane_id, name, worktree,
                               transcript_path=transcript,
                               envelope_path=spec.envelope_path,
@@ -1840,58 +1876,51 @@ class HerdrLauncher:
             self._proven_absent.pop(spec.correlation_token, None)
             if transcript:
                 self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
-        wait_for_interactive_agent(
-            lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
-            name)
-        if transcript is None:
-            # The start payload is a snapshot taken before the coder opened its
-            # session, not a statement that this route has no transcript. Poll
-            # for the typed path now that the agent is idle at its composer, so
-            # the caller's SESSION_PATH_MISSING means absent rather than early.
-            transcript = wait_for_agent_transcript(
-                lambda *args, **kwargs: self._herdr(*args, env=environment,
-                                                    **kwargs),
-                name, TRANSCRIPT_PATH_TIMEOUT_S)
-            if transcript is not None:
-                # The handle is already registered, and `_handles` must keep
-                # naming the same object the caller holds -- same frozen-field
-                # assignment `__post_init__` uses, rather than a second handle
-                # the registry and the caller could disagree about.
-                object.__setattr__(handle, "transcript_path", transcript)
-                with self._handles_lock:
-                    self._tailers[spec.correlation_token] = TranscriptTailer(
-                        transcript)
-        if spec.route != "omp":
+        try:
+            wait_for_interactive_agent(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=environment, **kwargs),
+                name)
+            # Every coding route receives the complete node instruction only
+            # after its composer is ready. Startup delivery can race OMP
+            # initialization and execute only the prompt's leading command.
             bootstrap = "@{0}".format(spec.prompt_path.resolve())
-            # Settle for either working or idle: the harness turn runs for as
-            # long as the task takes, so waiting for idle here would hold the
-            # launch open for the whole run, while a short task can be back at
-            # idle before the working state is ever sampled. Neither word is
-            # trusted on its own -- `submit_agent_prompt` requires the pane's
-            # revision to have moved, because `idle` is also what a composer
-            # holding an unsubmitted prompt reports.
             submit_agent_prompt(
                 lambda *args, **kwargs: self._herdr(
                     *args, env=environment, **kwargs),
-                pane_id, bootstrap, name,
-                timeout_s=60.0, until=("working", "idle"))
-        # The omp route carries its prompt in argv (`build_omp_argv`), so there
-        # is nothing to type and no composer to stall.
+                pane_id, bootstrap, name, timeout_s=60.0,
+                until=("working", "idle"),
+                working_proves=spec.route == "claude")
+            if transcript is None:
+                transcript = wait_for_agent_transcript(
+                    lambda *args, **kwargs: self._herdr(
+                        *args, env=environment, **kwargs),
+                    name, TRANSCRIPT_PATH_TIMEOUT_S, launched_cwd=worktree,
+                    environment=environment)
+                if transcript is not None:
+                    object.__setattr__(handle, "transcript_path", transcript)
+                    with self._handles_lock:
+                        self._tailers[spec.correlation_token] = TranscriptTailer(
+                            transcript)
 
-        # Resolved here, last, and deliberately not earlier: before the prompt
-        # is submitted the pane's foreground group is still its own shell, and
-        # `pane_liveness_pid` would decline. Same frozen-field assignment the
-        # transcript path above uses, so `_handles` and the caller keep naming
-        # one object. A `None` is the normal case on any route that does not
-        # report a distinct foreground group, not a failure: it leaves the
-        # attempt with the turn clock and the node clock it already had.
-        liveness_pid = pane_liveness_pid(
-            lambda *args, **kwargs: self._herdr(*args, env=environment,
-                                                **kwargs),
-            pane_id)
-        if liveness_pid is not None:
-            object.__setattr__(handle, "liveness_pid", liveness_pid)
-        return handle
+            # The pane's foreground group is meaningful only after submission.
+            liveness_pid = pane_liveness_pid(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=environment, **kwargs),
+                pane_id)
+            if liveness_pid is not None:
+                object.__setattr__(handle, "liveness_pid", liveness_pid)
+            return handle
+        except BaseException as exc:
+            # A started agent is owned execution. Cancel it before returning a
+            # launch refusal; cancellation failure remains a quiescence error.
+            self.cancel(handle, time.monotonic() + 5.0)
+            if not isinstance(exc, Exception):
+                raise
+            raise LaunchRefused(
+                LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
+                "{0}: {1}".format(type(exc).__name__, exc),
+                pane_created=False) from exc
 
     def agent_status(self, handle: LaunchHandle) -> Optional[str]:
         """The route's raw per-pane status, uncollapsed — B14's seam.
@@ -2104,6 +2133,22 @@ class HerdrLauncher:
             handle = self._handles.get(token)
         return (handle,) if handle is not None else ()
 
+    def agent_presence(self, token: str) -> Optional[bool]:
+        """Whether Herdr still holds the deterministic agent for an attempt.
+
+        `False` requires Herdr's typed `agent_not_found`; transport failure is
+        `None`, never absence. This is intentionally independent of the
+        process-local handle registry so a later `run resume` invocation can
+        prove that an attempt blocked on unproven quiescence is now gone.
+        """
+        try:
+            payload = self._herdr("agent", "get", _agent_name(token))
+        except HerdrCallError as exc:
+            return False if exc.code == AGENT_NOT_FOUND else None
+        except RuntimeError:
+            return None
+        return True if isinstance(_extract(payload, "agent"), dict) else None
+
     def classify(self, exc: BaseException) -> ErrorClass:
         return classify_error(exc)
 
@@ -2203,12 +2248,15 @@ def _herdr_error_code_of(exc: BaseException) -> str:
 def classify_error(exc: BaseException) -> ErrorClass:
     if _herdr_error_code_of(exc) in TRANSIENT_HERDR_ERROR_CODES:
         return ErrorClass.TRANSIENT
-    if isinstance(exc, PromptSubmissionUnobservable):
-        # An unreadable revision counter is a missing observation about herdr,
-        # not a wedged composer (D9). `PromptNotSubmitted` deliberately does
-        # not land here: a legible counter that never moved is a real refusal
-        # and stays EXECUTION.
-        return ErrorClass.TRANSIENT
+    cursor: Optional[BaseException] = exc
+    seen = set()
+    while cursor is not None and id(cursor) not in seen:
+        seen.add(id(cursor))
+        if isinstance(cursor, PromptSubmissionUnobservable):
+            # An unreadable revision counter is a missing observation about
+            # herdr, not a wedged composer (D9).
+            return ErrorClass.TRANSIENT
+        cursor = cursor.__cause__
     if isinstance(exc, FileNotFoundError):
         return ErrorClass.CONFIGURATION
     if isinstance(exc, PermissionError):

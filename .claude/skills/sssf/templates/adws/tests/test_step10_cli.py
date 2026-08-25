@@ -132,6 +132,30 @@ class RepositoryStateIdentityTest(unittest.TestCase):
                      / "lifecycle.sqlite3").resolve()))
             self.assertEqual(rows[0]["plans_dir"], str(first / "plans"))
 
+    def test_moving_state_replaces_the_repositorys_registry_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            registry = root / "registry.json"
+            repo, config_path = self._installation(root, "project")
+            (repo / ".git").mkdir()
+            with mock.patch.dict(
+                    os.environ, {"MAESTRO_REGISTRY": str(registry)}):
+                maestro._register_installation(
+                    maestro._load_maestro_layout(repo, config_path))
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config["state_root"] = "../moved-state"
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                maestro._register_installation(
+                    maestro._load_maestro_layout(repo, config_path))
+                recorded = json.loads(registry.read_text(encoding="utf-8"))
+
+            row, = recorded["installations"]
+            self.assertEqual(row["repository"], str(repo))
+            self.assertEqual(
+                row["database"],
+                str((root / "moved-state" / "project"
+                     / "lifecycle.sqlite3").resolve()))
+
     def test_an_unwritable_registry_never_fails_a_run(self):
         """Observability bookkeeping is not allowed to refuse a run."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -196,7 +220,9 @@ class OperatorCliTest(unittest.TestCase):
             binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             binary.chmod(0o755)
             binaries[name] = str(binary)
-        state = (repo / state_root).resolve()
+        configured_state = Path(state_root).expanduser()
+        state = (configured_state if configured_state.is_absolute()
+                 else repo / configured_state).resolve()
         route_dir = state / repo.name / "route-receipts"
         route_dir.mkdir(parents=True)
         for route in ("omp", "claude"):
@@ -282,6 +308,49 @@ class OperatorCliTest(unittest.TestCase):
                          (fixture["repo"].parent / "omp").resolve())
         self.assertEqual(Path(args.claude).resolve(),
                          (fixture["repo"].parent / "claude").resolve())
+
+    def test_home_relative_state_root_binds_central_repository_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                fixture = self._named_plan_configuration(
+                    root, state_root="~/.maestro")
+                with mock.patch.dict(
+                        os.environ, fixture["environment"], clear=False), \
+                        self._repository_cwd(fixture["repo"]), \
+                        mock.patch.object(
+                            maestro, "_plan_validate",
+                            return_value=0) as validate:
+                    self.assertEqual(
+                        maestro.main(["plan", "validate", "named"]), 0)
+
+        args = validate.call_args.args[0]
+        expected = (home / ".maestro" / fixture["repo"].name).resolve()
+        self.assertEqual(Path(args.data_dir), expected / "data")
+        self.assertEqual(Path(args.receipt_dir), expected / "receipts")
+
+    def test_a_ledger_command_refreshes_the_dashboard_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "registry.json"
+            fixture = self._named_plan_configuration(root)
+            with mock.patch.dict(
+                    os.environ,
+                    {**fixture["environment"],
+                     "MAESTRO_REGISTRY": str(registry)},
+                    clear=False), \
+                    self._repository_cwd(fixture["repo"]), \
+                    mock.patch.object(
+                        maestro, "_run_status", return_value=0):
+                self.assertEqual(maestro.main(["run", "status", "named"]), 0)
+
+            row, = json.loads(
+                registry.read_text(encoding="utf-8"))["installations"]
+            self.assertEqual(row["repository"], str(fixture["repo"].resolve()))
+            self.assertEqual(row["database"], str(
+                (fixture["state"] / "lifecycle.sqlite3").resolve()))
 
     def test_a_configured_verb_binds_from_below_the_repository_root(self):
         """The repository owns the configuration; the shell's cwd does not.
@@ -969,6 +1038,55 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(payload["outcome"], "RUN_EXECUTION_FAILED")
         self.assertIn("RuntimeError", payload["detail"])
         self.assertEqual(quiesce.call_count, 2)
+
+    def test_resume_retries_code_quiescence_without_agent_liveness_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            root.mkdir()
+            node = SimpleNamespace(
+                kind=scheduler_types.NodeKind.CODE, node_id="code",
+                command=("unreachable",))
+            plan = SimpleNamespace(
+                agent_nodes=(), tests_nodes=(),
+                merge_policy=SimpleNamespace(
+                    integration_branch="main",
+                    integration_gate=SimpleNamespace(
+                        runner="none", argv=(), min_cases=1)),
+                to_plan_nodes=lambda: (node,))
+            args = SimpleNamespace(
+                plan_file=str(root / "plan.json"),
+                db=str(Path(tmp) / "state.db"),
+                run_id="run-1", integration_path=str(root), repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
+                worktrees_root=str(root / "worktrees"),
+                scratch_root=str(root / "scratch-root"), digest="a" * 64)
+
+            class RetryReached(Exception):
+                pass
+
+            store = mock.Mock()
+            store.quiescence_blocked_attempts.return_value = (("code", 1),)
+            store.retry.side_effect = RetryReached
+            output = io.StringIO()
+            with mock.patch.object(
+                    maestro, "_run_configuration", return_value=mock.Mock()
+            ), mock.patch.object(
+                    maestro, "_load_runnable_plan", return_value=plan
+            ), mock.patch.object(
+                    maestro, "_resolve_run_runners", return_value={}
+            ), mock.patch.object(
+                    maestro.lc, "LifecycleStore", return_value=store
+            ), mock.patch.object(
+                    maestro, "_runtime_launcher"
+            ) as runtime_launcher, contextlib.redirect_stdout(output):
+                code = maestro._run_resume(args)
+
+        self.assertEqual(code, 3)
+        self.assertEqual(
+            json.loads(output.getvalue())["outcome"], "RUN_EXECUTION_FAILED")
+        store.retry.assert_called_once_with("run-1", "code", force=True)
+        runtime_launcher.assert_not_called()
 
     def test_run_path_preflight_refuses_data_directory_aliases_and_hardlinks(self):
         with tempfile.TemporaryDirectory() as tmp:

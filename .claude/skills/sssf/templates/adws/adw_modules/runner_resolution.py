@@ -69,11 +69,11 @@ cwd)`, because it imports every test module; a cheaper probe that skipped that
 import would miss a conftest that only fails on a plugin a test module pulls
 in.
 
-**vitest is unmeasured, and therefore refused.** `vitest` is installed nowhere
-on the machine this was written on, so its probe argv and its capable exit are
-not known. They are not guessed: a runner with no `CAPABLE_EXIT` row resolves
-to `RUNNER_UNUSABLE(UNRESOLVED)`. That is the same mechanism rather than an
-exception to it, and it is the correct state for a path nobody has exercised.
+**Vitest uses its native list mode.** Measured against Vitest 3.2.4:
+`vitest list --run --testNamePattern maestro_runner_probe_no_match` loads the
+repository test graph, selects no cases, prints nothing, and exits 0. A broken
+configuration or module import exits non-zero, so the same capability rule
+applies without parsing output.
 
 **The resolution is not part of the plan digest.** `plan_model.to_plan_nodes`
 still projects `gate_command` as the abstract `(runner,) + argv`, and
@@ -115,13 +115,15 @@ COLLECT_ARGS: Dict[str, Tuple[str, ...]] = {
 PROBE_ARGS: Dict[str, Tuple[str, ...]] = {
     "pytest": ("-p", "no:cacheprovider", "-o", "addopts=", "--collect-only",
                "-q", "-k", "maestro_runner_probe_no_match"),
+    "vitest": ("list", "--run", "--testNamePattern",
+               "maestro_runner_probe_no_match"),
 }
 
 #: The exit code a capable runner returns from its probe. Measured, never
-#: guessed. A runner absent from this table cannot be proven capable and
-#: therefore refuses — which is why `vitest` has no row.
+#: guessed. Both values are stable runner behavior rather than parsed prose.
 CAPABLE_EXIT: Dict[str, int] = {
     "pytest": 5,  # pytest.ExitCode.NO_TESTS_COLLECTED
+    "vitest": 0,  # vitest list with a test-name filter that matches nothing
 }
 
 #: How a runner is asked for its own version. Recorded as provenance in the run
@@ -369,8 +371,7 @@ def resolve(runner: str, repo: Path, cwd: str = ".", *,
     working = (repo / cwd).resolve()
     if not _measured(runner):
         # No measured probe means capability cannot be established, and an
-        # unproven runner is refused rather than trusted. `vitest` lives here
-        # until someone measures its row.
+        # unproven runner is refused rather than trusted.
         raise RunnerUnusable(
             runner, Reason.UNRESOLVED, cwd,
             detail="{0} has no measured capability probe, so no invocation of "

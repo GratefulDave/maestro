@@ -321,6 +321,7 @@ def _register_installation(layout: Dict[str, Any]) -> None:
                     item for item in loaded["installations"]
                     if isinstance(item, dict)
                     and item.get("database") != entry["database"]
+                    and item.get("repository") != entry["repository"]
                 ]
         installations.insert(0, entry)
         # Written beside the destination and renamed, so a dashboard reading
@@ -414,6 +415,23 @@ def _repository_path(repo: Path, value, label, *, inside: bool) -> Path:
         raise _MaestroConfigurationError(label + " must resolve inside the repository")
     if not inside and within_repo:
         raise _MaestroConfigurationError(label + " must resolve outside the repository")
+    return resolved
+
+
+def _state_root_path(repo: Path, value) -> Path:
+    """Resolve a central state holder, including a home-relative path.
+
+    Repository data belongs outside every checkout. Unlike `plans_dir`, its
+    configured holder may therefore be absolute; `~/.maestro` is the portable
+    operator-level spelling shared by every repository and linked worktree.
+    The repository name is appended later, so repositories remain isolated
+    below that central holder.
+    """
+    raw = Path(_config_string(value, "state_root")).expanduser()
+    resolved = (raw if raw.is_absolute() else repo / raw).resolve()
+    if _path_is_within(resolved, repo):
+        raise _MaestroConfigurationError(
+            "state_root must resolve outside the repository")
     return resolved
 
 
@@ -547,8 +565,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     # `plans_dir` stays bound to `repo` above, because the plan being run is
     # whatever this checkout has on disk.
     identity = _repository_identity_root(repo)
-    state_root = _repository_path(
-        identity, root["state_root"], "state_root", inside=False)
+    state_root = _state_root_path(identity, root["state_root"])
     if _path_is_within(state_root, repo):
         raise _MaestroConfigurationError(
             "state_root must resolve outside the repository")
@@ -1097,8 +1114,9 @@ def _apply_repository_config(
         return
 
     if args.command == "run" and args.run_command in _RUN_LEDGER_COMMANDS:
-        _bind_run_ledger_configuration(
-            args, _load_maestro_layout(repo, config_path))
+        layout = _load_maestro_layout(repo, config_path)
+        _bind_run_ledger_configuration(args, layout)
+        _register_installation(layout)
         return
 
     config = _load_maestro_config(repo, config_path)
@@ -3463,6 +3481,23 @@ def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
         sleep(0.05)
 
 
+def _late_agent_execution(
+        attempt: worktree.AttemptWorktree,
+        record: scheduler_types.AttemptRecord) -> Optional[scheduler.NodeExecution]:
+    """Read a successful declaration from an existing attempt; never launch."""
+    envelope = attempt.scratch / "agent-envelope.json"
+    if not envelope.is_file():
+        return None
+    try:
+        payload = json.loads(envelope.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+    return scheduler.NodeExecution(
+        envelope_parsed=True, envelope_payload=payload, exit_code=0)
+
+
 def _resolve_run_runners(
         args: argparse.Namespace,
         plan: plan_model.Plan) -> Dict[str, "runner_resolution.ResolvedRunner"]:
@@ -3531,6 +3566,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         tests_nodes = getattr(plan, "tests_nodes", ()) or ()
         route_runner = (_runtime_launcher(args)
                         if plan.agent_nodes or tests_nodes else None)
+        interactive_node_ids = {
+            node.node_id for node in (*plan.agent_nodes, *tests_nodes)
+        }
         store = lc.LifecycleStore(args.db)
         handles = {}
         proven_absent = set()
@@ -3541,8 +3579,83 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         # which may be the operator's own. `None` until `worktree add` succeeds.
         created_integration_path: Optional[Path] = None
         try:
+            retryable_quiescence = []
+            late_envelope_recovery = []
             if resuming:
+                # A completed interactive declaration belongs to its original
+                # generation. Prove the old agent absent and validate every
+                # durable input before changing that lifecycle; code nodes have
+                # no agent to probe and retain the forced-retry behavior.
+                for node_id, attempt_no in store.quiescence_blocked_attempts(
+                        args.run_id):
+                    if node_id not in interactive_node_ids:
+                        retryable_quiescence.append(node_id)
+                        continue
+                    token = "{}-{}-{}".format(
+                        args.run_id, node_id, attempt_no)
+                    probe = getattr(route_runner, "agent_presence", None)
+                    presence = probe(token) if callable(probe) else None
+                    if presence is True:
+                        return _refusal(
+                            "RESUME_AGENT_STILL_LIVE",
+                            "{} attempt {} still has live agent {}; resume "
+                            "left the run unchanged".format(
+                                node_id, attempt_no, token))
+                    if presence is None:
+                        return _refusal(
+                            "RESUME_AGENT_LIVENESS_UNKNOWN",
+                            "{} attempt {} could not be proven absent; resume "
+                            "left the run unchanged".format(
+                                node_id, attempt_no))
+                    scratch = (
+                        Path(args.scratch_root)
+                        / worktree.worktree_dirname(
+                            args.run_id, node_id, attempt_no))
+                    envelope = scratch / "agent-envelope.json"
+                    if not envelope.is_file():
+                        retryable_quiescence.append(node_id)
+                        continue
+                    record = store.get_attempt(
+                        args.run_id, node_id, attempt_no)
+                    try:
+                        reopened = worktree.reopen_attempt_worktree(
+                            Path(args.repo), args.run_id, node_id, attempt_no,
+                            record.base_sha, Path(args.worktrees_root),
+                            Path(args.scratch_root))
+                        identity = worktree.check_at_create(reopened)
+                        baseline = store.attempt_baseline(
+                            args.run_id, node_id, attempt_no)
+                        ignored = store.attempt_ignored_at_base(
+                            args.run_id, node_id, attempt_no)
+                        execution = _late_agent_execution(reopened, record)
+                    except (lc.LifecycleError, worktree.WorktreeError) as exc:
+                        return _refusal(
+                            "LATE_ENVELOPE_RECOVERY_INVALID",
+                            "{} attempt {} cannot recover: {}".format(
+                                node_id, attempt_no, exc))
+                    if not identity.ok or ignored is None or execution is None:
+                        detail = (
+                            "; ".join(identity.detail)
+                            if not identity.ok else
+                            "baseline identity or successful envelope is missing")
+                        return _refusal(
+                            "LATE_ENVELOPE_RECOVERY_INVALID",
+                            "{} attempt {} cannot recover: {}".format(
+                                node_id, attempt_no, detail))
+                    # Force the durable baseline decoder before mutation. The
+                    # scheduler re-reads it after claiming the same attempt.
+                    if baseline is None:
+                        return _refusal(
+                            "LATE_ENVELOPE_RECOVERY_INVALID",
+                            "{} attempt {} has no recorded baseline".format(
+                                node_id, attempt_no))
+                    late_envelope_recovery.append((node_id, attempt_no))
                 store.resume_run(args.run_id)
+                for node_id, attempt_no in late_envelope_recovery:
+                    store.prepare_late_envelope_recovery(
+                        args.run_id, node_id, attempt_no)
+                for node_id in retryable_quiescence:
+                    store.retry(args.run_id, node_id, force=True)
             else:
                 refused = _refuse_base_commit_divergence(args, plan)
                 if refused is not None:
@@ -3735,6 +3848,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 integration_branch=plan.merge_policy.integration_branch,
                 worktrees_root=Path(args.worktrees_root),
                 scratch_root=Path(args.scratch_root), run_node=run_node,
+                recover_node=_late_agent_execution,
                 run_gate=run_gate, run_integration_gate=run_integration_gate,
                 quiesce_attempt=quiesce_attempt,
                 # §8.8's single integration gate, adjudicated at the number the

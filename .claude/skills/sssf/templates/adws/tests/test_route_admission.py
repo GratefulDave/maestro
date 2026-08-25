@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from dataclasses import replace
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -314,7 +315,7 @@ class RouteAdmissionTest(unittest.TestCase):
             herdr=self.herdr,
             binary=self.omp if route == "omp" else self.claude,
             # Both routes carry a configured model: omp keeps the model out of
-            # its argv (the pm-profile selects it) but the receipt still records
+            # its argv (the profile selects it) but the receipt still records
             # which model the caller asked for. `--model` omission for omp is
             # covered by the argv contract tests in test_step7_launcher.
             model="test-model",
@@ -324,6 +325,11 @@ class RouteAdmissionTest(unittest.TestCase):
             timeout_s=5.0,
             startup_settle_s=0.0,
         )
+
+    def test_missing_omp_profile_is_refused_before_herdr(self):
+        with self.assertRaisesRegex(ra.AdmissionError, "OMP_PROFILE_REQUIRED"):
+            ra.capture_route(replace(self.spec("omp"), profile=None))
+        self.assertFalse((self.root / "argv.jsonl").exists())
 
     def test_capture_proves_cwd_continuity_and_cancel_for_both_routes(self):
         for route in ("omp", "claude"):
@@ -402,6 +408,15 @@ class RouteAdmissionTest(unittest.TestCase):
                     ]
                     self.assertEqual(len(prompts), 1)
                     self.assertLess(waits[0], prompts[0])
+                submitted = [
+                    command[3] for command in argv
+                    if command[:2] == ["agent", "prompt"]
+                ]
+                self.assertEqual(len(submitted), 2)
+                for prompt in submitted:
+                    self.assertEqual(
+                        prompt.startswith(launcher.CLAUDE_TEAM_PROMPT_PREFIX),
+                        route == "claude")
                 # A prompt that submits cleanly needs no key recovery.
                 self.assertFalse(any(
                     command[:2] in (
