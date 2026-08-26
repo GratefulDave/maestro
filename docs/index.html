@@ -211,26 +211,26 @@
           <div><h2>Architecture diagrams</h2><p class="section-copy">These diagrams are live-code views of the shipped control plane, not slides. Open the <a href="architecture/index.html">architecture gallery</a>, or jump to a specific diagram below.</p></div>
         </div>
         <div class="grid-3">
-          <a class="card" href="architecture/01-system.html"><span class="tag">01 · system</span><h3>System architecture</h3><p>Control plane, workers, isolated worktrees, and the SQLite trace.</p></a>
+          <a class="card" href="architecture/01-system.html"><span class="tag">01 · system</span><h3>System architecture</h3><p>Control plane, derived build::review, isolated worktrees, and the SQLite trace.</p></a>
           <a class="card" href="architecture/02-layers.html"><span class="tag">02 · layers</span><h3>Control-plane layers</h3><p>Authority stacked from plan schema through scheduling, launch, and merge.</p></a>
-          <a class="card" href="architecture/03-deployment.html"><span class="tag">03 · deploy</span><h3>Deployment</h3><p>Where Maestro runs — host, panes, worktrees, and durable state.</p></a>
+          <a class="card" href="architecture/03-deployment.html"><span class="tag">03 · deploy</span><h3>Deployment</h3><p>Host, panes, worktrees, durable review rows; workspace_not_found is absence.</p></a>
           <a class="card" href="architecture/10-classes-plan.html"><span class="tag">10 · classes</span><h3>Plan model classes</h3><p>Typed plan nodes, dependencies, gates, and scheduler projection.</p></a>
-          <a class="card" href="architecture/11-classes-scheduler.html"><span class="tag">11 · classes</span><h3>Scheduler lifecycle classes</h3><p>Ready set, attempts, retries, verification, and the merge frontier.</p></a>
+          <a class="card" href="architecture/11-classes-scheduler.html"><span class="tag">11 · classes</span><h3>Scheduler lifecycle classes</h3><p>LifecycleStore owns CandidateReview, ActorSession, handoff, and granted_extra_attempts.</p></a>
           <a class="card" href="architecture/12-classes-envelopes.html"><span class="tag">12 · classes</span><h3>Envelope ADW classes</h3><p>Typed envelopes that carry work across the ADW boundary.</p></a>
-          <a class="card" href="architecture/20-state-node.html"><span class="tag">20 · state</span><h3>NodeState machine</h3><p>PENDING through MERGED, plus BLOCKED and CANCELLED terminals.</p></a>
+          <a class="card" href="architecture/20-state-node.html"><span class="tag">20 · state</span><h3>NodeState machine</h3><p>PENDING through MERGED; a review-budget grant is not BLOCKED→PENDING.</p></a>
           <a class="card" href="architecture/21-state-run.html"><span class="tag">21 · state</span><h3>Derived run state</h3><p>Run outcome projected from node states, not a separate machine.</p></a>
-          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · state</span><h3>Attempt retry class</h3><p>Bounded semantic, environmental, and launcher-transient retries.</p></a>
-          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · flow</span><h3>Run start flowchart</h3><p>From digest to worker pool: admit, schedule, isolate, and record.</p></a>
+          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · state</span><h3>Attempt retry class</h3><p>Retry classes plus resume identity, QUIESCENCE_UNPROVEN, and workspace_not_found absence.</p></a>
+          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · flow</span><h3>Run start flowchart</h3><p>Admit, schedule, isolate; merge waits on derived build::review PASS.</p></a>
           <a class="card" href="architecture/31-flow-plan.html"><span class="tag">31 · flow</span><h3>Plan ship flowchart</h3><p>Validate, finalize, and ship a plan until it is runnable.</p></a>
-          <a class="card" href="architecture/32-flow-escape.html"><span class="tag">32 · flow</span><h3>Operator escape flowchart</h3><p>retry, skip, and abandon as explicit, recorded escapes.</p></a>
+          <a class="card" href="architecture/32-flow-escape.html"><span class="tag">32 · flow</span><h3>Operator escape flowchart</h3><p>Semantic grant goes PENDING; review-budget grant stays BLOCKED until resume.</p></a>
           <a class="card" href="architecture/33-flow-commit.html"><span class="tag">33 · flow</span><h3>Pre-commit refusal flowchart</h3><p>Gitignored outputs and unreferenced symbols, counted before the commit.</p></a>
-          <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · flow</span><h3>Repair chain flowchart</h3><p>A repair inherits its falsifiability witness from the chain root, bounded by REPAIR_CHAIN_LIMIT.</p></a>
+          <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · flow</span><h3>Repair chain flowchart</h3><p>SEMANTIC plus output SHA opens repair; review rejection is not the trigger.</p></a>
           <a class="card" href="architecture/40-mind-modules.html"><span class="tag">40 · mind</span><h3>Runtime module tree</h3><p>Module ownership: who may mutate lifecycle, who is transport only.</p></a>
           <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · mind</span><h3>Verb groups</h3><p>plan, run, and workspace command groups on the operator CLI.</p></a>
           <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · mind</span><h3>Nine root verbs</h3><p>bootstrap, plan, deliver, run, retry, skip, abandon, attempt, workspace.</p></a>
           <a class="card" href="architecture/04-data-flow-receipts.html"><span class="tag">04 · data</span><h3>Receipt data flow</h3><p>Only typed records and signed receipts move lifecycle state.</p></a>
-          <a class="card" href="architecture/13-uml-runtime.html"><span class="tag">13 · uml</span><h3>Runtime UML</h3><p>Scheduler, store, plan nodes, and the transport-only launcher.</p></a>
-          <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · seq</span><h3>Attempt sequence</h3><p>One agent attempt from isolate through envelope, gate, and merge.</p></a>
+          <a class="card" href="architecture/13-uml-runtime.html"><span class="tag">13 · uml</span><h3>Runtime UML</h3><p>Scheduler, store review types, PlanV3/TestsNode, and the transport-only launcher.</p></a>
+          <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · seq</span><h3>Attempt sequence</h3><p>Candidate publish, then review PASS, then merge — or SEMANTIC retry.</p></a>
         </div>
       </section>
 
@@ -305,8 +305,8 @@
           <span class="state bad">CANCELLED</span>
         </div>
         <div class="grid" style="margin-top:.85rem">
-          <article class="card"><span class="tag">Retry</span><h3>Same-session, bounded</h3><p>Semantic, environmental, and launcher-transient failures follow distinct budgets. Credential failures refuse retry; only semantic retries receive a mutated prompt.</p></article>
-          <article class="card"><span class="tag">Recovery</span><h3>Restart-safe</h3><p>Persisted state reconstructs quiescent work. Inherited running attempts become environmental failures and relaunch; unreachable panes are recorded as orphans, never adopted across processes.</p></article>
+          <article class="card"><span class="tag">Retry</span><h3>Same-session, bounded</h3><p>Semantic, environmental, and launcher-transient failures follow distinct budgets. Semantic <code>--force</code>/<code>--grant</code> returns PENDING immediately. A review-budget grant stays BLOCKED on that exact attempt.</p></article>
+          <article class="card"><span class="tag">Recovery</span><h3>Restart-safe</h3><p>Only absence-proven <code>run resume</code> returns a review-budget grant to PENDING, same attempt, no replacement worktree. An identity-bound late envelope continues; an absent envelope stays <code>QUIESCENCE_UNPROVEN</code>. Persistent actors adopt only on exact pane, cwd, session, correlation, role, and generation. <code>workspace_not_found</code> is absence for every pane and invalidates cached lane layouts.</p></article>
         </div>
       </section>
 

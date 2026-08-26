@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="03-deployment-title 03-deployment-desc">
       <title id="03-deployment-title">Maestro local deployment</title>
-      <desc id="03-deployment-desc">Deployment diagram placing adws and maestro.config.yaml in the git repository, lifecycle.sqlite3 receipts keys and run worktrees at repository_state/runs/&lt;run_id&gt;/worktrees in repository_state outside the repo, Herdr visible panes on the host, and an optional visualizer on bun:4600.</desc>
+      <desc id="03-deployment-desc">Deployment diagram placing adws and maestro.config.yaml in the git repository, lifecycle.sqlite3 receipts keys and run worktrees at repository_state/runs/&lt;run_id&gt;/worktrees in repository_state outside the repo, Herdr visible panes on the host, and an optional visualizer on bun:4600. Derived build::review lives in the ledger. workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -125,7 +125,7 @@
       <rect x="452" y="88" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
       <text x="472" y="97" fill="#f08a59" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
       <text x="640" y="120" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">lifecycle</text>
-      <text x="640" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">lifecycle.sqlite3</text>
+      <text x="640" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CandidateReview · ActorSession</text>
       <rect x="452" y="200" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
       <text x="460" y="216" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">SCHEMA</text>
       <text x="820" y="216" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">sqlite3</text>
@@ -160,7 +160,7 @@
       <rect x="932" y="88" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
       <text x="948" y="97" fill="#f5f5f5" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
       <text x="1070" y="120" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Herdr</text>
-      <text x="1070" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">visible panes</text>
+      <text x="1070" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">workspace_not_found = absence</text>
       <rect x="932" y="200" width="276" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
       <text x="940" y="216" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">herdr</text>
       <text x="1200" y="216" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">0.8.0</text>
@@ -198,6 +198,7 @@
 
       <line x1="920" y1="676" x2="948" y2="676" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
       <text x="956" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Optional poll</text>
+      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">derived build::review in the ledger · workspace_not_found is absence and invalidates cached lane layouts</text>
     </svg>
   </div>
 </body>
