@@ -713,6 +713,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             "profile",
             "vendor",
             "review_ceiling",
+            "test_review_ceiling",
             "review_reject_grade",
             "provision",
             "environmental_retries",
@@ -801,6 +802,19 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
                 execution_raw["review_ceiling"], "execution.review_ceiling"
             )
             if "review_ceiling" in execution_raw
+            else 3
+        ),
+        # The test reviewer's own ceiling. Separate from `review_ceiling` for
+        # the reason that one is separate from `semantic_ceiling`: they bound
+        # different loops, and one counter would let a lane whose tests took
+        # three rounds to become strong reach its implementation review with
+        # nothing left.
+        "test_review_ceiling": (
+            _config_positive_integer(
+                execution_raw["test_review_ceiling"],
+                "execution.test_review_ceiling",
+            )
+            if "test_review_ceiling" in execution_raw
             else 3
         ),
         # §3.6 A9's grading threshold, beside the ceiling because it answers
@@ -1068,14 +1082,28 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 #: receipt or launches anything, so none of them needs key material — asking
 #: `run status` for a signing seed is how a read verb becomes unusable on a
 #: machine that merely wants to watch a run.
-_RUN_LEDGER_COMMANDS = ("status", "list", "pause", "cancel", "convergence", "findings")
+_RUN_LEDGER_COMMANDS = (
+    "status",
+    "list",
+    "pause",
+    "cancel",
+    "convergence",
+    "findings",
+    # A read by default. `--migrate --apply` writes, and it writes only
+    # to the ledger it was pointed at -- no receipt is verified and
+    # nothing is launched, so it needs no key material either.
+    "test-strength",
+)
 
 #: Flags that select *which* run to read and how to print it. They are the only
 #: flags a configured run verb accepts, because they override no derived path;
 #: any other flag means the operator is driving every path by hand. `--discard`
 #: belongs here for the same reason: it selects which of `run cancel`'s two
 #: behaviours the operator meant, and derives no path at all.
-_RUN_SELECTION_OPTIONS = frozenset({"--run-id", "--json", "--discard"})
+_RUN_SELECTION_OPTIONS = frozenset(
+    {"--run-id", "--json", "--discard", "--migrate", "--apply",
+     "--policy", "--no-backup"}
+)
 
 #: Run-execution flags that override a *setting* rather than a *path*, mapped
 #: to the `argparse` destination each one writes.
@@ -1113,6 +1141,7 @@ _RUN_TUNING_OPTIONS: Dict[str, str] = {
     "--backstop-t-s": "backstop_t_s",
     "--semantic-ceiling": "semantic_ceiling",
     "--review-ceiling": "review_ceiling",
+    "--test-review-ceiling": "test_review_ceiling",
     "--review-start-deadline-s": "review_start_deadline_s",
     "--review-quiescence-confirm-s": "review_quiescence_confirm_s",
     "--environmental-retries": "environmental_retries",
@@ -1342,6 +1371,7 @@ def _apply_repository_config(args: argparse.Namespace, argv: Sequence[str]) -> N
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
         args.review_ceiling = execution["review_ceiling"]
+        args.test_review_ceiling = execution["test_review_ceiling"]
         # A9's other half, and the one `execution:` key that stops here.
         #
         # Every budget and bound around it continues into `SchedulerConfig`,
@@ -1991,12 +2021,17 @@ def _code_review_runner(
         resume_existing_dispatch: bool = False,
     ):
         build_node_id = lane_id(node)
+        # The rubric is a property of the node kind (§1.1 item 4). It is also
+        # a component of the review digest, so a tests node and a build node
+        # cannot share a cached verdict, and changing either rubric
+        # invalidates only its own cached answers.
+        rubric = code_review.rubric_for(node.kind)
         digest = code_review.review_digest(
             run_id=args.run_id,
             node_id=build_node_id,
             base_sha=base_sha,
             output_sha=output_sha,
-            rubric_version=code_review.CODE_RUBRIC.version,
+            rubric_version=rubric.version,
         )
         subject_root = review_root / digest
         report_path = subject_root / "report.json"
@@ -2010,7 +2045,16 @@ def _code_review_runner(
 
         diff, changed = code_review.read_diff(Path(args.repo), base_sha, output_sha)
         objects = code_review.review_objects(changed, output_sha)
-        matrix = finalization.compute_matrix(code_review.CODE_RUBRIC, digest, objects)
+        matrix = finalization.compute_matrix(rubric, digest, objects)
+        # The measurement the acceptance decision will rest on, not a fresh
+        # one: the reviewer must be judging the same evidence, and a second
+        # measurement here would be a second answer to a settled fact.
+        measured = None
+        if lifecycle_store is not None and node.kind is scheduler_types.NodeKind.TESTS:
+            recorded = lifecycle_store.test_gate_evidence(
+                args.run_id, build_node_id, output_sha
+            )
+            measured = dict(recorded[-1].evidence) if recorded else None
         handoff = code_review.build_handoff(
             subject_digest=digest,
             run_id=args.run_id,
@@ -2019,8 +2063,9 @@ def _code_review_runner(
             output_sha=output_sha,
             diff=diff,
             matrix=matrix,
-            rubric=code_review.CODE_RUBRIC,
+            rubric=rubric,
             report_path=report_path,
+            test_evidence=measured,
         )
         text = handoff.render()
         _preflight_prompt(text, args.reviewer_route, args.reviewer_model)
@@ -2340,7 +2385,7 @@ def _code_review_runner(
             subject_digest=digest,
             handoff=handoff,
             objects=objects,
-            rubric=code_review.CODE_RUBRIC,
+            rubric=rubric,
             store=receipt_store,
             window_factory=window_factory,
             occupancy_reader=_reviewer_occupancy,
@@ -3275,6 +3320,7 @@ def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerCon
         backstop_t_s=args.backstop_t_s,
         semantic_ceiling=args.semantic_ceiling,
         review_ceiling=_scheduler_setting(args, "review_ceiling"),
+        test_review_ceiling=_scheduler_setting(args, "test_review_ceiling"),
         environmental_retries=_scheduler_setting(args, "environmental_retries"),
         launcher_retries=_scheduler_setting(args, "launcher_retries"),
         credential_retries=_scheduler_setting(args, "credential_retries"),
@@ -3465,7 +3511,9 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
 #: version produces instructions a reviewer can judge against — that is the
 #: whole content of the v1/v2 distinction, and no structural check can
 #: substitute for it.
-_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({plan_model.SCHEMA_V2, plan_model.SCHEMA_V3})
+_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset(
+    {plan_model.SCHEMA_V2, plan_model.SCHEMA_V3, plan_model.SCHEMA_V4}
+)
 
 
 def _refuse_unrunnable_plan_schema(args: argparse.Namespace, stored: bytes) -> None:
@@ -3539,6 +3587,54 @@ def _refuse_unrunnable_plan_schema(args: argparse.Namespace, stored: bytes) -> N
         ),
         declared_schema_version=declared,
         runnable_schema_versions=sorted(_RUNNABLE_PLAN_SCHEMA_VERSIONS),
+    )
+
+
+def _refuse_uncontracted_tests_nodes(
+    args: argparse.Namespace, plan: plan_model.Plan
+) -> None:
+    """Refuse to **create** a run whose tests nodes prove nothing (§TS).
+
+    The rollout invariant in two halves, and this is the second one. The first
+    is that an existing run keeps the contract it was created under: it is
+    resumable, its terminal nodes stay terminal, and its legacy tests are
+    classified rather than reopened. This is the other side — a *new* run may
+    not be created under those rules, because "the new lifecycle is mandatory
+    for newly created runs" is only true if something refuses the alternative.
+
+    Keyed on the plan's tests nodes rather than on its version string, so a
+    plan that declares a contract for every tests node is admitted whatever it
+    calls itself, and a plan with no tests nodes at all is admitted trivially.
+
+    Resume is deliberately not on this path. `_execute_run` calls this only
+    when starting, and a v3 run already in flight would otherwise be refused
+    by the very check that exists to protect it.
+    """
+    uncontracted = [
+        node.node_id
+        for node in (getattr(plan, "tests_nodes", ()) or ())
+        if getattr(node, "test_strength", None) is None
+    ]
+    if not uncontracted:
+        return
+    raise _RunRefused(
+        "RUN_TEST_STRENGTH_CONTRACT_ABSENT",
+        "these tests nodes declare no test-strength contract: {nodes}. A tests "
+        "node accepted without one is accepted on its case count, and "
+        "run-8d1a71f463e4430f92a125a8f8b3731d is what that permits: a tests "
+        "node reached MERGED on four non-skipped cases while every "
+        "implementation candidate it existed to gate was independently "
+        "rejected. There is no upgrade function and no in-place edit (§6.3): "
+        "re-ship the plan at {version} with `maestro plan ship <plan_name>`, "
+        "declaring for each tests node the coverage obligations its cases must "
+        "discharge and the falsifiability strategy its negative control will "
+        "execute (docs/plan-authoring.md). An existing run of this plan is "
+        "unaffected and stays resumable.".format(
+            nodes=", ".join(sorted(uncontracted)),
+            version=plan_model.SCHEMA_V4,
+        ),
+        uncontracted_tests_nodes=sorted(uncontracted),
+        required_schema_version=plan_model.SCHEMA_V4,
     )
 
 
@@ -4960,6 +5056,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
 
         config = _run_configuration(args)
         plan = _load_runnable_plan(args)
+        if not resuming:
+            # Only on start. A run already in flight is pinned to the contract
+            # it was created under, and refusing its resume here would break
+            # the half of the rollout invariant that protects it.
+            _refuse_uncontracted_tests_nodes(args, plan)
         run_console.print("[green]✓[/green] plan and configuration loaded")
 
         # Before the ledger is opened for writing and before any worktree exists,
@@ -5863,6 +5964,19 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 recover_node=_late_agent_execution,
                 run_gate=run_gate,
                 run_integration_gate=run_integration_gate,
+                # The revert target for a `controlled_mutation` negative
+                # control. Carried from the plan the run is executing, so a
+                # control reverts to the state the plan declared as its
+                # starting point rather than to whatever HEAD happens to be.
+                #
+                # Read the way `_refuse_base_commit_divergence` reads it, and
+                # for the reason stated there: a fixture or double without the
+                # field is left to the refusal that already covers it rather
+                # than given an invented base here. The empty default is not a
+                # fallback -- `_prove_test_strength` refuses a revert_paths
+                # control by name when it has no target, instead of reverting
+                # against HEAD.
+                plan_base_commit=getattr(plan, "base_commit", "") or "",
                 quiesce_attempt=quiesce_attempt,
                 # §8.8's single integration gate, adjudicated at the number the
                 # plan declared for it. Omitting this is what left final
@@ -6285,6 +6399,86 @@ def _live_state(record: "lc.RunRecord", nodes: Sequence["lc.NodeRow"]) -> str:
     return lc.derive_run_state(record, nodes)
 
 
+def _test_strength_projection(
+    node: Any,
+    evidence: Sequence[Any],
+    accepted_test_sha: Mapping[str, str],
+    pairings: Sequence[Any],
+) -> Dict[str, Any]:
+    """The test-strength view of one node, for `run status` and the console.
+
+    Every value is read from the ledger or derived from it in one place, so
+    the CLI, the dashboard and the console cannot come to describe the same
+    node differently — which is how `tester MERGED` came to mean two things.
+
+    `test_bytes` is the field the old vocabulary could not express: a tests
+    node's candidate can be *private* (committed, not yet accepted), *staged*
+    (accepted, not yet on the integration branch) or *integrated*. Reporting
+    `MERGED` alone said only the last of the three and implied all of them.
+    """
+    kind = node.kind
+    try:
+        node_kind = scheduler_types.NodeKind(kind)
+    except ValueError:
+        return {"test_strength": None}
+    accepted = accepted_test_sha.get(node.node_id)
+    latest = evidence[-1] if evidence else None
+    if node_kind is scheduler_types.NodeKind.TESTS:
+        if accepted is None:
+            location = scheduler_types.TestBytesLocation.PRIVATE
+        elif node.state is scheduler_types.NodeState.MERGED:
+            location = scheduler_types.TestBytesLocation.INTEGRATED
+        else:
+            location = scheduler_types.TestBytesLocation.STAGED
+    else:
+        location = None
+    paired = [
+        {
+            "tests_node_id": row.tests_node_id,
+            "accepted_test_sha": row.accepted_test_sha,
+            "implementation_sha": row.implementation_sha,
+            "verifier_command": row.verifier_command,
+            "selector": row.selector,
+            "executed_cases": row.executed_cases,
+        }
+        for row in pairings
+        if node.output_sha is None or row.implementation_sha == node.output_sha
+    ]
+    phase = scheduler_types.test_strength_phase(
+        node_kind,
+        node.state,
+        node.lane_phase,
+        accepted=accepted is not None,
+        paired=bool(paired),
+    )
+    if phase is None:
+        return {"test_strength": None}
+    return {
+        "test_strength": {
+            "phase": phase.value,
+            "test_candidate_sha": accepted or (
+                latest.candidate_sha if latest is not None else None),
+            "accepted_test_sha": accepted,
+            "test_bytes": location.value if location is not None else None,
+            "gate_evidence": (
+                {
+                    "candidate_sha": latest.candidate_sha,
+                    "runner": latest.runner,
+                    "selector": latest.selector,
+                    "strong": latest.strong,
+                    "refusal": latest.refusal,
+                    "coverage": (latest.evidence or {}).get("coverage"),
+                    "falsifiability": (latest.evidence or {}).get(
+                        "falsifiability"),
+                }
+                if latest is not None
+                else None
+            ),
+            "pairings": paired,
+        }
+    }
+
+
 def _run_progress(
     reader: "lc.LifecycleReader", record: "lc.RunRecord", args: argparse.Namespace
 ) -> Dict[str, Any]:
@@ -6343,6 +6537,33 @@ def _run_progress(
                 }
             )
 
+    # The test-strength ledger, read once and joined onto the nodes below.
+    # Read here rather than per node so `run status` takes one pass over each
+    # table, and so a ledger written before these tables existed answers
+    # "nothing recorded" uniformly instead of once per node.
+    test_evidence = reader.test_gate_evidence(record.run_id, limit=10_000)
+    test_pairings = reader.test_pairings(record.run_id, limit=10_000)
+    test_strength_blocks = reader.legacy_test_strength_blocks(
+        record.run_id, limit=10_000
+    )
+    accepted_reviews = {
+        (review.review_node_id, review.candidate_sha)
+        for review in candidate_reviews
+        if review.state is scheduler_types.CandidateReviewState.COMPLETED
+        and review.verdict is scheduler_types.ReviewVerdict.PASS
+    }
+    accepted_test_sha: Dict[str, str] = {}
+    evidence_by_node: Dict[str, List[Any]] = {}
+    for item in test_evidence:
+        evidence_by_node.setdefault(item.tests_node_id, []).append(item)
+        if item.strong and (
+            "{0}::review".format(item.tests_node_id), item.candidate_sha
+        ) in accepted_reviews:
+            accepted_test_sha[item.tests_node_id] = item.candidate_sha
+    pairings_by_build: Dict[str, List[Any]] = {}
+    for pairing in test_pairings:
+        pairings_by_build.setdefault(pairing.build_node_id, []).append(pairing)
+
     projected_nodes = []
     for node in nodes:
         node_attempts = by_node.get(node.node_id, [])
@@ -6378,6 +6599,16 @@ def _run_progress(
                 "updated_at": node.updated_at,
                 "idle_s": _since(node.updated_at, now),
                 "attempts": node_attempts,
+                # The test-strength lifecycle, projected rather than stored.
+                # `null` on a kind the lifecycle does not describe, and on a
+                # ledger that recorded nothing, so a surface renders what is
+                # known instead of a phase nobody measured.
+                **_test_strength_projection(
+                    node,
+                    evidence_by_node.get(node.node_id, ()),
+                    accepted_test_sha,
+                    pairings_by_build.get(node.node_id, ()),
+                ),
             }
         )
 
@@ -6435,6 +6666,22 @@ def _run_progress(
                 "acknowledged_at": handoff.acknowledged_at,
             }
             for handoff in repair_handoffs
+        ],
+        # Which test-acceptance contract this run was created under, and what
+        # its tests nodes are classified as against the current one. Both are
+        # reported because they answer different operator questions: the pin
+        # says which rules decided this run, the audit says what would be
+        # unproven if it were decided under today's.
+        "test_strength_contract": reader.test_strength_contract(
+            record.run_id
+        ).value,
+        "legacy_test_strength_blocks": [
+            {
+                "tests_node_id": block.tests_node_id,
+                "reason": block.classification,
+                "detail": dict(block.detail),
+            }
+            for block in test_strength_blocks
         ],
         "results": [
             {
@@ -6542,6 +6789,59 @@ def _render_progress(progress: Dict[str, Any]) -> str:
                 node["node_id"][:44], node["state"], node["attempt_no"], detail
             )
         )
+        strength = node.get("test_strength")
+        if strength:
+            # Rendered under the node rather than in place of its state,
+            # because they answer different questions and collapsing them is
+            # what made a private acceptance read as `tester MERGED`.
+            phase = strength["phase"]
+            bytes_where = strength.get("test_bytes")
+            lines.append(
+                "  {:<44} {:<10} {:>8}  {}".format(
+                    "", "", "",
+                    "{0}{1}{2}".format(
+                        phase,
+                        "" if bytes_where is None
+                        else "  test bytes {0}".format(bytes_where),
+                        "" if not strength.get("accepted_test_sha")
+                        else "  @{0}".format(
+                            strength["accepted_test_sha"][:12]),
+                    ),
+                )
+            )
+            evidence = strength.get("gate_evidence") or {}
+            control = (evidence.get("falsifiability") or {})
+            if evidence:
+                lines.append(
+                    "  {:<44} {:<10} {:>8}  {}".format(
+                        "", "", "",
+                        "gate strength {0}{1}".format(
+                            "proven" if evidence.get("strong")
+                            else evidence.get("refusal") or "unmeasured",
+                            "" if not control.get("strategy")
+                            else "  control {0}".format(control["strategy"]),
+                        ),
+                    )
+                )
+            for pairing in strength.get("pairings") or ():
+                lines.append(
+                    "  {:<44} {:<10} {:>8}  {}".format(
+                        "", "", "",
+                        "paired with {0} @{1}  {2} case(s) green".format(
+                            pairing["tests_node_id"],
+                            pairing["accepted_test_sha"][:12],
+                            pairing["executed_cases"],
+                        ),
+                    )
+                )
+    contract = progress.get("test_strength_contract")
+    if contract:
+        lines.append("")
+        lines.append("  test contract  {}".format(contract))
+    for block in progress.get("legacy_test_strength_blocks") or ():
+        lines.append(
+            "  {:<44} {}".format(block["tests_node_id"][:44], block["reason"])
+        )
     if findings:
         lines.append("")
         lines.append("  rejected candidate reviews")
@@ -6632,6 +6932,193 @@ def _run_status(args: argparse.Namespace) -> int:
     else:
         print(_render_progress(progress))
     return 0
+
+
+def _run_test_strength(args: argparse.Namespace) -> int:
+    """Audit — and only on demand, migrate — one run's test-strength evidence.
+
+    The default is a **read**. `maestro run test-strength <run>` opens the
+    ledger read-only, classifies every tests node against the current
+    contract, and prints what it found. Nothing is written, no terminal row
+    moves, and no dependency decision changes. That is the whole of what an
+    existing run gets by default, and it is deliberate: a run created under
+    the old rules stays reproducible under them, and reclassifying its history
+    because a newer binary ran would make every completed run's meaning depend
+    on when someone last looked at it.
+
+    `--migrate` is the explicit operator command the rollout requires. It
+    takes a SQLite backup first and names it in the output, applies its writes
+    in one transaction, and restores the backup if any of them fails. Without
+    `--apply` it is still a dry run: the same code path produces the report,
+    so what an operator reads is what would happen rather than a second
+    description of it.
+
+    `--policy block-unadmitted` is the only policy that fences anything, and
+    it fences only dependants that **have never been admitted** — PENDING,
+    with no attempt row. A dependant that ever ran was admitted under the
+    pinned contract and is left exactly as it is.
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    migrating = bool(getattr(args, "migrate", False))
+    policy = str(getattr(args, "policy", "classify") or "classify").replace(
+        "-", "_")
+    if not migrating:
+        reader = _open_reader(args.db)
+        try:
+            record = _select_run(reader, args)
+            payload = {
+                "run_id": record.run_id,
+                "test_strength_contract": reader.test_strength_contract(
+                    record.run_id
+                ).value,
+                "applied": False,
+                "backup_path": None,
+                "findings": [
+                    {
+                        "tests_node_id": item.tests_node_id,
+                        "state": item.state,
+                        "candidate_sha": item.candidate_sha,
+                        "classification": item.classification,
+                        "blocking": item.blocking,
+                        "detail": dict(item.detail),
+                    }
+                    for item in _reader_test_strength_audit(reader, record.run_id)
+                ],
+            }
+        finally:
+            reader.close()
+    else:
+        reader = _open_reader(args.db)
+        try:
+            record = _select_run(reader, args)
+            run_id = record.run_id
+        finally:
+            reader.close()
+        store = lc.LifecycleStore(args.db)
+        try:
+            report = store.migrate_test_strength(
+                run_id,
+                apply=bool(getattr(args, "apply", False)),
+                policy=policy,
+                backup=not bool(getattr(args, "no_backup", False)),
+            )
+        except lc.LifecycleError as exc:
+            return _refusal("RUN_TEST_STRENGTH_MIGRATION_FAILED", str(exc))
+        finally:
+            store.conn.close()
+        payload = {
+            "run_id": report.run_id,
+            "test_strength_contract": report.contract,
+            "applied": report.applied,
+            "backup_path": report.backup_path,
+            "policy": policy,
+            "reason": report.reason,
+            "blocked_nodes": list(report.blocked_nodes),
+            "migrated_nodes": list(report.migrated_nodes),
+            "findings": [
+                {
+                    "tests_node_id": item.tests_node_id,
+                    "state": item.state,
+                    "candidate_sha": item.candidate_sha,
+                    "classification": item.classification,
+                    "blocking": item.blocking,
+                    "detail": dict(item.detail),
+                }
+                for item in report.findings
+            ],
+        }
+    if getattr(args, "as_json", False):
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    print("{}  contract {}".format(
+        payload["run_id"], payload["test_strength_contract"]))
+    if payload.get("backup_path"):
+        print("  backup       {}".format(payload["backup_path"]))
+    if payload.get("reason"):
+        print("  {}".format(payload["reason"]))
+    print("")
+    print("  {:<44} {:<10} {:<32} {}".format(
+        "TESTS NODE", "STATE", "CLASSIFICATION", "CANDIDATE"))
+    for item in payload["findings"]:
+        print("  {:<44} {:<10} {:<32} {}".format(
+            item["tests_node_id"][:44],
+            item["state"],
+            item["classification"] + ("  (fenced)" if item["blocking"] else ""),
+            (item["candidate_sha"] or "-")[:12],
+        ))
+    for node_id in payload.get("blocked_nodes") or ():
+        print("  unadmitted dependant fenced: {}".format(node_id))
+    return 0
+
+
+def _reader_test_strength_audit(reader, run_id: str):
+    """The audit, computed from a read-only handle.
+
+    `LifecycleStore.legacy_test_strength_audit` is the definition; this
+    reproduces it over `LifecycleReader` because opening the writable store
+    for a read verb would create the ledger it was asked about and take a
+    write lock on a database a live scheduler is transacting against. The two
+    read the same rows and answer with the same classification names; keeping
+    them in step is what `tests/test_test_gate_strength.py` asserts.
+    """
+    evidence = {
+        (item.tests_node_id, item.candidate_sha): item
+        for item in reader.test_gate_evidence(run_id, limit=10_000)
+    }
+    reviews = {
+        (review.review_node_id, review.candidate_sha): review
+        for review in reader.candidate_reviews(run_id, limit=10_000)
+    }
+    fenced = {
+        block.tests_node_id
+        for block in reader.legacy_test_strength_blocks(run_id, limit=10_000)
+    }
+    findings = []
+    for node in reader.nodes(run_id):
+        if node.kind != scheduler_types.NodeKind.TESTS.value:
+            continue
+        sha = node.output_sha
+        item = evidence.get((node.node_id, sha)) if sha else None
+        review = reviews.get(
+            ("{0}::review".format(node.node_id), sha)) if sha else None
+        reviewed = (
+            review is not None
+            and review.state is scheduler_types.CandidateReviewState.COMPLETED
+            and review.verdict is scheduler_types.ReviewVerdict.PASS
+        )
+        strong = item is not None and item.strong
+        if strong and reviewed:
+            classification = "TEST_ACCEPTED"
+        elif node.state in (
+            scheduler_types.NodeState.MERGED,
+            scheduler_types.NodeState.ACCEPTED,
+        ):
+            classification = lc.LEGACY_TEST_STRENGTH_UNPROVEN
+        elif node.state in (
+            scheduler_types.NodeState.BLOCKED,
+            scheduler_types.NodeState.CANCELLED,
+        ):
+            classification = "TEST_TERMINAL_WITHOUT_MERGE"
+        else:
+            classification = "TEST_STRENGTH_PENDING"
+        findings.append(
+            lc.LegacyTestStrengthFinding(
+                tests_node_id=node.node_id,
+                state=node.state.value,
+                candidate_sha=sha,
+                classification=classification,
+                blocking=node.node_id in fenced,
+                detail={
+                    "state": node.state.value,
+                    "candidate_sha": sha,
+                    "has_gate_evidence": item is not None,
+                    "gate_evidence_strong": strong,
+                    "independently_reviewed": reviewed,
+                },
+            )
+        )
+    return tuple(findings)
 
 
 def _run_list(args: argparse.Namespace) -> int:
@@ -8870,6 +9357,7 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backstop-t-s", type=float)
     parser.add_argument("--semantic-ceiling", type=int)
     parser.add_argument("--review-ceiling", type=int)
+    parser.add_argument("--test-review-ceiling", type=int)
     # §3.6 B10's escape from `NODE_BUDGET_EXHAUSTED_ACROSS_RUNS`, repeatable
     # so a run with two spent nodes needs one invocation rather than two. One
     # node id per flag, for the reason `--provision` takes one argv word per
@@ -9067,6 +9555,35 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_selection(findings_cmd)
     _add_db(findings_cmd)
     findings_cmd.set_defaults(handler=_run_findings)
+    test_strength = run_sub.add_parser("test-strength")
+    test_strength.add_argument("selector", metavar="PLAN_OR_RUN_ID")
+    _add_run_selection(test_strength)
+    _add_db(test_strength)
+    test_strength.add_argument(
+        "--migrate",
+        action="store_true",
+        help="plan a migration onto the test-strength contract (dry run)",
+    )
+    test_strength.add_argument(
+        "--apply",
+        action="store_true",
+        help="with --migrate, perform the writes the dry run described",
+    )
+    test_strength.add_argument(
+        "--policy",
+        choices=("classify", "block-unadmitted"),
+        default="classify",
+        help=(
+            "classify records the audit and fences nothing; block-unadmitted "
+            "additionally fences dependants that have never been admitted"
+        ),
+    )
+    test_strength.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="with --migrate --apply, skip the SQLite backup (not advised)",
+    )
+    test_strength.set_defaults(handler=_run_test_strength)
 
     def _positive_grant(value: str) -> int:
         """`--grant 0` and `--grant -2` are refused at parse time rather than

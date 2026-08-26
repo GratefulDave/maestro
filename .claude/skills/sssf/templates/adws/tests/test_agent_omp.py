@@ -188,7 +188,7 @@ class OmpRouteTest(unittest.TestCase):
         request.pm_profile = "grok"
         result, argv = self._run_capturing_argv(request)
 
-        self.assertEqual(argv[argv.index("--pm-profile") + 1], "grok")
+        self.assertEqual(argv[argv.index("--profile") + 1], "grok")
         self.assertNotIn("--provider", argv)
         self.assertNotIn("--model", argv)
         self.assertNotIn("--thinking", argv)

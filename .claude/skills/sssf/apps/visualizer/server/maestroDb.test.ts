@@ -9,7 +9,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MaestroDb, discoverMaestroLedger, mergeProvenance } from "./maestroDb.ts";
@@ -29,11 +29,42 @@ const LIFECYCLE_PY = resolve(
   "lifecycle.py",
 );
 
+/**
+ * The runtime's `SCHEMA`, as the runtime itself builds it.
+ *
+ * It used to be scraped with `/^SCHEMA = """([\S\s]*?)"""/`, which stopped
+ * working the moment `SCHEMA` became a concatenation — `SCHEMA = (` followed
+ * by a literal, a rendered `candidate_reviews` DDL, and a second literal. The
+ * regex then matched nothing and every case in this file failed at setup with
+ * `no SCHEMA literal`, which is the opposite of what a drift guard is for:
+ * the fixture stopped tracking the runtime and said so in a way that reads as
+ * a broken test rather than as a broken schema.
+ *
+ * Asking Python for the value is the fix, because the value is what these
+ * fixtures need. A parser for Python string concatenation written here would
+ * be a second implementation of the thing it is checking.
+ */
 function runtimeSchema(): string {
-  const source = readFileSync(LIFECYCLE_PY, "utf8");
-  const match = source.match(/^SCHEMA = """([\S\s]*?)"""/m);
-  if (!match) throw new Error(`no SCHEMA literal in ${LIFECYCLE_PY}`);
-  return match[1] as string;
+  // Imported as `adw_modules.lifecycle` from the runtime root, because the
+  // module's own imports are relative; loading the file by path outside its
+  // package raises `attempted relative import with no known parent package`.
+  const runtimeRoot = resolve(LIFECYCLE_PY, "..", "..");
+  const result = Bun.spawnSync([
+    "python3",
+    "-c",
+    [
+      "import sys",
+      `sys.path.insert(0, ${JSON.stringify(runtimeRoot)})`,
+      "from adw_modules import lifecycle",
+      "sys.stdout.write(lifecycle.SCHEMA)",
+    ].join("\n"),
+  ]);
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `could not read SCHEMA from ${LIFECYCLE_PY}: ${result.stderr.toString()}`,
+    );
+  }
+  return result.stdout.toString();
 }
 
 function runtimeTableSchema(table: string): string {
@@ -1229,11 +1260,15 @@ describe("persistent review lifecycle projection", () => {
        VALUES ('run-late', 'lane', 1, ?, NULL, 1, '2026-08-26T00:00:00Z')`,
     ).run(candidateSha);
     writer.query(
+      // `dispatched_at` is not optional on a DISPATCHED row: the runtime's
+      // CHECK requires it, because a dispatch claim with no submission proof
+      // is exactly the state that column exists to make unrepresentable.
       `INSERT INTO candidate_reviews
          (run_id, review_node_id, candidate_sha, reviewer_generation, state,
-          review_digest, receipt_path, findings_json, verdict, completed_at)
+          dispatched_at, review_digest, receipt_path, findings_json, verdict,
+          completed_at)
        VALUES ('run-late', 'lane::review', ?, 1, 'DISPATCHED',
-               NULL, NULL, '[]', NULL, NULL)`,
+               '2026-08-26T00:00:00Z', NULL, NULL, '[]', NULL, NULL)`,
     ).run(candidateSha);
     writer.query(
       `INSERT INTO actor_sessions

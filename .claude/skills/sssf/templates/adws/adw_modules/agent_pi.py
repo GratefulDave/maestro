@@ -238,7 +238,7 @@ def run(request: PiRequest, on_event: Optional[Callable[[dict], None]] = None,
         "--system-prompt", request.system_prompt,
     ]
     if request.pm_profile:
-        cmd += ["--pm-profile", request.pm_profile]
+        cmd += ["--profile", request.pm_profile]
         requested = ""
         result = PiResult(session_id=request.session_id, context_window=0)
     else:

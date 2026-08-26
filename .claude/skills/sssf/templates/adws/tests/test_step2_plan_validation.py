@@ -238,8 +238,10 @@ class TheGreenControl(ValidationTestCase):
         self.assertIsNone(result.digest)
 
     def test_there_are_exactly_fifteen_obligations(self):
-        self.assertEqual(len(pv.OBLIGATIONS), 15)
-        self.assertEqual(len(set(pv.OBLIGATIONS)), 15)
+        """Sixteen since `maestro-plan.v4`. The name is kept so the history
+        of this count stays greppable; the number is the enforced fact."""
+        self.assertEqual(len(pv.OBLIGATIONS), 16)
+        self.assertEqual(len(set(pv.OBLIGATIONS)), 16)
         self.assertEqual(set(pv.OBLIGATIONS), set(pv.Obligation))
 
     def test_every_obligation_is_reported_not_only_the_first(self):

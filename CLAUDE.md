@@ -174,12 +174,25 @@ no ambiguity.
 - Never gate progress on a zero-finding LLM sweep with restart-on-any-finding — it has no
   bounded termination. Bound the loop or accept graded findings (A9).
 - If a check's field has zero readers, that is a build failure (B15).
+- **A tests node is reviewed like any other producing lane, and by its own rubric.** The
+  derived review edge covers `agent` and `tests`; a code node still has none, because its
+  acceptance is its command's exit code. A test reviewer is asked whether the cases
+  discharge the declared obligations, exercise real boundaries, and would fail a plausible
+  wrong implementation — never "does this pass the gate on the merits", which is the wrong
+  question about a diff whose purpose is to be red (§19 M41).
+- **A tests node's acceptance is measured, not counted.** The plan declares which case ids
+  discharge which requirement and aspect, and code counts them; the declared falsifiability
+  strategy is executed and its failure must match the declared reason. An implementation
+  then binds to the exact accepted test sha. A case count, a green command, and a valid test
+  file are each compatible with a suite that asserts nothing.
 
 §19 records where Maestro itself broke these. B9's declared contract was degenerate in
 production until 2026-08-18 — a projection silently dropped the node's `instruction`, so every
 agent-node reviewer was told "make the gate pass" and nothing else (§19 M1) — and B13's size
-check sat on one launch path instead of the chokepoint every route crosses (§19 M6). A lesson in
-the list above is not a property of the code; read §19 beside it.
+check sat on one launch path instead of the chokepoint every route crosses (§19 M6), and the
+derived review edge covered agent nodes only, so a `tests` node reached MERGED with no
+independent reader at all (§19 M41). A lesson in the list above is not a property of the code;
+read §19 beside it.
 
 ## Verifiers
 

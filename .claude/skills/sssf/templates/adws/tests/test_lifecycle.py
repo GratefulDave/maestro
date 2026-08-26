@@ -314,7 +314,16 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
                     "run1", "build", depth=9, downstream_needs=("downstream",)
                 )
 
-    def test_authored_review_remains_refused_and_authored_tests_remain_ordinary(self):
+    def test_authored_review_remains_refused_and_a_tests_node_owns_a_review(self):
+        """An authored review node stays unrepresentable; a tests node owns one.
+
+        The second half of this used to assert the opposite — that a tests
+        node could not own a derived review — and that was the ledger half of
+        the defect run-8d1a71f463e4430f92a125a8f8b3731d exposed: a tests node
+        reached MERGED with no independent reader, because there was nothing
+        for one to be recorded against. A code node still cannot own one; its
+        acceptance is its command's exit code (§6.2).
+        """
         with self.assertRaises(ValueError):
             st.PlanNode(node_id="authored-review", kind=st.NodeKind.REVIEW, depth=0)
         tests = st.PlanNode(
@@ -325,17 +334,31 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             gate_selector="tests/test_example.py",
             instruction="add a focused test",
         )
+        code = st.PlanNode(
+            node_id="code",
+            kind=st.NodeKind.CODE,
+            depth=0,
+            command=("true",),
+        )
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))
-            store.create_run("run1", "d", [tests])
+            store.create_run("run1", "d", [tests, code])
             row = store.conn.execute(
                 "SELECT kind, review_of FROM dag_nodes WHERE run_id=? AND node_id=?",
                 ("run1", "tests"),
             ).fetchone()
             self.assertEqual(row, (st.NodeKind.TESTS.value, None))
+            store.ensure_derived_review_node(
+                "run1", "tests", depth=1, downstream_needs=()
+            )
+            derived = store.conn.execute(
+                "SELECT kind, review_of FROM dag_nodes WHERE run_id=? AND node_id=?",
+                ("run1", "tests::review"),
+            ).fetchone()
+            self.assertEqual(derived, (st.NodeKind.REVIEW.value, "tests"))
             with self.assertRaises(lc.LifecycleError):
                 store.ensure_derived_review_node(
-                    "run1", "tests", depth=1, downstream_needs=()
+                    "run1", "code", depth=1, downstream_needs=()
                 )
 
     def test_derived_review_rejects_generic_verified_and_merged_transitions(self):

@@ -20,15 +20,18 @@ passes at the parent is hollow and is refused by name.
 
 from __future__ import annotations
 
+import json
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import scheduler_types as st
 from . import verification as vf
@@ -68,9 +71,27 @@ def _pytest_prefix() -> Tuple[str, ...]:
     return (sys.executable, "-m", "pytest")
 
 
+#: pytest truncates each short-summary reason to the terminal width, and the
+#: negative control's whole evidence is that reason. At an 80-column default a
+#: `ModuleNotFoundError: No module named 'refunds'` arrives as
+#: `ModuleNotFoundErr...`, which matches no declared pattern and reads as
+#: "failed for the wrong reason" for every candidate. Pinned wide, and pinned
+#: rather than read from the environment so the same candidate is adjudicated
+#: identically on a laptop and in CI.
+_REPORT_COLUMNS = "1000"
+
+
+def _report_env() -> dict:
+    """The environment every runner's report is produced under."""
+    env = dict(os.environ)
+    env["COLUMNS"] = _REPORT_COLUMNS
+    return env
+
+
 def _pytest_env(tree: Path) -> dict:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tree) + os.pathsep + env.get("PYTHONPATH", "")
+    env["COLUMNS"] = _REPORT_COLUMNS
     return env
 
 
@@ -296,3 +317,941 @@ def _refused(code: TestsRefusal, detail: str, *,
         reason="{0}: {1}".format(code.value, detail),
         retry_class=retry_class,
         offending_paths=offending_paths)
+
+
+# ── the executable test-strength contract (§TS) ─────────────────────────────
+#
+# The clauses above answer "are these cases new, and are they red where the
+# implementation is absent". Run-8d1a71f463e4430f92a125a8f8b3731d showed that
+# is not discrimination proof: `lane-acquisition-manifest-tests` satisfied all
+# four of them on four non-skipped cases and reached MERGED, and every one of
+# the four implementation candidates its tests existed to gate was
+# independently rejected. Red-at-parent proves the cases *reach* absent code.
+# It does not prove they cover the contract, and it does not prove they fail
+# for the reason the contract names.
+#
+# What follows is measured, never claimed. §1.2 forbids keying a transition on
+# an agent's account of its own work, so nothing here asks the tester whether
+# it covered a requirement: the plan declares which case ids would prove it
+# did, and this module counts them.
+
+
+class StrengthRefusal(str, Enum):
+    """Typed reasons a test candidate fails its declared strength contract.
+
+    Separate from `TestsRefusal` because they refuse different things. A
+    `TestsRefusal` says the candidate is not a tests-node diff at all — it
+    wrote source, or it added no case. A `StrengthRefusal` says the candidate
+    *is* a tests diff and does not discriminate.
+    """
+
+    CONTRACT_ABSENT = "TEST_STRENGTH_CONTRACT_ABSENT"
+    REQUIREMENT_UNCOVERED = "TEST_STRENGTH_REQUIREMENT_UNCOVERED"
+    OBLIGATION_UNMET = "TEST_STRENGTH_OBLIGATION_UNMET"
+    OBLIGATION_ONLY_SKIPPED = "TEST_STRENGTH_OBLIGATION_ONLY_SKIPPED"
+    POSITIVE_GATE_NOT_GREEN = "TEST_STRENGTH_POSITIVE_GATE_NOT_GREEN"
+    CONTROL_NOT_SELECTED = "TEST_STRENGTH_CONTROL_SELECTED_NO_CASE"
+    CONTROL_NOT_RED = "TEST_STRENGTH_CONTROL_NOT_RED"
+    CONTROL_WRONG_REASON = "TEST_STRENGTH_CONTROL_WRONG_REASON"
+    CONTROL_COLLECTION_FAILED = "TEST_STRENGTH_CONTROL_COLLECTION_FAILED"
+    CONTROL_IMPORT_CRASH = "TEST_STRENGTH_CONTROL_IMPORT_CRASH"
+    CONTROL_NOT_ISOLATED = "TEST_STRENGTH_CONTROL_NOT_ISOLATED"
+    CONTROL_UNEXECUTABLE = "TEST_STRENGTH_CONTROL_UNEXECUTABLE"
+    RUNNER_UNSUPPORTED = "TEST_STRENGTH_RUNNER_UNSUPPORTED"
+
+
+#: The four statuses a single executed case can land in. `errored` is kept
+#: apart from `failed` for the reason `adjudicate_parent_red` keeps them
+#: apart: an import or collection crash is not a case that discriminated.
+CASE_STATUSES: Tuple[str, ...] = ("passed", "failed", "errored", "skipped")
+
+
+@dataclass(frozen=True)
+class CaseOutcome:
+    """One executed case, its status, and the reason it is not green.
+
+    `reason` is the runner's own text for the failure — an assertion message,
+    an exception type. It is evidence read out of a machine-produced report,
+    not prose an agent wrote, which is why a transition may key on it (§1.2).
+    """
+
+    nodeid: str
+    status: str
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in CASE_STATUSES:
+            raise ValueError(
+                "{0}: {1!r} is not one of {2}".format(
+                    self.nodeid, self.status, ", ".join(CASE_STATUSES)))
+
+
+@dataclass(frozen=True)
+class CaseRun:
+    """One execution of a set of cases, resolved to per-case outcomes.
+
+    `collection_failed` is a first-class field rather than an inference from
+    an empty outcome list: "the runner could not collect" and "the runner
+    collected nothing" are different facts, and only the second one could ever
+    be a candidate's own doing.
+    """
+
+    outcomes: Tuple[CaseOutcome, ...]
+    exit_code: int
+    collection_failed: bool = False
+    command: Tuple[str, ...] = ()
+    tail: Tuple[str, ...] = ()
+
+    def with_status(self, status: str) -> Tuple[CaseOutcome, ...]:
+        return tuple(o for o in self.outcomes if o.status == status)
+
+    @property
+    def passed(self) -> int:
+        return len(self.with_status("passed"))
+
+    @property
+    def failed(self) -> int:
+        return len(self.with_status("failed"))
+
+    @property
+    def errored(self) -> int:
+        return len(self.with_status("errored"))
+
+    @property
+    def skipped(self) -> int:
+        return len(self.with_status("skipped"))
+
+    def selecting(self, selector: str) -> Tuple[CaseOutcome, ...]:
+        """Outcomes whose case id contains `selector`.
+
+        Containment rather than a runner expression, because the selector has
+        to mean the same thing under pytest and under vitest and the two
+        disagree about `-k` and `--testNamePattern`. A plan that declares
+        `rejects_unknown_source` selects every case whose id carries those
+        characters under either runner.
+        """
+        return tuple(o for o in self.outcomes if selector in o.nodeid)
+
+
+# ── the two runners, behind one interface (verification requirement 13) ─────
+#
+# The invariant is the same under both: the adjudicators below are pure
+# functions over `CaseRun`, so pytest and vitest cannot drift into two
+# different definitions of "covered" or "failed for the expected reason".
+# What differs is only how a `CaseRun` is produced, which is this section.
+
+
+#: `FAILED tests/x.py::test_y - AssertionError: message`. The reason is
+#: everything after the first ` - `, which pytest emits under `-rf` and which
+#: is the runner's own text rather than anything a model wrote.
+_PYTEST_SHORT_SUMMARY = re.compile(
+    r"^(FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+(\S+?)(?:\s+-\s+(.*))?$")
+
+#: `1 failed, 2 passed in 0.10s` — only used to detect that a report was
+#: produced at all. Per-case status comes from the short summary above.
+_PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|skipped|xfailed)")
+
+
+class CaseRunner:
+    """Collect and execute cases for one gate runner.
+
+    Not a `Protocol`: the two implementations share `_argv_prefix` resolution
+    and the sandbox environment, and a protocol would duplicate both.
+    """
+
+    name = ""
+
+    def collect(self, tree: Path, paths: Sequence[str],
+                timeout_s: float = 120.0) -> Tuple[str, ...]:
+        raise NotImplementedError
+
+    def run(self, tree: Path, nodeids: Sequence[str],
+            timeout_s: float = 300.0) -> CaseRun:
+        raise NotImplementedError
+
+
+class PytestCaseRunner(CaseRunner):
+    name = "pytest"
+
+    def collect(self, tree: Path, paths: Sequence[str],
+                timeout_s: float = 120.0) -> Tuple[str, ...]:
+        return collect_nodeids(tree, paths, timeout_s=timeout_s)
+
+    def run(self, tree: Path, nodeids: Sequence[str],
+            timeout_s: float = 300.0) -> CaseRun:
+        prefix = _pytest_prefix()
+        command = prefix + _RUN_FLAGS + ("--tb=no", "-rfEs") + tuple(nodeids)
+        if not nodeids:
+            return CaseRun(outcomes=(), exit_code=5, collection_failed=False,
+                           command=command)
+        result = subprocess.run(
+            list(command), cwd=str(tree), env=_pytest_env(tree),
+            capture_output=True, text=True, timeout=timeout_s, check=False)
+        output = (result.stdout or "") + (result.stderr or "")
+        return CaseRun(
+            outcomes=parse_pytest_outcomes(output, nodeids),
+            exit_code=result.returncode,
+            collection_failed=not _PYTEST_TOTALS.search(output),
+            command=command,
+            tail=tuple(output.strip().splitlines()[-8:]))
+
+
+class VitestCaseRunner(CaseRunner):
+    """vitest, driven through its machine-readable JSON reporter.
+
+    Collection is `vitest list --json`, which every vitest that supports the
+    `list` verb prints as an array of case ids. Execution is
+    `vitest run --reporter=json`, whose `testResults[].assertionResults[]`
+    carry a status and, on failure, `failureMessages`. Both are the runner's
+    own structured output; nothing here parses human-facing text, which is
+    what makes the vitest arm hold the same evidence standard as the pytest
+    one rather than a looser variant of it.
+    """
+
+    name = "vitest"
+
+    def _prefix(self) -> Tuple[str, ...]:
+        found = shutil.which("vitest")
+        if found:
+            return (found,)
+        return ("npx", "--no-install", "vitest")
+
+    def collect(self, tree: Path, paths: Sequence[str],
+                timeout_s: float = 120.0) -> Tuple[str, ...]:
+        existing = [p for p in paths if (Path(tree) / p).exists()]
+        if not existing:
+            return ()
+        command = self._prefix() + ("list", "--json", *existing)
+        result = subprocess.run(
+            list(command), cwd=str(tree), env=_report_env(),
+            capture_output=True, text=True, timeout=timeout_s, check=False)
+        return parse_vitest_list((result.stdout or "") + (result.stderr or ""))
+
+    def run(self, tree: Path, nodeids: Sequence[str],
+            timeout_s: float = 300.0) -> CaseRun:
+        """Execute and return the outcomes for `nodeids`.
+
+        The run itself is not narrowed to those ids, and the outcomes are
+        filtered after. vitest selects by file and by name pattern, and a
+        `full name` carries spaces and regex metacharacters, so building a
+        `--testNamePattern` from a list of them is a quoting problem with a
+        silent failure mode: a pattern that matches nothing looks exactly like
+        a suite where nothing ran. Filtering a complete report is slower and
+        cannot be wrong about which case is which.
+        """
+        command = self._prefix() + ("run", "--reporter=json")
+        if not nodeids:
+            return CaseRun(outcomes=(), exit_code=1, collection_failed=False,
+                           command=command)
+        result = subprocess.run(
+            list(command), cwd=str(tree), env=_report_env(),
+            capture_output=True, text=True, timeout=timeout_s, check=False)
+        output = (result.stdout or "") + (result.stderr or "")
+        outcomes, parsed = parse_vitest_report(output)
+        wanted = set(nodeids)
+        return CaseRun(
+            outcomes=tuple(o for o in outcomes if o.nodeid in wanted),
+            exit_code=result.returncode,
+            collection_failed=not parsed,
+            command=command,
+            tail=tuple(output.strip().splitlines()[-8:]))
+
+
+_RUNNERS: dict = {"pytest": PytestCaseRunner, "vitest": VitestCaseRunner}
+
+
+class RunnerUnsupported(ValueError):
+    """A gate names a runner this module cannot resolve to cases.
+
+    Refused rather than defaulted to pytest. Silently measuring a vitest
+    node's coverage with pytest would report zero cases for every obligation,
+    which reads as "the tester covered nothing" instead of "this runtime
+    cannot measure this node".
+    """
+
+
+def case_runner(name: str) -> CaseRunner:
+    try:
+        return _RUNNERS[name]()
+    except KeyError:
+        raise RunnerUnsupported(
+            "{0}: {1} cannot resolve cases for this runner; supported: "
+            "{2}".format(StrengthRefusal.RUNNER_UNSUPPORTED.value, name,
+                         ", ".join(sorted(_RUNNERS)))) from None
+
+
+def parse_pytest_outcomes(output: str,
+                          nodeids: Sequence[str]) -> Tuple[CaseOutcome, ...]:
+    """Per-case outcomes from a `-rfEs --tb=no` run.
+
+    Cases the short summary does not name passed: pytest's `-rf` reports the
+    exceptional ones and stays silent about green. That inversion is why the
+    executed set is passed in — a green case is proven by having been asked
+    for and not reported, never by an absent line alone.
+    """
+    reported: dict = {}
+    for line in output.splitlines():
+        match = _PYTEST_SHORT_SUMMARY.match(line.strip())
+        if match is None:
+            continue
+        kind, nodeid, reason = match.group(1), match.group(2), match.group(3)
+        status = {"FAILED": "failed", "ERROR": "errored",
+                  "SKIPPED": "skipped", "XFAIL": "skipped",
+                  "XPASS": "failed"}[kind]
+        # An ERROR line names the file, not always the case. Bind it to every
+        # requested case in that file so an import crash cannot read as a set
+        # of silently-green cases.
+        reported[nodeid] = (status, (reason or "").strip())
+    outcomes = []
+    for nodeid in nodeids:
+        if nodeid in reported:
+            status, reason = reported[nodeid]
+            outcomes.append(CaseOutcome(nodeid, status, reason))
+            continue
+        file_part = nodeid.split("::", 1)[0]
+        if file_part in reported and reported[file_part][0] == "errored":
+            outcomes.append(CaseOutcome(nodeid, "errored",
+                                        reported[file_part][1]))
+            continue
+        outcomes.append(CaseOutcome(nodeid, "passed"))
+    return tuple(outcomes)
+
+
+def parse_vitest_list(output: str) -> Tuple[str, ...]:
+    """Case ids from `vitest list --json`."""
+    payload = _first_json(output)
+    if payload is None:
+        return ()
+    if isinstance(payload, list):
+        found = []
+        for item in payload:
+            if isinstance(item, str):
+                found.append(item)
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("fullName")
+                file_name = item.get("file") or item.get("filepath")
+                if isinstance(name, str):
+                    found.append("{0}::{1}".format(file_name, name)
+                                 if isinstance(file_name, str) else name)
+        return tuple(found)
+    return ()
+
+
+def parse_vitest_report(output: str) -> Tuple[Tuple[CaseOutcome, ...], bool]:
+    """Per-case outcomes from `vitest run --reporter=json`.
+
+    Returns the outcomes and whether a report was parsed at all, so a run that
+    produced no JSON is `collection_failed` rather than a green empty set.
+    """
+    payload = _first_json(output)
+    if not isinstance(payload, dict):
+        return (), False
+    files = payload.get("testResults")
+    if not isinstance(files, list):
+        return (), False
+    outcomes = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        file_name = entry.get("name") or entry.get("file") or ""
+        cases = entry.get("assertionResults")
+        if not isinstance(cases, list):
+            continue
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            title = case.get("fullName") or case.get("title") or ""
+            status = {"passed": "passed", "failed": "failed",
+                      "skipped": "skipped", "pending": "skipped",
+                      "todo": "skipped"}.get(str(case.get("status")), "errored")
+            messages = case.get("failureMessages")
+            reason = ""
+            if isinstance(messages, list) and messages:
+                reason = str(messages[0]).strip().splitlines()[0]
+            outcomes.append(CaseOutcome(
+                "{0}::{1}".format(file_name, title) if file_name else title,
+                status, reason))
+    return tuple(outcomes), True
+
+
+def _first_json(output: str):
+    """The first complete JSON value in `output`, or None.
+
+    A runner writes its report onto a stream that may already carry a banner
+    or a warning. Scanning for the first decodable value is what makes the
+    parse independent of that noise, without the parse ever guessing.
+    """
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(output):
+        if char not in "[{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(output[index:])
+        except ValueError:
+            continue
+        return value
+    return None
+
+
+# ── the adjudicators: pure, and shared by both runners ──────────────────────
+
+
+#: The two things a coverage obligation can be measured for, and the only
+#: two. `EXECUTED` is the standard at test acceptance: the implementation
+#: these cases gate does not exist yet, so every one of them is red, and what
+#: the obligation has to prove there is that a real case ran and reached a
+#: verdict. `PASSED` is the standard at implementation acceptance: the same
+#: cases, the same selectors, now green against the candidate they gate.
+#:
+#: One enum rather than two functions, because the refusal vocabulary, the
+#: skip handling and the ledger shape are identical and a second copy would
+#: be two answers to "is this requirement covered".
+EXECUTED = "executed"
+PASSED = "passed"
+
+
+@dataclass(frozen=True)
+class ObligationMeasurement:
+    """What one coverage obligation actually got, measured not claimed."""
+
+    requirement_id: str
+    aspect: str
+    case_selector: str
+    min_cases: int
+    standard: str = EXECUTED
+    selected: Tuple[str, ...] = ()
+    executed: Tuple[str, ...] = ()
+    passed: Tuple[str, ...] = ()
+    skipped: Tuple[str, ...] = ()
+
+    @property
+    def counted(self) -> Tuple[str, ...]:
+        return self.passed if self.standard == PASSED else self.executed
+
+    @property
+    def met(self) -> bool:
+        return len(self.counted) >= self.min_cases
+
+
+@dataclass(frozen=True)
+class CoverageMeasurement:
+    """Every obligation's measurement, and the refusal if one is unmet."""
+
+    obligations: Tuple[ObligationMeasurement, ...] = ()
+    refusal: Optional[str] = None
+    reason: str = ""
+    standard: str = EXECUTED
+
+    @property
+    def covered(self) -> bool:
+        return self.refusal is None
+
+    def as_mapping(self) -> Dict[str, Any]:
+        """The durable form. Ordered, so the ledger row is deterministic."""
+        return {
+            "standard": self.standard,
+            "obligations": [
+                {"requirement_id": item.requirement_id,
+                 "aspect": item.aspect,
+                 "case_selector": item.case_selector,
+                 "min_cases": item.min_cases,
+                 "standard": item.standard,
+                 "selected": list(item.selected),
+                 "executed": list(item.executed),
+                 "passed": list(item.passed),
+                 "skipped": list(item.skipped),
+                 "met": item.met}
+                for item in self.obligations],
+            "refusal": self.refusal,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class FalsifiabilityResult:
+    """The negative control's execution and what it proved."""
+
+    strategy: str = ""
+    executed: bool = False
+    proven: bool = False
+    refusal: Optional[str] = None
+    reason: str = ""
+    selected: Tuple[str, ...] = ()
+    failed_for_expected_reason: Tuple[str, ...] = ()
+    observed_reasons: Tuple[str, ...] = ()
+    mutation_paths: Tuple[str, ...] = ()
+    control_command: Tuple[str, ...] = ()
+
+    def as_mapping(self) -> Dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "executed": self.executed,
+            "proven": self.proven,
+            "refusal": self.refusal,
+            "reason": self.reason,
+            "selected": list(self.selected),
+            "failed_for_expected_reason":
+                list(self.failed_for_expected_reason),
+            "observed_reasons": list(self.observed_reasons),
+            "mutation_paths": list(self.mutation_paths),
+            "control_command": list(self.control_command),
+        }
+
+
+def measure_coverage(obligations: Sequence[Any], run: "CaseRun",
+                     standard: str = EXECUTED) -> CoverageMeasurement:
+    """Count each obligation's cases in one executed run, to one standard.
+
+    Under `EXECUTED` a selected case counts when it ran and reached a verdict
+    — passed or failed. Under `PASSED` only green counts. Neither standard
+    ever counts a skip, an xfail, or an errored case: the requirement it was
+    declared against has no executed behavioural evidence in any of those
+    states, which is what obligation 1 asks for. An obligation whose only
+    selected cases were skipped is refused by its own name so the reason
+    reaches the tester instead of a bare count.
+    """
+    if standard not in (EXECUTED, PASSED):
+        raise ValueError(
+            "{0!r} is not a coverage standard; expected {1} or {2}".format(
+                standard, EXECUTED, PASSED))
+    measured: List[ObligationMeasurement] = []
+    for obligation in obligations:
+        selector = obligation.case_selector
+        selected = run.selecting(selector)
+        measured.append(ObligationMeasurement(
+            requirement_id=obligation.requirement_id,
+            aspect=obligation.aspect,
+            case_selector=selector,
+            min_cases=int(obligation.min_cases),
+            standard=standard,
+            selected=tuple(o.nodeid for o in selected),
+            executed=tuple(o.nodeid for o in selected
+                           if o.status in ("passed", "failed")),
+            passed=tuple(o.nodeid for o in selected if o.status == "passed"),
+            skipped=tuple(o.nodeid for o in selected if o.status == "skipped"),
+        ))
+    frozen = tuple(measured)
+    for item in frozen:
+        if item.met:
+            continue
+        if not item.selected:
+            return CoverageMeasurement(
+                frozen, StrengthRefusal.REQUIREMENT_UNCOVERED.value,
+                "{0} declares a {1} obligation selected by {2!r} and the "
+                "candidate collected no such case".format(
+                    item.requirement_id, item.aspect, item.case_selector),
+                standard)
+        if item.skipped and not item.executed:
+            return CoverageMeasurement(
+                frozen, StrengthRefusal.OBLIGATION_ONLY_SKIPPED.value,
+                "{0}'s {1} obligation selected only skipped cases ({2}); a "
+                "skip is not executed behavioural evidence".format(
+                    item.requirement_id, item.aspect,
+                    ", ".join(item.skipped)),
+                standard)
+        if standard == PASSED and item.executed:
+            return CoverageMeasurement(
+                frozen, StrengthRefusal.POSITIVE_GATE_NOT_GREEN.value,
+                "{0}'s {1} obligation needs {2} passing case(s) selected by "
+                "{3!r}; {4} of {5} executed case(s) passed".format(
+                    item.requirement_id, item.aspect, item.min_cases,
+                    item.case_selector, len(item.passed), len(item.executed)),
+                standard)
+        return CoverageMeasurement(
+            frozen, StrengthRefusal.OBLIGATION_UNMET.value,
+            "{0}'s {1} obligation needs {2} executed case(s) selected by "
+            "{3!r}; {4} of {5} selected case(s) reached a verdict".format(
+                item.requirement_id, item.aspect, item.min_cases,
+                item.case_selector, len(item.executed), len(item.selected)),
+            standard)
+    return CoverageMeasurement(frozen, standard=standard)
+
+
+def adjudicate_negative_control(falsifiability: Any,
+                                run: "CaseRun") -> FalsifiabilityResult:
+    """Whether the negative control's run is discrimination proof.
+
+    Four ways it is not, each named rather than folded into "red":
+
+    * the runner produced no report — the control could not be executed, so
+      it proved nothing about the cases;
+    * a case errored — an import or collection crash is a broken tree, and
+      counting it as the red we wanted is how a test that does not parse
+      becomes evidence of missing behaviour;
+    * the declared selector matched no case — the contract names cases the
+      candidate does not have, which is unfalsifiable rather than falsified;
+    * every selected case failed, but none for the declared reason — the tests
+      are red about something else, and a random exception is not proof.
+    """
+    strategy = str(getattr(falsifiability, "strategy", ""))
+    selector = falsifiability.expected_failing_selector
+    pattern = falsifiability.expected_reason_pattern
+    selected = run.selecting(selector)
+    observed = tuple(o.reason for o in selected if o.reason)
+    base = dict(strategy=strategy, executed=True, selected=tuple(
+        o.nodeid for o in selected), observed_reasons=observed,
+        control_command=tuple(run.command))
+    if run.collection_failed:
+        return FalsifiabilityResult(
+            refusal=StrengthRefusal.CONTROL_COLLECTION_FAILED.value,
+            reason=("the negative control produced no parseable report; a run "
+                    "that did not execute proves nothing about these cases"),
+            **base)
+    errored = [o.nodeid for o in selected if o.status == "errored"]
+    if errored:
+        return FalsifiabilityResult(
+            refusal=StrengthRefusal.CONTROL_IMPORT_CRASH.value,
+            reason=("{0} errored under the negative control; an import or "
+                    "collection crash is not the red this proves".format(
+                        ", ".join(errored))),
+            **base)
+    if not selected:
+        return FalsifiabilityResult(
+            refusal=StrengthRefusal.CONTROL_NOT_SELECTED.value,
+            reason=("the contract's expected_failing_selector {0!r} matched "
+                    "no executed case; the control is unfalsifiable rather "
+                    "than falsified".format(selector)),
+            **base)
+    surviving = [o.nodeid for o in selected if o.status != "failed"]
+    if surviving:
+        return FalsifiabilityResult(
+            refusal=StrengthRefusal.CONTROL_NOT_RED.value,
+            reason=("{0} did not fail under the negative control; a case that "
+                    "survives the declared defect does not discriminate".format(
+                        ", ".join(surviving))),
+            **base)
+    expression = re.compile(pattern)
+    matched = tuple(o.nodeid for o in selected
+                    if expression.search(o.reason or ""))
+    if not matched:
+        return FalsifiabilityResult(
+            refusal=StrengthRefusal.CONTROL_WRONG_REASON.value,
+            reason=("every selected case failed, but none for the declared "
+                    "reason {0!r}; observed: {1}".format(
+                        pattern,
+                        "; ".join(observed) if observed else "(no reason "
+                        "reported)")),
+            **base)
+    return FalsifiabilityResult(
+        proven=True, failed_for_expected_reason=matched, **base)
+
+
+# ── executing the negative control, in isolation, reversibly ────────────────
+
+
+class NegativeControlUnexecutable(RuntimeError):
+    """The declared control could not be set up. The machine, not the tests.
+
+    Raised rather than returned as a refusal for the reason `TestsGitReadFailed`
+    is: "git could not read this object" and "these tests do not discriminate"
+    are different facts, and reporting the first as the second sends a tester
+    to rewrite tests that were never the problem (§7.5).
+    """
+
+
+def _porcelain(tree: Path) -> str:
+    """The working tree's dirt, as git states it. Compared before and after
+    the control so 'nothing was mutated' is proven rather than asserted."""
+    result = subprocess.run(
+        ["git", "-C", str(tree), "status", "--porcelain"],
+        capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise NegativeControlUnexecutable(
+            "git status failed in {0}: {1}".format(tree, result.stderr.strip()))
+    return result.stdout
+
+
+def _materialize(repo: Path, commit: str, destination: Path) -> None:
+    """Write `commit`'s tree into `destination`. Never touches `repo`."""
+    destination.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(
+        ["git", "-C", str(repo), "archive", "--format=tar", commit],
+        capture_output=True, check=False)
+    if archive.returncode != 0:
+        raise NegativeControlUnexecutable(
+            "git archive {0} failed: {1}".format(
+                commit, archive.stderr.decode("utf-8", "replace").strip()))
+    extract = subprocess.run(
+        ["tar", "-x", "-C", str(destination)],
+        input=archive.stdout, capture_output=True, check=False)
+    if extract.returncode != 0:
+        raise NegativeControlUnexecutable(
+            "extracting {0} failed: {1}".format(
+                commit, extract.stderr.decode("utf-8", "replace").strip()))
+
+
+def _revert_into(scratch: Path, repo: Path, base_commit: str,
+                 paths: Sequence[str]) -> Tuple[str, ...]:
+    """Restore `paths` in `scratch` to their `base_commit` content.
+
+    A path absent at the base is deleted rather than left alone: "this code
+    did not exist yet" is the behaviour the control is reverting to, and
+    leaving the file in place would run the control against the very code it
+    was supposed to remove.
+    """
+    reverted: List[str] = []
+    for path in paths:
+        blob = _blob_at(repo, base_commit, path)
+        target = scratch / path
+        if blob is None:
+            if target.exists():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            reverted.append(path)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob)
+        reverted.append(path)
+    return tuple(reverted)
+
+
+def execute_negative_control(
+        *,
+        falsifiability: Any,
+        runner: CaseRunner,
+        repo: Path,
+        tree: Path,
+        candidate_sha: str,
+        base_commit: str,
+        nodeids: Sequence[str],
+        scratch_root: Optional[Path] = None,
+        timeout_s: float = 300.0,
+        already_executed: Optional["CaseRun"] = None,
+) -> FalsifiabilityResult:
+    """Run the declared negative control and adjudicate what it proved.
+
+    Two strategies, one adjudicator.
+
+    `baseline_absent` executes the candidate's own cases in the tests node's
+    worktree. That tree *is* the baseline for this purpose and the property is
+    structural rather than incidental: a tests node's evidence chain refuses
+    any diff touching a non-test path, so everything in that worktree except
+    the new test files is exactly its parent commit, and the implementation
+    these cases were written to gate is absent from it by construction.
+
+    `controlled_mutation` materialises the candidate commit into a scratch
+    directory outside every worktree, reverts the declared paths to the plan's
+    base commit there, and runs the cases against that. The user's checkout,
+    the attempt worktree, and the shared integration worktree are never
+    written — the mutation happens in a directory that did not exist a moment
+    earlier and does not exist a moment later, which is what makes it
+    reversible without a restore step that could itself fail.
+
+    Cleanliness is proven either way by comparing `git status --porcelain` in
+    the attempt worktree across the whole operation. A control that leaves
+    dirt behind is refused by name rather than merged with a note.
+    """
+    strategy = str(getattr(falsifiability, "strategy", ""))
+    before = _porcelain(tree)
+    if strategy == "baseline_absent":
+        # Reuse the caller's run when it has one. Under this strategy the
+        # control *is* the same command over the same immutable tree that
+        # coverage was measured from, so executing it twice would be a second
+        # answer to one question as well as a second suite run -- and if the
+        # two ever disagreed, nothing here could say which was the evidence.
+        run = (already_executed if already_executed is not None
+               else runner.run(tree, nodeids, timeout_s=timeout_s))
+        after = _porcelain(tree)
+        result = adjudicate_negative_control(falsifiability, run)
+    elif strategy == "controlled_mutation":
+        mutation = falsifiability.mutation
+        holder = tempfile.mkdtemp(prefix="maestro-negative-control-",
+                                  dir=str(scratch_root) if scratch_root else None)
+        scratch = Path(holder) / "tree"
+        try:
+            _materialize(repo, candidate_sha, scratch)
+            reverted = _revert_into(scratch, repo, base_commit,
+                                    tuple(mutation.paths))
+            run = runner.run(scratch, nodeids, timeout_s=timeout_s)
+        finally:
+            shutil.rmtree(holder, ignore_errors=True)
+        after = _porcelain(tree)
+        result = adjudicate_negative_control(falsifiability, run)
+        result = replace(result, mutation_paths=reverted)
+    else:
+        return FalsifiabilityResult(
+            strategy=strategy,
+            refusal=StrengthRefusal.CONTROL_UNEXECUTABLE.value,
+            reason=("no executable falsifiability strategy is declared for "
+                    "this node; there is no default and none is inferred"))
+    if after != before:
+        return replace(
+            result,
+            proven=False,
+            refusal=StrengthRefusal.CONTROL_NOT_ISOLATED.value,
+            reason=("the negative control left the attempt worktree dirty; "
+                    "before={0!r} after={1!r}".format(before, after)))
+    return result
+
+
+# ── the durable evidence, and the verdict computed from it ──────────────────
+
+
+#: Refusals that name the machine rather than the tests. A tester handed one
+#: of these would be asked to fix something it did not break, so they retry as
+#: ENVIRONMENTAL and never spend the semantic budget.
+_ENVIRONMENTAL_REFUSALS: Tuple[str, ...] = (
+    StrengthRefusal.CONTROL_COLLECTION_FAILED.value,
+    StrengthRefusal.CONTROL_UNEXECUTABLE.value,
+    StrengthRefusal.RUNNER_UNSUPPORTED.value,
+)
+
+
+@dataclass(frozen=True)
+class GateStrengthEvidence:
+    """One test candidate's measured gate strength — the whole durable record.
+
+    Bound to `candidate_sha` rather than to the node, because the acceptance
+    it supports is an acceptance of *those bytes*. A later or substituted test
+    tree has a different sha, finds no row, and cannot inherit this evidence
+    (obligation 9).
+    """
+
+    tests_node_id: str
+    candidate_sha: str
+    runner: str
+    selector: str
+    contract_declared: bool
+    executed_nodeids: Tuple[str, ...] = ()
+    new_nodeids: Tuple[str, ...] = ()
+    coverage: CoverageMeasurement = field(default_factory=CoverageMeasurement)
+    falsifiability: FalsifiabilityResult = field(
+        default_factory=FalsifiabilityResult)
+
+    @property
+    def refusal(self) -> Optional[str]:
+        """The one named reason this candidate is not strong, or None.
+
+        Total by construction: strength and its refusal are one fact, and a
+        candidate that is not strong for a reason nobody named is exactly the
+        state the ledger's `strong XOR refusal` CHECK exists to make
+        unrepresentable. An unproven control with no refusal of its own is
+        `CONTROL_UNEXECUTABLE` -- the control did not run.
+        """
+        if not self.contract_declared:
+            return StrengthRefusal.CONTRACT_ABSENT.value
+        named = self.coverage.refusal or self.falsifiability.refusal
+        if named is not None:
+            return named
+        if not self.falsifiability.proven:
+            return StrengthRefusal.CONTROL_UNEXECUTABLE.value
+        return None
+
+    @property
+    def strong(self) -> bool:
+        return self.refusal is None
+
+    def as_mapping(self) -> Dict[str, Any]:
+        return {
+            "tests_node_id": self.tests_node_id,
+            "candidate_sha": self.candidate_sha,
+            "runner": self.runner,
+            "selector": self.selector,
+            "contract_declared": self.contract_declared,
+            "executed_nodeids": list(self.executed_nodeids),
+            "new_nodeids": list(self.new_nodeids),
+            "coverage": self.coverage.as_mapping(),
+            "falsifiability": self.falsifiability.as_mapping(),
+            "refusal": self.refusal,
+            "strong": self.strong,
+        }
+
+
+def verify_test_strength(evidence: GateStrengthEvidence
+                         ) -> vf.VerificationVerdict:
+    """The tests-node acceptance predicate, computed from measured evidence.
+
+    Never from an envelope field, a report the tester wrote, or a pass count.
+    Every input is either a git object or a runner's own machine-readable
+    output, which is what lets a lifecycle transition key on it (§1.2).
+    """
+    if not evidence.contract_declared:
+        return _strength_refused(
+            StrengthRefusal.CONTRACT_ABSENT.value,
+            "{0} declares no test-strength contract; a tests node accepted "
+            "without one is accepted on its case count, which is what "
+            "run-8d1a71f463e4430f92a125a8f8b3731d shows does not "
+            "discriminate".format(evidence.tests_node_id))
+    if evidence.coverage.refusal:
+        return _strength_refused(evidence.coverage.refusal,
+                                 evidence.coverage.reason)
+    if evidence.falsifiability.refusal:
+        return _strength_refused(evidence.falsifiability.refusal,
+                                 evidence.falsifiability.reason)
+    if not evidence.falsifiability.proven:
+        return _strength_refused(
+            StrengthRefusal.CONTROL_UNEXECUTABLE.value,
+            "the declared negative control was not executed, so nothing "
+            "proves these cases can fail")
+    return vf.VerificationVerdict(verified=True)
+
+
+def _strength_refused(code: str, detail: str) -> vf.VerificationVerdict:
+    retry_class = (st.RetryClass.ENVIRONMENTAL
+                   if code in _ENVIRONMENTAL_REFUSALS
+                   else st.RetryClass.SEMANTIC)
+    return vf.VerificationVerdict(
+        verified=False, failed_clause=3,
+        reason="{0}: {1}".format(code, detail),
+        retry_class=retry_class)
+
+
+def blob_id_at(tree: Path, commit: str, path: str) -> Optional[str]:
+    """The git object id of `path` at `commit`, or None when absent.
+
+    An object id rather than the bytes, because the question this answers is
+    identity: are the test files in the implementation candidate's tree the
+    *exact* bytes the accepted test candidate was reviewed as. Comparing ids
+    is that question asked directly, and it does not read a blob into memory
+    to answer it.
+
+    Absence is an empty successful ls-tree, never a failed exit (§7.5).
+    """
+    listed = subprocess.run(
+        ["git", "-C", str(tree), "ls-tree", "-z", "--full-tree", commit,
+         "--", path],
+        capture_output=True)
+    if listed.returncode != 0:
+        raise TestsGitReadFailed(
+            "GIT_READ_FAILED:ls-tree {0} -- {1}".format(commit, path))
+    records = [record for record in listed.stdout.split(b"\x00") if record]
+    if len(records) != 1:
+        return None
+    meta, _, _name = records[0].partition(b"\t")
+    try:
+        _mode, kind, object_id = meta.split(b" ", 2)
+    except ValueError as exc:
+        raise TestsGitReadFailed(
+            "GIT_READ_FAILED:unparseable ls-tree record for {0}@{1}".format(
+                path, commit)) from exc
+    if kind != b"blob":
+        return None
+    return object_id.decode("ascii", "replace")
+
+
+class PairingRefusal(str, Enum):
+    """Why an implementation candidate is not bound to accepted test bytes."""
+
+    NO_ACCEPTED_CANDIDATE = "TEST_PAIRING_NO_ACCEPTED_CANDIDATE"
+    BYTES_SUBSTITUTED = "TEST_PAIRING_TEST_BYTES_SUBSTITUTED"
+    GATE_NOT_GREEN = "TEST_PAIRING_ACCEPTED_TESTS_NOT_GREEN"
+    UNREADABLE = "TEST_PAIRING_TEST_TREE_UNREADABLE"
+
+
+def compare_test_bytes(tree: Path, accepted_sha: str, candidate_sha: str,
+                       paths: Sequence[str]) -> Tuple[str, ...]:
+    """Paths whose bytes differ between the two commits, or are absent now.
+
+    The returned tuple is the refusal's evidence: an implementation candidate
+    that edited, deleted, or replaced a file of the accepted test candidate
+    is not being gated by the tests that were reviewed, and inheriting that
+    review would be exactly obligation 9's substitution.
+    """
+    differing: List[str] = []
+    for path in paths:
+        accepted = blob_id_at(tree, accepted_sha, path)
+        current = blob_id_at(tree, candidate_sha, path)
+        if accepted != current:
+            differing.append(path)
+    return tuple(differing)

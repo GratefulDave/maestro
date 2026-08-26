@@ -436,6 +436,69 @@ export interface MaestroRepairHandoff {
   acknowledged_at: string | null;
 }
 
+/**
+ * One test candidate's measured gate strength, as the ledger holds it.
+ *
+ * Bound to `candidate_sha` rather than to the node, because what was accepted
+ * is *those bytes*: a later or substituted test tree has a different sha and
+ * cannot inherit this row.
+ */
+export interface MaestroTestGateEvidence {
+  tests_node_id: string;
+  candidate_sha: string;
+  runner: string;
+  selector: string;
+  strong: boolean;
+  /** The one named reason it is not strong, and null when it is. */
+  refusal: string | null;
+  /** The measured obligations and the negative control's result, verbatim. */
+  evidence: Record<string, unknown>;
+  created_at: string | null;
+}
+
+/** The exact (accepted test bytes, implementation bytes) pair a merge needs. */
+export interface MaestroTestPairing {
+  build_node_id: string;
+  tests_node_id: string;
+  accepted_test_sha: string;
+  implementation_sha: string;
+  verifier_command: string;
+  selector: string;
+  executed_cases: number;
+  created_at: string | null;
+}
+
+/** A tests node an operator migration explicitly fenced. */
+export interface MaestroLegacyTestStrengthBlock {
+  tests_node_id: string;
+  reason: string;
+}
+
+/**
+ * Where a tests node sits in the test-strength lifecycle.
+ *
+ * A projection of state, lane phase, acceptance and pairing — never a stored
+ * field. It exists because `MERGED` alone said only that the bytes reached
+ * the integration branch and read as "these tests are done and good".
+ */
+export type MaestroTestStrengthPhase =
+  | "TEST_BUILDING"
+  | "TEST_CANDIDATE_READY"
+  | "TEST_REVIEWING"
+  | "TEST_REJECTED"
+  | "TEST_REPAIRING"
+  | "TEST_ACCEPTED"
+  | "TEST_BLOCKED"
+  | "TEST_LEGACY_UNPROVEN"
+  | "IMPLEMENTATION_PENDING"
+  | "IMPLEMENTATION_BUILDING"
+  | "IMPLEMENTATION_REVIEWING"
+  | "IMPLEMENTATION_ACCEPTED"
+  | "PAIRED_MERGED";
+
+/** Whether a tests node's bytes are private, staged, or on integration. */
+export type MaestroTestBytesLocation = "private" | "staged" | "integrated";
+
 export type AttemptLiveness =
   | "running"
   | "stale"
@@ -603,6 +666,15 @@ export interface MaestroRunDetail {
   lane_candidates: MaestroLaneCandidate[];
   candidate_reviews: MaestroCandidateReview[];
   repair_handoffs: MaestroRepairHandoff[];
+  /**
+   * Which test-acceptance contract this run was **created** under. `LEGACY`
+   * on a ledger that recorded none, which is read as the pin rather than as
+   * "unknown": a run nobody pinned accepted its tests on their case count.
+   */
+  test_strength_contract: string;
+  test_gate_evidence: MaestroTestGateEvidence[];
+  test_pairings: MaestroTestPairing[];
+  legacy_test_strength_blocks: MaestroLegacyTestStrengthBlock[];
   results: MaestroResult[];
   /** Run-level transitions: outcome declarations, resumes, acceptance starts. */
   run_transitions: MaestroTransition[];

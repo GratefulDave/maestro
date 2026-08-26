@@ -37,6 +37,9 @@ import type {
   MaestroRepairHandoff,
   MaestroRunSummary,
   MaestroTransition,
+  MaestroTestGateEvidence,
+  MaestroTestPairing,
+  MaestroLegacyTestStrengthBlock,
 } from "../shared/types.ts";
 import {
   loadDeclaredRoles,
@@ -192,6 +195,33 @@ interface RepairHandoffRow {
   builder_generation: number;
   submitted_at: string | null;
   acknowledged_at: string | null;
+}
+
+interface TestGateEvidenceRow {
+  tests_node_id: string;
+  candidate_sha: string;
+  runner: string;
+  selector: string;
+  strong: number;
+  refusal: string | null;
+  evidence_json: string | null;
+  created_at: string | null;
+}
+
+interface TestPairingRow {
+  build_node_id: string;
+  tests_node_id: string;
+  accepted_test_sha: string;
+  implementation_sha: string;
+  verifier_command: string;
+  selector: string;
+  executed_cases: number;
+  created_at: string | null;
+}
+
+interface LegacyTestStrengthBlockRow {
+  tests_node_id: string;
+  reason: string;
 }
 
 interface TransitionRow {
@@ -369,6 +399,21 @@ export class MaestroDb {
     return this.columns(db, table).has(column)
       ? `${alias}.${column}`
       : `NULL AS ${column}`;
+  }
+
+  /**
+   * Which contract this run was created under. A ledger with no column, and a
+   * NULL in one that has it, both read `LEGACY` — the pin, not "unknown".
+   */
+  private testStrengthContract(runId: string): string {
+    const db = this.freshDb();
+    if (!this.columns(db, "runs").has("test_strength_contract")) return "LEGACY";
+    const row = db
+      .query<{ test_strength_contract: string | null }, [string]>(
+        "SELECT test_strength_contract FROM runs WHERE run_id = ?",
+      )
+      .get(runId);
+    return row?.test_strength_contract ?? "LEGACY";
   }
 
   runCount(): number {
@@ -571,6 +616,47 @@ export class MaestroDb {
             )
             .all(runId);
 
+    // The test-strength ledgers. Each guarded by its own table check, so a
+    // ledger written before the contract existed reads as "nothing recorded"
+    // rather than raising — which is the same shape `optionalColumn` gives a
+    // missing column, one level up.
+    const testGateEvidenceRows: TestGateEvidenceRow[] =
+      this.columns(db, "test_gate_evidence").size === 0
+        ? []
+        : db
+            .query<TestGateEvidenceRow, [string]>(
+              `SELECT tests_node_id, candidate_sha, runner, selector, strong,
+                      refusal, evidence_json, created_at
+                 FROM test_gate_evidence
+                WHERE run_id = ?
+                ORDER BY tests_node_id, created_at, rowid`,
+            )
+            .all(runId);
+    const testPairingRows: TestPairingRow[] =
+      this.columns(db, "test_implementation_pairings").size === 0
+        ? []
+        : db
+            .query<TestPairingRow, [string]>(
+              `SELECT build_node_id, tests_node_id, accepted_test_sha,
+                      implementation_sha, verifier_command, selector,
+                      executed_cases, created_at
+                 FROM test_implementation_pairings
+                WHERE run_id = ?
+                ORDER BY build_node_id, tests_node_id`,
+            )
+            .all(runId);
+    const legacyTestStrengthRows: LegacyTestStrengthBlockRow[] =
+      this.columns(db, "legacy_test_strength_blocks").size === 0
+        ? []
+        : db
+            .query<LegacyTestStrengthBlockRow, [string]>(
+              `SELECT tests_node_id, reason
+                 FROM legacy_test_strength_blocks
+                WHERE run_id = ?
+                ORDER BY tests_node_id`,
+            )
+            .all(runId);
+
     const acceptedAttempts = new Set<string>();
     for (const result of resultRows) {
       if (
@@ -694,6 +780,31 @@ export class MaestroDb {
         verdict: review.verdict,
         completed_at: review.completed_at,
       })) satisfies MaestroCandidateReview[],
+      test_strength_contract: this.testStrengthContract(runId),
+      test_gate_evidence: testGateEvidenceRows.map((item) => ({
+        tests_node_id: item.tests_node_id,
+        candidate_sha: item.candidate_sha,
+        runner: item.runner,
+        selector: item.selector,
+        strong: Boolean(item.strong),
+        refusal: item.refusal,
+        evidence: parseJson<Record<string, unknown>>(item.evidence_json, {}),
+        created_at: item.created_at,
+      })) satisfies MaestroTestGateEvidence[],
+      test_pairings: testPairingRows.map((item) => ({
+        build_node_id: item.build_node_id,
+        tests_node_id: item.tests_node_id,
+        accepted_test_sha: item.accepted_test_sha,
+        implementation_sha: item.implementation_sha,
+        verifier_command: item.verifier_command,
+        selector: item.selector,
+        executed_cases: item.executed_cases ?? 0,
+        created_at: item.created_at,
+      })) satisfies MaestroTestPairing[],
+      legacy_test_strength_blocks: legacyTestStrengthRows.map((item) => ({
+        tests_node_id: item.tests_node_id,
+        reason: item.reason,
+      })) satisfies MaestroLegacyTestStrengthBlock[],
       repair_handoffs: repairHandoffRows.map((handoff) => ({
         build_node_id: handoff.build_node_id,
         rejected_candidate_sha: handoff.rejected_candidate_sha,

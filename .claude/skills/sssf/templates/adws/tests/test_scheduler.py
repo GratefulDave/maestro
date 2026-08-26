@@ -442,7 +442,15 @@ class ReviewProjectionTests(SchedulerFixture):
         self.assertEqual(tuple(scheduler.authored_nodes), ("tests", "build"))
         self.assertIs(scheduler.authored_nodes["tests"], tests)
         self.assertEqual(scheduler.nodes["tests"], tests)
-        self.assertEqual(scheduler.nodes["build"].needs, ("tests",))
+        # The build node now depends on the tests node's *review*, exactly as
+        # it would on another build node's. A tests node is reviewable: it was
+        # not, and a tests node therefore went VERIFIED -> MERGED with no
+        # independent reader, which is the defect
+        # run-8d1a71f463e4430f92a125a8f8b3731d exposed. What "preserved
+        # unchanged" still means, and what this asserts above, is that the
+        # *authored* node is carried verbatim -- the projection adds an edge
+        # and rewrites nothing.
+        self.assertEqual(scheduler.nodes["build"].needs, ("tests::review",))
 
     def test_projects_one_stable_review_per_reviewable_build(self):
         template = self.agent("tests", outputs=("tests/test_build.py",))
@@ -453,8 +461,17 @@ class ReviewProjectionTests(SchedulerFixture):
         scheduler = self.schedule([tests, build, code], deps=self.review_deps())
 
         reviews = scheduler._derived_review_nodes()
-        self.assertEqual({review.node_id for review in reviews}, {"build::review"})
+        # One per *reviewable* node, and a tests node is one. A code node is
+        # not: its acceptance is its command's exit code (§6.2), so there is
+        # no diff a reviewer would be asked about.
+        self.assertEqual(
+            {review.node_id for review in reviews},
+            {"build::review", "tests::review"},
+        )
         self.assertNotIn("code::review", scheduler.nodes)
+        tests_review = scheduler.nodes["tests::review"]
+        self.assertIs(tests_review.kind, st.NodeKind.REVIEW)
+        self.assertEqual(tests_review.review_of, "tests")
         build_review = scheduler.nodes["build::review"]
         self.assertIs(build_review.kind, st.NodeKind.REVIEW)
         self.assertEqual(build_review.review_of, "build")

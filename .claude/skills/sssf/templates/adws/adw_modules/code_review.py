@@ -162,6 +162,131 @@ CODE_RUBRIC = fin.Rubric(
     ))
 
 
+#: The questions a **test** diff is judged on.
+#:
+#: A separate rubric rather than extra checks on `CODE_RUBRIC`, because almost
+#: none of that rubric's questions mean anything here. "Does the code satisfy
+#: the gate because the behaviour is present" is the wrong question to ask of
+#: a diff whose entire purpose is to be red; "is every hunk in service of this
+#: node's stated work" survives, and the rest do not. Asking a test reviewer
+#: the build rubric is how a reviewer ends up grading a test suite on whether
+#: it looks like an implementation.
+#:
+#: What is deliberately **not** here is anything code already measures. The
+#: coverage obligations, the executed case count, and the negative control are
+#: established before this reviewer opens, and re-asking them would spend a
+#: reviewer turn re-deriving a mechanical fact and invite it to disagree with
+#: one. Every question below names a way a suite can be weak that a green
+#: measurement cannot see.
+TESTS_RUBRIC = fin.Rubric(
+    version="maestro-tests-rubric.v1",
+    checks=(
+        fin.RubricCheck(
+            check_id="tests.traces_to_every_assigned_requirement",
+            question=("Does every requirement and invariant in the contract "
+                      "above have a case that actually exercises it, rather "
+                      "than a case whose name matches it? A case selected by "
+                      "an obligation's selector but asserting something else "
+                      "is a finding."),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.exercises_real_boundaries",
+            question=("Do these cases observe behaviour through the real "
+                      "boundary the contract names, rather than asserting "
+                      "against mocks, inspecting source text, checking that a "
+                      "file exists, or matching a constant the implementation "
+                      "would have to hardcode? Mock-only assertions are a "
+                      "finding unless the contract explicitly requires them."),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.would_fail_a_plausible_wrong_implementation",
+            question=("Name a plausible implementation that violates the "
+                      "stated contract and still passes these cases. If one "
+                      "exists, that is the finding: say what it is and which "
+                      "case should have caught it."),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.covers_boundaries_and_failure_modes",
+            question=("Are boundaries, precedence, transitions, and the real "
+                      "failure modes the contract names exercised — not only "
+                      "the happy path and one rejection?"),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.fixtures_are_real_and_owned",
+            question=("Are the fixtures realistic and owned by this node, "
+                      "rather than planted values, implementation-shaped "
+                      "stubs, or data copied out of the very code under "
+                      "test?"),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.conceals_no_failure",
+            question=("Do skips, xfail, parametrization, retries, sleeps, or "
+                      "broad `except` blocks hide a case that would otherwise "
+                      "fail? A case that cannot fail is a finding."),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.negative_control_fails_for_the_right_reason",
+            question=("The measured negative control above turned specific "
+                      "cases red. Is the reported reason the behavioural "
+                      "reason the contract names, rather than an incidental "
+                      "error that would appear for any broken tree?"),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="tests.no_unrelated_change_rides_along",
+            question=("Is every hunk in service of this node's stated work, "
+                      "with no unrelated edit to an existing test?"),
+            applies_to=(DIFF,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="file.assertions_observe_contract_behaviour",
+            question=("In this file, do the assertions observe contractual "
+                      "behaviour rather than internal plumbing — call counts, "
+                      "private attributes, log strings, or the shape of an "
+                      "intermediate value?"),
+            applies_to=(CHANGED_FILE,),
+            severity=fin.Severity.BLOCKING),
+        fin.RubricCheck(
+            check_id="file.no_secret_or_credential_introduced",
+            question=("Does this file's change introduce no credential, token, "
+                      "private key, or other secret?"),
+            applies_to=(CHANGED_FILE,),
+            severity=fin.Severity.BLOCKING),
+    ))
+
+
+class RubricUnavailable(ValueError):
+    """No rubric is defined for this node kind.
+
+    Refused rather than defaulted to `CODE_RUBRIC`. A kind whose questions
+    nobody wrote is a kind nobody decided how to review, and handing it the
+    build rubric would produce a confident verdict against the wrong standard
+    — which is B9's failure with the contract present instead of absent.
+    """
+
+
+def rubric_for(kind: "st.NodeKind") -> fin.Rubric:
+    """The rubric this node kind is judged by (§1.1 item 4).
+
+    An evidence chain is scoped to a node kind, and so is the reviewer's
+    contract: a tests node and a build node are asked different questions
+    because a PASS means a different thing about each.
+    """
+    if kind is st.NodeKind.TESTS:
+        return TESTS_RUBRIC
+    if kind in (st.NodeKind.AGENT, st.NodeKind.CODE):
+        return CODE_RUBRIC
+    raise RubricUnavailable(
+        "no review rubric is defined for node kind {0!r}".format(
+            getattr(kind, "value", kind)))
+
+
 # ── A9: graded findings, so a lane converges on a merge and not on a wall ───
 
 class FindingGrade(str, Enum):
@@ -924,6 +1049,24 @@ class ReviewHandoff(BaseModel):
     #: than an empty heading, so a reviewer is never shown a contract section
     #: with nothing under it.
     effects: List[Dict[str, str]] = []
+    #: A tests node's declared test-strength contract, rendered for its
+    #: reviewer. B9's "the reviewer's input is a declared contract" applied to
+    #: the kind that had no contract at all: a test reviewer shown only a diff
+    #: and a gate command can say whether the tests look reasonable, which is
+    #: not the question. What it must judge is whether *these* cases discharge
+    #: *these* obligations, and the obligations are only knowable from here.
+    #:
+    #: Empty for every other kind, and empty renders no block.
+    test_strength: Dict[str, Any] = {}
+    #: What code already measured about this candidate — the executed cases,
+    #: each obligation's selected cases, and the negative control's result.
+    #:
+    #: Handed over so the reviewer judges the *meaning* of facts it cannot
+    #: re-derive, and so it can contradict one with evidence: a control that
+    #: went red for an incidental reason is a finding this reviewer is
+    #: uniquely placed to make, and it cannot make it without seeing the
+    #: reason that was reported.
+    test_evidence: Dict[str, Any] = {}
     #: The cells to answer, and where to write the answers.
     matrix: List[Dict[str, Any]]
     pair_count: int
@@ -958,7 +1101,87 @@ class ReviewHandoff(BaseModel):
             raise HandoffIncomplete(
                 "an agent node's acceptance contract is its gate; the reviewer "
                 "cannot judge 'passed on the merits' without it (B9)")
+        if self.node_kind == st.NodeKind.TESTS.value:
+            # A tests node under the strength contract reaches its reviewer
+            # with obligations and measurements or it does not reach one at
+            # all. A reviewer handed a test diff and nothing else grades it
+            # on whether the tests look plausible, which is the standard that
+            # let a MERGED test node fail to gate four rejected candidates.
+            if self.test_strength and not self.test_evidence:
+                raise HandoffIncomplete(
+                    "a tests node's reviewer is given its contract and the "
+                    "measurements taken against it; the contract without the "
+                    "measurements asks it to re-derive facts code already "
+                    "established (B9)")
+            if self.test_evidence and not self.test_strength:
+                raise HandoffIncomplete(
+                    "a tests node's reviewer is shown measurements with no "
+                    "contract to judge them against (B9)")
         return self
+
+    def _test_strength_lines(self) -> List[str]:
+        """The tests-node contract and its measurements, as prompt text.
+
+        Empty for every other kind, so nothing renders an empty heading. The
+        ordering is fixed and every value is drawn from the handoff, so the
+        same candidate renders the same bytes and the size preflight measures
+        what is actually sent.
+        """
+        if not self.test_strength:
+            return []
+        contract = self.test_strength
+        evidence = self.test_evidence or {}
+        coverage = evidence.get("coverage") or {}
+        control = evidence.get("falsifiability") or {}
+        lines = [
+            "",
+            "## What these tests were required to prove",
+            "",
+            "Each line is one requirement, one behavioural aspect, and the "
+            "case selector the plan said would discharge it. Code has already "
+            "counted the cases; you are judging whether the cases that "
+            "matched actually exercise the behaviour named.",
+        ]
+        for item in contract.get("coverage", []):
+            lines.append("")
+            lines.append("  {0} / {1}".format(
+                item.get("requirement_id", "(unnamed)"),
+                item.get("aspect", "(unnamed)")))
+            lines.append("      cases selected by: {0!r}, at least {1}".format(
+                item.get("case_selector", ""), item.get("min_cases", 1)))
+        measured = {item.get("case_selector"): item
+                    for item in coverage.get("obligations", [])}
+        if measured:
+            lines.extend(["", "### What each obligation actually selected"])
+            for selector, item in measured.items():
+                lines.append("")
+                lines.append("  {0!r}: {1}".format(
+                    selector,
+                    ", ".join(item.get("selected", [])) or "(no case)"))
+        lines.extend([
+            "",
+            "## The negative control that was executed",
+            "",
+            "  strategy: {0}".format(control.get("strategy", "(none)")),
+        ])
+        if control.get("mutation_paths"):
+            lines.append("  reverted: {0}".format(
+                ", ".join(control.get("mutation_paths", []))))
+        lines.append("  cases it turned red: {0}".format(
+            ", ".join(control.get("selected", [])) or "(none)"))
+        for reason in control.get("observed_reasons", []):
+            lines.append("      reported reason: {0}".format(reason))
+        lines.append(
+            "  the contract required a failure matching: {0!r}".format(
+                (contract.get("falsifiability") or {}).get(
+                    "expected_reason_pattern", "")))
+        lines.extend([
+            "",
+            "A control that went red for an incidental reason — an import "
+            "error, a fixture that could not be built, a message unrelated to "
+            "the behaviour — is a finding, whatever the pattern matched.",
+        ])
+        return lines
 
     def render(self) -> str:
         """The prompt text. Deterministic, so the same subject renders the same
@@ -1015,6 +1238,7 @@ class ReviewHandoff(BaseModel):
                 lines.append("  {0}: {1}".format(
                     entry["effect"], entry["disposition"]))
                 lines.append("      forbidden act: " + entry["meaning"])
+        lines.extend(self._test_strength_lines())
         lines.extend([
             "",
             "## The diff, base..proposed",
@@ -1489,9 +1713,19 @@ def build_handoff(
     matrix: fin.ApplicabilityMatrix,
     rubric: fin.Rubric,
     report_path: Path,
+    test_evidence: Optional[Mapping[str, Any]] = None,
 ) -> ReviewHandoff:
-    """Assemble and validate the reviewer's contract (B9)."""
+    """Assemble and validate the reviewer's contract (B9).
+
+    `test_evidence` is the measurement the scheduler already took against this
+    exact candidate. It is passed in rather than re-measured here for the
+    reason every other fact on this contract is passed in: a second
+    measurement is a second answer, and the reviewer must be judging the
+    evidence the acceptance decision will rest on, not a fresh one that could
+    differ.
+    """
     asked = {cell.check_id for cell in matrix.cells}
+    strength = _test_strength_contract(node)
     return ReviewHandoff(
         subject_digest=subject_digest,
         run_id=run_id,
@@ -1509,6 +1743,8 @@ def build_handoff(
         effects=[{"effect": effect.effect, "disposition": effect.disposition,
                   "meaning": effect.meaning}
                  for effect in node.effects],
+        test_strength=strength,
+        test_evidence=dict(test_evidence or {}) if strength else {},
         base_sha=base_sha,
         output_sha=output_sha,
         diff=diff,
@@ -1523,6 +1759,40 @@ def build_handoff(
                          "known-bad object is a finding, the known-good object "
                          "is clear.")}],
     ).require_complete()
+
+
+def _test_strength_contract(node: st.PlanNode) -> Dict[str, Any]:
+    """The node's declared test-strength contract as plain JSON, or `{}`.
+
+    Read as an attribute rather than through a defaulted lookup, exactly as
+    `effects` is and for the same recorded reason: a `getattr(node, ..., {})`
+    cannot fail loudly when the projection stops carrying the field, and that
+    operator is what let `min_cases` and `instruction` read as their defaults
+    for every node in every run.
+    """
+    if node.kind is not st.NodeKind.TESTS:
+        return {}
+    strength = node.test_strength
+    if strength is None:
+        return {}
+    return {
+        "coverage": [
+            {"requirement_id": item.requirement_id,
+             "aspect": item.aspect,
+             "case_selector": item.case_selector,
+             "min_cases": item.min_cases}
+            for item in strength.coverage],
+        "falsifiability": {
+            "strategy": strength.falsifiability.strategy,
+            "expected_failing_selector":
+                strength.falsifiability.expected_failing_selector,
+            "expected_reason_pattern":
+                strength.falsifiability.expected_reason_pattern,
+            "mutation_paths": list(
+                strength.falsifiability.mutation.paths
+                if strength.falsifiability.mutation is not None else ()),
+        },
+    }
 
 
 class InstructionNotCarried(HandoffIncomplete):

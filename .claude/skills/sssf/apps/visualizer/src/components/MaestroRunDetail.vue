@@ -16,7 +16,13 @@ import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { Ban, ChevronRight, GitBranch, TriangleAlert, UserRound } from 'lucide-vue-next'
 import type { MaestroAttempt, MaestroNode, MaestroRunDetail } from '../lib/types'
 import { ApiHttpError, fetchRun } from '../lib/api'
-import { candidateLifecycleForNode, nodeAuthorityState } from '../lib/maestroLifecycle'
+import {
+  acceptedTestCandidate,
+  candidateLifecycleForNode,
+  nodeAuthorityState,
+  testBytesLocation,
+  testStrengthPhase,
+} from '../lib/maestroLifecycle'
 import { fmtDate, fmtDuration, ts } from '../lib/format'
 import MaestroStateChip from './MaestroStateChip.vue'
 
@@ -144,6 +150,47 @@ const candidateLifecycleByNode = computed(
       ]),
     ),
 )
+
+/**
+ * The test-strength line each node shows, or `null`.
+ *
+ * `MERGED` on a tests node says its bytes reached the integration branch and
+ * nothing more; it read as "these tests are done and good" while the lane
+ * they gated stayed BLOCKED behind four rejected candidates. So the phase,
+ * where the accepted bytes are, and the paired implementation are rendered
+ * beside the state rather than folded into it.
+ */
+const testStrengthByNode = computed(() => {
+  const detail = run.value
+  const rows = new Map<string, { phase: string; bytes: string | null; sha: string | null; refusal: string | null; pairedWith: string | null }>()
+  if (!detail) return rows
+  for (const node of detail.nodes ?? []) {
+    const accepted = acceptedTestCandidate(detail, node.node_id)
+    const pairing = (detail.test_pairings ?? []).find(
+      (row) =>
+        row.build_node_id === node.node_id &&
+        (node.output_sha === null || row.implementation_sha === node.output_sha),
+    )
+    const phase = testStrengthPhase(node, {
+      accepted: accepted !== null,
+      paired: pairing !== undefined,
+    })
+    if (phase === null) continue
+    // Newest last, so the last match is the current measurement. `findLast`
+    // rather than `filter().at(-1)`: one pass, and it says what it means.
+    const latest = (detail.test_gate_evidence ?? []).findLast(
+      (item) => item.tests_node_id === node.node_id,
+    )
+    rows.set(node.node_id, {
+      phase,
+      bytes: testBytesLocation(node, accepted),
+      sha: accepted ?? latest?.candidate_sha ?? null,
+      refusal: latest && !latest.strong ? latest.refusal : null,
+      pairedWith: pairing ? pairing.tests_node_id : null,
+    })
+  }
+  return rows
+})
 
 /** Every attempt still in flight, anywhere in the graph. */
 const inFlight = computed(() =>
@@ -323,6 +370,34 @@ function expanded(node: MaestroNode): boolean {
                 node {{ node.state.toLowerCase() }}
               </span>
             </button>
+
+            <div
+              v-if="testStrengthByNode.get(node.node_id)"
+              class="node-sub test-strength"
+            >
+              <span class="test-phase">
+                {{ testStrengthByNode.get(node.node_id)!.phase }}
+              </span>
+              <span v-if="testStrengthByNode.get(node.node_id)!.bytes" class="test-bytes">
+                test bytes {{ testStrengthByNode.get(node.node_id)!.bytes }}
+              </span>
+              <code
+                v-if="testStrengthByNode.get(node.node_id)!.sha"
+                class="sha"
+                :title="testStrengthByNode.get(node.node_id)!.sha!"
+              >
+                {{ testStrengthByNode.get(node.node_id)!.sha!.slice(0, 12) }}
+              </code>
+              <span v-if="testStrengthByNode.get(node.node_id)!.refusal" class="test-refusal">
+                {{ testStrengthByNode.get(node.node_id)!.refusal }}
+              </span>
+              <span
+                v-if="testStrengthByNode.get(node.node_id)!.pairedWith"
+                class="test-paired"
+              >
+                paired with {{ testStrengthByNode.get(node.node_id)!.pairedWith }}
+              </span>
+            </div>
 
             <div class="node-sub">
               <span class="attempt-count">
@@ -749,6 +824,26 @@ function expanded(node: MaestroNode): boolean {
   align-items: center;
   color: var(--dim);
   font-size: 15px;
+}
+
+.node-sub.test-strength {
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.test-phase {
+  color: var(--dim);
+  letter-spacing: 0.02em;
+}
+
+.test-bytes,
+.test-paired {
+  color: var(--faint);
+}
+
+.test-refusal {
+  color: var(--bad, #d06060);
 }
 
 .attempt-hint {

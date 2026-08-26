@@ -55,7 +55,7 @@ class LaunchRefusal(Enum):
       raised *before* the split hits a mandatory `finally: quiesce`, which
       raises `PROCESS_GROUP_UNTRACKED` over a process that was never started,
       and Python replaces the launch's own exception with it. The naive repair
-      — treating every failed launch as proven absent — lies for the refusals
+      — treating every failed launch as proven p pabsent — lies for the refusals
       raised *after* the split, where a pane may really exist and its group is
       exactly what quiescence is for. Reported rather than inferred, so the
       proof is skipped only where absence is established.

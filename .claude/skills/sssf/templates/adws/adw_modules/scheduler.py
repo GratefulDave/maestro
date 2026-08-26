@@ -400,6 +400,16 @@ class SchedulerDeps:
     #: not an observation of work: the clock still fires. `maestro run start`
     #: supplies the reader; omitting it is the M30 failure mode.
     actor_status: Optional[Callable[[st.AttemptRecord], Optional[str]]] = None
+    #: The plan's `base_commit`. The revert target for a `controlled_mutation`
+    #: negative control, and nothing else reads it.
+    #:
+    #: It is the plan's base rather than the attempt's, and the difference is
+    #: the whole point of the strategy: reverting to the attempt's own base
+    #: restores a tree in which the behaviour under test may already exist, so
+    #: the "control" would change nothing and every candidate would fail it
+    #: for the same uninformative reason. Empty is refused at the point of
+    #: use, by name, rather than silently reverting to `HEAD`.
+    plan_base_commit: str = ""
 
     def __post_init__(self) -> None:
         if self.quiesce_attempt is None:
@@ -424,6 +434,54 @@ class AcceptanceResult:
     gate: Optional["wt.GateResult"] = None
     ancestry: Dict[str, bool] = field(default_factory=dict)
     reason: str = ""
+
+
+class TestStrengthContractMismatch(RuntimeError):
+    """A run's durable pin and its plan disagree about the test contract.
+
+    Refused rather than reconciled, and refused in the direction that leaves
+    the run exactly as it was. Both possible reconciliations are wrong:
+    adopting the plan's contract decides an already-terminal node's dependants
+    under rules that node was never judged by, and adopting the pin runs a
+    contracted plan under the rules it was written to replace.
+    """
+
+
+class MixedTestStrengthContract(ValueError):
+    """Some tests nodes declare a strength contract and some do not.
+
+    Unrepresentable in a plan — `maestro-plan.v4` requires the field of every
+    tests node and v3 has no field to declare — so this can only be a
+    hand-built node set, and it has no defensible answer. Enforcing the
+    contract for half a run would accept the other half on its case count
+    while reporting the run as contracted, which is worse than either
+    consistent choice.
+    """
+
+
+def derive_test_strength_contract(
+    nodes: Sequence[st.PlanNode],
+) -> st.TestStrengthContract:
+    """Which contract this plan's tests nodes are judged under.
+
+    A plan with no tests nodes is `STRENGTH_V1`: there is nothing weaker
+    about it, and answering LEGACY would report every build-only run as
+    running under superseded rules.
+    """
+    tests = [node for node in nodes if node.kind is st.NodeKind.TESTS]
+    if not tests:
+        return st.TestStrengthContract.STRENGTH_V1
+    declared = [node for node in tests if node.test_strength is not None]
+    if not declared:
+        return st.TestStrengthContract.LEGACY
+    if len(declared) != len(tests):
+        raise MixedTestStrengthContract(
+            "these tests nodes declare a test-strength contract and these do "
+            "not: {0} vs {1}".format(
+                ", ".join(sorted(n.node_id for n in declared)),
+                ", ".join(sorted(n.node_id for n in tests
+                                 if n.test_strength is None))))
+    return st.TestStrengthContract.STRENGTH_V1
 
 
 @dataclass(frozen=True)
@@ -568,10 +626,49 @@ class Scheduler:
     def _dependency_satisfied(self, node_id: str) -> bool:
         node = self.nodes.get(node_id)
         if self._is_derived_review(node):
-            return self._review_is_accepted(node_id) and _is_merged(
-                self.deps.store, self.run_id, node.review_of
-            )
+            if not (
+                self._review_is_accepted(node_id)
+                and _is_merged(self.deps.store, self.run_id, node.review_of)
+            ):
+                return False
+            return self._test_prerequisite_satisfied(node.review_of)
+        if self._is_tests_node(node_id):
+            return _is_merged(
+                self.deps.store, self.run_id, node_id
+            ) and self._test_prerequisite_satisfied(node_id)
         return _is_merged(self.deps.store, self.run_id, node_id)
+
+    def _is_tests_node(self, node_id: str) -> bool:
+        node = self.authored_nodes.get(node_id)
+        return node is not None and node.kind is st.NodeKind.TESTS
+
+    def _test_prerequisite_satisfied(self, node_id: str) -> bool:
+        """Whether a tests node is a *completed* prerequisite (obligation 10).
+
+        Typed lifecycle state, not a generic MERGED inference. MERGED says the
+        candidate's commit reached the integration branch; it says nothing
+        about whether the candidate discriminates, and a consuming
+        implementation admitted on that alone is admitted on the strength of
+        tests nobody proved could fail. So the question asked here is the one
+        that matters: does this node have an accepted test candidate — strong
+        measured evidence *and* a passed independent review, both bound to the
+        same immutable sha.
+
+        A legacy-pinned run answers on MERGED alone, deliberately. Its tests
+        nodes were admitted under the contract they were created under, and
+        reaching back through an already-admitted dependency is what the
+        rollout invariant forbids.
+        """
+        if not self._is_tests_node(node_id):
+            return True
+        if self.test_strength_contract is not st.TestStrengthContract.STRENGTH_V1:
+            return True
+        if self.deps.store.accepted_test_candidate(self.run_id, node_id) is None:
+            return False
+        return not any(
+            block.tests_node_id == node_id
+            for block in self.deps.store.legacy_test_strength_blocks(self.run_id)
+        )
 
     def _project_nodes(
         self, authored_nodes: Mapping[str, st.PlanNode]
@@ -580,10 +677,20 @@ class Scheduler:
         if self.deps.review_attempt is None:
             return dict(authored_nodes)
 
+        # Tests nodes are reviewable, and their absence from this set was the
+        # defect. A derived review node is the only thing in this design that
+        # makes "no lane merges unreviewed" a property of every run rather
+        # than of an author remembering to declare one -- and until now it was
+        # derived for build lanes only, so a tests node went VERIFIED ->
+        # MERGED with no independent reader at all.
+        # Run-8d1a71f463e4430f92a125a8f8b3731d is what that costs:
+        # `lane-acquisition-manifest-tests` reached MERGED on four non-skipped
+        # cases, and the four implementation candidates it existed to gate
+        # were each independently rejected. The tests were never judged.
         reviewable = {
             node_id
             for node_id, node in authored_nodes.items()
-            if node.kind is st.NodeKind.AGENT
+            if node.kind in (st.NodeKind.AGENT, st.NodeKind.TESTS)
         }
         review_ids = {node_id: self._review_id(node_id) for node_id in reviewable}
         collisions = set(authored_nodes).intersection(review_ids.values())
@@ -676,6 +783,15 @@ class Scheduler:
             node.node_id: node for node in nodes
         }
         self.nodes: Dict[str, Any] = self._project_nodes(self.authored_nodes)
+        #: Which test-acceptance rules this run's nodes are judged under.
+        #:
+        #: Derived from the plan rather than read from the ledger, so there is
+        #: one authority for "what does accepting a test candidate require"
+        #: and it is the artifact the run is executing. The ledger's
+        #: `runs.test_strength_contract` is the durable *pin* of the same
+        #: fact, written once at `create_run` and compared against this at
+        #: resume; a mismatch is refused there rather than reconciled here.
+        self.test_strength_contract = derive_test_strength_contract(nodes)
         self.plan_digest = plan_digest
         self.plan_name = plan_name
         # Defaults to `time.time` so it matches `started_at` and
@@ -882,9 +998,32 @@ class Scheduler:
                 self.plan_digest,
                 list(self.authored_nodes.values()),
                 plan_name=self.plan_name,
+                test_strength_contract=self.test_strength_contract,
             )
         except lc.RunAlreadyExists:
-            pass
+            # An existing run keeps the contract it was created under. The pin
+            # is compared, never rewritten: a run resumed by a binary that
+            # would derive a different contract from the same plan is a run
+            # whose already-terminal nodes were decided under other rules, and
+            # continuing it under new ones is exactly the retroactive
+            # reclassification the rollout invariant forbids.
+            #
+            # Asked only of a run that **has** tests nodes. A plan with none
+            # derives `STRENGTH_V1` — there is nothing weaker about it — while
+            # every run created before the column reads `LEGACY`, so comparing
+            # the two unconditionally refuses the resume of every run that
+            # already exists, for a contract that governs nothing in it.
+            pinned = self.deps.store.test_strength_contract(self.run_id)
+            governs = any(node.kind is st.NodeKind.TESTS
+                          for node in self.authored_nodes.values())
+            if governs and pinned is not self.test_strength_contract:
+                raise TestStrengthContractMismatch(
+                    "{0} was created under the {1} test-acceptance contract "
+                    "and this plan implies {2}; a run is pinned to the "
+                    "contract it started with. Start a new run rather than "
+                    "resuming this one under different rules.".format(
+                        self.run_id, pinned.value,
+                        self.test_strength_contract.value))
         # This is intentionally also called for a new run.  It either inserts
         # the derived review plus rewired direct downstream edges, or validates
         # the exact durable row a prior scheduler process left behind.
@@ -2536,6 +2675,19 @@ class Scheduler:
                 self._settle_context(context)
                 self._settle_verdict(node, verdict, execution, record)
                 return
+            if self.test_strength_contract is st.TestStrengthContract.STRENGTH_V1:
+                self._require_running(record)
+                paired = self._bind_test_pairing(node, attempt, output_sha)
+                self._require_running(record)
+                if not paired.verified:
+                    if self._continue_after_preacceptance_failure(
+                        node, context, attempt, record, output_sha, paired,
+                        execution, head
+                    ):
+                        return
+                    self._settle_context(context)
+                    self._settle_verdict(node, paired, execution, record)
+                    return
         elif node.kind is st.NodeKind.TESTS:
             self._require_running(record)
             parent_red = self._prove_tests_red_at_parent(node, attempt, measured)
@@ -2544,6 +2696,16 @@ class Scheduler:
                 self._settle_context(context)
                 self._settle_verdict(node, parent_red, execution, record)
                 return
+            if self.test_strength_contract is st.TestStrengthContract.STRENGTH_V1:
+                self._require_running(record)
+                strength = self._prove_test_strength(
+                    node, attempt, measured, output_sha
+                )
+                self._require_running(record)
+                if not strength.verified:
+                    self._settle_context(context)
+                    self._settle_verdict(node, strength, execution, record)
+                    return
 
         # The committed candidate is now immutable, but not mergeable.  The
         # builder stays quiescent in the same worktree while its derived review
@@ -2669,6 +2831,265 @@ class Scheduler:
         new = tc.new_nodeids(parent, current)
         parent_run = tc.run_cases(attempt.path, new)
         return tc.adjudicate_parent_red(parent_run, len(new))
+
+    def _tests_prerequisites(self, node: st.PlanNode) -> Tuple[st.PlanNode, ...]:
+        """The tests nodes this implementation node is gated by.
+
+        Read from the **authored** graph, not the projection: the projection
+        rewrote each dependency to the derived review id, and the thing this
+        needs is the tests node itself and its declared contract.
+        """
+        authored = self.authored_nodes.get(node.node_id)
+        if authored is None:
+            return ()
+        # `authored.needs`, never `node.needs`: the node the worker holds is
+        # the *projected* one, whose dependency on a tests node was rewritten
+        # to that node's derived review id. Reading the projected edge here
+        # finds `tests::review` in `authored_nodes`, finds nothing, and
+        # answers "this implementation is gated by no tests" for every pair in
+        # every run -- which is the field-reads-as-its-default shape §19 M26
+        # records, one layer along.
+        return tuple(
+            self.authored_nodes[dependency]
+            for dependency in authored.needs
+            if self._is_tests_node(dependency)
+        )
+
+    def _bind_test_pairing(
+        self,
+        node: st.PlanNode,
+        attempt: wt.AttemptWorktree,
+        output_sha: str,
+    ) -> "vf.VerificationVerdict":
+        """Bind this implementation candidate to the exact test bytes it passed.
+
+        Three facts, each proven against immutable objects rather than
+        inferred from the tree that happens to be present:
+
+        1. the tests node has an accepted candidate — strong measured
+           evidence and a passed independent review, bound to one sha;
+        2. every file that candidate declared is **byte-identical** in this
+           implementation candidate's own commit. An implementation that
+           edited, weakened, or deleted one of the reviewed test files is not
+           gated by the tests that were reviewed, and letting it inherit that
+           acceptance is obligation 9's substitution;
+        3. the accepted candidate's coverage obligations are green here.
+           That is obligation 5 stated the only way it can be measured: the
+           same selectors, the same cases, now passing against the candidate
+           they were written to gate.
+
+        The pairing row is written last and is the merge check's authority.
+        Without it a merge would have to re-derive all three from mutable
+        state, and the answer would be yes for any test tree present.
+        """
+        for tests_node in self._tests_prerequisites(node):
+            accepted = self.deps.store.accepted_test_candidate(
+                self.run_id, tests_node.node_id
+            )
+            if accepted is None:
+                return self._pairing_refused(
+                    tc.PairingRefusal.NO_ACCEPTED_CANDIDATE,
+                    "{0} has no accepted test candidate, so {1} has nothing "
+                    "to be gated by".format(tests_node.node_id, node.node_id),
+                    retry_class=st.RetryClass.ENVIRONMENTAL,
+                )
+            declared = tuple(tests_node.outputs)
+            try:
+                differing = tc.compare_test_bytes(
+                    Path(attempt.repo), accepted.candidate_sha, output_sha,
+                    declared)
+            except tc.TestsGitReadFailed as exc:
+                return self._pairing_refused(
+                    tc.PairingRefusal.UNREADABLE, str(exc),
+                    retry_class=st.RetryClass.ENVIRONMENTAL)
+            if differing:
+                return self._pairing_refused(
+                    tc.PairingRefusal.BYTES_SUBSTITUTED,
+                    "{0} does not carry the accepted test candidate {1} "
+                    "verbatim; these files differ: {2}".format(
+                        node.node_id, accepted.candidate_sha[:12],
+                        ", ".join(differing)))
+            strength = tests_node.test_strength
+            if strength is None:
+                continue
+            try:
+                runner = tc.case_runner(accepted.runner)
+            except tc.RunnerUnsupported as exc:
+                return self._pairing_refused(
+                    tc.PairingRefusal.UNREADABLE, str(exc),
+                    retry_class=st.RetryClass.ENVIRONMENTAL)
+            collected = runner.collect(attempt.path, declared)
+            positive = runner.run(attempt.path, collected)
+            coverage = tc.measure_coverage(
+                strength.coverage, positive, tc.PASSED)
+            if not coverage.covered:
+                return self._pairing_refused(
+                    tc.PairingRefusal.GATE_NOT_GREEN,
+                    "{0}: {1}".format(coverage.refusal, coverage.reason))
+            self.deps.store.record_test_pairing(
+                self.run_id,
+                node.node_id,
+                tests_node.node_id,
+                accepted_test_sha=accepted.candidate_sha,
+                implementation_sha=output_sha,
+                verifier_command=" ".join(positive.command),
+                selector=" ".join(declared),
+                executed_cases=positive.passed,
+                coverage=coverage.as_mapping(),
+            )
+        return vf.VerificationVerdict(verified=True)
+
+    @staticmethod
+    def _pairing_refused(
+        code: "tc.PairingRefusal",
+        detail: str,
+        retry_class: st.RetryClass = st.RetryClass.SEMANTIC,
+    ) -> "vf.VerificationVerdict":
+        return vf.VerificationVerdict(
+            verified=False,
+            failed_clause=3,
+            reason="{0}: {1}".format(code.value, detail),
+            retry_class=retry_class,
+        )
+
+    def _prove_test_strength(
+        self,
+        node: st.PlanNode,
+        attempt: wt.AttemptWorktree,
+        measured: "wt.InventoryDelta",
+        output_sha: str,
+    ) -> "vf.VerificationVerdict":
+        """Measure the candidate against its declared test-strength contract.
+
+        Runs before the candidate is published for review, so a candidate that
+        cannot discriminate never occupies a reviewer's turn, and the reviewer
+        that does open is reading a candidate whose mechanical facts are
+        already established. The evidence row is written **whether or not the
+        candidate passes**: a rejection that leaves no record is a rejection
+        nobody can audit, and the refusal reason is exactly what the retry
+        prompt carries back to the retained tester.
+
+        Two measurements, one run each:
+
+        1. every coverage obligation selects at least `min_cases` cases that
+           executed and reached a verdict. `EXECUTED`, not `PASSED`, because
+           the implementation these cases gate does not exist yet -- they are
+           all red here, and demanding green would be demanding the pair be
+           built backwards;
+        2. the declared negative control turns the declared cases red for the
+           declared reason.
+
+        **Coverage is measured over every case in the node's own files, not
+        only the new ones.** A tests node that adds a boundary case to an
+        existing file discharges its obligations with the whole file's cases,
+        which is the honest reading of "is this requirement covered". What
+        stops that from accepting a candidate that added nothing is the clause
+        before this one: `_prove_tests_red_at_parent` already requires at
+        least one genuinely new case and requires every new case to be red.
+
+        Nothing here reads the envelope, the agent's report, or a pass count.
+        """
+        strength = node.test_strength
+        runner_name = (node.gate_command[0] if node.gate_command else "")
+        selector = node.gate_selector or ""
+        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
+        if strength is None:
+            uncontracted = tc.GateStrengthEvidence(
+                tests_node_id=node.node_id, candidate_sha=output_sha,
+                runner=runner_name, selector=selector,
+                contract_declared=False)
+            self._record_strength_evidence(
+                node, output_sha, runner_name, selector, uncontracted)
+            return tc.verify_test_strength(uncontracted)
+        try:
+            runner = tc.case_runner(runner_name)
+        except tc.RunnerUnsupported as exc:
+            return vf.VerificationVerdict(
+                verified=False, failed_clause=3, reason=str(exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL)
+        try:
+            current = runner.collect(attempt.path, test_paths)
+            parent = tc.collect_parent_nodeids(
+                attempt.path, attempt.base, test_paths)
+        except tc.TestsGitReadFailed as exc:
+            return vf.VerificationVerdict(
+                verified=False, failed_clause=3,
+                reason="{0}: {1}".format(
+                    tc.TestsRefusal.COLLECTION_FAILED.value, exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL)
+        new = tc.new_nodeids(parent, current)
+        coverage_run = runner.run(attempt.path, current)
+        coverage = tc.measure_coverage(
+            strength.coverage, coverage_run, tc.EXECUTED)
+        falsifiability = tc.FalsifiabilityResult(
+            strategy=str(strength.falsifiability.strategy))
+        if coverage.covered:
+            base = (self.deps.plan_base_commit or "").strip()
+            if (strength.falsifiability.strategy == "controlled_mutation"
+                    and not base):
+                falsifiability = tc.FalsifiabilityResult(
+                    strategy=str(strength.falsifiability.strategy),
+                    refusal=tc.StrengthRefusal.CONTROL_UNEXECUTABLE.value,
+                    reason=("this scheduler was given no plan base commit, so "
+                            "a revert_paths control has no target to revert "
+                            "to; it is refused rather than run against HEAD"))
+            else:
+                try:
+                    falsifiability = tc.execute_negative_control(
+                        falsifiability=strength.falsifiability,
+                        runner=runner,
+                        repo=Path(attempt.repo),
+                        tree=attempt.path,
+                        candidate_sha=output_sha,
+                        base_commit=base or attempt.base,
+                        nodeids=current,
+                        scratch_root=Path(self.deps.scratch_root),
+                        # The coverage run and a `baseline_absent` control are
+                        # the same command over the same immutable tree. Handed
+                        # over rather than re-run, so the reviewer, the ledger
+                        # and the verdict all rest on one execution.
+                        already_executed=coverage_run,
+                    )
+                except (tc.NegativeControlUnexecutable,
+                        tc.TestsGitReadFailed) as exc:
+                    falsifiability = tc.FalsifiabilityResult(
+                        strategy=str(strength.falsifiability.strategy),
+                        refusal=tc.StrengthRefusal.CONTROL_UNEXECUTABLE.value,
+                        reason=str(exc))
+        evidence = tc.GateStrengthEvidence(
+            tests_node_id=node.node_id,
+            candidate_sha=output_sha,
+            runner=runner_name,
+            selector=selector,
+            contract_declared=True,
+            executed_nodeids=tuple(current),
+            new_nodeids=tuple(new),
+            coverage=coverage,
+            falsifiability=falsifiability,
+        )
+        self._record_strength_evidence(
+            node, output_sha, runner_name, selector, evidence)
+        return tc.verify_test_strength(evidence)
+
+    def _record_strength_evidence(
+        self,
+        node: st.PlanNode,
+        output_sha: str,
+        runner_name: str,
+        selector: str,
+        evidence: "tc.GateStrengthEvidence",
+    ) -> None:
+        """Persist the measurement. Exactly once per immutable candidate."""
+        self.deps.store.record_test_gate_evidence(
+            self.run_id,
+            node.node_id,
+            output_sha,
+            runner=runner_name,
+            selector=selector,
+            strong=evidence.strong,
+            refusal=evidence.refusal,
+            evidence=evidence.as_mapping(),
+        )
 
     def _active_actor_generation(
         self, node_id: str, actor_role: str, record: st.AttemptRecord
@@ -2970,6 +3391,10 @@ class Scheduler:
         lifecycle = self.deps.store.get_node(self.run_id, node.node_id)
         if retry_class is st.LaneRetryClass.REVIEW_REJECTION:
             ceiling = self.config.review_ceiling + lifecycle.granted_extra_attempts
+        elif retry_class is st.LaneRetryClass.TEST_REVIEW_REJECTION:
+            ceiling = (
+                self.config.test_review_ceiling + lifecycle.granted_extra_attempts
+            )
         elif retry_class is st.LaneRetryClass.SEMANTIC:
             ceiling = self.config.semantic_ceiling + lifecycle.granted_extra_attempts
         elif retry_class is st.LaneRetryClass.LAUNCHER_TRANSIENT:
@@ -2993,6 +3418,7 @@ class Scheduler:
         if retry_class in (
             st.LaneRetryClass.SEMANTIC,
             st.LaneRetryClass.REVIEW_REJECTION,
+            st.LaneRetryClass.TEST_REVIEW_REJECTION,
         ):
             return spent < ceiling
         # Launcher/environmental settings name retries after the first
@@ -3529,7 +3955,9 @@ class Scheduler:
         self._set_lane_phase(node.node_id, st.LanePhase.REPAIR_HANDOFF, record)
         allowed = replayed_handoff or self._lane_retry(
             node,
-            st.LaneRetryClass.REVIEW_REJECTION,
+            st.LaneRetryClass.TEST_REVIEW_REJECTION
+            if node.kind is st.NodeKind.TESTS
+            else st.LaneRetryClass.REVIEW_REJECTION,
             candidate_sha=candidate.candidate_sha,
             detail={
                 "candidate_sha": candidate.candidate_sha,
@@ -3548,6 +3976,18 @@ class Scheduler:
                 detail={
                     "candidate_sha": candidate.candidate_sha,
                     "findings": list(durable_review.findings),
+                    # Which budget ran out, named in the detail rather than in
+                    # a second BlockReason. The operator escape is identical
+                    # for both -- grant this lane more attempts -- so a second
+                    # terminal vocabulary entry would be two names for one
+                    # exit, while an operator still needs to know whether the
+                    # loop that failed to converge was the tester's or the
+                    # builder's.
+                    "retry_class": (
+                        st.LaneRetryClass.TEST_REVIEW_REJECTION.value
+                        if node.kind is st.NodeKind.TESTS
+                        else st.LaneRetryClass.REVIEW_REJECTION.value
+                    ),
                 },
             )
             return False
@@ -4016,6 +4456,8 @@ class Scheduler:
                         or completed.verdict is not st.ReviewVerdict.PASS
                     ):
                         return
+                if not self._merge_pairing_proven(candidate.node_id, output_sha):
+                    return
 
             result = wt.merge_verified_node(
                 Path(self.deps.integration_path), candidate.node_id, output_sha
@@ -4045,6 +4487,52 @@ class Scheduler:
                 return
             self.deps.store.mark_merged(self.run_id, candidate.node_id)
             self._remove_merged_worktree(candidate.node_id, result.ancestry_proven)
+
+    def _merge_pairing_proven(self, node_id: str, output_sha: str) -> bool:
+        """The merge check for test/implementation pairing.
+
+        Two directions, because the pair has two halves and each can be wrong
+        on its own:
+
+        * a **tests** node merges only when the sha about to be merged is the
+          one that carries strong evidence and a passed review. A tests node
+          whose accepted candidate is some *other* sha would otherwise merge
+          bytes nobody measured;
+        * an **implementation** node merges only when a pairing row exists for
+          exactly `(this node, this implementation sha, that accepted test
+          sha)`. That row is written by `_bind_test_pairing` after the tests
+          were proven byte-identical and green here, so its presence is the
+          durable statement that the exact accepted pair was verified — never
+          a re-derivation at merge time from whatever tree is present.
+
+        A legacy-pinned run is not asked either question. Its nodes were
+        admitted under the contract they were created with, and adding a merge
+        refusal to an in-flight run is precisely the retroactive
+        reclassification the rollout invariant forbids.
+        """
+        if self.test_strength_contract is not st.TestStrengthContract.STRENGTH_V1:
+            return True
+        if self._is_tests_node(node_id):
+            accepted = self.deps.store.accepted_test_candidate(
+                self.run_id, node_id)
+            return accepted is not None and accepted.candidate_sha == output_sha
+        node = self.authored_nodes.get(node_id)
+        if node is None:
+            return True
+        for tests_node in self._tests_prerequisites(node):
+            accepted = self.deps.store.accepted_test_candidate(
+                self.run_id, tests_node.node_id)
+            if accepted is None:
+                return False
+            paired = self.deps.store.test_pairings(
+                self.run_id, node_id, output_sha)
+            if not any(
+                row.tests_node_id == tests_node.node_id
+                and row.accepted_test_sha == accepted.candidate_sha
+                for row in paired
+            ):
+                return False
+        return True
 
     def _remove_merged_worktree(self, node_id: str, ancestry_proven: bool) -> None:
         """§8.8's cleanup for a node that merged with its ancestry proven.

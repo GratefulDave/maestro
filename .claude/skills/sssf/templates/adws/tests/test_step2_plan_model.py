@@ -94,15 +94,22 @@ class ModelShapeTests(unittest.TestCase):
         in a docstring drifts, and a member added without a decision is how
         a closed set stops being one.
 
+        Five more arrived with `maestro-plan.v4`'s test-strength contract:
+        `TestsNodeV4` and the four types that contract is made of. They are
+        listed here rather than exempted because the whole value of this
+        assertion is that adding a type is a decision somebody records.
+
         MAESTRO_architecture.md §6.2 still reads "nine in-plan types" and has
         to be brought level with this; the count here is the enforced one.
         """
-        self.assertEqual(len(pm.IN_PLAN_TYPES), 11)
+        self.assertEqual(len(pm.IN_PLAN_TYPES), 16)
         self.assertEqual(
             {cls.__name__ for cls in pm.IN_PLAN_TYPES},
             {"Plan", "Observed", "Produced", "Hypothesis", "Gate",
-             "AgentNode", "CodeNode", "TestsNode", "MergePolicy",
-             "PromptAsset", "NodeEffect"})
+             "AgentNode", "CodeNode", "TestsNode", "TestsNodeV4",
+             "MergePolicy", "PromptAsset", "NodeEffect",
+             "CoverageObligation", "ControlledMutation", "Falsifiability",
+             "TestStrength"})
 
     def test_exactly_three_evidence_types(self):
         self.assertEqual(len(pm.EVIDENCE_TYPES), 3)

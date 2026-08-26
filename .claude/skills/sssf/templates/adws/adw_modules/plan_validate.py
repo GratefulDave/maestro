@@ -101,6 +101,13 @@ class Obligation(str, Enum):
     `TESTS_BUILD_PAIRED` is the fifteenth: a `tests` node is not an agent
     node, and without this check a tests node with no dependent, or a build
     node that still owns the test files, would parse.
+
+    `TEST_STRENGTH_COHERENT` is the sixteenth. `maestro-plan.v4`'s
+    `TestStrength` model already refuses a contract that is internally
+    malformed; this refuses one that is well-formed and still unexecutable
+    against *this* plan — a controlled mutation naming paths no node
+    produces, or naming the tester's own test files, which reverts the
+    evidence rather than the behaviour it is evidence about.
     """
 
     CLOSED_PARSE = "CLOSED_PARSE"
@@ -118,6 +125,7 @@ class Obligation(str, Enum):
     GATE_SELECTOR_NODE_SCOPED = "GATE_SELECTOR_NODE_SCOPED"
     INTEGRATION_GATE_COVERS_LANES = "INTEGRATION_GATE_COVERS_LANES"
     TESTS_BUILD_PAIRED = "TESTS_BUILD_PAIRED"
+    TEST_STRENGTH_COHERENT = "TEST_STRENGTH_COHERENT"
 
 
 #: Named as a tuple as well as an enum so the count is checkable rather than
@@ -138,6 +146,7 @@ OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.GATE_SELECTOR_NODE_SCOPED,
     Obligation.INTEGRATION_GATE_COVERS_LANES,
     Obligation.TESTS_BUILD_PAIRED,
+    Obligation.TEST_STRENGTH_COHERENT,
 )
 
 
@@ -893,6 +902,84 @@ def _tests_build_paired(plan: "pm.Plan") -> List[Blocker]:
 
 
 
+def _test_strength_coherent(plan: "pm.Plan") -> List[Blocker]:
+    """A declared test-strength contract must be executable against **this**
+    plan (§6.4's sixteenth obligation).
+
+    `TestStrength` already refuses a contract that is malformed on its own
+    terms — no negative obligation for a requirement, a mutation strategy with
+    no mutation, an `expected_reason_pattern` that is not a regular
+    expression. What it cannot see is the graph. Three things are only
+    checkable here:
+
+    * a `revert_paths` mutation must revert paths the **paired build node**
+      declares as outputs. Reverting anything else proves nothing about the
+      behaviour these tests gate;
+    * it must not revert the tests node's own files. That is a negative
+      control over the evidence rather than over the behaviour, and it is red
+      for the trivial reason that the cases are gone;
+    * a tests node with a contract must declare the test files it writes, or
+      there is nothing for the coverage obligations to be measured over.
+
+    A plan whose tests nodes declare no contract (v1, v2, v3) produces no
+    blockers. Those versions stay valid and stay resumable; what refuses them
+    is `maestro run start`, which will not *create* a run under a contract the
+    plan cannot express.
+    """
+    blockers: List[Blocker] = []
+    builders: Dict[str, List[str]] = {}
+    for node in plan.nodes:
+        if not isinstance(node, pm.AgentNode):
+            continue
+        for needed in node.needs:
+            builders.setdefault(needed, []).append(node.node_id)
+    by_id = plan.node_by_id()
+    for index, node in enumerate(plan.nodes):
+        strength = getattr(node, "test_strength", None)
+        if strength is None:
+            continue
+        pointer = "/nodes/{0}".format(index)
+        if not node.outputs:
+            blockers.append(Blocker(
+                Obligation.TEST_STRENGTH_COHERENT, pointer + "/outputs",
+                "{0} declares a test-strength contract but no outputs; there "
+                "are no test files for its coverage obligations to be "
+                "measured over".format(node.node_id)))
+        falsifiability = strength.falsifiability
+        mutation = falsifiability.mutation
+        if mutation is None:
+            continue
+        owned = {_norm(path) for path in node.outputs}
+        paired = builders.get(node.node_id) or []
+        buildable: set = set()
+        for builder_id in paired:
+            builder = by_id.get(builder_id)
+            if builder is not None:
+                buildable |= {_norm(path) for path in builder.outputs}
+        for path in mutation.paths:
+            normalized = _norm(path)
+            if normalized in owned:
+                blockers.append(Blocker(
+                    Obligation.TEST_STRENGTH_COHERENT,
+                    pointer + "/test_strength/falsifiability/mutation/paths",
+                    "{0}'s negative control reverts its own test file {1}; "
+                    "that is red because the cases are gone, which proves "
+                    "nothing about the behaviour they gate".format(
+                        node.node_id, path)))
+                continue
+            if normalized not in buildable:
+                blockers.append(Blocker(
+                    Obligation.TEST_STRENGTH_COHERENT,
+                    pointer + "/test_strength/falsifiability/mutation/paths",
+                    "{0}'s negative control reverts {1}, which is not an "
+                    "output of the build node it gates ({2}); reverting a "
+                    "path this pair does not produce is not a control over "
+                    "this pair's behaviour".format(
+                        node.node_id, path,
+                        ", ".join(paired) if paired else "(none)")))
+    return blockers
+
+
 def validate_plan(stored: bytes, repo: Union[str, Path], *,
                   receipts: ReceiptIndex, collector: GateCollector,
                   config: Optional[ValidationConfig] = None) -> ValidationResult:
@@ -961,6 +1048,7 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
     blockers.extend(_gate_selector_node_scoped(plan))
     blockers.extend(_integration_gate_covers_lanes(plan))
     blockers.extend(_tests_build_paired(plan))
+    blockers.extend(_test_strength_coherent(plan))
 
     if blockers:
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))

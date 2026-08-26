@@ -263,6 +263,31 @@ class IngressProjectionTotalityTest(IngressFixture):
         draft = pci.project_draft(ir, self.repo)
         node = dict(draft["nodes"][0])
         node["kind"] = "tests"
+        # A tests node carries the contract its cases must discharge. Without
+        # it the guard raises — which is the case below, asserted rather than
+        # assumed, because "the emitted node is missing a field the
+        # destination declares" is exactly what this guard exists for and
+        # `test_strength` is the newest field it has to see.
+        with self.assertRaises(pci.IngressProjectionIncomplete) as absent:
+            pci._assert_ingress_projection_is_total(
+                ir, ir["lanes"][0], ir["verifiers"][0], node
+            )
+        self.assertIn("test_strength", str(absent.exception))
+
+        node["test_strength"] = {
+            "coverage": [
+                {"requirement_id": "R1", "aspect": "positive",
+                 "case_selector": "test_pays", "min_cases": 1},
+                {"requirement_id": "R1", "aspect": "negative",
+                 "case_selector": "test_rejects", "min_cases": 1},
+            ],
+            "falsifiability": {
+                "strategy": "baseline_absent",
+                "mutation": None,
+                "expected_failing_selector": "test_",
+                "expected_reason_pattern": "AssertionError",
+            },
+        }
         pci._assert_ingress_projection_is_total(
             ir, ir["lanes"][0], ir["verifiers"][0], node
         )

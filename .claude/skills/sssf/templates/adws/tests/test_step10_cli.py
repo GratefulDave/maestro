@@ -1412,7 +1412,7 @@ class OperatorCliTest(unittest.TestCase):
                     maestro,
                     "_load_runnable_plan",
                     return_value=SimpleNamespace(
-                        agent_nodes=(),
+                                agent_nodes=(),
                         merge_policy=SimpleNamespace(
                             integration_branch="main",
                             integration_gate=SimpleNamespace(

@@ -72,6 +72,12 @@ execution:
   # from semantic_ceiling. Three total: reject, reject, reject -> the lane
   # blocks REVIEW_BUDGET_EXHAUSTED with the findings reported.
   review_ceiling: 3
+  # Attempts a tests node may spend on test-review rejections, counted
+  # separately from review_ceiling. A rejected test candidate is corrected by
+  # writing cases that did not exist, which converges differently from
+  # repairing a diff whose gate is already green -- one shared counter would
+  # let the tester spend the builder's budget.
+  test_review_ceiling: 3
   # Section 3.6 A9: the grade at which a reviewer's finding refuses the merge.
   # The ceiling above bounds how many rejections a node may collect; this
   # decides what counts as one, which is the half a bound cannot supply --
@@ -114,7 +120,10 @@ execution:
   # `concurrency` provisions may share the download cache at once.
 tester:
   route: omp
-  model: xai-oauth/grok-4.6
+  # The omp route's argv is `omp --profile <profile> --session-dir <dir>`:
+  # `model` and `effort` are never passed. They stay here only because the
+  # config loader still requires them on every lane.
+  model: deepseek/deepseek-v4-flash:auto
   effort: high
-  profile: tester
-  vendor: xai
+  profile: deepseek
+  vendor: deepseek

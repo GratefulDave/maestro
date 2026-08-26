@@ -215,6 +215,86 @@ def test_mdl_cases_carries_a_docket_number():
   zero or several verifiers is refused with `maestro.lane_gate`. When a lane genuinely needs two
   independent checks, either widen one command's selector to cover both or split the lane.
 
+## What a tests lane must declare
+
+A `tests` lane writes the tests a later build lane has to make pass. It also declares **what those
+tests must prove**, in a field the runtime executes rather than reads.
+
+You author it on the lane's **verifier**, in the plan-contract IR:
+
+```json
+"verifiers": [
+  {
+    "verifier_id": "verify-refund-tests",
+    "lane_ids": ["lane-refund-tests"],
+    "command": "pytest tests/test_refund.py",
+    "min_executed": 2,
+    "test_strength": { … the object below … }
+  }
+]
+```
+
+`maestro plan ship` projects it onto the tests node and emits `maestro-plan.v4`. A tests lane
+whose verifier declares none is refused at projection with
+`UNMAPPABLE_VERIFIERS:<lane>.test_strength`, and a build lane's verifier that declares one is
+refused the same way — it would be a field nothing reads. The projected node looks like this:
+
+```json
+"test_strength": {
+  "coverage": [
+    {"requirement_id": "R-refund-01", "aspect": "positive",
+     "case_selector": "test_refund_pays_the_balance", "min_cases": 1},
+    {"requirement_id": "R-refund-01", "aspect": "negative",
+     "case_selector": "test_refund_rejects_a_negative_amount", "min_cases": 1}
+  ],
+  "falsifiability": {
+    "strategy": "baseline_absent",
+    "mutation": null,
+    "expected_failing_selector": "test_refund",
+    "expected_reason_pattern": "refund must be positive"
+  }
+}
+```
+
+`maestro run start` refuses a plan whose tests lanes declare none —
+`RUN_TEST_STRENGTH_CONTRACT_ABSENT`. An existing run of an older plan is unaffected and stays
+resumable; it is pinned to the contract it was created under. There is no upgrade function and no
+in-place edit (§6.3): add the block to the IR and re-ship.
+
+**Why the plan declares the case names.** §1.2 forbids keying a lifecycle transition on an agent's
+account of its own work, so the tester is never asked whether it covered a requirement. The plan
+says which case ids would prove it did, and code counts them. `case_selector` is a substring of the
+case id (`path::case` under pytest, `file::full name` under vitest), because it has to mean the same
+thing under both runners and they disagree about `-k` and `--testNamePattern`.
+
+**Every requirement needs a positive and a negative obligation.** A contract that names only happy
+paths does not parse. That rule exists because of one measured run: a tests lane reached `MERGED` on
+four non-skipped cases and every implementation candidate it existed to gate was independently
+rejected — the tests asserted what the code should do and never what it must refuse.
+
+**The falsifiability strategy is executed, not stored.**
+
+| strategy | what runs | when to use it |
+| --- | --- | --- |
+| `baseline_absent` | the candidate's own cases, in a tree where the implementation does not exist yet | test-first: the paired build lane has not run |
+| `controlled_mutation` | the same cases against a scratch copy with `mutation.paths` reverted to the plan's `base_commit` | brownfield: the behaviour already exists and the control must remove it |
+
+The failure must **match** `expected_reason_pattern` — a Python regular expression over the runner's
+own reported reason. A random exception, an import error, or a collection failure is refused by
+name: it proves the tree does not import, not that the cases discriminate. A `controlled_mutation`
+may only revert paths the **paired build lane** declares as outputs, and never the tests lane's own
+files; both are refused at admission with `TEST_STRENGTH_COHERENT`.
+
+Nothing is mutated in place. The control materialises the candidate commit into a scratch directory
+outside every worktree, reverts there, and discards it; the attempt worktree's cleanliness is
+compared across the whole operation and a control that leaves dirt behind is refused.
+
+**What the pair costs downstream.** The build lane that needs this tests lane cannot start until the
+tests lane has an *accepted candidate* — strong measured evidence **and** a passed independent
+review, both bound to one immutable sha. When it does run, its own commit must carry the accepted
+test files byte-identically, and the accepted contract's coverage obligations must be green against
+it. The merge verifies that exact pair and refuses anything else.
+
 ## What a lane's outputs must cover
 
 A lane's `outputs` are not a summary of what it will touch. They are its entire write permission.
