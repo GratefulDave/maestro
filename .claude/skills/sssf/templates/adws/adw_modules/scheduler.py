@@ -59,8 +59,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
-                    Tuple)
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import code_review as cr
 from . import launcher as lch
@@ -130,28 +129,91 @@ class NodeExecution:
     envelope_payload: Optional[Mapping[str, Any]] = None
 
 
+@dataclass(frozen=True)
+class RepairExecution:
+    """A persistent builder's typed response to one repair handoff.
+
+    The acknowledgement is deliberately returned beside, but not folded into,
+    ``NodeExecution``: an agent envelope describes one completed node
+    execution, while a repair acknowledgement authorizes delivery of findings
+    about a *previous immutable candidate*.  Joining the two would let a
+    stale acknowledgement be mistaken for the current execution's result.
+    """
+
+    execution: NodeExecution
+    acknowledged_rejected_sha: str
+    builder_generation: int
+
+
 #: Runner boundaries receive the scheduler's cancellation lease explicitly.
 #: They MUST use it while waiting so no gate or owned execution can outlive
 #: the RUNNING generation that authorized it.
 CancelRequested = Callable[[], bool]
-NodeRunner = Callable[[
-    wt.AttemptWorktree, st.PlanNode, st.AttemptRecord, Optional[str],
-    Callable[[Optional[int]], None], CancelRequested,
-], NodeExecution]
-GateRunner = Callable[[
-    wt.AttemptWorktree, st.PlanNode, str, CancelRequested,
-], "wt.GateResult"]
-IntegrationGateRunner = Callable[[
-    Path, Sequence[str], CancelRequested,
-], "wt.GateResult"]
+NodeRunner = Callable[
+    [
+        wt.AttemptWorktree,
+        st.PlanNode,
+        st.AttemptRecord,
+        Optional[str],
+        Callable[[Optional[int]], None],
+        CancelRequested,
+    ],
+    NodeExecution,
+]
+GateRunner = Callable[
+    [
+        wt.AttemptWorktree,
+        st.PlanNode,
+        str,
+        CancelRequested,
+    ],
+    "wt.GateResult",
+]
+IntegrationGateRunner = Callable[
+    [
+        Path,
+        Sequence[str],
+        CancelRequested,
+    ],
+    "wt.GateResult",
+]
 QuiesceAttempt = Callable[[st.AttemptRecord, str], None]
-#: `(attempt, node, record, base_sha, output_sha) -> code_review.ReviewOutcome`.
+#: ``(attempt, node, record, base_sha, output_sha,
+#: resume_existing_dispatch) -> code_review.ReviewOutcome``.
+#: The final flag distinguishes a newly-created dispatch from an unfinished
+#: durable dispatch whose retained actor/report must be adopted on resume.
 #: Raises `code_review.ReviewStalled` when the reviewer never reported, which
 #: the scheduler classifies ENVIRONMENTAL — a wedged reviewer is a fact about
 #: the machine, and must not spend a node's review budget.
-ReviewRunner = Callable[[
-    wt.AttemptWorktree, st.PlanNode, st.AttemptRecord, str, str,
-], Any]
+ReviewRunner = Callable[
+    [
+        wt.AttemptWorktree,
+        st.PlanNode,
+        st.AttemptRecord,
+        str,
+        str,
+        bool,
+    ],
+    Any,
+]
+
+#: Resume the existing builder pane/session after a candidate rejection.
+#: The repair acknowledgement names the rejected immutable candidate and the
+#: generation which accepted it, so a late response can never authorize a
+#: different handoff.
+ContinueRunner = Callable[
+    [
+        wt.AttemptWorktree,
+        st.PlanNode,
+        st.AttemptRecord,
+        str,
+        str,
+        int,
+        CancelRequested,
+    ],
+    RepairExecution,
+]
+CloseReview = Callable[[str], None]
 
 
 class QuiescenceDependencyError(ValueError):
@@ -268,9 +330,9 @@ class LaunchFailed(RuntimeError):
         return self.failure
 
 
-
 class DurableOutputIdentityError(RuntimeError):
     """A terminal durable row names no verifiable commit identity."""
+
 
 @dataclass
 class SchedulerDeps:
@@ -287,8 +349,9 @@ class SchedulerDeps:
     run_integration_gate: IntegrationGateRunner
     quiesce_attempt: QuiesceAttempt
     #: Re-read a declaration from an existing attempt; never launches.
-    recover_node: Optional[Callable[
-        [wt.AttemptWorktree, st.AttemptRecord], Optional[NodeExecution]]] = None
+    recover_node: Optional[
+        Callable[[wt.AttemptWorktree, st.AttemptRecord], Optional[NodeExecution]]
+    ] = None
 
     #: §10.2's threshold for the ONE integration gate this run ends with
     #: (§8.8), taken from `merge_policy.integration_gate.min_cases`.
@@ -323,6 +386,15 @@ class SchedulerDeps:
     #: unreviewed path is reachable only by a caller that constructs
     #: `SchedulerDeps` itself and omits it.
     review_attempt: Optional[ReviewRunner] = None
+    #: Submit a repair handoff to the existing builder session.  A replacement
+    #: builder is an actor-session recovery concern, never an attempt retry.
+    continue_node: Optional[ContinueRunner] = None
+    #: Close the lane's persistent reviewer only after the lane is terminal.
+    close_review: Optional[CloseReview] = None
+    #: Resolves immutable review evidence to its confined signed receipt path.
+    #: The review outcome intentionally carries a receipt value, not storage
+    #: ownership, so this remains a runtime-provided seam.
+    receipt_path_for: Optional[Callable[[str], str]] = None
     #: Raw per-pane agent status for the watchdog's turn clock (#107 / B14).
     #: Never `observe()` — that call collapses idle into RUNNING. `None` is
     #: not an observation of work: the clock still fires. `maestro run start`
@@ -333,7 +405,8 @@ class SchedulerDeps:
         if self.quiesce_attempt is None:
             raise QuiescenceDependencyError(
                 "quiesce_attempt is required: a scheduler cannot classify or "
-                "retry while owned execution may still exist")
+                "retry while owned execution may still exist"
+            )
 
 
 @dataclass
@@ -351,6 +424,26 @@ class AcceptanceResult:
     gate: Optional["wt.GateResult"] = None
     ancestry: Dict[str, bool] = field(default_factory=dict)
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class _DerivedReviewNode:
+    """Scheduler-owned review edge; never an authored ``PlanNode``.
+
+    ``PlanNode`` deliberately refuses ``NodeKind.REVIEW`` so an authored plan
+    cannot make review optional.  The lifecycle projection nevertheless needs
+    the same graph fields as a plan node.  Keeping this private structural
+    value here preserves that authored-schema boundary while making the
+    scheduler's derived edge explicit and durable.
+    """
+
+    node_id: str
+    review_of: str
+    depth: int
+    needs: Tuple[str, ...]
+    kind: st.NodeKind = st.NodeKind.REVIEW
+    outputs: Tuple[str, ...] = ()
+    specs: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -389,6 +482,9 @@ class RunReport:
     #: rather than by hand. Rebuilt from the attempt rows on resume, so it
     #: reports the whole run rather than whichever process finished it.
     review_convergence: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
+    #: Scheduler-derived review-node state by stable review id.  These nodes
+    #: are not sources and therefore never appear in ``merged``.
+    review_nodes: Dict[str, str] = field(default_factory=dict)
 
     @property
     def integration_untested(self) -> bool:
@@ -406,15 +502,180 @@ class Scheduler:
     one would be the overloaded role §4's RC4 convicts.
     """
 
-    def __init__(self, run_id: str, nodes: Sequence[st.PlanNode],
-                 config: st.SchedulerConfig, deps: SchedulerDeps,
-                 plan_digest: str = "",
-                 plan_name: Optional[str] = None,
-                 time_source: Callable[[], float] = time.time) -> None:
+    @staticmethod
+    def _review_id(build_node_id: str) -> str:
+        return f"{build_node_id}::review"
+
+    @staticmethod
+    def _is_derived_review(node: Any) -> bool:
+        return isinstance(node, _DerivedReviewNode)
+
+    def _derived_review_nodes(self) -> Tuple[_DerivedReviewNode, ...]:
+        return tuple(
+            node for node in self.nodes.values() if self._is_derived_review(node)
+        )
+
+    def _downstream_authored_nodes(self, build_node_id: str) -> Tuple[str, ...]:
+        return tuple(
+            node.node_id
+            for node in self.authored_nodes.values()
+            if build_node_id in node.needs
+        )
+
+    def _runnable_ready_nodes(self) -> Tuple[str, ...]:
+        """Ready authored nodes, treating ACCEPTED review edges as satisfied."""
+        # Preserve the lifecycle store's ready-query boundary: operators and
+        # cancellation tests may observe between-frontier readiness there.
+        self.deps.store.ready_nodes(self.run_id)
+        return tuple(
+            record.node_id
+            for record in self.deps.store.node_records(self.run_id)
+            if (
+                record.state == st.NodeState.PENDING.value
+                and record.node_id in self.nodes
+                and not self._is_derived_review(self.nodes[record.node_id])
+                and all(
+                    self._dependency_satisfied(dependency)
+                    for dependency in record.needs
+                )
+            )
+        )
+
+    def _review_for_build(self, build_node_id: str) -> Optional[_DerivedReviewNode]:
+        review = self.nodes.get(self._review_id(build_node_id))
+        return review if self._is_derived_review(review) else None
+
+    def _review_is_accepted(self, review_node_id: str) -> bool:
+        return (
+            self.deps.store.get_node(self.run_id, review_node_id).state
+            is st.NodeState.ACCEPTED
+        )
+
+    def _merge_records(
+        self, records: Sequence["wt.NodeRecord"]
+    ) -> Tuple["wt.NodeRecord", ...]:
+        """Present accepted review edges as satisfied, never merge candidates."""
+        return tuple(
+            record.with_state(st.NodeState.MERGED.value)
+            if (
+                self._is_derived_review(self.nodes.get(record.node_id))
+                and record.state == st.NodeState.ACCEPTED.value
+            )
+            else record
+            for record in records
+        )
+
+    def _dependency_satisfied(self, node_id: str) -> bool:
+        node = self.nodes.get(node_id)
+        if self._is_derived_review(node):
+            return self._review_is_accepted(node_id) and _is_merged(
+                self.deps.store, self.run_id, node.review_of
+            )
+        return _is_merged(self.deps.store, self.run_id, node_id)
+
+    def _project_nodes(
+        self, authored_nodes: Mapping[str, st.PlanNode]
+    ) -> Dict[str, Any]:
+        """Overlay mandatory review edges without mutating authored nodes."""
+        if self.deps.review_attempt is None:
+            return dict(authored_nodes)
+
+        reviewable = {
+            node_id
+            for node_id, node in authored_nodes.items()
+            if node.kind is st.NodeKind.AGENT
+        }
+        review_ids = {node_id: self._review_id(node_id) for node_id in reviewable}
+        collisions = set(authored_nodes).intersection(review_ids.values())
+        if collisions:
+            raise ValueError(
+                "an authored node collides with the scheduler-derived review id: "
+                + ", ".join(sorted(collisions))
+            )
+
+        needs = {
+            node_id: tuple(
+                review_ids.get(dependency, dependency) for dependency in node.needs
+            )
+            for node_id, node in authored_nodes.items()
+        }
+        projected: Dict[str, Any] = dict(authored_nodes)
+        for build_node_id in sorted(reviewable):
+            build = authored_nodes[build_node_id]
+            projected[review_ids[build_node_id]] = _DerivedReviewNode(
+                node_id=review_ids[build_node_id],
+                review_of=build_node_id,
+                depth=build.depth + 1,
+                needs=(build_node_id,),
+                specs=(),
+            )
+
+        # A derived edge lengthens every path below the reviewed build.  Keep
+        # authored depths as lower bounds, then lift only runtime projection
+        # depths needed to retain a truthful topological order.
+        source_depth = {node_id: node.depth for node_id, node in projected.items()}
+        projected_needs = {
+            **needs,
+            **{
+                review_id: (build_node_id,)
+                for build_node_id, review_id in review_ids.items()
+            },
+        }
+        visiting = set()
+        resolved_depth: Dict[str, int] = {}
+
+        def depth_for(node_id: str) -> int:
+            if node_id in resolved_depth:
+                return resolved_depth[node_id]
+            if node_id in visiting:
+                raise ValueError(f"{node_id}: dependency graph contains a cycle")
+            visiting.add(node_id)
+            dependencies = projected_needs[node_id]
+            depth = source_depth[node_id]
+            if dependencies:
+                try:
+                    depth = max(depth, max(depth_for(dep) + 1 for dep in dependencies))
+                except KeyError as exc:
+                    raise ValueError(
+                        f"{node_id}: dependency {exc.args[0]!r} is not a plan node"
+                    ) from exc
+            visiting.remove(node_id)
+            resolved_depth[node_id] = depth
+            return depth
+
+        for node_id in projected:
+            depth_for(node_id)
+        for node_id, node in tuple(projected.items()):
+            node_needs = projected_needs[node_id]
+            if self._is_derived_review(node):
+                projected[node_id] = replace(
+                    node, depth=resolved_depth[node_id], needs=node_needs
+                )
+            elif node.needs != node_needs or node.depth != resolved_depth[node_id]:
+                projected[node_id] = replace(
+                    node, depth=resolved_depth[node_id], needs=node_needs
+                )
+        return projected
+
+    def __init__(
+        self,
+        run_id: str,
+        nodes: Sequence[st.PlanNode],
+        config: st.SchedulerConfig,
+        deps: SchedulerDeps,
+        plan_digest: str = "",
+        plan_name: Optional[str] = None,
+        time_source: Callable[[], float] = time.time,
+    ) -> None:
         self.run_id = run_id
-        self.nodes: Dict[str, st.PlanNode] = {n.node_id: n for n in nodes}
         self.config = config
         self.deps = deps
+        # PlanNode remains the exact authored schema.  `self.nodes` is the
+        # runtime DAG that additionally owns derived review edges.
+        self.authored_nodes: Dict[str, st.PlanNode] = {
+            node.node_id: node for node in nodes
+        }
+        self.nodes: Dict[str, Any] = self._project_nodes(self.authored_nodes)
         self.plan_digest = plan_digest
         self.plan_name = plan_name
         # Defaults to `time.time` so it matches `started_at` and
@@ -507,16 +768,105 @@ class Scheduler:
 
     # ── lifecycle of the scheduler itself ───────────────────────────────────
 
+    def _reconcile_accepted_pass_crash(self) -> None:
+        """Complete the sole crash seam after an accepted PASS.
+
+        Lane phase must be written while the builder still owns its RUNNING
+        attempt.  A process can therefore die after that terminal phase is
+        durable but before the source node reaches VERIFIED.  The sealed
+        attempt output and exact accepted review are sufficient authority to
+        complete only that interrupted transition; anything less is blocked
+        rather than left as an invisible RUNNING node on resume.
+        """
+        store = self.deps.store
+        for node in self.authored_nodes.values():
+            review_node = self._review_for_build(node.node_id)
+            if review_node is None:
+                continue
+            lifecycle = store.get_node(self.run_id, node.node_id)
+            if (
+                lifecycle.state is not st.NodeState.RUNNING
+                or lifecycle.lane_phase is not st.LanePhase.ACCEPTED
+                or not lifecycle.attempt_no
+            ):
+                continue
+            try:
+                attempt = store.get_attempt(
+                    self.run_id, node.node_id, lifecycle.attempt_no
+                )
+            except lc.UnknownNode:
+                attempt = None
+            output_sha = (
+                None
+                if attempt is None
+                else store.attempt_sealed_output(
+                    self.run_id, node.node_id, lifecycle.attempt_no
+                )
+            )
+            completed = (
+                None
+                if output_sha is None
+                else store.candidate_review(
+                    self.run_id, review_node.node_id, output_sha
+                )
+            )
+            valid = (
+                attempt is not None
+                and output_sha is not None
+                and wt.is_attempt_output_commit(
+                    Path(self.deps.repo),
+                    output_sha,
+                    run_id=self.run_id,
+                    node_id=node.node_id,
+                    attempt_no=lifecycle.attempt_no,
+                    expected_base=attempt.base_sha,
+                )
+                and completed is not None
+                and completed.verdict is st.ReviewVerdict.PASS
+                and self._review_is_accepted(review_node.node_id)
+            )
+            if not valid:
+                store.mark_blocked(
+                    self.run_id,
+                    node.node_id,
+                    st.BlockReason.OUTPUT_IDENTITY_INVALID,
+                    detail={
+                        "reason": (
+                            "accepted lane phase lacks the sealed exact PASS "
+                            "needed to finish verification"
+                        )
+                    },
+                )
+                continue
+            store.mark_verified(self.run_id, node.node_id, output_sha)
+            self._output_shas[node.node_id] = output_sha
+
     def project(self) -> None:
         """Write the DAG projection, once (§7.1)."""
         if self._projected:
             return
         try:
-            self.deps.store.create_run(self.run_id, self.plan_digest,
-                                       list(self.nodes.values()),
-                                       plan_name=self.plan_name)
+            # The store's explicit review-projection API is the only writer of
+            # derived rows.  Pass authored nodes here so an interrupted fresh
+            # run is resumed through the same idempotent seam as an old run.
+            self.deps.store.create_run(
+                self.run_id,
+                self.plan_digest,
+                list(self.authored_nodes.values()),
+                plan_name=self.plan_name,
+            )
         except lc.RunAlreadyExists:
             pass
+        # This is intentionally also called for a new run.  It either inserts
+        # the derived review plus rewired direct downstream edges, or validates
+        # the exact durable row a prior scheduler process left behind.
+        for review in self._derived_review_nodes():
+            self.deps.store.ensure_derived_review_node(
+                self.run_id,
+                review.review_of,
+                depth=review.depth,
+                downstream_needs=self._downstream_authored_nodes(review.review_of),
+            )
         # This process now owns the run, whether it just projected the plan or
         # adopted an existing projection. Recorded durably because it is the
         # only fact that can later contradict a reader calling a dead run live:
@@ -526,11 +876,18 @@ class Scheduler:
         # path too — that is a second process taking over a run the ledger
         # still attributes to the first.
         self.deps.store.claim_run(self.run_id)
+        self._reconcile_accepted_pass_crash()
+
         # Both durable states carry authority only after their persisted SHA is
         # revalidated. A crash after VERIFIED has no in-memory output map, so
         # excluding it would strand a ready merge forever; trusting an
         # unverified string would let a corrupt row choose the merge input.
-        for node_id in self.nodes:
+        for node_id, node in self.nodes.items():
+            # Reviews carry verdict evidence, never a source commit.  Treating
+            # their terminal state as an output SHA would both reject a sound
+            # resume and let a review enter the merge frontier.
+            if self._is_derived_review(node):
+                continue
             row = self.deps.store.get_node(self.run_id, node_id)
             if row.state not in (st.NodeState.VERIFIED, st.NodeState.MERGED):
                 continue
@@ -539,42 +896,57 @@ class Scheduler:
             if valid and row.state is st.NodeState.VERIFIED:
                 try:
                     attempt = self.deps.store.get_attempt(
-                        self.run_id, node_id, row.attempt_no)
+                        self.run_id, node_id, row.attempt_no
+                    )
                 except lc.UnknownNode:
                     valid = False
                 else:
-                    valid = (attempt.state is st.NodeState.VERIFIED
-                             and wt.is_attempt_output_commit(
-                                 Path(self.deps.repo), output_sha,
-                                 run_id=self.run_id, node_id=node_id,
-                                 attempt_no=row.attempt_no,
-                                 expected_base=attempt.base_sha))
+                    valid = (
+                        attempt.state is st.NodeState.VERIFIED
+                        and wt.is_attempt_output_commit(
+                            Path(self.deps.repo),
+                            output_sha,
+                            run_id=self.run_id,
+                            node_id=node_id,
+                            attempt_no=row.attempt_no,
+                            expected_base=attempt.base_sha,
+                        )
+                    )
             elif valid:
-                valid = (
-                    wt.is_valid_output_commit(
-                        Path(self.deps.integration_path), output_sha)
-                    and wt.final_ancestry_sweep(
-                        Path(self.deps.integration_path),
-                        {node_id: output_sha}).get(node_id, False))
+                valid = wt.is_valid_output_commit(
+                    Path(self.deps.integration_path), output_sha
+                ) and wt.final_ancestry_sweep(
+                    Path(self.deps.integration_path), {node_id: output_sha}
+                ).get(node_id, False)
             if not valid:
                 if row.state is st.NodeState.VERIFIED:
                     self.deps.store.mark_blocked(
-                        self.run_id, node_id, st.BlockReason.OUTPUT_IDENTITY_INVALID)
+                        self.run_id, node_id, st.BlockReason.OUTPUT_IDENTITY_INVALID
+                    )
                     continue
                 raise DurableOutputIdentityError(
-                    f"{self.run_id}/{node_id}: MERGED output identity is invalid")
+                    f"{self.run_id}/{node_id}: MERGED output identity is invalid"
+                )
             self._output_shas[node_id] = output_sha
-        # The ledger and the convergence series are both derived state, and
-        # both used to be built only by the process that observed the
-        # failures. A resumed run therefore told its builder nothing about
-        # why the earlier attempts were rejected and reported a convergence
-        # series starting from whichever attempt this process happened to
-        # see. Both are rebuilt from the durable attempt rows here, which is
-        # the only place a resumed scheduler learns anything at all.
-        self._guidance = rp.guidance_from_attempts(
-            self.deps.store.attempts_for(self.run_id))
-        self._review_convergence = rp.review_convergence_from_attempts(
-            self.deps.store.attempts_for(self.run_id))
+        # Retry prompts and convergence are both derived state. Legacy runs
+        # carry prompt guidance on attempt rows; the persistent correction
+        # loop carries each semantic failure in ``lane_retry_spend`` and each
+        # review rejection in ``candidate_reviews`` because one retained
+        # attempt may publish several candidates. Rebuild both representations
+        # here so resume cannot silently forget a standing constraint.
+        attempts = self.deps.store.attempts_for(self.run_id)
+        self._guidance = rp.guidance_from_attempts(attempts)
+        latest_attempts: Dict[str, st.AttemptRecord] = {}
+        for attempt in attempts:
+            previous = latest_attempts.get(attempt.node_id)
+            if previous is None or attempt.attempt_no > previous.attempt_no:
+                latest_attempts[attempt.node_id] = attempt
+        for build_node_id, attempt in latest_attempts.items():
+            if self._review_for_build(build_node_id) is not None:
+                self._refresh_lane_guidance(build_node_id, attempt)
+        self._review_convergence = rp.review_convergence_from_reviews(
+            self.deps.store.candidate_reviews(self.run_id, limit=10_000)
+        )
         self._projected = True
 
     def cancel(self) -> None:
@@ -628,8 +1000,8 @@ class Scheduler:
             pool.shutdown(wait=False, cancel_futures=True)
 
     def _preserve_unpublished_work(
-            self, attempt: st.AttemptRecord,
-            reason: str = "NODE_TIMEOUT") -> None:
+        self, attempt: st.AttemptRecord, reason: str = "NODE_TIMEOUT"
+    ) -> None:
         """Publish unpublished builder work onto the attempt ref (#97, #110).
 
         Empty delta is a no-op — nothing to salvage. Errors propagate to the
@@ -638,18 +1010,22 @@ class Scheduler:
         """
         with self._lock:
             worktree = self._attempt_worktrees.get(attempt.node_id)
-        if (worktree is None
-                or worktree.attempt_no != attempt.attempt_no
-                or worktree.baseline is None):
+        if (
+            worktree is None
+            or worktree.attempt_no != attempt.attempt_no
+            or worktree.baseline is None
+        ):
             return
         after = wt.inventory(worktree.path)
         measured = wt.delta(worktree.baseline, after)
         if measured.is_empty:
             return
         wt.commit_measured_delta(
-            worktree, measured, after,
-            "{} attempt {} {}".format(
-                attempt.node_id, attempt.attempt_no, reason))
+            worktree,
+            measured,
+            after,
+            "{} attempt {} {}".format(attempt.node_id, attempt.attempt_no, reason),
+        )
 
     def _preserve_running_unpublished(self) -> None:
         """PR #124's preserve step, for every RUNNING node, before escalate."""
@@ -659,19 +1035,21 @@ class Scheduler:
             lifecycle = self.deps.store.get_node(self.run_id, row.node_id)
             try:
                 attempt = self.deps.store.get_attempt(
-                    self.run_id, row.node_id, lifecycle.attempt_no)
+                    self.run_id, row.node_id, lifecycle.attempt_no
+                )
             except lc.UnknownNode:
                 continue
             try:
-                self._preserve_unpublished_work(
-                    attempt, reason="SIGINT_ESCALATED")
+                self._preserve_unpublished_work(attempt, reason="SIGINT_ESCALATED")
             except Exception:
                 continue
 
     def _owns_running(self, record: st.AttemptRecord) -> bool:
         lifecycle = self.deps.store.get_node(self.run_id, record.node_id)
-        return (lifecycle.state is st.NodeState.RUNNING
-                and lifecycle.attempt_no == record.attempt_no)
+        return (
+            lifecycle.state is st.NodeState.RUNNING
+            and lifecycle.attempt_no == record.attempt_no
+        )
 
     def _fence_watchdog_generation(self, record: st.AttemptRecord) -> None:
         """Revoke a timed-out generation before its quiescence proof blocks."""
@@ -684,10 +1062,12 @@ class Scheduler:
                 raise AttemptCancelled()
             if record.key in self._watchdog_fences:
                 raise AttemptOwnershipLost(
-                    f"{record.node_id}#{record.attempt_no} was fenced by watchdog")
+                    f"{record.node_id}#{record.attempt_no} was fenced by watchdog"
+                )
             if not self._owns_running(record):
                 raise AttemptOwnershipLost(
-                    f"{record.node_id}#{record.attempt_no} no longer owns RUNNING")
+                    f"{record.node_id}#{record.attempt_no} no longer owns RUNNING"
+                )
 
     def _attempt_dispatched(self, record: st.AttemptRecord) -> bool:
         """Whether `run_node` was ever entered for this attempt.
@@ -700,11 +1080,14 @@ class Scheduler:
         never leased is unknown, not absent, and answers `True`.
         """
         with self._lock:
-            return self._attempt_dispatch.get(
-                (record.node_id, record.attempt_no), True)
+            return self._attempt_dispatch.get((record.node_id, record.attempt_no), True)
 
-    def _quiesce(self, record: st.AttemptRecord, phase: str,
-                 in_flight: Optional[BaseException] = None) -> None:
+    def _quiesce(
+        self,
+        record: st.AttemptRecord,
+        phase: str,
+        in_flight: Optional[BaseException] = None,
+    ) -> None:
         """Prove this attempt's owned execution absent, when it could have any.
 
         `in_flight` is the exception this quiesce is cleaning up after, when
@@ -732,11 +1115,14 @@ class Scheduler:
         That is a node mid-transition, not a quiescent one, and §7.3 defines
         quiescence as "nothing in flight and no node can progress".
         """
-        return any(record.state == st.NodeState.RUNNING.value
-                   for record in self.deps.store.node_records(self.run_id))
+        return any(
+            record.state == st.NodeState.RUNNING.value
+            for record in self.deps.store.node_records(self.run_id)
+        )
 
-    def _settle_context(self, context: _AttemptContext,
-                        in_flight: Optional[BaseException] = None) -> None:
+    def _settle_context(
+        self, context: _AttemptContext, in_flight: Optional[BaseException] = None
+    ) -> None:
         """§8.3's settle, taken over the execution this attempt dispatched.
 
         An attempt that never entered `run_node` dispatched none, and every
@@ -758,9 +1144,14 @@ class Scheduler:
             self._quiesce(context.record, "settle", in_flight)
         context.settled = True
 
-    def _block_quiescence(self, node: st.PlanNode,
-                          record: Optional[st.AttemptRecord],
-                          failure: QuiescenceFailure) -> None:
+    def _block_quiescence(
+        self,
+        node: st.PlanNode,
+        record: Optional[st.AttemptRecord],
+        failure: QuiescenceFailure,
+        *,
+        allow_watchdog_fence: bool = False,
+    ) -> None:
         if record is None:
             return
         with self._lock:
@@ -777,14 +1168,52 @@ class Scheduler:
             current: Optional[BaseException] = cause
             while current is not None and id(current) not in seen:
                 seen.add(id(current))
-                chain.append("{0}: {1}".format(
-                    type(current).__name__, current))
+                chain.append("{0}: {1}".format(type(current).__name__, current))
                 current = current.__cause__ or current.__context__
+            if self._review_for_build(node.node_id) is not None:
+                self._set_lane_phase(
+                    node.node_id,
+                    st.LanePhase.BLOCKED,
+                    record,
+                    allow_watchdog_fence=(
+                        allow_watchdog_fence or self._cancelled.is_set()
+                    ),
+                )
             self.deps.store.mark_blocked(
-                self.run_id, node.node_id, st.BlockReason.QUIESCENCE_UNPROVEN,
-                detail={"phase": failure.phase,
-                        "exception_type": type(cause).__name__,
-                        "causes": chain[:6]})
+                self.run_id,
+                node.node_id,
+                st.BlockReason.QUIESCENCE_UNPROVEN,
+                detail={
+                    "phase": failure.phase,
+                    "exception_type": type(cause).__name__,
+                    "causes": chain[:6],
+                },
+            )
+
+    def _contain_quiescence_failure(
+        self,
+        node: st.PlanNode,
+        record: Optional[st.AttemptRecord],
+        failure: QuiescenceFailure,
+        *,
+        allow_watchdog_fence: bool = False,
+    ) -> None:
+        """Contain a failed absence proof unless interruption is a pause.
+
+        Pausing still asks the runtime to interrupt and quiesce the owned
+        execution, but it deliberately writes no lifecycle outcome. A failed
+        proof during that best-effort interruption is therefore not durable
+        evidence that the lane is blocked. Cancellation and every other stop
+        path retain the ordinary fail-closed containment below.
+        """
+        if self._paused.is_set() or self._sigint_pause_latched:
+            return
+        self._block_quiescence(
+            node,
+            record,
+            failure,
+            allow_watchdog_fence=allow_watchdog_fence,
+        )
 
     def _request_cancel(self, node_id: str) -> None:
         lifecycle = self.deps.store.get_node(self.run_id, node_id)
@@ -792,19 +1221,26 @@ class Scheduler:
             return
         try:
             record = self.deps.store.get_attempt(
-                self.run_id, node_id, lifecycle.attempt_no)
+                self.run_id, node_id, lifecycle.attempt_no
+            )
         except lc.UnknownNode:
             return
         try:
             self._quiesce(record, "cancel")
+            if (
+                self._review_for_build(node_id) is not None
+                and self.deps.close_review is not None
+            ):
+                # Cancellation reaches this point only after absence proof.
+                self.deps.close_review(node_id)
         except QuiescenceFailure as exc:
             node = self.nodes.get(node_id)
             if node is not None:
-                self._block_quiescence(node, record, exc)
+                self._contain_quiescence_failure(node, record, exc)
 
     def _interrupt_in_flight(
-            self, in_flight: Dict[str, "Future"],
-            cancellation_requested: set) -> None:
+        self, in_flight: Dict[str, "Future"], cancellation_requested: set
+    ) -> None:
         """`Future.cancel` cannot stop a running worker. Quiesce it first."""
         for node_id, future in list(in_flight.items()):
             future.cancel()
@@ -841,8 +1277,7 @@ class Scheduler:
         except ValueError as exc:
             previous_sigint = None
             self._sigint_handler_installed = False
-            print("SIGINT_HANDLER_NOT_INSTALLED: {0}".format(exc),
-                  file=sys.stderr)
+            print("SIGINT_HANDLER_NOT_INSTALLED: {0}".format(exc), file=sys.stderr)
         self.project()
         if self._sigint_pause_latched:
             self.request_pause()
@@ -909,12 +1344,16 @@ class Scheduler:
                     self._merge_frontier()
                     if self._cancelled.is_set():
                         continue
-
-                    ready = [node_id for node_id in self.deps.store.ready_nodes(self.run_id)
-                             if node_id not in in_flight]
+                    ready = [
+                        node_id
+                        for node_id in self._runnable_ready_nodes()
+                        if node_id not in in_flight
+                    ]
                     for node_id in ready:
-                        if (self._cancelled.is_set()
-                                or len(in_flight) >= self.config.concurrency):
+                        if (
+                            self._cancelled.is_set()
+                            or len(in_flight) >= self.config.concurrency
+                        ):
                             break
                         in_flight[node_id] = self._pool.submit(self._attempt, node_id)
 
@@ -923,7 +1362,7 @@ class Scheduler:
                         # start either, no node can progress and the run is
                         # quiescent.
                         self._merge_frontier()
-                        if self.deps.store.ready_nodes(self.run_id):
+                        if self._runnable_ready_nodes():
                             continue
                         if self._settling():
                             # Not quiescent — mid-verdict. `ready_nodes` returns
@@ -1000,8 +1439,11 @@ class Scheduler:
         store = self.deps.store
 
         def running_attempts():
-            return [a for a in store.attempts_for(self.run_id)
-                    if a.state is st.NodeState.RUNNING]
+            return [
+                a
+                for a in store.attempts_for(self.run_id)
+                if a.state is st.NodeState.RUNNING
+            ]
 
         def kill(attempt):
             # `_stall` calls the killer before `fail_attempt`. Revoke the
@@ -1016,8 +1458,12 @@ class Scheduler:
             except BaseException as exc:
                 node = self.nodes.get(attempt.node_id)
                 if node is not None:
-                    self._block_quiescence(
-                        node, attempt, QuiescenceFailure("watchdog-kill", exc))
+                    self._contain_quiescence_failure(
+                        node,
+                        attempt,
+                        QuiescenceFailure("watchdog-kill", exc),
+                        allow_watchdog_fence=True,
+                    )
 
         def fail(attempt, retry_class, reason):
             # `reason` is the watchdog's `StallReason` value -- NODE_TIMEOUT,
@@ -1040,13 +1486,17 @@ class Scheduler:
             try:
                 self._quiesce(attempt, "watchdog")
             except QuiescenceFailure as exc:
-                self._block_quiescence(node, attempt, exc)
+                self._contain_quiescence_failure(
+                    node, attempt, exc, allow_watchdog_fence=True
+                )
                 return
             if not self._cancelled.is_set():
                 self._settle_failure(
                     node,
                     rp.Classification(retry_class=retry_class, reason=reason),
-                    record=attempt, allow_watchdog_fence=True)
+                    record=attempt,
+                    allow_watchdog_fence=True,
+                )
 
         def exit_status_observed(attempt: st.AttemptRecord) -> bool:
             """Whether something other than the watchdog sees this process end.
@@ -1087,10 +1537,10 @@ class Scheduler:
 
             §9.7 again, at the two clock signals rather than the process one,
             and for the failure `exit_status_observed` does not cover: the
-            attempt is not gone, it is *finished*. `_attempt` quiesces the
-            builder at `pre-inventory` — before it commits the work, before
-            the post gate, before the cross-vendor reviewer is dispatched —
-            so the builder's transcript cannot grow again from that point by
+            attempt is not gone, it is *finished*. `_attempt` quiesces a
+            successful builder at `candidate-idle` — before it measures and
+            publishes the candidate, before the reviewer is dispatched — so
+            the builder's transcript cannot grow again from that point by
             construction. The watchdog goes on measuring exactly that file for
             the whole of the review, and review latency tracks reviewer turn
             count, so it is unbounded.
@@ -1114,9 +1564,12 @@ class Scheduler:
             the row describes some other generation's work and must not spare
             this one.
             """
-            return self.deps.store.result_adjudication(
-                self.run_id, attempt.node_id,
-                attempt.attempt_no) is st.Adjudication.ACCEPTED
+            return (
+                self.deps.store.result_adjudication(
+                    self.run_id, attempt.node_id, attempt.attempt_no
+                )
+                is st.Adjudication.ACCEPTED
+            )
 
         def preserve_unpublished(attempt: st.AttemptRecord) -> None:
             """Publish unpublished builder work onto the attempt ref (#97).
@@ -1137,14 +1590,16 @@ class Scheduler:
             declared_result_observed=declared_result_observed,
             actor_status=self.deps.actor_status,
             preserve_unpublished=preserve_unpublished,
-            time_source=self._time_source)
+            time_source=self._time_source,
+        )
 
         backstop = wd.RunBackstop(
             config=self.config,
             last_transition_at=lambda: store.last_transition_at(self.run_id),
             on_stuck=lambda diagnostic: None,
             diagnostic=self.status_diagnostic,
-            time_source=self._time_source)
+            time_source=self._time_source,
+        )
         return watchdog, backstop
 
     def status_diagnostic(self) -> str:
@@ -1152,17 +1607,19 @@ class Scheduler:
         print rather than exiting silently — the same answer `run status`
         gives, so an operator never has to read the database by hand."""
         store = self.deps.store
-        lines = [f"run {self.run_id}: no lifecycle transition within "
-                 f"T={self.config.backstop_t_s}s"]
+        lines = [
+            f"run {self.run_id}: no lifecycle transition within "
+            f"T={self.config.backstop_t_s}s"
+        ]
         stranded = set(store.upstream_blocked(self.run_id))
-        for record in sorted(store.node_records(self.run_id),
-                             key=lambda r: (r.depth, r.node_id)):
+        for record in sorted(
+            store.node_records(self.run_id), key=lambda r: (r.depth, r.node_id)
+        ):
             why = ""
             if record.node_id in stranded:
                 why = " (an ancestor is blocked or abandoned)"
             elif record.state == st.NodeState.PENDING.value:
-                unmet = [d for d in record.needs
-                         if not _is_merged(store, self.run_id, d)]
+                unmet = [d for d in record.needs if not self._dependency_satisfied(d)]
                 if unmet:
                     why = f" (waiting on {', '.join(sorted(unmet))})"
             lines.append(f"  {record.node_id}: {record.state}{why}")
@@ -1171,8 +1628,7 @@ class Scheduler:
         # looking for what the harness itself did, and a runner adapter
         # rewriting the tree after every post-gate is that shape.
         for node_id, entries in sorted(self._adapter_hygiene.items()):
-            lines.append(f"  {node_id}: harness hygiene — "
-                         + "; ".join(entries))
+            lines.append(f"  {node_id}: harness hygiene — " + "; ".join(entries))
         # §7.8 — panes a resumed process could not reach are recorded in
         # `orphans` and reported here. The scheduler never adopts them and
         # never kills them, so if this text does not name them the stated cost
@@ -1182,9 +1638,14 @@ class Scheduler:
             lines.append(f"  {len(orphans)} orphaned pane(s) — kill by hand:")
             for row in orphans:
                 where = row.get("handle") or (
-                    f"pid {row['pid']}" if row.get("pid") is not None else "no handle recorded")
-                lines.append(f"    orphan {row.get('node_id', '?')}"
-                             f"#{row.get('attempt_no', '?')}: {where}")
+                    f"pid {row['pid']}"
+                    if row.get("pid") is not None
+                    else "no handle recorded"
+                )
+                lines.append(
+                    f"    orphan {row.get('node_id', '?')}"
+                    f"#{row.get('attempt_no', '?')}: {where}"
+                )
         return "\n".join(lines)
 
     # ── one attempt (§7.3, §7.4, §8.3, §8.4) ────────────────────────────────
@@ -1201,13 +1662,14 @@ class Scheduler:
             try:
                 self._settle_context(context)
             except QuiescenceFailure as exc:
-                self._block_quiescence(node, context.record, exc)
+                self._contain_quiescence_failure(node, context.record, exc)
             return
         except QuiescenceFailure as exc:
-            self._block_quiescence(node, context.record, exc)
+            self._contain_quiescence_failure(node, context.record, exc)
         except wt.HarnessQuiescenceError as exc:
-            self._block_quiescence(
-                node, context.record, QuiescenceFailure("harness-gate", exc))
+            self._contain_quiescence_failure(
+                node, context.record, QuiescenceFailure("harness-gate", exc)
+            )
         except BaseException as exc:  # noqa: BLE001 — containment is the point
             try:
                 # `exc` is handed to the settle, not merely caught around it.
@@ -1222,11 +1684,13 @@ class Scheduler:
                 # `lane-p1-freeze-and-run-log#4`, at zero turns.
                 self._settle_context(context, in_flight=exc)
             except QuiescenceFailure as quiescence:
-                self._block_quiescence(node, context.record, quiescence)
+                self._contain_quiescence_failure(node, context.record, quiescence)
                 return
-            if (context.record is not None
-                    and not self._cancelled.is_set()
-                    and self._owns_running(context.record)):
+            if (
+                context.record is not None
+                and not self._cancelled.is_set()
+                and self._owns_running(context.record)
+            ):
                 # A `LaunchFailed` names its own class in a typed enum member,
                 # so `classify`'s launcher branch is reachable from the real
                 # adapter for the first time (§16.3 item 42). Every other
@@ -1246,12 +1710,18 @@ class Scheduler:
                 # so it blocks on its first occurrence naming the refusal,
                 # rather than spending two launches that cannot differ (§16.3
                 # item 46).
+                exception_type = type(exc).__name__
+                launcher_failure = (
+                    exc.classified_failure if isinstance(exc, LaunchFailed) else None
+                )
+
                 def build_signal() -> rp.FailureSignal:
                     return rp.FailureSignal(
-                        node_kind=node.kind, exception_type=type(exc).__name__,
-                        launcher_failure=(exc.classified_failure
-                                          if isinstance(exc, LaunchFailed)
-                                          else None))
+                        node_kind=node.kind,
+                        exception_type=exception_type,
+                        launcher_failure=launcher_failure,
+                    )
+
                 # `classify` reads none of the signal's ENVIRONMENTAL evidence
                 # by design (§7.5 forbids the lexical shortcut), so its
                 # fall-through returns a classification with no account of
@@ -1261,82 +1731,124 @@ class Scheduler:
                 # it. Recorded the way `_block_quiescence` records a cause:
                 # type and message, written and never read back (§10.1).
                 self._settle_failure(
-                    node, _with_reason(
+                    node,
+                    _with_reason(
                         rp.classify_with_containment(build_signal),
-                        _exception_reason(exc)),
-                    record=context.record)
+                        _exception_reason(exc),
+                    ),
+                    record=context.record,
+                )
 
-    def _repair_decision(self, node: st.PlanNode,
-                         head: str) -> rp.RepairDecision:
-        """Gather the typed facts and ask `retry_policy` whether to repair.
-
-        Everything read here is a durable row or a git object: the node's
-        attempt rows, the previous attempt's own ref as git resolves it now,
-        and `is_attempt_output_commit` over the sha that row stored. No pane
-        text, no prompt text, no envelope field, and no agent's claim about
-        its own work reaches the decision (§1.2) — the reviewer's findings
-        travel to the *prompt* and are read nowhere else.
-
-        `attempt_ref_commit` is allowed to raise. §7.5's git rule is that only
-        the documented not-found exit means the object is absent, and a
-        transient git failure read as "the commit is gone" would silently
-        discard a builder's committed tree — the exact discard this method
-        exists to prevent. Raising here lands in the worker's containment
-        handler and costs an ENVIRONMENTAL retry, which is the correct price
-        for a machine fault; the stall path calls the same helper the same way.
-        """
-        store = self.deps.store
-        repo = Path(self.deps.repo)
-        attempts = tuple(store.attempts_for(self.run_id, node.node_id))
-        prior = max(attempts, key=lambda row: row.attempt_no, default=None)
-        subject = rp.repair_subject(attempts)
-        prove = subject if subject is not None else prior
-        rejected_ref_sha: Optional[str] = None
-        output_proven = False
-        if prove is not None:
-            rejected_ref_sha = wt.attempt_ref_commit(
-                repo, self.run_id, node.node_id, prove.attempt_no)
-            rejected_sha = (prove.extra or {}).get(rp.REVIEW_OUTPUT_SHA_KEY)
-            if isinstance(rejected_sha, str) and rejected_sha:
-                output_proven = wt.is_attempt_output_commit(
-                    repo, rejected_sha, run_id=self.run_id,
-                    node_id=node.node_id, attempt_no=prove.attempt_no,
-                    expected_base=prove.base_sha)
-        return rp.decide_repair(rp.RepairFacts(
-            integration_head=head,
-            prior=prior,
-            rejected_ref_sha=rejected_ref_sha,
-            output_proven=output_proven,
-            repaired_findings=rp.repaired_findings_count(attempts, subject),
-            attempts=attempts))
+    def _durable_repair_resume(
+        self,
+        node: st.PlanNode,
+        lifecycle: st.NodeLifecycle,
+    ) -> Tuple[
+        Optional[rp.RepairBasis],
+        Optional[st.CandidateReview],
+        Optional[st.RepairHandoff],
+    ]:
+        """Recover a rejected candidate and its handoff for a new generation."""
+        if lifecycle.lane_phase not in (
+            st.LanePhase.REPAIR_HANDOFF,
+            st.LanePhase.REPAIRING,
+            st.LanePhase.WAITING_FOR_NEW_CANDIDATE,
+        ):
+            return None, None, None
+        review_node = self._review_for_build(node.node_id)
+        if review_node is None or not lifecycle.attempt_no:
+            return None, None, None
+        candidates = self.deps.store.lane_candidates(
+            self.run_id, node.node_id, limit=10_000
+        )
+        if not candidates:
+            return None, None, None
+        candidate = candidates[-1]
+        review = self.deps.store.candidate_review(
+            self.run_id, review_node.node_id, candidate.candidate_sha
+        )
+        handoff = self.deps.store.repair_handoff(
+            self.run_id, node.node_id, candidate.candidate_sha
+        )
+        if (
+            review is None
+            or review.verdict is not st.ReviewVerdict.REJECTED
+            or handoff is None
+        ):
+            return None, None, None
+        rejected_attempt = self.deps.store.get_attempt(
+            self.run_id, node.node_id, lifecycle.attempt_no
+        )
+        return (
+            rp.RepairBasis(
+                base_sha=candidate.candidate_sha,
+                integration_head=rejected_attempt.integration_head,
+                repair_of_attempt=lifecycle.attempt_no,
+                chain_length=candidate.candidate_seq,
+            ),
+            review,
+            handoff,
+        )
 
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
+        existing: Optional[st.AttemptRecord] = None
         lifecycle = store.get_node(self.run_id, node.node_id)
         if lifecycle.attempt_no:
             existing = store.get_attempt(
-                self.run_id, node.node_id, lifecycle.attempt_no)
+                self.run_id, node.node_id, lifecycle.attempt_no
+            )
             if existing.extra.get(lc.LATE_ENVELOPE_RECOVERY_KEY) is True:
                 self._recover_attempt_body(node, context, existing)
                 return
-        head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
 
-        # A rejected diff is repaired rather than re-implemented. `basis` is
-        # `None` for every attempt that is not repairing one — a first attempt,
-        # a red gate, an environmental or launcher retry, a rejection whose
-        # commit cannot be proved, and a rejection whose integration head has
-        # since moved — and in every one of those cases `base` is `head` and
-        # nothing below this line behaves differently from before.
-        decision = self._repair_decision(node, head)
-        basis = decision.basis
+        # A process failure may end the persistent scheduler while an immutable
+        # candidate and rejected-review handoff remain inside this attempt.
+        # Those ledgers are authority to reopen the same attempt/worktree, not
+        # permission to mint a replacement generation from integration HEAD.
+        basis, durable_repair, durable_handoff = self._durable_repair_resume(
+            node, lifecycle
+        )
+        if basis is not None and existing is not None:
+            review_node = self._review_for_build(node.node_id)
+            if review_node is None:
+                raise lc.LifecycleError(
+                    f"{node.node_id}: rejected candidate has no review node"
+                )
+            store.claim_repair_handoff_attempt(
+                self.run_id,
+                node.node_id,
+                review_node.node_id,
+                existing.attempt_no,
+                basis.base_sha,
+            )
+            recovered = store.get_attempt(
+                self.run_id, node.node_id, existing.attempt_no
+            )
+            self._recover_attempt_body(node, context, recovered, already_claimed=True)
+            return
+        head = (
+            basis.integration_head
+            if basis is not None
+            else wt.integration_head(self.deps.repo, self.deps.integration_branch)
+        )
         base = basis.base_sha if basis is not None else head
 
         # §7.6 — the window opens BEFORE the worktree exists, so a hung
         # `git worktree add` is inside it rather than outside.
         attempt_no = store.start_attempt(
-            self.run_id, node.node_id, base,
-            attempt_extra=rp.repair_extra(basis) if basis is not None else None,
-            detail={"repair": decision.reason})
+            self.run_id,
+            node.node_id,
+            base,
+            attempt_extra=(rp.repair_extra(basis) if basis is not None else None),
+            detail={
+                "repair": (
+                    "durable-rejected-candidate"
+                    if basis is not None
+                    else "fresh-attempt"
+                )
+            },
+        )
         with self._lock:
             # Recorded against the durable row as soon as it exists, and
             # before anything can observe the attempt RUNNING: leased by this
@@ -1347,10 +1859,26 @@ class Scheduler:
         record = store.get_attempt(self.run_id, node.node_id, attempt_no)
         context.record = record
         self._require_running(record)
+        if self._review_for_build(node.node_id) is not None:
+            self._set_lane_phase(
+                node.node_id,
+                (
+                    st.LanePhase.REPAIRING
+                    if durable_repair is not None
+                    else st.LanePhase.BUILDING
+                ),
+                record,
+            )
 
         attempt = wt.create_attempt_worktree(
-            self.deps.repo, self.run_id, node.node_id, attempt_no, base,
-            Path(self.deps.worktrees_root), Path(self.deps.scratch_root))
+            self.deps.repo,
+            self.run_id,
+            node.node_id,
+            attempt_no,
+            base,
+            Path(self.deps.worktrees_root),
+            Path(self.deps.scratch_root),
+        )
         with self._lock:
             self._attempt_worktrees[node.node_id] = attempt
         self._require_running(record)
@@ -1363,10 +1891,13 @@ class Scheduler:
             # and on what; discarding it here left the third ENVIRONMENTAL arm
             # writing the same empty row as the other two.
             self._settle_failure(
-                node, rp.Classification(
+                node,
+                rp.Classification(
                     retry_class=st.RetryClass.ENVIRONMENTAL,
-                    reason=_check_result_reason(created)),
-                record=record)
+                    reason=_check_result_reason(created),
+                ),
+                record=record,
+            )
             return
 
         pre_verdict = None
@@ -1379,8 +1910,7 @@ class Scheduler:
             self._require_running(record)
             if node.kind is st.NodeKind.AGENT:
                 self._require_running(record)
-                pre = self.deps.run_gate(
-                    attempt, node, "pre", self._cancelled.is_set)
+                pre = self.deps.run_gate(attempt, node, "pre", self._cancelled.is_set)
                 # A selector path this node is declared to produce, absent
                 # at its base, is the red clause 2 asks for -- not a broken
                 # runner. Asked per path, because the runner refuses to
@@ -1393,10 +1923,11 @@ class Scheduler:
                 declared = {posixpath.normpath(path) for path in node.outputs}
                 unbuilt = any(
                     path in declared and not (attempt.path / path).exists()
-                    for path in pm.selector_string_paths(
-                        node.gate_selector or ""))
+                    for path in pm.selector_string_paths(node.gate_selector or "")
+                )
                 pre_verdict = vf.adjudicate_pre_gate(
-                    pre, node.gate_min_cases, selector_unbuilt=unbuilt)
+                    pre, node.gate_min_cases, selector_unbuilt=unbuilt
+                )
         finally:
             # Provision and the pre gate both execute before the measurement
             # bracket; their process groups must be absent before its baseline.
@@ -1409,12 +1940,14 @@ class Scheduler:
         # by construction; the witness clause 2 wants was taken at the chain
         # root's base, which `basis.integration_head` records.
         if pre_verdict is not None and vf.pre_gate_not_falsifiable(
-                pre_verdict, repairing=basis is not None):
+            pre_verdict, repairing=basis is not None
+        ):
             self._settle_context(context)
             self._settle_failure(
-                node, rp.Classification(
-                    block_reason=st.BlockReason.GATE_NOT_FALSIFIABLE),
-                record=record)
+                node,
+                rp.Classification(block_reason=st.BlockReason.GATE_NOT_FALSIFIABLE),
+                record=record,
+            )
             return
 
         baseline = wt.take_baseline(attempt)
@@ -1434,8 +1967,13 @@ class Scheduler:
         # `existing_ignored_outputs` has no before-side after the attempt dies,
         # and salvage could commit a node whose declared output is gitignored
         # while the receipt asserts a digest over what was committed (#67).
-        store.record_baseline(self.run_id, node.node_id, attempt_no, baseline,
-                              ignored_at_base=attempt.ignored_at_base)
+        store.record_baseline(
+            self.run_id,
+            node.node_id,
+            attempt_no,
+            baseline,
+            ignored_at_base=attempt.ignored_at_base,
+        )
         self._require_running(record)
 
         def on_launch(pid: Optional[int] = None) -> None:
@@ -1451,113 +1989,182 @@ class Scheduler:
             # raises still leaves whatever it created behind, and the quiescer
             # must go on demanding a measured absence for it.
             self._attempt_dispatch[(record.node_id, record.attempt_no)] = True
-        try:
-            execution = self.deps.run_node(
-                attempt, node, record,
-                rp.render_guidance(node, self._guidance.get(record.guidance_key),
-                                   repair=basis),
-                on_launch, self._cancelled.is_set)
-        except BaseException as exc:
-            # §16.3 item 45. The quiesce below used to sit in a bare `finally`,
-            # which is right about ordering and wrong about exceptions: an
-            # exception raised inside a `finally` REPLACES the one in flight,
-            # so a launch that failed before anything was registered blocked
-            # QUIESCENCE_UNPROVEN — terminal — over a process that was never
-            # started, and its own `LaunchFailed` never reached the
-            # containment handler that would have classified it. That is item
-            # 42's discharge defeated for exactly this family of failure.
-            #
-            # The repair is not "treat every failed launch as absent", which
-            # lies for the refusals raised after the pane split. It is to skip
-            # the proof only where the launcher has *stated*, as a typed fact,
-            # that it created nothing to reap — absence by construction rather
-            # than absence asserted. Every other failure is quiesced exactly as
-            # before, and when that quiesce genuinely fails the resulting
-            # QuiescenceFailure carries this exception as its chained context,
-            # so `_block_quiescence`'s cause chain records both.
-            #
-            # Handed to `_quiesce` rather than branched on here: the decision
-            # is owed by *every* quiesce a failed launch crosses, and this site
-            # owning it privately is why the settle one frame up went on
-            # converting the same refusal into a terminal block (§19 M3 again,
-            # one attempt boundary later).
-            self._quiesce(record, "pre-inventory", in_flight=exc)
-            raise
+        guidance = rp.render_guidance(
+            node, self._guidance.get(record.guidance_key), repair=basis
+        )
+        if (
+            durable_repair is not None
+            and durable_handoff is not None
+            and basis is not None
+        ):
+            if guidance is None:
+                guidance = self._repair_prompt(basis.base_sha, durable_repair)
+            repair = self._continue_repair_handoff(
+                node,
+                context,
+                attempt,
+                record,
+                guidance,
+                basis.base_sha,
+                durable_handoff.builder_generation,
+            )
+            if repair is None:
+                return
+            execution = repair.execution
         else:
-            # Classification cannot release or block the attempt until its
-            # owned group is absent.
-            self._quiesce(record, "pre-inventory")
+            try:
+                execution = self.deps.run_node(
+                    attempt, node, record, guidance, on_launch, self._cancelled.is_set
+                )
+            except BaseException as exc:
+                # Typed launch refusal can prove that no process was created;
+                # every other failure still crosses the ordinary absence gate.
+                self._quiesce(record, "pre-inventory", in_flight=exc)
+                raise
+            else:
+                self._quiesce(record, "candidate-idle")
         self._complete_attempt(
-            node, context, attempt, record, basis, pre_verdict, baseline,
-            execution, head)
+            node,
+            context,
+            attempt,
+            record,
+            basis,
+            pre_verdict,
+            baseline,
+            execution,
+            head,
+        )
 
     def _recover_attempt_body(
-            self, node: st.PlanNode, context: _AttemptContext,
-            stranded: st.AttemptRecord) -> None:
+        self,
+        node: st.PlanNode,
+        context: _AttemptContext,
+        stranded: st.AttemptRecord,
+        *,
+        already_claimed: bool = False,
+    ) -> None:
         """Continue one declared generation without relaunching its builder."""
         store = self.deps.store
-        store.claim_late_envelope_attempt(
-            self.run_id, node.node_id, stranded.attempt_no)
-        record = store.get_attempt(
-            self.run_id, node.node_id, stranded.attempt_no)
+        if not already_claimed:
+            store.claim_late_envelope_attempt(
+                self.run_id, node.node_id, stranded.attempt_no
+            )
+        record = store.get_attempt(self.run_id, node.node_id, stranded.attempt_no)
         context.record = record
         with self._lock:
             self._attempt_dispatch[(node.node_id, record.attempt_no)] = False
         self._require_running(record)
 
-        if self.deps.recover_node is None:
+        if not already_claimed and self.deps.recover_node is None:
             raise DurableOutputIdentityError(
-                f"{stranded.node_id}#{stranded.attempt_no}: "
-                "no late-envelope reader")
+                f"{stranded.node_id}#{stranded.attempt_no}: no late-envelope reader"
+            )
         attempt = wt.reopen_attempt_worktree(
-            self.deps.repo, self.run_id, node.node_id, stranded.attempt_no,
-            stranded.base_sha, Path(self.deps.worktrees_root),
-            Path(self.deps.scratch_root))
+            self.deps.repo,
+            self.run_id,
+            node.node_id,
+            stranded.attempt_no,
+            stranded.base_sha,
+            Path(self.deps.worktrees_root),
+            Path(self.deps.scratch_root),
+        )
         identity = wt.check_at_create(attempt)
         if not identity.ok:
             raise DurableOutputIdentityError(
                 f"{stranded.node_id}#{stranded.attempt_no}: "
-                + "; ".join(identity.detail))
+                + "; ".join(identity.detail)
+            )
+        sealed_output_sha = store.attempt_sealed_output(
+            self.run_id, node.node_id, stranded.attempt_no
+        )
+        if sealed_output_sha is not None and not wt.is_attempt_output_commit(
+            self.deps.repo,
+            sealed_output_sha,
+            run_id=self.run_id,
+            node_id=node.node_id,
+            attempt_no=stranded.attempt_no,
+            expected_base=stranded.base_sha,
+        ):
+            raise DurableOutputIdentityError(
+                f"{stranded.node_id}#{stranded.attempt_no}: "
+                f"sealed output {sealed_output_sha} is not the attempt ref"
+            )
         baseline = store.attempt_baseline(
-            self.run_id, node.node_id, stranded.attempt_no)
+            self.run_id, node.node_id, stranded.attempt_no
+        )
         ignored = store.attempt_ignored_at_base(
-            self.run_id, node.node_id, stranded.attempt_no)
+            self.run_id, node.node_id, stranded.attempt_no
+        )
         if ignored is None:
             raise lc.BaselineUnrecorded(
                 f"{self.run_id}/{node.node_id}#{stranded.attempt_no}: "
-                "ignored-at-base evidence was not recorded")
+                "ignored-at-base evidence was not recorded"
+            )
         attempt.baseline = baseline
         attempt.ignored_at_base = ignored
         with self._lock:
             self._attempt_worktrees[node.node_id] = attempt
 
-        execution = self.deps.recover_node(attempt, stranded)
+        execution = (
+            None if already_claimed else self.deps.recover_node(attempt, stranded)
+        )
         if execution is None or not execution.envelope_parsed:
-            raise DurableOutputIdentityError(
-                f"{stranded.node_id}#{stranded.attempt_no}: "
-                "late envelope is not usable")
+            payload = store.accepted_result_payload(
+                self.run_id, node.node_id, stranded.attempt_no
+            )
+            if payload is None:
+                raise DurableOutputIdentityError(
+                    f"{stranded.node_id}#{stranded.attempt_no}: "
+                    "late envelope is not usable"
+                )
+            execution = NodeExecution(
+                envelope_parsed=True, exit_code=0, envelope_payload=payload
+            )
         pre_verdict = vf.GateVerdict(
-            green=False, unparseable=False, counts=None,
-            reason="recovered generation crossed pre-gate before baseline")
+            green=False,
+            unparseable=False,
+            counts=None,
+            reason="recovered generation crossed pre-gate before baseline",
+        )
         basis = None
         if record.repair_of_attempt is not None:
             basis = rp.RepairBasis(
                 base_sha=record.base_sha,
                 integration_head=record.integration_head,
                 repair_of_attempt=record.repair_of_attempt,
-                chain_length=record.repair_chain_length)
+                chain_length=record.repair_chain_length,
+            )
         self._complete_attempt(
-            node, context, attempt, record, basis, pre_verdict, baseline,
-            execution, record.integration_head)
+            node,
+            context,
+            attempt,
+            record,
+            basis,
+            pre_verdict,
+            baseline,
+            execution,
+            record.integration_head,
+            sealed_output_sha=sealed_output_sha,
+        )
 
     def _complete_attempt(
-            self, node: st.PlanNode, context: _AttemptContext,
-            attempt: wt.AttemptWorktree, record: st.AttemptRecord,
-            basis: Optional[rp.RepairBasis], pre_verdict: vf.GateVerdict,
-            baseline: wt.Inventory, execution: NodeExecution,
-            head: str) -> None:
+        self,
+        node: st.PlanNode,
+        context: _AttemptContext,
+        attempt: wt.AttemptWorktree,
+        record: st.AttemptRecord,
+        basis: Optional[rp.RepairBasis],
+        pre_verdict: vf.GateVerdict,
+        baseline: wt.Inventory,
+        execution: NodeExecution,
+        head: str,
+        *,
+        record_result: bool = True,
+        sealed_output_sha: Optional[str] = None,
+    ) -> None:
         store = self.deps.store
-        self._record_result(node, record, execution)
+        if record_result:
+            self._record_result(node, record, execution)
         self._require_running(record)
         if execution.launched_pid is not None:
             # A runner that reports its pid only on return still arms the
@@ -1565,31 +2172,36 @@ class Scheduler:
             with self._lock:
                 self._require_running(record)
                 store.mark_launched(
-                    self.run_id, node.node_id, record.attempt_no,
-                    execution.launched_pid)
+                    self.run_id, node.node_id, record.attempt_no, execution.launched_pid
+                )
 
         after = wt.inventory(attempt.path)
         self._require_running(record)
         measured = wt.delta(baseline, after)
         permission = wt.permission_check(attempt, measured, node.outputs)
         ignored = wt.existing_ignored_outputs(
-            attempt.path, node.outputs, after, attempt.ignored_at_base)
+            attempt.path, node.outputs, after, attempt.ignored_at_base
+        )
         if ignored:
             # The file is on disk and matches a declared output, but git
             # will not carry it. An empty commit here is a silent success.
             verdict = vf.VerificationVerdict(
-                verified=False, failed_clause=4,
-                reason=("declared output exists on disk but is gitignored "
-                        "and cannot reach the commit: "
-                        + ", ".join(ignored)),
+                verified=False,
+                failed_clause=4,
+                reason=(
+                    "declared output exists on disk but is gitignored "
+                    "and cannot reach the commit: " + ", ".join(ignored)
+                ),
                 block_reason=st.BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE,
-                offending_paths=ignored)
+                offending_paths=ignored,
+            )
             self._settle_context(context)
             self._settle_verdict(node, verdict, execution, record)
             return
 
         unreachable = self._unreferenced_produced_symbols(
-            attempt, baseline, measured, after)
+            attempt, baseline, measured, after
+        )
         if unreachable:
             # `min_cases` is a floor with no ceiling (#118). Evaluated here,
             # beside the ignored-output refusal and before the commit, because
@@ -1602,15 +2214,18 @@ class Scheduler:
 
         if node.kind is st.NodeKind.CODE:
             verdict = vf.verify_code_node(
-                exit_code=execution.exit_code, permission=permission,
+                exit_code=execution.exit_code,
+                permission=permission,
                 diff_empty=not measured.touched,
-                expects_changes=node.expects_changes)
+                expects_changes=node.expects_changes,
+            )
         elif node.kind is st.NodeKind.TESTS:
             verdict = tc.verify_tests_node(
                 envelope_parsed=execution.envelope_parsed,
                 permission=permission,
                 written=measured.touched,
-                new_case_count=0)
+                new_case_count=0,
+            )
         else:
             # Clause 4 is evaluated here, at measurement, and the commit
             # follows it immediately (§8.4). Clause 3 is evaluated after the
@@ -1618,35 +2233,80 @@ class Scheduler:
             # only once the commit has been taken.
             verdict = vf.verify_agent_node(
                 envelope_parsed=execution.envelope_parsed,
-                pre_gate=pre_verdict, post_gate=_pending_gate(),
-                permission=permission, repairing=basis is not None)
+                pre_gate=pre_verdict,
+                post_gate=_pending_gate(),
+                permission=permission,
+                repairing=basis is not None,
+            )
 
         if not verdict.verified and verdict.failed_clause != 3:
+            if self._continue_before_candidate_failure(
+                node,
+                context,
+                attempt,
+                record,
+                basis,
+                pre_verdict,
+                baseline,
+                verdict,
+                execution,
+                head,
+            ):
+                return
             self._settle_context(context)
             self._settle_verdict(node, verdict, execution, record)
             return
 
         if basis is not None and measured.is_empty:
-            # #113: an empty repair mints no new sha. Classified rather than
-            # committed, so review_digest cannot key a byte-identical tree
-            # under a new commit and re-ask the reviewer. Non-repair empty
-            # deltas still go through commit_measured_delta unchanged.
+            # #113: an empty repair mints no new sha. In a persistent review
+            # lane this is another pre-candidate semantic failure, so spend
+            # the durable same-session budget and ask the retained builder to
+            # repair again. Falling through to the legacy attempt settlement
+            # leaves the acknowledged handoff recoverable; the scheduler then
+            # reclaims the same cancelled attempt forever without spending a
+            # lane retry.
+            empty_repair = vf.VerificationVerdict(
+                verified=False,
+                reason=rp.REPAIR_DIFF_EMPTY,
+                retry_class=st.RetryClass.SEMANTIC,
+            )
+            if self._continue_before_candidate_failure(
+                node,
+                context,
+                attempt,
+                record,
+                basis,
+                pre_verdict,
+                baseline,
+                empty_repair,
+                execution,
+                head,
+            ):
+                return
             self._settle_context(context)
             self._settle_verdict(
                 node,
-                vf.VerificationVerdict(
-                    verified=False,
-                    reason=rp.REPAIR_DIFF_EMPTY,
-                    retry_class=st.RetryClass.SEMANTIC),
-                execution, record,
-                extra_facts={rp.REPAIR_DIFF_EMPTY_KEY: True})
+                empty_repair,
+                execution,
+                record,
+                extra_facts={rp.REPAIR_DIFF_EMPTY_KEY: True},
+            )
             return
 
-        with self._lock:
-            self._require_running(record)
-            output_sha = wt.commit_measured_delta(
-                attempt, measured, after,
-                f"{node.node_id} attempt {record.attempt_no}")
+        if sealed_output_sha is None:
+            with self._lock:
+                self._require_running(record)
+                output_sha = wt.commit_measured_delta(
+                    attempt,
+                    measured,
+                    after,
+                    f"{node.node_id} attempt {record.attempt_no}",
+                )
+                store.record_sealed_output(
+                    self.run_id, node.node_id, record.attempt_no, output_sha
+                )
+        else:
+            output_sha = sealed_output_sha
         self._require_running(record)
         expected = wt.expected_inventory(baseline, measured, after)
         committed = wt.check_post_commit(attempt, expected)
@@ -1664,140 +2324,101 @@ class Scheduler:
             # consequences and production delivered neither.
             self._settle_context(context)
             self._settle_failure(
-                node, rp.Classification(
+                node,
+                rp.Classification(
                     retry_class=st.RetryClass.ENVIRONMENTAL,
-                    reason=_check_result_reason(committed)),
-                record=record)
+                    reason=_check_result_reason(committed),
+                ),
+                record=record,
+            )
             return
 
         if node.kind is st.NodeKind.AGENT:
             self._require_running(record)
-            post = self.deps.run_gate(
-                attempt, node, "post", self._cancelled.is_set)
+            post = self.deps.run_gate(attempt, node, "post", self._cancelled.is_set)
             self._require_running(record)
             verdict = vf.verify_agent_node(
                 envelope_parsed=execution.envelope_parsed,
                 pre_gate=pre_verdict,
                 post_gate=vf.adjudicate_gate(post, node.gate_min_cases),
-                permission=permission, repairing=basis is not None)
+                permission=permission,
+                repairing=basis is not None,
+            )
             if not verdict.verified:
+                if self._continue_after_preacceptance_failure(
+                    node, context, attempt, record, output_sha, verdict, execution, head
+                ):
+                    return
                 self._settle_context(context)
                 self._settle_verdict(node, verdict, execution, record)
                 return
         elif node.kind is st.NodeKind.TESTS:
             self._require_running(record)
-            parent_red = self._prove_tests_red_at_parent(
-                node, attempt, measured)
+            parent_red = self._prove_tests_red_at_parent(node, attempt, measured)
             self._require_running(record)
             if not parent_red.verified:
                 self._settle_context(context)
                 self._settle_verdict(node, parent_red, execution, record)
                 return
 
-        # The final proof covers post-gates as well as every failure path
-        # above. Only then may the scheduler make a durable state transition.
-        self._settle_context(context)
-
-        # §8.3's SECOND cleanliness evaluation, after the gate has run and
-        # after the quiesce above — the ordering §8.3 requires, so the report
-        # names the adapter's real residue rather than a still-running
-        # writer's moving target. Its consequence is deliberately not the
-        # post-commit one: the commit was sealed before the gate ran and §8.6
-        # merges the output SHA, so residue here is an adapter hygiene defect
-        # with its paths named and never a merge hazard. Reported, never
-        # convicting — a node that did its work correctly must not be blocked
-        # for the harness's own runner leaving a cache behind.
-        #
-        # It had no production caller at all until now, so §8.3's stated
-        # maintenance signal did not exist: an adapter could leak on every
-        # attempt of every run and nothing would say so.
+        # The committed candidate is now immutable, but not mergeable.  The
+        # builder stays quiescent in the same worktree while its derived review
+        # is authoritative; settlement happens only after PASS or a terminal
+        # block/cancel path.
         residue = wt.check_pre_merge(attempt, expected)
         if residue.cleanliness is not None and not residue.cleanliness.clean:
-            self._report_hygiene(node.node_id, tuple(
-                "{0} {1}".format(d.kind, d.path)
-                for d in residue.cleanliness.divergences))
-        # Residue an agent left *outside* the attempt's own tree. Reviewers
-        # create ad-hoc detached worktrees under /tmp of their own accord and
-        # remove them inconsistently; the inventory comparison above measures
-        # one tree and can never see one that lives somewhere else. Reported
-        # on the same hygiene channel and with the same consequence — the
-        # merge is not blocked, because the node that produced the diff did
-        # not create the tree and must not be stranded for it.
+            self._report_hygiene(
+                node.node_id,
+                tuple(
+                    "{0} {1}".format(d.kind, d.path)
+                    for d in residue.cleanliness.divergences
+                ),
+            )
         if residue.unprovisioned_worktrees:
-            self._report_hygiene(node.node_id, tuple(
-                "unprovisioned-worktree {0}".format(entry)
-                for entry in residue.unprovisioned_worktrees))
+            self._report_hygiene(
+                node.node_id,
+                tuple(
+                    "unprovisioned-worktree {0}".format(entry)
+                    for entry in residue.unprovisioned_worktrees
+                ),
+            )
 
-        # ── the review stage, which no longer decides anything (§19 M35) ─────
-        #
-        # Here, and not one line earlier. After `_settle_context`, because that
-        # is the proof this attempt's owned process group is absent, and the
-        # reviewer opens a pane of its own — starting it while the builder
-        # might still be alive would put two owned groups inside one attempt's
-        # quiescence obligation.
-        #
-        # It no longer needs to be before `mark_verified` for any reason of
-        # authority, because it has none: a rejection is recorded and the
-        # attempt proceeds. It stays before it anyway so the findings are on
-        # the row by the time the node is eligible to merge, which is what lets
-        # a merged node carry the advisories it merged with.
-        #
-        # Bounded by `execution.review_ceiling`, counted over this node's
-        # already-stored rejection markers: the one prose layer §1.2 lets
-        # survive must terminate on a count, and with the verdict no longer
-        # convicting, what the count now bounds is what the reviewer costs
-        # rather than what it may refuse.
-        if (self.deps.review_attempt is not None
-                and self._review_wanted(node.node_id)):
-            review = self._review_with_redispatch(
-                node, record, attempt, head, output_sha)
-            if review is None:
-                # Settled inside — the attempt is already released or blocked.
-                return
-            self._require_running(record)
-            if not review.passed:
-                self._record_review_advisory(node, review, record, output_sha)
-
-        # ── §7.4's post-work half, and the last word (§19 M35) ──────────────
-        #
-        # After the review stage rather than before it, and the ordering is
-        # load-bearing in one direction only: a refusal here recycles the
-        # attempt, and the reviewer's findings have to be on the row and in the
-        # guidance ledger by then or the repair prompt carries a falsification
-        # verdict and nothing else. Paying for a review of an attempt this may
-        # refuse is the cost of that, and it buys the thing GOAL 1a asks for —
-        # a reviewer that cannot stop a merge but whose objections still reach
-        # the next attempt.
-        #
-        # The falsifiability base is the chain root's head, not this attempt's
-        # base: §7.4 takes its witness once per repair chain, and the question
-        # asked here is about the node's whole work rather than about one
-        # attempt's edit to it. A repair that touched only its test file has a
-        # measured delta of one path, and asking this over that delta would
-        # find nothing to revert and pass vacuously.
         if node.kind is st.NodeKind.AGENT:
             falsified = self._falsify_outputs(
-                node, attempt,
-                basis.integration_head if basis is not None else attempt.base)
+                node,
+                attempt,
+                basis.integration_head if basis is not None else attempt.base,
+            )
             self._require_running(record)
             if not falsified.verified:
+                if self._continue_after_preacceptance_failure(
+                    node,
+                    context,
+                    attempt,
+                    record,
+                    output_sha,
+                    falsified,
+                    execution,
+                    head,
+                ):
+                    return
                 self._settle_context(context)
-                # The commit is already sealed and provable, so this failure is
-                # repaired rather than re-implemented (§7.5) — the next attempt
-                # branches from this tree and is asked to make its tests
-                # exercise the paths named in the verdict.
-                self._settle_verdict(
-                    node, falsified, execution, record,
-                    extra_facts=rp.review_output_extra(output_sha))
+                self._settle_verdict(node, falsified, execution, record)
                 return
+
+        if not self._publish_and_review_candidate(
+            node, context, attempt, record, baseline, execution, head, output_sha
+        ):
+            return
 
         with self._lock:
             self._require_running(record)
             self._output_shas[node.node_id] = output_sha
             store.mark_verified(self.run_id, node.node_id, output_sha)
 
-    def _falsify_outputs(self, node: st.PlanNode, attempt: wt.AttemptWorktree,
-                         falsify_base: str) -> "vf.VerificationVerdict":
+    def _falsify_outputs(
+        self, node: st.PlanNode, attempt: wt.AttemptWorktree, falsify_base: str
+    ) -> "vf.VerificationVerdict":
         """§7.4's post-work half: take the subject back out and re-ask the gate.
 
         Here, and not earlier, because it needs a green post-node gate to be
@@ -1822,19 +2443,25 @@ class Scheduler:
         unnamed = vf.outputs_unnamed_by_gate(written, argv)
         if not unnamed:
             return vf.adjudicate_output_falsification(
-                vf.GateVerdict(green=False, unparseable=False, counts=None), ())
+                vf.GateVerdict(green=False, unparseable=False, counts=None), ()
+            )
         reverted = wt.revert_paths_to(attempt, falsify_base, unnamed)
         try:
             result = self.deps.run_gate(
-                attempt, node, "falsify", self._cancelled.is_set)
+                attempt, node, "falsify", self._cancelled.is_set
+            )
         finally:
             wt.restore_paths_from_head(attempt, reverted)
         return vf.adjudicate_output_falsification(
-            vf.adjudicate_gate(result, node.gate_min_cases), reverted)
+            vf.adjudicate_gate(result, node.gate_min_cases), reverted
+        )
 
     def _prove_tests_red_at_parent(
-            self, node: st.PlanNode, attempt: wt.AttemptWorktree,
-            measured: "wt.InventoryDelta") -> "vf.VerificationVerdict":
+        self,
+        node: st.PlanNode,
+        attempt: wt.AttemptWorktree,
+        measured: "wt.InventoryDelta",
+    ) -> "vf.VerificationVerdict":
         """Tests-node evidence: new cases, each red at this attempt's base.
 
         The worktree *is* the parent commit plus the tests this node wrote,
@@ -1847,142 +2474,881 @@ class Scheduler:
         test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
         current = tc.collect_nodeids(attempt.path, test_paths)
         try:
-            parent = tc.collect_parent_nodeids(
-                attempt.path, attempt.base, test_paths)
+            parent = tc.collect_parent_nodeids(attempt.path, attempt.base, test_paths)
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
-                verified=False, failed_clause=3,
-                reason="{0}: {1}".format(
-                    tc.TestsRefusal.COLLECTION_FAILED.value, exc),
-                retry_class=st.RetryClass.ENVIRONMENTAL)
+                verified=False,
+                failed_clause=3,
+                reason="{0}: {1}".format(tc.TestsRefusal.COLLECTION_FAILED.value, exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+            )
         new = tc.new_nodeids(parent, current)
         parent_run = tc.run_cases(attempt.path, new)
         return tc.adjudicate_parent_red(parent_run, len(new))
 
-    def _review_with_redispatch(self, node: st.PlanNode, record: st.AttemptRecord,
-                                attempt: wt.AttemptWorktree, head: str,
-                                output_sha: str) -> Optional[Any]:
-        """Review this attempt's committed output, re-dispatching the *reviewer*
-        when the reviewer is what failed. `None` means the attempt was settled.
+    def _active_actor_generation(
+        self, node_id: str, actor_role: str, record: st.AttemptRecord
+    ) -> int:
+        """Read the durable actor generation that fences a callback."""
+        session = self.deps.store.current_actor_session(
+            self.run_id, node_id, actor_role
+        )
+        return session.generation if session is not None else record.attempt_no
 
-        A reviewer that never reported says nothing about the code — that much
-        the stall arm always had right, and it is why this classifies
-        ENVIRONMENTAL rather than SEMANTIC and mutates no prompt. What it had
-        wrong is which actor the retry lands on. Failing the whole attempt
-        discards a tree that has already passed its post-node gate, its
-        permission check, and its post-commit cleanliness check, and re-derives
-        the node from the integration head; issue #90 recorded that happening
-        to one node four times in a row — four accepted envelopes, four passing
-        gates, zero verdicts, then `ENVIRONMENTAL_BUDGET_EXHAUSTED` on a node
-        no reviewer had ever judged. And it is not a compensation for an
-        unreliable reviewer: over the same corpus the reviewer completed 33
-        reviews and failed 7, so this is a rare, node-specific failure
-        discarding a builder commit nothing ever faulted.
+    def _require_actor_generation(
+        self, node_id: str, actor_role: str, generation: int, record: st.AttemptRecord
+    ) -> None:
+        self._require_running(record)
+        active = self.deps.store.current_actor_session(self.run_id, node_id, actor_role)
+        if active is not None and active.generation != generation:
+            raise AttemptOwnershipLost(
+                f"{node_id}: {actor_role} generation {generation} was superseded"
+            )
 
-        The budget is the ENVIRONMENTAL one, unchanged — the class this failure
-        already belonged to — spent on re-dispatching the reviewer instead of
-        on discarding the builder. Exhausting it falls through to exactly the
-        settle this method replaced, with the reason it always wrote, so a run
-        that cannot get a verdict ends where it ended before.
-
-        **Nothing here needs the receipt lock reclaimed, and the reason is
-        worth stating because the opposite is the natural assumption.**
-        `ReceiptStore._locked` is an `fcntl.flock` held for the body of a
-        context manager over an open descriptor; the kernel releases it when
-        that descriptor closes, process death included. A `<digest>.lock` file
-        left on disk beside no receipt is the *file* `recover()` created by
-        opening it, not a lock anyone still holds. `code_review.review_attempt`
-        opens with `store.recover(subject_digest)` and then `store.has(...)`,
-        so a re-dispatch re-acquires the lock uncontended, finds no receipt,
-        and proceeds; a race that did produce two writers is already resolved
-        create-once by `ReceiptExists`. Attribution survives too — the receipt
-        carries `ReviewerIdentity(route, model, session_id)` taken from the
-        session that actually reported, which is the dispatch that produced it.
-        """
-        # Bound once. Re-reading the optional attribute inside the loop would
-        # leave every dispatch calling something the type says may be `None`,
-        # and the caller's guard is what makes it not be.
-        dispatch = self.deps.review_attempt
-        assert dispatch is not None, "the caller checks this before calling"
-        store = self.deps.store
-        budget = self.config.retry_budget(st.RetryClass.ENVIRONMENTAL)
-        while True:
+    def _set_lane_phase(
+        self,
+        node_id: str,
+        phase: st.LanePhase,
+        record: st.AttemptRecord,
+        *,
+        allow_watchdog_fence: bool = False,
+    ) -> None:
+        """CAS a lane phase while this builder generation owns RUNNING."""
+        if not allow_watchdog_fence:
             self._require_running(record)
-            try:
-                return dispatch(attempt, node, record, head, output_sha)
-            except cr.ReviewStalled as stall:
-                facts = rp.ReviewStallFacts(
-                    output_sha=output_sha,
-                    # Read back from git *after* the stall, never remembered
-                    # from before it: the question is whether the builder's
-                    # work is still where the evidence chain says it is.
-                    surviving_sha=wt.attempt_ref_commit(
-                        self.deps.repo, self.run_id, node.node_id,
-                        record.attempt_no),
-                    dispatches_spent=rp.review_dispatches_spent(
-                        store.get_attempt(self.run_id, node.node_id,
-                                          record.attempt_no)),
-                    budget=budget,
-                    # Typed fields off the exception. `getattr` because a
-                    # `ReviewStalled` raised by a route that never opened a
-                    # session carries none of them, and an absent fact is
-                    # recorded absent rather than invented.
-                    signal=_stall_signal(stall),
-                    route=getattr(stall, "route", None),
-                    model=getattr(stall, "model", None),
-                    session_id=getattr(stall, "session_id", None),
-                    elapsed_s=getattr(stall, "elapsed_s", None),
-                    window_headroom_s=self._attempt_window_headroom(record))
-                decision = rp.classify_review_stall(facts)
-                # Recorded on **both** arms, and decided before it is written.
-                #
-                # Both arms, because `ReviewStalled.signal` is the reviewer
-                # window's own typed account of how it ended and until this row
-                # existed it had zero readers and zero durable representations:
-                # `maestro.py` records stalls with `lambda _s, _sig, _e: None`
-                # on every window factory, and the arm below writes one reason
-                # string for all four signals, so nothing on disk told
-                # ACTOR_ABANDONED from PROCESS_DEAD, TURN_TIMEOUT, or
-                # WINDOW_TIMEOUT. §3.6 B15 makes a field with no readers a
-                # build failure. Writing only the re-dispatched stalls would
-                # have left the *last* one — the one that settles the attempt,
-                # and the one an operator diagnoses from — unrecorded.
-                #
-                # Decided first, because the count this write increments is the
-                # loop's bound: reading it after the write would spend a
-                # dispatch on deciding whether to spend one.
-                store.record_review_dispatch(
-                    self.run_id, node.node_id, record.attempt_no,
-                    rp.review_dispatch_row(facts))
-                if decision.outcome is not rp.ReviewDispatchOutcome.REDISPATCH:
-                    self._settle_failure(
-                        node, rp.Classification(
-                            retry_class=st.RetryClass.ENVIRONMENTAL,
-                            reason=decision.reason),
-                        record=record)
-                    return None
+        current = self.deps.store.get_node(self.run_id, node_id).lane_phase
+        if current is phase:
+            return
+        if current in st.LANE_PHASE_TERMINAL or not self.deps.store.set_lane_phase(
+            self.run_id, node_id, phase, expected=current
+        ):
+            raise AttemptOwnershipLost(
+                f"{node_id}: lane phase changed before {phase.value}"
+            )
 
-    def _attempt_window_headroom(self, record: st.AttemptRecord) -> Optional[float]:
-        """Seconds left in this attempt's §7.6 wall-clock window, or `None`.
+    def _review_evidence(
+        self, review: Any
+    ) -> Tuple[str, str, Tuple[Mapping[str, Any], ...]]:
+        """Extract typed immutable evidence for the candidate review ledger."""
+        digest = getattr(review, "subject_digest", None)
+        if not isinstance(digest, str) or not digest:
+            raise lc.LifecycleError("review outcome has no typed subject digest")
+        if self.deps.receipt_path_for is None:
+            raise lc.LifecycleError(
+                "persistent candidate review requires receipt_path_for"
+            )
+        receipt_path = self.deps.receipt_path_for(digest)
+        if not isinstance(receipt_path, str) or not receipt_path:
+            raise lc.LifecycleError(
+                "receipt_path_for did not return the review receipt path"
+            )
+        findings: List[Mapping[str, Any]] = []
+        for cell in (
+            tuple(getattr(review, "findings", ()))
+            + tuple(getattr(review, "advisories", ()))
+            + tuple(getattr(review, "unreachable", ()))
+        ):
+            if isinstance(cell, Mapping):
+                findings.append(dict(cell))
+            else:
+                findings.append(
+                    {
+                        "check_id": str(getattr(cell, "check_id", "")),
+                        "object_id": str(getattr(cell, "object_id", "")),
+                        "message": str(getattr(cell, "message", "")),
+                        "grade": getattr(cell, "grade", None),
+                    }
+                )
+        return digest, receipt_path, tuple(findings)
 
-        `None` where it cannot be measured — an attempt row whose `started_at`
-        was never written reads `0.0`, and treating that as "no time left"
-        would refuse every re-dispatch on a ledger old enough to lack it.
-        Unmeasured is not zero.
+    def _repair_prompt(self, rejected_candidate_sha: str, review: Any) -> str:
+        findings_text = getattr(review, "findings_text", None)
+        rendered = findings_text() if callable(findings_text) else ""
+        if not rendered:
+            lines = []
+            for finding in getattr(review, "findings", ()):
+                if isinstance(finding, Mapping):
+                    check_id = str(finding.get("check_id", "")).strip()
+                    object_id = str(finding.get("object_id", "")).strip()
+                    message = str(finding.get("message", "")).strip()
+                    rationale = str(
+                        finding.get("grade_rationale", "")
+                        or finding.get("rationale", "")
+                    ).strip()
+                else:
+                    check_id = str(getattr(finding, "check_id", "")).strip()
+                    object_id = str(getattr(finding, "object_id", "")).strip()
+                    message = str(getattr(finding, "message", "")).strip()
+                    rationale = str(
+                        getattr(finding, "grade_rationale", "")
+                        or getattr(finding, "rationale", "")
+                    ).strip()
+                label = " / ".join(part for part in (check_id, object_id) if part)
+                line = f"- {label}: {message}" if label else f"- {message}"
+                if rationale:
+                    line += f" Rationale: {rationale}"
+                lines.append(line)
+            rendered = "\n".join(lines)
+        return (
+            f"Repair rejected candidate {rejected_candidate_sha} in the existing "
+            "worktree. Address every finding and emit one distinct descendant "
+            f"candidate.\n\n{rendered}"
+        )
 
-        `self._time_source()` and not a second clock: `start_attempt` writes
-        `started_at` with `time.time()`, and subtracting one clock's reading
-        from another's is a number with no meaning. Production therefore
-        defaults the seam to `time.time`.
-        """
-        if record.started_at <= 0:
+    def _continue_repair_handoff(
+        self,
+        node: st.PlanNode,
+        context: _AttemptContext,
+        attempt: wt.AttemptWorktree,
+        record: st.AttemptRecord,
+        prompt: str,
+        rejected_candidate_sha: str,
+        builder_generation: int,
+    ) -> Optional[RepairExecution]:
+        """Deliver and durably acknowledge one handoff on the owning builder."""
+        if self.deps.continue_node is None:
+            self.deps.store.fail_handoff(
+                self.run_id,
+                node.node_id,
+                rejected_candidate_sha,
+                builder_generation=builder_generation,
+                reason="persistent repair callback is unavailable",
+            )
+            self._close_persistent_reviewer(node.node_id, record)
+            self._settle_context(context)
+            self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+            self.deps.store.mark_blocked(
+                self.run_id,
+                node.node_id,
+                st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                detail={
+                    "candidate_sha": rejected_candidate_sha,
+                    "reason": "persistent repair callback is unavailable",
+                },
+            )
             return None
-        return self.config.node_timeout_s - (self._time_source() - record.started_at)
+
+        self._set_lane_phase(node.node_id, st.LanePhase.REPAIRING, record)
+        while True:
+            try:
+                repair = self.deps.continue_node(
+                    attempt,
+                    node,
+                    record,
+                    prompt,
+                    rejected_candidate_sha,
+                    builder_generation,
+                    self._cancelled.is_set,
+                )
+                break
+            except (AttemptCancelled, AttemptOwnershipLost, QuiescenceFailure):
+                raise
+            except Exception as exc:
+                retry_class = (
+                    st.LaneRetryClass.LAUNCHER_TRANSIENT
+                    if isinstance(exc, LaunchFailed)
+                    else st.LaneRetryClass.ENVIRONMENTAL
+                )
+                detail = {
+                    "candidate_sha": rejected_candidate_sha,
+                    "reason": _exception_reason(exc),
+                }
+                allowed = self._lane_retry(
+                    node,
+                    retry_class,
+                    candidate_sha=rejected_candidate_sha,
+                    detail=detail,
+                )
+                if allowed:
+                    builder_generation = self._active_actor_generation(
+                        node.node_id, "builder", record
+                    )
+                    candidate = self.deps.store.candidate(
+                        self.run_id, node.node_id, rejected_candidate_sha
+                    )
+                    guidance = self._refresh_lane_guidance(node.node_id, record)
+                    prompt = rp.render_guidance(
+                        node,
+                        guidance,
+                        repair=rp.RepairBasis(
+                            base_sha=rejected_candidate_sha,
+                            integration_head=record.integration_head,
+                            repair_of_attempt=record.attempt_no,
+                            chain_length=(
+                                candidate.candidate_seq if candidate is not None else 1
+                            ),
+                        ),
+                    )
+                    continue
+                self.deps.store.fail_handoff(
+                    self.run_id,
+                    node.node_id,
+                    rejected_candidate_sha,
+                    builder_generation=builder_generation,
+                    reason=_exception_reason(exc),
+                )
+                self._close_persistent_reviewer(node.node_id, record)
+                self._settle_context(context)
+                self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+                self.deps.store.mark_blocked(
+                    self.run_id,
+                    node.node_id,
+                    st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                    detail=detail,
+                )
+                return None
+
+        replacement_generation = repair.builder_generation
+        self._require_actor_generation(
+            node.node_id, "builder", replacement_generation, record
+        )
+        submitted = self.deps.store.mark_handoff_submitted(
+            self.run_id,
+            node.node_id,
+            rejected_candidate_sha,
+            builder_generation=replacement_generation,
+        )
+        if not submitted.submitted:
+            raise AttemptOwnershipLost(
+                f"{node.node_id}: builder generation lost repair handoff"
+            )
+        self._quiesce(record, "repair-idle")
+        if repair.acknowledged_rejected_sha != rejected_candidate_sha:
+            self.deps.store.fail_handoff(
+                self.run_id,
+                node.node_id,
+                rejected_candidate_sha,
+                builder_generation=replacement_generation,
+                reason="repair acknowledgement does not bind the active handoff",
+            )
+            raise AttemptOwnershipLost(
+                f"{node.node_id}: repair acknowledgement is stale or mismatched"
+            )
+        acknowledged = self.deps.store.acknowledge_handoff(
+            self.run_id,
+            node.node_id,
+            rejected_candidate_sha,
+            builder_generation=replacement_generation,
+        )
+        if not acknowledged.acknowledged:
+            raise AttemptOwnershipLost(
+                f"{node.node_id}: repair acknowledgement lost lifecycle ownership"
+            )
+        self._set_lane_phase(
+            node.node_id, st.LanePhase.WAITING_FOR_NEW_CANDIDATE, record
+        )
+        return repair
+
+    def _lane_retry(
+        self,
+        node: st.PlanNode,
+        retry_class: st.LaneRetryClass,
+        *,
+        candidate_sha: Optional[str],
+        detail: Mapping[str, Any],
+    ) -> bool:
+        """Spend one durable same-session correction-loop budget unit."""
+        previous = self.deps.store.lane_retry_spends(
+            self.run_id, node.node_id, limit=10_000
+        )
+        spend = self.deps.store.spend_lane_retry(
+            self.run_id,
+            node.node_id,
+            retry_class,
+            cycle_seq=len(previous) + 1,
+            candidate_sha=candidate_sha,
+            detail=detail,
+        )
+        if not spend.created:
+            return True
+        lifecycle = self.deps.store.get_node(self.run_id, node.node_id)
+        if retry_class is st.LaneRetryClass.REVIEW_REJECTION:
+            ceiling = self.config.review_ceiling + lifecycle.granted_extra_attempts
+        elif retry_class is st.LaneRetryClass.SEMANTIC:
+            ceiling = self.config.semantic_ceiling + lifecycle.granted_extra_attempts
+        elif retry_class is st.LaneRetryClass.LAUNCHER_TRANSIENT:
+            ceiling = self.config.launcher_retries
+        else:
+            ceiling = self.config.environmental_retries
+        spent = sum(
+            item.retry_class is retry_class
+            for item in self.deps.store.lane_retry_spends(
+                self.run_id, node.node_id, limit=10_000
+            )
+        )
+        if retry_class in (
+            st.LaneRetryClass.SEMANTIC,
+            st.LaneRetryClass.REVIEW_REJECTION,
+        ):
+            return spent < ceiling
+        # Launcher/environmental settings name retries after the first
+        # failure; semantic/review ceilings name the total rejected cycles.
+        return spent <= ceiling
+
+    def _refresh_lane_guidance(
+        self, build_node_id: str, record: st.AttemptRecord
+    ) -> rp.GuidanceLedger:
+        """Rebuild one retained lane's prompt constraints from durable rows."""
+        legacy = rp.guidance_from_attempts(
+            self.deps.store.attempts_for(self.run_id)
+        ).get(record.guidance_key, rp.GuidanceLedger())
+        review_node = self._review_for_build(build_node_id)
+        reviews = (
+            ()
+            if review_node is None
+            else self.deps.store.candidate_reviews(
+                self.run_id, review_node.node_id, limit=10_000
+            )
+        )
+        persistent = rp.guidance_from_lane_history(
+            self.deps.store.lane_retry_spends(self.run_id, build_node_id, limit=10_000),
+            reviews,
+        )
+        combined = rp.GuidanceLedger(
+            verification=legacy.verification + persistent.verification,
+            review=legacy.review + persistent.review,
+        )
+        if combined.empty:
+            self._guidance.pop(record.guidance_key, None)
+        else:
+            self._guidance[record.guidance_key] = combined
+        return combined
+
+    def _lane_semantic_budget_detail(
+        self, detail: Mapping[str, Any], node_id: str
+    ) -> Dict[str, Any]:
+        """Describe the durable correction-loop spend that caused a block."""
+        lifecycle = self.deps.store.get_node(self.run_id, node_id)
+        spent = sum(
+            item.retry_class is st.LaneRetryClass.SEMANTIC
+            for item in self.deps.store.lane_retry_spends(
+                self.run_id, node_id, limit=10_000
+            )
+        )
+        granted = lifecycle.granted_extra_attempts
+        required = spent + 2 - self.config.semantic_ceiling - granted
+        return dict(
+            detail,
+            semantic_retry_spends_total=spent,
+            semantic_ceiling=self.config.semantic_ceiling,
+            granted_extra_attempts=granted,
+            semantic_grant_required=max(1, required),
+        )
+
+    @staticmethod
+    def _verdict_classification(
+        node: st.PlanNode, verdict: "vf.VerificationVerdict", execution: NodeExecution
+    ) -> rp.Classification:
+        """Classify one deterministic verification failure identically everywhere."""
+        signal = rp.FailureSignal(
+            node_kind=node.kind,
+            exit_code=execution.exit_code,
+            gate=rp.GateOutcome(pre_gate_failed=True, post_gate_passed=False)
+            if verdict.failed_clause == 3
+            else None,
+            report=rp.ReportOutcome(
+                parsed=execution.envelope_parsed, failed=verdict.failed_clause == 3
+            ),
+            launcher_failure=execution.launcher_failure,
+        )
+        return (
+            rp.Classification(retry_class=verdict.retry_class)
+            if verdict.retry_class is not None
+            else rp.classify(signal)
+        )
+
+    def _continue_before_candidate_failure(
+        self,
+        node: st.PlanNode,
+        context: _AttemptContext,
+        attempt: wt.AttemptWorktree,
+        record: st.AttemptRecord,
+        basis: Optional[rp.RepairBasis],
+        pre_verdict: vf.GateVerdict,
+        baseline: wt.Inventory,
+        verdict: "vf.VerificationVerdict",
+        execution: NodeExecution,
+        head: str,
+    ) -> bool:
+        """Repair an uncommitted semantic failure in the retained worktree."""
+        if (
+            self._review_for_build(node.node_id) is None
+            or self.deps.continue_node is None
+            or verdict.block_reason is not None
+        ):
+            return False
+        classification = self._verdict_classification(node, verdict, execution)
+        if classification.retry_class is None:
+            return False
+        retry_class = st.LaneRetryClass(classification.retry_class.value)
+        subject_sha = basis.base_sha if basis is not None else attempt.base
+        detail = _failure_detail(classification, verdict)
+        detail["candidate_sha"] = subject_sha
+        allowed = self._lane_retry(
+            node, retry_class, candidate_sha=subject_sha, detail=detail
+        )
+        guidance = self._refresh_lane_guidance(node.node_id, record)
+        if not allowed:
+            self._close_persistent_reviewer(node.node_id, record)
+            self._settle_context(context)
+            self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+            if retry_class is st.LaneRetryClass.SEMANTIC:
+                detail = self._lane_semantic_budget_detail(detail, node.node_id)
+            self.deps.store.mark_blocked(
+                self.run_id,
+                node.node_id,
+                _budget_reason(classification.retry_class),
+                detail=detail,
+                retry_class=classification.retry_class,
+            )
+            return True
+        builder_generation = self._active_actor_generation(
+            node.node_id, "builder", record
+        )
+        self._require_actor_generation(
+            node.node_id, "builder", builder_generation, record
+        )
+        self._set_lane_phase(node.node_id, st.LanePhase.REPAIRING, record)
+        repair_instruction = (
+            "Repair the failed pre-candidate work in this existing worktree. "
+            f"Failure: {verdict.reason}"
+        )
+        rendered = rp.render_guidance(node, guidance, repair=basis)
+        repair_prompt = "\n\n".join(
+            part for part in (repair_instruction, rendered) if part
+        )
+        repair = self.deps.continue_node(
+            attempt,
+            node,
+            record,
+            repair_prompt,
+            subject_sha,
+            builder_generation,
+            self._cancelled.is_set,
+        )
+        self._quiesce(record, "repair-idle")
+        if (
+            repair.acknowledged_rejected_sha != subject_sha
+            or repair.builder_generation != builder_generation
+        ):
+            raise AttemptOwnershipLost(
+                f"{node.node_id}: pre-candidate repair acknowledgement mismatched"
+            )
+        self._set_lane_phase(
+            node.node_id, st.LanePhase.WAITING_FOR_NEW_CANDIDATE, record
+        )
+        self._complete_attempt(
+            node,
+            context,
+            attempt,
+            record,
+            basis,
+            pre_verdict,
+            baseline,
+            repair.execution,
+            head,
+            record_result=False,
+        )
+        return True
+
+    def _continue_after_preacceptance_failure(
+        self,
+        node: st.PlanNode,
+        context: _AttemptContext,
+        attempt: wt.AttemptWorktree,
+        record: st.AttemptRecord,
+        previous_sha: str,
+        verdict: "vf.VerificationVerdict",
+        execution: NodeExecution,
+        head: str,
+    ) -> bool:
+        """Repair a committed-but-not-published failure in the same session."""
+        if (
+            self._review_for_build(node.node_id) is None
+            or self.deps.continue_node is None
+            or verdict.block_reason is not None
+        ):
+            return False
+        classification = self._verdict_classification(node, verdict, execution)
+        if classification.retry_class is None:
+            return False
+        retry_class = st.LaneRetryClass(classification.retry_class.value)
+        detail = _failure_detail(classification, verdict)
+        detail["candidate_sha"] = previous_sha
+        allowed = self._lane_retry(
+            node, retry_class, candidate_sha=previous_sha, detail=detail
+        )
+        guidance = self._refresh_lane_guidance(node.node_id, record)
+        if not allowed:
+            self._close_persistent_reviewer(node.node_id, record)
+            self._settle_context(context)
+            self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+            if retry_class is st.LaneRetryClass.SEMANTIC:
+                detail = self._lane_semantic_budget_detail(detail, node.node_id)
+            self.deps.store.mark_blocked(
+                self.run_id,
+                node.node_id,
+                _budget_reason(classification.retry_class),
+                detail=detail,
+                retry_class=classification.retry_class,
+            )
+            return True
+        builder_generation = self._active_actor_generation(
+            node.node_id, "builder", record
+        )
+        self._require_actor_generation(
+            node.node_id, "builder", builder_generation, record
+        )
+        self._set_lane_phase(node.node_id, st.LanePhase.REPAIRING, record)
+        repair_basis = rp.RepairBasis(
+            base_sha=previous_sha,
+            integration_head=head,
+            repair_of_attempt=record.attempt_no,
+            chain_length=1,
+        )
+        wt.prepare_descendant_candidate(attempt, previous_sha)
+        repair_baseline = wt.take_baseline(attempt)
+        repair_instruction = (
+            "Repair the failed pre-acceptance candidate "
+            f"{previous_sha}. Gate failure: {verdict.reason}"
+        )
+        rendered = rp.render_guidance(node, guidance, repair=repair_basis)
+        repair_prompt = "\n\n".join(
+            part for part in (repair_instruction, rendered) if part
+        )
+        repair = self.deps.continue_node(
+            attempt,
+            node,
+            record,
+            repair_prompt,
+            previous_sha,
+            builder_generation,
+            self._cancelled.is_set,
+        )
+        self._quiesce(record, "repair-idle")
+        if (
+            repair.acknowledged_rejected_sha != previous_sha
+            or repair.builder_generation != builder_generation
+        ):
+            raise AttemptOwnershipLost(
+                f"{node.node_id}: pre-acceptance repair acknowledgement mismatched"
+            )
+        self._set_lane_phase(
+            node.node_id, st.LanePhase.WAITING_FOR_NEW_CANDIDATE, record
+        )
+        self._complete_attempt(
+            node,
+            context,
+            attempt,
+            record,
+            repair_basis,
+            _pending_gate(),
+            repair_baseline,
+            repair.execution,
+            head,
+            record_result=False,
+        )
+        return True
+
+    def _close_persistent_reviewer(
+        self, node_id: str, record: st.AttemptRecord
+    ) -> None:
+        """Terminal paths close the reviewer; waiting paths never do."""
+        if self.deps.close_review is None:
+            return
+        self._require_running(record)
+        self.deps.close_review(node_id)
+
+    def _publish_and_review_candidate(
+        self,
+        node: st.PlanNode,
+        context: _AttemptContext,
+        attempt: wt.AttemptWorktree,
+        record: st.AttemptRecord,
+        baseline: wt.Inventory,
+        execution: NodeExecution,
+        head: str,
+        output_sha: str,
+    ) -> bool:
+        """Publish one candidate and drive its exactly-once review/repair loop."""
+        review_node = self._review_for_build(node.node_id)
+        if review_node is None or self.deps.review_attempt is None:
+            return True
+        candidates = self.deps.store.lane_candidates(
+            self.run_id, node.node_id, limit=10_000
+        )
+        replay = next(
+            (item for item in candidates if item.candidate_sha == output_sha), None
+        )
+        durable_handoff = (
+            self.deps.store.repair_handoff(self.run_id, node.node_id, output_sha)
+            if replay is not None
+            else None
+        )
+        replayed_handoff = durable_handoff is not None
+        repair_builder_generation = (
+            durable_handoff.builder_generation
+            if durable_handoff is not None
+            else self._active_actor_generation(node.node_id, "builder", record)
+        )
+        # A replay reasserts immutable publication identity, not ownership of
+        # the currently active builder.  New repair delivery below remains
+        # fenced to that active builder; an existing handoff remains fenced to
+        # its durable bound generation.
+        publication_builder_generation = (
+            replay.builder_generation
+            if replay is not None and durable_handoff is None
+            else repair_builder_generation
+        )
+        self._require_actor_generation(
+            node.node_id, "builder", repair_builder_generation, record
+        )
+        parent = (
+            replay.parent_candidate_sha
+            if replay is not None
+            else candidates[-1].candidate_sha
+            if candidates
+            else None
+        )
+        candidate = self.deps.store.publish_candidate(
+            self.run_id,
+            node.node_id,
+            output_sha,
+            parent_candidate_sha=parent,
+            builder_generation=publication_builder_generation,
+            repo_path=attempt.repo,
+        ).candidate
+        self._set_lane_phase(node.node_id, st.LanePhase.CANDIDATE_READY, record)
+        reviewer_generation = self._active_actor_generation(
+            node.node_id, "reviewer", record
+        )
+        self._set_lane_phase(node.node_id, st.LanePhase.REVIEWING, record)
+        begun = self.deps.store.begin_review(
+            self.run_id,
+            review_node.node_id,
+            candidate.candidate_sha,
+            reviewer_generation=reviewer_generation,
+        )
+        durable_review = begun.review
+        if durable_review.state is st.CandidateReviewState.DISPATCHED:
+            # A DISPATCHED row is an unfinished review, not proof that the
+            # scheduler consumed its report. Resume the same durable review
+            # callback; the callback adopts the retained reviewer and replays
+            # an already-written report/receipt without submitting a second
+            # prompt. Only a terminal row suppresses the callback.
+            resume_existing_dispatch = not begun.should_dispatch
+            if durable_review.reviewer_generation != reviewer_generation:
+                recovered = self.deps.store.recover_review_dispatch(
+                    self.run_id,
+                    review_node.node_id,
+                    candidate.candidate_sha,
+                    expected_reviewer_generation=durable_review.reviewer_generation,
+                    reviewer_generation=reviewer_generation,
+                )
+                durable_review = recovered.review
+                resume_existing_dispatch = True
+            review = None
+            while durable_review.state is st.CandidateReviewState.DISPATCHED:
+                self._require_actor_generation(
+                    node.node_id, "reviewer", reviewer_generation, record
+                )
+                try:
+                    callback_review = self.deps.review_attempt(
+                        attempt,
+                        node,
+                        record,
+                        head,
+                        candidate.candidate_sha,
+                        resume_existing_dispatch,
+                    )
+                except cr.ReviewStalled as stall:
+                    signal_name = _stall_signal(stall)
+                    reason = (
+                        signal_name or "the code reviewer stalled without reporting"
+                    )
+                    replacement_generation = self._active_actor_generation(
+                        node.node_id, "reviewer", record
+                    )
+                    if replacement_generation != reviewer_generation:
+                        recovered = self.deps.store.recover_review_dispatch(
+                            self.run_id,
+                            review_node.node_id,
+                            candidate.candidate_sha,
+                            expected_reviewer_generation=reviewer_generation,
+                            reviewer_generation=replacement_generation,
+                        )
+                        durable_review = recovered.review
+                        reviewer_generation = replacement_generation
+                        if durable_review.terminal:
+                            break
+                    allowed = self._lane_retry(
+                        node,
+                        st.LaneRetryClass.ENVIRONMENTAL,
+                        candidate_sha=candidate.candidate_sha,
+                        detail={
+                            "candidate_sha": candidate.candidate_sha,
+                            "reason": reason,
+                        },
+                    )
+                    if allowed:
+                        resume_existing_dispatch = True
+                        continue
+                    self._close_persistent_reviewer(node.node_id, record)
+                    self._settle_context(context)
+                    self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+                    self.deps.store.mark_blocked(
+                        self.run_id,
+                        node.node_id,
+                        st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                        detail={
+                            "candidate_sha": candidate.candidate_sha,
+                            "reason": reason,
+                        },
+                        retry_class=st.RetryClass.ENVIRONMENTAL,
+                    )
+                    return False
+                replacement_generation = self._active_actor_generation(
+                    node.node_id, "reviewer", record
+                )
+                if replacement_generation != reviewer_generation:
+                    # The callback returned from a superseded reviewer. Move
+                    # the unfinished durable dispatch to the replacement and
+                    # call it again there. Never apply the old callback's
+                    # evidence under the replacement generation.
+                    recovered = self.deps.store.recover_review_dispatch(
+                        self.run_id,
+                        review_node.node_id,
+                        candidate.candidate_sha,
+                        expected_reviewer_generation=reviewer_generation,
+                        reviewer_generation=replacement_generation,
+                    )
+                    durable_review = recovered.review
+                    reviewer_generation = replacement_generation
+                    if durable_review.state is st.CandidateReviewState.DISPATCHED:
+                        resume_existing_dispatch = True
+                        continue
+                    break
+                review = callback_review
+                break
+            if review is not None:
+                digest, receipt_path, findings = self._review_evidence(review)
+                if bool(getattr(review, "passed", False)):
+                    durable_review = self.deps.store.complete_review(
+                        self.run_id,
+                        review_node.node_id,
+                        candidate.candidate_sha,
+                        reviewer_generation=reviewer_generation,
+                        verdict=st.ReviewVerdict.PASS,
+                        review_digest=digest,
+                        receipt_path=receipt_path,
+                        findings=findings,
+                    ).review
+                else:
+                    durable_review = self.deps.store.reject_and_create_handoff(
+                        self.run_id,
+                        review_node.node_id,
+                        candidate.candidate_sha,
+                        reviewer_generation=reviewer_generation,
+                        builder_generation=repair_builder_generation,
+                        review_digest=digest,
+                        receipt_path=receipt_path,
+                        findings=findings,
+                    ).review
+        if durable_review.verdict is st.ReviewVerdict.PASS:
+            self._require_actor_generation(
+                node.node_id, "builder", repair_builder_generation, record
+            )
+            if not self._review_is_accepted(review_node.node_id):
+                self.deps.store.mark_review_accepted(
+                    self.run_id, review_node.node_id, candidate.candidate_sha
+                )
+            self._set_lane_phase(node.node_id, st.LanePhase.ACCEPTED, record)
+            self._close_persistent_reviewer(node.node_id, record)
+            self._settle_context(context)
+            return True
+        if durable_review.verdict is not st.ReviewVerdict.REJECTED:
+            self._set_lane_phase(
+                node.node_id, st.LanePhase.WAITING_FOR_NEW_CANDIDATE, record
+            )
+            return False
+        self._review_convergence.setdefault(node.node_id, []).append(
+            len(durable_review.findings)
+        )
+        self._review_findings[node.node_id] = "\n".join(
+            str(finding.get("message", "")) for finding in durable_review.findings
+        )
+
+        self._set_lane_phase(node.node_id, st.LanePhase.REPAIR_HANDOFF, record)
+        allowed = replayed_handoff or self._lane_retry(
+            node,
+            st.LaneRetryClass.REVIEW_REJECTION,
+            candidate_sha=candidate.candidate_sha,
+            detail={
+                "candidate_sha": candidate.candidate_sha,
+                "review_digest": durable_review.review_digest,
+            },
+        )
+        guidance = self._refresh_lane_guidance(node.node_id, record)
+        if not allowed:
+            self._close_persistent_reviewer(node.node_id, record)
+            self._settle_context(context)
+            self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+            self.deps.store.mark_blocked(
+                self.run_id,
+                node.node_id,
+                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                detail={
+                    "candidate_sha": candidate.candidate_sha,
+                    "findings": list(durable_review.findings),
+                },
+            )
+            return False
+        repair_basis = rp.RepairBasis(
+            base_sha=candidate.candidate_sha,
+            integration_head=head,
+            repair_of_attempt=record.attempt_no,
+            chain_length=candidate.candidate_seq + 1,
+        )
+        repair_prompt = rp.render_guidance(node, guidance, repair=repair_basis)
+        if repair_prompt is None:
+            repair_prompt = self._repair_prompt(candidate.candidate_sha, durable_review)
+        wt.prepare_descendant_candidate(attempt, candidate.candidate_sha)
+        repair_baseline = wt.take_baseline(attempt)
+        repair = self._continue_repair_handoff(
+            node,
+            context,
+            attempt,
+            record,
+            repair_prompt,
+            candidate.candidate_sha,
+            repair_builder_generation,
+        )
+        if repair is None:
+            return False
+        self._complete_attempt(
+            node,
+            context,
+            attempt,
+            record,
+            rp.RepairBasis(
+                base_sha=candidate.candidate_sha,
+                integration_head=head,
+                repair_of_attempt=record.attempt_no,
+                chain_length=candidate.candidate_seq + 1,
+            ),
+            _pending_gate(),
+            repair_baseline,
+            repair.execution,
+            head,
+            record_result=False,
+        )
+        return False
 
     # ── settling a failed attempt ───────────────────────────────────────────
 
-    def _record_result(self, node: st.PlanNode, record: st.AttemptRecord,
-                       execution: NodeExecution) -> None:
+    def _record_result(
+        self, node: st.PlanNode, record: st.AttemptRecord, execution: NodeExecution
+    ) -> None:
         """§7.7 — land the agent's declared result in one adjudicated row.
 
         **Placed here, before `_require_running`, and that ordering is the
@@ -2023,18 +3389,29 @@ class Scheduler:
                 node,
                 rp.Classification(
                     retry_class=st.RetryClass.ENVIRONMENTAL,
-                    reason=wd.StallReason.NODE_TIMEOUT.value),
-                record=record, allow_watchdog_fence=True)
+                    reason=wd.StallReason.NODE_TIMEOUT.value,
+                ),
+                record=record,
+                allow_watchdog_fence=True,
+            )
         adjudged = vf.adjudicate_result(
-            st.ResultRecord(node_id=node.node_id, attempt_no=record.attempt_no,
-                            subject_sha=record.base_sha, payload=payload),
-            self.deps.store.attempts_for(self.run_id, node.node_id))
+            st.ResultRecord(
+                node_id=node.node_id,
+                attempt_no=record.attempt_no,
+                subject_sha=record.base_sha,
+                payload=payload,
+            ),
+            self.deps.store.attempts_for(self.run_id, node.node_id),
+        )
         self.deps.store.record_result(self.run_id, adjudged)
 
     def _unreferenced_produced_symbols(
-            self, attempt: "wt.AttemptWorktree", baseline: "wt.Inventory",
-            measured: "wt.InventoryDelta", after: "wt.Inventory"
-            ) -> Tuple["rc.ProducedSymbol", ...]:
+        self,
+        attempt: "wt.AttemptWorktree",
+        baseline: "wt.Inventory",
+        measured: "wt.InventoryDelta",
+        after: "wt.Inventory",
+    ) -> Tuple["rc.ProducedSymbol", ...]:
         """The counted fact behind #118, measured over this attempt's delta.
 
         Three sources, each read from where it is authoritative: what the
@@ -2051,8 +3428,9 @@ class Scheduler:
         at all: `blob_text` raises, because §7.5 forbids reading a failed git
         call as a fact about the tree.
         """
-        written = tuple(rel for rel in measured.added + measured.changed
-                        if rel.endswith(".py"))
+        written = tuple(
+            rel for rel in measured.added + measured.changed if rel.endswith(".py")
+        )
         if not written:
             return ()
         produced: Dict[str, str] = {}
@@ -2078,56 +3456,80 @@ class Scheduler:
                 surface[rel] = source
         return rc.unreferenced(produced, surface, base_sources)
 
-    def _settle_verdict(self, node: st.PlanNode, verdict: "vf.VerificationVerdict",
-                        execution: NodeExecution, record: st.AttemptRecord,
-                        extra_facts: Optional[Mapping[str, Any]] = None) -> None:
+    def _settle_verdict(
+        self,
+        node: st.PlanNode,
+        verdict: "vf.VerificationVerdict",
+        execution: NodeExecution,
+        record: st.AttemptRecord,
+        extra_facts: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """Turn a failed VERIFIED predicate into a classification (§7.5).
 
         `extra_facts` is merged onto the failing attempt's row beside the
-        guidance entry. Two callers pass it. Falsification refusal carries
-        the sealed output commit `decide_repair` proves against. Empty
-        repair carries `REPAIR_DIFF_EMPTY_KEY`, so `repair_subject` can
-        walk past a row that minted no tree.
+        guidance entry. Two callers pass it. A falsification refusal carries
+        the sealed output commit that recovery can prove; an empty repair
+        carries `REPAIR_DIFF_EMPTY_KEY` for durable audit and retry guidance.
         """
         if verdict.block_reason is not None:
             self._settle_failure(
-                node, rp.Classification(block_reason=verdict.block_reason),
-                record=record)
+                node,
+                rp.Classification(block_reason=verdict.block_reason),
+                record=record,
+            )
             return
 
-        signal = rp.FailureSignal(
-            node_kind=node.kind,
-            exit_code=execution.exit_code,
-            gate=rp.GateOutcome(pre_gate_failed=True, post_gate_passed=False)
-            if verdict.failed_clause == 3 else None,
-            report=rp.ReportOutcome(parsed=execution.envelope_parsed,
-                                    failed=verdict.failed_clause == 3),
-            launcher_failure=execution.launcher_failure)
-        classification = (rp.Classification(retry_class=verdict.retry_class)
-                          if verdict.retry_class is not None
-                          else rp.classify(signal))
+        classification = self._verdict_classification(node, verdict, execution)
         # The adapter's own account of the execution, attached where every
         # other observation is attached. `_with_reason` never overwrites, and
         # neither arm above sets one, so this is the ledger's only chance to
         # record what the launcher saw (§7.6).
         self._settle_failure(
-            node, _with_reason(classification, execution.launch_detail or None),
-            verdict, record, extra_facts=extra_facts)
+            node,
+            _with_reason(classification, execution.launch_detail or None),
+            verdict,
+            record,
+            extra_facts=extra_facts,
+        )
 
-    def _settle_failure(self, node: st.PlanNode, classification: rp.Classification,
-                        verdict: Optional["vf.VerificationVerdict"] = None,
-                        record: Optional[st.AttemptRecord] = None,
-                        allow_watchdog_fence: bool = False,
-                        extra_facts: Optional[Mapping[str, Any]] = None) -> None:
+    def _mark_lane_blocked(
+        self,
+        node: st.PlanNode,
+        record: st.AttemptRecord,
+        *,
+        allow_watchdog_fence: bool = False,
+    ) -> None:
+        """Persist terminal lane phase before the owning node is blocked."""
+        if self._review_for_build(node.node_id) is None:
+            return
+        phase = self.deps.store.get_node(self.run_id, node.node_id).lane_phase
+        if phase not in st.LANE_PHASE_TERMINAL:
+            self._set_lane_phase(
+                node.node_id,
+                st.LanePhase.BLOCKED,
+                record,
+                allow_watchdog_fence=allow_watchdog_fence,
+            )
+
+    def _settle_failure(
+        self,
+        node: st.PlanNode,
+        classification: rp.Classification,
+        verdict: Optional["vf.VerificationVerdict"] = None,
+        record: Optional[st.AttemptRecord] = None,
+        allow_watchdog_fence: bool = False,
+        extra_facts: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """Block or release only the generation that still owns RUNNING."""
         if record is None:
             return
         store = self.deps.store
         with self._lock:
-            if (self._cancelled.is_set()
-                    or not self._owns_running(record)
-                    or (record.key in self._watchdog_fences
-                        and not allow_watchdog_fence)):
+            if (
+                self._cancelled.is_set()
+                or not self._owns_running(record)
+                or (record.key in self._watchdog_fences and not allow_watchdog_fence)
+            ):
                 return
             # Why the attempt failed, computed once and written wherever this
             # failure is recorded — the retry row below and, above all, the
@@ -2136,9 +3538,15 @@ class Scheduler:
             detail = _failure_detail(classification, verdict)
 
             if classification.block_reason is not None:
+                self._mark_lane_blocked(
+                    node, record, allow_watchdog_fence=allow_watchdog_fence
+                )
                 store.mark_blocked(
-                    self.run_id, node.node_id, classification.block_reason,
-                    detail=detail or None)
+                    self.run_id,
+                    node.node_id,
+                    classification.block_reason,
+                    detail=detail or None,
+                )
                 return
 
             retry_class = classification.retry_class or st.DEFAULT_RETRY_CLASS
@@ -2161,22 +3569,29 @@ class Scheduler:
                 if extra_facts:
                     extra.update(extra_facts)
                 self._guidance[record.guidance_key] = self._guidance.get(
-                    record.guidance_key, rp.GuidanceLedger()).with_verification(
-                        rp.verification_guidance(detail))
+                    record.guidance_key, rp.GuidanceLedger()
+                ).with_verification(rp.verification_guidance(detail))
                 lifecycle = store.get_node(self.run_id, node.node_id)
                 if self._semantic_ceiling_reached(
-                        node.node_id, lifecycle.granted_extra_attempts):
+                    node.node_id, lifecycle.granted_extra_attempts
+                ):
                     # The capped attempt persists its guidance too. A node
                     # blocked on the ceiling is the one most likely to be
                     # resumed after an operator grants it more attempts, and
                     # it is exactly the finding that would have been lost.
+                    self._mark_lane_blocked(
+                        node, record, allow_watchdog_fence=allow_watchdog_fence
+                    )
                     store.mark_blocked(
-                        self.run_id, node.node_id,
+                        self.run_id,
+                        node.node_id,
                         st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
                         detail=self._semantic_budget_detail(
-                            detail, node.node_id,
-                            lifecycle.granted_extra_attempts),
-                        retry_class=retry_class, attempt_extra=extra)
+                            detail, node.node_id, lifecycle.granted_extra_attempts
+                        ),
+                        retry_class=retry_class,
+                        attempt_extra=extra,
+                    )
                     return
             else:
                 # LAUNCHER_TRANSIENT's budget is a property of the member, not
@@ -2185,103 +3600,38 @@ class Scheduler:
                 # alone gave a credential refusal the same two retries as a
                 # dropped transport — the zero-retry rule stated in §7.5 and
                 # implemented in `launcher_retry_budget` had no caller.
-                budget = (rp.launcher_retry_budget(
-                              self.config, classification.launcher_failure)
-                          if retry_class is st.RetryClass.LAUNCHER_TRANSIENT
-                          else self.config.retry_budget(retry_class))
-                spent = store.attempts_spent(
-                    self.run_id, node.node_id, retry_class)
+                budget = (
+                    rp.launcher_retry_budget(
+                        self.config, classification.launcher_failure
+                    )
+                    if retry_class is st.RetryClass.LAUNCHER_TRANSIENT
+                    else self.config.retry_budget(retry_class)
+                )
+                spent = store.attempts_spent(self.run_id, node.node_id, retry_class)
                 if spent >= budget:
+                    self._mark_lane_blocked(
+                        node, record, allow_watchdog_fence=allow_watchdog_fence
+                    )
                     store.mark_blocked(
-                        self.run_id, node.node_id,
-                        _budget_reason(retry_class,
-                                       classification.launcher_failure),
-                        detail=detail or None, retry_class=retry_class)
+                        self.run_id,
+                        node.node_id,
+                        _budget_reason(retry_class, classification.launcher_failure),
+                        detail=detail or None,
+                        retry_class=retry_class,
+                    )
                     return
 
-            store.fail_attempt(self.run_id, node.node_id, retry_class,
-                               detail=detail or None, attempt_extra=extra)
+            store.fail_attempt(
+                self.run_id,
+                node.node_id,
+                retry_class,
+                detail=detail or None,
+                attempt_extra=extra,
+            )
 
-    def _review_wanted(self, node_id: str) -> bool:
-        """May another reviewer be dispatched for this node in this run?
-
-        `execution.review_ceiling`, counted over the rejection markers already
-        stored on this node's attempt rows. It is the same number and the same
-        `COUNT(*)` it always was; what changed is what running out of it costs.
-        It used to block the node — the reviewer's prose deciding a lifecycle
-        transition, which §1.2 forbids and which four run_ids of
-        `lane-p5-gap-policy` paid for (§19 M35). It now stops the scheduler
-        paying for further reviews of a node whose reviewer has rejected it
-        `review_ceiling` times, and nothing else: the attempt in flight merges
-        on its counts either way.
-
-        This is §1.2's condition on the one prose layer that survives, met in
-        the only way that is still available to it. A layer that cannot state
-        its verdict as a count does not adjudicate; a layer that adjudicates
-        nothing still has to terminate, or it is an unbounded cost.
-
-        The grant `retry --force` writes is honoured here for the same reason
-        the semantic ceiling honours it: an operator who deliberately widened a
-        node wants the reviewer's advice on the attempts they bought.
-        """
-        lifecycle = self.deps.store.get_node(self.run_id, node_id)
-        attempts = self.deps.store.attempts_for(self.run_id, node_id)
-        spent = rp.review_attempts_total(attempts, node_id)
-        return spent < (self.config.review_ceiling
-                        + lifecycle.granted_extra_attempts)
-
-    def _record_review_advisory(self, node: st.PlanNode, review: Any,
-                                record: st.AttemptRecord,
-                                output_sha: str) -> None:
-        """Keep everything a rejection used to carry, and fail nothing (§19 M35).
-
-        What this writes is byte-for-byte what `_settle_review_rejection`
-        wrote: the same four facts on the attempt row the convergence series
-        and the ledger are rebuilt from, the same typed detail, the same
-        REVIEW slot in the guidance ledger. What it no longer does is call
-        `fail_attempt` or `mark_blocked`. The attempt stays RUNNING and its
-        caller goes on to `mark_verified`.
-
-        The findings still reach two readers, which is the whole reason the
-        stage still runs. `self._review_findings` is the run report's
-        operator-facing surface, and it is now populated for every rejected
-        node rather than only for the ones a ceiling cut off — a merged node
-        that was rejected is exactly the node an operator wants to read about.
-        And `self._guidance` still holds the REVIEW slot, so a *later* failure
-        of this same node at this same base — a red gate on a subsequent
-        attempt, a falsification refusal — carries the reviewer's objections
-        into the retry prompt. That is how a lane learns from a reviewer that
-        can no longer stop it.
-
-        `output_sha` is stored for the reason it always was: `node_lifecycle.
-        output_sha` is written by `mark_verified`, and the repair basis
-        (§7.5) is proved against the commit this row names.
-        """
-        store = self.deps.store
-        findings = review.findings_text()
-        with self._lock:
-            if (self._cancelled.is_set()
-                    or not self._owns_running(record)
-                    or record.key in self._watchdog_fences):
-                return
-
-            marker = {rp.REVIEW_REJECTED_KEY: True,
-                      rp.REVIEW_FINDINGS_COUNT_KEY: len(review.findings),
-                      "review_subject_digest": review.subject_digest,
-                      "review_advisory": True}
-            marker.update(rp.review_output_extra(output_sha))
-            marker.update(rp.guidance_extra_review(review))
-            self._review_convergence.setdefault(node.node_id, []).append(
-                len(review.findings))
-            self._review_findings[node.node_id] = findings
-            self._guidance[record.guidance_key] = self._guidance.get(
-                record.guidance_key, rp.GuidanceLedger()).with_review(
-                    rp.review_guidance(review))
-            store.record_review_advisory(
-                self.run_id, node.node_id, record.attempt_no, marker)
-
-    def _semantic_budget_detail(self, detail: Mapping[str, Any], node_id: str,
-                                granted: int) -> Dict[str, Any]:
+    def _semantic_budget_detail(
+        self, detail: Mapping[str, Any], node_id: str, granted: int
+    ) -> Dict[str, Any]:
         """The block payload for `SEMANTIC_BUDGET_EXHAUSTED`, with the numbers
         an operator needs to size the escape (#81).
 
@@ -2310,7 +3660,8 @@ class Scheduler:
         re-opened #81 while closing something else.
         """
         already = rp.semantic_attempts_total(
-            self.deps.store.attempts_for(self.run_id, node_id), node_id)
+            self.deps.store.attempts_for(self.run_id, node_id), node_id
+        )
         # After the block, `already + 1` rows are stored. The next failure
         # blocks again unless `stored + 1 < ceiling + granted`.
         required = (already + 1) + 2 - self.config.semantic_ceiling - granted
@@ -2319,7 +3670,8 @@ class Scheduler:
             semantic_attempts_total=already,
             semantic_ceiling=self.config.semantic_ceiling,
             granted_extra_attempts=granted,
-            semantic_grant_required=max(1, required))
+            semantic_grant_required=max(1, required),
+        )
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts
@@ -2368,19 +3720,43 @@ class Scheduler:
         the property the frontier exists to remove.
         """
         while not self._cancelled.is_set():
-            records = self.deps.store.node_records(self.run_id)
+            records = self._merge_records(self.deps.store.node_records(self.run_id))
             candidate = wt.merge_ready(records)
             if candidate is None:
                 return
+            candidate_node = self.nodes.get(candidate.node_id)
+            if self._is_derived_review(candidate_node):
+                return
+            review = self._review_for_build(candidate.node_id)
             with self._lock:
                 if self._cancelled.is_set():
                     return
                 output_sha = self._output_shas.get(candidate.node_id)
-            if output_sha is None:
-                return
+                lifecycle = self.deps.store.get_node(self.run_id, candidate.node_id)
+                if output_sha is None:
+                    return
+                if review is not None:
+                    if (
+                        lifecycle.lane_phase is not st.LanePhase.ACCEPTED
+                        or not self._review_is_accepted(review.node_id)
+                    ):
+                        return
+                    publication = self.deps.store.candidate(
+                        self.run_id, candidate.node_id, output_sha
+                    )
+                    completed = self.deps.store.candidate_review(
+                        self.run_id, review.node_id, output_sha
+                    )
+                    if (
+                        publication is None
+                        or completed is None
+                        or completed.verdict is not st.ReviewVerdict.PASS
+                    ):
+                        return
 
-            result = wt.merge_verified_node(Path(self.deps.integration_path),
-                                            candidate.node_id, output_sha)
+            result = wt.merge_verified_node(
+                Path(self.deps.integration_path), candidate.node_id, output_sha
+            )
             if result.conflicted_paths:
                 # §8.7 — capture, abort, block with the evidence, and let the
                 # descendants become derived-unready. Resolution is human: a
@@ -2388,13 +3764,19 @@ class Scheduler:
                 # their declared globs did not, which is a planning defect
                 # that re-prompting papers over.
                 self.deps.store.mark_blocked(
-                    self.run_id, candidate.node_id, st.BlockReason.MERGE_CONFLICT,
-                    detail={"conflicted_paths": list(result.conflicted_paths)})
+                    self.run_id,
+                    candidate.node_id,
+                    st.BlockReason.MERGE_CONFLICT,
+                    detail={"conflicted_paths": list(result.conflicted_paths)},
+                )
                 continue
             if not result.ancestry_proven:
                 self.deps.store.mark_blocked(
-                    self.run_id, candidate.node_id, st.BlockReason.MERGE_CONFLICT,
-                    detail={"reason": "ancestry not proven after merge"})
+                    self.run_id,
+                    candidate.node_id,
+                    st.BlockReason.MERGE_CONFLICT,
+                    detail={"reason": "ancestry not proven after merge"},
+                )
                 continue
             if self._cancelled.is_set():
                 return
@@ -2437,12 +3819,19 @@ class Scheduler:
             return
         try:
             wt.remove_attempt_worktree(
-                attempt, ancestry_proven=ancestry_proven,
-                integration_path=Path(self.deps.integration_path))
+                attempt,
+                ancestry_proven=ancestry_proven,
+                integration_path=Path(self.deps.integration_path),
+            )
         except (wt.WorktreeError, OSError) as exc:
-            self._report_hygiene(node_id, (
-                "attempt worktree {0} was not removed: {1}".format(
-                    attempt.path, exc),))
+            self._report_hygiene(
+                node_id,
+                (
+                    "attempt worktree {0} was not removed: {1}".format(
+                        attempt.path, exc
+                    ),
+                ),
+            )
 
     def _report_hygiene(self, node_id: str, entries: Tuple[str, ...]) -> None:
         """Add harness-hygiene facts about one node without losing the others."""
@@ -2450,7 +3839,8 @@ class Scheduler:
             return
         with self._lock:
             self._adapter_hygiene[node_id] = (
-                self._adapter_hygiene.get(node_id, ()) + entries)
+                self._adapter_hygiene.get(node_id, ()) + entries
+            )
 
     # ── §8.8 final acceptance, and §7.3's declaration ───────────────────────
 
@@ -2464,8 +3854,16 @@ class Scheduler:
 
         records = store.node_records(self.run_id)
         states = {r.node_id: r.state for r in records}
-        merged = tuple(sorted(n for n, s in states.items()
-                              if s == st.NodeState.MERGED.value))
+        merged = tuple(
+            sorted(
+                node_id
+                for node_id, state in states.items()
+                if (
+                    state == st.NodeState.MERGED.value
+                    and not self._is_derived_review(self.nodes.get(node_id))
+                )
+            )
+        )
 
         acceptance = None
         if not self._cancelled.is_set() and self._is_candidate_accepted(states):
@@ -2475,19 +3873,36 @@ class Scheduler:
                 store.cancel_run(self.run_id)
                 records = store.node_records(self.run_id)
                 states = {r.node_id: r.state for r in records}
-                merged = tuple(sorted(n for n, s in states.items()
-                                      if s == st.NodeState.MERGED.value))
-            cancelled = tuple(sorted(n for n, s in states.items()
-                                     if s == st.NodeState.CANCELLED.value))
-            blocked = tuple(sorted(
-                (n, store.get_node(self.run_id, n).block_reason)
-                for n, s in states.items() if s == st.NodeState.BLOCKED.value))
+                merged = tuple(
+                    sorted(
+                        node_id
+                        for node_id, state in states.items()
+                        if (
+                            state == st.NodeState.MERGED.value
+                            and not self._is_derived_review(self.nodes.get(node_id))
+                        )
+                    )
+                )
+            cancelled = tuple(
+                sorted(
+                    n for n, s in states.items() if s == st.NodeState.CANCELLED.value
+                )
+            )
+            blocked = tuple(
+                sorted(
+                    (n, store.get_node(self.run_id, n).block_reason)
+                    for n, s in states.items()
+                    if s == st.NodeState.BLOCKED.value
+                )
+            )
             # This closes the cancellation/ACCEPTED race: after the final gate
             # returned, either cancellation is made durable here or acceptance
             # is declared before a later cancellation request can take effect.
             declared = store.declare_outcome(
-                self.run_id, stuck=self._stuck,
-                acceptance_result=(acceptance.green if acceptance else None))
+                self.run_id,
+                stuck=self._stuck,
+                acceptance_result=(acceptance.green if acceptance else None),
+            )
 
         return RunReport(
             outcome=declared.outcome,
@@ -2507,19 +3922,34 @@ class Scheduler:
             review_findings=dict(self._review_findings),
             review_convergence={
                 node_id: tuple(counts)
-                for node_id, counts in self._review_convergence.items()})
+                for node_id, counts in self._review_convergence.items()
+            },
+            review_nodes={
+                node_id: state
+                for node_id, state in states.items()
+                if self._is_derived_review(self.nodes.get(node_id))
+            },
+        )
 
     def _is_candidate_accepted(self, states: Mapping[str, str]) -> bool:
-        """§8.8 — at least one node MERGED and every other MERGED or
-        abandoned to CANCELLED. On every other quiescent shape there is no
-        final head that represents the plan, so acceptance never runs."""
-        values = set(states.values())
-        return (st.NodeState.MERGED.value in values
-                and values <= {st.NodeState.MERGED.value,
-                               st.NodeState.CANCELLED.value})
+        """Every source merge needs an accepted review edge before final gate."""
+        source_merged = any(
+            state == st.NodeState.MERGED.value
+            and not self._is_derived_review(self.nodes.get(node_id))
+            for node_id, state in states.items()
+        )
+        return source_merged and all(
+            state in (st.NodeState.MERGED.value, st.NodeState.CANCELLED.value)
+            or (
+                state == st.NodeState.ACCEPTED.value
+                and self._is_derived_review(self.nodes.get(node_id))
+            )
+            for node_id, state in states.items()
+        )
 
-    def _run_final_acceptance(self, records: Sequence["wt.NodeRecord"],
-                              merged: Sequence[str]) -> AcceptanceResult:
+    def _run_final_acceptance(
+        self, records: Sequence["wt.NodeRecord"], merged: Sequence[str]
+    ) -> AcceptanceResult:
         """The bounded window of §8.8, opened by the acceptance-start refresh.
 
         The refresh is not bookkeeping: nothing transitions between the last
@@ -2531,7 +3961,8 @@ class Scheduler:
         store = self.deps.store
         if self._cancelled.is_set():
             return AcceptanceResult(
-                green=False, specs=(), reason="cancellation requested before acceptance")
+                green=False, specs=(), reason="cancellation requested before acceptance"
+            )
         store.acceptance_started(self.run_id)
         deadline = self._time_source() + self.config.final_acceptance_timeout_s
 
@@ -2540,35 +3971,62 @@ class Scheduler:
         ancestry = wt.final_ancestry_sweep(Path(self.deps.integration_path), shas)
         if self._cancelled.is_set():
             return AcceptanceResult(
-                green=False, specs=(), ancestry=ancestry,
-                reason="cancellation requested during the final ancestry sweep")
+                green=False,
+                specs=(),
+                ancestry=ancestry,
+                reason="cancellation requested during the final ancestry sweep",
+            )
         if not all(ancestry.values()) or len(ancestry) != len(merged):
             return AcceptanceResult(
-                green=False, specs=(), ancestry=ancestry,
-                reason="the final ancestry sweep did not re-prove every merged node")
+                green=False,
+                specs=(),
+                ancestry=ancestry,
+                reason="the final ancestry sweep did not re-prove every merged node",
+            )
         if self._time_source() > deadline:
-            return AcceptanceResult(green=False, specs=(), ancestry=ancestry,
-                                    reason="final-acceptance timeout during the sweep")
+            return AcceptanceResult(
+                green=False,
+                specs=(),
+                ancestry=ancestry,
+                reason="final-acceptance timeout during the sweep",
+            )
 
         specs = wt.acceptance_specs(records)
         try:
             gate = self.deps.run_integration_gate(
-                Path(self.deps.integration_path), specs, self._cancelled.is_set)
+                Path(self.deps.integration_path), specs, self._cancelled.is_set
+            )
         except wt.GateCancelled:
             return AcceptanceResult(
-                green=False, specs=specs, ancestry=ancestry,
-                reason="cancellation requested during the final integration gate")
+                green=False,
+                specs=specs,
+                ancestry=ancestry,
+                reason="cancellation requested during the final integration gate",
+            )
         if self._cancelled.is_set():
             return AcceptanceResult(
-                green=False, specs=specs, gate=gate, ancestry=ancestry,
-                reason="cancellation requested during the final integration gate")
+                green=False,
+                specs=specs,
+                gate=gate,
+                ancestry=ancestry,
+                reason="cancellation requested during the final integration gate",
+            )
         verdict = vf.adjudicate_gate(gate, self.deps.integration_min_cases)
         if self._time_source() > deadline:
-            return AcceptanceResult(green=False, specs=specs, gate=gate,
-                                    ancestry=ancestry,
-                                    reason="final-acceptance timeout during the gate")
-        return AcceptanceResult(green=verdict.green, specs=specs, gate=gate,
-                                ancestry=ancestry, reason=verdict.reason)
+            return AcceptanceResult(
+                green=False,
+                specs=specs,
+                gate=gate,
+                ancestry=ancestry,
+                reason="final-acceptance timeout during the gate",
+            )
+        return AcceptanceResult(
+            green=verdict.green,
+            specs=specs,
+            gate=gate,
+            ancestry=ancestry,
+            reason=verdict.reason,
+        )
 
 
 class IntegrationBranchCollision(ValueError):
@@ -2597,10 +4055,12 @@ def _refuse_colliding_integration_branch(integration_branch: str, run_id: str) -
             f"integration branch {integration_branch!r} collides with the attempt "
             f"branch namespace {prefix}/<node>/a<n>: git cannot hold a ref and a "
             f"ref directory at the same path, so every attempt worktree would "
-            f"fail to create. Choose a name outside {prefix}/.")
+            f"fail to create. Choose a name outside {prefix}/."
+        )
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
+
 
 def _pending_gate() -> "vf.GateVerdict":
     """A stand-in for clause 3 before the commit exists.
@@ -2610,18 +4070,21 @@ def _pending_gate() -> "vf.GateVerdict":
     evaluation happens against the committed tree a few lines later. Named
     rather than inlined so that no reader mistakes it for a gate result.
     """
-    return vf.GateVerdict(green=True, unparseable=False, counts=None,
-                          reason="clause 3 not yet evaluated")
+    return vf.GateVerdict(
+        green=True, unparseable=False, counts=None, reason="clause 3 not yet evaluated"
+    )
 
 
 def _is_merged(store, run_id: str, node_id: str) -> bool:
-    return any(r.node_id == node_id and r.state == st.NodeState.MERGED.value
-               for r in store.node_records(run_id))
+    return any(
+        r.node_id == node_id and r.state == st.NodeState.MERGED.value
+        for r in store.node_records(run_id)
+    )
 
 
-def _budget_reason(retry_class: st.RetryClass,
-                   launcher_failure: Optional[rp.LauncherFailure] = None
-                   ) -> st.BlockReason:
+def _budget_reason(
+    retry_class: st.RetryClass, launcher_failure: Optional[rp.LauncherFailure] = None
+) -> st.BlockReason:
     """The block a spent budget writes.
 
     CREDENTIAL is separated because §7.5 gives it a *zero* budget: it blocks
@@ -2635,6 +4098,8 @@ def _budget_reason(retry_class: st.RetryClass,
     compiling: a stall is never a launcher failure, so it passes no member and
     lands on the environmental arm exactly as it did before.
     """
+    if retry_class is st.RetryClass.SEMANTIC:
+        return st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED
     if retry_class is st.RetryClass.LAUNCHER_TRANSIENT:
         if launcher_failure is rp.LauncherFailure.CREDENTIAL:
             return st.BlockReason.CREDENTIAL_REFUSED
@@ -2668,8 +4133,9 @@ def _launch_left_nothing_to_reap(exc: Optional[BaseException]) -> bool:
     return isinstance(exc, LaunchFailed) and not exc.pane_created
 
 
-def _with_reason(classification: rp.Classification,
-                 reason: Optional[str]) -> rp.Classification:
+def _with_reason(
+    classification: rp.Classification, reason: Optional[str]
+) -> rp.Classification:
     """Give a classification an account of itself when it arrived without one.
 
     `classify` is structural, never lexical (§7.5), so its ENVIRONMENTAL
@@ -2725,12 +4191,14 @@ def _check_result_reason(result: "wt.CheckResult") -> str:
     cleanliness = result.cleanliness
     if cleanliness is not None and not cleanliness.clean:
         shown = cleanliness.divergences[:8]
-        named = ", ".join(
-            "{0} {1}".format(d.kind, d.path) for d in shown)
-        parts.append("{0} path(s) diverge from the expected inventory: {1}{2}"
-                     .format(len(cleanliness.divergences), named,
-                             ", ..." if len(cleanliness.divergences) > len(shown)
-                             else ""))
+        named = ", ".join("{0} {1}".format(d.kind, d.path) for d in shown)
+        parts.append(
+            "{0} path(s) diverge from the expected inventory: {1}{2}".format(
+                len(cleanliness.divergences),
+                named,
+                ", ..." if len(cleanliness.divergences) > len(shown) else "",
+            )
+        )
     if parts:
         return "{0} check failed: {1}".format(result.stage, "; ".join(parts))
     return "{0} check failed".format(result.stage)
@@ -2744,9 +4212,9 @@ def _read_source(path: Path) -> Optional[str]:
         return None
 
 
-def _failure_detail(classification: rp.Classification,
-                    verdict: Optional["vf.VerificationVerdict"]
-                    ) -> Dict[str, Any]:
+def _failure_detail(
+    classification: rp.Classification, verdict: Optional["vf.VerificationVerdict"]
+) -> Dict[str, Any]:
     """Why one attempt failed, as a typed record (§1.1 item 4).
 
     A bare `retry:ENVIRONMENTAL` row says a retry was spent and nothing about
@@ -2793,22 +4261,30 @@ def _failure_detail(classification: rp.Classification,
     return detail
 
 
-def _wait_any(items: Sequence[Tuple[str, "Future"]],
-              timeout: float = 0.05) -> Tuple[List[str], List[str]]:
-    """Return the node ids whose futures are done, waiting briefly if none are.
+def _wait_any(
+    items: Sequence[Tuple[str, "Future"]], timeout: float = 0.05
+) -> Tuple[List[str], List[str]]:
+    """Return completed node ids; propagate any escaped worker failure.
 
-    A short poll rather than `concurrent.futures.wait` on the whole set,
-    because the loop must also re-check the merge frontier and the
-    cancellation flag while work is in flight.
+    `_attempt` contains ordinary execution failures and writes their durable
+    verdicts. A future-level exception is therefore a scheduler defect, not a
+    retry signal. Swallowing it leaves a ready PENDING node unchanged and can
+    create an unbounded redispatch loop with no transition evidence.
     """
     done = [node_id for node_id, future in items if future.done()]
     if done:
+        for node_id, future in items:
+            if node_id in done:
+                future.result()
         return done, [n for n, _ in items if n not in done]
     for _, future in items:
         try:
             future.result(timeout=timeout)
-        except Exception:
+        except TimeoutError:
             pass
         break
     done = [node_id for node_id, future in items if future.done()]
+    for node_id, future in items:
+        if node_id in done:
+            future.result()
     return done, [n for n, _ in items if n not in done]

@@ -24,6 +24,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
+from rich.console import Console as RichConsole
+from rich.markup import escape as rich_escape
+from rich import box as rich_box
+from rich.panel import Panel as RichPanel
+from rich.table import Table as RichTable
+from rich.text import Text as RichText
 
 from adw_modules import agent_pi
 from adw_modules import code_review
@@ -108,9 +114,9 @@ class _RunRefused(RuntimeError):
 
     def emit(self) -> int:
         if self.fields:
-            return _typed_refusal({"outcome": self.outcome, **self.fields},
-                                  self.detail)
+            return _typed_refusal({"outcome": self.outcome, **self.fields}, self.detail)
         return _refusal(self.outcome, self.detail)
+
 
 class _RunSelectionError(ValueError):
     """Nothing in the ledger matches the run the operator named.
@@ -140,7 +146,8 @@ _PLAN_CONTRACT_RENDERED_SUFFIX = ".html"
 _PLAN_CONTRACT_RECEIPT_SUFFIX = ".plan-review.json"
 _PLAN_CONTRACT_SCRIPT = Path("scripts") / "planctl.py"
 _PLAN_CONTRACT_REPOSITORY_SKILL = (
-    Path(".claude") / "skills" / "plan-contract" / _PLAN_CONTRACT_SCRIPT)
+    Path(".claude") / "skills" / "plan-contract" / _PLAN_CONTRACT_SCRIPT
+)
 _PLAN_CONTRACT_SKILL_ENV = "PLAN_CONTRACT_SKILL_PATH"
 _PLAN_CONTRACT_AUTHOR_OPTION = "--from-plan-contract"
 _PLAN_CONTRACT_RECEIPT_OPTION = "--plan-contract-receipt"
@@ -159,8 +166,10 @@ _REVIEWER_HMAC_KEY_MINTED_BYTES = 32
 # travels in the environment; only it, never a key, is ever expanded here.
 _PLAN_STEP_LOG_ENV = "MAESTRO_PLAN_STEP_LOG"
 _PLAN_STEP_SHELL = (
-    "/bin/sh", "-c",
-    'exec >>"$' + _PLAN_STEP_LOG_ENV + '" 2>&1; exec "$0" "$@"')
+    "/bin/sh",
+    "-c",
+    'exec >>"$' + _PLAN_STEP_LOG_ENV + '" 2>&1; exec "$0" "$@"',
+)
 
 
 class _StrictYamlLoader(yaml.SafeLoader):
@@ -173,18 +182,22 @@ def _construct_unique_mapping(loader, node, deep=False):
         key = loader.construct_object(key_node, deep=deep)
         if not isinstance(key, str):
             raise yaml.constructor.ConstructorError(
-                None, None, "configuration mapping keys must be strings",
-                key_node.start_mark)
+                None,
+                None,
+                "configuration mapping keys must be strings",
+                key_node.start_mark,
+            )
         if key in mapping:
             raise yaml.constructor.ConstructorError(
-                None, None, "duplicate configuration key: " + key,
-                key_node.start_mark)
+                None, None, "duplicate configuration key: " + key, key_node.start_mark
+            )
         mapping[key] = loader.construct_object(value_node, deep=deep)
     return mapping
 
 
 _StrictYamlLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
 
 
 def _config_mapping(value, label, required, optional=()):
@@ -199,27 +212,29 @@ def _config_mapping(value, label, required, optional=()):
             detail.append("missing " + ", ".join(sorted(missing)))
         if unknown:
             detail.append("unknown " + ", ".join(sorted(unknown)))
-        raise _MaestroConfigurationError(
-            label + " has " + "; ".join(detail) + " keys")
+        raise _MaestroConfigurationError(label + " has " + "; ".join(detail) + " keys")
     return value
 
 
 def _config_string(value, label):
-    if (not isinstance(value, str) or not value or value != value.strip()
-            or "\x00" in value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+    ):
         raise _MaestroConfigurationError(label + " must be a non-empty string")
     return value
 
 
 def _config_positive_number(value, label):
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or value <= 0):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise _MaestroConfigurationError(label + " must be positive")
     return float(value)
 
 
 def _config_positive_integer(value, label):
-    if (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise _MaestroConfigurationError(label + " must be a positive integer")
     return value
 
@@ -233,8 +248,7 @@ def _config_nonnegative_integer(value, label):
     whose whole purpose is not to retry unexpressible in configuration.
     """
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise _MaestroConfigurationError(
-            label + " must be a non-negative integer")
+        raise _MaestroConfigurationError(label + " must be a non-negative integer")
     return value
 
 
@@ -254,7 +268,8 @@ def _config_reject_grade(value) -> "code_review.FindingGrade":
         return code_review.parse_reject_grade(value)
     except code_review.UnknownGrade as exc:
         raise _MaestroConfigurationError(
-            "execution.review_reject_grade: " + str(exc)) from exc
+            "execution.review_reject_grade: " + str(exc)
+        ) from exc
 
 
 def _config_argv(value, label) -> Tuple[str, ...]:
@@ -267,10 +282,12 @@ def _config_argv(value, label) -> Tuple[str, ...]:
     """
     if not isinstance(value, list) or not value:
         raise _MaestroConfigurationError(
-            label + " must be a non-empty list of argv strings")
+            label + " must be a non-empty list of argv strings"
+        )
     return tuple(
         _config_string(item, label + "[{}]".format(index))
-        for index, item in enumerate(value))
+        for index, item in enumerate(value)
+    )
 
 
 def _path_is_within(path: Path, boundary: Path) -> bool:
@@ -316,9 +333,11 @@ def _register_installation(layout: Dict[str, Any]) -> None:
         if path.is_file():
             loaded = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and isinstance(
-                    loaded.get("installations"), list):
+                loaded.get("installations"), list
+            ):
                 installations = [
-                    item for item in loaded["installations"]
+                    item
+                    for item in loaded["installations"]
                     if isinstance(item, dict)
                     and item.get("database") != entry["database"]
                     and item.get("repository") != entry["repository"]
@@ -329,9 +348,10 @@ def _register_installation(layout: Dict[str, Any]) -> None:
         # half-written one.
         scratch = path.with_name(path.name + ".tmp")
         scratch.write_text(
-            json.dumps({"installations": installations}, indent=2,
-                       sort_keys=True) + "\n",
-            encoding="utf-8")
+            json.dumps({"installations": installations}, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
         scratch.replace(path)
     except (OSError, UnicodeError, ValueError):
         return
@@ -431,7 +451,8 @@ def _state_root_path(repo: Path, value) -> Path:
     resolved = (raw if raw.is_absolute() else repo / raw).resolve()
     if _path_is_within(resolved, repo):
         raise _MaestroConfigurationError(
-            "state_root must resolve outside the repository")
+            "state_root must resolve outside the repository"
+        )
     return resolved
 
 
@@ -454,7 +475,11 @@ def _resolve_binary(value, label) -> str:
 
 
 def _resolve_key_environment(
-        name, label, expected_size: int, *, fallback: Optional[Path] = None,
+    name,
+    label,
+    expected_size: int,
+    *,
+    fallback: Optional[Path] = None,
 ) -> str:
     environment_name = _config_string(name, label)
     if _ENVIRONMENT_NAME.fullmatch(environment_name) is None:
@@ -465,18 +490,22 @@ def _resolve_key_environment(
             value = fallback.read_text(encoding="ascii").strip()
         except (OSError, UnicodeError) as exc:
             raise _MaestroEnvironmentError(
-                "key material file is unreadable: " + str(fallback)) from exc
+                "key material file is unreadable: " + str(fallback)
+            ) from exc
     if not value:
         raise _MaestroEnvironmentError(
-            "required environment variable is unset: " + environment_name)
+            "required environment variable is unset: " + environment_name
+        )
     try:
         material = bytes.fromhex(value)
     except ValueError as exc:
         raise _MaestroEnvironmentError(
-            "environment variable is not hexadecimal: " + environment_name) from exc
+            "environment variable is not hexadecimal: " + environment_name
+        ) from exc
     if len(material) != expected_size:
         raise _MaestroEnvironmentError(
-            "environment variable has invalid key length: " + environment_name)
+            "environment variable has invalid key length: " + environment_name
+        )
     return value
 
 
@@ -494,8 +523,9 @@ _SCHEDULER_CONFIG_DEFAULTS: Dict[str, Any] = {
 }
 
 
-def _validate_review_clocks(reviewer: Mapping[str, Any],
-                            execution: Mapping[str, Any]) -> None:
+def _validate_review_clocks(
+    reviewer: Mapping[str, Any], execution: Mapping[str, Any]
+) -> None:
     """Refuse review windows that the remaining live bound cannot hold.
 
     `execution.turn_timeout_s` is *not* compared to
@@ -520,14 +550,16 @@ def _validate_review_clocks(reviewer: Mapping[str, Any],
             "less than reviewer.finalization_timeout_s, or a single silent "
             "turn consumes the whole review window. "
             "reviewer_turn={0}, finalization={1}".format(
-                reviewer_turn_s, finalization_s))
+                reviewer_turn_s, finalization_s
+            )
+        )
     if finalization_s >= backstop_s:
         raise _MaestroConfigurationError(
             "LIVENESS_BOUND_UNSATISFIED: reviewer.finalization_timeout_s "
             "must be less than execution.backstop_t_s, or the run-level "
             "backstop fires inside a healthy review. "
-            "finalization={0}, backstop={1}".format(
-                finalization_s, backstop_s))
+            "finalization={0}, backstop={1}".format(finalization_s, backstop_s)
+        )
     sequential_s = node_timeout_s + finalization_s
     if sequential_s >= backstop_s:
         raise _MaestroConfigurationError(
@@ -537,7 +569,9 @@ def _validate_review_clocks(reviewer: Mapping[str, Any],
             "healthy sequential node-and-review path. "
             "node_timeout={0}, finalization={1}, sequential={2}, "
             "backstop={3}".format(
-                node_timeout_s, finalization_s, sequential_s, backstop_s))
+                node_timeout_s, finalization_s, sequential_s, backstop_s
+            )
+        )
 
 
 def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
@@ -547,15 +581,25 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
             raw = yaml.load(handle, Loader=_StrictYamlLoader)
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise _MaestroConfigurationError(
-            "cannot load " + str(_MAESTRO_CONFIG_FILE)) from exc
+            "cannot load " + str(_MAESTRO_CONFIG_FILE)
+        ) from exc
     root = _config_mapping(
-        raw, "maestro configuration",
-        ("schema", "plans_dir", "state_root", "keys", "executables",
-         "route_receipts", "reviewer", "execution"),
-        ("plan_contract", "author", "runners", "tester"))
+        raw,
+        "maestro configuration",
+        (
+            "schema",
+            "plans_dir",
+            "state_root",
+            "keys",
+            "executables",
+            "route_receipts",
+            "reviewer",
+            "execution",
+        ),
+        ("plan_contract", "author", "runners", "tester"),
+    )
     if root["schema"] != _MAESTRO_SCHEMA:
-        raise _MaestroConfigurationError(
-            "schema must be " + _MAESTRO_SCHEMA)
+        raise _MaestroConfigurationError("schema must be " + _MAESTRO_SCHEMA)
 
     plans_dir = _repository_path(repo, root["plans_dir"], "plans_dir", inside=True)
     if not plans_dir.is_dir():
@@ -568,25 +612,32 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     state_root = _state_root_path(identity, root["state_root"])
     if _path_is_within(state_root, repo):
         raise _MaestroConfigurationError(
-            "state_root must resolve outside the repository")
+            "state_root must resolve outside the repository"
+        )
     repository_state = (state_root / identity.name).resolve()
     if not _path_is_within(repository_state, state_root):
         raise _MaestroConfigurationError(
-            "repository state must remain below state_root")
+            "repository state must remain below state_root"
+        )
 
     keys = _config_mapping(
-        root["keys"], "keys",
+        root["keys"],
+        "keys",
         ("verify_key_env", "signing_seed_env", "route_verify_key_env"),
-        ("reviewer_hmac_key_env",))
+        ("reviewer_hmac_key_env",),
+    )
     if "reviewer_hmac_key_env" in keys:
         reviewer_key_env = _config_string(
-            keys["reviewer_hmac_key_env"], "keys.reviewer_hmac_key_env")
+            keys["reviewer_hmac_key_env"], "keys.reviewer_hmac_key_env"
+        )
         if _ENVIRONMENT_NAME.fullmatch(reviewer_key_env) is None:
             raise _MaestroConfigurationError(
-                "keys.reviewer_hmac_key_env must name an environment variable")
+                "keys.reviewer_hmac_key_env must name an environment variable"
+            )
 
     executable_values = _config_mapping(
-        root["executables"], "executables", ("herdr", "omp", "claude"))
+        root["executables"], "executables", ("herdr", "omp", "claude")
+    )
     executables = {
         name: _resolve_binary(executable_values[name], "executables." + name)
         for name in ("herdr", "omp", "claude")
@@ -602,11 +653,11 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     runners: Dict[str, str] = {}
     if "runners" in root:
         runner_values = _config_mapping(
-            root["runners"], "runners", (), tuple(plan_model.RUNNERS))
+            root["runners"], "runners", (), tuple(plan_model.RUNNERS)
+        )
         for name in plan_model.RUNNERS:
             if name in runner_values:
-                runners[name] = _config_string(
-                    runner_values[name], "runners." + name)
+                runners[name] = _config_string(runner_values[name], "runners." + name)
 
     receipts = root["route_receipts"]
     if not isinstance(receipts, dict) or not receipts:
@@ -617,83 +668,141 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         route_name = _config_string(route, "route_receipts route")
         if "=" in route_name:
             raise _MaestroConfigurationError(
-                "route_receipts route must not contain '='")
-        relative = _config_relative_path(
-            value, "route_receipts." + route_name)
+                "route_receipts route must not contain '='"
+            )
+        relative = _config_relative_path(value, "route_receipts." + route_name)
         path = (repository_state / relative).resolve()
         if not _path_is_within(path, repository_state):
             raise _MaestroConfigurationError(
-                "route receipt must remain below repository state")
+                "route receipt must remain below repository state"
+            )
         if _path_is_within(path, runs_root):
             raise _MaestroConfigurationError(
-                "route receipt must not be in a participant run boundary")
+                "route receipt must not be in a participant run boundary"
+            )
         route_paths[route_name] = path
 
     reviewer_raw = _config_mapping(
-        root["reviewer"], "reviewer",
-        ("route", "model", "effort", "finalization_timeout_s",
-         "turn_timeout_s", "poll_interval_s"), ("profile", "id", "vendor"))
+        root["reviewer"],
+        "reviewer",
+        (
+            "route",
+            "model",
+            "effort",
+            "finalization_timeout_s",
+            "turn_timeout_s",
+            "poll_interval_s",
+        ),
+        ("profile", "id", "vendor"),
+    )
     execution_raw = _config_mapping(
-        root["execution"], "execution",
-        ("route", "model", "effort", "concurrency", "node_timeout_s",
-         "turn_timeout_s", "final_acceptance_timeout_s", "backstop_t_s",
-         "semantic_ceiling"),
-        ("profile", "vendor", "review_ceiling", "review_reject_grade",
-         "provision", "environmental_retries", "launcher_retries",
-         "credential_retries", "restrict_actor_tools"))
+        root["execution"],
+        "execution",
+        (
+            "route",
+            "model",
+            "effort",
+            "concurrency",
+            "node_timeout_s",
+            "turn_timeout_s",
+            "final_acceptance_timeout_s",
+            "backstop_t_s",
+            "semantic_ceiling",
+        ),
+        (
+            "profile",
+            "vendor",
+            "review_ceiling",
+            "review_reject_grade",
+            "provision",
+            "environmental_retries",
+            "launcher_retries",
+            "credential_retries",
+            "restrict_actor_tools",
+        ),
+    )
 
     reviewer = {
         "route": _config_string(reviewer_raw["route"], "reviewer.route"),
         "model": _config_string(reviewer_raw["model"], "reviewer.model"),
         "effort": _config_string(reviewer_raw["effort"], "reviewer.effort"),
-        "profile": (_config_string(reviewer_raw["profile"], "reviewer.profile")
-                    if "profile" in reviewer_raw else None),
-        "id": (_config_string(reviewer_raw["id"], "reviewer.id")
-               if "id" in reviewer_raw else None),
-        "vendor": (_config_string(reviewer_raw["vendor"], "reviewer.vendor")
-                   if "vendor" in reviewer_raw else None),
+        "profile": (
+            _config_string(reviewer_raw["profile"], "reviewer.profile")
+            if "profile" in reviewer_raw
+            else None
+        ),
+        "id": (
+            _config_string(reviewer_raw["id"], "reviewer.id")
+            if "id" in reviewer_raw
+            else None
+        ),
+        "vendor": (
+            _config_string(reviewer_raw["vendor"], "reviewer.vendor")
+            if "vendor" in reviewer_raw
+            else None
+        ),
         "finalization_timeout_s": _config_positive_number(
-            reviewer_raw["finalization_timeout_s"],
-            "reviewer.finalization_timeout_s"),
+            reviewer_raw["finalization_timeout_s"], "reviewer.finalization_timeout_s"
+        ),
         "turn_timeout_s": _config_positive_number(
-            reviewer_raw["turn_timeout_s"], "reviewer.turn_timeout_s"),
+            reviewer_raw["turn_timeout_s"], "reviewer.turn_timeout_s"
+        ),
         "poll_interval_s": _config_positive_number(
-            reviewer_raw["poll_interval_s"], "reviewer.poll_interval_s"),
+            reviewer_raw["poll_interval_s"], "reviewer.poll_interval_s"
+        ),
     }
     execution = {
         "route": _config_string(execution_raw["route"], "execution.route"),
         "model": _config_string(execution_raw["model"], "execution.model"),
         "effort": _config_string(execution_raw["effort"], "execution.effort"),
-        "profile": (_config_string(execution_raw["profile"], "execution.profile")
-                    if "profile" in execution_raw else None),
+        "profile": (
+            _config_string(execution_raw["profile"], "execution.profile")
+            if "profile" in execution_raw
+            else None
+        ),
         "concurrency": _config_positive_integer(
-            execution_raw["concurrency"], "execution.concurrency"),
+            execution_raw["concurrency"], "execution.concurrency"
+        ),
         "node_timeout_s": _config_positive_number(
-            execution_raw["node_timeout_s"], "execution.node_timeout_s"),
+            execution_raw["node_timeout_s"], "execution.node_timeout_s"
+        ),
         "turn_timeout_s": _config_positive_number(
-            execution_raw["turn_timeout_s"], "execution.turn_timeout_s"),
+            execution_raw["turn_timeout_s"], "execution.turn_timeout_s"
+        ),
         "final_acceptance_timeout_s": _config_positive_number(
             execution_raw["final_acceptance_timeout_s"],
-            "execution.final_acceptance_timeout_s"),
+            "execution.final_acceptance_timeout_s",
+        ),
         "backstop_t_s": _config_positive_number(
-            execution_raw["backstop_t_s"], "execution.backstop_t_s"),
+            execution_raw["backstop_t_s"], "execution.backstop_t_s"
+        ),
         "semantic_ceiling": _config_positive_integer(
-            execution_raw["semantic_ceiling"], "execution.semantic_ceiling"),
-        "vendor": (_config_string(execution_raw["vendor"], "execution.vendor")
-                   if "vendor" in execution_raw else None),
+            execution_raw["semantic_ceiling"], "execution.semantic_ceiling"
+        ),
+        "vendor": (
+            _config_string(execution_raw["vendor"], "execution.vendor")
+            if "vendor" in execution_raw
+            else None
+        ),
         # Secondary hatch. Default off: the omp profile is the tool policy.
         # True appends permissions.route_capability_argv on every launch.
         "restrict_actor_tools": (
-            _config_bool(execution_raw["restrict_actor_tools"],
-                         "execution.restrict_actor_tools")
-            if "restrict_actor_tools" in execution_raw else False),
+            _config_bool(
+                execution_raw["restrict_actor_tools"], "execution.restrict_actor_tools"
+            )
+            if "restrict_actor_tools" in execution_raw
+            else False
+        ),
         # Separate from the semantic ceiling by construction. Defaulted rather
         # than required so an existing config keeps working, but the default is
         # a real bound, not "unlimited".
         "review_ceiling": (
-            _config_positive_integer(execution_raw["review_ceiling"],
-                                     "execution.review_ceiling")
-            if "review_ceiling" in execution_raw else 3),
+            _config_positive_integer(
+                execution_raw["review_ceiling"], "execution.review_ceiling"
+            )
+            if "review_ceiling" in execution_raw
+            else 3
+        ),
         # §3.6 A9's grading threshold, beside the ceiling because it answers
         # the half of A9 the ceiling cannot: the ceiling decides how many
         # rejections a node may collect, this decides what counts as one. A
@@ -702,7 +811,8 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "review_reject_grade": (
             _config_reject_grade(execution_raw["review_reject_grade"])
             if "review_reject_grade" in execution_raw
-            else code_review.DEFAULT_REJECT_GRADE),
+            else code_review.DEFAULT_REJECT_GRADE
+        ),
         # §8.3/§9.3's provision step: the ecosystem's setup, run in every
         # attempt's fresh worktree after `git worktree add` and before the
         # pre-node gate and the baseline inventory. `npm ci` for a JavaScript
@@ -716,9 +826,11 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         # absent is not red for the intended reason, and its post-node partner
         # can never go green, so every agent node blocks on a fact about the
         # tree rather than about the work.
-        "provision": (_config_argv(execution_raw["provision"],
-                                   "execution.provision")
-                      if "provision" in execution_raw else ()),
+        "provision": (
+            _config_argv(execution_raw["provision"], "execution.provision")
+            if "provision" in execution_raw
+            else ()
+        ),
         # §7.5's two non-semantic budgets and CREDENTIAL's zero. The defaults
         # are read off `SchedulerConfig` rather than restated here: a literal
         # in this file would be a second representation of a number the
@@ -727,21 +839,25 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         "environmental_retries": (
             _config_nonnegative_integer(
                 execution_raw["environmental_retries"],
-                "execution.environmental_retries")
+                "execution.environmental_retries",
+            )
             if "environmental_retries" in execution_raw
-            else _SCHEDULER_CONFIG_DEFAULTS["environmental_retries"]),
+            else _SCHEDULER_CONFIG_DEFAULTS["environmental_retries"]
+        ),
         "launcher_retries": (
             _config_nonnegative_integer(
-                execution_raw["launcher_retries"],
-                "execution.launcher_retries")
+                execution_raw["launcher_retries"], "execution.launcher_retries"
+            )
             if "launcher_retries" in execution_raw
-            else _SCHEDULER_CONFIG_DEFAULTS["launcher_retries"]),
+            else _SCHEDULER_CONFIG_DEFAULTS["launcher_retries"]
+        ),
         "credential_retries": (
             _config_nonnegative_integer(
-                execution_raw["credential_retries"],
-                "execution.credential_retries")
+                execution_raw["credential_retries"], "execution.credential_retries"
+            )
             if "credential_retries" in execution_raw
-            else _SCHEDULER_CONFIG_DEFAULTS["credential_retries"]),
+            else _SCHEDULER_CONFIG_DEFAULTS["credential_retries"]
+        ),
     }
     # `author` is optional so an installation that never runs `maestro deliver`
     # keeps working unchanged; `deliver` refuses when it is absent rather than
@@ -749,37 +865,60 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     author = None
     if "author" in root:
         author_raw = _config_mapping(
-            root["author"], "author",
-            ("route", "model", "effort", "author_timeout_s", "turn_timeout_s",
-             "poll_interval_s"), ("profile",))
+            root["author"],
+            "author",
+            (
+                "route",
+                "model",
+                "effort",
+                "author_timeout_s",
+                "turn_timeout_s",
+                "poll_interval_s",
+            ),
+            ("profile",),
+        )
         author = {
             "route": _config_string(author_raw["route"], "author.route"),
             "model": _config_string(author_raw["model"], "author.model"),
             "effort": _config_string(author_raw["effort"], "author.effort"),
-            "profile": (_config_string(author_raw["profile"], "author.profile")
-                        if "profile" in author_raw else None),
+            "profile": (
+                _config_string(author_raw["profile"], "author.profile")
+                if "profile" in author_raw
+                else None
+            ),
             "author_timeout_s": _config_positive_number(
-                author_raw["author_timeout_s"], "author.author_timeout_s"),
+                author_raw["author_timeout_s"], "author.author_timeout_s"
+            ),
             "turn_timeout_s": _config_positive_number(
-                author_raw["turn_timeout_s"], "author.turn_timeout_s"),
+                author_raw["turn_timeout_s"], "author.turn_timeout_s"
+            ),
             "poll_interval_s": _config_positive_number(
-                author_raw["poll_interval_s"], "author.poll_interval_s"),
+                author_raw["poll_interval_s"], "author.poll_interval_s"
+            ),
         }
 
     tester = None
     if "tester" in root:
         tester_raw = _config_mapping(
-            root["tester"], "tester",
+            root["tester"],
+            "tester",
             ("route", "model", "effort"),
-            ("profile", "vendor"))
+            ("profile", "vendor"),
+        )
         tester = {
             "route": _config_string(tester_raw["route"], "tester.route"),
             "model": _config_string(tester_raw["model"], "tester.model"),
             "effort": _config_string(tester_raw["effort"], "tester.effort"),
-            "profile": (_config_string(tester_raw["profile"], "tester.profile")
-                        if "profile" in tester_raw else None),
-            "vendor": (_config_string(tester_raw["vendor"], "tester.vendor")
-                       if "vendor" in tester_raw else None),
+            "profile": (
+                _config_string(tester_raw["profile"], "tester.profile")
+                if "profile" in tester_raw
+                else None
+            ),
+            "vendor": (
+                _config_string(tester_raw["vendor"], "tester.vendor")
+                if "vendor" in tester_raw
+                else None
+            ),
         }
 
     sections = [("reviewer", reviewer), ("execution", execution)]
@@ -789,8 +928,7 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
         sections.append(("tester", tester))
     for label, section in sections:
         if section["route"] not in route_paths:
-            raise _MaestroConfigurationError(
-                label + ".route has no route receipt")
+            raise _MaestroConfigurationError(label + ".route has no route receipt")
 
     # B12's *equality* half applies to every verb that loads a config: two
     # blocks naming the same vendor is a misconfiguration whenever it is
@@ -798,10 +936,9 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     # the run branch instead, because a config with no vendors is legal for
     # `plan validate`, `bootstrap`, and the workspace verbs — none of them
     # launches a reviewer, so none of them can be self-judging.
-    if (execution.get("vendor") and reviewer.get("vendor")):
+    if execution.get("vendor") and reviewer.get("vendor"):
         try:
-            code_review.require_distinct_vendor(
-                execution["vendor"], reviewer["vendor"])
+            code_review.require_distinct_vendor(execution["vendor"], reviewer["vendor"])
         except code_review.SelfJudgeRefused as exc:
             raise _MaestroConfigurationError(str(exc)) from exc
 
@@ -817,20 +954,25 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
     data_dir = repository_state / "data"
     receipt_dir = repository_state / "receipts"
     database = repository_state / "lifecycle.sqlite3"
-    for label, path in (("data directory", data_dir),
-                        ("receipt store", receipt_dir),
-                        ("lifecycle database", database)):
+    for label, path in (
+        ("data directory", data_dir),
+        ("receipt store", receipt_dir),
+        ("lifecycle database", database),
+    ):
         if _path_is_within(path, repo) or _path_is_within(path, runs_root):
             raise _MaestroConfigurationError(
-                label + " is inside a repository or participant boundary")
+                label + " is inside a repository or participant boundary"
+            )
     if _path_is_within(receipt_dir, data_dir) or _path_is_within(data_dir, receipt_dir):
         raise _MaestroConfigurationError(
-            "receipt store and data directory must be separate")
+            "receipt store and data directory must be separate"
+        )
     plan_contract = None
     if "plan_contract" in root:
         raw_contract = Path(_config_string(root["plan_contract"], "plan_contract"))
-        plan_contract = (raw_contract if raw_contract.is_absolute()
-                         else repo / raw_contract).resolve()
+        plan_contract = (
+            raw_contract if raw_contract.is_absolute() else repo / raw_contract
+        ).resolve()
     return {
         "repo": repo,
         "plan_contract": plan_contract,
@@ -855,17 +997,23 @@ def _bind_maestro_keys(layout: Dict[str, Any]) -> Dict[str, Any]:
     keys = layout["key_env"]
     key_dir = layout["repository_state"] / "keys"
     verify_key = _resolve_key_environment(
-        keys["verify_key_env"], "keys.verify_key_env",
+        keys["verify_key_env"],
+        "keys.verify_key_env",
         receipt_crypto.PUBLIC_KEY_SIZE,
-        fallback=key_dir / "signing.pub")
+        fallback=key_dir / "signing.pub",
+    )
     signing_seed = _resolve_key_environment(
-        keys["signing_seed_env"], "keys.signing_seed_env",
+        keys["signing_seed_env"],
+        "keys.signing_seed_env",
         receipt_crypto.SEED_SIZE,
-        fallback=key_dir / "signing.seed")
+        fallback=key_dir / "signing.seed",
+    )
     route_verify_key = _resolve_key_environment(
-        keys["route_verify_key_env"], "keys.route_verify_key_env",
+        keys["route_verify_key_env"],
+        "keys.route_verify_key_env",
         receipt_crypto.PUBLIC_KEY_SIZE,
-        fallback=key_dir / "route.pub")
+        fallback=key_dir / "route.pub",
+    )
     bound = dict(layout)
     bound["verify_key"] = verify_key
     bound["signing_seed"] = signing_seed
@@ -884,9 +1032,14 @@ def _is_plan_name(name: Any) -> bool:
     lives here once: a second spelling of "what counts as a plan name" is how
     the resolver and the mode selector come to disagree about the same string.
     """
-    return (isinstance(name, str) and bool(name) and name not in (".", "..")
-            and "/" not in name and "\\" not in name
-            and Path(name).name == name)
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and name not in (".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and Path(name).name == name
+    )
 
 
 def _named_plan_name(name: str) -> str:
@@ -974,8 +1127,12 @@ _RUN_TUNING_OPTIONS: Dict[str, str] = {
 
 #: Named once so the refusal can quote a few of them, rather than telling an
 #: operator that "tuning flags" exist without saying which ones they are.
-_RUN_TUNING_EXAMPLES = ("--concurrency", "--environmental-retries",
-                        "--launcher-retries", "--review-ceiling")
+_RUN_TUNING_EXAMPLES = (
+    "--concurrency",
+    "--environmental-retries",
+    "--launcher-retries",
+    "--review-ceiling",
+)
 
 #: Run-execution flags that name neither a path nor a setting, but an operator
 #: *decision* about this one invocation. `--allow-exhausted-node` names a node
@@ -1010,16 +1167,22 @@ def _spells_its_own_plan_file(args: argparse.Namespace) -> bool:
     — a refusal whose exit code was right and whose vocabulary named the wrong
     cause. Selecting the manual mode here is what lets the receipt gate speak.
     """
-    return (args.command == "plan"
-            and args.plan_command in _PLAN_FILE_VERBS
-            and not _is_plan_name(getattr(args, "plan_name", None)))
+    return (
+        args.command == "plan"
+        and args.plan_command in _PLAN_FILE_VERBS
+        and not _is_plan_name(getattr(args, "plan_name", None))
+    )
 
 
 def _configured_command(args: argparse.Namespace) -> bool:
-    return (args.command == "bootstrap"
-            or (args.command == "plan"
-                and args.plan_command in ("validate", "finalize", "author"))
-            or args.command == "run")
+    return (
+        args.command == "bootstrap"
+        or (
+            args.command == "plan"
+            and args.plan_command in ("validate", "finalize", "author")
+        )
+        or args.command == "run"
+    )
 
 
 def _bind_layout_executables(args: argparse.Namespace, layout: Dict[str, Any]) -> None:
@@ -1028,19 +1191,19 @@ def _bind_layout_executables(args: argparse.Namespace, layout: Dict[str, Any]) -
     args.omp = layout["executables"]["omp"]
     args.claude = layout["executables"]["claude"]
     args.route_receipt = [
-        route + "=" + str(path)
-        for route, path in sorted(layout["route_paths"].items())
+        route + "=" + str(path) for route, path in sorted(layout["route_paths"].items())
     ]
     args.repository_state = str(layout["repository_state"])
     args.runners = dict(layout.get("runners") or {})
     args.layout = layout
 
 
-def _apply_repository_config(
-        args: argparse.Namespace, argv: Sequence[str]) -> None:
+def _apply_repository_config(args: argparse.Namespace, argv: Sequence[str]) -> None:
     """Bind named-plan and bootstrap entrypoints to installed repository state."""
-    if (args.command == "attempt"
-            and getattr(args, "attempt_command", None) == "salvage"):
+    if (
+        args.command == "attempt"
+        and getattr(args, "attempt_command", None) == "salvage"
+    ):
         _bind_salvage_configuration(args, argv)
         return
     if not _configured_command(args):
@@ -1054,15 +1217,20 @@ def _apply_repository_config(
         return
     if not config_path.is_file():
         raise _MaestroConfigurationError(
-            str(_MAESTRO_CONFIG_FILE) + " is not a regular file")
-    options = tuple(item.split("=", 1)[0] for item in argv
-                    if item.startswith("-"))
+            str(_MAESTRO_CONFIG_FILE) + " is not a regular file"
+        )
+    options = tuple(item.split("=", 1)[0] for item in argv if item.startswith("-"))
     supplied = frozenset(options)
     tuning: Dict[str, Any] = {}
     if args.command == "run" and args.run_command != "start":
-        manual = tuple(sorted(
-            supplied - _RUN_SELECTION_OPTIONS - frozenset(_RUN_TUNING_OPTIONS)
-            - _RUN_ESCAPE_OPTIONS))
+        manual = tuple(
+            sorted(
+                supplied
+                - _RUN_SELECTION_OPTIONS
+                - frozenset(_RUN_TUNING_OPTIONS)
+                - _RUN_ESCAPE_OPTIONS
+            )
+        )
         if manual:
             # A fully manual invocation. Every path it works on came from a
             # flag, and binding the other half from configuration is exactly
@@ -1082,9 +1250,11 @@ def _apply_repository_config(
         # unconditionally, so without this snapshot a tuning flag that no
         # longer disables binding would instead be silently overwritten by the
         # configured value, which is the same defect wearing a quieter face.
-        tuning = {attribute: getattr(args, attribute, None)
-                  for option, attribute in _RUN_TUNING_OPTIONS.items()
-                  if option in supplied}
+        tuning = {
+            attribute: getattr(args, attribute, None)
+            for option, attribute in _RUN_TUNING_OPTIONS.items()
+            if option in supplied
+        }
     elif options:
         # The same class as the branch above, refusing loudly rather than
         # silently, and it named the rule without ever naming the word that
@@ -1095,17 +1265,19 @@ def _apply_repository_config(
         # The escape options are exempt on the run verbs and nowhere else: a
         # `plan` verb has no run to admit a node into, so an escape flag there
         # is as much a mistake as any other runtime flag.
-        runtime = sorted(supplied - (_RUN_ESCAPE_OPTIONS
-                                     if args.command == "run"
-                                     else frozenset()))
+        runtime = sorted(
+            supplied - (_RUN_ESCAPE_OPTIONS if args.command == "run" else frozenset())
+        )
         if runtime:
             raise _MaestroConfigurationError(
                 "configured named-plan commands do not accept runtime flags: "
-                + ", ".join(runtime))
+                + ", ".join(runtime)
+            )
 
     repo = config_path.parent.parent.resolve()
     if args.command == "bootstrap" or (
-            args.command == "plan" and args.plan_command == "author"):
+        args.command == "plan" and args.plan_command == "author"
+    ):
         layout = _load_maestro_layout(repo, config_path)
         _bind_layout_executables(args, layout)
         _register_installation(layout)
@@ -1134,8 +1306,7 @@ def _apply_repository_config(
     args.signing_seed = config["signing_seed"]
     args.route_verify_key = [config["route_verify_key"]]
     args.route_receipt = [
-        route + "=" + str(path)
-        for route, path in sorted(config["route_paths"].items())
+        route + "=" + str(path) for route, path in sorted(config["route_paths"].items())
     ]
     args.herdr = config["executables"]["herdr"]
     args.omp = config["executables"]["omp"]
@@ -1167,8 +1338,7 @@ def _apply_repository_config(
         args.concurrency = execution["concurrency"]
         args.node_timeout_s = execution["node_timeout_s"]
         args.turn_timeout_s = execution["turn_timeout_s"]
-        args.final_acceptance_timeout_s = execution[
-            "final_acceptance_timeout_s"]
+        args.final_acceptance_timeout_s = execution["final_acceptance_timeout_s"]
         args.backstop_t_s = execution["backstop_t_s"]
         args.semantic_ceiling = execution["semantic_ceiling"]
         args.review_ceiling = execution["review_ceiling"]
@@ -1276,8 +1446,7 @@ def _named_plan_digests(layout: Dict[str, Any]) -> Dict[str, str]:
 _SALVAGE_DERIVED_OPTIONS = ("--worktrees-root", "--scratch-root", "--db")
 
 
-def _bind_salvage_configuration(
-        args: argparse.Namespace, argv: Sequence[str]) -> None:
+def _bind_salvage_configuration(args: argparse.Namespace, argv: Sequence[str]) -> None:
     """Derive salvage's run-directory paths exactly as `run start` mints them.
 
     Salvage takes the run id positionally and reads the same
@@ -1302,14 +1471,15 @@ def _bind_salvage_configuration(
         return
     if not config_path.is_file():
         raise _MaestroConfigurationError(
-            str(_MAESTRO_CONFIG_FILE) + " is not a regular file")
-    layout = _load_maestro_layout(
-        config_path.parent.parent.resolve(), config_path)
+            str(_MAESTRO_CONFIG_FILE) + " is not a regular file"
+        )
+    layout = _load_maestro_layout(config_path.parent.parent.resolve(), config_path)
     runs_root = (layout["repository_state"] / "runs").resolve()
     run_root = (runs_root / str(args.run_id)).resolve()
     if not _path_is_within(run_root, runs_root):
         raise _MaestroConfigurationError(
-            "run id does not name a directory inside the run boundary")
+            "run id does not name a directory inside the run boundary"
+        )
     if "--worktrees-root" not in supplied:
         args.worktrees_root = str(run_root / "worktrees")
     if "--scratch-root" not in supplied:
@@ -1319,7 +1489,8 @@ def _bind_salvage_configuration(
 
 
 def _bind_run_ledger_configuration(
-        args: argparse.Namespace, layout: Dict[str, Any]) -> None:
+    args: argparse.Namespace, layout: Dict[str, Any]
+) -> None:
     """Point a read verb at the configured ledger, and nothing more."""
     args.repo = str(layout["repo"])
     args.db = str(layout["database"])
@@ -1334,8 +1505,9 @@ def _bind_run_ledger_configuration(
     args.review_ceiling = layout["execution"]["review_ceiling"]
 
 
-def _select_run(reader: "lc.LifecycleReader",
-                args: argparse.Namespace) -> "lc.RunRecord":
+def _select_run(
+    reader: "lc.LifecycleReader", args: argparse.Namespace
+) -> "lc.RunRecord":
     """The single rule that turns what an operator typed into one run.
 
     Three accepted shapes, in falling order of explicitness: `--run-id`, a run
@@ -1353,27 +1525,30 @@ def _select_run(reader: "lc.LifecycleReader",
         return record
     selector = getattr(args, "selector", None)
     if not selector:
-        raise _RunSelectionError(
-            "name a plan or a run id, or pass --run-id")
+        raise _RunSelectionError("name a plan or a run id, or pass --run-id")
     record = reader.run(selector)
     if record is not None:
         return record
     digest = (getattr(args, "plan_digests", None) or {}).get(selector)
     if digest is None:
         raise _RunSelectionError(
-            selector + " is neither a run id in the ledger nor an installed "
-            "plan name")
+            selector + " is neither a run id in the ledger nor an installed plan name"
+        )
     records = reader.runs(digest)
     if not records:
         raise _RunSelectionError(
-            "no run has been started for plan " + selector
-            + " at its current contents (digest " + digest[:12] + ")")
+            "no run has been started for plan "
+            + selector
+            + " at its current contents (digest "
+            + digest[:12]
+            + ")"
+        )
     return records[0]
 
 
 def _resolve_resume_target(
-        args: argparse.Namespace,
-        config: Dict[str, Any]) -> Tuple[str, Path]:
+    args: argparse.Namespace, config: Dict[str, Any]
+) -> Tuple[str, Path]:
     """The existing run `resume` re-enters, and the plan bytes it ran on.
 
     Resume is the verb that most needs *not* to invent an identity: a fresh
@@ -1393,9 +1568,13 @@ def _resolve_resume_target(
         if digest == record.plan_digest:
             return record.run_id, _named_plan_file(config, name)
     raise _RunSelectionError(
-        "run " + record.run_id + " ran plan digest " + record.plan_digest[:12]
+        "run "
+        + record.run_id
+        + " ran plan digest "
+        + record.plan_digest[:12]
         + ", which no installed plan currently matches; the plan file has "
-        "changed since the run started")
+        "changed since the run started"
+    )
 
 
 def _open_reader(database) -> "lc.LifecycleReader":
@@ -1429,7 +1608,8 @@ def _quiescence_refusal(exc: BaseException) -> int:
     text = str(exc)
     code = text.partition(":")[0]
     return _typed_refusal(
-        {"outcome": "RUN_QUIESCENCE_UNPROVEN", "quiescence_code": code}, text)
+        {"outcome": "RUN_QUIESCENCE_UNPROVEN", "quiescence_code": code}, text
+    )
 
 
 def _typed_refusal(payload: Dict[str, Any], detail: str) -> int:
@@ -1453,7 +1633,8 @@ def _bootstrap(args: argparse.Namespace) -> int:
     if layout is None:
         return _refusal(
             "MAESTRO_CONFIGURATION_INVALID",
-            "bootstrap requires an installed " + str(_MAESTRO_CONFIG_FILE))
+            "bootstrap requires an installed " + str(_MAESTRO_CONFIG_FILE),
+        )
     keys_dir = Path(layout["repository_state"]) / "keys"
     try:
         keys = route_admission.provision_keys(keys_dir)
@@ -1473,7 +1654,8 @@ def _bootstrap(args: argparse.Namespace) -> int:
         reviewer_env_file = route_admission.write_reviewer_env_file(
             keys,
             reviewer_hmac_key_env=layout["key_env"].get(
-                "reviewer_hmac_key_env", _REVIEWER_HMAC_KEY_ENV),
+                "reviewer_hmac_key_env", _REVIEWER_HMAC_KEY_ENV
+            ),
         )
         # A receipt is per route while several lanes may ride one route, so the
         # capture spec comes from the first configured lane naming it. The
@@ -1488,26 +1670,30 @@ def _bootstrap(args: argparse.Namespace) -> int:
             lanes.append(layout["author"])
         specs = []
         for route, path in sorted(layout["route_paths"].items()):
-            section = next(
-                (lane for lane in lanes if lane["route"] == route), None)
+            section = next((lane for lane in lanes if lane["route"] == route), None)
             if section is None:
                 raise route_admission.AdmissionError(
-                    "ROUTE_MODEL_UNCONFIGURED:{}".format(route))
+                    "ROUTE_MODEL_UNCONFIGURED:{}".format(route)
+                )
             timeout = section.get("turn_timeout_s") or 180.0
-            specs.append(route_admission.RouteCaptureSpec(
-                route=route,
-                cwd=Path(layout["repo"]),
-                herdr=Path(layout["executables"]["herdr"]),
-                binary=Path(layout["executables"][route]),
-                model=section["model"],
-                effort=section["effort"],
-                profile=section.get("profile"),
-                session_dir=(Path(layout["repository_state"])
-                             / "admission" / route),
-                timeout_s=float(timeout),
-            ))
+            specs.append(
+                route_admission.RouteCaptureSpec(
+                    route=route,
+                    cwd=Path(layout["repo"]),
+                    herdr=Path(layout["executables"]["herdr"]),
+                    binary=Path(layout["executables"][route]),
+                    model=section["model"],
+                    effort=section["effort"],
+                    profile=section.get("profile"),
+                    session_dir=(
+                        Path(layout["repository_state"]) / "admission" / route
+                    ),
+                    timeout_s=float(timeout),
+                )
+            )
         written = route_admission.admit_routes(
-            specs, layout["route_paths"], route_seed=keys.route_seed)
+            specs, layout["route_paths"], route_seed=keys.route_seed
+        )
     except route_admission.AdmissionError as exc:
         return _refusal("ROUTE_ADMISSION_FAILED", str(exc))
     payload = {
@@ -1522,6 +1708,7 @@ def _bootstrap(args: argparse.Namespace) -> int:
     print(json.dumps(payload, sort_keys=True))
     return 0
 
+
 def _plan_author(args: argparse.Namespace) -> int:
     destination = Path(args.plan_file)
     draft = getattr(args, "from_file", None)
@@ -1534,8 +1721,12 @@ def _plan_author(args: argparse.Namespace) -> int:
                 return _refusal("PLAN_AUTHORING_FAILED", "RECEIPT_REQUIRED")
             rendered = getattr(args, "plan_contract_rendered", None)
             stored, _trace = plan_contract_ingress.author_from_plan_contract(
-                Path(contract), Path(receipt), destination, repo,
-                Path(rendered) if rendered else None)
+                Path(contract),
+                Path(receipt),
+                destination,
+                repo,
+                Path(rendered) if rendered else None,
+            )
             draft_path = Path(contract)
         else:
             if draft:
@@ -1568,7 +1759,9 @@ class _VerifiedReceipts:
                 self._args,
                 missing_detail=(
                     "--receipt-dir, --data-dir, and at least one --verify-key "
-                    "are required when validating a superseded plan"))
+                    "are required when validating a superseded plan"
+                ),
+            )
         return self._store
 
     def has_receipt(self, digest: str) -> bool:
@@ -1576,14 +1769,21 @@ class _VerifiedReceipts:
             receipt = self._receipt_store().load(digest)
         except FileNotFoundError:
             return False
-        except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-                finalization.SignatureInvalid, UnicodeError, ValueError,
-                KeyError) as exc:
+        except (
+            finalization.ReceiptInvalid,
+            finalization.SignatureMissing,
+            finalization.SignatureInvalid,
+            UnicodeError,
+            ValueError,
+            KeyError,
+        ) as exc:
             raise _PlanReceiptVerificationError(str(exc)) from exc
         if receipt.plan_digest != digest:
             raise _PlanReceiptVerificationError(
                 "the receipt stored for {0} names {1}".format(
-                    digest, receipt.plan_digest))
+                    digest, receipt.plan_digest
+                )
+            )
         return True
 
 
@@ -1604,15 +1804,18 @@ def _plan_collector(args: argparse.Namespace) -> "pv.SubprocessCollector":
     # would be exactly that.
     return pv.SubprocessCollector(
         declared=dict(getattr(args, "runners", {}) or {}),
-        resolver=runner_resolution.resolve)
+        resolver=runner_resolution.resolve,
+    )
 
 
 def _plan_validate(args: argparse.Namespace) -> int:
     try:
         result = pv.validate_plan(
-            Path(args.plan_file).read_bytes(), args.repo,
+            Path(args.plan_file).read_bytes(),
+            args.repo,
             receipts=_VerifiedReceipts(args),
-            collector=_plan_collector(args))
+            collector=_plan_collector(args),
+        )
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
     except _PlanReceiptVerificationError as exc:
@@ -1621,8 +1824,11 @@ def _plan_validate(args: argparse.Namespace) -> int:
         "outcome": result.outcome.value,
         "digest": result.digest,
         "blockers": [
-            {"obligation": row.obligation.value, "pointer": row.pointer,
-             "message": row.message}
+            {
+                "obligation": row.obligation.value,
+                "pointer": row.pointer,
+                "message": row.message,
+            }
             for row in result.blockers
         ],
     }
@@ -1631,148 +1837,368 @@ def _plan_validate(args: argparse.Namespace) -> int:
 
 
 def _finalization_store(args: argparse.Namespace) -> finalization.ReceiptStore:
-    if (not args.receipt_dir or not args.data_dir or not args.verify_key
-            or not args.signing_seed):
+    if (
+        not args.receipt_dir
+        or not args.data_dir
+        or not args.verify_key
+        or not args.signing_seed
+    ):
         raise _PlanReceiptConfigurationError(
             "--receipt-dir, --data-dir, --verify-key, and --signing-seed "
-            "are required to write to the receipt store")
+            "are required to write to the receipt store"
+        )
     try:
         verify_keys = tuple(bytes.fromhex(value) for value in args.verify_key)
         signing_seed = bytes.fromhex(args.signing_seed)
     except (TypeError, ValueError) as exc:
         raise _PlanReceiptConfigurationError(
-            "finalization key material must be hexadecimal") from exc
-    if (not verify_keys or any(len(key) != receipt_crypto.PUBLIC_KEY_SIZE
-                               for key in verify_keys)
-            or len(signing_seed) != receipt_crypto.SEED_SIZE):
+            "finalization key material must be hexadecimal"
+        ) from exc
+    if (
+        not verify_keys
+        or any(len(key) != receipt_crypto.PUBLIC_KEY_SIZE for key in verify_keys)
+        or len(signing_seed) != receipt_crypto.SEED_SIZE
+    ):
         raise _PlanReceiptConfigurationError(
-            "finalization keys must be Ed25519 public keys and a 32-byte seed")
+            "finalization keys must be Ed25519 public keys and a 32-byte seed"
+        )
     try:
         return finalization.ReceiptStore(
-            args.receipt_dir, repo_paths=(args.repo,), data_dir=args.data_dir,
-            verify_keys=verify_keys, signing_seed=signing_seed)
-    except (finalization.ReceiptStoreLocationError,
-            finalization.SigningKeyUnavailable) as exc:
+            args.receipt_dir,
+            repo_paths=(args.repo,),
+            data_dir=args.data_dir,
+            verify_keys=verify_keys,
+            signing_seed=signing_seed,
+        )
+    except (
+        finalization.ReceiptStoreLocationError,
+        finalization.SigningKeyUnavailable,
+    ) as exc:
         raise _PlanReceiptConfigurationError(str(exc)) from exc
 
 
-def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLauncher"):
-    """Build the scheduler's review stage: one reviewer per verified attempt.
+def _session_tab_id(session: Any) -> str:
+    """Read optional placement identity from current and legacy session rows."""
+    return str(getattr(session, "tab_id", "") or "")
 
-    Shares the launcher with the node runner deliberately — a second
-    `HerdrLauncher` would own a second pane registry, and the pane accounting
-    that `cancel` depends on would then be split across two objects that cannot
-    see each other's handles.
-    """
-    # B12's absence half, enforced where a reviewer is actually about to run.
-    # Fail closed: a vendor nobody declared cannot be shown to differ from the
-    # builder's, and "probably a different model" is not a property.
+
+def _code_review_runner(
+    args: argparse.Namespace,
+    runner: "launcher.HerdrLauncher",
+    lifecycle_store: Optional["lc.LifecycleStore"] = None,
+):
+    """Build the persistent derived-review callback for every build lane."""
     try:
         code_review.require_distinct_vendor(
             getattr(args, "execution_vendor", "") or "",
-            getattr(args, "reviewer_vendor", "") or "")
+            getattr(args, "reviewer_vendor", "") or "",
+        )
     except code_review.SelfJudgeRefused as exc:
         raise _PlanReceiptConfigurationError(str(exc)) from exc
 
     review_root = Path(args.review_root)
-    store = finalization.ReceiptStore(
-        Path(args.review_receipt_dir), repo_paths=(args.repo,),
+    receipt_store = finalization.ReceiptStore(
+        Path(args.review_receipt_dir),
+        repo_paths=(args.repo,),
         data_dir=args.data_dir,
         verify_keys=tuple(bytes.fromhex(k) for k in args.verify_key),
-        signing_seed=bytes.fromhex(args.signing_seed))
+        signing_seed=bytes.fromhex(args.signing_seed),
+    )
+    handles: Dict[str, launcher.LaunchHandle] = {}
 
-    def review(attempt, node, record, base_sha: str, output_sha: str):
+    def lane_id(node: Any) -> str:
+        return str(getattr(node, "review_of", None) or node.node_id)
+
+    def active_session(build_node_id: str) -> Any:
+        if lifecycle_store is None:
+            return None
+        session = lifecycle_store.current_actor_session(
+            args.run_id, build_node_id, "reviewer"
+        )
+        if (
+            session is None
+            or session.state is not scheduler_types.ActorSessionState.ACTIVE
+        ):
+            return None
+        return session
+
+    def next_generation(build_node_id: str, record: Any) -> int:
+        floor = int(getattr(record, "attempt_no", 1))
+        if lifecycle_store is None:
+            return floor
+        sessions = lifecycle_store.actor_sessions(
+            args.run_id, build_node_id, actor_role="reviewer", limit=10_000
+        )
+        return max(
+            floor, max((session.generation for session in sessions), default=0) + 1
+        )
+
+    def close(build_node_id: str) -> None:
+        handle = handles.pop(build_node_id, None)
+        session = active_session(build_node_id)
+        if handle is None and session is not None:
+            try:
+                handle = runner.adopt(
+                    launcher.PersistedActorHandle(
+                        correlation_token=session.correlation_token,
+                        pane_id=session.pane_id,
+                        agent_name=launcher.agent_name_for(session.correlation_token),
+                        launched_cwd=Path(args.repo),
+                        transcript_path=Path(session.session_path),
+                        workspace_id=launcher.workspace_of(_session_tab_id(session)),
+                        tab_id=_session_tab_id(session),
+                        lane_key=build_node_id,
+                    )
+                )
+            except launcher.HandleAbsent:
+                # A typed absence is sufficient terminal proof.  Unknown
+                # liveness and mismatched ids escape without closing the row.
+                lifecycle_store.close_actor_session(
+                    args.run_id,
+                    build_node_id,
+                    "reviewer",
+                    generation=session.generation,
+                )
+                return
+        if handle is None:
+            return
+        runner.cancel(handle, finalization_window.time.monotonic() + 5.0)
+        if session is not None:
+            lifecycle_store.close_actor_session(
+                args.run_id, build_node_id, "reviewer", generation=session.generation
+            )
+
+    def review(
+        attempt,
+        node,
+        record,
+        base_sha: str,
+        output_sha: str,
+        resume_existing_dispatch: bool = False,
+    ):
+        build_node_id = lane_id(node)
         digest = code_review.review_digest(
-            run_id=args.run_id, node_id=node.node_id, base_sha=base_sha,
-            output_sha=output_sha, rubric_version=code_review.CODE_RUBRIC.version)
-        # Keyed by the subject digest, not the attempt number, so a rebuilt but
-        # byte-identical output lands on the same directory and the same
-        # receipt — B10's replay rather than a second opinion.
+            run_id=args.run_id,
+            node_id=build_node_id,
+            base_sha=base_sha,
+            output_sha=output_sha,
+            rubric_version=code_review.CODE_RUBRIC.version,
+        )
         subject_root = review_root / digest
         report_path = subject_root / "report.json"
-        # Every finding this review produced, rejecting and sub-threshold
-        # alike, beside the reviewer's own report and under the same subject
-        # digest as the receipt that admits the merge. This is where a merged
-        # node's advisories live: an operator reads
-        #   <state>/runs/<run_id>/review/<digest>/findings.json
-        # or `code_review.read_finding_ledger` on that path.
         ledger_path = subject_root / code_review.FINDING_LEDGER_FILENAME
         prompt_path = subject_root / "prompt.md"
-        session_dir = subject_root / "session"
-        # §8.3 applies to the reviewer's pane exactly as it does to a node's.
-        # The reviewer runs at the repository, not inside an attempt worktree,
-        # so it owns a scratch beside its own session directory under the run's
-        # review root -- a location Maestro owns -- rather than borrowing some
-        # attempt's. Omitting it entirely left `LaunchSpec.environment` at its
-        # empty default, and `pane_env_flags` then refused the launch with
-        # SCRATCH_REDIRECT_MISSING for all seven variables, discarding a
-        # verified attempt's work at the review stage.
-        scratch_dir = subject_root / "scratch"
+        # Actor material belongs to the lane, not one immutable candidate. The
+        # candidate's prompt/report/receipt remain under its digest.
+        lane_root = review_root / build_node_id
+        session_dir = lane_root / "session"
+        scratch_dir = lane_root / "scratch"
 
-        diff, changed = code_review.read_diff(
-            Path(args.repo), base_sha, output_sha)
+        diff, changed = code_review.read_diff(Path(args.repo), base_sha, output_sha)
         objects = code_review.review_objects(changed, output_sha)
-        matrix = finalization.compute_matrix(
-            code_review.CODE_RUBRIC, digest, objects)
+        matrix = finalization.compute_matrix(code_review.CODE_RUBRIC, digest, objects)
         handoff = code_review.build_handoff(
-            subject_digest=digest, run_id=args.run_id, node=node,
-            base_sha=base_sha, output_sha=output_sha, diff=diff,
-            matrix=matrix, rubric=code_review.CODE_RUBRIC,
-            report_path=report_path)
-
-        # B13 — measured against the reviewer's real window before a pane is
-        # allocated, so an oversized handoff is a refusal rather than a
-        # confident verdict about something else.
+            subject_digest=digest,
+            run_id=args.run_id,
+            node=node,
+            base_sha=base_sha,
+            output_sha=output_sha,
+            diff=diff,
+            matrix=matrix,
+            rubric=code_review.CODE_RUBRIC,
+            report_path=report_path,
+        )
         text = handoff.render()
         _preflight_prompt(text, args.reviewer_route, args.reviewer_model)
-
-        handle_box: Dict[str, Any] = {"handle": None}
 
         def window_factory(_matrix):
             subject_root.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(text, encoding="utf-8")
-            _clear_stale_reviewer_report(report_path)
+            # A durable dispatch may leave a syntactically valid draft while
+            # its reviewer is still writing.  Only the common poller's
+            # completeness contract may adopt a persisted report.
+            persisted_report = (
+                _poll_reviewer_report(report_path) if resume_existing_dispatch else None
+            )
+            if not resume_existing_dispatch:
+                _clear_stale_reviewer_report(report_path)
+            submitted = False
 
             def launch_reviewer():
-                # The site that actually refused in
-                # run-f31686ea41b44c33b117f64e3b319317: its agent node had
-                # launched and done 61 turns before this reviewer's launch was
-                # refused, and the refusal spent an ENVIRONMENTAL retry.
-                handle = _typed_launch_pane(runner, launcher.LaunchSpec(
-                    correlation_token="review-" + digest[:16],
-                    worktree=Path(args.repo), prompt_path=prompt_path,
-                    envelope_path=report_path, route=args.reviewer_route,
-                    model=args.reviewer_model, effort=args.reviewer_effort,
-                    profile=args.reviewer_profile, session_dir=session_dir,
-                    context_window_tokens=_route_context_window(
-                        args.reviewer_route, args.reviewer_model),
-                    # Same tab as the builder whose output it is judging --
-                    # `_code_review_runner` is handed the run's own launcher,
-                    # so the group key resolves to the tab that node already
-                    # opened.
-                    pane_group=node.node_id, pane_role="reviewer",
-                    pane_group_size=2,
-                    restrict_tools=getattr(args, "restrict_actor_tools", False),
-                    environment=worktree.launch_env(
-                        scratch_dir, concurrency=getattr(args, "concurrency", None))))
-                handle_box["handle"] = handle
+                nonlocal submitted
+                handle = handles.get(build_node_id)
+                if handle is not None:
+                    # A retained handle already owns a dispatched turn.  On
+                    # resume, poll its report rather than prompt it again;
+                    # only a fresh candidate needs another submission.
+                    if not resume_existing_dispatch and not submitted:
+                        runner.resubmit(
+                            handle,
+                            prompt_path,
+                            route=args.reviewer_route,
+                            expected_token=handle.correlation_token,
+                        )
+                        submitted = True
+                else:
+                    session = active_session(build_node_id)
+                    adopted_existing = False
+                    if session is not None:
+                        try:
+                            handle = runner.adopt(
+                                launcher.PersistedActorHandle(
+                                    correlation_token=session.correlation_token,
+                                    pane_id=session.pane_id,
+                                    agent_name=launcher.agent_name_for(
+                                        session.correlation_token
+                                    ),
+                                    launched_cwd=Path(args.repo),
+                                    transcript_path=Path(session.session_path),
+                                    envelope_path=report_path,
+                                    workspace_id=launcher.workspace_of(
+                                        _session_tab_id(session)
+                                    ),
+                                    tab_id=_session_tab_id(session),
+                                    lane_key=build_node_id,
+                                )
+                            )
+                            adopted_existing = True
+                        except launcher.HandleAbsent:
+                            generation = session.generation + 1
+                            handle = _typed_launch_pane(
+                                runner,
+                                launcher.LaunchSpec(
+                                    correlation_token=(
+                                        "review-{}-{}-a{}".format(
+                                            args.run_id, build_node_id, generation
+                                        )
+                                    ),
+                                    worktree=Path(args.repo),
+                                    prompt_path=prompt_path,
+                                    envelope_path=report_path,
+                                    route=args.reviewer_route,
+                                    model=args.reviewer_model,
+                                    effort=args.reviewer_effort,
+                                    profile=args.reviewer_profile,
+                                    session_dir=session_dir,
+                                    context_window_tokens=_route_context_window(
+                                        args.reviewer_route, args.reviewer_model
+                                    ),
+                                    workspace_label=getattr(
+                                        runner, "workspace_label", ""
+                                    ),
+                                    lane_key=build_node_id,
+                                    lane_label=build_node_id,
+                                    pane_role="reviewer",
+                                    attempt_no=generation,
+                                    pane_group_size=3,
+                                    restrict_tools=getattr(
+                                        args, "restrict_actor_tools", False
+                                    ),
+                                    environment=worktree.launch_env(
+                                        scratch_dir,
+                                        concurrency=getattr(args, "concurrency", None),
+                                    ),
+                                ),
+                            )
+                            if lifecycle_store is not None:
+                                _require_session_path(handle, build_node_id, generation)
+                            if lifecycle_store is not None:
+                                recovered = lifecycle_store.recover_actor_session(
+                                    args.run_id,
+                                    build_node_id,
+                                    "reviewer",
+                                    expected_generation=session.generation,
+                                    generation=generation,
+                                    pane_id=handle.pane_id,
+                                    session_path=str(handle.transcript_path),
+                                    correlation_token=handle.correlation_token,
+                                    tab_id=handle.tab_id,
+                                )
+                                if not recovered.recovered:
+                                    runner.cancel(
+                                        handle,
+                                        finalization_window.time.monotonic() + 5.0,
+                                    )
+                                    raise scheduler.AttemptOwnershipLost(
+                                        "reviewer generation changed"
+                                    )
+                            submitted = True
+                    else:
+                        generation = next_generation(build_node_id, record)
+                        handle = _typed_launch_pane(
+                            runner,
+                            launcher.LaunchSpec(
+                                correlation_token="review-{}-{}-a{}".format(
+                                    args.run_id, build_node_id, generation
+                                ),
+                                worktree=Path(args.repo),
+                                prompt_path=prompt_path,
+                                envelope_path=report_path,
+                                route=args.reviewer_route,
+                                model=args.reviewer_model,
+                                effort=args.reviewer_effort,
+                                profile=args.reviewer_profile,
+                                session_dir=session_dir,
+                                context_window_tokens=_route_context_window(
+                                    args.reviewer_route, args.reviewer_model
+                                ),
+                                workspace_label=getattr(runner, "workspace_label", ""),
+                                lane_key=build_node_id,
+                                lane_label=build_node_id,
+                                pane_role="reviewer",
+                                attempt_no=generation,
+                                pane_group_size=3,
+                                restrict_tools=getattr(
+                                    args, "restrict_actor_tools", False
+                                ),
+                                environment=worktree.launch_env(
+                                    scratch_dir,
+                                    concurrency=getattr(args, "concurrency", None),
+                                ),
+                            ),
+                        )
+                        submitted = True
+                        if lifecycle_store is not None:
+                            _require_session_path(handle, build_node_id, generation)
+                        if lifecycle_store is not None:
+                            lifecycle_store.register_actor_session(
+                                args.run_id,
+                                build_node_id,
+                                "reviewer",
+                                generation=generation,
+                                pane_id=handle.pane_id,
+                                session_path=str(handle.transcript_path),
+                                correlation_token=handle.correlation_token,
+                                tab_id=handle.tab_id,
+                            )
+                    if adopted_existing and not resume_existing_dispatch:
+                        runner.resubmit(
+                            handle,
+                            prompt_path,
+                            route=args.reviewer_route,
+                            expected_token=handle.correlation_token,
+                        )
+                        submitted = True
+                    handles[build_node_id] = handle
                 return finalization_window.ReviewerSession(
-                    route=args.reviewer_route, model=args.reviewer_model,
-                    session_id=handle.pane_id, session_dir=str(session_dir),
-                    # As above: the kill stays gated on `process_group`, the
-                    # liveness read may use the fallback (#20).
+                    route=args.reviewer_route,
+                    model=args.reviewer_model,
+                    session_id=handle.pane_id,
+                    session_dir=str(session_dir),
                     harness_owned_group=handle.process_group is not None,
-                    pid=handle.process_group or handle.liveness_pid)
+                    pid=handle.process_group or handle.liveness_pid,
+                )
 
             def poll_report():
-                return _poll_reviewer_report(report_path)
+                return (
+                    persisted_report
+                    if persisted_report is not None
+                    else _poll_reviewer_report(report_path)
+                )
 
             def read_status(_session):
-                handle = handle_box["handle"]
+                handle = handles.get(build_node_id)
                 return runner.agent_status(handle) if handle is not None else None
-
-            def kill_reviewer(_session):
-                _close_reviewer_pane(runner, handle_box)
 
             return finalization_window.FinalizationWindow(
                 config=finalization_window.FinalizationConfig(
@@ -1781,59 +2207,40 @@ def _code_review_runner(args: argparse.Namespace, runner: "launcher.HerdrLaunche
                     poll_interval_s=args.reviewer_poll_interval_s,
                     start_deadline_s=(
                         args.review_start_deadline_s
-                        if getattr(args, "review_start_deadline_s", None)
-                        is not None
-                        else finalization_window.DEFAULT_START_DEADLINE_S),
+                        if getattr(args, "review_start_deadline_s", None) is not None
+                        else finalization_window.DEFAULT_START_DEADLINE_S
+                    ),
                     quiescence_confirm_s=(
                         args.review_quiescence_confirm_s
                         if getattr(args, "review_quiescence_confirm_s", None)
                         is not None
-                        else finalization_window.DEFAULT_QUIESCENCE_CONFIRM_S)),
-                launch=launch_reviewer, poll_report=poll_report,
+                        else finalization_window.DEFAULT_QUIESCENCE_CONFIRM_S
+                    ),
+                ),
+                launch=launch_reviewer,
+                poll_report=poll_report,
                 record_reviewer_session=lambda _s: None,
-                kill=kill_reviewer,
-                actor_status=read_status)
+                kill=lambda _s: close(build_node_id),
+                actor_status=read_status,
+            )
 
-        try:
-            return code_review.review_attempt(
-                subject_digest=digest, handoff=handoff, objects=objects,
-                rubric=code_review.CODE_RUBRIC, store=store,
-                window_factory=window_factory,
-                occupancy_reader=_reviewer_occupancy,
-                reject_at=args.review_reject_grade,
-                ledger_path=ledger_path)
-        finally:
-            # Unconditional. The pane is closed on the success path too, not
-            # only when the window stalls and calls `kill` — a completed review
-            # that leaves its pane alive is the leak that accumulates one
-            # orphaned pane per node for the length of a run.
-            _close_reviewer_pane(runner, handle_box)
+        return code_review.review_attempt(
+            subject_digest=digest,
+            handoff=handoff,
+            objects=objects,
+            rubric=code_review.CODE_RUBRIC,
+            store=receipt_store,
+            window_factory=window_factory,
+            occupancy_reader=_reviewer_occupancy,
+            reject_at=args.review_reject_grade,
+            ledger_path=ledger_path,
+        )
 
+    # Scheduler holds the terminal edge; an accepted/rejected candidate keeps
+    # this callable's actor open until that edge explicitly invokes `close`.
+    review.close = close
+    review.receipt_path_for = lambda digest: str(receipt_store.path_for(digest))
     return review
-
-
-def _close_reviewer_pane(runner: "launcher.HerdrLauncher",
-                         handle_box: Dict[str, Any]) -> None:
-    """Close the reviewer's pane and forget the handle, at most once.
-
-    `cancel` proves quiescence and raises when it cannot. Here that exception
-    is swallowed on purpose: this runs in a `finally` around a review whose
-    verdict is already decided, and letting a pane-close failure replace a real
-    PASS or FAIL with a quiescence error would turn a cosmetic leak into a lost
-    review. The pane id stays in the log either way.
-    """
-    handle = handle_box.get("handle")
-    if handle is None:
-        return
-    handle_box["handle"] = None
-    try:
-        runner.cancel(handle, finalization_window.time.monotonic() + 5.0)
-    except BaseException as exc:  # noqa: BLE001 — see docstring
-        print(json.dumps({
-            "event": "reviewer_pane_close_failed",
-            "pane_id": handle.pane_id,
-            "detail": str(exc)[:200],
-        }, sort_keys=True), file=sys.stderr)
 
 
 #: How a builder should look things up, appended to every agent-node prompt.
@@ -1852,13 +2259,12 @@ AGENT_DISCOVERY_ROUTING = (
     "Use the code-intel-routing skill to decide how to look something up "
     "before you search: codemap for a known file's structure, LSP for a "
     "symbol's definitions and references, codebase-memory for \"where does "
-    "this happen\", and grep only for an exact literal in a known path. It is "
+    'this happen", and grep only for an exact literal in a known path. It is '
     "faster than reading files whole, and it leaves you the context to finish."
 )
 
 
-def _agent_node_prompt(node: Any, envelope: Path,
-                       retry_prompt: Optional[str]) -> str:
+def _agent_node_prompt(node: Any, envelope: Path, retry_prompt: Optional[str]) -> str:
     """The instruction, plus every term the attempt is actually judged on.
 
     Verification asks four questions of an agent node -- did it write a typed
@@ -1877,7 +2283,8 @@ def _agent_node_prompt(node: Any, envelope: Path,
     if outputs:
         lines.append(
             "Write only these paths, relative to the repository root. A change "
-            "to anything else fails the attempt:")
+            "to anything else fails the attempt:"
+        )
         lines.extend("  " + path for path in outputs)
         lines.append("")
     gate = getattr(node, "gate", None)
@@ -1885,27 +2292,29 @@ def _agent_node_prompt(node: Any, envelope: Path,
         lines.append(
             "Your work is judged by this command, run from {0!r}. It fails now "
             "and must pass, collecting at least {1} case(s), when you are "
-            "done:".format(gate.cwd, gate.min_cases))
+            "done:".format(gate.cwd, gate.min_cases)
+        )
         lines.append("  " + " ".join([gate.runner, *gate.argv]))
         lines.append("")
     if retry_prompt:
         lines.extend(["Retry guidance:", retry_prompt, ""])
-    lines.extend([
-        "When you have finished, write this file and then stop:",
-        "  " + str(envelope),
-        '  {"success": true, "summary": "<what you did>"}',
-        "",
-        "Use \"success\": false if you could not finish, with the reason in "
-        "the summary. The attempt is not verified without this file, and "
-        "nothing else ends it.",
-        "",
-        AGENT_DISCOVERY_ROUTING,
-    ])
+    lines.extend(
+        [
+            "When you have finished, write this file and then stop:",
+            "  " + str(envelope),
+            '  {"success": true, "summary": "<what you did>"}',
+            "",
+            'Use "success": false if you could not finish, with the reason in '
+            "the summary. The attempt is not verified without this file, and "
+            "nothing else ends it.",
+            "",
+            AGENT_DISCOVERY_ROUTING,
+        ]
+    )
     return "\n".join(lines)
 
 
-def _tests_node_prompt(node: Any, envelope: Path,
-                       retry_prompt: Optional[str]) -> str:
+def _tests_node_prompt(node: Any, envelope: Path, retry_prompt: Optional[str]) -> str:
     """Goal, produces, acceptance — tests only, no implementation."""
     lines = [node.instruction, ""]
     outputs = list(getattr(node, "outputs", ()) or ())
@@ -1913,7 +2322,8 @@ def _tests_node_prompt(node: Any, envelope: Path,
         lines.append(
             "Write only these test files, relative to the repository root. "
             "Do not write implementation. A change to anything else fails "
-            "the attempt:")
+            "the attempt:"
+        )
         lines.extend("  " + path for path in outputs)
         lines.append("")
     gate = getattr(node, "gate", None)
@@ -1922,23 +2332,25 @@ def _tests_node_prompt(node: Any, envelope: Path,
             "Maestro will collect these tests and require every new case to "
             "fail at the parent commit (implementation does not exist yet). "
             "A case that passes at the parent is refused. A collection "
-            "error or an import crash of the test file is not a red:")
+            "error or an import crash of the test file is not a red:"
+        )
         lines.append("  " + " ".join([gate.runner, *gate.argv]))
         lines.append("")
     if retry_prompt:
         lines.extend(["Retry guidance:", retry_prompt, ""])
-    lines.extend([
-        "When you have finished, write this file and then stop:",
-        "  " + str(envelope),
-        '  {"success": true, "summary": "<what you did>"}',
-        "",
-        AGENT_DISCOVERY_ROUTING,
-    ])
+    lines.extend(
+        [
+            "When you have finished, write this file and then stop:",
+            "  " + str(envelope),
+            '  {"success": true, "summary": "<what you did>"}',
+            "",
+            AGENT_DISCOVERY_ROUTING,
+        ]
+    )
     return "\n".join(lines)
 
 
-def _append_needed_tests(prompt: str, worktree: Path, node: Any,
-                         plan: Any) -> str:
+def _append_needed_tests(prompt: str, worktree: Path, node: Any, plan: Any) -> str:
     """Attach already-merged test file bytes to a build node's handoff.
 
     The tests node merged first; those files sit in this worktree and are
@@ -1946,6 +2358,7 @@ def _append_needed_tests(prompt: str, worktree: Path, node: Any,
     after this function returns.
     """
     from adw_modules.tests_chain import is_test_path
+
     by_id = plan.node_by_id()
     chunks = []
     for need in getattr(node, "needs", ()) or ():
@@ -1987,20 +2400,24 @@ def _worktree_holding_branch(repo: Path, branch: str) -> Optional[Path]:
     try:
         listed = subprocess.run(
             ("git", "-C", str(repo), "worktree", "list", "--porcelain"),
-            capture_output=True, text=True, check=False)
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     except OSError as exc:
-        raise RuntimeError(
-            "GIT_READ_FAILED:worktree list in {}".format(repo)) from exc
+        raise RuntimeError("GIT_READ_FAILED:worktree list in {}".format(repo)) from exc
     if listed.returncode != 0:
         raise RuntimeError(
             "GIT_READ_FAILED:worktree list in {} exited {}".format(
-                repo, listed.returncode))
+                repo, listed.returncode
+            )
+        )
     wanted = "refs/heads/" + branch
     path: Optional[Path] = None
     for line in (listed.stdout or "").splitlines():
         if line.startswith("worktree "):
-            path = Path(line[len("worktree "):].strip())
-        elif line.startswith("branch ") and line[len("branch "):].strip() == wanted:
+            path = Path(line[len("worktree ") :].strip())
+        elif line.startswith("branch ") and line[len("branch ") :].strip() == wanted:
             return path
     return None
 
@@ -2026,8 +2443,7 @@ class _RunStateStillHeld(RuntimeError):
     """
 
 
-def _run_owning_worktree(occupant: Path,
-                         runs_root: Optional[Path]) -> Optional[str]:
+def _run_owning_worktree(occupant: Path, runs_root: Optional[Path]) -> Optional[str]:
     """The run id a checkout under this system's run root belongs to.
 
     The run root is laid out `<runs_root>/<run_id>/<...>`, so the first path
@@ -2072,21 +2488,21 @@ def _recorded_run_is_over(database: Any, run_id: str) -> Tuple[bool, str]:
         return False, "no lifecycle ledger"
     try:
         connection = sqlite3.connect(
-            "file:{}?mode=ro".format(database), uri=True, timeout=5.0)
+            "file:{}?mode=ro".format(database), uri=True, timeout=5.0
+        )
     except sqlite3.Error:
         return False, "unreadable lifecycle ledger"
     try:
         row = connection.execute(
-            "SELECT latest_outcome FROM runs WHERE run_id=?",
-            (run_id,)).fetchone()
+            "SELECT latest_outcome FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
         outcome = str(row[0]) if row and row[0] is not None else ""
         cause = ""
         if outcome == scheduler_types.RunOutcome.CANCELLED.value:
             cause_row = connection.execute(
-                "SELECT cancel_cause FROM runs WHERE run_id=?",
-                (run_id,)).fetchone()
-            cause = (str(cause_row[0])
-                     if cause_row and cause_row[0] is not None else "")
+                "SELECT cancel_cause FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            cause = str(cause_row[0]) if cause_row and cause_row[0] is not None else ""
     except sqlite3.Error:
         return False, "unreadable lifecycle ledger"
     finally:
@@ -2099,8 +2515,9 @@ def _recorded_run_is_over(database: Any, run_id: str) -> Tuple[bool, str]:
     if outcome == scheduler_types.RunOutcome.ACCEPTED.value:
         return True, outcome
     if outcome == scheduler_types.RunOutcome.CANCELLED.value:
-        reopenable = tuple(member.value for member
-                           in scheduler_types.REOPENABLE_CANCEL_CAUSES)
+        reopenable = tuple(
+            member.value for member in scheduler_types.REOPENABLE_CANCEL_CAUSES
+        )
         if cause in reopenable:
             return False, outcome + " (" + cause + ")"
         return True, outcome + " (" + (cause or "unrecorded cause") + ")"
@@ -2111,8 +2528,12 @@ def _recorded_run_is_over(database: Any, run_id: str) -> Tuple[bool, str]:
 
 
 def _reclaim_stranded_integration_worktree(
-        repo: Path, runs_root: Optional[Path], branch: str,
-        database: Any, discard_live: bool = False) -> Optional[Path]:
+    repo: Path,
+    runs_root: Optional[Path],
+    branch: str,
+    database: Any,
+    discard_live: bool = False,
+) -> Optional[Path]:
     """Take back an integration checkout this system's own run root still holds.
 
     Permanent Maestro semantics, not a repair for one installation: an operator
@@ -2167,8 +2588,11 @@ def _reclaim_stranded_integration_worktree(
     """
     occupant = _worktree_holding_branch(repo, branch)
     released: Optional[Path] = None
-    if (occupant is not None and runs_root is not None
-            and _path_is_within(occupant.resolve(), runs_root.resolve())):
+    if (
+        occupant is not None
+        and runs_root is not None
+        and _path_is_within(occupant.resolve(), runs_root.resolve())
+    ):
         run_id = _run_owning_worktree(occupant, runs_root)
         if run_id is None:
             over, state = False, "no run identity in its path"
@@ -2178,26 +2602,42 @@ def _reclaim_stranded_integration_worktree(
             over, state = _recorded_run_is_over(database, run_id)
         if not over:
             raise _RunStateStillHeld(
-                "the integration branch " + branch + " is checked out at "
-                + str(occupant) + ", which belongs to run "
-                + (run_id or "(unidentified)") + " whose recorded state is "
-                + state + ". That run is resumable, and removing its "
+                "the integration branch "
+                + branch
+                + " is checked out at "
+                + str(occupant)
+                + ", which belongs to run "
+                + (run_id or "(unidentified)")
+                + " whose recorded state is "
+                + state
+                + ". That run is resumable, and removing its "
                 "integration checkout would take the merges every MERGED node "
                 "is re-proved against on resume. Resume that run, or end it "
-                "for good with `run cancel --discard`")
+                "for good with `run cancel --discard`"
+            )
         result = subprocess.run(
             ("git", "-C", str(repo), "worktree", "remove", str(occupant)),
-            capture_output=True, text=True, check=False)
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         if result.returncode == 0:
             released = occupant
         else:
             # Unforced, so this is the ordinary way a non-empty tree says so.
             # The operator learns what is in the way instead of losing it.
-            print("integration worktree not reclaimed: {}: {}".format(
-                occupant, (result.stderr or result.stdout or "").strip()),
-                file=sys.stderr)
-    subprocess.run(("git", "-C", str(repo), "worktree", "prune"),
-                   capture_output=True, text=True, check=False)
+            print(
+                "integration worktree not reclaimed: {}: {}".format(
+                    occupant, (result.stderr or result.stdout or "").strip()
+                ),
+                file=sys.stderr,
+            )
+    subprocess.run(
+        ("git", "-C", str(repo), "worktree", "prune"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     return released
 
 
@@ -2225,9 +2665,11 @@ def _release_run_integration_worktree(repo: Path, path: Optional[Path]) -> None:
         return
     try:
         released = subprocess.run(
-            ("git", "-C", str(repo), "worktree", "remove", "--force",
-             str(path)),
-            capture_output=True, text=True, check=False)
+            ("git", "-C", str(repo), "worktree", "remove", "--force", str(path)),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     except OSError as exc:
         detail = str(exc)
     else:
@@ -2237,12 +2679,15 @@ def _release_run_integration_worktree(repo: Path, path: Optional[Path]) -> None:
     # stdout carries the run's report, so a failed release is reported beside
     # it rather than inside it: the operator learns there is a worktree left to
     # clean up, and the run still says exactly what it did.
-    print("integration worktree release failed: {}: {}".format(path, detail),
-          file=sys.stderr)
+    print(
+        "integration worktree release failed: {}: {}".format(path, detail),
+        file=sys.stderr,
+    )
 
 
 def _reviewer_occupancy(
-        session: finalization_window.ReviewerSession) -> Optional[float]:
+    session: finalization_window.ReviewerSession,
+) -> Optional[float]:
     """How full the reviewer's context window was after its last valid turn.
 
     The reading comes from the transcript the route wrote, not from the report
@@ -2264,7 +2709,8 @@ def _reviewer_occupancy(
     for transcript in sorted(Path(directory).glob("*.jsonl")):
         try:
             lines = transcript.read_text(
-                encoding="utf-8", errors="replace").splitlines()
+                encoding="utf-8", errors="replace"
+            ).splitlines()
         except OSError:
             continue
         for line in lines:
@@ -2338,9 +2784,11 @@ def _deterministic_receipt(digest: str) -> finalization.Receipt:
         verdict=finalization.Verdict.PASS,
         cells=(),
         reviewer=finalization.ReviewerIdentity(
-            route="deterministic", model="plan_validate", session_id=digest),
+            route="deterministic", model="plan_validate", session_id=digest
+        ),
         created_at_epoch=time.time(),
-        reject_at=None)
+        reject_at=None,
+    )
 
 
 def _plan_finalize(args: argparse.Namespace) -> int:
@@ -2358,18 +2806,29 @@ def _plan_finalize(args: argparse.Namespace) -> int:
     try:
         stored = Path(args.plan_file).read_bytes()
         validation = pv.validate_plan(
-            stored, args.repo, receipts=_VerifiedReceipts(args),
-            collector=_plan_collector(args))
+            stored,
+            args.repo,
+            receipts=_VerifiedReceipts(args),
+            collector=_plan_collector(args),
+        )
         if not validation.eligible:
-            print(json.dumps({
-                "outcome": validation.outcome.value,
-                "digest": validation.digest,
-                "blockers": [
-                    {"obligation": row.obligation.value, "pointer": row.pointer,
-                     "message": row.message}
-                    for row in validation.blockers
-                ],
-            }, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "outcome": validation.outcome.value,
+                        "digest": validation.digest,
+                        "blockers": [
+                            {
+                                "obligation": row.obligation.value,
+                                "pointer": row.pointer,
+                                "message": row.message,
+                            }
+                            for row in validation.blockers
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
             return 2
         store = _finalization_store(args)
         store.recover(validation.digest)
@@ -2384,30 +2843,42 @@ def _plan_finalize(args: argparse.Namespace) -> int:
                 receipt, replayed = store.load(validation.digest), True
     except _PlanReceiptConfigurationError as exc:
         return _refusal("FINALIZATION_CONFIGURATION_REQUIRED", str(exc))
-    except (_PlanReceiptVerificationError, finalization.SignatureMissing,
-            finalization.SignatureInvalid, finalization.ReceiptInvalid) as exc:
+    except (
+        _PlanReceiptVerificationError,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+        finalization.ReceiptInvalid,
+    ) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
-    except (finalization.ReceiptStoreLocationError,
-            receipt_crypto.KeyMaterialError,
-            route_receipts.ReceiptInvalid, ValueError, OSError) as exc:
+    except (
+        finalization.ReceiptStoreLocationError,
+        receipt_crypto.KeyMaterialError,
+        route_receipts.ReceiptInvalid,
+        ValueError,
+        OSError,
+    ) as exc:
         return _refusal("FINALIZATION_FAILED", str(exc))
-    print(json.dumps({
-        "outcome": "FINALIZED",
-        "digest": receipt.plan_digest,
-        "verdict": receipt.verdict.value,
-        "replayed": replayed,
-    }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "outcome": "FINALIZED",
+                "digest": receipt.plan_digest,
+                "verdict": receipt.verdict.value,
+                "replayed": replayed,
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
 def _receipt_root(args: argparse.Namespace) -> Optional[Path]:
-    raw = getattr(args, "receipt_dir", None) or os.environ.get(
-        "MAESTRO_RECEIPT_DIR")
+    raw = getattr(args, "receipt_dir", None) or os.environ.get("MAESTRO_RECEIPT_DIR")
     return Path(raw) if raw else None
 
 
 def _plan_receipt_store(
-        args: argparse.Namespace, *, missing_detail: str
+    args: argparse.Namespace, *, missing_detail: str
 ) -> finalization.ReceiptStore:
     root = _receipt_root(args)
     verify_key_values = getattr(args, "verify_key", None)
@@ -2423,11 +2894,17 @@ def _plan_receipt_store(
     if any(len(key) != receipt_crypto.PUBLIC_KEY_SIZE for key in verify_keys):
         raise _PlanReceiptConfigurationError(
             "--verify-key must contain exactly {0} bytes".format(
-                receipt_crypto.PUBLIC_KEY_SIZE))
+                receipt_crypto.PUBLIC_KEY_SIZE
+            )
+        )
     try:
         return finalization.ReceiptStore(
-            root, repo_paths=(getattr(args, "repo", "."),),
-            data_dir=data_dir, verify_keys=verify_keys, create=False)
+            root,
+            repo_paths=(getattr(args, "repo", "."),),
+            data_dir=data_dir,
+            verify_keys=verify_keys,
+            create=False,
+        )
     except finalization.ReceiptStoreLocationError as exc:
         raise _PlanReceiptConfigurationError(str(exc)) from exc
 
@@ -2442,15 +2919,22 @@ def _plan_show(args: argparse.Namespace) -> int:
             args,
             missing_detail=(
                 "--receipt-dir, --data-dir, and at least one --verify-key "
-                "are required for receipt access"))
+                "are required for receipt access"
+            ),
+        )
         receipt = store.load(args.digest)
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
     except FileNotFoundError:
         return _refusal("FINALIZED_PLAN_NOT_FOUND", args.digest)
-    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-            finalization.SignatureInvalid, UnicodeError, ValueError,
-            KeyError) as exc:
+    except (
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+        UnicodeError,
+        ValueError,
+        KeyError,
+    ) as exc:
         return _plan_receipt_verification_refusal(exc)
     print(receipt.to_bytes().decode("utf-8"))
     return 0
@@ -2472,14 +2956,19 @@ def _plan_set_aside(args: argparse.Namespace) -> int:
     """
     try:
         store = _finalization_store(args)
-        record = store.set_aside(args.digest, invoked_by=args.invoked_by,
-                                 reason=args.reason)
+        record = store.set_aside(
+            args.digest, invoked_by=args.invoked_by, reason=args.reason
+        )
     except _PlanReceiptConfigurationError as exc:
         return _refusal("SET_ASIDE_CONFIGURATION_REQUIRED", str(exc))
     except finalization.SetAsideRefused as exc:
         return _refusal("SET_ASIDE_REFUSED", str(exc))
-    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-            finalization.SignatureInvalid, UnicodeError) as exc:
+    except (
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+        UnicodeError,
+    ) as exc:
         return _plan_receipt_verification_refusal(exc)
     except (ValueError, KeyError, OSError) as exc:
         return _refusal("SET_ASIDE_FAILED", str(exc))
@@ -2496,22 +2985,31 @@ def _plan_set_aside_log(args: argparse.Namespace) -> int:
             args,
             missing_detail=(
                 "--receipt-dir, --data-dir, and at least one --verify-key "
-                "are required for receipt access"))
+                "are required for receipt access"
+            ),
+        )
         entries = [
             {
                 "record": json.loads(record.to_bytes().decode("utf-8")),
                 "superseded_receipt": json.loads(
-                    store.load_set_aside_receipt(
-                        args.digest, record.sequence
-                    ).to_bytes().decode("utf-8")),
+                    store.load_set_aside_receipt(args.digest, record.sequence)
+                    .to_bytes()
+                    .decode("utf-8")
+                ),
             }
             for record in store.set_aside_records(args.digest)
         ]
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
-    except (FileNotFoundError, finalization.ReceiptInvalid,
-            finalization.SignatureMissing, finalization.SignatureInvalid,
-            UnicodeError, ValueError, KeyError) as exc:
+    except (
+        FileNotFoundError,
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+        UnicodeError,
+        ValueError,
+        KeyError,
+    ) as exc:
         return _plan_receipt_verification_refusal(exc)
     print(json.dumps(entries, sort_keys=True))
     return 0
@@ -2523,19 +3021,29 @@ def _plan_list(args: argparse.Namespace) -> int:
             args,
             missing_detail=(
                 "--receipt-dir, --data-dir, and at least one --verify-key "
-                "are required for receipt access"))
+                "are required for receipt access"
+            ),
+        )
     except _PlanReceiptConfigurationError as exc:
         return _refusal("RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED", str(exc))
     digests = sorted(
-        path.stem for path in store.root.glob("*.json")
-        if len(path.stem) == 64 and all(
-            character in "0123456789abcdef" for character in path.stem))
+        path.stem
+        for path in store.root.glob("*.json")
+        if len(path.stem) == 64
+        and all(character in "0123456789abcdef" for character in path.stem)
+    )
     try:
         for digest in digests:
             store.load(digest)
-    except (FileNotFoundError, finalization.ReceiptInvalid,
-            finalization.SignatureMissing, finalization.SignatureInvalid,
-            UnicodeError, ValueError, KeyError) as exc:
+    except (
+        FileNotFoundError,
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+        UnicodeError,
+        ValueError,
+        KeyError,
+    ) as exc:
         return _plan_receipt_verification_refusal(exc)
     print(json.dumps(digests))
     return 0
@@ -2549,7 +3057,8 @@ def _run_start(args: argparse.Namespace) -> int:
     if not getattr(args, "plan_file", None):
         return _refusal(
             "RUN_CONFIGURATION_REQUIRED",
-            "repository, finalized receipt, launcher roster, and liveness bounds are required")
+            "repository, finalized receipt, launcher roster, and liveness bounds are required",
+        )
     try:
         return _execute_run(args, resuming=False)
     except _RunRefused as exc:
@@ -2560,8 +3069,11 @@ def _run_start(args: argparse.Namespace) -> int:
         return _refusal("RUN_CONFIGURATION_REQUIRED", str(exc))
     except _PlanReceiptVerificationError as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
-    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-            finalization.SignatureInvalid) as exc:
+    except (
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+    ) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
     except Exception as exc:
         # Everything with no better name, under the one it already had. The
@@ -2569,12 +3081,14 @@ def _run_start(args: argparse.Namespace) -> int:
         # and differed from it in nothing else, so the class name was the whole
         # of what it added — and a class name is not a refusal vocabulary. It
         # keeps its diagnostic value in `detail`, which is where prose belongs.
-        return _refusal("RUN_EXECUTION_FAILED",
-                        "{0}: {1}".format(type(exc).__name__, exc))
+        return _refusal(
+            "RUN_EXECUTION_FAILED", "{0}: {1}".format(type(exc).__name__, exc)
+        )
 
 
 def _missing_run_configuration_detail(
-        args: argparse.Namespace, missing: Sequence[str]) -> str:
+    args: argparse.Namespace, missing: Sequence[str]
+) -> str:
     """The `missing run configuration` refusal, plus the rule that caused it.
 
     A list of fifteen absent values is a symptom, and on a configured
@@ -2596,41 +3110,63 @@ def _missing_run_configuration_detail(
         return detail
     named = ", ".join(manual)
     return (
-        detail + "; configuration binding was disabled by " + named
+        detail
+        + "; configuration binding was disabled by "
+        + named
         + " because it names a path, key or executable by hand, and a run "
         "half-derived from " + str(_MAESTRO_CONFIG_FILE) + " and half typed "
         "at the prompt cannot be trusted to name one run. Either drop "
-        + named + " and let every value above bind from configuration, or "
+        + named
+        + " and let every value above bind from configuration, or "
         "supply all of them as flags. Tuning flags ("
-        + ", ".join(_RUN_TUNING_EXAMPLES) + " and the other settings in "
-        "execution:) override a value without disabling binding.")
+        + ", ".join(_RUN_TUNING_EXAMPLES)
+        + " and the other settings in "
+        "execution:) override a value without disabling binding."
+    )
 
 
 def _run_configuration(args: argparse.Namespace) -> scheduler_types.SchedulerConfig:
-    required = ("plan_file", "repo", "receipt_dir", "data_dir", "verify_key",
-                "digest", "db", "run_id", "integration_path", "worktrees_root",
-                "scratch_root", "concurrency", "node_timeout_s",
-                "turn_timeout_s", "final_acceptance_timeout_s",
-                "backstop_t_s", "semantic_ceiling")
+    required = (
+        "plan_file",
+        "repo",
+        "receipt_dir",
+        "data_dir",
+        "verify_key",
+        "digest",
+        "db",
+        "run_id",
+        "integration_path",
+        "worktrees_root",
+        "scratch_root",
+        "concurrency",
+        "node_timeout_s",
+        "turn_timeout_s",
+        "final_acceptance_timeout_s",
+        "backstop_t_s",
+        "semantic_ceiling",
+    )
     missing = [name for name in required if not getattr(args, name, None)]
     if missing:
         raise _PlanReceiptConfigurationError(
-            _missing_run_configuration_detail(args, missing))
+            _missing_run_configuration_detail(args, missing)
+        )
     # Every field of `SchedulerConfig` is named here, and
     # `test_every_scheduler_config_field_is_projected` fails if one is not.
     # This is the projection §7.4 describes: the one that copied a gate's
     # runner, argv and selector and dropped its threshold, because a
     # field-by-field copy has no way to notice the field it did not copy.
     return scheduler_types.SchedulerConfig(
-        concurrency=args.concurrency, node_timeout_s=args.node_timeout_s,
+        concurrency=args.concurrency,
+        node_timeout_s=args.node_timeout_s,
         turn_timeout_s=args.turn_timeout_s,
         final_acceptance_timeout_s=args.final_acceptance_timeout_s,
-        backstop_t_s=args.backstop_t_s, semantic_ceiling=args.semantic_ceiling,
+        backstop_t_s=args.backstop_t_s,
+        semantic_ceiling=args.semantic_ceiling,
         review_ceiling=_scheduler_setting(args, "review_ceiling"),
-        environmental_retries=_scheduler_setting(
-            args, "environmental_retries"),
+        environmental_retries=_scheduler_setting(args, "environmental_retries"),
         launcher_retries=_scheduler_setting(args, "launcher_retries"),
-        credential_retries=_scheduler_setting(args, "credential_retries"))
+        credential_retries=_scheduler_setting(args, "credential_retries"),
+    )
 
 
 def _scheduler_setting(args: argparse.Namespace, name: str) -> Any:
@@ -2662,7 +3198,9 @@ def _paths_share_inode(left: Path, right: Path) -> bool:
     except OSError:
         return False
     return (left_stat.st_dev, left_stat.st_ino) == (
-        right_stat.st_dev, right_stat.st_ino)
+        right_stat.st_dev,
+        right_stat.st_ino,
+    )
 
 
 def _is_within_run_boundary(path: Path, boundary: Path) -> bool:
@@ -2680,8 +3218,9 @@ def _is_within_run_boundary(path: Path, boundary: Path) -> bool:
     return _paths_share_inode(ancestor, boundary)
 
 
-def _refuse_base_commit_divergence(args: argparse.Namespace,
-                                   plan: plan_model.Plan) -> Optional[int]:
+def _refuse_base_commit_divergence(
+    args: argparse.Namespace, plan: plan_model.Plan
+) -> Optional[int]:
     """Single-repo twin of workspace_runtime.prepare_candidate's SHA check.
 
     Attempt worktrees still branch from the integration head so `needs` works
@@ -2707,20 +3246,24 @@ def _refuse_base_commit_divergence(args: argparse.Namespace,
         return _refusal(
             "BASE_COMMIT_UNRESOLVABLE",
             "plan.base_commit {0} or integration branch {1} could not be "
-            "resolved, so recorded-base identity cannot be verified: {2}"
-            .format(base, branch, exc))
+            "resolved, so recorded-base identity cannot be verified: {2}".format(
+                base, branch, exc
+            ),
+        )
     if head.lower() != base_sha.lower():
         return _refusal(
             "BASE_COMMIT_DIVERGED",
             "integration branch {0} is at {1}, plan.base_commit {2} "
             "resolves to {3}. The single-repo path used to create attempt "
             "worktrees against whatever {0} pointed at and never compared "
-            "the two.".format(branch, head, base, base_sha))
+            "the two.".format(branch, head, base, base_sha),
+        )
     return None
 
 
-def _refuse_uncommittable_outputs(args: argparse.Namespace,
-                                  plan: plan_model.Plan) -> Optional[int]:
+def _refuse_uncommittable_outputs(
+    args: argparse.Namespace, plan: plan_model.Plan
+) -> Optional[int]:
     """Fail closed when a node declares an output git will not commit.
 
     A gitignored path is outside `git ls-files --cached --others
@@ -2759,7 +3302,8 @@ def _refuse_uncommittable_outputs(args: argparse.Namespace,
         return None
     detail = "; ".join(
         "{0} declares {1}, which git check-ignore excludes".format(nid, path)
-        for nid, path in ignored)
+        for nid, path in ignored
+    )
     return _refusal("DECLARED_OUTPUT_UNCOMMITTABLE", detail)
 
 
@@ -2778,10 +3322,12 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
         database_stat = None
     except OSError as exc:
         raise _RunPathConfigurationError(
-            "lifecycle database cannot be statted: {}".format(database)) from exc
+            "lifecycle database cannot be statted: {}".format(database)
+        ) from exc
     if database_stat is not None and database_stat.st_nlink != 1:
         raise _RunPathConfigurationError(
-            "lifecycle database has no single canonical inode: {}".format(database))
+            "lifecycle database has no single canonical inode: {}".format(database)
+        )
 
     boundaries = (
         ("repository", Path(args.repo).resolve()),
@@ -2794,7 +3340,8 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
     for label, boundary in boundaries:
         if _is_within_run_boundary(database, boundary):
             raise _RunPathConfigurationError(
-                "lifecycle database is inside the {}: {}".format(label, boundary))
+                "lifecycle database is inside the {}: {}".format(label, boundary)
+            )
 
 
 #: The plan schema versions this runtime will execute (§6.3, §19 M26).
@@ -2806,12 +3353,10 @@ def _validate_run_paths(args: argparse.Namespace, _plan: plan_model.Plan) -> Non
 #: version produces instructions a reviewer can judge against — that is the
 #: whole content of the v1/v2 distinction, and no structural check can
 #: substitute for it.
-_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({
-    plan_model.SCHEMA_V2, plan_model.SCHEMA_V3})
+_RUNNABLE_PLAN_SCHEMA_VERSIONS = frozenset({plan_model.SCHEMA_V2, plan_model.SCHEMA_V3})
 
 
-def _refuse_unrunnable_plan_schema(args: argparse.Namespace,
-                                   stored: bytes) -> None:
+def _refuse_unrunnable_plan_schema(args: argparse.Namespace, stored: bytes) -> None:
     """Refuse a plan whose schema version this runtime does not execute.
 
     **Why a version can refuse a run at all.** `plan_contract_ingress` used to
@@ -2878,9 +3423,11 @@ def _refuse_unrunnable_plan_schema(args: argparse.Namespace,
         "the plan from its IR with `maestro plan ship <plan_name>` "
         "(docs/plan-authoring.md), which re-projects it at {runnable}, "
         "re-validates, and re-finalizes it under a new digest.".format(
-            plan=args.plan_file, declared=declared, runnable=runnable),
+            plan=args.plan_file, declared=declared, runnable=runnable
+        ),
         declared_schema_version=declared,
-        runnable_schema_versions=sorted(_RUNNABLE_PLAN_SCHEMA_VERSIONS))
+        runnable_schema_versions=sorted(_RUNNABLE_PLAN_SCHEMA_VERSIONS),
+    )
 
 
 def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
@@ -2892,12 +3439,14 @@ def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
     _refuse_unrunnable_plan_schema(args, stored)
     receipts = _VerifiedReceipts(args)
     validation = pv.validate_plan(
-        stored, args.repo, receipts=receipts, collector=_plan_collector(args))
+        stored, args.repo, receipts=receipts, collector=_plan_collector(args)
+    )
     if not validation.eligible or validation.digest != args.digest:
         raise _RunRefused(
             "RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE",
             "the plan bytes are not canonical at {0}, or the plan is not "
-            "eligible to run".format(args.digest))
+            "eligible to run".format(args.digest),
+        )
     store = receipts._receipt_store()
     try:
         receipt = store.load(args.digest)
@@ -2907,12 +3456,15 @@ def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
         raise _RunRefused(
             "RUN_RECEIPT_NOT_PASS",
             "the finalization receipt for {0} records {1}".format(
-                args.digest, receipt.verdict.value))
+                args.digest, receipt.verdict.value
+            ),
+        )
     return plan_model.parse_bytes(stored)
 
 
-def _receipt_absent(store: "finalization.ReceiptStore",
-                    plan_digest: str) -> _RunRefused:
+def _receipt_absent(
+    store: "finalization.ReceiptStore", plan_digest: str
+) -> _RunRefused:
     """`RUN_RECEIPT_ABSENT`, and which of its two causes this is.
 
     A run needs a PASS receipt, and there are two ways for the digest not to
@@ -2932,24 +3484,35 @@ def _receipt_absent(store: "finalization.ReceiptStore",
     """
     try:
         records = store.set_aside_records(plan_digest)
-    except (OSError, ValueError, finalization.ReceiptInvalid,
-            finalization.SignatureMissing, finalization.SignatureInvalid):
+    except (
+        OSError,
+        ValueError,
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+    ):
         records = ()
     if records:
         return _RunRefused(
             "RUN_RECEIPT_ABSENT",
             "the finalization receipt for {0} was set aside {1} time(s); "
             "run `maestro plan finalize` to review those bytes afresh".format(
-                plan_digest, len(records)),
-            cause="SET_ASIDE", set_aside_count=len(records))
+                plan_digest, len(records)
+            ),
+            cause="SET_ASIDE",
+            set_aside_count=len(records),
+        )
     return _RunRefused(
         "RUN_RECEIPT_ABSENT",
         "no finalization receipt exists for {0}".format(plan_digest),
-        cause="NEVER_FINALIZED", set_aside_count=0)
+        cause="NEVER_FINALIZED",
+        set_aside_count=0,
+    )
 
 
-def _refuse_cross_run_node_budget(args: argparse.Namespace,
-                                 plan: plan_model.Plan) -> None:
+def _refuse_cross_run_node_budget(
+    args: argparse.Namespace, plan: plan_model.Plan
+) -> None:
     """Refuse a run whose nodes have already spent their fix-loop budget in
     earlier runs of the same plan.
 
@@ -3016,13 +3579,15 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
             "The plan's nodes are {2}. A misspelled node id would admit "
             "nothing and refuse nothing, so it is refused here rather than "
             "silently ignored.".format(
-                ", ".join(unknown), args.plan_file, ", ".join(sorted(known))),
-            unknown_node_ids=unknown, plan_node_ids=sorted(known))
+                ", ".join(unknown), args.plan_file, ", ".join(sorted(known))
+            ),
+            unknown_node_ids=unknown,
+            plan_node_ids=sorted(known),
+        )
     database = getattr(args, "db", None)
     ceiling = getattr(args, "semantic_ceiling", None)
     digest = getattr(args, "digest", None)
-    if (not database or not digest or ceiling is None
-            or not Path(database).is_file()):
+    if not database or not digest or ceiling is None or not Path(database).is_file():
         # No ledger means no prior run, which is the ordinary first start.
         # The reader would refuse an absent database, and creating one to
         # discover it is empty is exactly the side effect `LedgerUnavailable`
@@ -3037,9 +3602,11 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
     try:
         excluded = getattr(args, "run_id", None)
         attempts_by_run = reader.attempts_by_run_for_plan(
-            digest, exclude_run_id=excluded)
+            digest, exclude_run_id=excluded
+        )
         granted = reader.granted_extra_attempts_for_plan(
-            digest, exclude_run_id=excluded)
+            digest, exclude_run_id=excluded
+        )
     finally:
         reader.close()
 
@@ -3047,14 +3614,17 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
     admitted: List[Dict[str, Any]] = []
     for node_id in sorted(known):
         total, run_ids = retry_policy.semantic_attempts_across_runs(
-            attempts_by_run, node_id)
+            attempts_by_run, node_id
+        )
         effective = int(ceiling) + int(granted.get(node_id, 0))
         if total <= effective:
             continue
-        record = {"node_id": node_id,
-                  "cumulative_semantic_attempts": total,
-                  "effective_ceiling": effective,
-                  "run_ids": list(run_ids)}
+        record = {
+            "node_id": node_id,
+            "cumulative_semantic_attempts": total,
+            "effective_ceiling": effective,
+            "run_ids": list(run_ids),
+        }
         (admitted if node_id in allowed else exhausted).append(record)
 
     if exhausted:
@@ -3073,66 +3643,89 @@ def _refuse_cross_run_node_budget(args: argparse.Namespace,
                     "{0} spent {1} attempt(s) over {2}".format(
                         record["node_id"],
                         record["cumulative_semantic_attempts"],
-                        ", ".join(record["run_ids"]))
-                    for record in exhausted),
-                ceiling),
-            plan_digest=digest, semantic_ceiling=int(ceiling),
-            nodes=exhausted)
+                        ", ".join(record["run_ids"]),
+                    )
+                    for record in exhausted
+                ),
+                ceiling,
+            ),
+            plan_digest=digest,
+            semantic_ceiling=int(ceiling),
+            nodes=exhausted,
+        )
 
     if admitted:
         store = lc.LifecycleStore(database)
         try:
             for record in admitted:
                 store.record_budget_allowance(
-                    args.run_id, record["node_id"],
-                    cumulative_semantic_attempts=record[
-                        "cumulative_semantic_attempts"],
+                    args.run_id,
+                    record["node_id"],
+                    cumulative_semantic_attempts=record["cumulative_semantic_attempts"],
                     effective_ceiling=record["effective_ceiling"],
-                    run_ids=record["run_ids"])
+                    run_ids=record["run_ids"],
+                )
         finally:
             store.close()
 
 
-def _herdr_workspace_label(args: argparse.Namespace) -> str:
-    """The name of the herdr workspace this run's panes land in.
+def _run_workspace_label(args: argparse.Namespace, plan: Any, *, resuming: bool) -> str:
+    """Return the one persisted, authored workspace label for this run."""
+    authored = str(getattr(plan, "title", "") or "")
+    if not resuming:
+        return authored or str(args.run_id)
+    reader = lc.LifecycleReader.open(args.db)
+    try:
+        record = reader.run(args.run_id)
+    finally:
+        reader.close()
+    if record is None:
+        raise _RunSelectionError("unknown run {}".format(args.run_id))
+    return str(record.plan_name or authored or args.run_id)
 
-    The plan's own name where there is one, because that is what the operator
-    calls the work and what the sidebar has room for; the run id otherwise, so
-    the workspace is still named after this run and not after whatever was in
-    front of it.
-    """
-    name = str(getattr(args, "plan_name", "") or "")
-    return name or str(getattr(args, "run_id", "") or "maestro")
 
-
-def _runtime_launcher(args: argparse.Namespace) -> launcher.HerdrLauncher:
-    required = (args.herdr, args.omp, args.claude, args.agent_route,
-                args.agent_model, args.agent_effort, args.route_receipt,
-                args.route_verify_key)
+def _runtime_launcher(
+    args: argparse.Namespace, workspace_label: str
+) -> launcher.HerdrLauncher:
+    required = (
+        args.herdr,
+        args.omp,
+        args.claude,
+        args.agent_route,
+        args.agent_model,
+        args.agent_effort,
+        args.route_receipt,
+        args.route_verify_key,
+    )
     if not all(required):
         raise _PlanReceiptConfigurationError(
             "Herdr launcher route, verified route receipt, and agent model "
-            "configuration are required for agent nodes")
+            "configuration are required for agent nodes"
+        )
     try:
         keys = tuple(bytes.fromhex(value) for value in args.route_verify_key)
         paths = dict(item.split("=", 1) for item in args.route_receipt)
     except (TypeError, ValueError) as exc:
         raise _PlanReceiptConfigurationError(
-            "route receipts are ROUTE=PATH and route keys are hexadecimal") from exc
+            "route receipts are ROUTE=PATH and route keys are hexadecimal"
+        ) from exc
     admitted = route_receipts.load_admitted_routes(
-        {route: Path(path) for route, path in paths.items()}, verify_keys=keys)
+        {route: Path(path) for route, path in paths.items()}, verify_keys=keys
+    )
     return launcher.HerdrLauncher(
-        herdr_path=Path(args.herdr), omp_path=Path(args.omp),
-        claude_path=Path(args.claude), admitted_routes=admitted,
+        herdr_path=Path(args.herdr),
+        omp_path=Path(args.omp),
+        claude_path=Path(args.claude),
+        admitted_routes=admitted,
         # §9.3's sixth operation. The adapter has implemented it since it was
         # written; nothing had ever handed it the argv to run, so it returned
         # immediately for every attempt of every run.
         provision_argv=tuple(getattr(args, "provision_argv", None) or ()),
-        # One workspace per run, created by the launcher and named for the
-        # plan. Every pane this run opens -- builders and the reviewers of the
-        # same `route_runner` alike -- lands in it, so an operator has one
-        # place to watch and an unrelated run's pane can never appear there.
-        workspace_label=_herdr_workspace_label(args))
+        # One workspace per plan. The validated label is resolved once by
+        # `_execute_run`; resume reads the persisted run row rather than
+        # deriving another label from argparse state.
+        workspace_label=workspace_label,
+    )
 
 
 class _ConfiguredProvisioner:
@@ -3201,14 +3794,18 @@ _LAUNCHER_FAILURE_BY_ERROR_CLASS = {
 #: reach their own handlers untouched: cancellation, the quiescence proof, and
 #: a failure already carrying its type.
 _LAUNCH_PASSTHROUGH = (
-    launcher.HarnessCancelled, launcher.HarnessQuiescenceError,
-    scheduler.AttemptCancelled, scheduler.AttemptOwnershipLost,
-    scheduler.QuiescenceFailure, scheduler.LaunchFailed,
+    launcher.HarnessCancelled,
+    launcher.HarnessQuiescenceError,
+    scheduler.AttemptCancelled,
+    scheduler.AttemptOwnershipLost,
+    scheduler.QuiescenceFailure,
+    scheduler.LaunchFailed,
 )
 
 
-def _launcher_failure_for(adapter: Any,
-                          exc: BaseException) -> retry_policy.LauncherFailure:
+def _launcher_failure_for(
+    adapter: Any, exc: BaseException
+) -> retry_policy.LauncherFailure:
     """The typed launcher class for one failed launch or poll.
 
     STARTUP is the fall-through rather than a raise: an `ErrorClass` this
@@ -3217,7 +3814,8 @@ def _launcher_failure_for(adapter: Any,
     misclassification this function exists to end.
     """
     return _LAUNCHER_FAILURE_BY_ERROR_CLASS.get(
-        adapter.classify(exc), retry_policy.LauncherFailure.STARTUP)
+        adapter.classify(exc), retry_policy.LauncherFailure.STARTUP
+    )
 
 
 def _typed_launch(adapter: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
@@ -3237,7 +3835,8 @@ def _typed_launch(adapter: Any, operation: Any, *args: Any, **kwargs: Any) -> An
     except Exception as exc:
         raise scheduler.LaunchFailed(
             _launcher_failure_for(adapter, exc),
-            "{0}: {1}".format(type(exc).__name__, exc)) from exc
+            "{0}: {1}".format(type(exc).__name__, exc),
+        ) from exc
 
 
 def _typed_launch_pane(runner: Any, spec: "launcher.LaunchSpec") -> Any:
@@ -3290,20 +3889,26 @@ def _require_session_path(handle: Any, node_id: str, attempt_no: int) -> None:
         return
     raise scheduler.LaunchFailed(
         retry_policy.LauncherFailure.STARTUP,
-        "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no))
+        "SESSION_PATH_MISSING:{0}#{1}".format(node_id, attempt_no),
+    )
 
 
-def _launch_attempt_extra(session_path: str, *, vendor: object = None,
-                          model: object = None,
-                          route: object = None) -> Dict[str, str]:
+def _launch_attempt_extra(
+    session_path: str,
+    *,
+    vendor: object = None,
+    model: object = None,
+    route: object = None,
+) -> Dict[str, str]:
     """session_path plus the identity keys the launcher holds at dispatch.
 
     Adds to the existing mapping. Replacing it would drop
     `watchdog.SESSION_PATH_KEY` and break the transcript signal.
     """
     extra = {watchdog.SESSION_PATH_KEY: session_path}
-    extra.update(attempt_identity.launch_identity_extra(
-        vendor=vendor, model=model, route=route))
+    extra.update(
+        attempt_identity.launch_identity_extra(vendor=vendor, model=model, route=route)
+    )
     return extra
 
 
@@ -3359,7 +3964,9 @@ def _route_context_window(route: str, model_spec: str) -> Optional[int]:
         raise code_review.HandoffTooLarge(
             "model {0!r} does not resolve in the {1} catalog, so the prompt "
             "cannot be shown to fit any window: {2} (B13)".format(
-                model_spec, route, exc)) from exc
+                model_spec, route, exc
+            )
+        ) from exc
     return agent_pi.context_window(provider, model_id)
 
 
@@ -3416,10 +4023,67 @@ def _poll_reviewer_report(report_path: Path) -> Optional[Any]:
     return payload
 
 
-def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
-                          record: Any, cancel_requested: Any,
-                          quiesce_attempt: Any,
-                          sleep: Any = time.sleep) -> "scheduler.NodeExecution":
+def _clear_turn_artifact(path: Path) -> None:
+    """Remove one prior turn's terminal artifact before interactive reuse."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _repair_prompt_text(
+    repair_prompt: str,
+    rejected_candidate_sha: str,
+    builder_generation: int,
+    acknowledgement_path: Path,
+) -> str:
+    """Render the exact durable handoff plus a schema-bound acknowledgement."""
+    return (
+        "# Persistent repair handoff\n\n"
+        "Rejected candidate SHA: `{}`\n"
+        "Builder generation: `{}`\n\n"
+        "{}\n\n"
+        "Before making the repair, write exactly this JSON object to "
+        "`{}` (no additional keys):\n"
+        '```json\n{{"builder_generation": {}, "kind": '
+        '"repair_acknowledgement", "rejected_candidate_sha": "{}"}}\n```\n'
+        "Keep working in this existing worktree and session. Commit a distinct "
+        "descendant candidate, then write the normal terminal envelope."
+    ).format(
+        rejected_candidate_sha,
+        builder_generation,
+        repair_prompt,
+        acknowledgement_path,
+        builder_generation,
+        rejected_candidate_sha,
+    )
+
+
+def _read_repair_acknowledgement(
+    acknowledgement_path: Path, rejected_candidate_sha: str, builder_generation: int
+) -> bool:
+    """Accept only the exact acknowledgement for this handoff generation."""
+    try:
+        payload = json.loads(acknowledgement_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return False
+    expected = {
+        "kind": "repair_acknowledgement",
+        "rejected_candidate_sha": rejected_candidate_sha,
+        "builder_generation": builder_generation,
+    }
+    return isinstance(payload, dict) and payload == expected
+
+
+def _poll_agent_execution(
+    adapter: Any,
+    handle: Any,
+    envelope_path: Path,
+    record: Any,
+    cancel_requested: Any,
+    quiesce_attempt: Any,
+    sleep: Any = time.sleep,
+) -> "scheduler.NodeExecution":
     """Poll one launched agent until it settles, and never spin on GONE.
 
     Module level rather than a closure inside `_execute_run` because the real
@@ -3458,10 +4122,12 @@ def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
             except (OSError, ValueError, UnicodeError):
                 pass
             return scheduler.NodeExecution(
-                envelope_parsed=parsed, exit_code=state.exit_code or 1,
+                envelope_parsed=parsed,
+                exit_code=state.exit_code or 1,
                 launched_pid=handle.process_group,
                 launch_detail=state.detail,
-                envelope_payload=payload)
+                envelope_payload=payload,
+            )
         if state.state is launcher.PollState.GONE:
             # TRANSPORT rather than STARTUP: the agent launched and then its
             # record vanished, so what was lost is the channel to it, not its
@@ -3469,21 +4135,23 @@ def _poll_agent_execution(adapter: Any, handle: Any, envelope_path: Path,
             # members, so the choice between them is diagnostic only — the
             # ledger reads this, never a branch.
             return scheduler.NodeExecution(
-                envelope_parsed=False, exit_code=1,
+                envelope_parsed=False,
+                exit_code=1,
                 launched_pid=handle.process_group,
                 launcher_failure=retry_policy.LauncherFailure.TRANSPORT,
-                launch_detail=state.detail)
+                launch_detail=state.detail,
+            )
         if cancel_requested():
             quiesce_attempt(record, "cancel")
             return scheduler.NodeExecution(
-                envelope_parsed=False, exit_code=1,
-                launched_pid=handle.process_group)
+                envelope_parsed=False, exit_code=1, launched_pid=handle.process_group
+            )
         sleep(0.05)
 
 
 def _late_agent_execution(
-        attempt: worktree.AttemptWorktree,
-        record: scheduler_types.AttemptRecord) -> Optional[scheduler.NodeExecution]:
+    attempt: worktree.AttemptWorktree, record: scheduler_types.AttemptRecord
+) -> Optional[scheduler.NodeExecution]:
     """Read a successful declaration from an existing attempt; never launch."""
     envelope = attempt.scratch / "agent-envelope.json"
     if not envelope.is_file():
@@ -3495,12 +4163,90 @@ def _late_agent_execution(
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
     return scheduler.NodeExecution(
-        envelope_parsed=True, envelope_payload=payload, exit_code=0)
+        envelope_parsed=True, envelope_payload=payload, exit_code=0
+    )
+
+
+def _running_late_agent_execution(
+    args: argparse.Namespace,
+    route_runner: Any,
+    store: "lc.LifecycleStore",
+    node_id: str,
+    attempt_no: int,
+    *,
+    allow_live_builder: bool = False,
+) -> Optional[scheduler.NodeExecution]:
+    """Validate a dead scheduler's completed RUNNING generation."""
+    scratch = Path(args.scratch_root) / worktree.worktree_dirname(
+        args.run_id, node_id, attempt_no
+    )
+    envelope = scratch / "agent-envelope.json"
+    if not envelope.is_file():
+        return None
+    try:
+        declared = json.loads(envelope.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(declared, dict) or declared.get("success") is not True:
+        return None
+
+    token = "{}-{}-{}".format(args.run_id, node_id, attempt_no)
+    probe = getattr(route_runner, "agent_presence", None)
+    presence = probe(token) if callable(probe) else None
+    if presence is True and not allow_live_builder:
+        raise _RunRefused(
+            "RESUME_AGENT_STILL_LIVE",
+            "{} attempt {} still has live agent {}; resume left the run "
+            "unchanged".format(node_id, attempt_no, token),
+        )
+    if presence is None:
+        raise _RunRefused(
+            "RESUME_AGENT_LIVENESS_UNKNOWN",
+            "{} attempt {} could not be proven absent; resume left the run "
+            "unchanged".format(node_id, attempt_no),
+        )
+
+    record = store.get_attempt(args.run_id, node_id, attempt_no)
+    try:
+        reopened = worktree.reopen_attempt_worktree(
+            Path(args.repo),
+            args.run_id,
+            node_id,
+            attempt_no,
+            record.base_sha,
+            Path(args.worktrees_root),
+            Path(args.scratch_root),
+        )
+        identity = worktree.check_at_create(reopened)
+        baseline = store.attempt_baseline(args.run_id, node_id, attempt_no)
+        ignored = store.attempt_ignored_at_base(args.run_id, node_id, attempt_no)
+        execution = _late_agent_execution(reopened, record)
+    except (lc.LifecycleError, worktree.WorktreeError) as exc:
+        raise _RunRefused(
+            "LATE_ENVELOPE_RECOVERY_INVALID",
+            "{} attempt {} cannot recover: {}".format(node_id, attempt_no, exc),
+        ) from exc
+    if not identity.ok or ignored is None or execution is None:
+        detail = (
+            "; ".join(identity.detail)
+            if not identity.ok
+            else "baseline identity or successful envelope is missing"
+        )
+        raise _RunRefused(
+            "LATE_ENVELOPE_RECOVERY_INVALID",
+            "{} attempt {} cannot recover: {}".format(node_id, attempt_no, detail),
+        )
+    if baseline is None:
+        raise _RunRefused(
+            "LATE_ENVELOPE_RECOVERY_INVALID",
+            "{} attempt {} has no recorded baseline".format(node_id, attempt_no),
+        )
+    return execution
 
 
 def _resolve_run_runners(
-        args: argparse.Namespace,
-        plan: plan_model.Plan) -> Dict[str, "runner_resolution.ResolvedRunner"]:
+    args: argparse.Namespace, plan: plan_model.Plan
+) -> Dict[str, "runner_resolution.ResolvedRunner"]:
     """Resolve every gate runner this run will execute, before it starts.
 
     Keyed by the runner literal alone rather than by `(runner, cwd)`, and that
@@ -3520,31 +4266,529 @@ def _resolve_run_runners(
     scratch = Path(args.scratch_root) / "runner-probe"
     env = worktree.launch_env(scratch, concurrency=getattr(args, "concurrency", None))
     wanted = {node.gate.runner for node in plan.agent_nodes}
-    wanted.update(node.gate.runner
-                  for node in getattr(plan, "tests_nodes", ()) or ())
+    wanted.update(node.gate.runner for node in getattr(plan, "tests_nodes", ()) or ())
     wanted.add(plan.merge_policy.integration_gate.runner)
     return {
         runner: runner_resolution.resolve(
-            runner, Path(args.repo), ".", declared=declared.get(runner),
-            env=env)
+            runner, Path(args.repo), ".", declared=declared.get(runner), env=env
+        )
         for runner in sorted(wanted)
     }
 
 
+def _legacy_receipt_findings(
+    receipt: finalization.Receipt,
+) -> Tuple[Mapping[str, Any], ...]:
+    """Render only signed receipt cells for a migrated review ledger."""
+    return tuple(
+        {
+            "check_id": cell.check_id,
+            "object_id": cell.object_id,
+            "status": cell.status.value,
+            "severity": cell.severity.value,
+            "message": cell.message,
+            "canary": None if cell.canary is None else cell.canary.value,
+            "grade": cell.grade,
+        }
+        for cell in receipt.cells
+    )
+
+
+def _migrate_legacy_inline_reviews(
+    args: argparse.Namespace,
+    store: lc.LifecycleStore,
+    nodes: Sequence[scheduler_types.PlanNode],
+) -> Tuple[lc.LegacyReviewMigration, ...]:
+    """Import only receipt-proven reviews written before candidate ledgers."""
+    receipt_store = finalization.ReceiptStore(
+        Path(args.review_receipt_dir),
+        repo_paths=(args.repo,),
+        data_dir=args.data_dir,
+        verify_keys=tuple(bytes.fromhex(key) for key in args.verify_key),
+        create=False,
+    )
+    receipts: List[Tuple[str, finalization.Receipt]] = []
+    if receipt_store.root.is_dir():
+        for path in receipt_store.root.glob("*.json"):
+            digest = path.stem
+            if len(digest) != 64 or any(
+                char not in "0123456789abcdef" for char in digest
+            ):
+                continue
+            try:
+                receipts.append((digest, receipt_store.load(digest)))
+            except Exception:
+                # A candidate with no verified match below becomes a typed
+                # migration block; unrelated receipt debris does not.
+                continue
+
+    def receipt_matches(item: lc.LegacyReviewEvidence) -> bool:
+        try:
+            receipt = receipt_store.load(item.review_digest)
+            expected = code_review.review_digest(
+                run_id=args.run_id,
+                node_id=item.build_node_id,
+                base_sha=item.base_sha,
+                output_sha=item.candidate_sha,
+                rubric_version=receipt.rubric_version,
+            )
+            verdict = (
+                scheduler_types.ReviewVerdict.PASS
+                if receipt.verdict is finalization.Verdict.PASS
+                else scheduler_types.ReviewVerdict.REJECTED
+            )
+            return (
+                expected == item.review_digest
+                and Path(item.receipt_path).resolve()
+                == receipt_store.path_for(item.review_digest).resolve()
+                and item.verdict is verdict
+                and tuple(item.findings) == _legacy_receipt_findings(receipt)
+            )
+        except Exception:
+            return False
+
+    evidence: List[lc.LegacyReviewEvidence] = []
+    reviewable = {
+        node.node_id
+        for node in nodes
+        if node.kind in (scheduler_types.NodeKind.AGENT, scheduler_types.NodeKind.CODE)
+    }
+    attempts = store.attempts_for(args.run_id)
+    for build_node_id in sorted(reviewable):
+        node = store.get_node(args.run_id, build_node_id)
+        retry_spend_floor = store.retry_spend_floor(args.run_id, build_node_id)
+        # Operator retry establishes a durable attempt boundary. Attempts at
+        # or below that floor belong to superseded build cycles even after the
+        # replacement attempt has left PENDING and is RUNNING/BLOCKED. Legacy
+        # inline review evidence must never cross that boundary.
+        build_attempts = sorted(
+            (
+                record
+                for record in attempts
+                if record.node_id == build_node_id
+                and record.attempt_no > retry_spend_floor
+            ),
+            key=lambda record: record.attempt_no,
+        )
+        # An explicit operator retry starts a new build cycle. Its historical
+        # attempts remain audit evidence, but they are no longer candidate
+        # evidence for the current cycle. Re-importing their inline reviews
+        # would recreate a migration block after every operator recovery and
+        # make the reset impossible to resume.
+        if (
+            node.state is scheduler_types.NodeState.PENDING
+            and node.pending_cause is scheduler_types.PendingCause.OPERATOR_RETRY
+            and node.output_sha is None
+        ):
+            continue
+        candidates: List[Tuple[str, str]] = []
+        for record in build_attempts:
+            candidate_sha = (record.extra or {}).get("review_output_sha")
+            if isinstance(candidate_sha, str):
+                candidates.append((candidate_sha, record.base_sha))
+        if node.output_sha and node.output_sha not in {
+            candidate_sha for candidate_sha, _base_sha in candidates
+        }:
+            final_attempt = next(
+                (
+                    record
+                    for record in build_attempts
+                    if record.attempt_no == node.attempt_no
+                ),
+                None,
+            )
+            candidates.append(
+                (
+                    node.output_sha,
+                    final_attempt.base_sha if final_attempt is not None else "",
+                )
+            )
+        for sequence, (candidate_sha, base_sha) in enumerate(candidates, start=1):
+            matches = [
+                (digest, receipt)
+                for digest, receipt in receipts
+                if code_review.review_digest(
+                    run_id=args.run_id,
+                    node_id=build_node_id,
+                    base_sha=base_sha,
+                    output_sha=candidate_sha,
+                    rubric_version=receipt.rubric_version,
+                )
+                == digest
+            ]
+            if matches:
+                for digest, receipt in matches:
+                    evidence.append(
+                        lc.LegacyReviewEvidence(
+                            build_node_id=build_node_id,
+                            candidate_seq=sequence,
+                            candidate_sha=candidate_sha,
+                            base_sha=base_sha,
+                            review_digest=digest,
+                            receipt_path=str(receipt_store.path_for(digest)),
+                            verdict=(
+                                scheduler_types.ReviewVerdict.PASS
+                                if receipt.verdict is finalization.Verdict.PASS
+                                else scheduler_types.ReviewVerdict.REJECTED
+                            ),
+                            findings=_legacy_receipt_findings(receipt),
+                        )
+                    )
+                continue
+            # This placeholder has no authority: the validator rejects it and
+            # persistently fences the lane rather than redispatching a SHA that
+            # may already have received an inline review.
+            digest = code_review.review_digest(
+                run_id=args.run_id,
+                node_id=build_node_id,
+                base_sha=base_sha,
+                output_sha=candidate_sha,
+                rubric_version=code_review.CODE_RUBRIC.version,
+            )
+            evidence.append(
+                lc.LegacyReviewEvidence(
+                    build_node_id=build_node_id,
+                    candidate_seq=sequence,
+                    candidate_sha=candidate_sha,
+                    base_sha=base_sha,
+                    review_digest=digest,
+                    receipt_path=str(receipt_store.path_for(digest)),
+                    verdict=scheduler_types.ReviewVerdict.PASS,
+                    findings=(),
+                )
+            )
+    if not evidence:
+        return ()
+
+    def is_descendant(parent_sha: str, child_sha: str) -> bool:
+        return (
+            subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(args.repo),
+                    "merge-base",
+                    "--is-ancestor",
+                    parent_sha,
+                    child_sha,
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+        )
+
+    return store.migrate_legacy_inline_reviews(
+        args.run_id,
+        evidence,
+        evidence_validator=receipt_matches,
+        ancestry_validator=is_descendant,
+    )
+
+
+def _keeps_builder_session_open(
+    node_id: str, phase: str, builder_node_ids: frozenset[str]
+) -> bool:
+    """Only build/review turns retain an interactive actor after completion."""
+    return phase in ("candidate-idle", "repair-idle") and node_id in builder_node_ids
+
+
+def _lane_placement_by_node(plan: Any) -> Dict[str, str]:
+    """Map each interactive authored node to the lane tab that owns it.
+
+    A tests node is authored independently but visually belongs beside the
+    single build lane that directly depends on it. Shared or unconsumed tests
+    keep their own tab: one pane cannot truthfully appear in two lane tabs,
+    and guessing an owner would hide shared work under an arbitrary build.
+    """
+    tests = {node.node_id: node for node in (getattr(plan, "tests_nodes", ()) or ())}
+    owners: Dict[str, List[str]] = {node_id: [] for node_id in tests}
+    placement = {
+        node.node_id: node.node_id for node in (getattr(plan, "agent_nodes", ()) or ())
+    }
+    for build in getattr(plan, "agent_nodes", ()) or ():
+        for dependency in getattr(build, "needs", ()) or ():
+            if dependency in owners:
+                owners[dependency].append(build.node_id)
+    for test_node_id, build_node_ids in owners.items():
+        placement[test_node_id] = (
+            build_node_ids[0] if len(build_node_ids) == 1 else test_node_id
+        )
+    return placement
+
+
+class _RunProgress:
+    """Rich stderr narrative for a foreground scheduler invocation.
+
+    Stdout remains the command's single JSON result.  The observer owns a
+    read-only SQLite connection, so reporting can neither share the scheduler's
+    connection across threads nor delay lifecycle writes.
+    """
+
+    HEARTBEAT_SECONDS = 10.0
+    POLL_SECONDS = 0.25
+
+    def __init__(
+        self, db_path: Path, run_id: str, *, resuming: bool, announce: bool = True
+    ):
+        import threading
+
+        self.db_path = Path(db_path)
+        self.run_id = run_id
+        self.action = "resume" if resuming else "start"
+        self.console = RichConsole(file=sys.stderr, highlight=False, soft_wrap=True)
+        self._stop = threading.Event()
+        self.announce = announce
+        self._thread = threading.Thread(
+            target=self._observe, name="maestro-run-progress", daemon=True
+        )
+        self._cursor = 0
+        self._last_change = time.monotonic()
+
+    @staticmethod
+    def _short(value: Any, limit: int = 72) -> str:
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    def _max_transition_id(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM transitions WHERE run_id=?",
+            (self.run_id,),
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _state_style(state: str) -> str:
+        if state in {"MERGED", "COMPLETED", "ACCEPTED", "PASS"}:
+            return "bold green"
+        if state in {"BLOCKED", "FAILED", "REJECTED", "CANCELLED"}:
+            return "bold red"
+        if state in {"PENDING", "DISPATCHED", "WAITING"}:
+            return "bold yellow"
+        if state in {"RUNNING", "REVIEWING"}:
+            return "bold cyan"
+        return "bold white"
+
+    def _frontier_rows(
+        self,
+        conn: sqlite3.Connection,
+    ) -> List[Tuple[str, str, str, str, str]]:
+        rows: List[Tuple[str, str, str, str, str]] = []
+        for row in conn.execute(
+            "SELECT node_id,state,attempt_no,lane_phase,block_reason "
+            "FROM node_lifecycle WHERE run_id=? "
+            "AND state IN ('RUNNING','BLOCKED') ORDER BY node_id",
+            (self.run_id,),
+        ):
+            node_id = str(row["node_id"])
+            role = "tester" if node_id.endswith("-tests") else "builder"
+            rows.append(
+                (
+                    node_id,
+                    role,
+                    "a{}".format(row["attempt_no"]),
+                    str(row["state"]),
+                    self._short(row["lane_phase"] or row["block_reason"] or ""),
+                )
+            )
+        for row in conn.execute(
+            "SELECT review_node_id,state,reviewer_generation "
+            "FROM candidate_reviews WHERE run_id=? AND state='DISPATCHED' "
+            "ORDER BY review_node_id",
+            (self.run_id,),
+        ):
+            review_node_id = str(row["review_node_id"])
+            rows.append(
+                (
+                    review_node_id.removesuffix("::review"),
+                    "reviewer",
+                    "r{}".format(row["reviewer_generation"]),
+                    str(row["state"]),
+                    "signed verdict pending",
+                )
+            )
+        return rows
+
+    def _frontier(self, conn: sqlite3.Connection) -> str:
+        parts = []
+        for node, _role, attempt, state, detail in self._frontier_rows(conn):
+            suffix = " · {}".format(detail) if detail else ""
+            parts.append("{} {} {}{}".format(node, state, attempt, suffix))
+        return "; ".join(parts) if parts else "scheduler evaluating frontier"
+
+    def _print_frontier(self, conn: sqlite3.Connection, heading: str) -> None:
+        rows = self._frontier_rows(conn)
+        if not rows:
+            body: Any = RichText(
+                "No active lane transitions; evaluating the DAG frontier.", style="dim"
+            )
+        else:
+            table = RichTable(
+                box=None,
+                expand=True,
+                padding=(0, 1),
+                header_style="bold bright_cyan",
+                show_edge=False,
+            )
+            table.add_column("LANE", style="bold white", no_wrap=True)
+            table.add_column("ACTOR", style="magenta", no_wrap=True)
+            table.add_column("TRY", style="bright_black", no_wrap=True)
+            table.add_column("STATE", no_wrap=True)
+            table.add_column("PHASE / EVIDENCE", style="white")
+            for node, role, attempt, state, detail in rows:
+                table.add_row(
+                    node,
+                    role,
+                    attempt,
+                    RichText(state, style=self._state_style(state)),
+                    detail or "—",
+                )
+            body = table
+        self.console.print(
+            RichPanel(
+                body,
+                title=RichText(heading.upper(), style="bold bright_cyan"),
+                border_style="cyan",
+                box=rich_box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
+
+    def _emit_transition(self, row: sqlite3.Row) -> None:
+        node = str(row["node_id"] or "run")
+        destination = str(row["to_state"] or "EVENT")
+        try:
+            payload = json.loads(row["detail_json"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        phase = payload.get("phase") or payload.get("lane_phase")
+        line = RichText()
+        line.append("● ", style=self._state_style(destination))
+        line.append(node, style="bold white")
+        line.append("  ")
+        line.append(destination, style=self._state_style(destination))
+        line.append("  ")
+        line.append(self._short(row["reason"]), style="bold magenta")
+        if phase:
+            line.append("  ·  {}".format(self._short(phase)), style="cyan")
+        self.console.print(line)
+
+    def _observe(self) -> None:
+        try:
+            conn = sqlite3.connect(
+                self.db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0
+            )
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error as exc:
+            self.console.print(
+                "[yellow]progress observer unavailable:[/yellow] {}".format(
+                    rich_escape(self._short(exc))
+                )
+            )
+            return
+        try:
+            while not self._stop.wait(self.POLL_SECONDS):
+                try:
+                    rows = conn.execute(
+                        "SELECT id,node_id,to_state,reason,detail_json "
+                        "FROM transitions WHERE run_id=? AND id>? ORDER BY id",
+                        (self.run_id, self._cursor),
+                    ).fetchall()
+                    for row in rows:
+                        self._cursor = int(row["id"])
+                        self._last_change = time.monotonic()
+                        self._emit_transition(row)
+                    if time.monotonic() - self._last_change >= self.HEARTBEAT_SECONDS:
+                        self._print_frontier(
+                            conn,
+                            "waiting · no transition for {}s".format(
+                                int(self.HEARTBEAT_SECONDS)
+                            ),
+                        )
+                        self._last_change = time.monotonic()
+                except sqlite3.Error as exc:
+                    self.console.print(
+                        "[yellow]progress read delayed:[/yellow] {}".format(
+                            rich_escape(self._short(exc))
+                        )
+                    )
+                    self._last_change = time.monotonic()
+        finally:
+            conn.close()
+
+    def __enter__(self) -> "_RunProgress":
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(
+                self.db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0
+            )
+            conn.row_factory = sqlite3.Row
+            self._cursor = self._max_transition_id(conn)
+        except sqlite3.Error:
+            if conn is not None:
+                conn.close()
+            conn = None
+        if self.announce:
+            self.console.print(
+                RichPanel(
+                    RichText(self.run_id, style="bold white"),
+                    title=RichText(
+                        "MAESTRO {}".format(self.action.upper()),
+                        style="bold bright_cyan",
+                    ),
+                    border_style="bright_cyan",
+                    box=rich_box.HEAVY,
+                    padding=(0, 1),
+                )
+            )
+        if conn is not None:
+            self._print_frontier(conn, "current frontier")
+            conn.close()
+        else:
+            self.console.print(
+                "[bold yellow]◌ scheduler state is initializing[/bold yellow]"
+            )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        if exc is None:
+            self.console.print("[bold green]✓ Maestro command finished[/bold green]")
+        else:
+            self.console.print(
+                "[bold red]✗ scheduler stopped[/bold red]  {}".format(
+                    rich_escape(self._short(exc))
+                )
+            )
+
+
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     worktree.bind_lane_concurrency(getattr(args, "concurrency", None))
+    action = "resume" if resuming else "start"
+    run_console = RichConsole(file=sys.stderr, highlight=False, soft_wrap=True)
+    run_console.print(
+        "[bold cyan]Maestro {}[/bold cyan] [bold]{}[/bold]\n"
+        "[dim]preflight · loading and validating plan[/dim]".format(
+            action, rich_escape(args.run_id)
+        )
+    )
     try:
-
         from threading import RLock
 
         config = _run_configuration(args)
         plan = _load_runnable_plan(args)
+        run_console.print("[green]✓[/green] plan and configuration loaded")
 
         # Before the ledger is opened for writing and before any worktree exists,
         # because a run refused for a spent cross-run review budget must leave
         # nothing behind (§3.6 B10's escape is the only way past it).
         _refuse_cross_run_node_budget(args, plan)
         _validate_run_paths(args, plan)
+        run_console.print("[green]✓[/green] paths and cross-run budgets validated")
+        run_console.print("[dim]preflight · resolving declared runners[/dim]")
         # A run precondition, in the same family as the integration branch already
         # being checked out: decided before the scheduler exists, so an unusable
         # runner launches no pane, writes no attempt row, and reaches no retry
@@ -3555,21 +4799,42 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
             resolved_runners = _resolve_run_runners(args, plan)
         except runner_resolution.RunnerUnusable as exc:
             return _typed_refusal(exc.payload(), exc.detail)
+        run_console.print("[green]✓[/green] runners resolved")
+        builder_handles: Dict[str, launcher.LaunchHandle] = {}
         runner_resolution.write_record(
             Path(args.integration_path).parent / "runner-resolution.json",
-            resolved_runners.values())
+            resolved_runners.values(),
+        )
         notice = runner_resolution.adoption_notice(resolved_runners.values())
         if notice:
             # stderr, because this verb's stdout is one JSON document and an
             # operator hint is not part of it.
             print(notice, file=sys.stderr)
         tests_nodes = getattr(plan, "tests_nodes", ()) or ()
-        route_runner = (_runtime_launcher(args)
-                        if plan.agent_nodes or tests_nodes else None)
+        workspace_label = _run_workspace_label(args, plan, resuming=resuming)
+        if plan.agent_nodes or tests_nodes:
+            run_console.print(
+                "[dim]preflight · connecting to the persisted Herdr workspace[/dim]"
+            )
+        route_runner = (
+            _runtime_launcher(args, workspace_label)
+            if plan.agent_nodes or tests_nodes
+            else None
+        )
+        run_console.print("[green]✓[/green] runtime launcher ready")
         interactive_node_ids = {
             node.node_id for node in (*plan.agent_nodes, *tests_nodes)
         }
+        lane_placement = _lane_placement_by_node(plan)
+        builder_node_ids = frozenset(node.node_id for node in plan.agent_nodes)
         store = lc.LifecycleStore(args.db)
+        run_console.print(
+            "[dim]preflight · reconciling durable attempts and actor sessions[/dim]"
+        )
+        progress = _RunProgress(
+            Path(args.db), args.run_id, resuming=resuming, announce=False
+        )
+        progress.__enter__()
         handles = {}
         proven_absent = set()
         handles_lock = RLock()
@@ -3579,83 +4844,232 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         # which may be the operator's own. `None` until `worktree add` succeeds.
         created_integration_path: Optional[Path] = None
         try:
-            retryable_quiescence = []
             late_envelope_recovery = []
+            running_late_envelope_recovery = []
             if resuming:
                 # A completed interactive declaration belongs to its original
-                # generation. Prove the old agent absent and validate every
-                # durable input before changing that lifecycle; code nodes have
-                # no agent to probe and retain the forced-retry behavior.
+                # generation. Validate every durable input, then either prove
+                # the actor absent or reclaim that exact retained actor. A live
+                # completed builder must advance to review without relaunching
+                # the build; an unknown actor identity still leaves the run
+                # unchanged.
                 for node_id, attempt_no in store.quiescence_blocked_attempts(
-                        args.run_id):
+                    args.run_id
+                ):
                     if node_id not in interactive_node_ids:
-                        retryable_quiescence.append(node_id)
                         continue
-                    token = "{}-{}-{}".format(
-                        args.run_id, node_id, attempt_no)
+                    token = "{}-{}-{}".format(args.run_id, node_id, attempt_no)
                     probe = getattr(route_runner, "agent_presence", None)
                     presence = probe(token) if callable(probe) else None
-                    if presence is True:
-                        return _refusal(
-                            "RESUME_AGENT_STILL_LIVE",
-                            "{} attempt {} still has live agent {}; resume "
-                            "left the run unchanged".format(
-                                node_id, attempt_no, token))
                     if presence is None:
                         return _refusal(
                             "RESUME_AGENT_LIVENESS_UNKNOWN",
                             "{} attempt {} could not be proven absent; resume "
-                            "left the run unchanged".format(
-                                node_id, attempt_no))
-                    scratch = (
-                        Path(args.scratch_root)
-                        / worktree.worktree_dirname(
-                            args.run_id, node_id, attempt_no))
+                            "left the run unchanged".format(node_id, attempt_no),
+                        )
+                    scratch = Path(args.scratch_root) / worktree.worktree_dirname(
+                        args.run_id, node_id, attempt_no
+                    )
                     envelope = scratch / "agent-envelope.json"
                     if not envelope.is_file():
-                        retryable_quiescence.append(node_id)
                         continue
-                    record = store.get_attempt(
-                        args.run_id, node_id, attempt_no)
+                    record = store.get_attempt(args.run_id, node_id, attempt_no)
                     try:
                         reopened = worktree.reopen_attempt_worktree(
-                            Path(args.repo), args.run_id, node_id, attempt_no,
-                            record.base_sha, Path(args.worktrees_root),
-                            Path(args.scratch_root))
+                            Path(args.repo),
+                            args.run_id,
+                            node_id,
+                            attempt_no,
+                            record.base_sha,
+                            Path(args.worktrees_root),
+                            Path(args.scratch_root),
+                        )
                         identity = worktree.check_at_create(reopened)
                         baseline = store.attempt_baseline(
-                            args.run_id, node_id, attempt_no)
+                            args.run_id, node_id, attempt_no
+                        )
                         ignored = store.attempt_ignored_at_base(
-                            args.run_id, node_id, attempt_no)
+                            args.run_id, node_id, attempt_no
+                        )
                         execution = _late_agent_execution(reopened, record)
                     except (lc.LifecycleError, worktree.WorktreeError) as exc:
                         return _refusal(
                             "LATE_ENVELOPE_RECOVERY_INVALID",
                             "{} attempt {} cannot recover: {}".format(
-                                node_id, attempt_no, exc))
+                                node_id, attempt_no, exc
+                            ),
+                        )
                     if not identity.ok or ignored is None or execution is None:
                         detail = (
                             "; ".join(identity.detail)
-                            if not identity.ok else
-                            "baseline identity or successful envelope is missing")
+                            if not identity.ok
+                            else "baseline identity or successful envelope is missing"
+                        )
                         return _refusal(
                             "LATE_ENVELOPE_RECOVERY_INVALID",
                             "{} attempt {} cannot recover: {}".format(
-                                node_id, attempt_no, detail))
+                                node_id, attempt_no, detail
+                            ),
+                        )
                     # Force the durable baseline decoder before mutation. The
                     # scheduler re-reads it after claiming the same attempt.
                     if baseline is None:
                         return _refusal(
                             "LATE_ENVELOPE_RECOVERY_INVALID",
                             "{} attempt {} has no recorded baseline".format(
-                                node_id, attempt_no))
+                                node_id, attempt_no
+                            ),
+                        )
+                    if presence is True:
+                        session = store.current_actor_session(
+                            args.run_id, node_id, "builder"
+                        )
+                        if (
+                            session is None
+                            or session.state
+                            is not scheduler_types.ActorSessionState.ACTIVE
+                            or session.generation != attempt_no
+                        ):
+                            return _refusal(
+                                "LIVE_BUILDER_IDENTITY_INVALID",
+                                "{} attempt {} has no matching active builder "
+                                "generation".format(node_id, attempt_no),
+                            )
+                        try:
+                            handle = route_runner.adopt(
+                                launcher.PersistedActorHandle(
+                                    correlation_token=(session.correlation_token),
+                                    pane_id=session.pane_id,
+                                    agent_name=launcher.agent_name_for(
+                                        session.correlation_token
+                                    ),
+                                    launched_cwd=reopened.path,
+                                    transcript_path=Path(session.session_path),
+                                    envelope_path=envelope,
+                                    environment=worktree.launch_env(
+                                        reopened.scratch,
+                                        concurrency=getattr(args, "concurrency", None),
+                                    ),
+                                    workspace_id=launcher.workspace_of(
+                                        _session_tab_id(session)
+                                    ),
+                                    tab_id=_session_tab_id(session),
+                                    lane_key=node_id,
+                                )
+                            )
+                            route_runner.wait_for_idle(handle)
+                        except RuntimeError as exc:
+                            return _refusal(
+                                "LIVE_BUILDER_ADOPTION_INVALID",
+                                "{} attempt {} cannot reclaim completed "
+                                "builder: {}".format(node_id, attempt_no, exc),
+                            )
+                        key = (node_id, attempt_no)
+                        with handles_lock:
+                            handles[key] = handle
+                            builder_handles[node_id] = handle
+                            proven_absent.discard(key)
+                    else:
+                        proven_absent.add((node_id, attempt_no))
                     late_envelope_recovery.append((node_id, attempt_no))
-                store.resume_run(args.run_id)
+                # A scheduler can die after a fast agent has declared success
+                # but before launch returns a handle. That leaves RUNNING in
+                # the ledger rather than QUIESCENCE_UNPROVEN. Apply the same
+                # evidence gate before `resume_run` closes inherited attempts,
+                # or the accepted declaration is discarded and the original
+                # assignment is relaunched from its base.
+                for node_id, attempt_no in store.running_attempts(args.run_id):
+                    if node_id not in interactive_node_ids:
+                        continue
+                    try:
+                        execution = _running_late_agent_execution(
+                            args,
+                            route_runner,
+                            store,
+                            node_id,
+                            attempt_no,
+                            allow_live_builder=node_id in builder_node_ids,
+                        )
+                    except _RunRefused as refused:
+                        return refused.emit()
+                    if execution is not None:
+                        running_late_envelope_recovery.append((node_id, attempt_no))
+                        token = "{}-{}-{}".format(args.run_id, node_id, attempt_no)
+                        presence = route_runner.agent_presence(token)
+                        key = (node_id, attempt_no)
+                        if presence is False:
+                            with handles_lock:
+                                proven_absent.add(key)
+                        if node_id in builder_node_ids and presence is True:
+                            session = store.current_actor_session(
+                                args.run_id, node_id, "builder"
+                            )
+                            if (
+                                session is None
+                                or session.state
+                                is not scheduler_types.ActorSessionState.ACTIVE
+                                or session.generation != attempt_no
+                            ):
+                                return _refusal(
+                                    "LIVE_BUILDER_BINDING_MISSING",
+                                    "{} attempt {} has a live completed "
+                                    "agent but no matching durable builder "
+                                    "binding".format(node_id, attempt_no),
+                                )
+                            record = store.get_attempt(args.run_id, node_id, attempt_no)
+                            reopened = worktree.reopen_attempt_worktree(
+                                Path(args.repo),
+                                args.run_id,
+                                node_id,
+                                attempt_no,
+                                record.base_sha,
+                                Path(args.worktrees_root),
+                                Path(args.scratch_root),
+                            )
+                            try:
+                                handle = route_runner.adopt(
+                                    launcher.PersistedActorHandle(
+                                        correlation_token=(session.correlation_token),
+                                        pane_id=session.pane_id,
+                                        agent_name=launcher.agent_name_for(
+                                            session.correlation_token
+                                        ),
+                                        launched_cwd=reopened.path,
+                                        transcript_path=Path(session.session_path),
+                                        envelope_path=(
+                                            reopened.scratch / "agent-envelope.json"
+                                        ),
+                                        environment=worktree.launch_env(
+                                            reopened.scratch,
+                                            concurrency=getattr(
+                                                args, "concurrency", None
+                                            ),
+                                        ),
+                                        workspace_id=launcher.workspace_of(
+                                            _session_tab_id(session)
+                                        ),
+                                        tab_id=_session_tab_id(session),
+                                        lane_key=node_id,
+                                    )
+                                )
+                                route_runner.wait_for_idle(handle)
+                            except (launcher.HandleAbsent, RuntimeError) as exc:
+                                return _refusal(
+                                    "LIVE_BUILDER_ADOPTION_INVALID",
+                                    "{} attempt {} cannot reclaim completed "
+                                    "builder: {}".format(node_id, attempt_no, exc),
+                                )
+                            with handles_lock:
+                                handles[key] = handle
+                                builder_handles[node_id] = handle
+                                proven_absent.discard(key)
+                store.resume_run(
+                    args.run_id, late_envelope_attempts=running_late_envelope_recovery
+                )
                 for node_id, attempt_no in late_envelope_recovery:
                     store.prepare_late_envelope_recovery(
-                        args.run_id, node_id, attempt_no)
-                for node_id in retryable_quiescence:
-                    store.retry(args.run_id, node_id, force=True)
+                        args.run_id, node_id, attempt_no
+                    )
             else:
                 refused = _refuse_base_commit_divergence(args, plan)
                 if refused is not None:
@@ -3675,8 +5089,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # still reaches the refusal below untouched.
                 try:
                     _reclaim_stranded_integration_worktree(
-                        Path(args.repo), _configured_runs_root(args), branch,
-                        getattr(args, "db", None))
+                        Path(args.repo),
+                        _configured_runs_root(args),
+                        branch,
+                        getattr(args, "db", None),
+                    )
                 except _RunStateStillHeld as held:
                     # The same defect at the same seam: whose was checked here
                     # from the day this reclaim was written, whether-in-use never
@@ -3685,36 +5102,54 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     # gets the same predicate and a refusal that names the run
                     # holding the branch rather than the generic one below, which
                     # would say "not among them" about a worktree that is.
-                    return _refusal("INTEGRATION_WORKTREE_RUN_NOT_OVER",
-                                    str(held))
+                    return _refusal("INTEGRATION_WORKTREE_RUN_NOT_OVER", str(held))
                 occupant = _worktree_holding_branch(Path(args.repo), branch)
                 if occupant is not None:
                     return _refusal(
                         "INTEGRATION_BRANCH_CHECKED_OUT",
-                        "the integration branch " + branch + " is checked out at "
-                        + str(occupant) + ", and git gives a branch to one worktree "
+                        "the integration branch "
+                        + branch
+                        + " is checked out at "
+                        + str(occupant)
+                        + ", and git gives a branch to one worktree "
                         "at a time. The run's integration worktree must hold it, "
                         "because every attempt is based on that branch's head and a "
                         "detached copy would never advance it. Maestro reclaims the "
                         "stranded integration checkouts inside its own run root "
                         "without asking, and this one is not among them, so it has "
                         "been left exactly as it is. Move that checkout to another "
-                        "branch and start the run again")
+                        "branch and start the run again",
+                    )
                 subprocess.run(
-                    ("git", "-C", str(args.repo), "worktree", "add",
-                     str(args.integration_path), branch),
-                    check=True, capture_output=True, text=True)
+                    (
+                        "git",
+                        "-C",
+                        str(args.repo),
+                        "worktree",
+                        "add",
+                        str(args.integration_path),
+                        branch,
+                    ),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
                 created_integration_path = Path(args.integration_path)
 
-            def run_node(attempt, node, record, retry_prompt, on_launch,
-                         cancel_requested):
+            def run_node(
+                attempt, node, record, retry_prompt, on_launch, cancel_requested
+            ):
                 key = (node.node_id, record.attempt_no)
                 launch_environment = worktree.launch_env(
-                    attempt.scratch, concurrency=getattr(args, "concurrency", None))
+                    attempt.scratch, concurrency=getattr(args, "concurrency", None)
+                )
                 if node.kind is scheduler_types.NodeKind.CODE:
                     process = subprocess.Popen(
-                        node.command, cwd=attempt.path, env=launch_environment,
-                        start_new_session=True)
+                        node.command,
+                        cwd=attempt.path,
+                        env=launch_environment,
+                        start_new_session=True,
+                    )
                     with handles_lock:
                         handles[key] = process
                         proven_absent.discard(key)
@@ -3724,7 +5159,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                             quiesce_attempt(record, "cancel")
                             process.wait(timeout=1)
                             return scheduler.NodeExecution(
-                                exit_code=process.returncode or 1)
+                                exit_code=process.returncode or 1
+                            )
                         time.sleep(0.05)
                     return scheduler.NodeExecution(exit_code=process.returncode or 0)
                 assert route_runner is not None
@@ -3732,21 +5168,24 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 envelope = attempt.scratch / "agent-envelope.json"
                 plan_node = plan.node_by_id()[node.node_id]
                 if node.kind is scheduler_types.NodeKind.TESTS:
-                    prompt_text = _tests_node_prompt(
-                        plan_node, envelope, retry_prompt)
+                    prompt_text = _tests_node_prompt(plan_node, envelope, retry_prompt)
                     lane_route = getattr(args, "tester_route", None) or args.agent_route
                     lane_model = getattr(args, "tester_model", None) or args.agent_model
-                    lane_effort = getattr(args, "tester_effort", None) or args.agent_effort
-                    lane_profile = getattr(args, "tester_profile", None) or args.agent_profile
+                    lane_effort = (
+                        getattr(args, "tester_effort", None) or args.agent_effort
+                    )
+                    lane_profile = (
+                        getattr(args, "tester_profile", None) or args.agent_profile
+                    )
                     # B15: tester.vendor is loaded onto args and recorded here.
                     # The information barrier is the node split, not a B12 vendor
                     # pair, and LaunchSpec has no vendor field.
                     lane_vendor = getattr(args, "tester_vendor", None)
                 else:
-                    prompt_text = _agent_node_prompt(
-                        plan_node, envelope, retry_prompt)
+                    prompt_text = _agent_node_prompt(plan_node, envelope, retry_prompt)
                     prompt_text = _append_needed_tests(
-                        prompt_text, attempt.path, node, plan)
+                        prompt_text, attempt.path, node, plan
+                    )
                     lane_route = args.agent_route
                     lane_model = args.agent_model
                     lane_effort = args.agent_effort
@@ -3756,40 +5195,86 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # goal, so it is strictly larger. Same chokepoint as before.
                 _preflight_prompt(prompt_text, lane_route, lane_model)
                 prompt.write_text(prompt_text, encoding="utf-8")
-                handle = _typed_launch_pane(route_runner, launcher.LaunchSpec(
-                    correlation_token="{}-{}-{}".format(
-                        args.run_id, node.node_id, record.attempt_no),
-                    worktree=attempt.path, prompt_path=prompt,
-                    envelope_path=envelope, route=lane_route,
-                    model=lane_model, effort=lane_effort,
-                    profile=lane_profile,
-                    session_dir=attempt.scratch / "session",
-                    context_window_tokens=_route_context_window(
-                        lane_route, lane_model),
-                    pane_group=node.node_id,
-                    pane_role=("tester"
-                               if node.kind is scheduler_types.NodeKind.TESTS
-                               else "builder"),
-                    pane_group_size=2,
-                    restrict_tools=getattr(args, "restrict_actor_tools", False),
-                    environment=launch_environment))
+                handle = _typed_launch_pane(
+                    route_runner,
+                    launcher.LaunchSpec(
+                        correlation_token="{}-{}-{}".format(
+                            args.run_id, node.node_id, record.attempt_no
+                        ),
+                        worktree=attempt.path,
+                        prompt_path=prompt,
+                        envelope_path=envelope,
+                        route=lane_route,
+                        model=lane_model,
+                        effort=lane_effort,
+                        profile=lane_profile,
+                        session_dir=attempt.scratch / "session",
+                        context_window_tokens=_route_context_window(
+                            lane_route, lane_model
+                        ),
+                        workspace_label=workspace_label,
+                        lane_key=lane_placement[node.node_id],
+                        lane_label=lane_placement[node.node_id],
+                        pane_role=(
+                            "tester"
+                            if node.kind is scheduler_types.NodeKind.TESTS
+                            else "builder"
+                        ),
+                        attempt_no=record.attempt_no,
+                        pane_group_size=3,
+                        restrict_tools=getattr(args, "restrict_actor_tools", False),
+                        environment=launch_environment,
+                    ),
+                )
                 with handles_lock:
                     handles[key] = handle
                     proven_absent.discard(key)
                 _require_session_path(handle, node.node_id, record.attempt_no)
+                if node.kind is scheduler_types.NodeKind.AGENT:
+                    try:
+                        store.register_actor_session(
+                            args.run_id,
+                            node.node_id,
+                            "builder",
+                            generation=record.attempt_no,
+                            pane_id=handle.pane_id,
+                            session_path=str(handle.transcript_path),
+                            correlation_token=handle.correlation_token,
+                            tab_id=handle.tab_id,
+                        )
+                    except BaseException:
+                        with handles_lock:
+                            handles.pop(key, None)
+                        route_runner.cancel(
+                            handle, finalization_window.time.monotonic() + 5.0
+                        )
+                        raise
+                    with handles_lock:
+                        builder_handles[node.node_id] = handle
                 liveness_pid = handle.process_group
                 if liveness_pid is None:
                     liveness_pid = handle.liveness_pid
                 store.mark_launched(
-                    args.run_id, node.node_id, record.attempt_no,
+                    args.run_id,
+                    node.node_id,
+                    record.attempt_no,
                     liveness_pid,
                     extra=_launch_attempt_extra(
                         str(handle.transcript_path),
-                        vendor=lane_vendor, model=lane_model, route=lane_route))
+                        vendor=lane_vendor,
+                        model=lane_model,
+                        route=lane_route,
+                    ),
+                )
                 on_launch(liveness_pid)
                 return _poll_agent_execution(
-                    route_runner, handle, envelope, record, cancel_requested,
-                    quiesce_attempt)
+                    route_runner,
+                    handle,
+                    envelope,
+                    record,
+                    cancel_requested,
+                    quiesce_attempt,
+                )
 
             def quiesce_attempt(record, phase):
                 key = (record.node_id, record.attempt_no)
@@ -3802,34 +5287,352 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                             return
                         raise RuntimeError(
                             "PROCESS_GROUP_UNTRACKED:{}:{}#{}".format(
-                                phase, record.node_id, record.attempt_no))
+                                phase, record.node_id, record.attempt_no
+                            )
+                        )
+                    if _keeps_builder_session_open(
+                        record.node_id, phase, builder_node_ids
+                    ):
+                        if (
+                            not isinstance(handle, launcher.LaunchHandle)
+                            or route_runner is None
+                        ):
+                            raise RuntimeError(
+                                "ACTOR_IDLE_UNPROVEN:{}:{}#{}".format(
+                                    phase, record.node_id, record.attempt_no
+                                )
+                            )
+                        try:
+                            route_runner.wait_for_idle(handle)
+                        except RuntimeError as exc:
+                            raise RuntimeError(
+                                "ACTOR_IDLE_UNPROVEN:{}:{}".format(
+                                    phase, handle.correlation_token
+                                )
+                            ) from exc
+                        return
                     if isinstance(handle, subprocess.Popen):
                         process_group = handle.pid
                         launcher.quiesce_process_group(
-                            process_group, time.monotonic() + 1.0)
+                            process_group, time.monotonic() + 1.0
+                        )
                         if not launcher._process_group_absent(process_group):
                             raise RuntimeError(
                                 "PROCESS_GROUP_STILL_OWNED:{}:{}".format(
-                                    phase, process_group))
+                                    phase, process_group
+                                )
+                            )
                     else:
                         if route_runner is None:
                             raise RuntimeError(
                                 "PROCESS_GROUP_UNTRACKED:{}:{}#{}".format(
-                                    phase, record.node_id, record.attempt_no))
+                                    phase, record.node_id, record.attempt_no
+                                )
+                            )
                         route_runner.cancel(handle, time.monotonic() + 1.0)
                         if route_runner.reclaim(handle.correlation_token):
                             raise RuntimeError(
                                 "PROCESS_GROUP_STILL_OWNED:{}:{}".format(
-                                    phase, handle.correlation_token))
+                                    phase, handle.correlation_token
+                                )
+                            )
+                        if builder_handles.get(record.node_id) is handle:
+                            session = store.current_actor_session(
+                                args.run_id, record.node_id, "builder"
+                            )
+                            if (
+                                session is not None
+                                and session.state
+                                is scheduler_types.ActorSessionState.ACTIVE
+                            ):
+                                store.close_actor_session(
+                                    args.run_id,
+                                    record.node_id,
+                                    "builder",
+                                    generation=session.generation,
+                                )
+                            builder_handles.pop(record.node_id, None)
                     handles.pop(key)
                     proven_absent.add(key)
 
+            def continue_node(
+                attempt,
+                node,
+                record,
+                repair_prompt,
+                rejected_candidate_sha,
+                builder_generation,
+                cancel_requested,
+            ):
+                """Resume or replace the durable builder for one repair handoff."""
+                if node.kind is not scheduler_types.NodeKind.AGENT:
+                    raise scheduler.AttemptOwnershipLost(
+                        "{} is not a persistent builder lane".format(node.node_id)
+                    )
+                if route_runner is None:
+                    raise scheduler.AttemptOwnershipLost(
+                        "builder launcher is unavailable"
+                    )
+                session = store.current_actor_session(
+                    args.run_id, node.node_id, "builder"
+                )
+                if session is None:
+                    prior_sessions = store.actor_sessions(
+                        args.run_id, node.node_id, actor_role="builder"
+                    )
+                    session = prior_sessions[-1] if prior_sessions else None
+                if session is None or session.generation != builder_generation:
+                    raise scheduler.AttemptOwnershipLost(
+                        "{}: builder generation changed".format(node.node_id)
+                    )
+                key = (node.node_id, record.attempt_no)
+                envelope_path = attempt.scratch / "agent-envelope.json"
+                acknowledgement_path = attempt.scratch / "repair-acknowledgement.json"
+                prompt_path = attempt.scratch / "repair-prompt.md"
+                launch_environment = worktree.launch_env(
+                    attempt.scratch, concurrency=getattr(args, "concurrency", None)
+                )
+                handoff = store.repair_handoff(
+                    args.run_id, node.node_id, rejected_candidate_sha
+                )
+                resuming_submitted_handoff = (
+                    handoff is not None
+                    and handoff.builder_generation == builder_generation
+                    and handoff.state
+                    in (
+                        scheduler_types.RepairHandoffState.SUBMITTED,
+                        scheduler_types.RepairHandoffState.ACKNOWLEDGED,
+                    )
+                )
+
+                def write_prompt(generation):
+                    prompt_path.write_text(
+                        _repair_prompt_text(
+                            repair_prompt,
+                            rejected_candidate_sha,
+                            generation,
+                            acknowledgement_path,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                def mark_handoff_submitted(generation):
+                    if handoff is None:
+                        return
+                    submission = store.mark_handoff_submitted(
+                        args.run_id,
+                        node.node_id,
+                        rejected_candidate_sha,
+                        builder_generation=generation,
+                    )
+                    if (
+                        not submission.submitted
+                        or submission.handoff.builder_generation != generation
+                    ):
+                        raise scheduler.AttemptOwnershipLost(
+                            "{}: builder handoff submission generation lost".format(
+                                node.node_id
+                            )
+                        )
+
+                if not resuming_submitted_handoff:
+                    _clear_turn_artifact(envelope_path)
+                    _clear_turn_artifact(acknowledgement_path)
+                    write_prompt(builder_generation)
+
+                def launch_replacement():
+                    nonlocal session, builder_generation
+                    generation = session.generation + 1
+                    # A proven-absent session cannot own its old envelope or
+                    # acknowledgement; its replacement gets a fresh turn.
+                    _clear_turn_artifact(envelope_path)
+                    _clear_turn_artifact(acknowledgement_path)
+                    write_prompt(generation)
+                    replacement = _typed_launch_pane(
+                        route_runner,
+                        launcher.LaunchSpec(
+                            correlation_token=(
+                                "{}-{}-builder-g{}".format(
+                                    args.run_id, node.node_id, generation
+                                )
+                            ),
+                            worktree=attempt.path,
+                            prompt_path=prompt_path,
+                            envelope_path=envelope_path,
+                            route=args.agent_route,
+                            model=args.agent_model,
+                            effort=args.agent_effort,
+                            profile=args.agent_profile,
+                            session_dir=(
+                                attempt.scratch
+                                / "session-builder-g{}".format(generation)
+                            ),
+                            context_window_tokens=_route_context_window(
+                                args.agent_route, args.agent_model
+                            ),
+                            workspace_label=workspace_label,
+                            lane_key=lane_placement[node.node_id],
+                            lane_label=lane_placement[node.node_id],
+                            pane_role="builder",
+                            attempt_no=generation,
+                            pane_group_size=3,
+                            restrict_tools=getattr(args, "restrict_actor_tools", False),
+                            environment=launch_environment,
+                        ),
+                    )
+                    try:
+                        _require_session_path(replacement, node.node_id, generation)
+                        if handoff is None:
+                            recovered = store.recover_actor_session(
+                                args.run_id,
+                                node.node_id,
+                                "builder",
+                                expected_generation=session.generation,
+                                generation=generation,
+                                pane_id=replacement.pane_id,
+                                session_path=str(replacement.transcript_path),
+                                correlation_token=replacement.correlation_token,
+                                tab_id=replacement.tab_id,
+                            )
+                        else:
+                            recovered = store.recover_builder_handoff(
+                                args.run_id,
+                                node.node_id,
+                                rejected_candidate_sha,
+                                expected_generation=session.generation,
+                                generation=generation,
+                                pane_id=replacement.pane_id,
+                                session_path=str(replacement.transcript_path),
+                                correlation_token=replacement.correlation_token,
+                                tab_id=replacement.tab_id,
+                            )
+                    except BaseException:
+                        route_runner.cancel(
+                            replacement, finalization_window.time.monotonic() + 5.0
+                        )
+                        raise
+                    if not recovered.recovered:
+                        route_runner.cancel(
+                            replacement, finalization_window.time.monotonic() + 5.0
+                        )
+                        raise scheduler.AttemptOwnershipLost(
+                            "{}: builder replacement generation lost".format(
+                                node.node_id
+                            )
+                        )
+                    session = recovered.session
+                    builder_generation = generation
+                    mark_handoff_submitted(generation)
+                    with handles_lock:
+                        handles[key] = replacement
+                        builder_handles[node.node_id] = replacement
+                        proven_absent.discard(key)
+                    return replacement
+
+                with handles_lock:
+                    handle = builder_handles.get(node.node_id)
+                launched_replacement = False
+                if handle is None:
+                    try:
+                        handle = route_runner.adopt(
+                            launcher.PersistedActorHandle(
+                                correlation_token=session.correlation_token,
+                                pane_id=session.pane_id,
+                                agent_name=launcher.agent_name_for(
+                                    session.correlation_token
+                                ),
+                                launched_cwd=attempt.path,
+                                transcript_path=Path(session.session_path),
+                                envelope_path=envelope_path,
+                                environment=launch_environment,
+                                workspace_id=launcher.workspace_of(
+                                    _session_tab_id(session)
+                                ),
+                                tab_id=_session_tab_id(session),
+                                lane_key=node.node_id,
+                            )
+                        )
+                    except launcher.HandleAbsent:
+                        handle = launch_replacement()
+                        launched_replacement = True
+                    with handles_lock:
+                        handles[key] = handle
+                        builder_handles[node.node_id] = handle
+                        proven_absent.discard(key)
+                if handle.correlation_token != session.correlation_token:
+                    raise scheduler.AttemptOwnershipLost(
+                        "{}: builder handle token changed".format(node.node_id)
+                    )
+                if not launched_replacement and not resuming_submitted_handoff:
+                    try:
+                        route_runner.resubmit(
+                            handle,
+                            prompt_path,
+                            route=args.agent_route,
+                            expected_token=session.correlation_token,
+                        )
+                    except launcher.HandleAbsent:
+                        handle = launch_replacement()
+                        launched_replacement = True
+                    except scheduler.AttemptOwnershipLost:
+                        raise
+                    except Exception as exc:
+                        # Submission proof can race a prompt that did land. If
+                        # the retained actor is visibly working or has already
+                        # declared, consume that turn instead of creating a
+                        # duplicate attempt.
+                        status = route_runner.agent_status(handle)
+                        if not envelope_path.exists() and status != "working":
+                            raise scheduler.LaunchFailed(
+                                _launcher_failure_for(route_runner, exc),
+                                "{}: {}".format(type(exc).__name__, exc),
+                            ) from exc
+                        mark_handoff_submitted(builder_generation)
+                    else:
+                        mark_handoff_submitted(builder_generation)
+                elif resuming_submitted_handoff:
+                    # Fence the adopted durable dispatch before consuming its
+                    # existing turn; this is idempotent for SUBMITTED/ACKED.
+                    mark_handoff_submitted(builder_generation)
+                execution = _poll_agent_execution(
+                    route_runner,
+                    handle,
+                    envelope_path,
+                    record,
+                    cancel_requested,
+                    quiesce_attempt,
+                )
+                acknowledged = (
+                    rejected_candidate_sha
+                    if _read_repair_acknowledgement(
+                        acknowledgement_path, rejected_candidate_sha, builder_generation
+                    )
+                    else ""
+                )
+                return scheduler.RepairExecution(
+                    execution=execution,
+                    acknowledged_rejected_sha=acknowledged,
+                    builder_generation=builder_generation,
+                )
+
             run_gate, run_integration_gate = _scheduler_gate_deps(
-                plan, resolved_runners)
+                plan, resolved_runners
+            )
             review_attempt = (
-                _code_review_runner(args, route_runner)
+                _code_review_runner(args, route_runner, store)
                 if route_runner is not None and getattr(args, "review_root", None)
-                else None)
+                else None
+            )
+            close_review = (
+                getattr(review_attempt, "close", None)
+                if review_attempt is not None
+                else None
+            )
+            receipt_path_for = (
+                getattr(review_attempt, "receipt_path_for", None)
+                if review_attempt is not None
+                else None
+            )
 
             def actor_status(attempt):
                 """Raw per-pane status for the watchdog turn clock. Never observe()."""
@@ -3843,19 +5646,21 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 return route_runner.agent_status(handle)
 
             deps = scheduler.SchedulerDeps(
-                store=store, repo=Path(args.repo),
+                store=store,
+                repo=Path(args.repo),
                 integration_path=Path(args.integration_path),
                 integration_branch=plan.merge_policy.integration_branch,
                 worktrees_root=Path(args.worktrees_root),
-                scratch_root=Path(args.scratch_root), run_node=run_node,
+                scratch_root=Path(args.scratch_root),
+                run_node=run_node,
                 recover_node=_late_agent_execution,
-                run_gate=run_gate, run_integration_gate=run_integration_gate,
+                run_gate=run_gate,
+                run_integration_gate=run_integration_gate,
                 quiesce_attempt=quiesce_attempt,
                 # §8.8's single integration gate, adjudicated at the number the
                 # plan declared for it. Omitting this is what left final
                 # acceptance counting to 1 while the plan asked for 70.
-                integration_min_cases=(
-                    plan.merge_policy.integration_gate.min_cases),
+                integration_min_cases=(plan.merge_policy.integration_gate.min_cases),
                 # §8.3's provision step, which the scheduler has always called and
                 # nothing had ever supplied. Omitting it measured every baseline
                 # against an unprovisioned tree and left §7.4's pre-gate red for
@@ -3864,59 +5669,132 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 provision=_run_provisioner(args, route_runner),
                 kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
                 review_attempt=review_attempt,
-                actor_status=actor_status)
+                continue_node=continue_node,
+                close_review=close_review,
+                receipt_path_for=receipt_path_for,
+                actor_status=actor_status,
+            )
             try:
-                report = scheduler.Scheduler(
-                    args.run_id, plan.to_plan_nodes(), config, deps,
+                runtime = scheduler.Scheduler(
+                    args.run_id,
+                    plan.to_plan_nodes(),
+                    config,
+                    deps,
                     plan_digest=args.digest,
-                    plan_name=getattr(plan, "title", None)).run()
+                    plan_name=getattr(plan, "title", None),
+                )
+                # Projection creates the derived review DAG rows that legacy
+                # evidence must bind to, but does not dispatch a node.
+                runtime.project()
+                if resuming:
+                    migrations = _migrate_legacy_inline_reviews(
+                        args, store, plan.to_plan_nodes()
+                    )
+                    blocks = tuple(
+                        migration for migration in migrations if migration.blocked
+                    )
+                    if not blocks:
+                        blocks = store.legacy_review_migrations(args.run_id)
+                    if blocks:
+                        return _refusal(
+                            "LEGACY_REVIEW_MIGRATION_BLOCKED",
+                            "; ".join(
+                                "{}:{}".format(
+                                    migration.build_node_id, migration.reason
+                                )
+                                for migration in blocks
+                            ),
+                        )
+                    for migration in migrations:
+                        if not migration.reviews:
+                            continue
+                        accepted = migration.reviews[-1]
+                        if accepted.verdict is not scheduler_types.ReviewVerdict.PASS:
+                            continue
+                        review_node_id = "{}::review".format(migration.build_node_id)
+                        review_lifecycle = store.get_node(args.run_id, review_node_id)
+                        if (
+                            review_lifecycle.state
+                            is not scheduler_types.NodeState.ACCEPTED
+                        ):
+                            store.mark_review_accepted(
+                                args.run_id, review_node_id, accepted.candidate_sha
+                            )
+                        build_lifecycle = store.get_node(
+                            args.run_id, migration.build_node_id
+                        )
+                        if build_lifecycle.lane_phase is None:
+                            store.set_lane_phase(
+                                args.run_id,
+                                migration.build_node_id,
+                                scheduler_types.LanePhase.ACCEPTED,
+                                expected=None,
+                            )
+                report = runtime.run()
             except scheduler.RunPaused:
                 # Not an outcome, and deliberately not printed as one: nothing was
                 # declared, no node moved, and `run resume` is legal from here.
-                print(json.dumps({
-                    "outcome": "PAUSED", "run_id": args.run_id,
-                }, sort_keys=True))
+                print(
+                    json.dumps(
+                        {
+                            "outcome": "PAUSED",
+                            "run_id": args.run_id,
+                        },
+                        sort_keys=True,
+                    )
+                )
                 return 0
         finally:
-            # Nested so that a failing close still releases the checkout, and a
-            # failing release still leaves the store closed. Neither may become the
-            # reason the run's own outcome goes unreported.
+            # Progress and the store both stop before the integration checkout
+            # is released. Each cleanup still runs if the preceding one fails.
             try:
-                store.close()
+                try:
+                    progress.__exit__(*sys.exc_info())
+                finally:
+                    store.close()
             finally:
                 _release_run_integration_worktree(
-                    Path(args.repo), created_integration_path)
-        print(json.dumps({"outcome": report.outcome.value,
-                          "run_id": args.run_id,
-                          "merged": list(report.merged),
-                          "blocked": [
-                              {"node_id": node, "reason": reason.value}
-                              for node, reason in report.blocked],
-                          # The findings that exhausted a node's review budget. A
-                          # bare REVIEW_BUDGET_EXHAUSTED names the rule that fired
-                          # and nothing an operator can act on. Read defensively:
-                          # the scheduler is a seam tests substitute, and a run's
-                          # exit status must not depend on a stand-in carrying
-                          # every field of the real report.
-                          "review_findings": dict(
-                              getattr(report, "review_findings", {}) or {}),
-                          # Findings-per-attempt for every reviewed node, in
-                          # order. `review_findings` answers "what did the
-                          # reviewer object to"; this answers "was it objecting
-                          # less each time", which is the question behind
-                          # `review_ceiling` and the one nothing in the run
-                          # could answer once the process exited.
-                          "review_convergence": {
-                              node_id: list(counts)
-                              for node_id, counts in dict(
-                                  getattr(report, "review_convergence", {})
-                                  or {}).items()}},
-                         sort_keys=True))
+                    Path(args.repo), created_integration_path
+                )
+        print(
+            json.dumps(
+                {
+                    "outcome": report.outcome.value,
+                    "run_id": args.run_id,
+                    "merged": list(report.merged),
+                    "blocked": [
+                        {"node_id": node, "reason": reason.value}
+                        for node, reason in report.blocked
+                    ],
+                    # The findings that exhausted a node's review budget. A
+                    # bare REVIEW_BUDGET_EXHAUSTED names the rule that fired
+                    # and nothing an operator can act on. Read defensively:
+                    # the scheduler is a seam tests substitute, and a run's
+                    # exit status must not depend on a stand-in carrying
+                    # every field of the real report.
+                    "review_findings": dict(
+                        getattr(report, "review_findings", {}) or {}
+                    ),
+                    # Findings-per-attempt for every reviewed node, in
+                    # order. `review_findings` answers "what did the
+                    # reviewer object to"; this answers "was it objecting
+                    # less each time", which is the question behind
+                    # `review_ceiling` and the one nothing in the run
+                    # could answer once the process exited.
+                    "review_convergence": {
+                        node_id: list(counts)
+                        for node_id, counts in dict(
+                            getattr(report, "review_convergence", {}) or {}
+                        ).items()
+                    },
+                },
+                sort_keys=True,
+            )
+        )
         return 0
 
     finally:
         worktree.bind_lane_concurrency(None)
-
 
 
 def _scheduler_gate_deps(plan: plan_model.Plan, runners):
@@ -3934,8 +5812,13 @@ def _scheduler_gate_deps(plan: plan_model.Plan, runners):
     def run_gate(attempt, node, phase, cancel_requested):
         command = tuple(node.gate_command)
         return worktree.run_node_gate(
-            attempt, runners[command[0]], command[1:], node.gate_selector,
-            cancel_requested, label="{}-{}".format(node.node_id, phase))
+            attempt,
+            runners[command[0]],
+            command[1:],
+            node.gate_selector,
+            cancel_requested,
+            label="{}-{}".format(node.node_id, phase),
+        )
 
     def run_integration_gate(integration_path, specs, cancel_requested):
         # `specs` is the union of merged node specs, recorded on the
@@ -3946,13 +5829,15 @@ def _scheduler_gate_deps(plan: plan_model.Plan, runners):
         # test no lane owned.
         del specs
         return worktree.run_integration_gate(
-            integration_path, runners[integration_gate.runner],
+            integration_path,
+            runners[integration_gate.runner],
             plan_model.unscoped_argv(integration_gate.argv),
             Path(integration_path).parent / ".maestro",
-            cancel_requested, label="integration-gate")
+            cancel_requested,
+            label="integration-gate",
+        )
 
     return run_gate, run_integration_gate
-
 
 
 def _epoch(stamp: Optional[str]) -> Optional[float]:
@@ -4001,9 +5886,11 @@ def _integration_head(path: Path) -> Optional[Dict[str, Any]]:
     """
     if not path.is_dir():
         return None
-    read = {"branch": ("rev-parse", "--abbrev-ref", "HEAD"),
-            "head": ("rev-parse", "HEAD"),
-            "subject": ("log", "-1", "--format=%s")}
+    read = {
+        "branch": ("rev-parse", "--abbrev-ref", "HEAD"),
+        "head": ("rev-parse", "HEAD"),
+        "subject": ("log", "-1", "--format=%s"),
+    }
     found: Dict[str, Any] = {"path": str(path)}
     # A key is present when git answered and absent when it did not. The
     # ternary this replaces wrote `None` on every nonzero exit, which reads as
@@ -4015,8 +5902,8 @@ def _integration_head(path: Path) -> Optional[Dict[str, Any]]:
     unreadable = []
     for key, command in read.items():
         completed = subprocess.run(
-            ("git", "-C", str(path)) + command,
-            capture_output=True, text=True)
+            ("git", "-C", str(path)) + command, capture_output=True, text=True
+        )
         if completed.returncode == 0:
             found[key] = completed.stdout.strip()
         else:
@@ -4026,8 +5913,9 @@ def _integration_head(path: Path) -> Optional[Dict[str, Any]]:
     return found
 
 
-def _attempt_history(transitions: Sequence[Dict[str, Any]]
-                     ) -> Dict[Tuple[str, int], List[Dict[str, Any]]]:
+def _attempt_history(
+    transitions: Sequence[Dict[str, Any]],
+) -> Dict[Tuple[str, int], List[Dict[str, Any]]]:
     """Every node transition filed under the attempt it happened to.
 
     The ledger numbers attempts in `attempts` and narrates them in
@@ -4049,21 +5937,25 @@ def _attempt_history(transitions: Sequence[Dict[str, Any]]
         attempt_no = open_attempt.get(node_id)
         if attempt_no is None:
             continue
-        history.setdefault((node_id, attempt_no), []).append({
-            "reason": row.get("reason"),
-            "from_state": row.get("from_state"),
-            "to_state": row.get("to_state"),
-            "actor": row.get("actor"),
-            "at": row.get("created_at"),
-            "detail": row.get("detail", {}),
-        })
+        history.setdefault((node_id, attempt_no), []).append(
+            {
+                "reason": row.get("reason"),
+                "from_state": row.get("from_state"),
+                "to_state": row.get("to_state"),
+                "actor": row.get("actor"),
+                "at": row.get("created_at"),
+                "detail": row.get("detail", {}),
+            }
+        )
     return history
 
 
 def _attempt_verdict(entries: Sequence[Dict[str, Any]]) -> Optional[str]:
     """The sentence that explains why an attempt ended, when there is one."""
     for entry in entries:
-        detail = entry.get("detail") or {}
+        detail = entry.get("detail")
+        if not isinstance(detail, Mapping):
+            continue
         verdict = detail.get("verdict")
         if verdict:
             return str(verdict)
@@ -4119,23 +6011,29 @@ def _merge_evidence_lines(node: Mapping[str, Any]) -> List[str]:
         return []
     if evidence.get("verified_ever"):
         chain = "node reached VERIFIED {} time(s) before it was accepted".format(
-            evidence.get("verified_transitions"))
+            evidence.get("verified_transitions")
+        )
     else:
-        chain = ("node never reached VERIFIED: no post-node gate pass and no "
-                 "reviewer verdict is recorded for it")
+        chain = (
+            "node never reached VERIFIED: no post-node gate pass and no "
+            "reviewer verdict is recorded for it"
+        )
     return [
-        "    OPERATOR-ACCEPTED: {} — evidence chain not established by this run"
-        .format(node["output_sha"][:12] if node["output_sha"] else "?"),
+        "    OPERATOR-ACCEPTED: {} — evidence chain not established by this run".format(
+            node["output_sha"][:12] if node["output_sha"] else "?"
+        ),
         "      {}".format(chain),
         "      {} review rejection(s) over {} attempt(s); blocked as {}".format(
             evidence.get("review_rejections"),
             evidence.get("attempts_recorded"),
-            evidence.get("block_reason") or "no stored reason"),
+            evidence.get("block_reason") or "no stored reason",
+        ),
     ]
 
 
-def _merge_evidence_by_node(transitions: Sequence[Dict[str, Any]]
-                            ) -> Dict[str, Dict[str, Any]]:
+def _merge_evidence_by_node(
+    transitions: Sequence[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
     """The evidence record `skip` wrote, per node it accepted (§1.1 item 4).
 
     `node_lifecycle.merge_cause` says *that* an operator accepted the node,
@@ -4162,8 +6060,7 @@ def _merge_evidence_by_node(transitions: Sequence[Dict[str, Any]]
     return found
 
 
-def _live_state(record: "lc.RunRecord",
-                nodes: Sequence["lc.NodeRow"]) -> str:
+def _live_state(record: "lc.RunRecord", nodes: Sequence["lc.NodeRow"]) -> str:
     """What the run is doing now, which is not what it last *declared*.
 
     `runs.latest_outcome` is the last quiescence a scheduler declared, and it
@@ -4181,18 +6078,23 @@ def _live_state(record: "lc.RunRecord",
     return lc.derive_run_state(record, nodes)
 
 
-def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
-                  args: argparse.Namespace) -> Dict[str, Any]:
+def _run_progress(
+    reader: "lc.LifecycleReader", record: "lc.RunRecord", args: argparse.Namespace
+) -> Dict[str, Any]:
     """Everything `run status` knows about one run, as one document."""
     now = time.time()
     nodes = reader.nodes(record.run_id)
     attempts = reader.attempts(record.run_id)
+    candidate_reviews = reader.candidate_reviews(record.run_id, limit=10_000)
+    repair_handoffs = reader.repair_handoffs(record.run_id, limit=10_000)
     transitions = reader.transitions(record.run_id)
     history = _attempt_history(transitions)
     merge_evidence = _merge_evidence_by_node(transitions)
     results = reader.results(record.run_id)
-    names = {digest: name for name, digest
-             in (getattr(args, "plan_digests", None) or {}).items()}
+    names = {
+        digest: name
+        for name, digest in (getattr(args, "plan_digests", None) or {}).items()
+    }
 
     by_node: Dict[str, List[Dict[str, Any]]] = {}
     in_flight: List[Dict[str, Any]] = []
@@ -4206,87 +6108,93 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
             "state": attempt.state.value,
             "base_sha": attempt.base_sha,
             "turn_count": attempt.turn_count,
-            "retry_class": (attempt.retry_class.value
-                            if attempt.retry_class else None),
+            "retry_class": (attempt.retry_class.value if attempt.retry_class else None),
             "pid": attempt.pid,
             "started_at": attempt.started_at or None,
             "launched_at": attempt.launched_at,
             "running": running,
-            "elapsed_s": (max(0.0, now - started)
-                          if running and started else None),
+            "elapsed_s": (max(0.0, now - started) if running and started else None),
             "session_path": attempt.extra.get(watchdog.SESSION_PATH_KEY),
             "vendor": identity.vendor,
             "model": identity.model,
             "route": identity.route,
             "verdict": _attempt_verdict(entries),
             "transitions": entries,
-            "review_findings": [
+            "legacy_review_findings": [
                 finding.as_dict()
-                for finding in review_findings.blocking_findings_from_extra(
-                    attempt.extra)],
+                for finding in review_findings.legacy_findings_from_extra(attempt.extra)
+            ],
         }
         by_node.setdefault(attempt.node_id, []).append(projected)
         if running:
-            in_flight.append({"node_id": attempt.node_id,
-                              "attempt_no": attempt.attempt_no,
-                              "turn_count": attempt.turn_count,
-                              "elapsed_s": projected["elapsed_s"]})
+            in_flight.append(
+                {
+                    "node_id": attempt.node_id,
+                    "attempt_no": attempt.attempt_no,
+                    "turn_count": attempt.turn_count,
+                    "elapsed_s": projected["elapsed_s"],
+                }
+            )
 
     projected_nodes = []
     for node in nodes:
         node_attempts = by_node.get(node.node_id, [])
-        projected_nodes.append({
-            "node_id": node.node_id,
-            "kind": node.kind,
-            "depth": node.depth,
-            "needs": list(node.needs),
-            "state": node.state.value,
-            "block_reason": (node.block_reason.value
-                             if node.block_reason else None),
-            "attempt_no": node.attempt_no,
-            "attempts_recorded": len(node_attempts),
-            "granted_extra_attempts": node.granted_extra_attempts,
-            # How the node reached MERGED, as one key with three values and a
-            # null: `SCHEDULER`, `OPERATOR_ACCEPTED`, `UNRECORDED` for a row
-            # written before the column, and `null` where the node is not
-            # MERGED and the question does not arise. Both `MERGED` shapes
-            # used to render identically here, which is what left the git log
-            # as the only place the difference was visible (#93).
-            "merge_cause": node.merge_provenance,
-            # How the node reached PENDING after leaving it: `SCHEDULER`,
-            # `OPERATOR_RETRY`, `OPERATOR_RESUME`, or `null` where the node
-            # never left the frontier or the column was never recorded.
-            # The three PENDING writers used to render identically here (#103).
-            "pending_cause": node.pending_provenance,
-            # What the ledger could show about the evidence chain when the
-            # operator accepted it — present only on a node `skip` wrote.
-            "merge_evidence": merge_evidence.get(node.node_id),
-            "output_sha": node.output_sha,
-            "updated_at": node.updated_at,
-            "idle_s": _since(node.updated_at, now),
-            "attempts": node_attempts,
-        })
+        projected_nodes.append(
+            {
+                "node_id": node.node_id,
+                "kind": node.kind,
+                "depth": node.depth,
+                "needs": list(node.needs),
+                "state": node.state.value,
+                "block_reason": (
+                    node.block_reason.value if node.block_reason else None
+                ),
+                "attempt_no": node.attempt_no,
+                "attempts_recorded": len(node_attempts),
+                "granted_extra_attempts": node.granted_extra_attempts,
+                # How the node reached MERGED, as one key with three values and a
+                # null: `SCHEDULER`, `OPERATOR_ACCEPTED`, `UNRECORDED` for a row
+                # written before the column, and `null` where the node is not
+                # MERGED and the question does not arise. Both `MERGED` shapes
+                # used to render identically here, which is what left the git log
+                # as the only place the difference was visible (#93).
+                "merge_cause": node.merge_provenance,
+                # How the node reached PENDING after leaving it: `SCHEDULER`,
+                # `OPERATOR_RETRY`, `OPERATOR_RESUME`, or `null` where the node
+                # never left the frontier or the column was never recorded.
+                # The three PENDING writers used to render identically here (#103).
+                "pending_cause": node.pending_provenance,
+                # What the ledger could show about the evidence chain when the
+                # operator accepted it — present only on a node `skip` wrote.
+                "merge_evidence": merge_evidence.get(node.node_id),
+                "output_sha": node.output_sha,
+                "updated_at": node.updated_at,
+                "idle_s": _since(node.updated_at, now),
+                "attempts": node_attempts,
+            }
+        )
 
     integration = None
     state_root = getattr(args, "repository_state", None)
     if state_root:
         integration = _integration_head(
-            Path(state_root) / "runs" / record.run_id / "integration")
+            Path(state_root) / "runs" / record.run_id / "integration"
+        )
     return {
         "run_id": record.run_id,
         "plan_name": names.get(record.plan_digest),
         "plan_digest": record.plan_digest,
         "state": _live_state(record, nodes),
-        "declared_outcome": (record.latest_outcome.value
-                             if record.latest_outcome else None),
+        "declared_outcome": (
+            record.latest_outcome.value if record.latest_outcome else None
+        ),
         "declared_outcome_at": record.latest_outcome_at,
         "cancel_requested": record.cancel_requested,
         # Which of §7.3's two cancellation shapes the declared CANCELLED was,
         # and therefore whether `run resume` will take this run back. Reported
         # rather than left to be inferred from the node states: the inference
         # is exactly the heuristic the stored cause exists to replace.
-        "cancel_cause": (record.cancel_cause.value
-                         if record.cancel_cause else None),
+        "cancel_cause": (record.cancel_cause.value if record.cancel_cause else None),
         # The three facts the state above was derived from, reported so an
         # ABANDONED verdict can be checked rather than believed.
         "scheduler_pid": record.scheduler_pid,
@@ -4300,92 +6208,148 @@ def _run_progress(reader: "lc.LifecycleReader", record: "lc.RunRecord",
         "in_flight": in_flight,
         "nodes": projected_nodes,
         "review_findings": [
-            node.as_dict()
-            for node in review_findings.run_findings(
-                record.run_id, nodes, attempts,
-                declared_outcome=(record.latest_outcome.value
-                                  if record.latest_outcome else None)).nodes],
+            review.as_dict()
+            for review in review_findings.run_findings(
+                record.run_id,
+                candidate_reviews,
+                declared_outcome=(
+                    record.latest_outcome.value if record.latest_outcome else None
+                ),
+            ).reviews
+        ],
+        "repair_handoffs": [
+            {
+                "build_node_id": handoff.build_node_id,
+                "rejected_candidate_sha": handoff.rejected_candidate_sha,
+                "findings": [dict(finding) for finding in handoff.findings],
+                "state": handoff.state.value,
+                "builder_generation": handoff.builder_generation,
+                "submitted_at": handoff.submitted_at,
+                "acknowledged_at": handoff.acknowledged_at,
+            }
+            for handoff in repair_handoffs
+        ],
         "results": [
-            {"node_id": row.get("node_id"), "attempt_no": row.get("attempt_no"),
-             "adjudication": row.get("adjudication"),
-             "subject_sha": row.get("subject_sha"), "at": row.get("created_at"),
-             "payload": row.get("payload")}
-            for row in results],
+            {
+                "node_id": row.get("node_id"),
+                "attempt_no": row.get("attempt_no"),
+                "adjudication": row.get("adjudication"),
+                "subject_sha": row.get("subject_sha"),
+                "at": row.get("created_at"),
+                "payload": row.get("payload"),
+            }
+            for row in results
+        ],
     }
 
 
 def _render_progress(progress: Dict[str, Any]) -> str:
     """The default human view. One run, top to bottom, newest fact last."""
-    lines = ["{}  {}".format(progress["run_id"],
-                             progress["plan_name"] or "(plan not installed)")]
+    lines = [
+        "{}  {}".format(
+            progress["run_id"], progress["plan_name"] or "(plan not installed)"
+        )
+    ]
     declared = progress["declared_outcome"]
-    lines.append("  state        {}{}".format(
-        progress["state"],
-        "" if declared is None
-        else "   (last declared outcome {} at {})".format(
-            declared, progress["declared_outcome_at"])))
+    lines.append(
+        "  state        {}{}".format(
+            progress["state"],
+            ""
+            if declared is None
+            else "   (last declared outcome {} at {})".format(
+                declared, progress["declared_outcome_at"]
+            ),
+        )
+    )
     findings = progress.get("review_findings") or []
     if findings:
-        lines.append("  findings     {} merged node{} carried rejecting findings".format(
-            len(findings), "" if len(findings) == 1 else "s"))
+        lines.append(
+            "  findings     {} rejected candidate review{}".format(
+                len(findings), "" if len(findings) == 1 else "s"
+            )
+        )
     lines.append("  plan digest  {}".format(progress["plan_digest"]))
-    lines.append("  started      {}   ({} ago)".format(
-        progress["created_at"], _duration(progress["elapsed_s"])))
-    lines.append("  last change  {}   ({} ago)".format(
-        progress["last_transition_at"], _duration(progress["idle_s"])))
+    lines.append(
+        "  started      {}   ({} ago)".format(
+            progress["created_at"], _duration(progress["elapsed_s"])
+        )
+    )
+    lines.append(
+        "  last change  {}   ({} ago)".format(
+            progress["last_transition_at"], _duration(progress["idle_s"])
+        )
+    )
     if progress["cancel_requested"]:
         lines.append("  cancel       requested")
     if progress["cancel_cause"]:
-        lines.append("  cancel cause {}{}".format(
-            progress["cancel_cause"],
-            "   (resumable)"
-            if progress["cancel_cause"]
-            == scheduler_types.CancelCause.RUN_CANCEL.value
-            else "   (not reopenable)"))
+        lines.append(
+            "  cancel cause {}{}".format(
+                progress["cancel_cause"],
+                "   (resumable)"
+                if progress["cancel_cause"]
+                == scheduler_types.CancelCause.RUN_CANCEL.value
+                else "   (not reopenable)",
+            )
+        )
     if progress["scheduler_pid"]:
         alive = progress["scheduler_alive"]
-        lines.append("  scheduler    pid {} on {} — {}".format(
-            progress["scheduler_pid"], progress["scheduler_host"] or "?",
-            "alive" if alive else "gone" if alive is False else "unknown host"))
+        lines.append(
+            "  scheduler    pid {} on {} — {}".format(
+                progress["scheduler_pid"],
+                progress["scheduler_host"] or "?",
+                "alive" if alive else "gone" if alive is False else "unknown host",
+            )
+        )
     integration = progress["integration"]
     if integration is None:
         lines.append("  integration  (no worktree found)")
     else:
-        lines.append("  integration  {} @ {}".format(
-            integration.get("branch") or "?",
-            (integration.get("head") or "?")[:12]))
+        lines.append(
+            "  integration  {} @ {}".format(
+                integration.get("branch") or "?", (integration.get("head") or "?")[:12]
+            )
+        )
         lines.append("               {}".format(integration["path"]))
         if integration.get("subject"):
-            lines.append("               head: {}".format(
-                integration["subject"]))
+            lines.append("               head: {}".format(integration["subject"]))
 
     lines.append("")
-    lines.append("  {:<44} {:<10} {:>8}  {}".format(
-        "NODE", "STATE", "ATTEMPT", "DETAIL"))
+    lines.append(
+        "  {:<44} {:<10} {:>8}  {}".format("NODE", "STATE", "ATTEMPT", "DETAIL")
+    )
     for node in progress["nodes"]:
         detail = node["block_reason"] or ""
         live = [item for item in node["attempts"] if item["running"]]
         if live:
             detail = "in flight {}, {} turns".format(
-                _duration(live[0]["elapsed_s"]), live[0]["turn_count"])
+                _duration(live[0]["elapsed_s"]), live[0]["turn_count"]
+            )
         elif node.get("pending_cause"):
             detail = _pending_cause_detail(node["pending_cause"])
         elif node["output_sha"]:
-            detail = "{}{}".format(_merge_cause_prefix(node["merge_cause"]),
-                                   node["output_sha"][:12])
-        lines.append("  {:<44} {:<10} {:>8}  {}".format(
-            node["node_id"][:44], node["state"], node["attempt_no"], detail))
+            detail = "{}{}".format(
+                _merge_cause_prefix(node["merge_cause"]), node["output_sha"][:12]
+            )
+        lines.append(
+            "  {:<44} {:<10} {:>8}  {}".format(
+                node["node_id"][:44], node["state"], node["attempt_no"], detail
+            )
+        )
     if findings:
         lines.append("")
         lines.append("  rejecting findings on merged nodes")
         for node in findings:
-            lines.append("  {}  a{}  {} blocking".format(
-                node["node_id"], node["attempt_no"],
-                len(node.get("findings") or ())))
+            lines.append(
+                "  {}  a{}  {} blocking".format(
+                    node["node_id"], node["attempt_no"], len(node.get("findings") or ())
+                )
+            )
             for finding in node.get("findings") or ():
-                lines.append("    {}  {}".format(
-                    finding.get("check_id") or "",
-                    finding.get("object_id") or ""))
+                lines.append(
+                    "    {}  {}".format(
+                        finding.get("check_id") or "", finding.get("object_id") or ""
+                    )
+                )
                 if finding.get("message"):
                     lines.append("      {}".format(finding["message"]))
 
@@ -4396,25 +6360,40 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         lines.append("  {} — attempts".format(node["node_id"]))
         for attempt in node["attempts"]:
             outcome = attempt["retry_class"] or attempt["state"]
-            lines.append("    a{:<3} {:<10} {:<22} {:>4} turns  {}".format(
-                attempt["attempt_no"], attempt["state"], outcome,
-                attempt["turn_count"],
-                _duration(attempt["elapsed_s"]) if attempt["running"] else ""))
+            lines.append(
+                "    a{:<3} {:<10} {:<22} {:>4} turns  {}".format(
+                    attempt["attempt_no"],
+                    attempt["state"],
+                    outcome,
+                    attempt["turn_count"],
+                    _duration(attempt["elapsed_s"]) if attempt["running"] else "",
+                )
+            )
             if attempt["verdict"]:
                 lines.append("         why: {}".format(attempt["verdict"]))
             if attempt["session_path"]:
-                lines.append("         session: {}".format(
-                    attempt["session_path"]))
-            lines.append("         vendor: {}".format(
-                attempt_identity.display(attempt.get("vendor"))))
-            lines.append("         model: {}".format(
-                attempt_identity.display(attempt.get("model"))))
-            lines.append("         route: {}".format(
-                attempt_identity.display(attempt.get("route"))))
+                lines.append("         session: {}".format(attempt["session_path"]))
+            lines.append(
+                "         vendor: {}".format(
+                    attempt_identity.display(attempt.get("vendor"))
+                )
+            )
+            lines.append(
+                "         model: {}".format(
+                    attempt_identity.display(attempt.get("model"))
+                )
+            )
+            lines.append(
+                "         route: {}".format(
+                    attempt_identity.display(attempt.get("route"))
+                )
+            )
             for finding in attempt.get("review_findings") or ():
-                lines.append("         finding: {}  {}".format(
-                    finding.get("check_id") or "",
-                    finding.get("object_id") or ""))
+                lines.append(
+                    "         finding: {}  {}".format(
+                        finding.get("check_id") or "", finding.get("object_id") or ""
+                    )
+                )
         if node["block_reason"]:
             lines.append("    BLOCKED: {}".format(node["block_reason"]))
         for line in _merge_evidence_lines(node):
@@ -4422,8 +6401,11 @@ def _render_progress(progress: Dict[str, Any]) -> str:
 
     for row in progress["results"]:
         lines.append("")
-        lines.append("  result {}#{} {}".format(
-            row["node_id"], row["attempt_no"], row["adjudication"] or ""))
+        lines.append(
+            "  result {}#{} {}".format(
+                row["node_id"], row["attempt_no"], row["adjudication"] or ""
+            )
+        )
         lines.append("    {}".format(json.dumps(row["payload"], sort_keys=True)))
     return "\n".join(lines)
 
@@ -4458,18 +6440,23 @@ def _run_list(args: argparse.Namespace) -> int:
     reader = _open_reader(args.db)
     try:
         records = reader.runs(wanted)
-        rows = [{"run_id": record.run_id,
-                 "plan_name": names.get(record.plan_digest),
-                 "plan_digest": record.plan_digest,
-                 "created_at": record.created_at,
-                 "last_transition_at": record.last_transition_at,
-                 "declared_outcome": (record.latest_outcome.value
-                                      if record.latest_outcome else None),
-                 "cancel_requested": record.cancel_requested,
-                 "scheduler_pid": record.scheduler_pid,
-                 "scheduler_alive": lc.scheduler_liveness(record),
-                 "state": _live_state(record, reader.nodes(record.run_id))}
-                for record in records]
+        rows = [
+            {
+                "run_id": record.run_id,
+                "plan_name": names.get(record.plan_digest),
+                "plan_digest": record.plan_digest,
+                "created_at": record.created_at,
+                "last_transition_at": record.last_transition_at,
+                "declared_outcome": (
+                    record.latest_outcome.value if record.latest_outcome else None
+                ),
+                "cancel_requested": record.cancel_requested,
+                "scheduler_pid": record.scheduler_pid,
+                "scheduler_alive": lc.scheduler_liveness(record),
+                "state": _live_state(record, reader.nodes(record.run_id)),
+            }
+            for record in records
+        ]
     finally:
         reader.close()
     if getattr(args, "as_json", False):
@@ -4478,35 +6465,31 @@ def _run_list(args: argparse.Namespace) -> int:
     if not rows:
         print("no runs")
         return 0
-    print("{:<40} {:<28} {:<11} {:<11} {}".format(
-        "RUN", "PLAN", "STATE", "DECLARED", "STARTED"))
+    print(
+        "{:<40} {:<28} {:<11} {:<11} {}".format(
+            "RUN", "PLAN", "STATE", "DECLARED", "STARTED"
+        )
+    )
     for row in rows:
-        print("{:<40} {:<28} {:<11} {:<11} {}".format(
-            row["run_id"], (row["plan_name"] or row["plan_digest"][:12])[:28],
-            row["state"], row["declared_outcome"] or "-", row["created_at"]))
+        print(
+            "{:<40} {:<28} {:<11} {:<11} {}".format(
+                row["run_id"],
+                (row["plan_name"] or row["plan_digest"][:12])[:28],
+                row["state"],
+                row["declared_outcome"] or "-",
+                row["created_at"],
+            )
+        )
     return 0
 
 
 def _run_convergence(args: argparse.Namespace) -> int:
-    """Findings-per-attempt per lane, for any run the ledger holds (#30, #107).
+    """Findings per immutable candidate, from the durable review ledger.
 
-    The scheduler prints this series when a run ends in the process that ran
-    it. That is the only place it has ever existed, so a run that was resumed,
-    cancelled, or simply read the next morning could not be asked whether its
-    reviewers were converging — and `execution.review_ceiling` was sized by
-    hand from three lanes somebody happened to still have on screen.
-
-    This was documented as being "for a run that has already finished", and the
-    verdicts were written as though that were enforced. It is not: nothing
-    refuses the verb against a live run, and an operator watching one was told
-    "not converged — run ended first" about a lane that was RUNNING on its
-    fourth attempt (#107). So the run's own liveness is derived here, where the
-    `runs` row is in hand, and handed to the profile — `lc.run_in_flight` over
-    the same record and node rows `_live_state` reads, not a second rule about
-    what "finished" means (§10.6).
-
-    Same reader, same tables, same query path as `run status` (§10.6). It
-    writes nothing and decides nothing; the ledger it opens is `mode=ro`.
+    The scheduler report also carries this series for the process that ended a
+    run. This command rebuilds it from ``lane_candidates`` and
+    ``candidate_reviews``, so resume, process exit, and stale attempt extras
+    cannot change the answer.
     """
     if not getattr(args, "db", None):
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
@@ -4518,10 +6501,13 @@ def _run_convergence(args: argparse.Namespace) -> int:
         # scheduler is still writing to.
         nodes = reader.nodes(record.run_id)
         profile = review_convergence.run_convergence(
-            record.run_id, nodes,
-            reader.attempts(record.run_id), reader.transitions(record.run_id),
+            record.run_id,
+            nodes,
+            reader.lane_candidates(record.run_id, limit=10_000),
+            reader.candidate_reviews(record.run_id, limit=10_000),
             review_ceiling=getattr(args, "review_ceiling", None),
-            in_flight=lc.run_in_flight(record, nodes))
+            in_flight=lc.run_in_flight(record, nodes),
+        )
     finally:
         reader.close()
     if getattr(args, "as_json", False):
@@ -4532,17 +6518,12 @@ def _run_convergence(args: argparse.Namespace) -> int:
 
 
 def _run_findings(args: argparse.Namespace) -> int:
-    """Merged nodes that carried rejecting findings, for any run the ledger holds.
+    """Rejected candidate findings, read from the durable review ledger.
 
-    The scheduler prints ``review_findings`` once, in the process-exit JSON.
-    After that process is gone the findings still sit on the attempt row and
-    on disk, and nothing read them — so a run could declare ACCEPTED with
-    BLOCKING findings on every merged lane and an operator the next morning
-    had no verb that would say so.
-
-    Same reader, same tables, same query path as ``run status`` (§10.6). It
-    writes nothing and decides nothing; the ledger it opens is ``mode=ro``.
-    Findings never fail an attempt, block a node, or stop a merge (§19 M35).
+    Each entry is keyed by derived review node and immutable candidate SHA.
+    Earlier rejections remain visible after a descendant passes; only the
+    matching PASS candidate can authorize merge. Legacy attempt guidance is
+    audit-only and is not consulted by this command.
     """
     if not getattr(args, "db", None):
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
@@ -4550,10 +6531,12 @@ def _run_findings(args: argparse.Namespace) -> int:
     try:
         record = _select_run(reader, args)
         profile = review_findings.run_findings(
-            record.run_id, reader.nodes(record.run_id),
-            reader.attempts(record.run_id),
-            declared_outcome=(record.latest_outcome.value
-                              if record.latest_outcome else None))
+            record.run_id,
+            reader.candidate_reviews(record.run_id, limit=10_000),
+            declared_outcome=(
+                record.latest_outcome.value if record.latest_outcome else None
+            ),
+        )
     finally:
         reader.close()
     if getattr(args, "as_json", False):
@@ -4561,7 +6544,6 @@ def _run_findings(args: argparse.Namespace) -> int:
     else:
         print(review_findings.render(profile))
     return 0
-
 
 
 def _run_pause(args: argparse.Namespace) -> int:
@@ -4593,30 +6575,51 @@ def _run_pause(args: argparse.Namespace) -> int:
     finally:
         reader.close()
     if not pid or alive is not True:
-        print(json.dumps({
-            "outcome": "ALREADY_STOPPED", "run_id": run_id,
-            "scheduler_pid": pid, "scheduler_alive": alive,
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "outcome": "ALREADY_STOPPED",
+                    "run_id": run_id,
+                    "scheduler_pid": pid,
+                    "scheduler_alive": alive,
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     if target is None:
         return _refusal(
             "PAUSE_PID_UNPROVEN",
             "recorded scheduler pid {0} exists but is not proven to be "
-            "the process that claimed this run".format(pid))
+            "the process that claimed this run".format(pid),
+        )
     try:
         os.kill(target, signal.SIGINT)
     except ProcessLookupError:
-        print(json.dumps({
-            "outcome": "ALREADY_STOPPED", "run_id": run_id,
-            "scheduler_pid": pid, "scheduler_alive": False,
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "outcome": "ALREADY_STOPPED",
+                    "run_id": run_id,
+                    "scheduler_pid": pid,
+                    "scheduler_alive": False,
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     except OSError as exc:
         return _refusal("PAUSE_SIGNAL_FAILED", str(exc))
-    print(json.dumps({
-        "outcome": "PAUSE_REQUESTED", "run_id": run_id,
-        "scheduler_pid": target,
-    }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "outcome": "PAUSE_REQUESTED",
+                "run_id": run_id,
+                "scheduler_pid": target,
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -4643,11 +6646,14 @@ def _run_cancel(args: argparse.Namespace) -> int:
     store = lc.LifecycleStore(args.db)
     try:
         outcome = store.latest_outcome(run_id)
-        if outcome in (scheduler_types.RunOutcome.ACCEPTED,
-                       scheduler_types.RunOutcome.CANCELLED):
+        if outcome in (
+            scheduler_types.RunOutcome.ACCEPTED,
+            scheduler_types.RunOutcome.CANCELLED,
+        ):
             return _refusal(
                 "RUN_ALREADY_TERMINAL",
-                "{0} already declared {1}".format(run_id, outcome.value))
+                "{0} already declared {1}".format(run_id, outcome.value),
+            )
         # Named before the discard, not after: this is work that reached a
         # measured predicate and is about to stop being reachable, and the
         # operator is the only one who can decide that is acceptable.
@@ -4657,16 +6663,24 @@ def _run_cancel(args: argparse.Namespace) -> int:
                 "cancel --discard will make these completed attempts "
                 "unreachable through Maestro (§7.3): "
                 + ", ".join(
-                    "{0} ({1})".format(row["node_id"], row["why"])
-                    for row in adoptable),
-                file=sys.stderr)
+                    "{0} ({1})".format(row["node_id"], row["why"]) for row in adoptable
+                ),
+                file=sys.stderr,
+            )
         store.cancel_run(run_id, cause=scheduler_types.CancelCause.DISCARDED)
         store.declare_outcome(
-            run_id, cancel_cause=scheduler_types.CancelCause.DISCARDED)
-        print(json.dumps({
-            "outcome": "CANCELLED", "run_id": run_id,
-            "unreachable": list(adoptable),
-        }, sort_keys=True))
+            run_id, cancel_cause=scheduler_types.CancelCause.DISCARDED
+        )
+        print(
+            json.dumps(
+                {
+                    "outcome": "CANCELLED",
+                    "run_id": run_id,
+                    "unreachable": list(adoptable),
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     finally:
         store.close()
@@ -4687,12 +6701,16 @@ def _run_resume(args: argparse.Namespace) -> int:
         return _refusal("RUN_CONFIGURATION_REQUIRED", str(exc))
     except _PlanReceiptVerificationError as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
-    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-            finalization.SignatureInvalid) as exc:
+    except (
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+    ) as exc:
         return _refusal("RECEIPT_VERIFICATION_FAILED", str(exc))
     except Exception as exc:
-        return _refusal("RUN_EXECUTION_FAILED",
-                        "{0}: {1}".format(type(exc).__name__, exc))
+        return _refusal(
+            "RUN_EXECUTION_FAILED", "{0}: {1}".format(type(exc).__name__, exc)
+        )
 
 
 def _escape(args: argparse.Namespace) -> int:
@@ -4701,11 +6719,19 @@ def _escape(args: argparse.Namespace) -> int:
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
     try:
         if args.command == "retry":
-            row = store.retry(args.run_id, args.node_id, force=args.force,
-                              grant=getattr(args, "grant", 0) or 0)
+            row = store.retry(
+                args.run_id,
+                args.node_id,
+                force=args.force,
+                grant=getattr(args, "grant", 0) or 0,
+            )
         elif args.command == "skip":
-            row = store.skip(args.run_id, args.node_id,
-                             accept_sha=args.accept_sha, repo_path=args.repo)
+            row = store.skip(
+                args.run_id,
+                args.node_id,
+                accept_sha=args.accept_sha,
+                repo_path=args.repo,
+            )
         else:
             row = store.abandon(args.run_id, args.node_id)
         print(json.dumps({"node_id": row.node_id, "state": row.state.value}))
@@ -4717,31 +6743,35 @@ def _escape(args: argparse.Namespace) -> int:
 def _parse_salvage_seed(value: object) -> bytes:
     if not value:
         raise salvage.SalvageRefused(
-            "SALVAGE_SIGNING_REQUIRED",
-            "--signing-seed is required")
+            "SALVAGE_SIGNING_REQUIRED", "--signing-seed is required"
+        )
     try:
         seed = bytes.fromhex(str(value))
     except (TypeError, ValueError) as exc:
         raise salvage.SalvageRefused(
-            "SALVAGE_SIGNING_REQUIRED",
-            "signing seed must be hexadecimal") from exc
+            "SALVAGE_SIGNING_REQUIRED", "signing seed must be hexadecimal"
+        ) from exc
     if len(seed) != receipt_crypto.SEED_SIZE:
         raise salvage.SalvageRefused(
-            "SALVAGE_SIGNING_REQUIRED",
-            "signing seed must be a 32-byte Ed25519 seed")
+            "SALVAGE_SIGNING_REQUIRED", "signing seed must be a 32-byte Ed25519 seed"
+        )
     return seed
 
 
 def _attempt_salvage(args: argparse.Namespace) -> int:
-    missing = [flag for flag, value in (
-        ("--worktrees-root", getattr(args, "worktrees_root", None)),
-        ("--scratch-root", getattr(args, "scratch_root", None)),
-    ) if not value]
+    missing = [
+        flag
+        for flag, value in (
+            ("--worktrees-root", getattr(args, "worktrees_root", None)),
+            ("--scratch-root", getattr(args, "scratch_root", None)),
+        )
+        if not value
+    ]
     if missing:
         return _refusal(
             "RUN_CONFIGURATION_REQUIRED",
-            " and ".join(missing) + " is required outside a configured "
-            "repository")
+            " and ".join(missing) + " is required outside a configured repository",
+        )
     store = _store(args)
     if store is None:
         return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
@@ -4759,23 +6789,30 @@ def _attempt_salvage(args: argparse.Namespace) -> int:
             signing_seed=_parse_salvage_seed(args.signing_seed),
             record_dir=Path(args.record_dir),
         )
-        print(json.dumps({
-            "outcome": "SALVAGED",
-            "run_id": result.run_id,
-            "node_id": result.node_id,
-            "attempt_no": result.attempt_no,
-            "base_sha": result.base_sha,
-            "output_sha": result.output_sha,
-            "record": str(result.record_path),
-            "files": list(result.files),
-            # Printed on every salvage, including the empty and the unknown
-            # case, because an operator reading only the happy path is what
-            # this field exists to prevent: `[]` says no declared output was
-            # left behind, `null` says nobody could tell (#67).
-            "uncommittable_outputs": (
-                None if result.uncommittable_outputs is None
-                else list(result.uncommittable_outputs)),
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "outcome": "SALVAGED",
+                    "run_id": result.run_id,
+                    "node_id": result.node_id,
+                    "attempt_no": result.attempt_no,
+                    "base_sha": result.base_sha,
+                    "output_sha": result.output_sha,
+                    "record": str(result.record_path),
+                    "files": list(result.files),
+                    # Printed on every salvage, including the empty and the unknown
+                    # case, because an operator reading only the happy path is what
+                    # this field exists to prevent: `[]` says no declared output was
+                    # left behind, `null` says nobody could tell (#67).
+                    "uncommittable_outputs": (
+                        None
+                        if result.uncommittable_outputs is None
+                        else list(result.uncommittable_outputs)
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
         return 0
     except salvage.SalvageRefused as exc:
         payload = {"outcome": exc.outcome}
@@ -4787,14 +6824,13 @@ def _attempt_salvage(args: argparse.Namespace) -> int:
         store.close()
 
 
-
 def _plan_contract_layout() -> Dict[str, Any]:
     """The repository layout the plan-contract pipeline derives every path from."""
     config_path = _installed_config_path()
     if not config_path.is_file():
         raise _MaestroConfigurationError(
-            "the plan pipeline requires an installed "
-            + str(_MAESTRO_CONFIG_FILE))
+            "the plan pipeline requires an installed " + str(_MAESTRO_CONFIG_FILE)
+        )
     return _load_maestro_layout(config_path.parent.parent.resolve(), config_path)
 
 
@@ -4803,17 +6839,16 @@ def _plan_contract_path(layout: Dict[str, Any], name: str, suffix: str) -> Path:
     path = (layout["plans_dir"] / (_named_plan_name(name) + suffix)).resolve()
     if not _path_is_within(path, layout["plans_dir"]):
         raise _MaestroConfigurationError(
-            "plan contract artifact resolves outside plans_dir")
+            "plan contract artifact resolves outside plans_dir"
+        )
     return path
 
 
 def _plan_contract_artifacts(layout: Dict[str, Any], name: str) -> Dict[str, Path]:
     return {
         "plan_ir": _plan_contract_path(layout, name, _PLAN_CONTRACT_IR_SUFFIX),
-        "rendered": _plan_contract_path(
-            layout, name, _PLAN_CONTRACT_RENDERED_SUFFIX),
-        "receipt": _plan_contract_path(
-            layout, name, _PLAN_CONTRACT_RECEIPT_SUFFIX),
+        "rendered": _plan_contract_path(layout, name, _PLAN_CONTRACT_RENDERED_SUFFIX),
+        "receipt": _plan_contract_path(layout, name, _PLAN_CONTRACT_RECEIPT_SUFFIX),
     }
 
 
@@ -4838,10 +6873,14 @@ def _resolve_planctl(layout: Dict[str, Any]) -> Path:
             return script.resolve()
     raise _MaestroConfigurationError(
         "planctl is unavailable: set plan_contract in "
-        + str(_MAESTRO_CONFIG_FILE) + ", install the plan-contract skill at "
-        + str(_PLAN_CONTRACT_REPOSITORY_SKILL) + ", or export "
-        + _PLAN_CONTRACT_SKILL_ENV + "; searched "
-        + ", ".join(str(_planctl_script(item)) for item in searched))
+        + str(_MAESTRO_CONFIG_FILE)
+        + ", install the plan-contract skill at "
+        + str(_PLAN_CONTRACT_REPOSITORY_SKILL)
+        + ", or export "
+        + _PLAN_CONTRACT_SKILL_ENV
+        + "; searched "
+        + ", ".join(str(_planctl_script(item)) for item in searched)
+    )
 
 
 def _planctl_supports_repo_root(script: Path) -> bool:
@@ -4849,7 +6888,11 @@ def _planctl_supports_repo_root(script: Path) -> bool:
     try:
         completed = subprocess.run(
             [sys.executable, str(script), "validate", "--help"],
-            capture_output=True, text=True, check=False, timeout=120)
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
     except (OSError, subprocess.SubprocessError):
         return False
     return "--repo-root" in (completed.stdout or "") + (completed.stderr or "")
@@ -4863,9 +6906,11 @@ def _planctl_repo_root(layout: Dict[str, Any], script: Path) -> Optional[Path]:
     if layout["plans_dir"] != repo:
         raise _MaestroConfigurationError(
             "the installed planctl has no --repo-root, so a Plan IR must sit at "
-            "the repository root, but plans_dir is " + str(layout["plans_dir"])
+            "the repository root, but plans_dir is "
+            + str(layout["plans_dir"])
             + "; install a planctl that supports --repo-root or set plans_dir "
-            "to the repository root")
+            "to the repository root"
+        )
     return None
 
 
@@ -4879,8 +6924,9 @@ def _reviewer_key_environment_names(layout: Dict[str, Any]) -> Tuple[str, ...]:
 
 
 def _reviewer_keys_in_environment(layout: Dict[str, Any]) -> Tuple[str, ...]:
-    return tuple(name for name in _reviewer_key_environment_names(layout)
-                 if os.environ.get(name))
+    return tuple(
+        name for name in _reviewer_key_environment_names(layout) if os.environ.get(name)
+    )
 
 
 def _reviewer_hmac_key_file(layout: Dict[str, Any]) -> Path:
@@ -4894,13 +6940,18 @@ def _existing_reviewer_hmac_key(path: Path) -> str:
         raise _MaestroConfigurationError(
             "the reviewer key at " + str(path) + " is unreadable; it is not "
             "replaced, because that would invalidate every receipt already "
-            "signed with it") from exc
+            "signed with it"
+        ) from exc
     if len(existing.encode("utf-8")) < _REVIEWER_HMAC_KEY_MINIMUM_BYTES:
         raise _MaestroConfigurationError(
-            "the reviewer key at " + str(path) + " is shorter than "
-            + str(_REVIEWER_HMAC_KEY_MINIMUM_BYTES) + " bytes; it is not "
+            "the reviewer key at "
+            + str(path)
+            + " is shorter than "
+            + str(_REVIEWER_HMAC_KEY_MINIMUM_BYTES)
+            + " bytes; it is not "
             "regenerated, because that would invalidate every receipt already "
-            "signed with it")
+            "signed with it"
+        )
     return existing
 
 
@@ -4919,12 +6970,16 @@ def _minted_reviewer_hmac_key(layout: Dict[str, Any]) -> str:
     if _path_is_within(path, layout["repo"]):
         raise _MaestroConfigurationError(
             "the reviewer key would be stored inside the repository at "
-            + str(path) + "; state_root must resolve outside the repository")
+            + str(path)
+            + "; state_root must resolve outside the repository"
+        )
     for ancestor in (path.parent, *path.parent.parents):
         if (ancestor / ".git").exists():
             raise _MaestroConfigurationError(
                 "the reviewer key would be stored inside the git work tree at "
-                + str(ancestor) + "; point state_root outside every repository")
+                + str(ancestor)
+                + "; point state_root outside every repository"
+            )
     if path.exists():
         return _existing_reviewer_hmac_key(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4932,19 +6987,21 @@ def _minted_reviewer_hmac_key(layout: Dict[str, Any]) -> str:
     minted = secrets.token_hex(_REVIEWER_HMAC_KEY_MINTED_BYTES)
     try:
         descriptor = os.open(
-            str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            stat.S_IRUSR | stat.S_IWUSR)
+            str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR
+        )
     except FileExistsError:
         return _existing_reviewer_hmac_key(path)
     except OSError as exc:
         raise _MaestroConfigurationError(
-            "cannot create the reviewer key at " + str(path)) from exc
+            "cannot create the reviewer key at " + str(path)
+        ) from exc
     try:
         with os.fdopen(descriptor, "w", encoding="ascii") as handle:
             handle.write(minted + "\n")
     except OSError as exc:
         raise _MaestroConfigurationError(
-            "cannot write the reviewer key at " + str(path)) from exc
+            "cannot write the reviewer key at " + str(path)
+        ) from exc
     return minted
 
 
@@ -4955,8 +7012,11 @@ def _reviewer_hmac_key(layout: Dict[str, Any]) -> str:
         if supplied:
             if len(supplied.encode("utf-8")) < _REVIEWER_HMAC_KEY_MINIMUM_BYTES:
                 raise _MaestroEnvironmentError(
-                    name + " must carry at least "
-                    + str(_REVIEWER_HMAC_KEY_MINIMUM_BYTES) + " bytes")
+                    name
+                    + " must carry at least "
+                    + str(_REVIEWER_HMAC_KEY_MINIMUM_BYTES)
+                    + " bytes"
+                )
             return supplied
     return _minted_reviewer_hmac_key(layout)
 
@@ -4998,11 +7058,16 @@ class _PlanPane:
 
     def _call(self, *args: str) -> Dict[str, Any]:
         result = subprocess.run(
-            [self._herdr, *args], capture_output=True, text=True,
-            check=False, timeout=30.0)
+            [self._herdr, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30.0,
+        )
         if result.returncode != 0:
             raise RuntimeError(
-                (result.stderr or result.stdout or "herdr failed").strip()[-200:])
+                (result.stderr or result.stdout or "herdr failed").strip()[-200:]
+            )
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError:
@@ -5013,33 +7078,40 @@ class _PlanPane:
         """Prove the pane exists before a single artifact is written."""
         try:
             payload = self._call(
-                "pane", "split", "--current", "--direction", "right",
-                "--cwd", str(self._cwd), "--no-focus")
+                "pane",
+                "split",
+                "--current",
+                "--direction",
+                "right",
+                "--cwd",
+                str(self._cwd),
+                "--no-focus",
+            )
             container = payload.get("result", payload)
             pane = container.get("pane") if isinstance(container, dict) else None
             if not isinstance(pane, dict) or not pane.get("pane_id"):
                 raise RuntimeError("herdr opened no pane")
             pane_id = str(pane["pane_id"])
-        except (OSError, RuntimeError, ValueError,
-                subprocess.SubprocessError) as exc:
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             raise _PlanPaneUnavailable(
-                "no visible Herdr pane (" + (str(exc) or type(exc).__name__)
+                "no visible Herdr pane ("
+                + (str(exc) or type(exc).__name__)
                 + "); start Herdr and rerun, or fix executables.herdr in "
                 + str(_MAESTRO_CONFIG_FILE)
-                + ". Nothing was rendered, reviewed, or authored.") from exc
+                + ". Nothing was rendered, reviewed, or authored."
+            ) from exc
         try:
             self._log.parent.mkdir(parents=True, exist_ok=True)
             self._log.write_text("", encoding="utf-8")
-            self._call("pane", "run", pane_id, "tail", "-n", "+1", "-f",
-                       str(self._log))
-        except (OSError, RuntimeError, ValueError,
-                subprocess.SubprocessError) as exc:
+            self._call("pane", "run", pane_id, "tail", "-n", "+1", "-f", str(self._log))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             self.pane_id = pane_id
             self.close()
             raise _PlanPaneUnavailable(
                 "the Herdr pane could not stream this step ("
                 + (str(exc) or type(exc).__name__)
-                + "). Nothing was rendered, reviewed, or authored.") from exc
+                + "). Nothing was rendered, reviewed, or authored."
+            ) from exc
         self.pane_id = pane_id
         self._reported_pane = pane_id
 
@@ -5065,14 +7137,19 @@ class _PlanPane:
 
 
 def _plan_step_log(layout: Dict[str, Any], name: str, verb: str) -> Path:
-    return (Path(layout["repository_state"]) / "plan-contract" / name
-            / (verb + ".log"))
+    return Path(layout["repository_state"]) / "plan-contract" / name / (verb + ".log")
 
 
 def _planctl_run(
-        script: Path, layout: Dict[str, Any], repo_root: Optional[Path],
-        verb: str, plan_ir: Path, arguments: Sequence[str], *,
-        log: Path, reviewer_key: Optional[str] = None
+    script: Path,
+    layout: Dict[str, Any],
+    repo_root: Optional[Path],
+    verb: str,
+    plan_ir: Path,
+    arguments: Sequence[str],
+    *,
+    log: Path,
+    reviewer_key: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """One planctl step, streamed into the pane's log, key in the environment only."""
     command = [sys.executable, str(script), verb, str(plan_ir)]
@@ -5090,12 +7167,18 @@ def _planctl_run(
     before = log.stat().st_size if log.is_file() else 0
     try:
         completed = launcher.run_harness_process(
-            argv, cwd=layout["repo"], env=environment)
-    except (launcher.HarnessCancelled, launcher.HarnessQuiescenceError,
-            TimeoutError, OSError) as exc:
+            argv, cwd=layout["repo"], env=environment
+        )
+    except (
+        launcher.HarnessCancelled,
+        launcher.HarnessQuiescenceError,
+        TimeoutError,
+        OSError,
+    ) as exc:
         return subprocess.CompletedProcess(argv, 1, "", str(exc))
     return subprocess.CompletedProcess(
-        argv, completed.returncode, _log_tail(log, before), completed.stderr or "")
+        argv, completed.returncode, _log_tail(log, before), completed.stderr or ""
+    )
 
 
 def _log_tail(log: Path, offset: int) -> str:
@@ -5108,8 +7191,12 @@ def _log_tail(log: Path, offset: int) -> str:
 
 
 def _plan_contract_step_failure(
-        outcome: str, step: str, completed: subprocess.CompletedProcess,
-        pane: Dict[str, Any], secret: Optional[str] = None) -> int:
+    outcome: str,
+    step: str,
+    completed: subprocess.CompletedProcess,
+    pane: Dict[str, Any],
+    secret: Optional[str] = None,
+) -> int:
     """Name the step that failed and hand back planctl's diagnostics verbatim."""
     payload = {
         "outcome": outcome,
@@ -5124,11 +7211,17 @@ def _plan_contract_step_failure(
 
 
 def _run_plan_contract(
-        args: argparse.Namespace, verb: str,
-        steps: Sequence[Tuple[str, Sequence[str]]], *, outcome: str,
-        failure: str, plan_ir: Path, layout: Dict[str, Any],
-        reviewer_key: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None) -> int:
+    args: argparse.Namespace,
+    verb: str,
+    steps: Sequence[Tuple[str, Sequence[str]]],
+    *,
+    outcome: str,
+    failure: str,
+    plan_ir: Path,
+    layout: Dict[str, Any],
+    reviewer_key: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> int:
     """Run planctl steps in order in a visible pane, stopping at the first failure."""
     # Fail closed before any step runs: no pane, no work, no artifacts left over.
     pane = _PlanPane(layout, _plan_step_log(layout, args.plan_name, verb))
@@ -5139,11 +7232,19 @@ def _run_plan_contract(
         for step, arguments in steps:
             pane.note("$ planctl " + step + " " + plan_ir.name)
             completed = _planctl_run(
-                script, layout, repo_root, step, plan_ir, arguments,
-                log=pane.log, reviewer_key=reviewer_key)
+                script,
+                layout,
+                repo_root,
+                step,
+                plan_ir,
+                arguments,
+                log=pane.log,
+                reviewer_key=reviewer_key,
+            )
             if completed.returncode != 0:
                 return _plan_contract_step_failure(
-                    failure, step, completed, pane.report(), reviewer_key)
+                    failure, step, completed, pane.report(), reviewer_key
+                )
     finally:
         pane.close()
     payload = {
@@ -5168,20 +7269,27 @@ def _plan_gate(args: argparse.Namespace) -> int:
             "REVIEWER_KEY_PRESENT",
             "plan gate refuses to run while the reviewer key is in its "
             "environment (" + ", ".join(held) + " is set); the author side must "
-            "not hold the key that authorizes its own plan")
+            "not hold the key that authorizes its own plan",
+        )
     artifacts = _plan_contract_artifacts(layout, args.plan_name)
     plan_ir = artifacts["plan_ir"]
     if not plan_ir.is_file():
-        return _refusal(
-            "PLAN_CONTRACT_IR_MISSING", "no Plan IR at " + str(plan_ir))
+        return _refusal("PLAN_CONTRACT_IR_MISSING", "no Plan IR at " + str(plan_ir))
     rendered = artifacts["rendered"]
     return _run_plan_contract(
-        args, "gate", (
+        args,
+        "gate",
+        (
             ("render", ("--out", str(rendered))),
             ("validate", ("--rendered", str(rendered))),
             ("mutate", ("--rendered", str(rendered))),
-        ), outcome="PLAN_GATED", failure="PLAN_GATE_FAILED",
-        plan_ir=plan_ir, layout=layout, extra={"rendered": str(rendered)})
+        ),
+        outcome="PLAN_GATED",
+        failure="PLAN_GATE_FAILED",
+        plan_ir=plan_ir,
+        layout=layout,
+        extra={"rendered": str(rendered)},
+    )
 
 
 def _plan_review(args: argparse.Namespace) -> int:
@@ -5190,35 +7298,67 @@ def _plan_review(args: argparse.Namespace) -> int:
     artifacts = _plan_contract_artifacts(layout, args.plan_name)
     plan_ir = artifacts["plan_ir"]
     if not plan_ir.is_file():
-        return _refusal(
-            "PLAN_CONTRACT_IR_MISSING", "no Plan IR at " + str(plan_ir))
+        return _refusal("PLAN_CONTRACT_IR_MISSING", "no Plan IR at " + str(plan_ir))
     rendered = artifacts["rendered"]
     if not rendered.is_file():
         return _refusal(
             "PLAN_CONTRACT_RENDER_MISSING",
-            "no rendered plan at " + str(rendered)
-            + "; run: maestro plan gate " + args.plan_name)
+            "no rendered plan at "
+            + str(rendered)
+            + "; run: maestro plan gate "
+            + args.plan_name,
+        )
     reviewer = layout["reviewer"]
     missing = [key for key in ("id", "vendor") if not reviewer.get(key)]
     if missing:
         return _refusal(
             "REVIEWER_IDENTITY_UNCONFIGURED",
-            "reviewer." + " and reviewer.".join(missing) + " must be set in "
-            + str(_MAESTRO_CONFIG_FILE))
+            "reviewer."
+            + " and reviewer.".join(missing)
+            + " must be set in "
+            + str(_MAESTRO_CONFIG_FILE),
+        )
     receipt = artifacts["receipt"]
     return _run_plan_contract(
-        args, "review", (
-            ("review", ("--rendered", str(rendered), "--receipt-out",
-                        str(receipt), "--reviewer", reviewer["id"],
-                        "--reviewer-vendor", reviewer["vendor"])),
-            ("validate", ("--rendered", str(rendered), "--receipt",
-                          str(receipt), "--require-approved")),
-        ), outcome="PLAN_REVIEWED", failure="PLAN_REVIEW_FAILED",
-        plan_ir=plan_ir, layout=layout,
+        args,
+        "review",
+        (
+            (
+                "review",
+                (
+                    "--rendered",
+                    str(rendered),
+                    "--receipt-out",
+                    str(receipt),
+                    "--reviewer",
+                    reviewer["id"],
+                    "--reviewer-vendor",
+                    reviewer["vendor"],
+                ),
+            ),
+            (
+                "validate",
+                (
+                    "--rendered",
+                    str(rendered),
+                    "--receipt",
+                    str(receipt),
+                    "--require-approved",
+                ),
+            ),
+        ),
+        outcome="PLAN_REVIEWED",
+        failure="PLAN_REVIEW_FAILED",
+        plan_ir=plan_ir,
+        layout=layout,
         reviewer_key=_reviewer_hmac_key(layout),
-        extra={"rendered": str(rendered), "receipt": str(receipt),
-               "reviewer": reviewer["id"],
-               "reviewer_vendor": reviewer["vendor"]})
+        extra={
+            "rendered": str(rendered),
+            "receipt": str(receipt),
+            "reviewer": reviewer["id"],
+            "reviewer_vendor": reviewer["vendor"],
+        },
+    )
 
 
 def _plan_author_options() -> Dict[str, str]:
@@ -5236,9 +7376,11 @@ def _plan_author_options() -> Dict[str, str]:
             author = plan_action.choices.get("author")
             if author is None:
                 continue
-            return {option: item.dest
-                    for item in author._actions
-                    for option in item.option_strings}
+            return {
+                option: item.dest
+                for item in author._actions
+                for option in item.option_strings
+            }
     return {}
 
 
@@ -5283,23 +7425,37 @@ def _plan_ship_approved(args: argparse.Namespace) -> Callable[[str], bool]:
     as approved, so an unreadable receipt costs a refusal the operator can act
     on rather than a plan silently replaced out from under a run.
     """
+
     def approved(digest: str) -> bool:
         try:
             store = _plan_receipt_store(
                 _configured_plan_step("finalize", args.plan_name),
-                missing_detail="receipt configuration is required to ship")
-        except (_PlanReceiptConfigurationError, _MaestroConfigurationError,
-                finalization.ReceiptStoreLocationError, OSError, ValueError):
+                missing_detail="receipt configuration is required to ship",
+            )
+        except (
+            _PlanReceiptConfigurationError,
+            _MaestroConfigurationError,
+            finalization.ReceiptStoreLocationError,
+            OSError,
+            ValueError,
+        ):
             # No store means no answer, and no answer means do not replace.
             return True
         try:
             return store.load(digest).verdict is finalization.Verdict.PASS
         except FileNotFoundError:
             return False
-        except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-                finalization.SignatureInvalid, UnicodeError, ValueError,
-                KeyError, OSError):
+        except (
+            finalization.ReceiptInvalid,
+            finalization.SignatureMissing,
+            finalization.SignatureInvalid,
+            UnicodeError,
+            ValueError,
+            KeyError,
+            OSError,
+        ):
             return True
+
     return approved
 
 
@@ -5312,8 +7468,9 @@ def _superseded_plan_path(destination: Path, digest: str) -> Path:
     return destination.parent / "superseded" / digest / destination.name
 
 
-def _plan_ship_authoring(destination: Path, projected: bytes,
-                         approved: Callable[[str], bool]) -> Optional[str]:
+def _plan_ship_authoring(
+    destination: Path, projected: bytes, approved: Callable[[str], bool]
+) -> Optional[str]:
     """Decide what the ship's author step must do, and make room for it.
 
     Returns the digest of a plan that was superseded, or None when nothing was
@@ -5362,8 +7519,8 @@ def _plan_ship_authoring(destination: Path, projected: bytes,
             "`plan finalize` is deterministic, so re-shipping moved bytes "
             "means removing this plan's directory once no live run holds it "
             "(`maestro deliver` does that on a re-ship). `plan set-aside` "
-            "cannot help here: it reopens a FAIL and refuses a PASS."
-            .format(superseded))
+            "cannot help here: it reopens a FAIL and refuses a PASS.".format(superseded)
+        )
     archive = _superseded_plan_path(destination, superseded)
     archive.parent.mkdir(parents=True, exist_ok=True)
     archive.write_bytes(existing)
@@ -5371,8 +7528,7 @@ def _plan_ship_authoring(destination: Path, projected: bytes,
     return superseded
 
 
-def _plan_ship_step_failure(step: str, status: int,
-                            pane: Dict[str, Any]) -> int:
+def _plan_ship_step_failure(step: str, status: int, pane: Dict[str, Any]) -> int:
     payload = {"outcome": "PLAN_SHIP_FAILED", "step": step, "status": status}
     payload.update(pane)
     print(json.dumps(payload, sort_keys=True))
@@ -5389,31 +7545,50 @@ def _plan_ship(args: argparse.Namespace) -> int:
     layout = _plan_contract_layout()
     artifacts = _plan_contract_artifacts(layout, args.plan_name)
     for label, outcome, remedy in (
-            ("plan_ir", "PLAN_CONTRACT_IR_MISSING", ""),
-            ("rendered", "PLAN_CONTRACT_RENDER_MISSING",
-             "; run: maestro plan gate " + args.plan_name),
-            ("receipt", "PLAN_CONTRACT_RECEIPT_MISSING",
-             "; run: maestro plan review " + args.plan_name)):
+        ("plan_ir", "PLAN_CONTRACT_IR_MISSING", ""),
+        (
+            "rendered",
+            "PLAN_CONTRACT_RENDER_MISSING",
+            "; run: maestro plan gate " + args.plan_name,
+        ),
+        (
+            "receipt",
+            "PLAN_CONTRACT_RECEIPT_MISSING",
+            "; run: maestro plan review " + args.plan_name,
+        ),
+    ):
         if not artifacts[label].is_file():
             return _refusal(
-                outcome, "no " + label.replace("_", " ") + " at "
-                + str(artifacts[label]) + remedy)
+                outcome,
+                "no "
+                + label.replace("_", " ")
+                + " at "
+                + str(artifacts[label])
+                + remedy,
+            )
     options = _plan_author_options()
-    required = (_PLAN_CONTRACT_AUTHOR_OPTION, _PLAN_CONTRACT_RECEIPT_OPTION,
-                _PLAN_CONTRACT_RENDERED_OPTION)
+    required = (
+        _PLAN_CONTRACT_AUTHOR_OPTION,
+        _PLAN_CONTRACT_RECEIPT_OPTION,
+        _PLAN_CONTRACT_RENDERED_OPTION,
+    )
     if any(option not in options for option in required):
         return _refusal(
             "PLAN_CONTRACT_INGRESS_UNAVAILABLE",
             "the installed plan author verb has no "
             + _PLAN_CONTRACT_AUTHOR_OPTION
-            + ", so an approved Plan IR cannot be projected onto a Maestro plan")
+            + ", so an approved Plan IR cannot be projected onto a Maestro plan",
+        )
     author_args = _configured_plan_step("author", args.plan_name)
-    setattr(author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION],
-            str(artifacts["plan_ir"]))
-    setattr(author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION],
-            str(artifacts["receipt"]))
-    setattr(author_args, options[_PLAN_CONTRACT_RENDERED_OPTION],
-            str(artifacts["rendered"]))
+    setattr(
+        author_args, options[_PLAN_CONTRACT_AUTHOR_OPTION], str(artifacts["plan_ir"])
+    )
+    setattr(
+        author_args, options[_PLAN_CONTRACT_RECEIPT_OPTION], str(artifacts["receipt"])
+    )
+    setattr(
+        author_args, options[_PLAN_CONTRACT_RENDERED_OPTION], str(artifacts["rendered"])
+    )
 
     destination = Path(author_args.plan_file)
 
@@ -5432,31 +7607,36 @@ def _plan_ship(args: argparse.Namespace) -> int:
         # step's own refusals and are reported as that step failing, not as a
         # ship that never started.
         try:
-            projected, _draft, _ir = (
-                plan_contract_ingress.project_canonical_plan(
-                    artifacts["plan_ir"], artifacts["receipt"],
-                    Path(author_args.repo), artifacts["rendered"]))
-        except (plan_author.AuthoringError,
-                plan_contract_ingress.IngressError) as exc:
+            projected, _draft, _ir = plan_contract_ingress.project_canonical_plan(
+                artifacts["plan_ir"],
+                artifacts["receipt"],
+                Path(author_args.repo),
+                artifacts["rendered"],
+            )
+        except (plan_author.AuthoringError, plan_contract_ingress.IngressError) as exc:
             return _refusal("PLAN_AUTHORING_FAILED", str(exc))
         try:
             superseded = _plan_ship_authoring(
-                destination, projected, _plan_ship_approved(args))
+                destination, projected, _plan_ship_approved(args)
+            )
         except _ShipSupersedeRefused as exc:
             return _refusal("PLAN_SUPERSEDE_REFUSED", str(exc))
         except OSError as exc:
             return _refusal("PLAN_SUPERSEDE_FAILED", str(exc))
         authored_already = destination.exists()
-        steps = (("validate", _plan_validate, None),
-                 ("finalize", _plan_finalize, None))
+        steps = (("validate", _plan_validate, None), ("finalize", _plan_finalize, None))
         if not authored_already:
             steps = (("author", _plan_author, author_args),) + steps
         for step, handler, prepared in steps:
             pane.note("$ maestro plan " + step + " " + args.plan_name)
             with _redirect_stdout(_PaneTee(sys.stdout, pane.log)):
-                status = int(handler(
-                    prepared if prepared is not None
-                    else _configured_plan_step(step, args.plan_name)))
+                status = int(
+                    handler(
+                        prepared
+                        if prepared is not None
+                        else _configured_plan_step(step, args.plan_name)
+                    )
+                )
             if status != 0:
                 return _plan_ship_step_failure(step, status, pane.report())
     finally:
@@ -5489,7 +7669,8 @@ def _deliver_config() -> Dict[str, Any]:
     config_path = _installed_config_path()
     if not config_path.is_file():
         raise _MaestroConfigurationError(
-            "maestro deliver requires an installed " + str(_MAESTRO_CONFIG_FILE))
+            "maestro deliver requires an installed " + str(_MAESTRO_CONFIG_FILE)
+        )
     return _load_maestro_config(config_path.parent.parent.resolve(), config_path)
 
 
@@ -5498,8 +7679,10 @@ def _deliver_author_lane(config: Dict[str, Any]) -> deliver_module.AuthorLane:
     if not configured:
         raise _MaestroConfigurationError(
             "maestro deliver requires an author: block in "
-            + str(_MAESTRO_CONFIG_FILE) + " naming the route, model, effort, "
-            "and timeouts of the authoring lane")
+            + str(_MAESTRO_CONFIG_FILE)
+            + " naming the route, model, effort, "
+            "and timeouts of the authoring lane"
+        )
     return deliver_module.AuthorLane(**configured)
 
 
@@ -5508,12 +7691,14 @@ def _deliver_runner(config: Dict[str, Any]) -> launcher.HerdrLauncher:
     other agent turn. No new trust material is minted for it."""
     route_keys = (bytes.fromhex(config["route_verify_key"]),)
     admitted = route_receipts.load_admitted_routes(
-        dict(config["route_paths"]), verify_keys=route_keys)
+        dict(config["route_paths"]), verify_keys=route_keys
+    )
     return launcher.HerdrLauncher(
         herdr_path=Path(config["executables"]["herdr"]),
         omp_path=Path(config["executables"]["omp"]),
         claude_path=Path(config["executables"]["claude"]),
-        admitted_routes=admitted)
+        admitted_routes=admitted,
+    )
 
 
 def _deliver_close_pane(config: Dict[str, Any], pane_id: Optional[str]) -> None:
@@ -5529,15 +7714,21 @@ def _deliver_close_pane(config: Dict[str, Any], pane_id: Optional[str]) -> None:
     try:
         subprocess.run(
             [config["executables"]["herdr"], "pane", "close", pane_id],
-            capture_output=True, text=True, check=False, timeout=30.0)
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30.0,
+        )
     except (OSError, subprocess.SubprocessError):
         pass
 
 
-def _deliver_author_turn(config: Dict[str, Any],
-                         lane: deliver_module.AuthorLane,
-                         runner: launcher.HerdrLauncher,
-                         session_root: Path):
+def _deliver_author_turn(
+    config: Dict[str, Any],
+    lane: deliver_module.AuthorLane,
+    runner: launcher.HerdrLauncher,
+    session_root: Path,
+):
     """One opus authoring turn, ending when the lane writes its envelope."""
 
     def turn(kind: str, prompt: str, envelope: Path) -> Dict[str, Any]:
@@ -5562,33 +7753,44 @@ def _deliver_author_turn(config: Dict[str, Any],
         # string, and nothing more. It is wrapped so that every `.launch(` in
         # this module goes through one path, which is what lets the structural
         # guard be a flat rule rather than a rule plus an exception.
-        handle = _typed_launch_pane(runner, launcher.LaunchSpec(
-            correlation_token=token, worktree=Path(config["repo"]),
-            prompt_path=prompt_path, envelope_path=envelope,
-            route=lane.route, model=lane.model, effort=lane.effort,
-            profile=lane.profile, session_dir=session_dir,
-            # B13 at the chokepoint, stated here rather than skipped. The
-            # author lane runs the `claude` route, which publishes no model
-            # catalog -- `opus` does not resolve in omp's -- so this resolves
-            # to `None` and `preflight_launch_prompt` makes no comparison.
-            # That is the answer for a route with no declared window: refuse
-            # to invent one, and refuse nothing. It is a property of the route
-            # (`handoff_budget.ROUTES_PUBLISHING_A_WINDOW`), so the day the
-            # route publishes a catalog this site is covered with no edit.
-            context_window_tokens=_route_context_window(lane.route, lane.model),
-            restrict_tools=bool(
-                config.get("execution", {}).get("restrict_actor_tools", False)),
-            environment=worktree.launch_env(
-                session_root / (token + ".scratch"),
-                concurrency=config.get("execution", {}).get("concurrency"))))
+        handle = _typed_launch_pane(
+            runner,
+            launcher.LaunchSpec(
+                correlation_token=token,
+                worktree=Path(config["repo"]),
+                prompt_path=prompt_path,
+                envelope_path=envelope,
+                route=lane.route,
+                model=lane.model,
+                effort=lane.effort,
+                profile=lane.profile,
+                session_dir=session_dir,
+                # B13 at the chokepoint, stated here rather than skipped. The
+                # author lane runs the `claude` route, which publishes no model
+                # catalog -- `opus` does not resolve in omp's -- so this resolves
+                # to `None` and `preflight_launch_prompt` makes no comparison.
+                # That is the answer for a route with no declared window: refuse
+                # to invent one, and refuse nothing. It is a property of the route
+                # (`handoff_budget.ROUTES_PUBLISHING_A_WINDOW`), so the day the
+                # route publishes a catalog this site is covered with no edit.
+                context_window_tokens=_route_context_window(lane.route, lane.model),
+                pane_role="author",
+                restrict_tools=bool(
+                    config.get("execution", {}).get("restrict_actor_tools", False)
+                ),
+                environment=worktree.launch_env(
+                    session_root / (token + ".scratch"),
+                    concurrency=config.get("execution", {}).get("concurrency"),
+                ),
+            ),
+        )
 
         deadline = time.monotonic() + lane.author_timeout_s
         state = None
         try:
             while time.monotonic() < deadline:
                 state = runner.poll(handle)
-                if state.state in (launcher.PollState.EXITED,
-                                   launcher.PollState.GONE):
+                if state.state in (launcher.PollState.EXITED, launcher.PollState.GONE):
                     break
                 time.sleep(lane.poll_interval_s)
         finally:
@@ -5600,18 +7802,22 @@ def _deliver_author_turn(config: Dict[str, Any],
         if not envelope.is_file():
             raise deliver_module.DeliverError(
                 "AUTHOR_LANE_NO_ENVELOPE:{}:{}".format(
-                    kind, state.detail if state is not None else "TIMEOUT"))
+                    kind, state.detail if state is not None else "TIMEOUT"
+                )
+            )
         try:
             payload = json.loads(envelope.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise deliver_module.DeliverError(
-                "AUTHOR_LANE_ENVELOPE_UNPARSED:{}".format(kind)) from exc
+                "AUTHOR_LANE_ENVELOPE_UNPARSED:{}".format(kind)
+            ) from exc
         if not isinstance(payload, dict) or payload.get("success") is not True:
             detail = ""
             if isinstance(payload, dict):
                 detail = str(payload.get("summary") or "")
             raise deliver_module.DeliverError(
-                "AUTHOR_LANE_FAILED:{}:{}".format(kind, detail))
+                "AUTHOR_LANE_FAILED:{}:{}".format(kind, detail)
+            )
         return payload
 
     return turn
@@ -5683,15 +7889,23 @@ def _deliver_shipped(config: Dict[str, Any], name: str) -> bool:
         return False
     try:
         store = finalization.ReceiptStore(
-            str(config["receipt_dir"]), repo_paths=(config["repo"],),
+            str(config["receipt_dir"]),
+            repo_paths=(config["repo"],),
             data_dir=str(config["data_dir"]),
             verify_keys=(bytes.fromhex(config["verify_key"]),),
-            create=False)
+            create=False,
+        )
         receipt = store.load(plan_digest.digest_of(stored))
-    except (finalization.ReceiptInvalid, finalization.SignatureMissing,
-            finalization.SignatureInvalid,
-            finalization.ReceiptStoreLocationError,
-            receipt_crypto.KeyMaterialError, KeyError, OSError, ValueError):
+    except (
+        finalization.ReceiptInvalid,
+        finalization.SignatureMissing,
+        finalization.SignatureInvalid,
+        finalization.ReceiptStoreLocationError,
+        receipt_crypto.KeyMaterialError,
+        KeyError,
+        OSError,
+        ValueError,
+    ):
         return False
     return receipt.verdict is finalization.Verdict.PASS
 
@@ -5709,15 +7923,16 @@ def _deliver_accepted_run(config: Dict[str, Any], name: str) -> Optional[str]:
         return None
     try:
         connection = sqlite3.connect(
-            "file:{}?mode=ro".format(database), uri=True, timeout=5.0)
+            "file:{}?mode=ro".format(database), uri=True, timeout=5.0
+        )
     except sqlite3.Error:
         return None
     try:
         row = connection.execute(
             "SELECT run_id FROM runs WHERE plan_digest=? AND latest_outcome=?"
             " ORDER BY latest_outcome_at DESC LIMIT 1",
-            (plan_digest.digest_of(stored),
-             scheduler_types.RunOutcome.ACCEPTED.value)).fetchone()
+            (plan_digest.digest_of(stored), scheduler_types.RunOutcome.ACCEPTED.value),
+        ).fetchone()
     except sqlite3.Error:
         return None
     finally:
@@ -5743,13 +7958,14 @@ def _deliver_blocked_lanes(config: Dict[str, Any], run_id: str):
             node = store.get_node(run_id, record.node_id)
             if node.state is scheduler_types.NodeState.MERGED:
                 continue
-            rows.append({
-                "lane": record.node_id,
-                "state": node.state.value,
-                "attempt": node.attempt_no,
-                "reason": (node.block_reason.value
-                           if node.block_reason else None),
-            })
+            rows.append(
+                {
+                    "lane": record.node_id,
+                    "state": node.state.value,
+                    "attempt": node.attempt_no,
+                    "reason": (node.block_reason.value if node.block_reason else None),
+                }
+            )
         return tuple(rows)
     except (lc.LifecycleError, sqlite3.Error, KeyError):
         return ()
@@ -5757,8 +7973,7 @@ def _deliver_blocked_lanes(config: Dict[str, Any], run_id: str):
         store.close()
 
 
-def _deliver_release_run(config: Dict[str, Any], name: str,
-                         discard_live: bool = False):
+def _deliver_release_run(config: Dict[str, Any], name: str, discard_live: bool = False):
     """Free the integration branch a previous run's worktree still holds.
 
     Deliberately narrow. `_execute_run` now releases the checkout it added on
@@ -5799,21 +8014,29 @@ def _deliver_release_run(config: Dict[str, Any], name: str,
         return ()
     try:
         released = _reclaim_stranded_integration_worktree(
-            Path(config["repo"]), config["repository_state"] / "runs", branch,
-            config.get("database"), discard_live=discard_live)
+            Path(config["repo"]),
+            config["repository_state"] / "runs",
+            branch,
+            config.get("database"),
+            discard_live=discard_live,
+        )
     except _RunStateStillHeld as held:
         # The escape is named by the verb that offers it. `run start` reaches
         # the same refusal and has no such flag, so the shared message cannot
         # carry one -- an escape an operator cannot type is worse than none.
-        print("RELEASE_REFUSED_RUN_NOT_OVER: " + str(held)
-              + ", or pass --discard-live-runs to discard it deliberately",
-              file=sys.stderr)
+        print(
+            "RELEASE_REFUSED_RUN_NOT_OVER: "
+            + str(held)
+            + ", or pass --discard-live-runs to discard it deliberately",
+            file=sys.stderr,
+        )
         return ()
     return () if released is None else (str(released),)
 
 
-def _plan_runs_not_over(config: Dict[str, Any], name: str
-                        ) -> Tuple[Tuple[str, str], ...]:
+def _plan_runs_not_over(
+    config: Dict[str, Any], name: str
+) -> Tuple[Tuple[str, str], ...]:
     """Runs against these exact plan bytes that an operator can still resume.
 
     Keyed by `plan_digest`, the same join `_deliver_accepted_run` uses, because
@@ -5833,13 +8056,15 @@ def _plan_runs_not_over(config: Dict[str, Any], name: str
     unreadable = (("(unidentified)", "unreadable lifecycle ledger"),)
     try:
         connection = sqlite3.connect(
-            "file:{}?mode=ro".format(database), uri=True, timeout=5.0)
+            "file:{}?mode=ro".format(database), uri=True, timeout=5.0
+        )
     except sqlite3.Error:
         return unreadable
     try:
         rows = connection.execute(
             "SELECT run_id FROM runs WHERE plan_digest=?",
-            (plan_digest.digest_of(stored),)).fetchall()
+            (plan_digest.digest_of(stored),),
+        ).fetchall()
     except sqlite3.Error:
         return unreadable
     finally:
@@ -5853,8 +8078,9 @@ def _plan_runs_not_over(config: Dict[str, Any], name: str
     return tuple(held)
 
 
-def _deliver_remove_plan(config: Dict[str, Any], name: str,
-                         discard_live: bool = False) -> None:
+def _deliver_remove_plan(
+    config: Dict[str, Any], name: str, discard_live: bool = False
+) -> None:
     """`plan author` is create-once, so a re-ship starts from no plan.
 
     Bounded to `plans_dir` by the same check every other derived path uses: a
@@ -5878,18 +8104,20 @@ def _deliver_remove_plan(config: Dict[str, Any], name: str,
     directory = (config["plans_dir"] / _named_plan_name(name)).resolve()
     if not _path_is_within(directory, config["plans_dir"]):
         raise _MaestroConfigurationError(
-            "plan directory resolves outside plans_dir: " + name)
+            "plan directory resolves outside plans_dir: " + name
+        )
     if not discard_live:
         held = _plan_runs_not_over(config, name)
         if held:
             raise deliver_module.DeliverError(
                 "PLAN_BYTES_HELD_BY_RUN: " + name + "'s plan bytes are the "
-                "bytes of " + ", ".join(
-                    run_id + " (" + state + ")" for run_id, state in held)
+                "bytes of "
+                + ", ".join(run_id + " (" + state + ")" for run_id, state in held)
                 + ", which is resumable. Removing the plan directory would "
                 "destroy the digest that run is found by. Resume or cancel "
                 "that run, or pass --discard-live-runs to discard it "
-                "deliberately")
+                "deliberately"
+            )
     if directory.is_dir():
         shutil.rmtree(directory)
 
@@ -5898,16 +8126,21 @@ def _deliver(args: argparse.Namespace) -> int:
     config = _deliver_config()
     lane = _deliver_author_lane(config)
     spec = Path(args.spec)
-    resolved_spec = (spec if spec.is_absolute()
-                     else (Path(config["repo"]) / spec)).resolve()
+    resolved_spec = (
+        spec if spec.is_absolute() else (Path(config["repo"]) / spec)
+    ).resolve()
     if not resolved_spec.is_file():
-        return _refusal("DELIVER_SPEC_MISSING",
-                        "no source document at " + str(resolved_spec))
+        return _refusal(
+            "DELIVER_SPEC_MISSING", "no source document at " + str(resolved_spec)
+        )
     if not _path_is_within(resolved_spec, config["repo"]):
         return _refusal(
             "DELIVER_SPEC_OUTSIDE_REPOSITORY",
             "a source document is pinned by repository-relative path, and "
-            + str(resolved_spec) + " is outside " + str(config["repo"]))
+            + str(resolved_spec)
+            + " is outside "
+            + str(config["repo"]),
+        )
     relative = str(resolved_spec.relative_to(Path(config["repo"]).resolve()))
 
     session_root = config["repository_state"] / "deliver"
@@ -5924,15 +8157,14 @@ def _deliver(args: argparse.Namespace) -> int:
         plan_step=_deliver_plan_step,
         request=args.request or "",
         max_attempts=args.max_attempts,
-        remove_plan_dir=lambda name: _deliver_remove_plan(
-            config, name, discard_live),
+        remove_plan_dir=lambda name: _deliver_remove_plan(config, name, discard_live),
         run_start=None if args.no_run else _deliver_run_start,
         accepted_run=lambda name: _deliver_accepted_run(config, name),
         blocked_lanes=lambda run_id: _deliver_blocked_lanes(config, run_id),
-        release_run=lambda name: _deliver_release_run(
-            config, name, discard_live),
+        release_run=lambda name: _deliver_release_run(config, name, discard_live),
         shipped=lambda name: _deliver_shipped(config, name),
-        ledger_path=session_root / (_deliver_ledger_name(relative)))
+        ledger_path=session_root / (_deliver_ledger_name(relative)),
+    )
     try:
         payload = delivery.run()
     except deliver_module.DeliverError as exc:
@@ -5965,23 +8197,28 @@ def _workspace_refusal(code: str, detail: str) -> int:
 
 
 def _workspace_participants(plan: workspace_model.WorkspacePlan) -> list:
-    return [{
-        "base_commit": spec.base_commit,
-        "mode": spec.mode.value,
-        "plan_digest": spec.plan_digest,
-        "repository_id": spec.repository_id,
-        "target_branch": spec.target_branch,
-    } for spec in plan.repositories]
+    return [
+        {
+            "base_commit": spec.base_commit,
+            "mode": spec.mode.value,
+            "plan_digest": spec.plan_digest,
+            "repository_id": spec.repository_id,
+            "target_branch": spec.target_branch,
+        }
+        for spec in plan.repositories
+    ]
 
 
-def _load_workspace_manifest(args: argparse.Namespace
-                             ) -> Tuple[Path, workspace_model.WorkspacePlan, str]:
+def _load_workspace_manifest(
+    args: argparse.Namespace,
+) -> Tuple[Path, workspace_model.WorkspacePlan, str]:
     manifest_file = Path(args.manifest_file).resolve()
     stored = manifest_file.read_bytes()
     plan = workspace_model.parse_bytes(stored)
     if stored != workspace_canonical.canonicalize_workspace(plan):
         raise _WorkspaceNotCanonical(
-            "workspace manifest must contain canonical WorkspacePlan bytes")
+            "workspace manifest must contain canonical WorkspacePlan bytes"
+        )
     return manifest_file.parent, plan, workspace_digest.digest_of(stored)
 
 
@@ -5990,11 +8227,14 @@ def _hex_material(value: str, label: str) -> bytes:
         material = bytes.fromhex(value)
     except (TypeError, ValueError) as exc:
         raise _WorkspaceConfigurationError(
-            "{0} must be hexadecimal".format(label)) from exc
+            "{0} must be hexadecimal".format(label)
+        ) from exc
     if len(material) != receipt_crypto.PUBLIC_KEY_SIZE:
         raise _WorkspaceConfigurationError(
             "{0} must contain exactly {1} bytes".format(
-                label, receipt_crypto.PUBLIC_KEY_SIZE))
+                label, receipt_crypto.PUBLIC_KEY_SIZE
+            )
+        )
     return material
 
 
@@ -6005,16 +8245,20 @@ def _verify_keys(args: argparse.Namespace) -> Tuple[bytes, ...]:
     return keys
 
 
-def _participant_boundaries(manifest_dir: Path,
-                            plan: workspace_model.WorkspacePlan) -> Tuple[Path, ...]:
+def _participant_boundaries(
+    manifest_dir: Path, plan: workspace_model.WorkspacePlan
+) -> Tuple[Path, ...]:
     return tuple((manifest_dir / spec.path).resolve() for spec in plan.repositories)
 
 
-def _workspace_receipt_store(args: argparse.Namespace, manifest_dir: Path,
-                             plan: workspace_model.WorkspacePlan,
-                             verify_keys: Tuple[bytes, ...], *,
-                             signing_seed: Optional[bytes] = None
-                             ) -> workspace_receipt.WorkspaceReceiptStore:
+def _workspace_receipt_store(
+    args: argparse.Namespace,
+    manifest_dir: Path,
+    plan: workspace_model.WorkspacePlan,
+    verify_keys: Tuple[bytes, ...],
+    *,
+    signing_seed: Optional[bytes] = None,
+) -> workspace_receipt.WorkspaceReceiptStore:
     return workspace_receipt.WorkspaceReceiptStore(
         args.workspace_receipt_dir,
         participant_repos=_participant_boundaries(manifest_dir, plan),
@@ -6025,9 +8269,12 @@ def _workspace_receipt_store(args: argparse.Namespace, manifest_dir: Path,
     )
 
 
-def _plan_receipt_loader(args: argparse.Namespace, manifest_dir: Path,
-                         plan: workspace_model.WorkspacePlan,
-                         verify_keys: Tuple[bytes, ...]):
+def _plan_receipt_loader(
+    args: argparse.Namespace,
+    manifest_dir: Path,
+    plan: workspace_model.WorkspacePlan,
+    verify_keys: Tuple[bytes, ...],
+):
     store = finalization.ReceiptStore(
         args.plan_receipt_dir,
         repo_paths=_participant_boundaries(manifest_dir, plan),
@@ -6045,7 +8292,8 @@ def _plan_receipt_loader(args: argparse.Namespace, manifest_dir: Path,
         store = stores.get(plan_digest)
         if store is None:
             raise FileNotFoundError(
-                "no participant receipt store for {0}".format(plan_digest))
+                "no participant receipt store for {0}".format(plan_digest)
+            )
         return store.load(plan_digest)
 
     return load
@@ -6068,44 +8316,58 @@ def _coordinator_config(args: argparse.Namespace) -> coordinator.CoordinatorConf
 def _publication_projection(intent, steps) -> Dict[str, Any]:
     return {
         "state": None if intent is None else intent.state.value,
-        "targets": [] if intent is None else [{
-            "accepted_sha": target.accepted_sha,
-            "candidate_branch": target.candidate_branch,
-            "expected_base_sha": target.expected_base_sha,
-            "remote_repository": target.remote_repository,
-            "remote_url": target.remote_url,
-            "repository_id": target.repository_id,
-        } for target in intent.targets],
-        "steps": [{
-            "detail": dict(step.detail),
-            "from_state": step.from_state.value,
-            "repository_id": step.repository_id,
-            "step_id": step.step_id,
-            "to_state": step.to_state.value,
-        } for step in steps],
+        "targets": []
+        if intent is None
+        else [
+            {
+                "accepted_sha": target.accepted_sha,
+                "candidate_branch": target.candidate_branch,
+                "expected_base_sha": target.expected_base_sha,
+                "remote_repository": target.remote_repository,
+                "remote_url": target.remote_url,
+                "repository_id": target.repository_id,
+            }
+            for target in intent.targets
+        ],
+        "steps": [
+            {
+                "detail": dict(step.detail),
+                "from_state": step.from_state.value,
+                "repository_id": step.repository_id,
+                "step_id": step.step_id,
+                "to_state": step.to_state.value,
+            }
+            for step in steps
+        ],
     }
 
 
 def _workspace_author(args: argparse.Namespace) -> int:
     try:
         stored = workspace_author.author_from_draft(
-            Path(args.from_file), Path(args.out), Path(args.root))
+            Path(args.from_file), Path(args.out), Path(args.root)
+        )
     except workspace_author.WorkspaceAuthoringError as exc:
         return _workspace_refusal("WORKSPACE_AUTHORING_FAILED", str(exc))
-    _workspace_emit({
-        "digest": workspace_digest.digest_of(stored),
-        "outcome": "WORKSPACE_AUTHORED",
-        "workspace": str(Path(args.out)),
-    })
+    _workspace_emit(
+        {
+            "digest": workspace_digest.digest_of(stored),
+            "outcome": "WORKSPACE_AUTHORED",
+            "workspace": str(Path(args.out)),
+        }
+    )
     return 0
+
 
 def _workspace_validate(args: argparse.Namespace) -> int:
     _manifest_dir, plan, digest = _load_workspace_manifest(args)
-    _workspace_emit({
-        "digest": digest,
-        "outcome": "VALID",
-        "participants": _workspace_participants(plan),
-    })
+    _workspace_emit(
+        {
+            "digest": digest,
+            "outcome": "VALID",
+            "participants": _workspace_participants(plan),
+        }
+    )
     return 0
 
 
@@ -6114,29 +8376,37 @@ def _workspace_finalize(args: argparse.Namespace) -> int:
     verify_keys = _verify_keys(args)
     signing_seed = _hex_material(args.signing_seed, "signing seed")
     store = _workspace_receipt_store(
-        args, manifest_dir, plan, verify_keys, signing_seed=signing_seed)
+        args, manifest_dir, plan, verify_keys, signing_seed=signing_seed
+    )
     receipt = workspace_receipt.finalize(
-        digest, plan, _plan_receipt_loader(args, manifest_dir, plan, verify_keys), store)
-    _workspace_emit({
-        "digest": receipt.workspace_digest,
-        "outcome": "FINALIZED",
-        "participants": [participant.to_mapping() for participant in receipt.participants],
-    })
+        digest, plan, _plan_receipt_loader(args, manifest_dir, plan, verify_keys), store
+    )
+    _workspace_emit(
+        {
+            "digest": receipt.workspace_digest,
+            "outcome": "FINALIZED",
+            "participants": [
+                participant.to_mapping() for participant in receipt.participants
+            ],
+        }
+    )
     return 0
 
 
 def _workspace_execute(args: argparse.Namespace, *, resuming: bool) -> int:
     manifest_dir, plan, digest = _load_workspace_manifest(args)
     verify_keys = _verify_keys(args)
-    receipt = _workspace_receipt_store(args, manifest_dir, plan, verify_keys).load(digest)
+    receipt = _workspace_receipt_store(args, manifest_dir, plan, verify_keys).load(
+        digest
+    )
     store = coordinator_store.CoordinatorStore(args.db)
     try:
         if resuming:
             persisted = store.get_run(args.run_id)
-            if (persisted.workspace_digest != digest or
-                    persisted.workspace != plan):
+            if persisted.workspace_digest != digest or persisted.workspace != plan:
                 raise coordinator.CoordinatorError(
-                    "stored run does not match the exact signed workspace manifest")
+                    "stored run does not match the exact signed workspace manifest"
+                )
         else:
             try:
                 store.get_run(args.run_id)
@@ -6145,7 +8415,9 @@ def _workspace_execute(args: argparse.Namespace, *, resuming: bool) -> int:
             else:
                 raise coordinator_store.RunAlreadyExists(
                     "workspace run {0} already exists; use workspace resume".format(
-                        args.run_id))
+                        args.run_id
+                    )
+                )
         outcome = WorkspaceCoordinator(
             run_id=args.run_id,
             plan=plan,
@@ -6157,12 +8429,14 @@ def _workspace_execute(args: argparse.Namespace, *, resuming: bool) -> int:
             participant_runner=SubprocessParticipantRunner(),
             config=_coordinator_config(args),
         ).run()
-        _workspace_emit({
-            "digest": digest,
-            "outcome": outcome.value,
-            "participants": _workspace_participants(plan),
-            "run_id": args.run_id,
-        })
+        _workspace_emit(
+            {
+                "digest": digest,
+                "outcome": outcome.value,
+                "participants": _workspace_participants(plan),
+                "run_id": args.run_id,
+            }
+        )
         return 0 if outcome is workspace_model.WorkspaceOutcome.ACCEPTED else 2
     finally:
         store.close()
@@ -6187,34 +8461,42 @@ def _workspace_status(args: argparse.Namespace) -> int:
             intent = store.get_publication_intent(args.run_id)
         except coordinator_store.PublicationRefused:
             intent = None
-        _workspace_emit({
-            "outcome": "STATUS",
-            "publication": _publication_projection(intent, steps),
-            "repositories": [{
-                "accepted_sha": record.accepted_sha,
-                "block_reason": record.block_reason,
-                "candidate_branch": record.candidate_branch,
-                "child_run_id": record.child_run_id,
-                "repository_id": record.repository_id,
-                "resolved_path": record.resolved_path,
-                "state": record.state.value,
-            } for record in repositories],
-            "repository_vector": _workspace_participants(run.workspace),
-            "run": {
-                "cancel_requested": run.cancel_requested,
-                "lease_expires_at": run.lease_expires_at,
-                "lease_owner": run.lease_owner,
-                "outcome": None if run.outcome is None else run.outcome.value,
-                "run_id": run.run_id,
-                "workspace_digest": run.workspace_digest,
-                "workspace_id": run.workspace_id,
-            },
-            "gates": [{
-                "detail": dict(gate.detail),
-                "gate_index": gate.gate_index,
-                "passed": gate.passed,
-            } for gate in gates],
-        })
+        _workspace_emit(
+            {
+                "outcome": "STATUS",
+                "publication": _publication_projection(intent, steps),
+                "repositories": [
+                    {
+                        "accepted_sha": record.accepted_sha,
+                        "block_reason": record.block_reason,
+                        "candidate_branch": record.candidate_branch,
+                        "child_run_id": record.child_run_id,
+                        "repository_id": record.repository_id,
+                        "resolved_path": record.resolved_path,
+                        "state": record.state.value,
+                    }
+                    for record in repositories
+                ],
+                "repository_vector": _workspace_participants(run.workspace),
+                "run": {
+                    "cancel_requested": run.cancel_requested,
+                    "lease_expires_at": run.lease_expires_at,
+                    "lease_owner": run.lease_owner,
+                    "outcome": None if run.outcome is None else run.outcome.value,
+                    "run_id": run.run_id,
+                    "workspace_digest": run.workspace_digest,
+                    "workspace_id": run.workspace_id,
+                },
+                "gates": [
+                    {
+                        "detail": dict(gate.detail),
+                        "gate_index": gate.gate_index,
+                        "passed": gate.passed,
+                    }
+                    for gate in gates
+                ],
+            }
+        )
         return 0
     finally:
         store.close()
@@ -6224,11 +8506,13 @@ def _workspace_cancel(args: argparse.Namespace) -> int:
     store = coordinator_store.CoordinatorStore(args.db)
     try:
         run = store.request_cancellation(args.run_id, actor=args.actor)
-        _workspace_emit({
-            "cancel_requested": run.cancel_requested,
-            "outcome": "CANCELLATION_REQUESTED",
-            "run_id": run.run_id,
-        })
+        _workspace_emit(
+            {
+                "cancel_requested": run.cancel_requested,
+                "outcome": "CANCELLATION_REQUESTED",
+                "run_id": run.run_id,
+            }
+        )
         return 0
     finally:
         store.close()
@@ -6239,15 +8523,19 @@ def _workspace_publish(args: argparse.Namespace) -> int:
     try:
         run = store.get_run(args.run_id)
         paths = workspace_runtime.resolve_repository_paths(
-            Path(args.manifest_dir), run.workspace)
+            Path(args.manifest_dir), run.workspace
+        )
         result = WorkspacePublisher(
-            store=store, repository_paths=paths, actor=args.actor).publish(args.run_id)
-        _workspace_emit({
-            "outcome": result.outcome.value,
-            "publication": _publication_projection(result.intent, result.steps),
-            "reason": result.reason,
-            "run_id": result.run_id,
-        })
+            store=store, repository_paths=paths, actor=args.actor
+        ).publish(args.run_id)
+        _workspace_emit(
+            {
+                "outcome": result.outcome.value,
+                "publication": _publication_projection(result.intent, result.steps),
+                "reason": result.reason,
+                "run_id": result.run_id,
+            }
+        )
         return 0 if result.outcome is workspace_model.WorkspaceOutcome.PUBLISHED else 2
     finally:
         store.close()
@@ -6258,15 +8546,19 @@ def _workspace_rollback(args: argparse.Namespace) -> int:
     try:
         run = store.get_run(args.run_id)
         paths = workspace_runtime.resolve_repository_paths(
-            Path(args.manifest_dir), run.workspace)
+            Path(args.manifest_dir), run.workspace
+        )
         result = WorkspacePublisher(
-            store=store, repository_paths=paths, actor=args.actor).rollback(args.run_id)
-        _workspace_emit({
-            "outcome": result.outcome.value,
-            "publication": _publication_projection(result.intent, result.steps),
-            "reason": result.reason,
-            "run_id": result.run_id,
-        })
+            store=store, repository_paths=paths, actor=args.actor
+        ).rollback(args.run_id)
+        _workspace_emit(
+            {
+                "outcome": result.outcome.value,
+                "publication": _publication_projection(result.intent, result.steps),
+                "reason": result.reason,
+                "run_id": result.run_id,
+            }
+        )
         return 0 if result.outcome is workspace_model.WorkspaceOutcome.ACCEPTED else 2
     finally:
         store.close()
@@ -6290,8 +8582,10 @@ _WORKSPACE_ERROR_CODES = (
     (finalization.SignatureInvalid, "SIGNATURE_INVALID"),
     (finalization.SigningKeyUnavailable, "SIGNING_KEY_UNAVAILABLE"),
     (receipt_crypto.KeyMaterialError, "KEY_MATERIAL_ERROR"),
-    (coordinator_store.CoordinatorDatabaseUnavailable,
-     "COORDINATOR_DATABASE_UNAVAILABLE"),
+    (
+        coordinator_store.CoordinatorDatabaseUnavailable,
+        "COORDINATOR_DATABASE_UNAVAILABLE",
+    ),
     (coordinator_store.RunAlreadyExists, "RUN_ALREADY_EXISTS"),
     (coordinator_store.UnknownRun, "UNKNOWN_RUN"),
     (coordinator_store.UnknownRepository, "UNKNOWN_REPOSITORY"),
@@ -6330,8 +8624,15 @@ def _internal_error(exc: BaseException) -> int:
     Exit 2 rather than 3 is preserved: 3 is a refusal Maestro decided on, 2 is
     an error it did not, and collapsing the two would lose the distinction.
     """
-    print(json.dumps({"detail": "{0}: {1}".format(type(exc).__name__, exc),
-                      "outcome": "MAESTRO_INTERNAL_ERROR"}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "detail": "{0}: {1}".format(type(exc).__name__, exc),
+                "outcome": "MAESTRO_INTERNAL_ERROR",
+            },
+            sort_keys=True,
+        )
+    )
     return 2
 
 
@@ -6364,8 +8665,12 @@ def _add_run_execution_options(parser: argparse.ArgumentParser) -> None:
     # so a run with two spent nodes needs one invocation rather than two. One
     # node id per flag, for the reason `--provision` takes one argv word per
     # flag: a comma-separated list is a parser nobody wrote.
-    parser.add_argument("--allow-exhausted-node", action="append",
-                        dest="allow_exhausted_nodes", metavar="NODE_ID")
+    parser.add_argument(
+        "--allow-exhausted-node",
+        action="append",
+        dest="allow_exhausted_nodes",
+        metavar="NODE_ID",
+    )
     parser.add_argument("--environmental-retries", type=int)
     parser.add_argument("--launcher-retries", type=int)
     parser.add_argument("--credential-retries", type=int)
@@ -6405,12 +8710,12 @@ def _add_workspace_receipt_access(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--verify-key", action="append", required=True)
 
+
 def _add_plan_receipt_access(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default=".")
     parser.add_argument("--receipt-dir")
     parser.add_argument("--data-dir")
     parser.add_argument("--verify-key", action="append")
-
 
 
 def _add_workspace_execution_options(parser: argparse.ArgumentParser) -> None:
@@ -6491,16 +8796,18 @@ def build_parser() -> argparse.ArgumentParser:
     deliver = root.add_parser("deliver")
     deliver.add_argument("spec")
     deliver.add_argument("--request", default="")
-    deliver.add_argument("--max-attempts", type=int,
-                         default=deliver_module.MAX_ATTEMPTS)
+    deliver.add_argument(
+        "--max-attempts", type=int, default=deliver_module.MAX_ATTEMPTS
+    )
     deliver.add_argument("--no-run", action="store_true")
     # The operator escape for the two destructive steps inside `deliver`:
     # reclaiming a previous run's integration checkout, and clearing a plan
     # directory before a re-ship. Both refuse while the run they would take
     # state from is resumable; this is how an operator says the discard is
     # what they meant. One flag, because it is one intention (§11.3).
-    deliver.add_argument("--discard-live-runs", action="store_true",
-                         dest="discard_live_runs")
+    deliver.add_argument(
+        "--discard-live-runs", action="store_true", dest="discard_live_runs"
+    )
     deliver.set_defaults(handler=_deliver)
 
     run = root.add_parser("run")
@@ -6528,8 +8835,10 @@ def build_parser() -> argparse.ArgumentParser:
     cancel.add_argument("selector", metavar="PLAN_OR_RUN_ID")
     cancel.add_argument("--run-id")
     cancel.add_argument(
-        "--discard", action="store_true",
-        help="make the run terminal; without this flag, cancel pauses")
+        "--discard",
+        action="store_true",
+        help="make the run terminal; without this flag, cancel pauses",
+    )
     _add_db(cancel)
     cancel.set_defaults(handler=_run_cancel)
     resume = run_sub.add_parser("resume")
@@ -6558,11 +8867,9 @@ def build_parser() -> argparse.ArgumentParser:
         try:
             parsed = int(value)
         except (TypeError, ValueError):
-            raise argparse.ArgumentTypeError(
-                f"grant must be an integer, got {value!r}")
+            raise argparse.ArgumentTypeError(f"grant must be an integer, got {value!r}")
         if parsed < 1:
-            raise argparse.ArgumentTypeError(
-                f"grant must be at least 1, got {parsed}")
+            raise argparse.ArgumentTypeError(f"grant must be at least 1, got {parsed}")
         return parsed
 
     retry = root.add_parser("retry")
@@ -6576,13 +8883,19 @@ def build_parser() -> argparse.ArgumentParser:
     # ambiguous between N and N+1.
     grant_group = retry.add_mutually_exclusive_group()
     grant_group.add_argument(
-        "--force", action="store_true",
-        help="grant one extra attempt beyond the ceiling")
+        "--force",
+        action="store_true",
+        help="grant one extra attempt beyond the ceiling",
+    )
     grant_group.add_argument(
-        "--grant", type=_positive_grant, default=0, metavar="N",
+        "--grant",
+        type=_positive_grant,
+        default=0,
+        metavar="N",
         help="grant N extra attempts beyond the ceiling; a node blocked "
-             "SEMANTIC_BUDGET_EXHAUSTED reports the N it needs as "
-             "semantic_grant_required")
+        "SEMANTIC_BUDGET_EXHAUSTED reports the N it needs as "
+        "semantic_grant_required",
+    )
     _add_db(retry)
     retry.set_defaults(handler=_escape)
     skip = root.add_parser("skip")
@@ -6616,10 +8929,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_db(salvage_cmd)
     salvage_cmd.set_defaults(handler=_attempt_salvage)
 
-
     workspace = root.add_parser("workspace")
-    workspace_sub = workspace.add_subparsers(
-        dest="workspace_command", required=True)
+    workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
 
     workspace_author_cmd = workspace_sub.add_parser("author")
     workspace_author_cmd.add_argument("--from", dest="from_file", required=True)
@@ -6686,8 +8997,10 @@ def parser_verbs(parser: argparse.ArgumentParser) -> Tuple[str, ...]:
                 continue
             for name, child in action.choices.items():
                 path = prefix + (name,)
-                if any(isinstance(item, argparse._SubParsersAction)
-                       for item in child._actions):
+                if any(
+                    isinstance(item, argparse._SubParsersAction)
+                    for item in child._actions
+                ):
                     walk(child, path)
                 else:
                     found.append(" ".join(path))

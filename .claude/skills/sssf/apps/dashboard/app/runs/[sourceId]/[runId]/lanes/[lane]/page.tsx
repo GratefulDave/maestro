@@ -1,4 +1,5 @@
 import { EmptyState } from "@/components/EmptyState";
+import { ReviewLifecycleTable } from "@/components/ReviewLifecycleTable";
 import { RunChrome, loadRunOrBanner } from "@/components/RunFrame";
 import { SourceBanner } from "@/components/SourceBanner";
 import { StatCard } from "@/components/StatCard";
@@ -30,25 +31,39 @@ export default async function RunLanePage({
     );
   }
 
+  const buildNodeId = node.node_id.endsWith("::review")
+    ? node.node_id.slice(0, -"::review".length)
+    : node.kind === "agent"
+      ? node.node_id
+      : null;
+  const authorityState = node.lane_phase ?? node.state;
+  const warningState = ["BLOCKED", "CANCELLED", "REPAIR_HANDOFF", "REPAIRING"].includes(
+    authorityState,
+  );
+
+
   return (
     <RunChrome run={run} runId={runId} sourceId={sourceId}>
       <SourceBanner
-        label={`${node.node_id} · ${node.state}`}
+        label={`${node.node_id} · ${authorityState}`}
         detail={[
           node.block_reason && `block_reason ${node.block_reason}`,
+          node.lane_phase && `node_state ${node.state}`,
           node.cancel_cause && `cancel_cause ${node.cancel_cause}`,
           node.merge_cause && `merge_cause ${node.merge_cause}`,
         ]
           .filter(Boolean)
           .join(" · ") || `attempt ${node.attempt_no}`}
-        tone={node.state === "BLOCKED" || node.state === "CANCELLED" ? "warning" : "info"}
+        tone={warningState ? "warning" : "info"}
       />
       <div className="stat-grid">
         <StatCard label="Kind" value={node.kind ?? "—"} />
+        <StatCard label="Lane phase" value={node.lane_phase ?? "legacy"} />
         <StatCard label="Attempt" value={node.attempt_no} />
         <StatCard label="Outputs" value={node.outputs.length} />
         <StatCard label="Needs" value={node.needs.length} />
       </div>
+      {buildNodeId && <ReviewLifecycleTable run={run} buildNodeId={buildNodeId} />}
       <section className="panel section-panel">
         <div className="section-heading">
           <div>

@@ -15,12 +15,19 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adw_modules import agent_cc, agent_pi, agents
-from adw_modules.data_types import (AgentCall, AgentConfig, GenericOutput,
-                                    Phase, PhaseParams, PiRequest,
-                                    PromptEngineering, SSSFConfig)
+from adw_modules.data_types import (
+    AgentCall,
+    AgentConfig,
+    GenericOutput,
+    Phase,
+    PhaseParams,
+    PiRequest,
+    PromptEngineering,
+    SSSFConfig,
+)
 
 
-FAKE_CLAUDE = r'''#!/usr/bin/env python3
+FAKE_CLAUDE = r"""#!/usr/bin/env python3
 import json
 import os
 import subprocess
@@ -57,7 +64,7 @@ events = json.loads(os.environ.get("FAKE_CLAUDE_EVENTS", json.dumps(default)))
 for event in events:
     print(json.dumps(event), flush=True)
 sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT", "0")))
-'''
+"""
 
 
 class DirectClaudeRouteContract(unittest.TestCase):
@@ -71,9 +78,13 @@ class DirectClaudeRouteContract(unittest.TestCase):
         os.environ["CLAUDE_PATH"] = str(self.binary)
         os.environ["FAKE_CLAUDE_ARGV"] = str(self.root / "argv.jsonl")
         os.environ["FAKE_CLAUDE_PROMPT"] = str(self.root / "prompt.txt")
-        for key in ("FAKE_CLAUDE_EVENTS", "FAKE_CLAUDE_EXIT",
-                    "FAKE_CLAUDE_STDERR_BYTES", "FAKE_CLAUDE_CHILD_PID",
-                    "FAKE_CLAUDE_CHILD_READY"):
+        for key in (
+            "FAKE_CLAUDE_EVENTS",
+            "FAKE_CLAUDE_EXIT",
+            "FAKE_CLAUDE_STDERR_BYTES",
+            "FAKE_CLAUDE_CHILD_PID",
+            "FAKE_CLAUDE_CHILD_READY",
+        ):
             os.environ.pop(key, None)
 
     def tearDown(self) -> None:
@@ -81,11 +92,22 @@ class DirectClaudeRouteContract(unittest.TestCase):
         os.environ.update(self._before)
         self._tmp.cleanup()
 
-    def request(self, *, session_id: str = "logical-one", model: str = "opus",
-                prompt: str = "work", tools=None, extensions=None) -> PiRequest:
+    def request(
+        self,
+        *,
+        session_id: str = "logical-one",
+        model: str = "opus",
+        prompt: str = "work",
+        tools=None,
+        extensions=None,
+    ) -> PiRequest:
         return PiRequest(
-            prompt=prompt, system_prompt="system", model=model, thinking="high",
-            session_id=session_id, session_dir=str(self.root / "sessions"),
+            prompt=prompt,
+            system_prompt="system",
+            model=model,
+            thinking="high",
+            session_id=session_id,
+            session_dir=str(self.root / "sessions"),
             raw_output_path=str(self.root / "raw.jsonl"),
             tools=["Read"] if tools is None else tools,
             extensions=[] if extensions is None else extensions,
@@ -93,7 +115,10 @@ class DirectClaudeRouteContract(unittest.TestCase):
         )
 
     def argv_records(self) -> list[list]:
-        return [json.loads(line) for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        return [
+            json.loads(line)
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
 
     def argv(self) -> list:
         return self.argv_records()[-1]
@@ -101,33 +126,49 @@ class DirectClaudeRouteContract(unittest.TestCase):
     def events(self, rows: list[dict]) -> None:
         os.environ["FAKE_CLAUDE_EVENTS"] = json.dumps(rows)
 
-    def success_events(self, *, model: str = "claude-opus-5", result: str = "done") -> list[dict]:
+    def success_events(
+        self, *, model: str = "claude-opus-5", result: str = "done"
+    ) -> list[dict]:
         return [
             {"type": "system", "session_id": "claude-session", "model": model},
-            {"type": "assistant", "message": {"content": [{"type": "text", "text": result}]}},
-            {"type": "result", "is_error": False, "result": result,
-             "usage": {"input_tokens": 7, "output_tokens": 3}},
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": result}]},
+            },
+            {
+                "type": "result",
+                "is_error": False,
+                "result": result,
+                "usage": {"input_tokens": 7, "output_tokens": 3},
+            },
         ]
 
-    def test_admits_the_signed_opus_alias_and_records_the_reported_canonical_identity(self):
+    def test_admits_the_signed_opus_alias_and_records_the_reported_canonical_identity(
+        self,
+    ):
         result = agent_cc.run(self.request())
 
         argv = self.argv()
         self.assertEqual(result.session_id, "claude-session")
         self.assertEqual(result.model_ran, "claude/claude-opus-5")
-        self.assertEqual((result.usage.input_tokens, result.usage.output_tokens), (7, 3))
+        self.assertEqual(
+            (result.usage.input_tokens, result.usage.output_tokens), (7, 3)
+        )
         self.assertIn("--tools", argv)
         tools = argv.index("--tools")
-        self.assertEqual(argv[tools + 1:tools + 2], ["Read"])
+        self.assertEqual(argv[tools + 1 : tools + 2], ["Read"])
         self.assertIn("--allowedTools", argv)
         allowed = argv.index("--allowedTools")
-        self.assertEqual(argv[allowed + 1:allowed + 2], ["Read"])
+        self.assertEqual(argv[allowed + 1 : allowed + 2], ["Read"])
         self.assertIn("--disallowedTools", argv)
         disallowed = argv.index("--disallowedTools")
-        self.assertEqual(argv[disallowed + 1:disallowed + 2], ["mcp__*"])
+        self.assertEqual(argv[disallowed + 1 : disallowed + 2], ["mcp__*"])
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertNotIn("work", argv)
-        self.assertEqual((self.root / "prompt.txt").read_text(), "work")
+        self.assertEqual(
+            (self.root / "prompt.txt").read_text(),
+            agent_cc.prepare_route_prompt_text("claude", "work"),
+        )
 
     def test_refuses_a_real_model_substitution_even_when_the_text_is_successful(self):
         self.events(self.success_events(model="claude-sonnet-4"))
@@ -186,8 +227,12 @@ class DirectClaudeRouteContract(unittest.TestCase):
         markers = sorted((self.root / "sessions").rglob("marker.json"))
         self.assertEqual(len(raw_files), 2)
         self.assertEqual(len(markers), 2)
-        self.assertTrue(all([json.loads(line) for line in path.read_text().splitlines()]
-                            for path in raw_files))
+        self.assertTrue(
+            all(
+                [json.loads(line) for line in path.read_text().splitlines()]
+                for path in raw_files
+            )
+        )
 
     def test_drains_large_stderr_before_accepting_a_success(self):
         os.environ["FAKE_CLAUDE_STDERR_BYTES"] = str(64 * 1024 + 1)
@@ -263,9 +308,16 @@ class DirectClaudeRouteContract(unittest.TestCase):
 
     def test_result_event_must_remain_terminal(self):
         rows = self.success_events()
-        rows.append({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "late"},
-        ]}})
+        rows.append(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "late"},
+                    ]
+                },
+            }
+        )
         self.events(rows)
 
         with self.assertRaises(RuntimeError) as caught:
@@ -301,54 +353,73 @@ class DirectClaudeRouteContract(unittest.TestCase):
             agent_cc.run(self.request(), on_exit=fail_exit)
         self.assertIn("7", str(caught.exception))
 
-
     def test_adjacent_text_blocks_are_concatenated_exactly(self):
-        self.events([
-            {"type": "system", "session_id": "claude-session", "model": "claude-opus-5"},
-            {"type": "assistant", "message": {"content": [
-                {"type": "text", "text": "first"},
-                {"type": "text", "text": "second"},
-            ]}},
-            {"type": "result", "is_error": False,
-             "usage": {"input_tokens": 1, "output_tokens": 2}},
-        ])
+        self.events(
+            [
+                {
+                    "type": "system",
+                    "session_id": "claude-session",
+                    "model": "claude-opus-5",
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "first"},
+                            {"type": "text", "text": "second"},
+                        ]
+                    },
+                },
+                {
+                    "type": "result",
+                    "is_error": False,
+                    "usage": {"input_tokens": 1, "output_tokens": 2},
+                },
+            ]
+        )
 
         result = agent_cc.run(self.request())
 
         self.assertEqual(result.text, "firstsecond")
 
     def test_capability_argv_limits_builtins_preserves_patterns_and_blocks_mcp(self):
-        request = self.request(tools=[
-            "Read", "Bash(git status)", "Bash(git diff:*)", "Bash(git status)",
-        ])
+        request = self.request(
+            tools=[
+                "Read",
+                "Bash(git status)",
+                "Bash(git diff:*)",
+                "Bash(git status)",
+            ]
+        )
         agent_cc.run(request)
         argv = self.argv()
 
         tools = argv.index("--tools") + 1
-        self.assertEqual(argv[tools:tools + 2], ["Read", "Bash"])
+        self.assertEqual(argv[tools : tools + 2], ["Read", "Bash"])
         allowed = argv.index("--allowedTools") + 1
-        self.assertEqual(argv[allowed:allowed + 4], request.tools)
+        self.assertEqual(argv[allowed : allowed + 4], request.tools)
         disallowed = argv.index("--disallowedTools") + 1
-        self.assertEqual(argv[disallowed:disallowed + 1], ["mcp__*"])
+        self.assertEqual(argv[disallowed : disallowed + 1], ["mcp__*"])
         self.assertNotIn("--dangerously-skip-permissions", argv)
 
         agent_cc.run(self.request(tools=["Read"], session_id="read-only"))
         argv = self.argv()
         tools = argv.index("--tools") + 1
         allowed = argv.index("--allowedTools") + 1
-        self.assertEqual(argv[tools:tools + 1], ["Read"])
-        self.assertEqual(argv[allowed:allowed + 1], ["Read"])
+        self.assertEqual(argv[tools : tools + 1], ["Read"])
+        self.assertEqual(argv[allowed : allowed + 1], ["Read"])
         self.assertNotIn("Bash", argv)
         self.assertNotIn("mcp__server__tool", argv)
 
         agent_cc.run(self.request(tools=[], session_id="no-tools"))
         argv = self.argv()
         tools_end = argv.index("--disallowedTools")
-        self.assertEqual(argv[argv.index("--tools") + 1:tools_end], [""])
+        self.assertEqual(argv[argv.index("--tools") + 1 : tools_end], [""])
         self.assertNotIn("--allowedTools", argv)
-        self.assertEqual(argv[argv.index("--disallowedTools") + 1:], ["mcp__*",
-                                                                        "--session-id",
-                                                                        agent_cc._claude_session_id("no-tools")])
+        self.assertEqual(
+            argv[argv.index("--disallowedTools") + 1 :],
+            ["mcp__*", "--session-id", agent_cc._claude_session_id("no-tools")],
+        )
 
         (self.root / "argv.jsonl").unlink()
         with self.assertRaises(ValueError):
@@ -369,7 +440,6 @@ class DirectClaudeRouteContract(unittest.TestCase):
         self.assertFalse((self.root / "argv.jsonl").exists())
 
 
-
 class ClaudeToolTraceContract(unittest.TestCase):
     def test_raw_claude_tool_events_retain_the_existing_completed_call_trace(self):
         observed = []
@@ -382,18 +452,47 @@ class ClaudeToolTraceContract(unittest.TestCase):
             adw_id = "adw-1"
             tracer = Tracer()
 
-        phase = Phase(phase_id="phase-1", adw_id="adw-1", seq=1,
-                      params=PhaseParams(name="direct", kind="agent", owner="direct",
-                                         description="Trace a direct tool call."))
+        phase = Phase(
+            phase_id="phase-1",
+            adw_id="adw-1",
+            seq=1,
+            params=PhaseParams(
+                name="direct",
+                kind="agent",
+                owner="direct",
+                description="Trace a direct tool call.",
+            ),
+        )
         forward = agents._event_forwarder(Run(), phase, "direct")
-        forward({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "id": "tool-1", "name": "Read",
-             "input": {"file_path": "safe.txt"}},
-        ]}})
-        forward({"type": "user", "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "tool-1",
-             "content": "contents"},
-        ]}})
+        forward(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tool-1",
+                            "name": "Read",
+                            "input": {"file_path": "safe.txt"},
+                        },
+                    ]
+                },
+            }
+        )
+        forward(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": "contents",
+                        },
+                    ]
+                },
+            }
+        )
 
         self.assertEqual(len(observed), 1)
         record = observed[0]
@@ -452,11 +551,20 @@ class DirectClaudeDispatchContract(unittest.TestCase):
         os.environ["CLAUDE_PATH"] = str(self.binary)
         os.environ["FAKE_CLAUDE_ARGV"] = str(self.root / "argv.jsonl")
         os.environ["FAKE_CLAUDE_PROMPT"] = str(self.root / "prompt.txt")
-        os.environ["FAKE_CLAUDE_EVENTS"] = json.dumps([
-            {"type": "system", "session_id": "claude-session", "model": "claude-opus-5"},
-            {"type": "result", "is_error": False,
-             "result": json.dumps({"status": "success", "summary": "direct"})},
-        ])
+        os.environ["FAKE_CLAUDE_EVENTS"] = json.dumps(
+            [
+                {
+                    "type": "system",
+                    "session_id": "claude-session",
+                    "model": "claude-opus-5",
+                },
+                {
+                    "type": "result",
+                    "is_error": False,
+                    "result": json.dumps({"status": "success", "summary": "direct"}),
+                },
+            ]
+        )
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -468,10 +576,19 @@ class DirectClaudeDispatchContract(unittest.TestCase):
         user = self.root / "user.md"
         system.write_text("system")
         user.write_text("{{prompt}}")
-        config = SSSFConfig(agents=[AgentConfig(
-            name="direct", coding_agent="claude_code", model="opus", tools=["Read"],
-            prompt_engineering=PromptEngineering(system=str(system), user=str(user)),
-        )])
+        config = SSSFConfig(
+            agents=[
+                AgentConfig(
+                    name="direct",
+                    coding_agent="claude_code",
+                    model="opus",
+                    tools=["Read"],
+                    prompt_engineering=PromptEngineering(
+                        system=str(system), user=str(user)
+                    ),
+                )
+            ]
+        )
 
         agents.validate(config, ["direct"])
 
@@ -484,9 +601,9 @@ class DirectClaudeDispatchContract(unittest.TestCase):
             adw_id = "adw-1"
             tracer = _Tracer()
             console = _Console()
+
             def agent_map_entry(self, name):
                 return self.agent_map.get(name)
-
 
             def add_usage(self, *_args):
                 pass
@@ -494,18 +611,31 @@ class DirectClaudeDispatchContract(unittest.TestCase):
             def save_agent_map(self, *_args):
                 pass
 
-        phase = Phase(phase_id="phase-1", adw_id="adw-1", seq=1,
-                      params=PhaseParams(name="direct", kind="agent", owner="direct",
-                                         description="Request a typed direct report."))
+        phase = Phase(
+            phase_id="phase-1",
+            adw_id="adw-1",
+            seq=1,
+            params=PhaseParams(
+                name="direct",
+                kind="agent",
+                owner="direct",
+                description="Request a typed direct report.",
+            ),
+        )
         call = AgentCall(output_type=GenericOutput, prompt="direct prompt")
-        with patch.object(agents.permissions, "snapshot", return_value={}), \
-             patch.object(agents.permissions, "enforce", return_value=[]):
+        with (
+            patch.object(agents.permissions, "snapshot", return_value={}),
+            patch.object(agents.permissions, "enforce", return_value=[]),
+        ):
             envelope = agents.execute(Run(), phase, call)
 
         self.assertEqual(envelope.summary, "direct")
         argv = json.loads((self.root / "argv.jsonl").read_text().splitlines()[-1])
         self.assertEqual(argv[0], "-p")
-        self.assertEqual((self.root / "prompt.txt").read_text(), "direct prompt")
+        self.assertEqual(
+            (self.root / "prompt.txt").read_text(),
+            agent_cc.prepare_route_prompt_text("claude", "direct prompt"),
+        )
 
 
 if __name__ == "__main__":

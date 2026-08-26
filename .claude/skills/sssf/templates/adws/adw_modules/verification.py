@@ -53,6 +53,7 @@ _ERROR_KEYS = ("errored", "error", "errors")
 
 # ── §10.2 one shared parser, one shared rule ────────────────────────────────
 
+
 @dataclass(frozen=True)
 class GateCounts:
     """`(collected, passed, failed, skipped, errored)` — the only shape the
@@ -78,8 +79,12 @@ class GateCounts:
             return None
         found = False
         values = {}
-        for name, keys in (("passed", ("passed",)), ("failed", ("failed",)),
-                           ("skipped", ("skipped",)), ("errored", _ERROR_KEYS)):
+        for name, keys in (
+            ("passed", ("passed",)),
+            ("failed", ("failed",)),
+            ("skipped", ("skipped",)),
+            ("errored", _ERROR_KEYS),
+        ):
             value = 0
             for key in keys:
                 if key in raw:
@@ -95,7 +100,9 @@ class GateCounts:
         # without naming the total — but a runner that collected ten and
         # reported three outcomes lost seven, and the rule must see the loss
         # rather than smooth it into a smaller denominator.
-        collected = int(raw["collected"]) if "collected" in raw else sum(values.values())
+        collected = (
+            int(raw["collected"]) if "collected" in raw else sum(values.values())
+        )
         return cls(collected=collected, **values)
 
 
@@ -125,14 +132,18 @@ def adjudicate_counts(raw: Mapping[str, Any], min_cases: int) -> GateVerdict:
     if min_cases < 1:
         raise ValueError(
             "min_cases >= 1 (§10.2): a gate that demands zero passing cases "
-            "cannot fail, which is the vacuity the counting rule exists to catch")
+            "cannot fail, which is the vacuity the counting rule exists to catch"
+        )
 
     counts = GateCounts.parse(raw)
     if counts is None:
         return GateVerdict(
-            green=False, unparseable=True, counts=None,
+            green=False,
+            unparseable=True,
+            counts=None,
             reason="no parseable report — fail-closed and environmental (§10.2)",
-            retry_class=st.RetryClass.ENVIRONMENTAL)
+            retry_class=st.RetryClass.ENVIRONMENTAL,
+        )
 
     if counts.errored:
         reason = f"{counts.errored} errored"
@@ -159,8 +170,9 @@ def adjudicate_counts(raw: Mapping[str, Any], min_cases: int) -> GateVerdict:
     return GateVerdict(green=False, unparseable=False, counts=counts, reason=reason)
 
 
-def adjudicate_pre_gate(result: "wt.GateResult", min_cases: int,
-                        selector_unbuilt: bool = False) -> GateVerdict:
+def adjudicate_pre_gate(
+    result: "wt.GateResult", min_cases: int, selector_unbuilt: bool = False
+) -> GateVerdict:
     """Adjudicate the pre-node gate, where an absent selector is the red.
 
     A node that creates its own test file has no test file at its base, so its
@@ -178,9 +190,14 @@ def adjudicate_pre_gate(result: "wt.GateResult", min_cases: int,
     """
     if selector_unbuilt and result.exit_code != 0:
         return GateVerdict(
-            green=False, unparseable=False, counts=GateCounts.parse(result.counts),
-            reason=("gate exited {} with its selector absent at base, which is "
-                    "this node's declared output".format(result.exit_code)))
+            green=False,
+            unparseable=False,
+            counts=GateCounts.parse(result.counts),
+            reason=(
+                "gate exited {} with its selector absent at base, which is "
+                "this node's declared output".format(result.exit_code)
+            ),
+        )
     return adjudicate_gate(result, min_cases)
 
 
@@ -193,13 +210,17 @@ def adjudicate_gate(result: "wt.GateResult", min_cases: int) -> GateVerdict:
     if result.exit_code != 0:
         counts = GateCounts.parse(result.counts)
         return GateVerdict(
-            green=False, unparseable=counts is None, counts=counts,
+            green=False,
+            unparseable=counts is None,
+            counts=counts,
             reason="gate exited {}".format(result.exit_code),
-            retry_class=st.RetryClass.ENVIRONMENTAL if counts is None else None)
+            retry_class=st.RetryClass.ENVIRONMENTAL if counts is None else None,
+        )
     return adjudicate_counts(result.counts, min_cases)
 
 
 # ── §7.3 the VERIFIED predicate, per node kind ──────────────────────────────
+
 
 @dataclass(frozen=True)
 class VerificationVerdict:
@@ -236,11 +257,12 @@ class VerificationVerdict:
 
 
 def _permission_paths(permission: "wt.PermissionVerdict") -> Tuple[str, ...]:
-    return tuple(permission.conjunct1_violations) + tuple(permission.conjunct2_violations)
+    return tuple(permission.conjunct1_violations) + tuple(
+        permission.conjunct2_violations
+    )
 
 
-def pre_gate_not_falsifiable(pre_gate: GateVerdict,
-                             repairing: bool = False) -> bool:
+def pre_gate_not_falsifiable(pre_gate: GateVerdict, repairing: bool = False) -> bool:
     """§7.4 clause 2, as the one predicate every caller asks.
 
     The rule is unchanged for every attempt that opens at the integration
@@ -258,13 +280,12 @@ def pre_gate_not_falsifiable(pre_gate: GateVerdict,
     the node to a hard block where a fresh base had previously retried.
 
     The witness is not re-established per attempt; it is **inherited from the
-    chain root**. A repair chain descends by construction from an attempt
-    that branched from the integration head and passed clause 2 there —
-    `decide_repair` admits a basis only over a *proven* output commit of the
-    prior attempt at a head that has not moved — so `repairing` asserts a fact
-    already established, not a fact waived. It needs no new persisted field:
-    `extra_json.repair_of.integration_head` already records the base the
-    witness was taken at, and `AttemptRecord.integration_head` already reads it.
+    chain root**. A repair chain descends by construction from an immutable
+    candidate whose builder attempt branched from the integration head and
+    passed clause 2 there. The lifecycle store admits the repair basis only
+    after proving the matching candidate, rejected review, and acknowledged
+    handoff. `extra_json.repair_of.integration_head` records the base where the
+    witness was taken, and `AttemptRecord.integration_head` reads it.
 
     A **red** pre-gate at a repair base is untouched: an ordinary falsifiable
     attempt, and the caller proceeds as it does for any other. An unparseable
@@ -275,11 +296,13 @@ def pre_gate_not_falsifiable(pre_gate: GateVerdict,
     return pre_gate.green and not repairing
 
 
-def verify_agent_node(envelope_parsed: bool,
-                      pre_gate: GateVerdict,
-                      post_gate: GateVerdict,
-                      permission: "wt.PermissionVerdict",
-                      repairing: bool = False) -> VerificationVerdict:
+def verify_agent_node(
+    envelope_parsed: bool,
+    pre_gate: GateVerdict,
+    post_gate: GateVerdict,
+    permission: "wt.PermissionVerdict",
+    repairing: bool = False,
+) -> VerificationVerdict:
     """§7.3's four clauses for an agent node.
 
     1. the terminal envelope **parses** as a typed envelope (§10.1);
@@ -304,50 +327,67 @@ def verify_agent_node(envelope_parsed: bool,
     """
     if not envelope_parsed:
         return VerificationVerdict(
-            verified=False, failed_clause=1,
-            reason="the terminal envelope did not parse as a typed envelope")
+            verified=False,
+            failed_clause=1,
+            reason="the terminal envelope did not parse as a typed envelope",
+        )
 
     # Clause 2 first: the pre-gate ran before the agent, so a green one stops
     # the attempt before any delta exists to check.
     if pre_gate.unparseable:
         return VerificationVerdict(
-            verified=False, failed_clause=2, reason=pre_gate.reason,
-            retry_class=st.RetryClass.ENVIRONMENTAL)
+            verified=False,
+            failed_clause=2,
+            reason=pre_gate.reason,
+            retry_class=st.RetryClass.ENVIRONMENTAL,
+        )
     if pre_gate_not_falsifiable(pre_gate, repairing):
         return VerificationVerdict(
-            verified=False, failed_clause=2,
-            reason=("the pre-node gate passed at this attempt's base, so it "
-                    "cannot witness this node's behaviour (§7.4)"),
-            block_reason=st.BlockReason.GATE_NOT_FALSIFIABLE)
+            verified=False,
+            failed_clause=2,
+            reason=(
+                "the pre-node gate passed at this attempt's base, so it "
+                "cannot witness this node's behaviour (§7.4)"
+            ),
+            block_reason=st.BlockReason.GATE_NOT_FALSIFIABLE,
+        )
 
     # Clause 4 next: measured at settle, and the commit follows it at once.
     if not permission.passes:
         paths = _permission_paths(permission)
         return VerificationVerdict(
-            verified=False, failed_clause=4,
+            verified=False,
+            failed_clause=4,
             reason="the measured delta failed §8.3's permission check",
             # An agent is not deterministic, and a retry prompt naming the
             # offending paths is genuinely new instructions — so unlike the
             # code-node case this is SEMANTIC rather than a block (§7.5).
             retry_class=st.RetryClass.SEMANTIC,
-            offending_paths=paths)
+            offending_paths=paths,
+        )
 
     # Clause 3 last: against the committed tree.
     if post_gate.unparseable:
         return VerificationVerdict(
-            verified=False, failed_clause=3, reason=post_gate.reason,
-            retry_class=st.RetryClass.ENVIRONMENTAL)
+            verified=False,
+            failed_clause=3,
+            reason=post_gate.reason,
+            retry_class=st.RetryClass.ENVIRONMENTAL,
+        )
     if not post_gate.green:
         return VerificationVerdict(
-            verified=False, failed_clause=3, reason=post_gate.reason)
+            verified=False, failed_clause=3, reason=post_gate.reason
+        )
 
     return VerificationVerdict(verified=True)
 
 
-def verify_code_node(exit_code: int,
-                     permission: "wt.PermissionVerdict",
-                     diff_empty: bool,
-                     expects_changes: bool = False) -> VerificationVerdict:
+def verify_code_node(
+    exit_code: int,
+    permission: "wt.PermissionVerdict",
+    diff_empty: bool,
+    expects_changes: bool = False,
+) -> VerificationVerdict:
     """§7.3's code-node predicate. Clauses 1-3 do not apply.
 
     A code node's acceptance is its exit code (§6.2), its diff's conformance
@@ -361,7 +401,8 @@ def verify_code_node(exit_code: int,
     """
     if exit_code != 0:
         return VerificationVerdict(
-            verified=False, reason=f"the node's command exited {exit_code}")
+            verified=False, reason=f"the node's command exited {exit_code}"
+        )
 
     if not permission.passes:
         return VerificationVerdict(
@@ -372,21 +413,26 @@ def verify_code_node(exit_code: int,
             # cannot write different paths — so unlike the agent case this is
             # non-retryable and operator-terminal (§7.5).
             block_reason=st.BlockReason.PERMISSION_SCOPE_VIOLATION,
-            offending_paths=_permission_paths(permission))
+            offending_paths=_permission_paths(permission),
+        )
 
     if expects_changes and diff_empty:
         return VerificationVerdict(
             verified=False,
-            reason=("the node declared expects_changes and produced an empty "
-                    "diff; re-running a deterministic command against an "
-                    "unchanged base cannot produce a different answer"),
-            block_reason=st.BlockReason.CODE_NODE_NO_EFFECT)
+            reason=(
+                "the node declared expects_changes and produced an empty "
+                "diff; re-running a deterministic command against an "
+                "unchanged base cannot produce a different answer"
+            ),
+            block_reason=st.BlockReason.CODE_NODE_NO_EFFECT,
+        )
 
     return VerificationVerdict(verified=True)
 
 
-def adjudicate_reachability(symbols: Sequence["rc.ProducedSymbol"],
-                            node_kind: st.NodeKind) -> VerificationVerdict:
+def adjudicate_reachability(
+    symbols: Sequence["rc.ProducedSymbol"], node_kind: st.NodeKind
+) -> VerificationVerdict:
     """Refuse an attempt that shipped machinery nothing references.
 
     `min_cases` is a floor with no ceiling: it asserts that at least N cases
@@ -408,18 +454,24 @@ def adjudicate_reachability(symbols: Sequence["rc.ProducedSymbol"],
     if not symbols:
         return VerificationVerdict(verified=True)
     located = tuple(symbol.located() for symbol in symbols)
-    reason = (f"the attempt defined {len(located)} symbol"
-              f"{'' if len(located) == 1 else 's'} nothing on the merged "
-              "surface references, from production or from a test")
+    reason = (
+        f"the attempt defined {len(located)} symbol"
+        f"{'' if len(located) == 1 else 's'} nothing on the merged "
+        "surface references, from production or from a test"
+    )
     if node_kind is st.NodeKind.CODE:
         return VerificationVerdict(
-            verified=False, reason=reason,
+            verified=False,
+            reason=reason,
             block_reason=st.BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
-            unreferenced_symbols=located)
+            unreferenced_symbols=located,
+        )
     return VerificationVerdict(
-        verified=False, reason=reason,
+        verified=False,
+        reason=reason,
         retry_class=st.RetryClass.SEMANTIC,
-        unreferenced_symbols=located)
+        unreferenced_symbols=located,
+    )
 
 
 # ── §7.4's other half: the gate must still be falsifiable *after* the work ──
@@ -449,8 +501,9 @@ def _gate_names(relpath: str, gate_argv: Sequence[str]) -> bool:
     return False
 
 
-def outputs_unnamed_by_gate(written: Sequence[str],
-                            gate_argv: Sequence[str]) -> Tuple[str, ...]:
+def outputs_unnamed_by_gate(
+    written: Sequence[str], gate_argv: Sequence[str]
+) -> Tuple[str, ...]:
     """The paths this attempt wrote that its own gate's argv does not select.
 
     §7.4's pre-node gate proves the node's behaviour was *absent* before the
@@ -488,11 +541,13 @@ def outputs_unnamed_by_gate(written: Sequence[str],
 #: missing subject.
 FALSIFICATION_NO_SUBJECT = (
     "FALSIFICATION_NO_SUBJECT: every path this node wrote is selected by "
-    "its own gate, so the gate was never shown to observe anything else")
+    "its own gate, so the gate was never shown to observe anything else"
+)
 
 
 def adjudicate_output_falsification(
-        gate: GateVerdict, reverted: Sequence[str]) -> VerificationVerdict:
+    gate: GateVerdict, reverted: Sequence[str]
+) -> VerificationVerdict:
     """Refuse an attempt whose gate passes without the code it is meant to prove.
 
     The predicate is `adjudicate_gate`'s own — the same §10.2 counting rule
@@ -519,16 +574,20 @@ def adjudicate_output_falsification(
         return VerificationVerdict(
             verified=False,
             reason=FALSIFICATION_NO_SUBJECT,
-            retry_class=st.RetryClass.SEMANTIC)
+            retry_class=st.RetryClass.SEMANTIC,
+        )
     if not gate.green:
         return VerificationVerdict(verified=True)
     return VerificationVerdict(
         verified=False,
-        reason=("the node's gate still passed with {0} reverted to this "
-                "attempt's base — the declared tests do not exercise the code "
-                "they are supposed to prove".format(", ".join(reverted))),
+        reason=(
+            "the node's gate still passed with {0} reverted to this "
+            "attempt's base — the declared tests do not exercise the code "
+            "they are supposed to prove".format(", ".join(reverted))
+        ),
         retry_class=st.RetryClass.SEMANTIC,
-        offending_paths=tuple(reverted))
+        offending_paths=tuple(reverted),
+    )
 
 
 # ── §7.3's review-node predicate lives in the review path, not here ─────────
@@ -562,6 +621,7 @@ def adjudicate_output_falsification(
 
 
 # ── §10.1 no guard reads free text ──────────────────────────────────────────
+
 
 def _free_text_names(node: ast.AST) -> List[str]:
     """Every §10.1 free-text field read anywhere inside `node`.
@@ -673,9 +733,12 @@ def free_text_reads(source: str) -> Tuple[str, ...]:
 
 # ── §7.7 results and late arrivals ──────────────────────────────────────────
 
-def adjudicate_result(result: st.ResultRecord,
-                      attempts: Iterable[st.AttemptRecord],
-                      node_state: Optional[st.NodeState] = None) -> st.ResultRecord:
+
+def adjudicate_result(
+    result: st.ResultRecord,
+    attempts: Iterable[st.AttemptRecord],
+    node_state: Optional[st.NodeState] = None,
+) -> st.ResultRecord:
     """Adjudicate a result **solely against the attempt row it names**.
 
     Never against the node's current state — `node_state` is accepted so a
@@ -702,6 +765,10 @@ def adjudicate_result(result: st.ResultRecord,
     else:
         verdict = st.Adjudication.ACCEPTED
 
-    return st.ResultRecord(node_id=result.node_id, attempt_no=result.attempt_no,
-                           subject_sha=result.subject_sha, payload=result.payload,
-                           adjudication=verdict)
+    return st.ResultRecord(
+        node_id=result.node_id,
+        attempt_no=result.attempt_no,
+        subject_sha=result.subject_sha,
+        payload=result.payload,
+        adjudication=verdict,
+    )

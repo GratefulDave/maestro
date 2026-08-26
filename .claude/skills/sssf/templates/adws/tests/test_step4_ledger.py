@@ -43,8 +43,13 @@ from adw_modules import scheduler_types as st  # noqa: E402
 
 def make_node(node_id: str, depth: int = 0, needs=()) -> st.PlanNode:
     """A code node — Step 4 is about rows, not about §7.4's gate."""
-    return st.PlanNode(node_id=node_id, kind=st.NodeKind.CODE, depth=depth,
-                       needs=tuple(needs), command=("true",))
+    return st.PlanNode(
+        node_id=node_id,
+        kind=st.NodeKind.CODE,
+        depth=depth,
+        needs=tuple(needs),
+        command=("true",),
+    )
 
 
 def new_store(tmp_root: Path) -> lc.LifecycleStore:
@@ -66,15 +71,19 @@ class LedgerFixture(unittest.TestCase):
         self.store.create_run(run_id, "digest-1", nodes)
 
     def attempt_states(self, run_id: str, node_id: str):
-        return [row[0] for row in self.store.conn.execute(
-            "SELECT state FROM attempts WHERE run_id=? AND node_id=? ORDER BY attempt_no",
-            (run_id, node_id)).fetchall()]
+        return [
+            row[0]
+            for row in self.store.conn.execute(
+                "SELECT state FROM attempts WHERE run_id=? AND node_id=? ORDER BY attempt_no",
+                (run_id, node_id),
+            ).fetchall()
+        ]
 
 
 # ── §10.3 the partial unique index ──────────────────────────────────────────
 
-class PartialUniqueIndexTests(LedgerFixture):
 
+class PartialUniqueIndexTests(LedgerFixture):
     def test_a_second_live_attempt_for_one_node_is_refused_by_the_database(self):
         """The constraint is declarative, not a Python check the scheduler can
         forget to call — a second RUNNING attempt row is refused by sqlite."""
@@ -84,17 +93,20 @@ class PartialUniqueIndexTests(LedgerFixture):
             self.store.conn.execute(
                 "INSERT INTO attempts (run_id, node_id, attempt_no, base_sha, state,"
                 " started_at, turn_count, extra_json) VALUES (?,?,?,?,?,?,0,'{}')",
-                ("run1", "a", 2, "sha1", st.NodeState.RUNNING.value, 1.0))
+                ("run1", "a", 2, "sha1", st.NodeState.RUNNING.value, 1.0),
+            )
 
     def test_the_constraint_releases_when_the_attempt_stops_being_live(self):
-        """"Releases automatically when status changes" (§10.3) — no explicit
+        """ "Releases automatically when status changes" (§10.3) — no explicit
         delete, and no second attempt refused after the first one closed."""
         self.seed("run1", "a")
         self.store.start_attempt("run1", "a", base_sha="sha0")
         self.store.fail_attempt("run1", "a", st.RetryClass.ENVIRONMENTAL)
         second = self.store.start_attempt("run1", "a", base_sha="sha1")
         self.assertEqual(second, 2)
-        self.assertEqual(self.attempt_states("run1", "a")[1], st.NodeState.RUNNING.value)
+        self.assertEqual(
+            self.attempt_states("run1", "a")[1], st.NodeState.RUNNING.value
+        )
 
     def test_a_failed_attempt_row_stops_being_live(self):
         """The watchdog polls attempt rows whose state is RUNNING (§7.6). An
@@ -103,11 +115,16 @@ class PartialUniqueIndexTests(LedgerFixture):
         self.seed("run1", "a")
         self.store.start_attempt("run1", "a", base_sha="sha0")
         self.store.fail_attempt("run1", "a", st.RetryClass.ENVIRONMENTAL)
-        live = [a for a in self.store.attempts_for("run1", "a")
-                if a.state is st.NodeState.RUNNING]
+        live = [
+            a
+            for a in self.store.attempts_for("run1", "a")
+            if a.state is st.NodeState.RUNNING
+        ]
         self.assertEqual(live, [])
-        self.assertEqual(self.store.attempts_for("run1", "a")[0].retry_class,
-                         st.RetryClass.ENVIRONMENTAL)
+        self.assertEqual(
+            self.store.attempts_for("run1", "a")[0].retry_class,
+            st.RetryClass.ENVIRONMENTAL,
+        )
 
     def test_cancel_run_closes_every_live_attempt_row(self):
         """§7.8 — a cancelled node's result is rejected "because its attempt is
@@ -116,8 +133,11 @@ class PartialUniqueIndexTests(LedgerFixture):
         self.store.start_attempt("run1", "a", base_sha="sha0")
         self.store.start_attempt("run1", "b", base_sha="sha0")
         self.store.cancel_run("run1")
-        live = [a for a in self.store.attempts_for("run1")
-                if a.state is st.NodeState.RUNNING]
+        live = [
+            a
+            for a in self.store.attempts_for("run1")
+            if a.state is st.NodeState.RUNNING
+        ]
         self.assertEqual(live, [])
 
     def test_abandon_closes_the_nodes_live_attempt_row(self):
@@ -126,10 +146,14 @@ class PartialUniqueIndexTests(LedgerFixture):
         self.store.declare_outcome("run1", stuck=True)
         self.store.conn.execute(
             "UPDATE runs SET scheduler_pid=?, scheduler_host=? WHERE run_id=?",
-            (2_000_000_000, lc.scheduler_host(), "run1"))
+            (2_000_000_000, lc.scheduler_host(), "run1"),
+        )
         self.store.abandon("run1", "a")
-        live = [a for a in self.store.attempts_for("run1", "a")
-                if a.state is st.NodeState.RUNNING]
+        live = [
+            a
+            for a in self.store.attempts_for("run1", "a")
+            if a.state is st.NodeState.RUNNING
+        ]
         self.assertEqual(live, [])
 
     def test_the_constraint_is_per_node_never_per_run(self):
@@ -137,8 +161,11 @@ class PartialUniqueIndexTests(LedgerFixture):
         self.seed("run1", "a", "b")
         self.store.start_attempt("run1", "a", base_sha="sha0")
         self.store.start_attempt("run1", "b", base_sha="sha0")
-        live = [a for a in self.store.attempts_for("run1")
-                if a.state is st.NodeState.RUNNING]
+        live = [
+            a
+            for a in self.store.attempts_for("run1")
+            if a.state is st.NodeState.RUNNING
+        ]
         self.assertEqual(sorted(a.node_id for a in live), ["a", "b"])
 
     def test_many_closed_attempts_for_one_node_are_legal(self):
@@ -153,7 +180,8 @@ class PartialUniqueIndexTests(LedgerFixture):
     def test_the_index_is_partial_and_named_in_the_schema(self):
         row = self.store.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
-            (lc.LIVE_ATTEMPT_INDEX,)).fetchone()
+            (lc.LIVE_ATTEMPT_INDEX,),
+        ).fetchone()
         self.assertIsNotNone(row, "the partial unique index is missing")
         self.assertIn("UNIQUE", row[0].upper())
         self.assertIn("WHERE", row[0].upper())
@@ -161,8 +189,8 @@ class PartialUniqueIndexTests(LedgerFixture):
 
 # ── §10.3 one index on the state-filtered read ──────────────────────────────
 
-class ReadySetIndexTests(LedgerFixture):
 
+class ReadySetIndexTests(LedgerFixture):
     def test_the_state_filtered_lifecycle_read_is_served_by_an_index(self):
         """§10.3's "one index on the ready-set query". The ready-set *predicate*
         (deps all MERGED) is computed in Python over the projection, so what an
@@ -171,28 +199,40 @@ class ReadySetIndexTests(LedgerFixture):
         self.seed("run1", "a")
         plan = self.store.conn.execute(
             "EXPLAIN QUERY PLAN SELECT node_id FROM node_lifecycle"
-            " WHERE run_id=? AND state=?", ("run1", "RUNNING")).fetchall()
+            " WHERE run_id=? AND state=?",
+            ("run1", "RUNNING"),
+        ).fetchall()
         detail = " ".join(str(row[-1]) for row in plan)
         self.assertIn(lc.READY_SET_INDEX, detail)
 
 
 # ── §10.3 / §7.7 the audit tier ─────────────────────────────────────────────
 
-class AuditTableTests(LedgerFixture):
 
+class AuditTableTests(LedgerFixture):
     def test_construction_creates_the_three_audit_tables(self):
-        names = {row[0] for row in self.store.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
+        names = {
+            row[0]
+            for row in self.store.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
         for table in ("transitions", "results", "orphans"):
             self.assertIn(table, names)
 
     def test_a_result_row_carries_its_payload_and_its_adjudication_together(self):
         self.seed("run1", "a")
         self.store.start_attempt("run1", "a", base_sha="sha0")
-        self.store.record_result("run1", st.ResultRecord(
-            node_id="a", attempt_no=1, subject_sha="sha0",
-            payload={"status": "success", "changed_files": ["a.py"]},
-            adjudication=st.Adjudication.ACCEPTED))
+        self.store.record_result(
+            "run1",
+            st.ResultRecord(
+                node_id="a",
+                attempt_no=1,
+                subject_sha="sha0",
+                payload={"status": "success", "changed_files": ["a.py"]},
+                adjudication=st.Adjudication.ACCEPTED,
+            ),
+        )
         rows = self.store.audit_results("run1")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["adjudication"], "ACCEPTED")
@@ -203,28 +243,47 @@ class AuditTableTests(LedgerFixture):
         result that dropped its payload is how a correct FAIL disappeared."""
         self.seed("run1", "a")
         for index, verdict in enumerate(st.Adjudication, start=1):
-            self.store.record_result("run1", st.ResultRecord(
-                node_id="a", attempt_no=index, subject_sha=f"sha{index}",
-                payload={"finding": verdict.value}, adjudication=verdict))
+            self.store.record_result(
+                "run1",
+                st.ResultRecord(
+                    node_id="a",
+                    attempt_no=index,
+                    subject_sha=f"sha{index}",
+                    payload={"finding": verdict.value},
+                    adjudication=verdict,
+                ),
+            )
         rows = self.store.audit_results("run1")
         self.assertEqual(len(rows), len(list(st.Adjudication)))
-        self.assertEqual({r["payload"]["finding"] for r in rows},
-                         {v.value for v in st.Adjudication})
+        self.assertEqual(
+            {r["payload"]["finding"] for r in rows}, {v.value for v in st.Adjudication}
+        )
 
     def test_the_payload_column_is_not_null_in_the_schema(self):
-        columns = {row[1]: row for row in
-                   self.store.conn.execute("PRAGMA table_info(results)")}
-        self.assertEqual(columns["payload_json"][3], 1,
-                         "results.payload_json must be NOT NULL (§10.3)")
+        columns = {
+            row[1]: row for row in self.store.conn.execute("PRAGMA table_info(results)")
+        }
+        self.assertEqual(
+            columns["payload_json"][3],
+            1,
+            "results.payload_json must be NOT NULL (§10.3)",
+        )
 
     def test_a_result_write_that_fails_leaves_no_half_row(self):
         """The audit write is its own `BEGIN IMMEDIATE` (§7.9): an unserialisable
         payload rolls the whole statement back rather than leaving a stub."""
         self.seed("run1", "a")
         with self.assertRaises(TypeError):
-            self.store.record_result("run1", st.ResultRecord(
-                node_id="a", attempt_no=1, subject_sha="sha0",
-                payload={"bad": object()}, adjudication=st.Adjudication.ACCEPTED))
+            self.store.record_result(
+                "run1",
+                st.ResultRecord(
+                    node_id="a",
+                    attempt_no=1,
+                    subject_sha="sha0",
+                    payload={"bad": object()},
+                    adjudication=st.Adjudication.ACCEPTED,
+                ),
+            )
         self.assertEqual(self.store.audit_results("run1"), ())
 
     def test_resume_records_an_orphan_for_every_pane_it_cannot_reach(self):
@@ -254,21 +313,32 @@ class AuditTableTests(LedgerFixture):
         self.store.mark_launched("run1", "a", 1, pid=4242)
         self.store.resume_run("run1")
         scheduler = sch.Scheduler(
-            run_id="run1", nodes=[make_node("a")],
+            run_id="run1",
+            nodes=[make_node("a")],
             config=st.SchedulerConfig(
-                concurrency=2, node_timeout_s=60.0, turn_timeout_s=30.0,
-                final_acceptance_timeout_s=60.0, backstop_t_s=600.0,
-                semantic_ceiling=2),
+                concurrency=2,
+                node_timeout_s=60.0,
+                turn_timeout_s=30.0,
+                final_acceptance_timeout_s=60.0,
+                backstop_t_s=600.0,
+                semantic_ceiling=2,
+            ),
             deps=sch.SchedulerDeps(
-                store=self.store, repo=self.root, integration_path=self.root,
+                store=self.store,
+                repo=self.root,
+                integration_path=self.root,
                 integration_branch="integration/run1",
-                worktrees_root=self.root / "wt", scratch_root=self.root / "scratch",
-                run_node=lambda attempt, node, record, retry_prompt, on_launch,
-                                cancel_requested: None,
+                worktrees_root=self.root / "wt",
+                scratch_root=self.root / "scratch",
+                run_node=lambda attempt, node, record, retry_prompt, on_launch, cancel_requested: (
+                    None
+                ),
                 run_gate=lambda attempt, node, phase, cancel_requested: None,
                 run_integration_gate=lambda path, specs, cancel_requested: None,
-                quiesce_attempt=lambda record, phase: None),
-            plan_digest="digest-1")
+                quiesce_attempt=lambda record, phase: None,
+            ),
+            plan_digest="digest-1",
+        )
         text = scheduler.status_diagnostic()
         self.assertIn("orphan", text.lower())
         self.assertIn("4242", text)
@@ -276,8 +346,8 @@ class AuditTableTests(LedgerFixture):
 
 # ── §10.5 / §5.3 the loading discipline ─────────────────────────────────────
 
-class LoadingDisciplineTests(LedgerFixture):
 
+class LoadingDisciplineTests(LedgerFixture):
     def test_audit_rows_load_as_plain_dicts_never_a_validating_model(self):
         """§5.3 — "audit rows are read as `sqlite3.Row`; blobs are `json.loads`ed
         to plain dicts". A pydantic model here reimports digest-revalidation."""
@@ -296,7 +366,8 @@ class LoadingDisciplineTests(LedgerFixture):
             "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
             " reason, actor, detail_json, created_at)"
             " VALUES ('run1','a','node','PENDING','RUNNING','x','scheduler',?,'2026-01-01')",
-            (json.dumps({"a_key_v1_never_heard_of": 1}),))
+            (json.dumps({"a_key_v1_never_heard_of": 1}),),
+        )
         rows = self.store.audit_transitions("run1")
         self.assertEqual(rows[-1]["detail"]["a_key_v1_never_heard_of"], 1)
 
@@ -306,7 +377,9 @@ class LoadingDisciplineTests(LedgerFixture):
         value that a later comparison would silently believe."""
         self.seed("run1", "a")
         self.store.acceptance_started("run1")
-        run_rows = [r for r in self.store.audit_transitions("run1") if r["kind"] == "run"]
+        run_rows = [
+            r for r in self.store.audit_transitions("run1") if r["kind"] == "run"
+        ]
         self.assertTrue(run_rows)
         self.assertNotIn("node_id", run_rows[0])
         self.assertIsNone(run_rows[0].get("node_id"))
@@ -330,9 +403,12 @@ class LoadingDisciplineTests(LedgerFixture):
             for row in self.store.conn.execute("PRAGMA table_info(%s)" % table):
                 name = row[1].lower()
                 for token in forbidden:
-                    self.assertNotIn(token, name,
-                                     "%s.%s looks like a content-derived audit "
-                                     "identifier (§5.3)" % (table, row[1]))
+                    self.assertNotIn(
+                        token,
+                        name,
+                        "%s.%s looks like a content-derived audit "
+                        "identifier (§5.3)" % (table, row[1]),
+                    )
 
     def test_the_ledger_holds_its_own_connection(self):
         """§10.5 — the ledger takes its own connection; sharing one would sweep
@@ -346,10 +422,97 @@ class LoadingDisciplineTests(LedgerFixture):
         self.assertIsNot(other.conn, self.store.conn)
 
 
+# ── durable actor-session placement ─────────────────────────────────────────
+
+
+class ActorSessionTabIdentityTests(LedgerFixture):
+    def test_an_active_actor_session_round_trips_its_exact_tab_id(self):
+        self.seed("run1", "a")
+        registered = self.store.register_actor_session(
+            "run1",
+            "a",
+            "builder",
+            generation=1,
+            pane_id="w1:p4",
+            tab_id="w1:t2",
+            session_path="/tmp/builder.jsonl",
+            correlation_token="run1-a-1",
+        )
+
+        current = self.store.current_actor_session("run1", "a", "builder")
+        history = self.store.actor_sessions("run1", "a", actor_role="builder")
+
+        self.assertEqual(registered.tab_id, "w1:t2")
+        self.assertEqual(current.tab_id, "w1:t2")
+        self.assertEqual(history, (current,))
+        with self.assertRaises(lc.LifecycleError):
+            self.store.register_actor_session(
+                "run1",
+                "a",
+                "builder",
+                generation=1,
+                pane_id="w1:p4",
+                tab_id="w1:t9",
+                session_path="/tmp/builder.jsonl",
+                correlation_token="run1-a-1",
+            )
+
+    def test_actor_recovery_replays_only_the_same_tab_identity(self):
+        self.seed("run1", "a")
+        self.store.register_actor_session(
+            "run1",
+            "a",
+            "builder",
+            generation=1,
+            pane_id="w1:p4",
+            tab_id="w1:t2",
+            session_path="/tmp/builder-1.jsonl",
+            correlation_token="run1-a-1",
+        )
+        recovered = self.store.recover_actor_session(
+            "run1",
+            "a",
+            "builder",
+            expected_generation=1,
+            generation=2,
+            pane_id="w1:p5",
+            tab_id="w1:t2",
+            session_path="/tmp/builder-2.jsonl",
+            correlation_token="run1-a-2",
+        )
+        replay = self.store.recover_actor_session(
+            "run1",
+            "a",
+            "builder",
+            expected_generation=1,
+            generation=2,
+            pane_id="w1:p5",
+            tab_id="w1:t2",
+            session_path="/tmp/builder-2.jsonl",
+            correlation_token="run1-a-2",
+        )
+
+        self.assertTrue(recovered.recovered)
+        self.assertEqual(recovered.session.tab_id, "w1:t2")
+        self.assertFalse(replay.recovered)
+        with self.assertRaises(lc.LifecycleError):
+            self.store.recover_actor_session(
+                "run1",
+                "a",
+                "builder",
+                expected_generation=1,
+                generation=2,
+                pane_id="w1:p5",
+                tab_id="w1:t9",
+                session_path="/tmp/builder-2.jsonl",
+                correlation_token="run1-a-2",
+            )
+
+
 # ── §10.6 one query path ────────────────────────────────────────────────────
 
-class OneQueryPathTests(LedgerFixture):
 
+class OneQueryPathTests(LedgerFixture):
     def test_the_same_reader_serves_a_live_run_and_a_finished_one(self):
         """§10.6 — live and historical reads use the same tables and the same
         cursor pattern. Not two readers that can disagree."""
@@ -360,20 +523,43 @@ class OneQueryPathTests(LedgerFixture):
         self.store.mark_merged("run1", "a")
         self.store.declare_outcome("run1", acceptance_result=True)
         historical = self.store.audit_transitions("run1")
-        self.assertEqual(historical[:len(live)], live)
+        self.assertEqual(historical[: len(live)], live)
         self.assertGreater(len(historical), len(live))
 
     def test_there_is_no_dashboard_only_table_or_view(self):
         """§10.6 — no dashboard-only schema and no fixture-only truth."""
-        objects = {(row[0], row[1]) for row in self.store.conn.execute(
-            "SELECT type, name FROM sqlite_master WHERE type IN ('table','view')")}
+        objects = {
+            (row[0], row[1])
+            for row in self.store.conn.execute(
+                "SELECT type, name FROM sqlite_master WHERE type IN ('table','view')"
+            )
+        }
         views = {name for kind, name in objects if kind == "view"}
         self.assertEqual(views, set())
-        tables = {name for kind, name in objects
-                  if kind == "table" and not name.startswith("sqlite_")}
-        self.assertEqual(tables, {"runs", "dag_nodes", "node_lifecycle", "attempts",
-                                  "attempt_baselines", "transitions", "results",
-                                  "orphans"})
+        tables = {
+            name
+            for kind, name in objects
+            if kind == "table" and not name.startswith("sqlite_")
+        }
+        self.assertEqual(
+            tables,
+            {
+                "runs",
+                "dag_nodes",
+                "node_lifecycle",
+                "attempts",
+                "attempt_baselines",
+                "transitions",
+                "results",
+                "orphans",
+                "actor_sessions",
+                "lane_candidates",
+                "candidate_reviews",
+                "repair_handoffs",
+                "lane_retry_spend",
+                "legacy_review_migration_blocks",
+            },
+        )
 
 
 if __name__ == "__main__":

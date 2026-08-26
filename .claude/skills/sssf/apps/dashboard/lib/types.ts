@@ -46,6 +46,39 @@ export interface MaestroReviewFinding {
   blocking: boolean;
 }
 
+export type MaestroLanePhase = string;
+
+export interface MaestroLaneCandidate {
+  build_node_id: string;
+  candidate_seq: number;
+  candidate_sha: string;
+  parent_candidate_sha: string | null;
+  builder_generation: number;
+  created_at: string | null;
+}
+
+export interface MaestroCandidateReview {
+  review_node_id: string;
+  candidate_sha: string;
+  reviewer_generation: number;
+  state: string;
+  review_digest: string | null;
+  receipt_path: string | null;
+  findings: MaestroReviewFinding[];
+  verdict: string | null;
+  completed_at: string | null;
+}
+
+export interface MaestroRepairHandoff {
+  build_node_id: string;
+  rejected_candidate_sha: string;
+  findings: MaestroReviewFinding[];
+  state: string;
+  builder_generation: number;
+  submitted_at: string | null;
+  acknowledged_at: string | null;
+}
+
 export type AttemptLiveness =
   | "running"
   | "stale"
@@ -92,6 +125,7 @@ export interface MaestroNode {
   needs: string[];
   outputs: string[];
   state: MaestroNodeState;
+  lane_phase: MaestroLanePhase | null;
   attempt_no: number;
   block_reason: string | null;
   cancel_cause: MaestroCancelCause | null;
@@ -136,6 +170,17 @@ export interface MaestroRunSummary {
   node_states: { node_id: string; state: MaestroNodeState }[];
 }
 
+export interface MaestroActorSession {
+  build_node_id: string;
+  actor_role: string;
+  generation: number;
+  state: string;
+  pane_id: string | null;
+  session_path: string | null;
+  correlation_token: string | null;
+  updated_at: string | null;
+}
+
 export interface MaestroRunDetail {
   run_id: string;
   plan_name: string | null;
@@ -153,6 +198,10 @@ export interface MaestroRunDetail {
   server_now_ms: number;
   integration: MaestroIntegration | null;
   nodes: MaestroNode[];
+  actor_sessions: MaestroActorSession[];
+  lane_candidates: MaestroLaneCandidate[];
+  candidate_reviews: MaestroCandidateReview[];
+  repair_handoffs: MaestroRepairHandoff[];
   results: MaestroResult[];
   run_transitions: MaestroTransition[];
 }

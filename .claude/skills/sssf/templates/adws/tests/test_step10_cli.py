@@ -7,8 +7,10 @@ import io
 import json
 import os
 import subprocess
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -58,14 +60,22 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             "executables": binaries,
             "route_receipts": {"omp": "route-receipts/omp.json"},
             "reviewer": {
-                "route": "omp", "model": "review-model", "effort": "high",
-                "finalization_timeout_s": 60, "turn_timeout_s": 20,
+                "route": "omp",
+                "model": "review-model",
+                "effort": "high",
+                "finalization_timeout_s": 60,
+                "turn_timeout_s": 20,
                 "poll_interval_s": 1,
             },
             "execution": {
-                "route": "omp", "model": "execution-model", "effort": "medium",
-                "concurrency": 2, "node_timeout_s": 120, "turn_timeout_s": 30,
-                "final_acceptance_timeout_s": 45, "backstop_t_s": 600,
+                "route": "omp",
+                "model": "execution-model",
+                "effort": "medium",
+                "concurrency": 2,
+                "node_timeout_s": 120,
+                "turn_timeout_s": 30,
+                "final_acceptance_timeout_s": 45,
+                "backstop_t_s": 600,
                 "semantic_ceiling": 3,
             },
         }
@@ -81,19 +91,18 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             worktree, worktree_config = self._installation(root, "project-wt")
             (worktree / ".git").write_text(
                 "gitdir: " + str(main_repo / ".git" / "worktrees" / "wt") + "\n",
-                encoding="utf-8")
+                encoding="utf-8",
+            )
 
             from_main = maestro._load_maestro_layout(main_repo, main_config)
-            from_worktree = maestro._load_maestro_layout(
-                worktree, worktree_config)
+            from_worktree = maestro._load_maestro_layout(worktree, worktree_config)
 
-            self.assertEqual(from_worktree["repository_state"],
-                             from_main["repository_state"])
+            self.assertEqual(
+                from_worktree["repository_state"], from_main["repository_state"]
+            )
             self.assertEqual(from_worktree["database"], from_main["database"])
-            self.assertEqual(from_worktree["receipt_dir"],
-                             from_main["receipt_dir"])
-            self.assertEqual(from_worktree["route_paths"],
-                             from_main["route_paths"])
+            self.assertEqual(from_worktree["receipt_dir"], from_main["receipt_dir"])
+            self.assertEqual(from_worktree["route_paths"], from_main["route_paths"])
             # The plan being run is still whatever *this* checkout has on disk.
             self.assertEqual(from_worktree["plans_dir"], worktree / "plans")
             self.assertEqual(from_main["plans_dir"], main_repo / "plans")
@@ -113,13 +122,15 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             (first / ".git").mkdir()
             second, second_config = self._installation(root, "beta")
             (second / ".git").mkdir()
-            with mock.patch.dict(
-                    os.environ, {"MAESTRO_REGISTRY": str(registry)}):
-                for repo, config_path in ((first, first_config),
-                                          (second, second_config),
-                                          (first, first_config)):
+            with mock.patch.dict(os.environ, {"MAESTRO_REGISTRY": str(registry)}):
+                for repo, config_path in (
+                    (first, first_config),
+                    (second, second_config),
+                    (first, first_config),
+                ):
                     maestro._register_installation(
-                        maestro._load_maestro_layout(repo, config_path))
+                        maestro._load_maestro_layout(repo, config_path)
+                    )
                 recorded = json.loads(registry.read_text(encoding="utf-8"))
 
             rows = recorded["installations"]
@@ -128,8 +139,8 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             self.assertEqual(rows[1]["repository"], str(second))
             self.assertEqual(
                 rows[0]["database"],
-                str((root / "maestro-state" / "alpha"
-                     / "lifecycle.sqlite3").resolve()))
+                str((root / "maestro-state" / "alpha" / "lifecycle.sqlite3").resolve()),
+            )
             self.assertEqual(rows[0]["plans_dir"], str(first / "plans"))
 
     def test_moving_state_replaces_the_repositorys_registry_row(self):
@@ -138,23 +149,24 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             registry = root / "registry.json"
             repo, config_path = self._installation(root, "project")
             (repo / ".git").mkdir()
-            with mock.patch.dict(
-                    os.environ, {"MAESTRO_REGISTRY": str(registry)}):
+            with mock.patch.dict(os.environ, {"MAESTRO_REGISTRY": str(registry)}):
                 maestro._register_installation(
-                    maestro._load_maestro_layout(repo, config_path))
+                    maestro._load_maestro_layout(repo, config_path)
+                )
                 config = json.loads(config_path.read_text(encoding="utf-8"))
                 config["state_root"] = "../moved-state"
                 config_path.write_text(json.dumps(config), encoding="utf-8")
                 maestro._register_installation(
-                    maestro._load_maestro_layout(repo, config_path))
+                    maestro._load_maestro_layout(repo, config_path)
+                )
                 recorded = json.loads(registry.read_text(encoding="utf-8"))
 
-            row, = recorded["installations"]
+            (row,) = recorded["installations"]
             self.assertEqual(row["repository"], str(repo))
             self.assertEqual(
                 row["database"],
-                str((root / "moved-state" / "project"
-                     / "lifecycle.sqlite3").resolve()))
+                str((root / "moved-state" / "project" / "lifecycle.sqlite3").resolve()),
+            )
 
     def test_an_unwritable_registry_never_fails_a_run(self):
         """Observability bookkeeping is not allowed to refuse a run."""
@@ -166,8 +178,8 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             blocker = root / "blocked"
             blocker.write_text("not a directory\n", encoding="utf-8")
             with mock.patch.dict(
-                    os.environ,
-                    {"MAESTRO_REGISTRY": str(blocker / "registry.json")}):
+                os.environ, {"MAESTRO_REGISTRY": str(blocker / "registry.json")}
+            ):
                 maestro._register_installation(layout)
 
     def test_a_plain_checkout_still_names_itself(self):
@@ -176,8 +188,10 @@ class RepositoryStateIdentityTest(unittest.TestCase):
             repo, config_path = self._installation(root, "project")
             (repo / ".git").mkdir()
             layout = maestro._load_maestro_layout(repo, config_path)
-            self.assertEqual(layout["repository_state"],
-                             (root / "maestro-state" / "project").resolve())
+            self.assertEqual(
+                layout["repository_state"],
+                (root / "maestro-state" / "project").resolve(),
+            )
 
 
 class OperatorCliTest(unittest.TestCase):
@@ -189,8 +203,10 @@ class OperatorCliTest(unittest.TestCase):
         # what the test is about, and the assertions would be about whichever
         # models this machine happens to have registered.
         patch = mock.patch.object(
-            maestro.agent_pi, "catalog",
-            lambda: (("stub", "model", 400_000), ("stub", "m", 400_000)))
+            maestro.agent_pi,
+            "catalog",
+            lambda: (("stub", "model", 400_000), ("stub", "m", 400_000)),
+        )
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -221,8 +237,11 @@ class OperatorCliTest(unittest.TestCase):
             binary.chmod(0o755)
             binaries[name] = str(binary)
         configured_state = Path(state_root).expanduser()
-        state = (configured_state if configured_state.is_absolute()
-                 else repo / configured_state).resolve()
+        state = (
+            configured_state
+            if configured_state.is_absolute()
+            else repo / configured_state
+        ).resolve()
         route_dir = state / repo.name / "route-receipts"
         route_dir.mkdir(parents=True)
         for route in ("omp", "claude"):
@@ -231,10 +250,12 @@ class OperatorCliTest(unittest.TestCase):
         route_seed = receipt_crypto.generate_seed()
         environment = {
             "MAESTRO_TEST_VERIFY_KEY": receipt_crypto.seed_to_public_key(
-                signing_seed).hex(),
+                signing_seed
+            ).hex(),
             "MAESTRO_TEST_SIGNING_SEED": signing_seed.hex(),
             "MAESTRO_TEST_ROUTE_VERIFY_KEY": receipt_crypto.seed_to_public_key(
-                route_seed).hex(),
+                route_seed
+            ).hex(),
         }
         config = {
             "schema": "maestro-config.v1",
@@ -272,7 +293,8 @@ class OperatorCliTest(unittest.TestCase):
             },
         }
         (repo / "adws" / "maestro.config.yaml").write_text(
-            json.dumps(config), encoding="utf-8")
+            json.dumps(config), encoding="utf-8"
+        )
         return {
             "environment": environment,
             "plan_file": plan_file,
@@ -284,30 +306,38 @@ class OperatorCliTest(unittest.TestCase):
     def test_named_plan_validate_binds_repository_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._named_plan_configuration(Path(tmp))
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(fixture["repo"]), \
-                    mock.patch.object(
-                        maestro, "_plan_validate", return_value=0) as validate:
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(fixture["repo"]),
+                mock.patch.object(
+                    maestro, "_plan_validate", return_value=0
+                ) as validate,
+            ):
                 self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
         args = validate.call_args.args[0]
-        self.assertEqual(Path(args.plan_file).resolve(),
-                         fixture["plan_file"].resolve())
+        self.assertEqual(Path(args.plan_file).resolve(), fixture["plan_file"].resolve())
         self.assertEqual(Path(args.repo).resolve(), fixture["repo"].resolve())
-        self.assertEqual(Path(args.data_dir).resolve(),
-                         (fixture["state"] / "data").resolve())
-        self.assertEqual(Path(args.receipt_dir).resolve(),
-                         (fixture["state"] / "receipts").resolve())
-        self.assertEqual(args.verify_key, [fixture["environment"][
-            "MAESTRO_TEST_VERIFY_KEY"]])
-        self.assertEqual(args.signing_seed, fixture["environment"][
-            "MAESTRO_TEST_SIGNING_SEED"])
-        self.assertEqual(Path(args.herdr).resolve(),
-                         (fixture["repo"].parent / "herdr").resolve())
-        self.assertEqual(Path(args.omp).resolve(),
-                         (fixture["repo"].parent / "omp").resolve())
-        self.assertEqual(Path(args.claude).resolve(),
-                         (fixture["repo"].parent / "claude").resolve())
+        self.assertEqual(
+            Path(args.data_dir).resolve(), (fixture["state"] / "data").resolve()
+        )
+        self.assertEqual(
+            Path(args.receipt_dir).resolve(), (fixture["state"] / "receipts").resolve()
+        )
+        self.assertEqual(
+            args.verify_key, [fixture["environment"]["MAESTRO_TEST_VERIFY_KEY"]]
+        )
+        self.assertEqual(
+            args.signing_seed, fixture["environment"]["MAESTRO_TEST_SIGNING_SEED"]
+        )
+        self.assertEqual(
+            Path(args.herdr).resolve(), (fixture["repo"].parent / "herdr").resolve()
+        )
+        self.assertEqual(
+            Path(args.omp).resolve(), (fixture["repo"].parent / "omp").resolve()
+        )
+        self.assertEqual(
+            Path(args.claude).resolve(), (fixture["repo"].parent / "claude").resolve()
+        )
 
     def test_home_relative_state_root_binds_central_repository_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -315,16 +345,15 @@ class OperatorCliTest(unittest.TestCase):
             home = root / "home"
             home.mkdir()
             with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
-                fixture = self._named_plan_configuration(
-                    root, state_root="~/.maestro")
-                with mock.patch.dict(
-                        os.environ, fixture["environment"], clear=False), \
-                        self._repository_cwd(fixture["repo"]), \
-                        mock.patch.object(
-                            maestro, "_plan_validate",
-                            return_value=0) as validate:
-                    self.assertEqual(
-                        maestro.main(["plan", "validate", "named"]), 0)
+                fixture = self._named_plan_configuration(root, state_root="~/.maestro")
+                with (
+                    mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                    self._repository_cwd(fixture["repo"]),
+                    mock.patch.object(
+                        maestro, "_plan_validate", return_value=0
+                    ) as validate,
+                ):
+                    self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
 
         args = validate.call_args.args[0]
         expected = (home / ".maestro" / fixture["repo"].name).resolve()
@@ -336,21 +365,22 @@ class OperatorCliTest(unittest.TestCase):
             root = Path(tmp)
             registry = root / "registry.json"
             fixture = self._named_plan_configuration(root)
-            with mock.patch.dict(
+            with (
+                mock.patch.dict(
                     os.environ,
-                    {**fixture["environment"],
-                     "MAESTRO_REGISTRY": str(registry)},
-                    clear=False), \
-                    self._repository_cwd(fixture["repo"]), \
-                    mock.patch.object(
-                        maestro, "_run_status", return_value=0):
+                    {**fixture["environment"], "MAESTRO_REGISTRY": str(registry)},
+                    clear=False,
+                ),
+                self._repository_cwd(fixture["repo"]),
+                mock.patch.object(maestro, "_run_status", return_value=0),
+            ):
                 self.assertEqual(maestro.main(["run", "status", "named"]), 0)
 
-            row, = json.loads(
-                registry.read_text(encoding="utf-8"))["installations"]
+            (row,) = json.loads(registry.read_text(encoding="utf-8"))["installations"]
             self.assertEqual(row["repository"], str(fixture["repo"].resolve()))
-            self.assertEqual(row["database"], str(
-                (fixture["state"] / "lifecycle.sqlite3").resolve()))
+            self.assertEqual(
+                row["database"], str((fixture["state"] / "lifecycle.sqlite3").resolve())
+            )
 
     def test_a_configured_verb_binds_from_below_the_repository_root(self):
         """The repository owns the configuration; the shell's cwd does not.
@@ -364,20 +394,23 @@ class OperatorCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._named_plan_configuration(Path(tmp))
             (fixture["repo"] / ".git").mkdir()
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(fixture["plan_file"].parent), \
-                    mock.patch.object(
-                        maestro, "_plan_validate", return_value=0) as validate:
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(fixture["plan_file"].parent),
+                mock.patch.object(
+                    maestro, "_plan_validate", return_value=0
+                ) as validate,
+            ):
                 self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
         args = validate.call_args.args[0]
-        self.assertEqual(Path(args.plan_file).resolve(),
-                         fixture["plan_file"].resolve())
+        self.assertEqual(Path(args.plan_file).resolve(), fixture["plan_file"].resolve())
         self.assertEqual(Path(args.repo).resolve(), fixture["repo"].resolve())
-        self.assertEqual(Path(args.data_dir).resolve(),
-                         (fixture["state"] / "data").resolve())
-        self.assertEqual(Path(args.receipt_dir).resolve(),
-                         (fixture["state"] / "receipts").resolve())
+        self.assertEqual(
+            Path(args.data_dir).resolve(), (fixture["state"] / "data").resolve()
+        )
+        self.assertEqual(
+            Path(args.receipt_dir).resolve(), (fixture["state"] / "receipts").resolve()
+        )
 
     def test_a_nested_checkout_does_not_inherit_the_enclosing_repository(self):
         """The search for an installation stops at the checkout it is in.
@@ -392,11 +425,13 @@ class OperatorCliTest(unittest.TestCase):
             (fixture["repo"] / ".git").mkdir()
             nested = fixture["repo"] / "vendor" / "unrelated"
             (nested / ".git").mkdir(parents=True)
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(nested), \
-                    mock.patch.object(
-                        maestro, "_plan_validate", return_value=0) as validate:
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(nested),
+                mock.patch.object(
+                    maestro, "_plan_validate", return_value=0
+                ) as validate,
+            ):
                 self.assertEqual(maestro.main(["plan", "validate", "named"]), 0)
         args = validate.call_args.args[0]
         self.assertEqual(args.plan_file, "named")
@@ -410,48 +445,57 @@ class OperatorCliTest(unittest.TestCase):
         them is bound and none is even a flag."""
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._named_plan_configuration(Path(tmp))
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(fixture["repo"]), \
-                    mock.patch.object(
-                        maestro, "_plan_finalize", return_value=0) as finalize:
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(fixture["repo"]),
+                mock.patch.object(
+                    maestro, "_plan_finalize", return_value=0
+                ) as finalize,
+            ):
                 self.assertEqual(maestro.main(["plan", "finalize", "named"]), 0)
         args = finalize.call_args.args[0]
-        self.assertEqual(Path(args.plan_file).resolve(),
-                         fixture["plan_file"].resolve())
+        self.assertEqual(Path(args.plan_file).resolve(), fixture["plan_file"].resolve())
         self.assertEqual(Path(args.repo).resolve(), fixture["repo"].resolve())
-        self.assertEqual(Path(args.receipt_dir).resolve(),
-                         (fixture["state"] / "receipts").resolve())
-        self.assertEqual(Path(args.data_dir).resolve(),
-                         (fixture["state"] / "data").resolve())
-        self.assertEqual(args.verify_key, [fixture["environment"][
-            "MAESTRO_TEST_VERIFY_KEY"]])
-        self.assertEqual(args.signing_seed, fixture["environment"][
-            "MAESTRO_TEST_SIGNING_SEED"])
-        for absent in ("reviewer_route", "reviewer_model", "reviewer_effort",
-                       "reviewer_profile", "reviewer_session_dir",
-                       "reviewer_report_file", "finalization_timeout_s",
-                       "reviewer_turn_timeout_s", "reviewer_poll_interval_s"):
+        self.assertEqual(
+            Path(args.receipt_dir).resolve(), (fixture["state"] / "receipts").resolve()
+        )
+        self.assertEqual(
+            Path(args.data_dir).resolve(), (fixture["state"] / "data").resolve()
+        )
+        self.assertEqual(
+            args.verify_key, [fixture["environment"]["MAESTRO_TEST_VERIFY_KEY"]]
+        )
+        self.assertEqual(
+            args.signing_seed, fixture["environment"]["MAESTRO_TEST_SIGNING_SEED"]
+        )
+        for absent in (
+            "reviewer_route",
+            "reviewer_model",
+            "reviewer_effort",
+            "reviewer_profile",
+            "reviewer_session_dir",
+            "reviewer_report_file",
+            "finalization_timeout_s",
+            "reviewer_turn_timeout_s",
+            "reviewer_poll_interval_s",
+        ):
             self.assertIsNone(getattr(args, absent, None), absent)
 
     def test_named_run_start_derives_digest_and_external_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self._named_plan_configuration(Path(tmp))
             run_uuid = SimpleNamespace(hex="0123456789abcdef")
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(fixture["repo"]), \
-                    mock.patch.object(maestro.uuid, "uuid4",
-                                      return_value=run_uuid), \
-                    mock.patch.object(
-                        maestro, "_run_start", return_value=0) as start:
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(fixture["repo"]),
+                mock.patch.object(maestro.uuid, "uuid4", return_value=run_uuid),
+                mock.patch.object(maestro, "_run_start", return_value=0) as start,
+            ):
                 self.assertEqual(maestro.main(["run", "start", "named"]), 0)
         args = start.call_args.args[0]
         run_root = fixture["state"] / "runs" / ("run-" + run_uuid.hex)
-        self.assertEqual(Path(args.plan_file).resolve(),
-                         fixture["plan_file"].resolve())
-        self.assertEqual(args.digest, maestro.plan_digest.digest_of(
-            fixture["stored"]))
+        self.assertEqual(Path(args.plan_file).resolve(), fixture["plan_file"].resolve())
+        self.assertEqual(args.digest, maestro.plan_digest.digest_of(fixture["stored"]))
         self.assertEqual(args.run_id, "run-" + run_uuid.hex)
         self.assertEqual(args.db, str(fixture["state"] / "lifecycle.sqlite3"))
         self.assertEqual(args.integration_path, str(run_root / "integration"))
@@ -460,63 +504,80 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(args.agent_route, "omp")
         self.assertEqual(args.agent_profile, "test")
         for path in (args.db, args.data_dir, args.receipt_dir):
-            self.assertFalse(maestro._path_is_within(
-                Path(path), fixture["repo"]))
-            self.assertFalse(maestro._path_is_within(
-                Path(path), Path(args.integration_path)))
+            self.assertFalse(maestro._path_is_within(Path(path), fixture["repo"]))
+            self.assertFalse(
+                maestro._path_is_within(Path(path), Path(args.integration_path))
+            )
 
     def test_named_plan_configuration_fails_closed_for_bad_env_and_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fixture = self._named_plan_configuration(root)
-            with mock.patch.dict(os.environ, {}, clear=True), \
-                    self._repository_cwd(fixture["repo"]), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                self._repository_cwd(fixture["repo"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
                 code = maestro.main(["plan", "validate", "named"])
             self.assertEqual(code, 3)
-            self.assertEqual(json.loads(output.getvalue())["outcome"],
-                             "MAESTRO_ENVIRONMENT_REQUIRED")
+            self.assertEqual(
+                json.loads(output.getvalue())["outcome"], "MAESTRO_ENVIRONMENT_REQUIRED"
+            )
 
             malformed_repo = root / "malformed-config"
             (malformed_repo / "adws").mkdir(parents=True)
             (malformed_repo / "adws" / "maestro.config.yaml").write_text(
-                "[", encoding="utf-8")
-            with self._repository_cwd(malformed_repo), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
+                "[", encoding="utf-8"
+            )
+            with (
+                self._repository_cwd(malformed_repo),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
                 code = maestro.main(["plan", "validate", "named"])
             self.assertEqual(code, 3)
-            self.assertEqual(json.loads(output.getvalue())["outcome"],
-                             "MAESTRO_CONFIGURATION_INVALID")
+            self.assertEqual(
+                json.loads(output.getvalue())["outcome"],
+                "MAESTRO_CONFIGURATION_INVALID",
+            )
 
             invalid = self._named_plan_configuration(
-                root / "invalid", state_root=".maestro-state")
-            with mock.patch.dict(
-                    os.environ, invalid["environment"], clear=False), \
-                    self._repository_cwd(invalid["repo"]), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
+                root / "invalid", state_root=".maestro-state"
+            )
+            with (
+                mock.patch.dict(os.environ, invalid["environment"], clear=False),
+                self._repository_cwd(invalid["repo"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
                 code = maestro.main(["plan", "validate", "named"])
             self.assertEqual(code, 3)
-            self.assertEqual(json.loads(output.getvalue())["outcome"],
-                             "MAESTRO_CONFIGURATION_INVALID")
+            self.assertEqual(
+                json.loads(output.getvalue())["outcome"],
+                "MAESTRO_CONFIGURATION_INVALID",
+            )
 
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(fixture["repo"]), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(fixture["repo"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
                 code = maestro.main(["plan", "validate", "missing"])
             self.assertEqual(code, 3)
-            self.assertEqual(json.loads(output.getvalue())["outcome"],
-                             "MAESTRO_CONFIGURATION_INVALID")
+            self.assertEqual(
+                json.loads(output.getvalue())["outcome"],
+                "MAESTRO_CONFIGURATION_INVALID",
+            )
 
-            with mock.patch.dict(
-                    os.environ, fixture["environment"], clear=False), \
-                    self._repository_cwd(fixture["repo"]), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
-                code = maestro.main([
-                    "plan", "validate", "named", "--repo", "override"])
+            with (
+                mock.patch.dict(os.environ, fixture["environment"], clear=False),
+                self._repository_cwd(fixture["repo"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                code = maestro.main(["plan", "validate", "named", "--repo", "override"])
             self.assertEqual(code, 3)
-            self.assertEqual(json.loads(output.getvalue())["outcome"],
-                             "MAESTRO_CONFIGURATION_INVALID")
+            self.assertEqual(
+                json.loads(output.getvalue())["outcome"],
+                "MAESTRO_CONFIGURATION_INVALID",
+            )
 
     def test_plan_validate_malformed_bytes_is_authoring_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -537,15 +598,22 @@ class OperatorCliTest(unittest.TestCase):
         digest = "a" * 64
         seed = receipt_crypto.generate_seed()
         store = finalization.ReceiptStore(
-            receipt_dir, repo_paths=(repo,), data_dir=data_dir,
+            receipt_dir,
+            repo_paths=(repo,),
+            data_dir=data_dir,
             verify_keys=[receipt_crypto.seed_to_public_key(seed)],
-            signing_seed=seed)
+            signing_seed=seed,
+        )
         receipt = finalization.Receipt(
-            plan_digest=digest, rubric_version="test.v1",
-            verdict=finalization.Verdict.PASS, cells=(),
+            plan_digest=digest,
+            rubric_version="test.v1",
+            verdict=finalization.Verdict.PASS,
+            cells=(),
             reviewer=finalization.ReviewerIdentity(
-                route="test", model="test", session_id="test"),
-            created_at_epoch=0.0)
+                route="test", model="test", session_id="test"
+            ),
+            created_at_epoch=0.0,
+        )
         plan_file = tmp / "plan.json"
         plan_file.write_text("{}")
         return {
@@ -561,26 +629,31 @@ class OperatorCliTest(unittest.TestCase):
 
     def _validation_arguments(self, environment, *verification):
         return [
-            "plan", "validate", str(environment["plan_file"]),
-            "--repo", str(environment["repo"]),
-            "--receipt-dir", str(environment["receipt_dir"]),
-            "--data-dir", str(environment["data_dir"]),
+            "plan",
+            "validate",
+            str(environment["plan_file"]),
+            "--repo",
+            str(environment["repo"]),
+            "--receipt-dir",
+            str(environment["receipt_dir"]),
+            "--data-dir",
+            str(environment["data_dir"]),
             *verification,
         ]
 
     def _validate_receipt_gate(self, digest):
         def validate(_stored, _repo, *, receipts, collector):
             if receipts.has_receipt(digest):
-                return pv.ValidationResult(
-                    pv.Outcome.FINALIZATION_ELIGIBLE, digest, ())
+                return pv.ValidationResult(pv.Outcome.FINALIZATION_ELIGIBLE, digest, ())
             return pv.ValidationResult(pv.Outcome.AUTHORING_BLOCKED, None, ())
+
         return validate
 
     def _run_receipt_gate(self, argv, digest):
         output = io.StringIO()
         with mock.patch.object(
-                maestro.pv, "validate_plan",
-                side_effect=self._validate_receipt_gate(digest)):
+            maestro.pv, "validate_plan", side_effect=self._validate_receipt_gate(digest)
+        ):
             with contextlib.redirect_stdout(output):
                 code = maestro.main(argv)
         return code, json.loads(output.getvalue())
@@ -588,14 +661,17 @@ class OperatorCliTest(unittest.TestCase):
     def test_plan_validate_rejects_a_forged_receipt_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             environment = self._receipt_environment(Path(tmp))
-            (environment["receipt_dir"] / (environment["digest"] + ".json")
-             ).write_text("{}")
+            (environment["receipt_dir"] / (environment["digest"] + ".json")).write_text(
+                "{}"
+            )
             code, payload = self._run_receipt_gate(
                 self._validation_arguments(
-                    environment, "--verify-key",
-                    receipt_crypto.seed_to_public_key(
-                        environment["seed"]).hex()),
-                environment["digest"])
+                    environment,
+                    "--verify-key",
+                    receipt_crypto.seed_to_public_key(environment["seed"]).hex(),
+                ),
+                environment["digest"],
+            )
         self.assertEqual(code, 3)
         self.assertEqual(payload["outcome"], "RECEIPT_VERIFICATION_FAILED")
 
@@ -605,10 +681,12 @@ class OperatorCliTest(unittest.TestCase):
             environment["store"].write(environment["receipt"])
             code, payload = self._run_receipt_gate(
                 self._validation_arguments(
-                    environment, "--verify-key",
-                    receipt_crypto.seed_to_public_key(
-                        environment["seed"]).hex()),
-                environment["digest"])
+                    environment,
+                    "--verify-key",
+                    receipt_crypto.seed_to_public_key(environment["seed"]).hex(),
+                ),
+                environment["digest"],
+            )
         self.assertEqual(code, 0)
         self.assertEqual(payload["outcome"], "FINALIZATION_ELIGIBLE")
 
@@ -617,11 +695,14 @@ class OperatorCliTest(unittest.TestCase):
             environment = self._receipt_environment(Path(tmp))
             environment["store"].write(environment["receipt"])
             wrong_key = receipt_crypto.seed_to_public_key(
-                receipt_crypto.generate_seed())
+                receipt_crypto.generate_seed()
+            )
             code, payload = self._run_receipt_gate(
                 self._validation_arguments(
-                    environment, "--verify-key", wrong_key.hex()),
-                environment["digest"])
+                    environment, "--verify-key", wrong_key.hex()
+                ),
+                environment["digest"],
+            )
         self.assertEqual(code, 3)
         self.assertEqual(payload["outcome"], "RECEIPT_VERIFICATION_FAILED")
 
@@ -630,24 +711,35 @@ class OperatorCliTest(unittest.TestCase):
             environment = self._receipt_environment(Path(tmp))
             environment["store"].write(environment["receipt"])
             with mock.patch.dict(
-                    os.environ,
-                    {"MAESTRO_RECEIPT_DIR": str(environment["receipt_dir"])},
-                    clear=False):
+                os.environ,
+                {"MAESTRO_RECEIPT_DIR": str(environment["receipt_dir"])},
+                clear=False,
+            ):
                 code, payload = self._run_receipt_gate(
-                    ["plan", "validate", str(environment["plan_file"]),
-                     "--repo", str(environment["repo"])],
-                    environment["digest"])
+                    [
+                        "plan",
+                        "validate",
+                        str(environment["plan_file"]),
+                        "--repo",
+                        str(environment["repo"]),
+                    ],
+                    environment["digest"],
+                )
         self.assertEqual(code, 3)
         self.assertEqual(
-            payload["outcome"], "RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED")
+            payload["outcome"], "RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED"
+        )
 
     def _receipt_access_arguments(self, environment):
         return [
-            "--repo", str(environment["repo"]),
-            "--receipt-dir", str(environment["receipt_dir"]),
-            "--data-dir", str(environment["data_dir"]),
-            "--verify-key", receipt_crypto.seed_to_public_key(
-                environment["seed"]).hex(),
+            "--repo",
+            str(environment["repo"]),
+            "--receipt-dir",
+            str(environment["receipt_dir"]),
+            "--data-dir",
+            str(environment["data_dir"]),
+            "--verify-key",
+            receipt_crypto.seed_to_public_key(environment["seed"]).hex(),
         ]
 
     def _run_receipt_access(self, argv):
@@ -661,27 +753,35 @@ class OperatorCliTest(unittest.TestCase):
             environment = self._receipt_environment(Path(tmp))
             environment["store"].write(environment["receipt"])
 
-            code, receipt = self._run_receipt_access([
-                "plan", "show", environment["digest"],
-                *self._receipt_access_arguments(environment)])
+            code, receipt = self._run_receipt_access(
+                [
+                    "plan",
+                    "show",
+                    environment["digest"],
+                    *self._receipt_access_arguments(environment),
+                ]
+            )
 
         self.assertEqual(code, 0)
-        self.assertEqual(receipt, json.loads(
-            environment["receipt"].to_bytes().decode("utf-8")))
-
+        self.assertEqual(
+            receipt, json.loads(environment["receipt"].to_bytes().decode("utf-8"))
+        )
 
     def test_plan_list_returns_only_verified_digest_identities(self):
         with tempfile.TemporaryDirectory() as tmp:
             environment = self._receipt_environment(Path(tmp))
             environment["store"].write(environment["receipt"])
             (environment["receipt_dir"] / "not-a-receipt.json").write_text(
-                "untrusted", encoding="utf-8")
+                "untrusted", encoding="utf-8"
+            )
 
-            code, digests = self._run_receipt_access([
-                "plan", "list", *self._receipt_access_arguments(environment)])
+            code, digests = self._run_receipt_access(
+                ["plan", "list", *self._receipt_access_arguments(environment)]
+            )
 
         self.assertEqual(code, 0)
         self.assertEqual(digests, [environment["digest"]])
+
     def test_plan_show_refuses_traversal_and_mismatched_verified_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             environment = self._receipt_environment(Path(tmp))
@@ -689,14 +789,20 @@ class OperatorCliTest(unittest.TestCase):
             source = environment["store"].path_for(environment["digest"])
             source.rename(environment["store"].path_for("b" * 64))
             Path(str(source) + ".sig").rename(
-                environment["store"].signature_path_for("b" * 64))
+                environment["store"].signature_path_for("b" * 64)
+            )
 
-            traversal_code, traversal = self._run_receipt_access([
-                "plan", "show", "../untrusted",
-                *self._receipt_access_arguments(environment)])
-            mismatch_code, mismatch = self._run_receipt_access([
-                "plan", "show", "b" * 64,
-                *self._receipt_access_arguments(environment)])
+            traversal_code, traversal = self._run_receipt_access(
+                [
+                    "plan",
+                    "show",
+                    "../untrusted",
+                    *self._receipt_access_arguments(environment),
+                ]
+            )
+            mismatch_code, mismatch = self._run_receipt_access(
+                ["plan", "show", "b" * 64, *self._receipt_access_arguments(environment)]
+            )
 
         self.assertEqual(traversal_code, 3)
         self.assertEqual(traversal["outcome"], "RECEIPT_VERIFICATION_FAILED")
@@ -708,10 +814,12 @@ class OperatorCliTest(unittest.TestCase):
             environment = self._receipt_environment(Path(tmp))
             environment["store"].write(environment["receipt"])
             (environment["receipt_dir"] / ("b" * 64 + ".json")).write_text(
-                "untrusted", encoding="utf-8")
+                "untrusted", encoding="utf-8"
+            )
 
-            code, failure = self._run_receipt_access([
-                "plan", "list", *self._receipt_access_arguments(environment)])
+            code, failure = self._run_receipt_access(
+                ["plan", "list", *self._receipt_access_arguments(environment)]
+            )
 
         self.assertEqual(code, 3)
         self.assertEqual(failure["outcome"], "RECEIPT_VERIFICATION_FAILED")
@@ -722,9 +830,14 @@ class OperatorCliTest(unittest.TestCase):
             path = environment["store"].write(environment["receipt"])
             Path(str(path) + ".sig").write_bytes(b"\xff")
 
-            code, failure = self._run_receipt_access([
-                "plan", "show", environment["digest"],
-                *self._receipt_access_arguments(environment)])
+            code, failure = self._run_receipt_access(
+                [
+                    "plan",
+                    "show",
+                    environment["digest"],
+                    *self._receipt_access_arguments(environment),
+                ]
+            )
 
         self.assertEqual(code, 3)
         self.assertEqual(failure["outcome"], "RECEIPT_VERIFICATION_FAILED")
@@ -736,11 +849,17 @@ class OperatorCliTest(unittest.TestCase):
             environment["store"].path_for(environment["digest"]).write_bytes(data)
             environment["store"].signature_path_for(environment["digest"]).write_text(
                 receipt_crypto.sign(environment["seed"], data).hex() + "\n",
-                encoding="ascii")
+                encoding="ascii",
+            )
 
-            code, failure = self._run_receipt_access([
-                "plan", "show", environment["digest"],
-                *self._receipt_access_arguments(environment)])
+            code, failure = self._run_receipt_access(
+                [
+                    "plan",
+                    "show",
+                    environment["digest"],
+                    *self._receipt_access_arguments(environment),
+                ]
+            )
 
         self.assertEqual(code, 3)
         self.assertEqual(failure["outcome"], "RECEIPT_VERIFICATION_FAILED")
@@ -754,29 +873,48 @@ class OperatorCliTest(unittest.TestCase):
             repo.mkdir()
             data.mkdir()
 
-            code, failure = self._run_receipt_access([
-                "plan", "show", "a" * 64, "--repo", str(repo),
-                "--receipt-dir", str(missing), "--data-dir", str(data),
-                "--verify-key", receipt_crypto.seed_to_public_key(
-                    receipt_crypto.generate_seed()).hex()])
+            code, failure = self._run_receipt_access(
+                [
+                    "plan",
+                    "show",
+                    "a" * 64,
+                    "--repo",
+                    str(repo),
+                    "--receipt-dir",
+                    str(missing),
+                    "--data-dir",
+                    str(data),
+                    "--verify-key",
+                    receipt_crypto.seed_to_public_key(
+                        receipt_crypto.generate_seed()
+                    ).hex(),
+                ]
+            )
 
             self.assertEqual(code, 3)
-            self.assertEqual(failure, {
-                "detail": "a" * 64,
-                "outcome": "FINALIZED_PLAN_NOT_FOUND",
-            })
+            self.assertEqual(
+                failure,
+                {
+                    "detail": "a" * 64,
+                    "outcome": "FINALIZED_PLAN_NOT_FOUND",
+                },
+            )
             self.assertFalse(missing.exists())
 
     def test_plan_receipt_access_has_a_stable_missing_configuration_refusal(self):
         code, refusal = self._run_receipt_access(["plan", "list"])
 
         self.assertEqual(code, 3)
-        self.assertEqual(refusal, {
-            "detail": (
-                "--receipt-dir, --data-dir, and at least one --verify-key "
-                "are required for receipt access"),
-            "outcome": "RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED",
-        })
+        self.assertEqual(
+            refusal,
+            {
+                "detail": (
+                    "--receipt-dir, --data-dir, and at least one --verify-key "
+                    "are required for receipt access"
+                ),
+                "outcome": "RECEIPT_VERIFICATION_CONFIGURATION_REQUIRED",
+            },
+        )
 
     def test_plan_finalize_refuses_a_signing_seed_absent_from_verify_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -787,11 +925,16 @@ class OperatorCliTest(unittest.TestCase):
             data.mkdir()
             signer = receipt_crypto.generate_seed()
             args = SimpleNamespace(
-                receipt_dir=str(root / "receipts"), data_dir=str(data),
+                receipt_dir=str(root / "receipts"),
+                data_dir=str(data),
                 repo=str(repo),
-                verify_key=[receipt_crypto.seed_to_public_key(
-                    receipt_crypto.generate_seed()).hex()],
-                signing_seed=signer.hex())
+                verify_key=[
+                    receipt_crypto.seed_to_public_key(
+                        receipt_crypto.generate_seed()
+                    ).hex()
+                ],
+                signing_seed=signer.hex(),
+            )
 
             with self.assertRaises(maestro._PlanReceiptConfigurationError):
                 maestro._finalization_store(args)
@@ -810,36 +953,46 @@ class OperatorCliTest(unittest.TestCase):
             digest = "a" * 64
             seed = receipt_crypto.generate_seed()
             args = mock.Mock(
-                plan_file=str(plan_file), repo=str(repo),
-                receipt_dir=str(root / "receipts"), data_dir=str(root / "data"),
+                plan_file=str(plan_file),
+                repo=str(repo),
+                receipt_dir=str(root / "receipts"),
+                data_dir=str(root / "data"),
                 # Bound by installed configuration, so it is named here: a
                 # `Mock` invents every attribute it is asked for, and the
                 # declared-runners block has to be a mapping.
                 runners={},
                 verify_key=[receipt_crypto.seed_to_public_key(seed).hex()],
-                signing_seed=seed.hex())
+                signing_seed=seed.hex(),
+            )
             validation = pv.ValidationResult(
-                pv.Outcome.FINALIZATION_ELIGIBLE, digest, ())
-            with mock.patch.object(
+                pv.Outcome.FINALIZATION_ELIGIBLE, digest, ()
+            )
+            with (
+                mock.patch.object(
                     maestro.pv, "validate_plan", return_value=validation
-            ) as validate, contextlib.redirect_stdout(io.StringIO()) as output:
+                ) as validate,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
                 code = maestro._plan_finalize(args)
             receipt = finalization.ReceiptStore(
-                root / "receipts", repo_paths=(repo,),
+                root / "receipts",
+                repo_paths=(repo,),
                 data_dir=root / "data",
                 verify_keys=(receipt_crypto.seed_to_public_key(seed),),
             ).load(digest)
 
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(output.getvalue()), {
-            "digest": digest,
-            "outcome": "FINALIZED",
-            "replayed": False,
-            "verdict": "PASS",
-        })
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "digest": digest,
+                "outcome": "FINALIZED",
+                "replayed": False,
+                "verdict": "PASS",
+            },
+        )
         self.assertEqual(validate.call_args.args[1], str(repo))
-        self.assertEqual(receipt.rubric_version,
-                         maestro.DETERMINISTIC_RUBRIC_VERSION)
+        self.assertEqual(receipt.rubric_version, maestro.DETERMINISTIC_RUBRIC_VERSION)
         self.assertEqual(receipt.reviewer.route, "deterministic")
 
     def test_run_resume_refuses_before_claiming_execution(self):
@@ -849,8 +1002,9 @@ class OperatorCliTest(unittest.TestCase):
                 code = maestro.main(["run", "resume", "run-1", "--db", "state.db"])
 
         self.assertEqual(code, 3)
-        self.assertEqual(json.loads(output.getvalue())["outcome"],
-                         "RUN_CONFIGURATION_REQUIRED")
+        self.assertEqual(
+            json.loads(output.getvalue())["outcome"], "RUN_CONFIGURATION_REQUIRED"
+        )
         store.return_value.resume_run.assert_not_called()
 
     def test_run_refuses_retry_while_unproven_herdr_handle_is_reclaimable(self):
@@ -861,8 +1015,12 @@ class OperatorCliTest(unittest.TestCase):
             scratch.mkdir()
             token = "run-1-agent-1"
             handle = launcher.LaunchHandle(
-                token, "pane-1", "agent-1", root,
-                transcript_path=scratch / "session.jsonl")
+                token,
+                "pane-1",
+                "agent-1",
+                root,
+                transcript_path=scratch / "session.jsonl",
+            )
 
             class FailingRoute:
                 def __init__(self):
@@ -879,7 +1037,8 @@ class OperatorCliTest(unittest.TestCase):
                 def cancel(self, _handle, _deadline):
                     self.cancel_calls += 1
                     raise launcher.HarnessQuiescenceError(
-                        "HERDR_QUIESCENCE_UNPROVEN:" + token)
+                        "HERDR_QUIESCENCE_UNPROVEN:" + token
+                    )
 
                 def reclaim(self, requested):
                     found = self.handles.get(requested)
@@ -895,16 +1054,20 @@ class OperatorCliTest(unittest.TestCase):
                     return None
 
             route = FailingRoute()
-            node = SimpleNamespace(
-                kind=scheduler_types.NodeKind.AGENT, node_id="agent")
+            node = SimpleNamespace(kind=scheduler_types.NodeKind.AGENT, node_id="agent")
             plan = SimpleNamespace(
                 agent_nodes=(node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
+                    integration_gate=SimpleNamespace(
+                        runner="none", argv=(), min_cases=1
+                    ),
+                ),
                 node_by_id=lambda: {
-                    "agent": SimpleNamespace(instruction="do the work")},
-                to_plan_nodes=lambda: ())
+                    "agent": SimpleNamespace(instruction="do the work")
+                },
+                to_plan_nodes=lambda: (),
+            )
             attempt = SimpleNamespace(path=root, scratch=scratch)
             record = SimpleNamespace(node_id="agent", attempt_no=1)
 
@@ -912,41 +1075,54 @@ class OperatorCliTest(unittest.TestCase):
                 def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                     self.deps = deps
 
+                def project(self):
+                    return None
+
                 def run(self):
                     try:
                         self.deps.run_node(
-                            attempt, node, record, "", lambda _pid: None,
-                            lambda: True)
+                            attempt, node, record, "", lambda _pid: None, lambda: True
+                        )
                     except launcher.HarnessQuiescenceError:
                         self.deps.quiesce_attempt(record, "retry")
                     raise AssertionError("unproven Herdr handle was released")
 
             args = SimpleNamespace(
-                plan_file=str(root / "plan.json"), db=str(Path(tmp) / "state.db"),
-                run_id="run-1", integration_path=str(root), repo=str(root),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                plan_file=str(root / "plan.json"),
+                db=str(Path(tmp) / "state.db"),
+                run_id="run-1",
+                integration_path=str(root),
+                repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch-root"), digest="a" * 64,
-                agent_route="omp", agent_model="model", agent_effort="high",
-                agent_profile="profile")
+                scratch_root=str(root / "scratch-root"),
+                digest="a" * 64,
+                agent_route="omp",
+                agent_model="model",
+                agent_effort="high",
+                agent_profile="profile",
+            )
             output = io.StringIO()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
+                ),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(
                     # Runner resolution probes a real interpreter. This plan is
                     # a stub whose gate never executes, so resolution joins the
                     # seams already substituted here rather than making every
                     # CLI test depend on the machine's PATH.
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
-                    maestro, "_runtime_launcher", return_value=route
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore"
-            ), mock.patch.object(
-                    maestro.scheduler, "Scheduler", RetryingScheduler
-            ), contextlib.redirect_stdout(output):
+                    maestro,
+                    "_resolve_run_runners",
+                    return_value={},
+                ),
+                mock.patch.object(maestro, "_runtime_launcher", return_value=route),
+                mock.patch.object(maestro.lc, "LifecycleStore"),
+                mock.patch.object(maestro.scheduler, "Scheduler", RetryingScheduler),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 3)
@@ -976,14 +1152,20 @@ class OperatorCliTest(unittest.TestCase):
                     return None
 
             node = SimpleNamespace(
-                kind=scheduler_types.NodeKind.CODE, node_id="code",
-                command=("unreachable",))
+                kind=scheduler_types.NodeKind.CODE,
+                node_id="code",
+                command=("unreachable",),
+            )
             plan = SimpleNamespace(
                 agent_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
-                to_plan_nodes=lambda: ())
+                    integration_gate=SimpleNamespace(
+                        runner="none", argv=(), min_cases=1
+                    ),
+                ),
+                to_plan_nodes=lambda: (),
+            )
             attempt = SimpleNamespace(path=root, scratch=root / "scratch")
             record = SimpleNamespace(node_id="code", attempt_no=1)
 
@@ -991,43 +1173,54 @@ class OperatorCliTest(unittest.TestCase):
                 def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                     self.deps = deps
 
+                def project(self):
+                    return None
+
                 def run(self):
                     try:
                         self.deps.run_node(
-                            attempt, node, record, "", lambda _pid: None,
-                            lambda: True)
+                            attempt, node, record, "", lambda _pid: None, lambda: True
+                        )
                     except RuntimeError:
                         self.deps.quiesce_attempt(record, "retry")
                     raise AssertionError("unproven process group was released")
 
             args = SimpleNamespace(
-                plan_file=str(root / "plan.json"), db=str(Path(tmp) / "state.db"),
-                run_id="run-1", integration_path=str(root), repo=str(root),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                plan_file=str(root / "plan.json"),
+                db=str(Path(tmp) / "state.db"),
+                run_id="run-1",
+                integration_path=str(root),
+                repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch-root"), digest="a" * 64)
+                scratch_root=str(root / "scratch-root"),
+                digest="a" * 64,
+            )
             output = io.StringIO()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
+                ),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(
                     # Runner resolution probes a real interpreter. This plan is
                     # a stub whose gate never executes, so resolution joins the
                     # seams already substituted here rather than making every
                     # CLI test depend on the machine's PATH.
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore"
-            ), mock.patch.object(
-                    maestro.scheduler, "Scheduler", RetryingScheduler
-            ), mock.patch.object(
-                    maestro.subprocess, "Popen", LiveProcess
-            ), mock.patch.object(
-                    maestro.launcher, "quiesce_process_group"
-            ) as quiesce, mock.patch.object(
+                    maestro,
+                    "_resolve_run_runners",
+                    return_value={},
+                ),
+                mock.patch.object(maestro.lc, "LifecycleStore"),
+                mock.patch.object(maestro.scheduler, "Scheduler", RetryingScheduler),
+                mock.patch.object(maestro.subprocess, "Popen", LiveProcess),
+                mock.patch.object(maestro.launcher, "quiesce_process_group") as quiesce,
+                mock.patch.object(
                     maestro.launcher, "_process_group_absent", return_value=False
-            ), contextlib.redirect_stdout(output):
+                ),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 3)
@@ -1039,53 +1232,68 @@ class OperatorCliTest(unittest.TestCase):
         self.assertIn("RuntimeError", payload["detail"])
         self.assertEqual(quiesce.call_count, 2)
 
-    def test_resume_retries_code_quiescence_without_agent_liveness_probe(self):
+    def test_resume_leaves_code_quiescence_blocked_without_grant_or_relaunch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
             root.mkdir()
             node = SimpleNamespace(
-                kind=scheduler_types.NodeKind.CODE, node_id="code",
-                command=("unreachable",))
+                kind=scheduler_types.NodeKind.CODE,
+                node_id="code",
+                command=("unreachable",),
+            )
             plan = SimpleNamespace(
-                agent_nodes=(), tests_nodes=(),
+                agent_nodes=(),
+                tests_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
                     integration_gate=SimpleNamespace(
-                        runner="none", argv=(), min_cases=1)),
-                to_plan_nodes=lambda: (node,))
+                        runner="none", argv=(), min_cases=1
+                    ),
+                ),
+                to_plan_nodes=lambda: (node,),
+            )
             args = SimpleNamespace(
                 plan_file=str(root / "plan.json"),
                 db=str(Path(tmp) / "state.db"),
-                run_id="run-1", integration_path=str(root), repo=str(root),
+                run_id="run-1",
+                integration_path=str(root),
+                repo=str(root),
                 data_dir=str(root / "data"),
                 receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch-root"), digest="a" * 64)
+                scratch_root=str(root / "scratch-root"),
+                digest="a" * 64,
+            )
 
-            class RetryReached(Exception):
+            class ResumeReached(Exception):
                 pass
 
             store = mock.Mock()
             store.quiescence_blocked_attempts.return_value = (("code", 1),)
-            store.retry.side_effect = RetryReached
+            store.running_attempts.return_value = ()
+            store.resume_run.side_effect = ResumeReached
             output = io.StringIO()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore", return_value=store
-            ), mock.patch.object(
-                    maestro, "_runtime_launcher"
-            ) as runtime_launcher, contextlib.redirect_stdout(output):
+                ),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(maestro, "_refuse_cross_run_node_budget"),
+                mock.patch.object(maestro, "_validate_run_paths"),
+                mock.patch.object(maestro, "_resolve_run_runners", return_value={}),
+                mock.patch.object(maestro, "_run_workspace_label", return_value="plan"),
+                mock.patch.object(maestro.lc, "LifecycleStore", return_value=store),
+                mock.patch.object(maestro, "_runtime_launcher") as runtime_launcher,
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_resume(args)
 
         self.assertEqual(code, 3)
         self.assertEqual(
-            json.loads(output.getvalue())["outcome"], "RUN_EXECUTION_FAILED")
-        store.retry.assert_called_once_with("run-1", "code", force=True)
+            json.loads(output.getvalue())["outcome"], "RUN_EXECUTION_FAILED"
+        )
+        store.resume_run.assert_called_once_with("run-1", late_envelope_attempts=[])
+        store.retry.assert_not_called()
         runtime_launcher.assert_not_called()
 
     def test_run_path_preflight_refuses_data_directory_aliases_and_hardlinks(self):
@@ -1103,11 +1311,14 @@ class OperatorCliTest(unittest.TestCase):
 
             def args_for(db):
                 return SimpleNamespace(
-                    db=str(db), repo=str(repo), data_dir=str(data_dir),
+                    db=str(db),
+                    repo=str(repo),
+                    data_dir=str(data_dir),
                     receipt_dir=str(receipt_dir),
                     integration_path=str(root / "integration"),
                     worktrees_root=str(worktrees_root),
-                    scratch_root=str(scratch_root))
+                    scratch_root=str(scratch_root),
+                )
 
             with self.assertRaises(ValueError):
                 maestro._validate_run_paths(args_for(alias / "state.db"), object())
@@ -1128,9 +1339,30 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(
             output.getvalue().splitlines(),
-            ['{"detail": "repository, finalized receipt, launcher roster, '
-             'and liveness bounds are required", '
-             '"outcome": "RUN_CONFIGURATION_REQUIRED"}'])
+            [
+                '{"detail": "repository, finalized receipt, launcher roster, '
+                'and liveness bounds are required", '
+                '"outcome": "RUN_CONFIGURATION_REQUIRED"}'
+            ],
+        )
+
+    def test_candidate_idle_retains_builders_but_closes_testers(self):
+        builders = frozenset({"build"})
+
+        self.assertTrue(
+            maestro._keeps_builder_session_open("build", "candidate-idle", builders)
+        )
+        self.assertTrue(
+            maestro._keeps_builder_session_open("build", "repair-idle", builders)
+        )
+        self.assertFalse(
+            maestro._keeps_builder_session_open(
+                "build-tests", "candidate-idle", builders
+            )
+        )
+        self.assertFalse(
+            maestro._keeps_builder_session_open("build-tests", "repair-idle", builders)
+        )
 
     def test_pre_baseline_missing_handle_is_vacuous_later_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1142,6 +1374,9 @@ class OperatorCliTest(unittest.TestCase):
                 def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                     self.deps = deps
 
+                def project(self):
+                    return None
+
                 def run(self):
                     self.deps.quiesce_attempt(record, "pre-baseline")
                     captured["pre_baseline"] = True
@@ -1151,34 +1386,47 @@ class OperatorCliTest(unittest.TestCase):
                         captured["later"] = str(exc)
                     return SimpleNamespace(
                         outcome=scheduler_types.RunOutcome.BLOCKED,
-                        merged=(), blocked=())
+                        merged=(),
+                        blocked=(),
+                    )
 
             args = SimpleNamespace(
-                plan_file=str(root / "plan.json"), db=str(root / "state.db"),
-                run_id="run-1", integration_path=str(root), repo=str(root),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                plan_file=str(root / "plan.json"),
+                db=str(root / "state.db"),
+                run_id="run-1",
+                integration_path=str(root),
+                repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch-root"), digest="a" * 64)
+                scratch_root=str(root / "scratch-root"),
+                digest="a" * 64,
+            )
             output = io.StringIO()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan",
+                ),
+                mock.patch.object(
+                    maestro,
+                    "_load_runnable_plan",
                     return_value=SimpleNamespace(
                         agent_nodes=(),
                         merge_policy=SimpleNamespace(
                             integration_branch="main",
-                            integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
-                        to_plan_nodes=lambda: ())
-            ), mock.patch.object(
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
-                    maestro, "_validate_run_paths"
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore"
-            ), mock.patch.object(
-                    maestro.scheduler, "Scheduler", CapturingScheduler
-            ), contextlib.redirect_stdout(output):
+                            integration_gate=SimpleNamespace(
+                                runner="none", argv=(), min_cases=1
+                            ),
+                        ),
+                        to_plan_nodes=lambda: (),
+                    ),
+                ),
+                mock.patch.object(maestro, "_resolve_run_runners", return_value={}),
+                mock.patch.object(maestro, "_validate_run_paths"),
+                mock.patch.object(maestro.lc, "LifecycleStore"),
+                mock.patch.object(maestro.scheduler, "Scheduler", CapturingScheduler),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 0)
@@ -1194,40 +1442,70 @@ class OperatorCliTest(unittest.TestCase):
             subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
             subprocess.run(
                 ["git", "config", "user.email", "maestro@example.invalid"],
-                cwd=repo, check=True)
+                cwd=repo,
+                check=True,
+            )
             subprocess.run(
-                ["git", "config", "user.name", "Maestro Test"],
-                cwd=repo, check=True)
+                ["git", "config", "user.name", "Maestro Test"], cwd=repo, check=True
+            )
             (repo / "README.md").write_text("base\n")
             subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
             subprocess.run(
-                ["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
-            subprocess.run(
-                ["git", "worktree", "add", "-q", "-b", "integration/run-1",
-                 str(integration), "HEAD"],
-                cwd=repo, check=True)
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "integration/run-1",
+                    str(integration),
+                    "HEAD",
+                ],
+                cwd=repo,
+                check=True,
+            )
 
             node = scheduler_types.PlanNode(
-                node_id="code", kind=scheduler_types.NodeKind.CODE, depth=0,
+                node_id="code",
+                kind=scheduler_types.NodeKind.CODE,
+                depth=0,
                 outputs=("out.txt",),
                 command=(
-                    sys.executable, "-c",
-                    "from pathlib import Path; Path('out.txt').write_text('done\\n')"),
-                expects_changes=True)
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('out.txt').write_text('done\\n')",
+                ),
+                expects_changes=True,
+            )
             plan = SimpleNamespace(
                 agent_nodes=(),
                 merge_policy=SimpleNamespace(
                     integration_branch="integration/run-1",
-                    integration_gate=SimpleNamespace(runner="fixture", argv=("gate",), min_cases=1)),
-                to_plan_nodes=lambda: (node,))
+                    integration_gate=SimpleNamespace(
+                        runner="fixture", argv=("gate",), min_cases=1
+                    ),
+                ),
+                to_plan_nodes=lambda: (node,),
+            )
             green = maestro.worktree.GateResult(
-                label="gate", scope="node", selector="code",
-                command=("gate",), exit_code=0, green=True,
-                counts={"passed": 1, "failed": 0, "skipped": 0, "errored": 0})
+                label="gate",
+                scope="node",
+                selector="code",
+                command=("gate",),
+                exit_code=0,
+                green=True,
+                counts={"passed": 1, "failed": 0, "skipped": 0, "errored": 0},
+            )
             red = maestro.worktree.GateResult(
-                label="gate", scope="node", selector="code",
-                command=("gate",), exit_code=1, green=False,
-                counts={"passed": 0, "failed": 1, "skipped": 0, "errored": 0})
+                label="gate",
+                scope="node",
+                selector="code",
+                command=("gate",),
+                exit_code=1,
+                green=False,
+                counts={"passed": 0, "failed": 1, "skipped": 0, "errored": 0},
+            )
 
             def run_gate(_attempt, _node, phase, _cancel_requested):
                 return red if phase == "falsify" else green
@@ -1236,32 +1514,46 @@ class OperatorCliTest(unittest.TestCase):
                 return green
 
             args = SimpleNamespace(
-                plan_file=str(root / "plan.json"), db=str(root / "state.db"),
-                run_id="run-1", integration_path=str(integration), repo=str(repo),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                plan_file=str(root / "plan.json"),
+                db=str(root / "state.db"),
+                run_id="run-1",
+                integration_path=str(integration),
+                repo=str(repo),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch"), digest="a" * 64)
+                scratch_root=str(root / "scratch"),
+                digest="a" * 64,
+            )
             config = scheduler_types.SchedulerConfig(
-                concurrency=1, node_timeout_s=30, turn_timeout_s=10,
-                final_acceptance_timeout_s=30, backstop_t_s=120,
-                semantic_ceiling=1)
+                concurrency=1,
+                node_timeout_s=30,
+                turn_timeout_s=10,
+                final_acceptance_timeout_s=30,
+                backstop_t_s=120,
+                semantic_ceiling=1,
+            )
             output = io.StringIO()
-            with mock.patch.object(
-                    maestro, "_run_configuration", return_value=config
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
+            with (
+                mock.patch.object(maestro, "_run_configuration", return_value=config),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(
                     # Runner resolution probes a real interpreter. This plan is
                     # a stub whose gate never executes, so resolution joins the
                     # seams already substituted here rather than making every
                     # CLI test depend on the machine's PATH.
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
-                    maestro, "_validate_run_paths"
-            ), mock.patch.object(
-                    maestro, "_scheduler_gate_deps",
-                    return_value=(run_gate, integration_gate)
-            ), contextlib.redirect_stdout(output):
+                    maestro,
+                    "_resolve_run_runners",
+                    return_value={},
+                ),
+                mock.patch.object(maestro, "_validate_run_paths"),
+                mock.patch.object(
+                    maestro,
+                    "_scheduler_gate_deps",
+                    return_value=(run_gate, integration_gate),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(args)
 
             self.assertEqual(code, 0, output.getvalue())
@@ -1289,8 +1581,12 @@ class OperatorCliTest(unittest.TestCase):
                 def launch(self, spec):
                     captured["spec_env"] = spec.environment
                     return launcher.LaunchHandle(
-                        spec.correlation_token, "pane-1", "agent-1", root,
-                        transcript_path=scratch / "session.jsonl")
+                        spec.correlation_token,
+                        "pane-1",
+                        "agent-1",
+                        root,
+                        transcript_path=scratch / "session.jsonl",
+                    )
 
                 def poll(self, _handle):
                     return launcher.PollResult(launcher.PollState.EXITED, 0, "ok")
@@ -1313,18 +1609,24 @@ class OperatorCliTest(unittest.TestCase):
             route = RecordingRoute()
             shared = {"XDG_CACHE_HOME": str(scratch / "xdg")}
             code_node = SimpleNamespace(
-                kind=scheduler_types.NodeKind.CODE, node_id="code",
-                command=("true",))
+                kind=scheduler_types.NodeKind.CODE, node_id="code", command=("true",)
+            )
             agent_node = SimpleNamespace(
-                kind=scheduler_types.NodeKind.AGENT, node_id="agent")
+                kind=scheduler_types.NodeKind.AGENT, node_id="agent"
+            )
             plan = SimpleNamespace(
                 agent_nodes=(agent_node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
+                    integration_gate=SimpleNamespace(
+                        runner="none", argv=(), min_cases=1
+                    ),
+                ),
                 node_by_id=lambda: {
-                    "agent": SimpleNamespace(instruction="do the work")},
-                to_plan_nodes=lambda: ())
+                    "agent": SimpleNamespace(instruction="do the work")
+                },
+                to_plan_nodes=lambda: (),
+            )
             attempt = SimpleNamespace(path=root, scratch=scratch)
             record = SimpleNamespace(node_id="code", attempt_no=1)
 
@@ -1332,48 +1634,67 @@ class OperatorCliTest(unittest.TestCase):
                 def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                     self.deps = deps
 
+                def project(self):
+                    return None
+
                 def run(self):
                     self.deps.run_node(
-                        attempt, code_node, record, "", lambda _pid: None,
-                        lambda: False)
+                        attempt, code_node, record, "", lambda _pid: None, lambda: False
+                    )
                     agent_record = SimpleNamespace(node_id="agent", attempt_no=1)
                     self.deps.run_node(
-                        attempt, agent_node, agent_record, "", lambda _pid: None,
-                        lambda: False)
+                        attempt,
+                        agent_node,
+                        agent_record,
+                        "",
+                        lambda _pid: None,
+                        lambda: False,
+                    )
                     return SimpleNamespace(
                         outcome=scheduler_types.RunOutcome.ACCEPTED,
-                        merged=(), blocked=())
+                        merged=(),
+                        blocked=(),
+                    )
 
             args = SimpleNamespace(
-                plan_file=str(root / "plan.json"), db=str(Path(tmp) / "state.db"),
-                run_id="run-1", integration_path=str(root), repo=str(root),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                plan_file=str(root / "plan.json"),
+                db=str(Path(tmp) / "state.db"),
+                run_id="run-1",
+                integration_path=str(root),
+                repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch-root"), digest="a" * 64,
-                agent_route="omp", agent_model="model", agent_effort="high",
-                agent_profile="profile")
+                scratch_root=str(root / "scratch-root"),
+                digest="a" * 64,
+                agent_route="omp",
+                agent_model="model",
+                agent_effort="high",
+                agent_profile="profile",
+            )
             store = mock.Mock()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
+                ),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(
                     # Runner resolution probes a real interpreter. This plan is
                     # a stub whose gate never executes, so resolution joins the
                     # seams already substituted here rather than making every
                     # CLI test depend on the machine's PATH.
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
-                    maestro, "_runtime_launcher", return_value=route
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore", return_value=store
-            ), mock.patch.object(
-                    maestro.scheduler, "Scheduler", DualScheduler
-            ), mock.patch.object(
-                    maestro.subprocess, "Popen", FinishedProcess
-            ), mock.patch.object(
+                    maestro,
+                    "_resolve_run_runners",
+                    return_value={},
+                ),
+                mock.patch.object(maestro, "_runtime_launcher", return_value=route),
+                mock.patch.object(maestro.lc, "LifecycleStore", return_value=store),
+                mock.patch.object(maestro.scheduler, "Scheduler", DualScheduler),
+                mock.patch.object(maestro.subprocess, "Popen", FinishedProcess),
+                mock.patch.object(
                     maestro.worktree, "launch_env", return_value=shared
-            ) as launch_env:
+                ) as launch_env,
+            ):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 0)
@@ -1395,7 +1716,8 @@ class OperatorCliTest(unittest.TestCase):
             class NoTranscriptRoute:
                 def launch(self, spec):
                     return launcher.LaunchHandle(
-                        spec.correlation_token, "pane-1", "agent-1", root)
+                        spec.correlation_token, "pane-1", "agent-1", root
+                    )
 
                 def cancel(self, handle, _deadline):
                     cancelled.append(handle.correlation_token)
@@ -1412,16 +1734,20 @@ class OperatorCliTest(unittest.TestCase):
                     """
                     return None
 
-            node = SimpleNamespace(
-                kind=scheduler_types.NodeKind.AGENT, node_id="agent")
+            node = SimpleNamespace(kind=scheduler_types.NodeKind.AGENT, node_id="agent")
             plan = SimpleNamespace(
                 agent_nodes=(node,),
                 merge_policy=SimpleNamespace(
                     integration_branch="main",
-                    integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
+                    integration_gate=SimpleNamespace(
+                        runner="none", argv=(), min_cases=1
+                    ),
+                ),
                 node_by_id=lambda: {
-                    "agent": SimpleNamespace(instruction="do the work")},
-                to_plan_nodes=lambda: ())
+                    "agent": SimpleNamespace(instruction="do the work")
+                },
+                to_plan_nodes=lambda: (),
+            )
             attempt = SimpleNamespace(path=root, scratch=scratch)
             record = SimpleNamespace(node_id="agent", attempt_no=1)
             store = mock.Mock()
@@ -1430,40 +1756,56 @@ class OperatorCliTest(unittest.TestCase):
                 def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                     self.deps = deps
 
+                def project(self):
+                    return None
+
                 def run(self):
                     try:
                         self.deps.run_node(
-                            attempt, node, record, "", armed.append, lambda: False)
+                            attempt, node, record, "", armed.append, lambda: False
+                        )
                     finally:
                         self.deps.quiesce_attempt(record, "pre-inventory")
                     raise AssertionError("missing transcript armed the attempt")
 
             args = SimpleNamespace(
-                plan_file=str(root / "plan.json"), db=str(Path(tmp) / "state.db"),
-                run_id="run-1", integration_path=str(root), repo=str(root),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                plan_file=str(root / "plan.json"),
+                db=str(Path(tmp) / "state.db"),
+                run_id="run-1",
+                integration_path=str(root),
+                repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch-root"), digest="a" * 64,
-                agent_route="omp", agent_model="model", agent_effort="high",
-                agent_profile="profile")
+                scratch_root=str(root / "scratch-root"),
+                digest="a" * 64,
+                agent_route="omp",
+                agent_model="model",
+                agent_effort="high",
+                agent_profile="profile",
+            )
             output = io.StringIO()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
+                ),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(
                     # Runner resolution probes a real interpreter. This plan is
                     # a stub whose gate never executes, so resolution joins the
                     # seams already substituted here rather than making every
                     # CLI test depend on the machine's PATH.
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
+                    maestro,
+                    "_resolve_run_runners",
+                    return_value={},
+                ),
+                mock.patch.object(
                     maestro, "_runtime_launcher", return_value=NoTranscriptRoute()
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore", return_value=store
-            ), mock.patch.object(
-                    maestro.scheduler, "Scheduler", ArmingScheduler
-            ), contextlib.redirect_stdout(output):
+                ),
+                mock.patch.object(maestro.lc, "LifecycleStore", return_value=store),
+                mock.patch.object(maestro.scheduler, "Scheduler", ArmingScheduler),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(args)
 
         self.assertEqual(code, 3)
@@ -1478,8 +1820,7 @@ class OperatorCliTest(unittest.TestCase):
             bogus.write_text("not sqlite")
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                code = maestro.main(
-                    ["run", "status", "run-1", "--db", str(bogus)])
+                code = maestro.main(["run", "status", "run-1", "--db", str(bogus)])
         self.assertEqual(code, 2)
         payload = json.loads(output.getvalue())
         self.assertEqual(set(payload), {"detail", "outcome"})
@@ -1488,6 +1829,85 @@ class OperatorCliTest(unittest.TestCase):
         # names the condition it is: an error Maestro did not decide on.
         self.assertEqual(payload["outcome"], "MAESTRO_INTERNAL_ERROR")
         self.assertIn("DatabaseError", payload["detail"])
+
+
+class RunProgressTest(unittest.TestCase):
+    def test_resume_reports_frontier_transitions_and_waits_on_stderr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "lifecycle.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                """
+                CREATE TABLE transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    node_id TEXT,
+                    to_state TEXT,
+                    reason TEXT NOT NULL,
+                    detail_json TEXT
+                );
+                CREATE TABLE node_lifecycle (
+                    run_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    lane_phase TEXT,
+                    block_reason TEXT
+                );
+                CREATE TABLE candidate_reviews (
+                    run_id TEXT NOT NULL,
+                    review_node_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    reviewer_generation INTEGER NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO node_lifecycle VALUES (?,?,?,?,?,?)",
+                ("run-1", "lane-a", "RUNNING", 2, "REVIEWING", None),
+            )
+            conn.execute(
+                "INSERT INTO candidate_reviews VALUES (?,?,?,?)",
+                ("run-1", "lane-a::review", "DISPATCHED", 2),
+            )
+            conn.commit()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                progress = maestro._RunProgress(db, "run-1", resuming=True)
+                progress.POLL_SECONDS = 0.01
+                progress.HEARTBEAT_SECONDS = 0.02
+                with progress:
+                    conn.execute(
+                        "INSERT INTO transitions "
+                        "(run_id,node_id,to_state,reason,detail_json) "
+                        "VALUES (?,?,?,?,?)",
+                        (
+                            "run-1",
+                            "lane-a::review",
+                            "RUNNING",
+                            "candidate-review-dispatched",
+                            json.dumps({"phase": "reviewing"}),
+                        ),
+                    )
+                    conn.commit()
+                    deadline = time.monotonic() + 1.0
+                    while (
+                        "candidate-review-dispatched" not in err.getvalue()
+                        or "waiting" not in err.getvalue()
+                    ) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+            conn.close()
+
+        rendered = err.getvalue()
+        self.assertIn("MAESTRO RESUME", rendered)
+        self.assertIn("CURRENT FRONTIER", rendered)
+        self.assertIn("lane-a", rendered)
+        self.assertIn("builder", rendered)
+        self.assertIn("reviewer", rendered)
+        self.assertIn("RUNNING", rendered)
+        self.assertIn("DISPATCHED", rendered)
+        self.assertIn("candidate-review-dispatched", rendered)
+        self.assertIn("WAITING", rendered)
 
 
 if __name__ == "__main__":

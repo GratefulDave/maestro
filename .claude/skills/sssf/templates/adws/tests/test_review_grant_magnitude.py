@@ -37,7 +37,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import maestro  # noqa: E402
 from adw_modules import lifecycle as lc  # noqa: E402
-from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
@@ -63,16 +62,20 @@ class CeilingProbe:
         self.run_id = "run1"
         self.config = cfg
         self.deps = SimpleNamespace(
-            store=SimpleNamespace(
-                attempts_for=lambda run_id, node_id: tuple(attempts)))
+            store=SimpleNamespace(attempts_for=lambda run_id, node_id: tuple(attempts))
+        )
 
 
 def _rejected(node_id: str, attempt_no: int) -> st.AttemptRecord:
     return st.AttemptRecord(
-        run_id="run1", node_id=node_id, attempt_no=attempt_no,
-        base_sha=BASE_SHA, state=st.NodeState.PENDING,
+        run_id="run1",
+        node_id=node_id,
+        attempt_no=attempt_no,
+        base_sha=BASE_SHA,
+        state=st.NodeState.PENDING,
         retry_class=st.RetryClass.SEMANTIC,
-        extra={rp.REVIEW_REJECTED_KEY: True})
+        extra={},
+    )
 
 
 def _blocked_node(store: lc.LifecycleStore, node_id: str = "a") -> None:
@@ -80,8 +83,7 @@ def _blocked_node(store: lc.LifecycleStore, node_id: str = "a") -> None:
     the escape verbs are legal against it."""
     store.create_run("run1", "d", [make_node(node_id, 0)])
     store.start_attempt("run1", node_id, base_sha="s1")
-    store.mark_blocked("run1", node_id,
-                       st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
+    store.mark_blocked("run1", node_id, st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
     store.declare_outcome("run1")
 
 
@@ -95,8 +97,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             _blocked_node(store)
             row = store.retry("run1", "a", grant=3)
             self.assertEqual(row.state, st.NodeState.PENDING)
-            self.assertEqual(
-                store.get_node("run1", "a").granted_extra_attempts, 3)
+            self.assertEqual(store.get_node("run1", "a").granted_extra_attempts, 3)
 
     def test_force_still_grants_exactly_one(self):
         """The existing meaning, unchanged. `--force` is a grant of one and
@@ -106,8 +107,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             self.addCleanup(store.close)
             _blocked_node(store)
             store.retry("run1", "a", force=True)
-            self.assertEqual(
-                store.get_node("run1", "a").granted_extra_attempts, 1)
+            self.assertEqual(store.get_node("run1", "a").granted_extra_attempts, 1)
 
     def test_a_plain_retry_still_grants_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,8 +115,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             self.addCleanup(store.close)
             _blocked_node(store)
             store.retry("run1", "a")
-            self.assertEqual(
-                store.get_node("run1", "a").granted_extra_attempts, 0)
+            self.assertEqual(store.get_node("run1", "a").granted_extra_attempts, 0)
 
     def test_repeating_force_cannot_supply_the_magnitude(self):
         """Why the magnitude has to ride one call: the first `--force` moves
@@ -129,8 +128,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             store.retry("run1", "a", force=True)
             with self.assertRaises(lc.IllegalTransition):
                 store.retry("run1", "a", force=True)
-            self.assertEqual(
-                store.get_node("run1", "a").granted_extra_attempts, 1)
+            self.assertEqual(store.get_node("run1", "a").granted_extra_attempts, 1)
 
     def test_force_and_grant_together_are_refused(self):
         """`--force` *is* a grant of one, so accepting both would leave the
@@ -142,8 +140,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             _blocked_node(store)
             with self.assertRaises(lc.EscapeRefused):
                 store.retry("run1", "a", force=True, grant=2)
-            self.assertEqual(
-                store.get_node("run1", "a").state, st.NodeState.BLOCKED)
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
 
     def test_a_negative_grant_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,8 +149,7 @@ class GrantMagnitudeTests(unittest.TestCase):
             _blocked_node(store)
             with self.assertRaises(lc.EscapeRefused):
                 store.retry("run1", "a", grant=-1)
-            self.assertEqual(
-                store.get_node("run1", "a").state, st.NodeState.BLOCKED)
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
 
     def test_the_transition_records_the_magnitude_it_granted(self):
         """A grant of three and a grant of one are the same escape verb, so
@@ -163,8 +159,11 @@ class GrantMagnitudeTests(unittest.TestCase):
             self.addCleanup(store.close)
             _blocked_node(store)
             store.retry("run1", "a", grant=3)
-            granting = [row for row in store.audit_transitions("run1", "a")
-                        if row.get("reason") == st.Escape.RETRY_FORCE.value]
+            granting = [
+                row
+                for row in store.audit_transitions("run1", "a")
+                if row.get("reason") == st.Escape.RETRY_FORCE.value
+            ]
             self.assertEqual(len(granting), 1)
             self.assertEqual(granting[0]["detail"]["granted_extra_delta"], 3)
 
@@ -177,17 +176,25 @@ class GrantMagnitudeTests(unittest.TestCase):
         run and three gate runs — and only three reopens it.
         """
         cfg = st.SchedulerConfig(
-            concurrency=1, node_timeout_s=1.0, turn_timeout_s=1.0,
-            final_acceptance_timeout_s=1.0, backstop_t_s=100.0,
-            semantic_ceiling=STRANDED_CEILING, review_ceiling=3)
+            concurrency=1,
+            node_timeout_s=1.0,
+            turn_timeout_s=1.0,
+            final_acceptance_timeout_s=1.0,
+            backstop_t_s=100.0,
+            semantic_ceiling=STRANDED_CEILING,
+            review_ceiling=3,
+        )
         rows = [_rejected("n", i) for i in range(STRANDED_ALREADY)]
         for insufficient in (0, 1, 2):
             self.assertTrue(
                 sch.Scheduler._semantic_ceiling_reached(
-                    CeilingProbe(cfg, rows), "n", insufficient),
-                f"a grant of {insufficient} must not reopen the node")
-        self.assertFalse(sch.Scheduler._semantic_ceiling_reached(
-            CeilingProbe(cfg, rows), "n", 3))
+                    CeilingProbe(cfg, rows), "n", insufficient
+                ),
+                f"a grant of {insufficient} must not reopen the node",
+            )
+        self.assertFalse(
+            sch.Scheduler._semantic_ceiling_reached(CeilingProbe(cfg, rows), "n", 3)
+        )
 
         # And the store can actually issue that three, in one command, against
         # a node that is BLOCKED — which is the whole complaint.
@@ -196,9 +203,13 @@ class GrantMagnitudeTests(unittest.TestCase):
             self.addCleanup(store.close)
             _blocked_node(store, "n")
             store.retry("run1", "n", grant=3)
-            self.assertFalse(sch.Scheduler._semantic_ceiling_reached(
-                CeilingProbe(cfg, rows), "n",
-                store.get_node("run1", "n").granted_extra_attempts))
+            self.assertFalse(
+                sch.Scheduler._semantic_ceiling_reached(
+                    CeilingProbe(cfg, rows),
+                    "n",
+                    store.get_node("run1", "n").granted_extra_attempts,
+                )
+            )
 
 
 class GrantCliTests(unittest.TestCase):
@@ -218,7 +229,8 @@ class GrantCliTests(unittest.TestCase):
             store.close()
 
             code, _ = self._main(
-                ["retry", "run1", "a", "--grant", "3", "--db", str(database)])
+                ["retry", "run1", "a", "--grant", "3", "--db", str(database)]
+            )
             self.assertEqual(code, 0)
 
             store = lc.LifecycleStore(database)
@@ -235,22 +247,22 @@ class GrantCliTests(unittest.TestCase):
             store.close()
 
             code, _ = self._main(
-                ["retry", "run1", "a", "--force", "--db", str(database)])
+                ["retry", "run1", "a", "--force", "--db", str(database)]
+            )
             self.assertEqual(code, 0)
 
             store = lc.LifecycleStore(database)
             self.addCleanup(store.close)
-            self.assertEqual(
-                store.get_node("run1", "a").granted_extra_attempts, 1)
+            self.assertEqual(store.get_node("run1", "a").granted_extra_attempts, 1)
 
     def test_force_and_grant_are_refused_at_parse_time(self):
         parser = maestro.build_parser()
         # Acquitted first, so the refusal below is not the parser rejecting a
         # flag it never had.
         self.assertEqual(
-            parser.parse_args(["retry", "run1", "a", "--grant", "3"]).grant, 3)
-        with self.assertRaises(SystemExit), \
-                contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["retry", "run1", "a", "--grant", "3"]).grant, 3
+        )
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             parser.parse_args(["retry", "run1", "a", "--force", "--grant", "3"])
 
     def test_a_zero_grant_is_refused_at_parse_time(self):
@@ -258,13 +270,15 @@ class GrantCliTests(unittest.TestCase):
         transition claiming it had been retried."""
         parser = maestro.build_parser()
         self.assertEqual(
-            parser.parse_args(["retry", "run1", "a", "--grant", "1"]).grant, 1)
+            parser.parse_args(["retry", "run1", "a", "--grant", "1"]).grant, 1
+        )
         for refused in ("0", "-2", "two"):
             with self.subTest(grant=refused):
-                with self.assertRaises(SystemExit), \
-                        contextlib.redirect_stderr(io.StringIO()):
-                    parser.parse_args(
-                        ["retry", "run1", "a", "--grant", refused])
+                with (
+                    self.assertRaises(SystemExit),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    parser.parse_args(["retry", "run1", "a", "--grant", refused])
 
 
 class BlockPayloadTests(SchedulerFixture):
@@ -288,75 +302,64 @@ class BlockPayloadTests(SchedulerFixture):
         # reach the reviewer.
         self.gate_script[("build", "falsify")] = [green(), green(), green()]
 
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
             on_launch(None)
-            (attempt.path / "build.py").write_text(
-                "ok-{0}\n".format(record.attempt_no))
+            (attempt.path / "build.py").write_text("ok-{0}\n".format(record.attempt_no))
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
 
-        report = self.schedule([self.agent("build")],
-                               config=self.config(semantic_ceiling=3),
-                               deps=self.deps(run_node=run_node,
-                                              review_attempt=review)).run()
+        report = self.schedule(
+            [self.agent("build")],
+            config=self.config(semantic_ceiling=3),
+            deps=self.deps(run_node=run_node, review_attempt=review),
+        ).run()
         self.assertEqual(
             self.store.get_node("run1", "build").block_reason,
-            st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
-        blocked = [row for row in self.store.audit_transitions("run1", "build")
-                   if row.get("reason") ==
-                   f"blocked:{st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED.value}"]
+            st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+        )
+        blocked = [
+            row
+            for row in self.store.audit_transitions("run1", "build")
+            if row.get("reason")
+            == f"blocked:{st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED.value}"
+        ]
         self.assertEqual(len(blocked), 1)
         return report, blocked[0]["detail"]
 
     def test_the_payload_names_the_cumulative_count(self):
-        """`review_convergence` reports the findings the *current process*
-        saw — it printed `[3]` on the run this issue came from while the
-        cumulative count was 7. The count the ceiling is compared against is
-        the one an operator needs, and it was in no output at all."""
+        """The correction-loop ledger count used by the ceiling is visible."""
         report, detail = self._block()
-        self.assertEqual(detail["semantic_attempts_total"], 2)
+        self.assertEqual(detail["semantic_retry_spends_total"], 3)
         self.assertEqual(detail["semantic_ceiling"], 3)
         self.assertEqual(detail["granted_extra_attempts"], 0)
-        # The per-process series is not that number and never was: it counts
-        # findings per attempt, not attempts against a budget.
-        self.assertEqual(report.review_convergence["build"], (1, 1, 1))
+        self.assertEqual(report.review_convergence, {})
 
     def test_the_payload_names_a_grant_that_actually_reopens_the_node(self):
-        """The required grant is the arithmetic, not its inputs: the count the
-        decision read excludes the attempt being blocked, whose row is written
-        in the same transaction, so a grant sized off the raw count would be
-        short by exactly one."""
+        """The payload states the smallest grant that admits another repair."""
         _, detail = self._block()
-        required = detail["semantic_grant_required"]
-        self.assertEqual(required, 2)
-
-        scheduler = self.schedule([self.agent("build")],
-                                  config=self.config(semantic_ceiling=3))
-        # Everything the payload offers short of the stated grant still
-        # re-blocks, and the stated grant does not.
-        for insufficient in range(required):
-            self.assertTrue(
-                scheduler._semantic_ceiling_reached("build", insufficient))
-        self.assertFalse(scheduler._semantic_ceiling_reached("build", required))
+        self.assertEqual(detail["semantic_grant_required"], 2)
 
     def test_the_payload_reaches_the_surface_it_is_diagnosed_from(self):
         """B15 — a field with zero readers is a build failure. `run status`
         projects each transition's detail onto the attempt it belongs to, and
         that projection is what carries these numbers to the operator."""
         _, detail = self._block()
-        history = maestro._attempt_history(
-            self.store.audit_transitions("run1"))
-        payloads = [entry["detail"]
-                    for (node_id, _), entries in history.items()
-                    if node_id == "build"
-                    for entry in entries
-                    if "semantic_attempts_total" in (entry.get("detail") or {})]
+        history = maestro._attempt_history(self.store.audit_transitions("run1"))
+        payloads = [
+            entry["detail"]
+            for (node_id, _), entries in history.items()
+            if node_id == "build"
+            for entry in entries
+            if "semantic_retry_spends_total" in (entry.get("detail") or {})
+        ]
         self.assertEqual(len(payloads), 1)
-        self.assertEqual(payloads[0]["semantic_grant_required"],
-                         detail["semantic_grant_required"])
-        self.assertEqual(payloads[0]["semantic_attempts_total"],
-                         detail["semantic_attempts_total"])
+        self.assertEqual(
+            payloads[0]["semantic_grant_required"], detail["semantic_grant_required"]
+        )
+        self.assertEqual(
+            payloads[0]["semantic_retry_spends_total"],
+            detail["semantic_retry_spends_total"],
+        )
 
     def test_the_stated_grant_is_issuable_in_one_command(self):
         """End to end: block, read the payload, hand its number to `retry
@@ -364,16 +367,21 @@ class BlockPayloadTests(SchedulerFixture):
         attempt."""
         _, detail = self._block()
         self.store.declare_outcome("run1")
-        self.store.retry("run1", "build",
-                         grant=detail["semantic_grant_required"])
+        self.store.retry("run1", "build", grant=detail["semantic_grant_required"])
 
         node = self.store.get_node("run1", "build")
         self.assertEqual(node.state, st.NodeState.PENDING)
-        self.assertFalse(
-            self.schedule(
-                [self.agent("build")],
-                config=self.config(semantic_ceiling=3)
-            )._semantic_ceiling_reached("build", node.granted_extra_attempts))
+        scheduler = self.schedule(
+            [self.agent("build")], config=self.config(semantic_ceiling=3)
+        )
+        self.assertTrue(
+            scheduler._lane_retry(
+                self.agent("build"),
+                st.LaneRetryClass.SEMANTIC,
+                candidate_sha=BASE_SHA,
+                detail={"reason": "retry proof"},
+            )
+        )
 
 
 if __name__ == "__main__":

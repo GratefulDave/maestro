@@ -37,31 +37,91 @@ from . import worktree as wt
 
 # ── §7.3 states, and the two kinds of terminal ──────────────────────────────
 
+
 class NodeState(str, Enum):
-    """The six. READY, MERGE_READY, and MERGING are deliberately absent: the
-    first is a derived predicate, the second a query, and the third a thing
-    recovery asks git about rather than reads off a marker."""
+    """The durable node states.
+
+    ``ACCEPTED`` belongs only to a derived review node: it is terminal review
+    evidence and deliberately does not mean that a source-producing node was
+    merged. Build lanes still use ``VERIFIED`` then ``MERGED``.
+    """
 
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     VERIFIED = "VERIFIED"
+    ACCEPTED = "ACCEPTED"
     MERGED = "MERGED"
     BLOCKED = "BLOCKED"
     CANCELLED = "CANCELLED"
 
 
-#: Nothing transitions out of these, ever (§7.3).
-ABSOLUTELY_TERMINAL: Tuple[NodeState, ...] = (NodeState.MERGED, NodeState.CANCELLED)
+class LanePhase(str, Enum):
+    """The persistent build/review loop phase for one reviewable lane."""
 
-#: No *automatic* transition leaves this, but the operator escapes can (§11.3).
+    BUILDING = "BUILDING"
+    CANDIDATE_READY = "CANDIDATE_READY"
+    REVIEWING = "REVIEWING"
+    REPAIR_HANDOFF = "REPAIR_HANDOFF"
+    REPAIRING = "REPAIRING"
+    WAITING_FOR_NEW_CANDIDATE = "WAITING_FOR_NEW_CANDIDATE"
+    ACCEPTED = "ACCEPTED"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+
+
+LANE_PHASE_TERMINAL: Tuple[LanePhase, ...] = (
+    LanePhase.ACCEPTED,
+    LanePhase.BLOCKED,
+    LanePhase.CANCELLED,
+)
+
+
+class CandidateReviewState(str, Enum):
+    """A reviewer dispatch is either outstanding or has one final verdict."""
+
+    DISPATCHED = "DISPATCHED"
+    COMPLETED = "COMPLETED"
+
+
+class ReviewVerdict(str, Enum):
+    PASS = "PASS"
+    REJECTED = "REJECTED"
+
+
+class RepairHandoffState(str, Enum):
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    FAILED = "FAILED"
+
+
+#: Nothing transitions out of these, ever (§7.3).
+ABSOLUTELY_TERMINAL: Tuple[NodeState, ...] = (
+    NodeState.MERGED,
+    NodeState.ACCEPTED,
+    NodeState.CANCELLED,
+)
+
+#: Operator action may unblock these; they are stopped, not immutable.
 OPERATOR_TERMINAL: Tuple[NodeState, ...] = (NodeState.BLOCKED,)
 
-#: Ends a node without a merge, so the frontier skips it and its descendants
-#: become derived-unready (§8.5, §8.7). The merge protocol already owns this
-#: set; the tuple below is built *from* it rather than beside it, so the two
-#: cannot drift into two representations of one fact.
-TERMINAL_WITHOUT_MERGE: Tuple[NodeState, ...] = tuple(
-    NodeState(value) for value in wt.TERMINAL_WITHOUT_MERGE)
+#: States that stop a node without merging source output. Shared with the
+#: merge frontier so cascade semantics cannot drift from lifecycle semantics.
+TERMINAL_WITHOUT_MERGE: Tuple[NodeState, ...] = (NodeState.BLOCKED, NodeState.CANCELLED)
+
+
+class LaneRetryClass(str, Enum):
+    """Durable correction-loop budget classes, separate from attempts."""
+
+    SEMANTIC = "SEMANTIC"
+    ENVIRONMENTAL = "ENVIRONMENTAL"
+    LAUNCHER_TRANSIENT = "LAUNCHER_TRANSIENT"
+    REVIEW_REJECTION = "REVIEW_REJECTION"
+
+
+class ActorSessionState(str, Enum):
+    ACTIVE = "ACTIVE"
+    CLOSED = "CLOSED"
 
 
 class RunOutcome(str, Enum):
@@ -204,8 +264,9 @@ UNEVIDENCED_MERGE_CAUSES: Tuple[MergeCause, ...] = (MergeCause.OPERATOR_ACCEPTED
 MERGE_CAUSE_UNRECORDED = "UNRECORDED"
 
 
-def merge_cause_label(state: NodeState,
-                      merge_cause: Optional[MergeCause]) -> Optional[str]:
+def merge_cause_label(
+    state: NodeState, merge_cause: Optional[MergeCause]
+) -> Optional[str]:
     """The one derivation of "how did this node reach MERGED".
 
     Three answers and a fourth non-answer: the two `MergeCause` members,
@@ -218,7 +279,6 @@ def merge_cause_label(state: NodeState,
     if state is not NodeState.MERGED:
         return None
     return merge_cause.value if merge_cause else MERGE_CAUSE_UNRECORDED
-
 
 
 class PendingCause(str, Enum):
@@ -256,8 +316,9 @@ class PendingCause(str, Enum):
     OPERATOR_RESUME = "OPERATOR_RESUME"
 
 
-def pending_cause_label(state: NodeState,
-                        pending_cause: Optional[PendingCause]) -> Optional[str]:
+def pending_cause_label(
+    state: NodeState, pending_cause: Optional[PendingCause]
+) -> Optional[str]:
     """The one derivation of "who put this node on the frontier".
 
     Four answers: the three `PendingCause` members, and `None` both for a
@@ -270,7 +331,9 @@ def pending_cause_label(state: NodeState,
         return None
     return pending_cause.value if pending_cause else None
 
+
 # ── §7.5 retry classes ──────────────────────────────────────────────────────
+
 
 class RetryClass(str, Enum):
     """Three, mutually exclusive, classified structurally and never lexically."""
@@ -395,7 +458,10 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     # K is a ceiling on a spend, not a verdict, so the forced grant is the
     # designed exit — one attempt per invocation, never a raised cap (§7.5).
     BlockReason.SEMANTIC_BUDGET_EXHAUSTED: (
-        Escape.RETRY_FORCE, Escape.SKIP, Escape.ABANDON),
+        Escape.RETRY_FORCE,
+        Escape.SKIP,
+        Escape.ABANDON,
+    ),
     # Same shape as the semantic ceiling, and the same exit: the reviewer's
     # findings are a verdict about content, so a plain retry against unchanged
     # bytes replays the stored FAIL (B10). `retry --force` grants the one extra
@@ -403,13 +469,18 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
     # `EMPTY_RESUBMISSION_GUARD_V1` shipped with no override at all, so a flaky
     # or environmental FAIL stranded the producer until it minted a new SHA.
     BlockReason.REVIEW_BUDGET_EXHAUSTED: (
-        Escape.RETRY_FORCE, Escape.SKIP, Escape.ABANDON),
+        Escape.RETRY_FORCE,
+        Escape.SKIP,
+        Escape.ABANDON,
+    ),
     # Infra faults: a healthier machine genuinely can produce a different
     # answer, so plain retry is the repair.
     BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED: (
-        Escape.RETRY, Escape.SKIP, Escape.ABANDON),
-    BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (
-        Escape.RETRY, Escape.SKIP, Escape.ABANDON),
+        Escape.RETRY,
+        Escape.SKIP,
+        Escape.ABANDON,
+    ),
+    BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     BlockReason.CREDENTIAL_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
     # The refusal is deterministic against an unchanged configuration, not
     # against every configuration: the operator's repair is to supply what the
@@ -435,6 +506,7 @@ def exits_for(reason: BlockReason) -> Tuple[Escape, ...]:
 
 
 # ── §7.7 results ────────────────────────────────────────────────────────────
+
 
 class Adjudication(str, Enum):
     """A result is adjudicated solely against the attempt row it names,
@@ -465,7 +537,8 @@ class ResultRecord:
         if self.payload is None:
             raise ValueError(
                 "a result row carries its payload and its adjudication together; "
-                "recording one without the other is what §7.7 exists to prevent")
+                "recording one without the other is what §7.7 exists to prevent"
+            )
 
     @property
     def key(self) -> Tuple[str, int, str]:
@@ -474,6 +547,7 @@ class ResultRecord:
 
 
 # ── §7.1 the node the scheduler consumes directly ───────────────────────────
+
 
 class NodeKind(str, Enum):
     """Four kinds, each with its own VERIFIED predicate (§7.3, §1.1 item 4).
@@ -608,30 +682,36 @@ class PlanNode:
                 f"{self.node_id}: a review node is derived by the scheduler from a "
                 "build node's verified attempt, never authored in a plan (§7.3). An "
                 "authored one would make 'every merged lane was reviewed' depend on "
-                "the author remembering to write it")
+                "the author remembering to write it"
+            )
 
         if self.kind is NodeKind.AGENT:
             if not self.gate_command:
                 raise ValueError(
                     f"{self.node_id}: an agent node's VERIFIED predicate is its own "
-                    "gate run twice (§7.4); without a command there is nothing to run")
+                    "gate run twice (§7.4); without a command there is nothing to run"
+                )
             if not (self.gate_selector or "").strip():
                 raise ValueError(
                     f"{self.node_id}: an agent node needs its own gate selector "
                     "(§7.4). A whole-suite post-node gate is red for a sibling's "
-                    "unmerged work, so no node could verify and nothing could merge")
+                    "unmerged work, so no node could verify and nothing could merge"
+                )
             if self.command:
                 raise ValueError(
                     f"{self.node_id}: an agent node's work is the agent's, not a "
-                    "command; a command here would be a second execution path")
+                    "command; a command here would be a second execution path"
+                )
             if self.expects_changes:
                 raise ValueError(
                     f"{self.node_id}: expects_changes is a code-node clause (§7.3); "
-                    "on an agent node it is a field nothing reads")
+                    "on an agent node it is a field nothing reads"
+                )
             if self.gate_min_cases < 1:
                 raise ValueError(
                     f"{self.node_id}: §10.2 counts `passed >= min_cases >= 1`; a "
-                    "gate demanding zero passing cases is green on an empty run")
+                    "gate demanding zero passing cases is green on an empty run"
+                )
             if not self.instruction.strip():
                 raise ValueError(
                     f"{self.node_id}: an agent node carries the instruction the "
@@ -639,50 +719,61 @@ class PlanNode:
                     "min_length=1, so a blank one here is not a plan that omitted "
                     "a goal -- it is a projection that dropped one, and the "
                     "reviewer would be handed a goal derived from the very gate "
-                    "it is meant to judge independently")
+                    "it is meant to judge independently"
+                )
         elif self.kind is NodeKind.TESTS:
             if not self.gate_command:
                 raise ValueError(
                     f"{self.node_id}: a tests node's evidence chain counts "
                     "cases from its gate; without a command there is nothing "
-                    "to collect")
+                    "to collect"
+                )
             if not (self.gate_selector or "").strip():
                 raise ValueError(
                     f"{self.node_id}: a tests node needs its own gate selector "
-                    "so new cases can be counted against that selector")
+                    "so new cases can be counted against that selector"
+                )
             if self.command:
                 raise ValueError(
                     f"{self.node_id}: a tests node's work is the agent's, not a "
-                    "command; a command here would be a second execution path")
+                    "command; a command here would be a second execution path"
+                )
             if self.expects_changes:
                 raise ValueError(
                     f"{self.node_id}: expects_changes is a code-node clause "
-                    "(§7.3); on a tests node it is a field nothing reads")
+                    "(§7.3); on a tests node it is a field nothing reads"
+                )
             if self.gate_min_cases < 1:
                 raise ValueError(
                     f"{self.node_id}: a tests node counts `new cases >= 1`; a "
-                    "gate demanding zero cases cannot refuse a hollow file")
+                    "gate demanding zero cases cannot refuse a hollow file"
+                )
             if not self.instruction.strip():
                 raise ValueError(
                     f"{self.node_id}: a tests node carries the instruction the "
-                    "plan declared for it (§3.6 B9)")
+                    "plan declared for it (§3.6 B9)"
+                )
         else:
             if self.instruction:
                 raise ValueError(
                     f"{self.node_id}: a code node's goal is its command (§6.2); an "
-                    "instruction here is a field nothing reads (§12.3)")
+                    "instruction here is a field nothing reads (§12.3)"
+                )
             if not self.command:
                 raise ValueError(
                     f"{self.node_id}: a code node's acceptance is its command's exit "
-                    "code (§6.2); without a command there is nothing to accept")
+                    "code (§6.2); without a command there is nothing to accept"
+                )
             if self.gate_command or self.gate_selector:
                 raise ValueError(
                     f"{self.node_id}: a code node has no gate and no min_cases "
-                    "(§7.3); a gate here is state nothing evaluates")
+                    "(§7.3); a gate here is state nothing evaluates"
+                )
             if self.gate_min_cases != 1:
                 raise ValueError(
                     f"{self.node_id}: a code node has no gate to count cases "
-                    "for (§7.3); a threshold here is a number nothing reads")
+                    "for (§7.3); a threshold here is a number nothing reads"
+                )
 
     def to_record(self, state: NodeState) -> "wt.NodeRecord":
         """Project onto the merge protocol's record (§7.1, §8.5).
@@ -691,12 +782,17 @@ class PlanNode:
         re-projecting at the same digest and diffing the rows makes a bug in
         this function observable rather than silent.
         """
-        return wt.NodeRecord(node_id=self.node_id, depth=self.depth,
-                             needs=tuple(self.needs), state=NodeState(state).value,
-                             specs=tuple(self.specs))
+        return wt.NodeRecord(
+            node_id=self.node_id,
+            depth=self.depth,
+            needs=tuple(self.needs),
+            state=NodeState(state).value,
+            specs=tuple(self.specs),
+        )
 
 
 # ── §11.2 configuration, and the bound preflight enforces ───────────────────
+
 
 class LivenessBoundUnsatisfied(ValueError):
     """`T` does not exceed the greatest run-window timeout (§9.5, §11.2).
@@ -740,17 +836,22 @@ class SchedulerConfig:
         if self.semantic_ceiling < 1:
             raise ValueError(
                 "a semantic ceiling of zero blocks every agent node on its first "
-                "semantic failure, which is a different design, not a setting")
+                "semantic failure, which is a different design, not a setting"
+            )
         if self.review_ceiling < 1:
             raise ValueError(
                 "a review ceiling of zero blocks every node on its first review "
-                "rejection, which is a different design, not a setting")
-        for name in ("node_timeout_s", "turn_timeout_s",
-                     "final_acceptance_timeout_s", "backstop_t_s"):
+                "rejection, which is a different design, not a setting"
+            )
+        for name in (
+            "node_timeout_s",
+            "turn_timeout_s",
+            "final_acceptance_timeout_s",
+            "backstop_t_s",
+        ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} is a wall clock; it is positive")
-        for name in ("environmental_retries", "launcher_retries",
-                     "credential_retries"):
+        for name in ("environmental_retries", "launcher_retries", "credential_retries"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} is a count; it is not negative")
         if self.backstop_t_s <= self.greatest_run_window_s:
@@ -758,7 +859,8 @@ class SchedulerConfig:
                 "LIVENESS_BOUND_UNSATISFIED: the run-level backstop must exceed "
                 "the greatest run-window timeout, or it fires inside a healthy "
                 f"window. T={self.backstop_t_s}, node_timeout={self.node_timeout_s}, "
-                f"final_acceptance_timeout={self.final_acceptance_timeout_s}")
+                f"final_acceptance_timeout={self.final_acceptance_timeout_s}"
+            )
 
     @property
     def greatest_run_window_s(self) -> float:
@@ -783,10 +885,12 @@ class SchedulerConfig:
             return self.launcher_retries
         raise ValueError(
             "the semantic budget is a COUNT(*) over attempt rows scoped to "
-            "(node_id, base_sha) under a (run_id, node_id) ceiling, not a constant")
+            "(node_id, base_sha) under a (run_id, node_id) ceiling, not a constant"
+        )
 
 
 # ── lifecycle rows the three pieces share ───────────────────────────────────
+
 
 @dataclass
 class NodeLifecycle:
@@ -806,13 +910,159 @@ class NodeLifecycle:
     block_reason: Optional[BlockReason] = None
     output_sha: Optional[str] = None
     granted_extra_attempts: int = 0
+    #: The durable authority that returned a node to the frontier. Seeded
+    #: PENDING rows and non-PENDING states carry no cause.
+    pending_cause: Optional[PendingCause] = None
+    #: The durable build/review-loop authority.  It is absent for ordinary
+    #: DAG nodes and for ledgers written before persistent review existed.
+    lane_phase: Optional[LanePhase] = None
 
     def __post_init__(self) -> None:
         if (self.block_reason is not None) != (self.state is NodeState.BLOCKED):
             raise ValueError(
                 f"{self.node_id}: a block reason and the BLOCKED state are one "
                 "fact; storing either without the other is a row that cannot be "
-                "reported and an exit that cannot be looked up (§11.3)")
+                "reported and an exit that cannot be looked up (§11.3)"
+            )
+
+
+@dataclass(frozen=True)
+class LaneCandidate:
+    """One immutable commit the persistent builder published for review."""
+
+    run_id: str
+    build_node_id: str
+    candidate_seq: int
+    candidate_sha: str
+    parent_candidate_sha: Optional[str]
+    builder_generation: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CandidateReview:
+    """One exactly-once review of one immutable candidate commit."""
+
+    run_id: str
+    review_node_id: str
+    candidate_sha: str
+    reviewer_generation: int
+    state: CandidateReviewState
+    review_digest: Optional[str]
+    receipt_path: Optional[str]
+    findings: Tuple[Mapping[str, Any], ...]
+    verdict: Optional[ReviewVerdict]
+    completed_at: Optional[str]
+
+    @property
+    def terminal(self) -> bool:
+        return self.state is CandidateReviewState.COMPLETED
+
+
+@dataclass(frozen=True)
+class RepairHandoff:
+    """The one builder-targeted repair handoff for a rejected candidate."""
+
+    run_id: str
+    build_node_id: str
+    rejected_candidate_sha: str
+    findings: Tuple[Mapping[str, Any], ...]
+    state: RepairHandoffState
+    builder_generation: int
+    submitted_at: Optional[str]
+    acknowledged_at: Optional[str]
+
+
+@dataclass(frozen=True)
+class CandidatePublication:
+    """The publication result; ``created=False`` is a deterministic replay."""
+
+    candidate: LaneCandidate
+    created: bool
+
+
+@dataclass(frozen=True)
+class ReviewBegin:
+    """Whether a caller owns the first dispatch for this candidate review."""
+
+    review: CandidateReview
+    created: bool
+    should_dispatch: bool
+
+
+@dataclass(frozen=True)
+class ReviewCompletion:
+    """The first terminal review result, or a persisted late/duplicate no-op."""
+
+    review: CandidateReview
+    completed: bool
+
+
+@dataclass(frozen=True)
+class RejectionHandoff:
+    """The atomic review rejection and its optional persisted handoff."""
+
+    review: CandidateReview
+    handoff: Optional[RepairHandoff]
+    completed: bool
+    created: bool
+
+
+@dataclass(frozen=True)
+class HandoffSubmission:
+    """Whether the exact persisted handoff was delivered to its builder."""
+
+    handoff: RepairHandoff
+    submitted: bool
+
+
+@dataclass(frozen=True)
+class HandoffAcknowledgement:
+    """Whether this generation acknowledged the exact rejected candidate."""
+
+    handoff: RepairHandoff
+    acknowledged: bool
+
+
+@dataclass(frozen=True)
+class LaneRetrySpend:
+    """One correction-loop budget debit, independent of builder attempts."""
+
+    run_id: str
+    build_node_id: str
+    retry_class: LaneRetryClass
+    cycle_seq: int
+    candidate_sha: Optional[str]
+    detail: Mapping[str, Any]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class LaneRetrySpendRecord:
+    spend: LaneRetrySpend
+    created: bool
+
+
+@dataclass(frozen=True)
+class ActorSession:
+    """The durable identity of one persistent builder or reviewer generation."""
+
+    run_id: str
+    build_node_id: str
+    actor_role: str
+    generation: int
+    state: ActorSessionState
+    pane_id: Optional[str]
+    tab_id: Optional[str]
+    session_path: Optional[str]
+    correlation_token: Optional[str]
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ActorSessionRecovery:
+    session: ActorSession
+    recovered: bool
 
 
 #: The `attempts.extra_json` key a repair attempt's own row carries: which

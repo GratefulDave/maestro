@@ -37,13 +37,14 @@ entirely. The layout is now a property of the run:
 
 * **One workspace per run**, created by the launcher and named for the plan.
   Nothing reads focus, so an unrelated workspace cannot receive a run's pane.
-* **One tab per node**, labelled `2-s3-inventory` -- the node id with its
-  `lane-p` prefix dropped -- so the sidebar is an index of the nodes in flight
-  and a node's builder and reviewer are neighbours.
+* **One tab per lane**, labelled with the authored build-lane name. The lane's
+  tester, builder, and reviewer are panes in that tab, so collapsing the
+  workspace still shows which lanes exist and opening one lane shows its
+  lifecycle actors together.
 * **A balanced grid inside the tab**, at most 3x3. Two panes are two columns
   side by side, never a stack.
-* **A durable pane label**, so a pane says which node and which role it is
-  without anyone reading its cwd.
+* **A durable role/generation pane label**, so `tester-a41`, `builder-a3`, and
+  `reviewer-a1` remain distinguishable without repeating the tab label.
 
 The grid and incremental dispatch are reconciled by making geometry a pure
 function of a pane's ordinal and its tab's column count (`split_plan`), so
@@ -59,17 +60,21 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from adw_modules import launcher as lch          # noqa: E402
+from adw_modules import launcher as lch  # noqa: E402
 from adw_modules import worktree as worktree_module  # noqa: E402
-from adw_modules.route_receipts import (load_admitted_routes,  # noqa: E402
-                                        load_public_key)
+from adw_modules.route_receipts import (
+    load_admitted_routes,  # noqa: E402
+    load_public_key,
+)
+import maestro  # noqa: E402
 
-from test_launch_refusal_cleanup import FakeHerdr   # noqa: E402
+from test_launch_refusal_cleanup import FakeHerdr  # noqa: E402
 
 
 class _PlacementHerdr(FakeHerdr):
@@ -82,8 +87,9 @@ class _PlacementHerdr(FakeHerdr):
     id handed out twice.
     """
 
-    def __init__(self, *, worktree: Path, transcript: Path,
-                 workspace: str = "w0") -> None:
+    def __init__(
+        self, *, worktree: Path, transcript: Path, workspace: str = "w0"
+    ) -> None:
         super().__init__(worktree=worktree, transcript=transcript)
         self.current_pane_id = workspace + ":p0"
         self._alloc_lock = threading.Lock()
@@ -95,13 +101,14 @@ class _PlacementHerdr(FakeHerdr):
         if head == ("pane", "split"):
             with self._alloc_lock:
                 self._next_pane += 1
-                self.split_pane_id = "{0}:p{1}".format(
-                    self._workspace, self._next_pane)
+                self.split_pane_id = "{0}:p{1}".format(self._workspace, self._next_pane)
         return super().__call__(*args, env=env, timeout=timeout)
 
     def directions(self):
-        return [call[call.index("--direction") + 1]
-                for call in self.argv_for(("pane", "split"))]
+        return [
+            call[call.index("--direction") + 1]
+            for call in self.argv_for(("pane", "split"))
+        ]
 
     def parents(self):
         return [call[2] for call in self.argv_for(("pane", "split"))]
@@ -117,15 +124,19 @@ class _WorkspaceHerdr(_PlacementHerdr):
     is therefore a test failure, not a fallback.
     """
 
-    def __init__(self, *, worktree: Path, transcript: Path,
-                 focus_workspace: str = "w99") -> None:
-        super().__init__(worktree=worktree, transcript=transcript,
-                         workspace=focus_workspace)
+    def __init__(
+        self, *, worktree: Path, transcript: Path, focus_workspace: str = "w99"
+    ) -> None:
+        super().__init__(
+            worktree=worktree, transcript=transcript, workspace=focus_workspace
+        )
         self._next_workspace = 0
         self._next_tab = 0
         self.renames = {}
         self.tab_labels = {}
         self.closed_tabs = []
+        self._pane_tabs = {}
+        self._live_tabs = set()
 
     def __call__(self, *args, env=None, timeout=30.0):
         head = tuple(args[:2])
@@ -135,13 +146,20 @@ class _WorkspaceHerdr(_PlacementHerdr):
             self._workspace = "wRUN{0}".format(self._next_workspace)
             self._next_tab += 1
             self._next_pane += 1
-            return {"result": {
-                "workspace": {"workspace_id": self._workspace,
-                              "label": args[args.index("--label") + 1]},
-                "tab": {"tab_id": "{0}:t{1}".format(self._workspace,
-                                                    self._next_tab)},
-                "root_pane": {"pane_id": "{0}:p{1}".format(self._workspace,
-                                                           self._next_pane)}}}
+            seed_tab_id = "{0}:t{1}".format(self._workspace, self._next_tab)
+            root_pane_id = "{0}:p{1}".format(self._workspace, self._next_pane)
+            self._live_tabs.add(seed_tab_id)
+            self._pane_tabs[root_pane_id] = seed_tab_id
+            return {
+                "result": {
+                    "workspace": {
+                        "workspace_id": self._workspace,
+                        "label": args[args.index("--label") + 1],
+                    },
+                    "tab": {"tab_id": seed_tab_id},
+                    "root_pane": {"pane_id": root_pane_id},
+                }
+            }
         if head == ("tab", "create"):
             self.calls.append(list(args))
             self._next_tab += 1
@@ -151,27 +169,77 @@ class _WorkspaceHerdr(_PlacementHerdr):
             self.tab_labels[tab_id] = args[args.index("--label") + 1]
             # A fresh tab's root pane is what `pane get` must report next.
             self.split_pane_id = pane_id
-            return {"result": {"tab": {"tab_id": tab_id, "label":
-                                       self.tab_labels[tab_id]},
-                               "root_pane": {"pane_id": pane_id,
-                                             "cwd": str(self.worktree)}}}
+            self._live_tabs.add(tab_id)
+            self._pane_tabs[pane_id] = tab_id
+            return {
+                "result": {
+                    "tab": {"tab_id": tab_id, "label": self.tab_labels[tab_id]},
+                    "root_pane": {"pane_id": pane_id, "cwd": str(self.worktree)},
+                }
+            }
         if head == ("tab", "close"):
             self.calls.append(list(args))
             self.closed_tabs.append(args[2])
+            self._live_tabs.discard(args[2])
             return {"result": {"type": "ok"}}
+        if head == ("tab", "list"):
+            self.calls.append(list(args))
+            return {
+                "result": {
+                    "tabs": [
+                        {"tab_id": tab_id, "label": self.tab_labels.get(tab_id, "")}
+                        for tab_id in sorted(self._live_tabs)
+                    ]
+                }
+            }
+        if head == ("pane", "get"):
+            self.calls.append(list(args))
+            pane_id = args[2]
+            index = (
+                min(
+                    len([call for call in self.calls if call[:2] == ["pane", "get"]]),
+                    len(self.get_cwds),
+                )
+                - 1
+            )
+            return {
+                "result": {
+                    "pane": {
+                        "pane_id": pane_id,
+                        "cwd": self.get_cwds[index],
+                        "workspace_id": lch.workspace_of(pane_id),
+                        "tab_id": self._pane_tabs.get(pane_id, ""),
+                        "revision": self.revision,
+                    }
+                }
+            }
+        if head == ("pane", "split"):
+            response = super().__call__(*args, env=env, timeout=timeout)
+            pane = response["result"]["pane"]
+            pane_id = pane.get("pane_id")
+            if pane_id:
+                self._pane_tabs[pane_id] = self._pane_tabs.get(args[2], "")
+            return response
         if head == ("pane", "rename"):
             self.calls.append(list(args))
             self.renames[args[2]] = args[3]
             return {"result": {"type": "ok"}}
         return super().__call__(*args, env=env, timeout=timeout)
 
+    def register_existing_tab(self, tab_id: str, *pane_ids: str) -> None:
+        self._live_tabs.add(tab_id)
+        self._pane_tabs.update({pane_id: tab_id for pane_id in pane_ids})
+
+    def hide_tab(self, tab_id: str) -> None:
+        self._live_tabs.discard(tab_id)
+
     def tab_create_labels(self):
-        return [call[call.index("--label") + 1]
-                for call in self.argv_for(("tab", "create"))]
+        return [
+            call[call.index("--label") + 1] for call in self.argv_for(("tab", "create"))
+        ]
 
 
 class PanePlacementTest(unittest.TestCase):
-
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -186,37 +254,66 @@ class PanePlacementTest(unittest.TestCase):
         key = load_public_key(fixtures / "route_receipts.pub")
         self.admitted = load_admitted_routes(
             {"omp": fixtures / "omp.json", "claude": fixtures / "claude.json"},
-            verify_keys=(key,))
+            verify_keys=(key,),
+        )
 
-    def spec(self, token: str = "run1-node_a-1", *, group: str = "",
-             role: str = "", size: int = 0) -> lch.LaunchSpec:
+    def spec(
+        self,
+        token: str = "run1-node_a-1",
+        *,
+        group: str = "",
+        role: str = "",
+        size: int = 0,
+        attempt: int | None = None,
+        workspace_label: str = "",
+    ) -> lch.LaunchSpec:
         return lch.LaunchSpec(
-            correlation_token=token, worktree=self.worktree,
-            prompt_path=self.prompt, envelope_path=self.root / "envelope.json",
-            route="omp", model="openai-codex/gpt-5.6-sol", effort="high",
-            profile="openai-performance", session_dir=self.root / "session",
+            correlation_token=token,
+            worktree=self.worktree,
+            prompt_path=self.prompt,
+            envelope_path=self.root / "envelope.json",
+            route="omp",
+            model="openai-codex/gpt-5.6-sol",
+            effort="high",
+            profile="openai-performance",
+            session_dir=self.root / "session",
             context_window_tokens=400_000,
-            pane_group=group, pane_role=role, pane_group_size=size,
-            environment=worktree_module.launch_env(self.scratch))
+            workspace_label=workspace_label,
+            lane_key=group,
+            lane_label=group,
+            pane_role=role,
+            attempt_no=attempt,
+            pane_group_size=size,
+            environment=worktree_module.launch_env(self.scratch),
+        )
 
-    def build(self, *, workspace_label: str = "", factory=None,
-              factory_kwargs=None, **kwargs):
+    def build(
+        self, *, workspace_label: str = "", factory=None, factory_kwargs=None, **kwargs
+    ):
         harness = lch.HerdrLauncher(
-            herdr_path=self.root / "herdr", omp_path=Path("/opt/omp"),
-            claude_path=Path("/opt/claude"), admitted_routes=self.admitted,
-            workspace_label=workspace_label)
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted,
+            workspace_label=workspace_label,
+        )
         # These cases are about placement, not about the busy window; zero so
         # a refusal here would surface at once rather than after ten seconds.
         harness.agent_start_busy_window_s = 0.0
         if factory is None:
             # `factory_kwargs` selects the vanishing-workspace fake without
             # every existing caller having to know it exists.
-            factory = (_VanishingWorkspaceHerdr if factory_kwargs
-                       else (_WorkspaceHerdr if workspace_label
-                             else _PlacementHerdr))
-        fake = factory(worktree=self.worktree,
-                       transcript=self.root / "session.jsonl",
-                       **(factory_kwargs or {}), **kwargs)
+            factory = (
+                _VanishingWorkspaceHerdr
+                if factory_kwargs
+                else (_WorkspaceHerdr if workspace_label else _PlacementHerdr)
+            )
+        fake = factory(
+            worktree=self.worktree,
+            transcript=self.root / "session.jsonl",
+            **(factory_kwargs or {}),
+            **kwargs,
+        )
         harness._herdr = fake
         return harness, fake
 
@@ -246,8 +343,10 @@ class PanePlacementTest(unittest.TestCase):
             except BaseException as exc:  # noqa: BLE001 — reported below
                 errors.append(exc)
 
-        threads = [threading.Thread(target=launch, args=(token,))
-                   for token in ("run1-node_a-1", "run1-node_b-1")]
+        threads = [
+            threading.Thread(target=launch, args=(token,))
+            for token in ("run1-node_a-1", "run1-node_b-1")
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -270,8 +369,10 @@ class PanePlacementTest(unittest.TestCase):
 
     def test_every_pane_of_a_run_reports_one_workspace(self):
         harness, fake = self.build()
-        panes = [harness.launch(self.spec("run1-node_{0}-1".format(name))).pane_id
-                 for name in ("a", "b", "c", "d")]
+        panes = [
+            harness.launch(self.spec("run1-node_{0}-1".format(name))).pane_id
+            for name in ("a", "b", "c", "d")
+        ]
 
         self.assertEqual(len(set(panes)), 4)
         self.assertEqual({lch.workspace_of(pane) for pane in panes}, {"w0"})
@@ -291,8 +392,11 @@ class PanePlacementTest(unittest.TestCase):
         def escape(*args, **kwargs):
             if tuple(args[:2]) == ("pane", "split"):
                 fake.calls.append(list(args))
-                return {"result": {"pane": {"pane_id": "w13F:p1",
-                                            "cwd": str(self.worktree)}}}
+                return {
+                    "result": {
+                        "pane": {"pane_id": "w13F:p1", "cwd": str(self.worktree)}
+                    }
+                }
             return original(*args, **kwargs)
 
         original = fake.__call__
@@ -322,9 +426,8 @@ class PanePlacementTest(unittest.TestCase):
         """
         self.assertEqual(
             [lch.grid_for(n) for n in range(1, 10)],
-            [(1, 1), (1, 2), (1, 3),
-             (2, 2), (2, 3), (2, 3),
-             (3, 3), (3, 3), (3, 3)])
+            [(1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (2, 3), (3, 3), (3, 3), (3, 3)],
+        )
 
     def test_the_grid_does_not_grow_past_three_by_three(self):
         """Ten panes stay in nine cells' worth of columns.
@@ -364,8 +467,9 @@ class PanePlacementTest(unittest.TestCase):
                 for index in range(1, size):
                     parent, direction = lch.split_plan(index, cols)
                     row, col = cells[parent]
-                    cells[index] = ((row, col + 1) if direction == "right"
-                                    else (row + 1, col))
+                    cells[index] = (
+                        (row, col + 1) if direction == "right" else (row + 1, col)
+                    )
                 placed = set(cells.values())
                 self.assertEqual(len(placed), size, "a cell was used twice")
                 self.assertEqual(max(r for r, _ in placed) + 1, rows)
@@ -380,8 +484,9 @@ class PanePlacementTest(unittest.TestCase):
         """
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
         for index in range(3):
-            harness.launch(self.spec("run1-node_{0}-1".format(index),
-                                     group="lane-p2-s3-inventory"))
+            harness.launch(
+                self.spec("run1-node_{0}-1".format(index), group="lane-p2-s3-inventory")
+            )
 
         # Three panes, two splits: the tab's own root pane is the first agent's.
         self.assertEqual(fake.directions(), ["right", "right"])
@@ -390,15 +495,17 @@ class PanePlacementTest(unittest.TestCase):
         """Three columns then three rows below them, from real split calls."""
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
         for index in range(6):
-            harness.launch(self.spec("run1-node_{0}-1".format(index),
-                                     group="lane-p2-s3-inventory",
-                                     size=6))
+            harness.launch(
+                self.spec(
+                    "run1-node_{0}-1".format(index),
+                    group="lane-p2-s3-inventory",
+                    size=6,
+                )
+            )
 
-        self.assertEqual(fake.directions(),
-                         ["right", "right", "down", "down", "down"])
+        self.assertEqual(fake.directions(), ["right", "right", "down", "down", "down"])
 
-
-    # ── one workspace per run, one tab per node ─────────────────────────────
+    # ── one workspace per run, one tab per lane ─────────────────────────────
 
     def test_a_runs_panes_land_in_the_runs_own_workspace(self):
         """Focus is somewhere else entirely and no pane follows it.
@@ -408,42 +515,54 @@ class PanePlacementTest(unittest.TestCase):
         there. Creating the workspace instead makes placement a property of
         the run, so `pane current` is never asked at all.
         """
-        harness, fake = self.build(workspace_label="cmo-consolidation-l-r4",
-                                   focus_workspace="w99")
-        panes = [harness.launch(self.spec("run1-node_a-{0}".format(index),
-                                          group="lane-p2-s3-inventory",
-                                          size=2)).pane_id
-                 for index in range(2)]
+        harness, fake = self.build(
+            workspace_label="cmo-consolidation-l-r4", focus_workspace="w99"
+        )
+        panes = [
+            harness.launch(
+                self.spec(
+                    "run1-node_a-{0}".format(index),
+                    group="lane-p2-s3-inventory",
+                    size=2,
+                )
+            ).pane_id
+            for index in range(2)
+        ]
 
         self.assertEqual(fake.argv_for(("pane", "current")), [])
         created = fake.argv_for(("workspace", "create"))
         self.assertEqual(len(created), 1)
         self.assertIn("cmo-consolidation-l-r4", created[0])
-        self.assertEqual({lch.workspace_of(pane) for pane in panes},
-                         {"wRUN1"})
+        self.assertEqual({lch.workspace_of(pane) for pane in panes}, {"wRUN1"})
         self.assertNotIn("w99", {lch.workspace_of(pane) for pane in panes})
 
     def test_the_workspace_is_created_once_for_the_whole_run(self):
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
         for node in ("lane-p2-s3-inventory", "lane-p3-dedup-decisions"):
-            harness.launch(self.spec("run1-" + node + "-1", group=node,
-                                     size=2))
+            harness.launch(self.spec("run1-" + node + "-1", group=node, size=2))
 
         self.assertEqual(len(fake.argv_for(("workspace", "create"))), 1)
 
-    def test_one_tab_per_node_shared_by_that_nodes_agents(self):
-        """Builder and reviewer of one node share a tab; two nodes do not."""
+    def test_one_tab_per_lane_shared_by_that_lanes_agents(self):
+        """Builder and reviewer of one lane share a tab; two lanes do not."""
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
-        harness.launch(self.spec("run1-a-1", group="lane-p2-s3-inventory",
-                                 role="builder", size=2))
-        harness.launch(self.spec("review-a", group="lane-p2-s3-inventory",
-                                 role="reviewer", size=2))
-        harness.launch(self.spec("run1-b-1", group="lane-p3-dedup-decisions",
-                                 role="builder", size=2))
+        harness.launch(
+            self.spec("run1-a-1", group="lane-p2-s3-inventory", role="builder", size=2)
+        )
+        harness.launch(
+            self.spec("review-a", group="lane-p2-s3-inventory", role="reviewer", size=2)
+        )
+        harness.launch(
+            self.spec(
+                "run1-b-1", group="lane-p3-dedup-decisions", role="builder", size=2
+            )
+        )
 
-        self.assertEqual(fake.tab_create_labels(),
-                         ["2-s3-inventory", "3-dedup-decisions"])
-        # The reviewer split its own node's tab, not the other node's.
+        self.assertEqual(
+            fake.tab_create_labels(),
+            ["lane-p2-s3-inventory", "lane-p3-dedup-decisions"],
+        )
+        # The reviewer split its own lane's tab, not the other lane's.
         self.assertEqual(len(fake.argv_for(("pane", "split"))), 1)
 
     def test_the_seed_tab_is_closed_once_a_real_tab_exists(self):
@@ -453,37 +572,40 @@ class PanePlacementTest(unittest.TestCase):
         refuses to close a workspace's last tab, and that refusal is correct.
         """
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
-        harness.launch(self.spec("run1-a-1", group="lane-p2-s3-inventory",
-                                 size=2))
+        harness.launch(self.spec("run1-a-1", group="lane-p2-s3-inventory", size=2))
 
         self.assertEqual(fake.closed_tabs, ["wRUN1:t1"])
         self.assertEqual(len(fake.argv_for(("tab", "create"))), 1)
 
-    def test_a_pane_is_named_for_its_node_and_role(self):
-        """Identifiable without reading a working directory.
-
-        Verified against the real binary: a pane renamed and then handed a
-        `claude` agent still reports `label` while `terminal_title` reads
-        `Claude Code`. The coder owns the title; herdr owns the label.
-        """
+    def test_a_pane_is_named_for_its_lane_role_and_attempt(self):
+        """Visible identity is authored placement, never runtime metadata."""
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
-        builder = harness.launch(self.spec(
-            "run1-a-1", group="lane-p2-s3-inventory", role="builder", size=2))
-        reviewer = harness.launch(self.spec(
-            "review-a", group="lane-p2-s3-inventory", role="reviewer", size=2))
+        builder = harness.launch(
+            self.spec(
+                "run1-a-19",
+                group="lane-p2-s3-inventory",
+                role="builder",
+                attempt=19,
+                size=2,
+            )
+        )
+        reviewer = harness.launch(
+            self.spec(
+                "review-digest",
+                group="lane-p2-s3-inventory",
+                role="reviewer",
+                attempt=2,
+                size=2,
+            )
+        )
 
-        self.assertEqual(fake.renames[builder.pane_id],
-                         "2-s3-inventory-builder")
-        self.assertEqual(fake.renames[reviewer.pane_id],
-                         "2-s3-inventory-reviewer")
+        self.assertEqual(fake.renames[builder.pane_id], "builder-a19")
+        self.assertEqual(fake.renames[reviewer.pane_id], "reviewer-a2")
 
-    def test_the_display_name_drops_the_lane_prefix(self):
-        self.assertEqual(lch.display_name("lane-p2-s3-inventory"),
-                         "2-s3-inventory")
-        self.assertEqual(lch.display_name("lane-p3-dedup-decisions"),
-                         "3-dedup-decisions")
-        # Anything that is not a lane id is already its own display name.
-        self.assertEqual(lch.display_name("finalize"), "finalize")
+    def test_role_only_pane_has_no_attempt_suffix(self):
+        harness, fake = self.build(factory=_WorkspaceHerdr)
+        author = harness.launch(self.spec("deliver-author", role="author"))
+        self.assertEqual(fake.renames[author.pane_id], "author")
 
     def test_the_first_agent_of_a_tab_takes_the_tab_root_pane(self):
         """A tab is created with the launch's cwd and redirection.
@@ -493,14 +615,16 @@ class PanePlacementTest(unittest.TestCase):
         idle shell in every node's rectangle.
         """
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
-        handle = harness.launch(self.spec(
-            "run1-a-1", group="lane-p2-s3-inventory", size=2))
+        handle = harness.launch(
+            self.spec("run1-a-1", group="lane-p2-s3-inventory", size=2)
+        )
 
         self.assertEqual(fake.argv_for(("pane", "split")), [])
         created = fake.argv_for(("tab", "create"))[0]
         self.assertIn("--cwd", created)
-        self.assertEqual(created[created.index("--cwd") + 1],
-                         str(self.worktree.resolve()))
+        self.assertEqual(
+            created[created.index("--cwd") + 1], str(self.worktree.resolve())
+        )
         self.assertEqual(lch.workspace_of(handle.pane_id), "wRUN1")
 
     def test_a_refused_workspace_is_typed_and_not_cached(self):
@@ -523,14 +647,12 @@ class PanePlacementTest(unittest.TestCase):
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(self.spec("run1-a-1", group="lane-p2-s3-inventory"))
 
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.WORKSPACE_UNRESOLVED)
+        self.assertIs(caught.exception.refusal, lch.LaunchRefusal.WORKSPACE_UNRESOLVED)
         self.assertFalse(caught.exception.pane_created)
         self.assertFalse(caught.exception.deterministic)
         # Not cached: the retry re-asks herdr rather than replaying the answer.
         harness._herdr = fake
-        handle = harness.launch(self.spec("run1-a-1",
-                                          group="lane-p2-s3-inventory"))
+        handle = harness.launch(self.spec("run1-a-1", group="lane-p2-s3-inventory"))
         self.assertEqual(lch.workspace_of(handle.pane_id), "wRUN1")
         self.assertEqual(len(fake.argv_for(("workspace", "create"))), 2)
 
@@ -558,25 +680,27 @@ class PanePlacementTest(unittest.TestCase):
         """The production sequence, which reaps between the two agents.
 
         `cancel` closes a builder's pane in a `finally` after every attempt,
-        and the node's reviewer launches afterwards — so by the time the
-        reviewer arrives its node's tab may hold no live pane at all. A tab
-        with nothing left in it is not a parent, and herdr has already closed
-        it, so the group opens a fresh tab under the same name rather than
+        and the lane's reviewer launches afterwards — so by the time the
+        reviewer arrives its lane tab may hold no live pane at all. A tab with
+        nothing left in it is not a parent, and herdr has already closed it,
+        so the group opens a fresh tab under the same name rather than
         refusing or splitting a dead pane.
         """
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
-        builder = harness.launch(self.spec(
-            "run1-a-1", group="lane-p2-s3-inventory", role="builder", size=2))
+        builder = harness.launch(
+            self.spec("run1-a-1", group="lane-p2-s3-inventory", role="builder", size=2)
+        )
         harness._reap_pane(builder.pane_id, {})
 
-        reviewer = harness.launch(self.spec(
-            "review-a", group="lane-p2-s3-inventory", role="reviewer", size=2))
+        reviewer = harness.launch(
+            self.spec("review-a", group="lane-p2-s3-inventory", role="reviewer", size=2)
+        )
 
-        self.assertEqual(fake.tab_create_labels(),
-                         ["2-s3-inventory", "2-s3-inventory"])
+        self.assertEqual(
+            fake.tab_create_labels(), ["lane-p2-s3-inventory", "lane-p2-s3-inventory"]
+        )
         self.assertEqual(fake.argv_for(("pane", "split")), [])
-        self.assertEqual(fake.renames[reviewer.pane_id],
-                         "2-s3-inventory-reviewer")
+        self.assertEqual(fake.renames[reviewer.pane_id], "reviewer")
         self.assertEqual(lch.workspace_of(reviewer.pane_id), "wRUN1")
 
     def test_a_reaped_pane_leaves_the_grid(self):
@@ -587,19 +711,248 @@ class PanePlacementTest(unittest.TestCase):
         change.
         """
         harness, fake = self.build(workspace_label="cmo-consolidation-l-r4")
-        first = harness.launch(self.spec("run1-a-1",
-                                         group="lane-p2-s3-inventory", size=3))
-        second = harness.launch(self.spec("run1-a-2",
-                                          group="lane-p2-s3-inventory", size=3))
+        first = harness.launch(
+            self.spec("run1-a-1", group="lane-p2-s3-inventory", size=3)
+        )
+        second = harness.launch(
+            self.spec("run1-a-2", group="lane-p2-s3-inventory", size=3)
+        )
         harness._reap_pane(second.pane_id, dict(fake_env()))
 
-        third = harness.launch(self.spec("run1-a-3",
-                                         group="lane-p2-s3-inventory", size=3))
+        third = harness.launch(
+            self.spec("run1-a-3", group="lane-p2-s3-inventory", size=3)
+        )
         parents = fake.parents()
         # Slot 2 would have split the reaped slot 1; it falls back to slot 0,
-        # which is still alive, and stays inside this node's tab either way.
+        # which is still alive, and stays inside this lane's tab either way.
         self.assertEqual(parents[-1], first.pane_id)
         self.assertEqual(lch.workspace_of(third.pane_id), "wRUN1")
+
+    def test_adoption_reclaims_only_the_persisted_pane_and_agent_ids(self):
+        runtime, fake = self.build(workspace_label="approved-plan")
+        original = runtime.launch(
+            self.spec(
+                "run1-build-a1",
+                group="build",
+                role="builder",
+                attempt=1,
+                workspace_label="approved-plan",
+            )
+        )
+        resumed = lch.HerdrLauncher(
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted,
+            workspace_label="approved-plan",
+        )
+        resumed._herdr = fake
+        adopted = resumed.adopt(
+            lch.PersistedActorHandle(
+                correlation_token=original.correlation_token,
+                pane_id=original.pane_id,
+                agent_name=original.agent_name,
+                launched_cwd=original.launched_cwd,
+                transcript_path=original.transcript_path,
+                environment=original.environment,
+                workspace_id=original.workspace_id,
+                tab_id=original.tab_id,
+                lane_key=original.lane_key,
+            )
+        )
+        self.assertEqual(adopted.pane_id, original.pane_id)
+        self.assertEqual(adopted.tab_id, original.tab_id)
+        self.assertEqual(adopted.workspace_id, original.workspace_id)
+        self.assertEqual(resumed.reclaim(original.correlation_token), (adopted,))
+
+    def test_proven_tab_survives_agent_absence_and_replacement_reuses_it(self):
+        runtime, fake = self.build(workspace_label="approved-plan")
+        original = runtime.launch(
+            self.spec(
+                "run1-build-a1",
+                group="build",
+                role="builder",
+                attempt=1,
+                workspace_label="approved-plan",
+            )
+        )
+        fake.closed.append(original.pane_id)
+        resumed = lch.HerdrLauncher(
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted,
+            workspace_label="approved-plan",
+        )
+        resumed._herdr = fake
+        with self.assertRaises(lch.HandleAbsent):
+            resumed.adopt(
+                lch.PersistedActorHandle(
+                    correlation_token=original.correlation_token,
+                    pane_id=original.pane_id,
+                    agent_name=original.agent_name,
+                    launched_cwd=original.launched_cwd,
+                    environment=original.environment,
+                    workspace_id=original.workspace_id,
+                    tab_id=original.tab_id,
+                    lane_key=original.lane_key,
+                )
+            )
+        layout = resumed._tabs[original.lane_key]
+        self.assertEqual(layout.tab_id, original.tab_id)
+        self.assertIn(original.pane_id, layout.panes)
+
+        replacement = resumed.launch(
+            self.spec(
+                "run1-build-a2",
+                group="build",
+                role="builder",
+                attempt=2,
+                workspace_label="approved-plan",
+            )
+        )
+
+        self.assertEqual(replacement.tab_id, original.tab_id)
+        self.assertEqual(replacement.workspace_id, original.workspace_id)
+        self.assertEqual(replacement.lane_key, original.lane_key)
+        self.assertEqual(len(fake.argv_for(("tab", "create"))), 1)
+
+    def test_unproven_or_vanished_tab_cannot_restore_replacement_placement(self):
+        runtime, fake = self.build(workspace_label="approved-plan")
+        original = runtime.launch(
+            self.spec(
+                "run1-build-a1",
+                group="build",
+                role="builder",
+                attempt=1,
+                workspace_label="approved-plan",
+            )
+        )
+        before_tab_creates = len(fake.argv_for(("tab", "create")))
+        cases = (
+            ("vanished", original.tab_id, original.tab_id, True),
+            ("unknown", "wRUN1:t999", "wRUN1:t999", False),
+        )
+        for label, persisted_tab_id, pane_tab_id, hide in cases:
+            with self.subTest(label=label):
+                fake._pane_tabs[original.pane_id] = pane_tab_id
+                if hide:
+                    fake.hide_tab(persisted_tab_id)
+                resumed = lch.HerdrLauncher(
+                    herdr_path=self.root / "herdr",
+                    omp_path=Path("/opt/omp"),
+                    claude_path=Path("/opt/claude"),
+                    admitted_routes=self.admitted,
+                    workspace_label="approved-plan",
+                )
+                resumed._herdr = fake
+                with self.assertRaisesRegex(lch.HandleAdoptionRefused, "TAB_ABSENT"):
+                    resumed.adopt(
+                        lch.PersistedActorHandle(
+                            correlation_token=original.correlation_token,
+                            pane_id=original.pane_id,
+                            agent_name=original.agent_name,
+                            launched_cwd=original.launched_cwd,
+                            environment=original.environment,
+                            workspace_id=original.workspace_id,
+                            tab_id=persisted_tab_id,
+                            lane_key=original.lane_key,
+                        )
+                    )
+                self.assertEqual(resumed._tabs, {})
+                self.assertEqual(
+                    len(fake.argv_for(("tab", "create"))), before_tab_creates
+                )
+
+    def test_adoption_keeps_all_live_actors_in_the_lane_layout(self):
+        resumed, fake = self.build(workspace_label="approved-plan")
+        actors = (
+            ("run1-build-a1", "wRUN1:p1"),
+            ("run1-review-a1", "wRUN1:p2"),
+        )
+        fake.register_existing_tab("wRUN1:t2", *(pane_id for _, pane_id in actors))
+        for token, pane_id in actors:
+            fake.split_pane_id = pane_id
+            resumed.adopt(
+                lch.PersistedActorHandle(
+                    correlation_token=token,
+                    pane_id=pane_id,
+                    agent_name=lch.agent_name_for(token),
+                    launched_cwd=self.worktree,
+                    environment=fake_env(),
+                    workspace_id="wRUN1",
+                    tab_id="wRUN1:t2",
+                    lane_key="build",
+                )
+            )
+
+        layout = resumed._tabs["build"]
+        self.assertEqual(layout.panes, ["wRUN1:p1", "wRUN1:p2"])
+        self.assertEqual(layout.claimed, 2)
+        self.assertEqual(resumed.workspace_id, "wRUN1")
+
+    def test_adoption_refuses_to_rebind_the_run_workspace(self):
+        resumed, fake = self.build(workspace_label="approved-plan")
+        fake.register_existing_tab("wRUN1:t2", "wRUN1:p1")
+        fake.register_existing_tab("wRUN2:t2", "wRUN2:p1")
+        for token, pane_id, workspace in (
+            ("run1-build-a1", "wRUN1:p1", "wRUN1"),
+            ("run2-build-a1", "wRUN2:p1", "wRUN2"),
+        ):
+            fake.split_pane_id = pane_id
+            persisted = lch.PersistedActorHandle(
+                correlation_token=token,
+                pane_id=pane_id,
+                agent_name=lch.agent_name_for(token),
+                launched_cwd=self.worktree,
+                environment=fake_env(),
+                workspace_id=workspace,
+                tab_id=workspace + ":t2",
+                lane_key="build",
+            )
+            if workspace == "wRUN1":
+                resumed.adopt(persisted)
+            else:
+                with self.assertRaisesRegex(
+                    lch.HandleAdoptionRefused, "WORKSPACE_ID_MISMATCH"
+                ):
+                    resumed.adopt(persisted)
+
+        self.assertEqual(resumed.workspace_id, "wRUN1")
+
+
+class LanePlacementMappingTest(unittest.TestCase):
+    """Authored test nodes render inside the build lane that consumes them."""
+
+    @staticmethod
+    def _node(node_id, needs=()):
+        return SimpleNamespace(node_id=node_id, needs=tuple(needs))
+
+    def test_unique_test_owner_shares_the_build_lane(self):
+        test = self._node("lane-direct-port-tests")
+        build = self._node("lane-direct-port", (test.node_id,))
+        plan = SimpleNamespace(agent_nodes=(build,), tests_nodes=(test,))
+
+        self.assertEqual(
+            maestro._lane_placement_by_node(plan),
+            {
+                "lane-direct-port": "lane-direct-port",
+                "lane-direct-port-tests": "lane-direct-port",
+            },
+        )
+
+    def test_shared_and_unconsumed_tests_keep_their_own_tabs(self):
+        shared = self._node("shared-tests")
+        orphan = self._node("orphan-tests")
+        first = self._node("lane-first", (shared.node_id,))
+        second = self._node("lane-second", (shared.node_id,))
+        plan = SimpleNamespace(
+            agent_nodes=(first, second), tests_nodes=(shared, orphan)
+        )
+
+        placement = maestro._lane_placement_by_node(plan)
+        self.assertEqual(placement[shared.node_id], shared.node_id)
+        self.assertEqual(placement[orphan.node_id], orphan.node_id)
 
 
 class LayoutWiringTest(unittest.TestCase):
@@ -622,30 +975,42 @@ class LayoutWiringTest(unittest.TestCase):
             if not isinstance(node, ast.Call):
                 continue
             target = node.func
-            name = (target.attr if isinstance(target, ast.Attribute)
-                    else getattr(target, "id", ""))
+            name = (
+                target.attr
+                if isinstance(target, ast.Attribute)
+                else getattr(target, "id", "")
+            )
             if name == "LaunchSpec":
                 yield {kw.arg: kw.value for kw in node.keywords}
 
-    def test_the_node_dispatch_sites_name_the_node_and_the_role(self):
+    def test_the_node_dispatch_sites_name_lane_role_and_attempt(self):
         roles = set()
 
-        def collect(node):
+        def collect(node, into):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                roles.add(node.value)
+                into.add(node.value)
             elif isinstance(node, ast.IfExp):
-                collect(node.body)
-                collect(node.orelse)
+                collect(node.body, into)
+                collect(node.orelse, into)
 
+        actor_roles = {"builder", "reviewer", "tester"}
         for keywords in self._launch_specs():
             role = keywords.get("pane_role")
             if role is None:
                 continue
-            collect(role)
-            # A role without a group would label a pane with no node.
-            self.assertIn("pane_group", keywords)
-            self.assertIn("pane_group_size", keywords)
-        self.assertEqual(roles, {"builder", "reviewer", "tester"})
+            site_roles = set()
+            collect(role, site_roles)
+            roles.update(site_roles)
+            if site_roles & actor_roles:
+                for field in (
+                    "workspace_label",
+                    "lane_key",
+                    "lane_label",
+                    "attempt_no",
+                    "pane_group_size",
+                ):
+                    self.assertIn(field, keywords)
+        self.assertEqual(roles, {"author", "builder", "reviewer", "tester"})
 
     def test_the_runs_launcher_is_given_a_workspace_label(self):
         labelled = []
@@ -653,12 +1018,14 @@ class LayoutWiringTest(unittest.TestCase):
             if not isinstance(node, ast.Call):
                 continue
             target = node.func
-            name = (target.attr if isinstance(target, ast.Attribute)
-                    else getattr(target, "id", ""))
+            name = (
+                target.attr
+                if isinstance(target, ast.Attribute)
+                else getattr(target, "id", "")
+            )
             if name != "HerdrLauncher":
                 continue
-            labelled.append(any(kw.arg == "workspace_label"
-                                for kw in node.keywords))
+            labelled.append(any(kw.arg == "workspace_label" for kw in node.keywords))
         self.assertTrue(labelled, "maestro builds no HerdrLauncher")
         # Exactly the run's launcher. The standalone reviewer and the plan
         # author are not runs and deliberately keep the pre-workspace path.
@@ -686,9 +1053,36 @@ class _VanishingWorkspaceHerdr(_WorkspaceHerdr):
             self.calls.append(list(args))
             raise lch.HerdrCallError(
                 'LAUNCH_REFUSED:{"error":{"code":"workspace_not_found",'
-                '"message":"workspace %s not found"},"id":"cli:tab:create"}'
-                % named,
-                "workspace_not_found")
+                '"message":"workspace %s not found"},"id":"cli:tab:create"}' % named,
+                "workspace_not_found",
+            )
+        return super().__call__(*args, env=env, timeout=timeout)
+
+
+class _SplitVanishingWorkspaceHerdr(_WorkspaceHerdr):
+    """A workspace that disappears after a lane has claimed its root pane."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.destroyed_workspace = ""
+        self.refused_splits = []
+
+    def destroy_workspace(self) -> None:
+        self.destroyed_workspace = self._workspace
+
+    def __call__(self, *args, env=None, timeout=30.0):
+        if (
+            tuple(args[:2]) == ("pane", "split")
+            and lch.workspace_of(args[2]) == self.destroyed_workspace
+        ):
+            self.calls.append(list(args))
+            self.refused_splits.append(args[2])
+            raise lch.HerdrCallError(
+                'LAUNCH_REFUSED:{"error":{"code":"workspace_not_found",'
+                '"message":"workspace %s not found"},"id":"cli:pane:split"}'
+                % self.destroyed_workspace,
+                "workspace_not_found",
+            )
         return super().__call__(*args, env=env, timeout=timeout)
 
 
@@ -700,39 +1094,74 @@ class DestroyedWorkspaceTest(PanePlacementTest):
     succeeded. The operator is told a counter ran out; nothing was retryable.
     """
 
+    def test_a_vanished_workspace_during_lane_split_replaces_its_layout(self):
+        """A live lane cache must not replay a split against its dead tab."""
+        lane = "lane-p2-s3-inventory"
+        harness, fake = self.build(
+            workspace_label="run-1", factory=_SplitVanishingWorkspaceHerdr
+        )
+        first = harness.launch(
+            self.spec("run1-builder-3", group=lane, role="builder", attempt=3, size=2)
+        )
+        old_workspace = harness.workspace_id
+        old_layout = harness._tabs[lane]
+        fake.destroy_workspace()
+
+        second = harness.launch(
+            self.spec("run1-reviewer-5", group=lane, role="reviewer", attempt=5, size=2)
+        )
+
+        self.assertEqual(fake.refused_splits, [first.pane_id])
+        self.assertNotEqual(lch.workspace_of(second.pane_id), old_workspace)
+        self.assertEqual(harness.workspace_id, lch.workspace_of(second.pane_id))
+        created = fake.argv_for(("workspace", "create"))
+        self.assertEqual(created[-1][created[-1].index("--label") + 1], "run-1")
+        self.assertEqual(len(fake.argv_for(("workspace", "create"))), 2)
+        self.assertEqual(fake.tab_create_labels(), [lane, lane])
+        self.assertIsNot(harness._tabs[lane], old_layout)
+        self.assertEqual(harness._tabs[lane].panes, [second.pane_id])
+        self.assertEqual(harness._tabs[lane].claimed, 1)
+        self.assertEqual(fake.renames[first.pane_id], "builder-a3")
+        self.assertEqual(fake.renames[second.pane_id], "reviewer-a5")
+
     def test_a_vanished_workspace_is_re_resolved_and_the_launch_succeeds(self):
-        harness, fake = self.build(workspace_label="run-1",
-                                   factory_kwargs={"vanish_times": 1})
-        handle = harness.launch(self.spec(group="node_a", role="builder",
-                                          size=2))
+        harness, fake = self.build(
+            workspace_label="run-1", factory_kwargs={"vanish_times": 1}
+        )
+        handle = harness.launch(self.spec(group="node_a", role="builder", size=2))
         self.assertTrue(handle.pane_id)
         created = fake.argv_for(("workspace", "create"))
-        self.assertEqual(len(created), 2,
-                         "the dead workspace must be replaced, not reused")
+        self.assertEqual(
+            len(created), 2, "the dead workspace must be replaced, not reused"
+        )
         tabs = fake.argv_for(("tab", "create"))
         first = tabs[0][tabs[0].index("--workspace") + 1]
         last = tabs[-1][tabs[-1].index("--workspace") + 1]
-        self.assertNotEqual(first, last,
-                            "the retry must ask a different question")
+        self.assertNotEqual(first, last, "the retry must ask a different question")
         self.assertEqual(fake.refused_workspaces, [first])
 
     def test_the_cache_holds_the_new_workspace_afterwards(self):
         """One re-resolution per vanishing, not one per launch: the next node
         must not pay for it again."""
-        harness, fake = self.build(workspace_label="run-1",
-                                   factory_kwargs={"vanish_times": 1})
+        harness, fake = self.build(
+            workspace_label="run-1", factory_kwargs={"vanish_times": 1}
+        )
         harness.launch(self.spec("run1-node_a-1", group="node_a", role="builder"))
         before = len(fake.argv_for(("workspace", "create")))
         harness.launch(self.spec("run1-node_b-1", group="node_b", role="builder"))
-        self.assertEqual(len(fake.argv_for(("workspace", "create"))), before,
-                         "the second node reused the re-resolved workspace")
+        self.assertEqual(
+            len(fake.argv_for(("workspace", "create"))),
+            before,
+            "the second node reused the re-resolved workspace",
+        )
 
     def test_a_workspace_that_vanishes_twice_is_refused_rather_than_looped(self):
         """Twice is not a stale cache. Something is destroying workspaces as
         fast as this makes them, and a third ask re-poses a question already
         answered the same way twice."""
-        harness, _fake = self.build(workspace_label="run-1",
-                                    factory_kwargs={"vanish_times": 2})
+        harness, _fake = self.build(
+            workspace_label="run-1", factory_kwargs={"vanish_times": 2}
+        )
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(self.spec(group="node_a", role="builder"))
         self.assertIs(caught.exception.refusal, lch.LaunchRefusal.TAB_UNRESOLVED)

@@ -22,6 +22,7 @@ is why they are settled together: the pre-merge evaluation is only meaningful
 once the post-gate's group is proven absent, and the cleanup is only legal once
 the merge proved ancestry.
 """
+
 from __future__ import annotations
 
 import sys
@@ -33,15 +34,16 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from adw_modules import retry_policy as rp       # noqa: E402
-from adw_modules import scheduler as sch         # noqa: E402
-from adw_modules import scheduler_types as st    # noqa: E402
-from adw_modules import worktree as wt           # noqa: E402
+from adw_modules import retry_policy as rp  # noqa: E402
+from adw_modules import scheduler as sch  # noqa: E402
+from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import worktree as wt  # noqa: E402
 
 from test_scheduler import SchedulerFixture, green, red, _git  # noqa: E402
 
 
 # ── §8.3, first evaluation: post-commit divergence convicts ─────────────────
+
 
 class PostCommitConvictionTests(SchedulerFixture):
     """`check_post_commit`'s verdict was computed and thrown away.
@@ -62,19 +64,20 @@ class PostCommitConvictionTests(SchedulerFixture):
             (attempt.path / relpath).write_text("planted\n")
             return output_sha
 
-        return mock.patch.object(wt, "commit_measured_delta",
-                                 side_effect=commit_then_litter)
+        return mock.patch.object(
+            wt, "commit_measured_delta", side_effect=commit_then_litter
+        )
 
     def test_a_write_between_the_commit_and_the_refresh_convicts(self):
         self.written = {"a": {"a.py": "A\n"}}
         with self._litter_after_the_commit():
-            self.schedule([self.agent("a")],
-                          config=self.config(concurrency=1)).run()
+            self.schedule([self.agent("a")], config=self.config(concurrency=1)).run()
 
         record = self.store.get_node("run1", "a")
         self.assertIs(record.state, st.NodeState.BLOCKED)
-        self.assertIs(record.block_reason,
-                      st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED)
+        self.assertIs(
+            record.block_reason, st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+        )
 
     def test_the_conviction_names_the_check_and_the_path(self):
         """A block is terminal, so its transition is the ledger's last chance
@@ -82,12 +85,14 @@ class PostCommitConvictionTests(SchedulerFixture):
         than the missing branch."""
         self.written = {"a": {"a.py": "A\n"}}
         with self._litter_after_the_commit():
-            self.schedule([self.agent("a")],
-                          config=self.config(concurrency=1)).run()
+            self.schedule([self.agent("a")], config=self.config(concurrency=1)).run()
 
-        blocked = [t for t in self.store.audit_transitions("run1")
-                   if t.get("node_id") == "a"
-                   and t.get("to_state") == st.NodeState.BLOCKED.value]
+        blocked = [
+            t
+            for t in self.store.audit_transitions("run1")
+            if t.get("node_id") == "a"
+            and t.get("to_state") == st.NodeState.BLOCKED.value
+        ]
         self.assertTrue(blocked)
         self.assertIn("post-commit", str(blocked[-1]))
         self.assertIn("stray-residue.txt", str(blocked[-1]))
@@ -98,11 +103,12 @@ class PostCommitConvictionTests(SchedulerFixture):
         touched is part of the expected inventory and is not dirt."""
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule([self.agent("a")]).run()
-        self.assertEqual(self.states(), {"a": "MERGED"})
+        self.assertEqual(self.states(), {"a": "MERGED", "a::review": "ACCEPTED"})
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
 
 # ── §8.3, second evaluation: pre-merge divergence is reported ───────────────
+
 
 class PreMergeHygieneReportTests(SchedulerFixture):
     """`check_pre_merge` had no production caller, so §8.3's stated
@@ -117,19 +123,23 @@ class PreMergeHygieneReportTests(SchedulerFixture):
                 target.write_text("adapter residue\n")
                 return green()
             return red()
+
         return leaky
 
     def test_residue_left_by_the_post_gate_is_reported_with_its_paths(self):
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule(
-            [self.agent("a")],
-            deps=self.deps(run_gate=self._gate_that_leaves_residue())).run()
+            [self.agent("a")], deps=self.deps(run_gate=self._gate_that_leaves_residue())
+        ).run()
 
         self.assertIn("a", report.adapter_hygiene)
         self.assertTrue(
-            any("post-gate-cache/report.xml" in entry
-                for entry in report.adapter_hygiene["a"]),
-            report.adapter_hygiene)
+            any(
+                "post-gate-cache/report.xml" in entry
+                for entry in report.adapter_hygiene["a"]
+            ),
+            report.adapter_hygiene,
+        )
 
     def test_the_node_still_merges_because_the_commit_was_sealed_first(self):
         """The consequence is the whole point of there being two evaluations.
@@ -139,10 +149,10 @@ class PreMergeHygieneReportTests(SchedulerFixture):
         correctly for the harness's own hygiene."""
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule(
-            [self.agent("a")],
-            deps=self.deps(run_gate=self._gate_that_leaves_residue())).run()
+            [self.agent("a")], deps=self.deps(run_gate=self._gate_that_leaves_residue())
+        ).run()
 
-        self.assertEqual(self.states(), {"a": "MERGED"})
+        self.assertEqual(self.states(), {"a": "MERGED", "a::review": "ACCEPTED"})
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
     def test_a_clean_adapter_reports_nothing(self):
@@ -155,6 +165,7 @@ class PreMergeHygieneReportTests(SchedulerFixture):
 
 
 # ── issue #21: residue outside the attempt's own tree ──────────────────────
+
 
 class UnprovisionedWorktreeReportTests(SchedulerFixture):
     """A worktree a reviewer registered against the repository and abandoned.
@@ -177,24 +188,34 @@ class UnprovisionedWorktreeReportTests(SchedulerFixture):
 
         def reviewing(attempt, node, phase, cancel_requested):
             if phase == "post":
-                _git(attempt.path, "worktree", "add", "--detach",
-                     str(self.root / name), "HEAD")
+                _git(
+                    attempt.path,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(self.root / name),
+                    "HEAD",
+                )
                 return green()
             return red()
+
         return reviewing
 
     def test_a_worktree_a_reviewer_left_behind_is_reported_with_its_path(self):
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule(
             [self.agent("a")],
-            deps=self.deps(run_gate=self._gate_that_opens_a_reviewer_worktree())).run()
+            deps=self.deps(run_gate=self._gate_that_opens_a_reviewer_worktree()),
+        ).run()
 
         entries = report.adapter_hygiene.get("a", ())
         self.assertTrue(
-            any(entry.startswith("unprovisioned-worktree")
-                and str(self.leaked) in entry
-                for entry in entries),
-            report.adapter_hygiene)
+            any(
+                entry.startswith("unprovisioned-worktree") and str(self.leaked) in entry
+                for entry in entries
+            ),
+            report.adapter_hygiene,
+        )
 
     def test_the_node_still_merges_because_it_did_not_open_the_tree(self):
         """The consequence, chosen deliberately. The leak is real residue —
@@ -205,9 +226,10 @@ class UnprovisionedWorktreeReportTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule(
             [self.agent("a")],
-            deps=self.deps(run_gate=self._gate_that_opens_a_reviewer_worktree())).run()
+            deps=self.deps(run_gate=self._gate_that_opens_a_reviewer_worktree()),
+        ).run()
 
-        self.assertEqual(self.states(), {"a": "MERGED"})
+        self.assertEqual(self.states(), {"a": "MERGED", "a::review": "ACCEPTED"})
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
     def test_the_runs_own_worktrees_are_never_reported(self):
@@ -218,16 +240,20 @@ class UnprovisionedWorktreeReportTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         report = self.schedule([self.agent("a")]).run()
 
-        self.assertEqual(self.states(), {"a": "MERGED"})
+        self.assertEqual(self.states(), {"a": "MERGED", "a::review": "ACCEPTED"})
         self.assertEqual(
-            [entry for entries in report.adapter_hygiene.values()
-             for entry in entries
-             if entry.startswith("unprovisioned-worktree")],
-            [])
-
+            [
+                entry
+                for entries in report.adapter_hygiene.values()
+                for entry in entries
+                if entry.startswith("unprovisioned-worktree")
+            ],
+            [],
+        )
 
 
 # ── §8.8 cleanup: the attempt worktree goes, once ancestry is proven ────────
+
 
 class MergedWorktreeCleanupTests(SchedulerFixture):
     """Nothing removed an attempt worktree. `run start`'s teardown releases
@@ -237,17 +263,22 @@ class MergedWorktreeCleanupTests(SchedulerFixture):
 
     def _attempt_worktrees(self):
         listed = _git(self.repo, "worktree", "list", "--porcelain")
-        return {Path(line[len("worktree "):].strip()).resolve()
-                for line in str(listed).splitlines()
-                if line.startswith("worktree ")}
+        return {
+            Path(line[len("worktree ") :].strip()).resolve()
+            for line in str(listed).splitlines()
+            if line.startswith("worktree ")
+        }
 
     def test_a_merged_node_leaves_no_worktree_or_branch_behind(self):
         self.written = {"a": {"a.py": "A\n"}}
         self.schedule([self.agent("a")]).run()
 
-        self.assertEqual(self.states(), {"a": "MERGED"})
-        leftover = [p for p in self._attempt_worktrees()
-                    if (self.root / "wt").resolve() in p.parents]
+        self.assertEqual(self.states(), {"a": "MERGED", "a::review": "ACCEPTED"})
+        leftover = [
+            p
+            for p in self._attempt_worktrees()
+            if (self.root / "wt").resolve() in p.parents
+        ]
         self.assertEqual(leftover, [])
         self.assertNotIn("run1-a-a1", str(_git(self.repo, "branch", "--list")))
 
@@ -255,13 +286,15 @@ class MergedWorktreeCleanupTests(SchedulerFixture):
         """§8.8's retention rule, and the mechanism is that cleanup is only
         reached from the merge path — not a second predicate that could
         disagree with the first."""
-        self.gate_script = {("a", "pre"): [green()]}   # GATE_NOT_FALSIFIABLE
+        self.gate_script = {("a", "pre"): [green()]}  # GATE_NOT_FALSIFIABLE
         self.schedule([self.agent("a")]).run()
 
-        self.assertIs(self.store.get_node("run1", "a").state,
-                      st.NodeState.BLOCKED)
-        retained = [p for p in self._attempt_worktrees()
-                    if (self.root / "wt").resolve() in p.parents]
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.BLOCKED)
+        retained = [
+            p
+            for p in self._attempt_worktrees()
+            if (self.root / "wt").resolve() in p.parents
+        ]
         self.assertTrue(retained)
 
     def test_a_cleanup_refusal_is_reported_and_never_aborts_the_run(self):
@@ -277,16 +310,28 @@ class MergedWorktreeCleanupTests(SchedulerFixture):
         with mock.patch.object(wt, "remove_attempt_worktree", side_effect=refuse):
             report = self.schedule([self.agent("a"), self.agent("b")]).run()
 
-        self.assertEqual(self.states(), {"a": "MERGED", "b": "MERGED"})
+        self.assertEqual(
+            self.states(),
+            {
+                "a": "MERGED",
+                "a::review": "ACCEPTED",
+                "b": "MERGED",
+                "b::review": "ACCEPTED",
+            },
+        )
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
         self.assertTrue(
-            any("was not removed" in entry
+            any(
+                "was not removed" in entry
                 for entries in report.adapter_hygiene.values()
-                for entry in entries),
-            report.adapter_hygiene)
+                for entry in entries
+            ),
+            report.adapter_hygiene,
+        )
 
 
 # ── §7.5: the guidance ledger is evidence about a base ──────────────────────
+
 
 class GuidanceScopeTests(SchedulerFixture):
     """Keyed by `node_id` alone, nothing cleared the ledger when the base
@@ -304,8 +349,7 @@ class GuidanceScopeTests(SchedulerFixture):
         """
         seen = {"n": 0}
 
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
             on_launch(None)
             seen["n"] += 1
@@ -316,8 +360,9 @@ class GuidanceScopeTests(SchedulerFixture):
                     _git(self.integration, "commit", "-q", "-m", "unrelated merge")
             else:
                 (attempt.path / "a.py").write_text("A\n")
-            return sch.NodeExecution(envelope_parsed=True, exit_code=0,
-                                     launched_pid=None)
+            return sch.NodeExecution(
+                envelope_parsed=True, exit_code=0, launched_pid=None
+            )
 
         return run_node
 
@@ -335,36 +380,57 @@ class GuidanceScopeTests(SchedulerFixture):
     def _bases(self):
         return [a.base_sha for a in self.store.attempts_for("run1", "a")]
 
-    def test_guidance_from_a_stale_base_is_not_handed_to_the_retry(self):
+    def test_integration_head_movement_keeps_retained_attempt_guidance(self):
+        """An unrelated merge does not rebase a live persistent builder.
+
+        Its evidence remains scoped to the retained attempt base, so the next
+        same-session repair still receives that evidence.
+        """
         self.schedule(
             [self.agent("a")],
             config=self.config(concurrency=1, semantic_ceiling=3),
-            deps=self.deps(run_node=self._node_a_that_fails_once(True),
-                           run_gate=self._gate())).run()
+            deps=self.deps(
+                run_node=self._node_a_that_fails_once(True),
+                run_gate=self._gate(),
+            ),
+        ).run()
 
         bases = self._bases()
-        self.assertNotEqual(bases[0], bases[1],
-                            "the fixture must actually move the base")
-        self.assertEqual(len(self.prompts["a"]), 2)
-        self.assertNotIn("Verification (§8.3)", self.prompts["a"][1] or "")
+        self.assertEqual(len(bases), 1)
+        self.assertNotEqual(
+            bases[0],
+            _git(self.integration, "rev-parse", "HEAD"),
+            "the fixture must move integration without replacing the attempt",
+        )
+        self.assertEqual(len(self.prompts["a"]), 3)
+        self.assertIn(
+            "Repair the failed pre-acceptance candidate", self.prompts["a"][1] or ""
+        )
+        self.assertIn("Verification (§8.3)", self.prompts["a"][2] or "")
 
-    def test_guidance_at_the_same_base_is_still_carried_forward(self):
-        """The control, and the regression the re-keying could have caused.
-        A retry against the *same* tree is retrying against the same evidence,
-        and §7.5's whole point is that such a retry gets new instructions."""
+    def test_guidance_at_the_retained_base_is_carried_forward(self):
+        """A same-session repair receives evidence from its retained base."""
         self.schedule(
             [self.agent("a")],
             config=self.config(concurrency=1, semantic_ceiling=3),
-            deps=self.deps(run_node=self._node_a_that_fails_once(False),
-                           run_gate=self._gate())).run()
+            deps=self.deps(
+                run_node=self._node_a_that_fails_once(False),
+                run_gate=self._gate(),
+            ),
+        ).run()
 
         bases = self._bases()
-        self.assertEqual(bases[0], bases[1])
-        self.assertEqual(len(self.prompts["a"]), 2)
-        self.assertIn("Verification (§8.3)", self.prompts["a"][1] or "")
+        self.assertEqual(len(bases), 1)
+        self.assertEqual(bases[0], _git(self.integration, "rev-parse", "HEAD"))
+        self.assertEqual(len(self.prompts["a"]), 3)
+        self.assertIn(
+            "Repair the failed pre-acceptance candidate", self.prompts["a"][1] or ""
+        )
+        self.assertIn("Verification (§8.3)", self.prompts["a"][2] or "")
 
 
 # ── §7.5 containment at the worker's top-level handler ──────────────────────
+
 
 class ContainmentTests(SchedulerFixture):
     """§7.5: "any exception that reaches [the top-level handler] without a
@@ -380,8 +446,7 @@ class ContainmentTests(SchedulerFixture):
     """
 
     @staticmethod
-    def _always_fails(attempt, node, record, retry_prompt, on_launch,
-                      cancel_requested):
+    def _always_fails(attempt, node, record, retry_prompt, on_launch, cancel_requested):
         on_launch(None)
         raise RuntimeError("the original failure")
 
@@ -391,17 +456,21 @@ class ContainmentTests(SchedulerFixture):
 
     def test_a_signal_that_cannot_be_built_still_classifies_environmental(self):
         real = rp.FailureSignal
-        with mock.patch.object(sch.rp, "FailureSignal",
-                               side_effect=self._exploding_signal):
-            self.schedule([self.agent("a")],
-                          config=self.config(concurrency=1),
-                          deps=self.deps(run_node=self._always_fails)).run()
+        with mock.patch.object(
+            sch.rp, "FailureSignal", side_effect=self._exploding_signal
+        ):
+            self.schedule(
+                [self.agent("a")],
+                config=self.config(concurrency=1),
+                deps=self.deps(run_node=self._always_fails),
+            ).run()
 
-        self.assertIs(real, rp.FailureSignal)      # patch really was undone
+        self.assertIs(real, rp.FailureSignal)  # patch really was undone
         record = self.store.get_node("run1", "a")
         self.assertIs(record.state, st.NodeState.BLOCKED)
-        self.assertIs(record.block_reason,
-                      st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED)
+        self.assertIs(
+            record.block_reason, st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+        )
 
     def test_a_collapsing_worker_leaves_its_siblings_alone(self):
         """§7.5's second containment invariant, and §13.3's negative test: a
@@ -409,21 +478,23 @@ class ContainmentTests(SchedulerFixture):
         self.written = {"b": {"b.py": "B\n"}}
         inner = self.run_node
 
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             if node.node_id == "a":
-                return self._always_fails(attempt, node, record, retry_prompt,
-                                          on_launch, cancel_requested)
-            return inner(attempt, node, record, retry_prompt, on_launch,
-                         cancel_requested)
+                return self._always_fails(
+                    attempt, node, record, retry_prompt, on_launch, cancel_requested
+                )
+            return inner(
+                attempt, node, record, retry_prompt, on_launch, cancel_requested
+            )
 
-        with mock.patch.object(sch.rp, "FailureSignal",
-                               side_effect=self._exploding_signal):
-            report = self.schedule([self.agent("a"), self.agent("b")],
-                                   deps=self.deps(run_node=run_node)).run()
+        with mock.patch.object(
+            sch.rp, "FailureSignal", side_effect=self._exploding_signal
+        ):
+            report = self.schedule(
+                [self.agent("a"), self.agent("b")], deps=self.deps(run_node=run_node)
+            ).run()
 
-        self.assertEqual(self.store.get_node("run1", "b").state,
-                         st.NodeState.MERGED)
+        self.assertEqual(self.store.get_node("run1", "b").state, st.NodeState.MERGED)
         self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
 
 

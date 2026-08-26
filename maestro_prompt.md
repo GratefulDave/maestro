@@ -21,7 +21,7 @@ Starting from Maestro’s current SSSF fork, design the smallest robust software
    - Claude directly;
    - OMP only with explicit `--profile`;
    - Kimi and Grok only through explicit configured routes;
-5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session retries, and SQLite trace.
+5. retain SSSF's typed envelopes, deterministic gates, SQLite trace, and bounded correction while keeping one builder and one independent reviewer session open per lane;
 
 The result must be an **expansion of SSSF**, not another Strav rewrite. Preserve SSSF’s understandable control plane. Add only the capabilities above and the minimum machinery needed to make them correct, durable, observable, and testable.
 
@@ -397,7 +397,7 @@ Add the smallest explicit DAG extension to SSSF. Specify:
 - bounded retry classes;
 - cancellation propagation;
 - stale result rejection;
-- completed-generation recovery after `QUIESCENCE_UNPROVEN`: only after agent absence is proved, continue the original attempt from a successful identity-bound late envelope without relaunching its builder; otherwise force a fresh retry or refuse unchanged according to the evidence;
+- completed-generation recovery after `QUIESCENCE_UNPROVEN` or an inherited `RUNNING` generation from a dead scheduler: only after agent absence is proved, continue the original attempt from a successful identity-bound late envelope without relaunching its builder; otherwise force a fresh retry or refuse unchanged according to the evidence;
 - dependency output acceptance before launch;
 - one understandable node primitive for code and agents;
 - SQLite representation of decisions/transitions.
@@ -477,11 +477,16 @@ Preserve SSSF boundaries but make them DAG/Herdr safe:
 - deterministic post-output gates;
 - gates prove behavior/outputs, not existence only;
 - known commands are code nodes;
-- bounded same-session correction through the same Herdr agent session;
-- a successful late envelope may continue only its original attempt through the ordinary gates, review, merge, and downstream DAG; it never waives acceptance or mints a replacement attempt;
-- budgets per attempt/failure class;
+- bounded same-session correction through the same Herdr builder session and retained attempt worktree;
+- one scheduler-derived review node per reviewable build; authored test nodes are never retyped as reviews;
+- one persistent reviewer session per lane; each immutable candidate SHA is reviewed exactly once;
+- rejection atomically records typed findings and a generation-fenced handoff to the existing builder; a distinct descendant candidate alone reactivates review;
+- builder, reviewer, and worktree remain open through the correction loop and close only after proven terminal acceptance, cancellation, or block cleanup;
+- independent durable retry spends for builder semantics, review rejection, environment, and launcher faults;
+- merge is impossible until the derived review node has an exact PASS receipt for the source node's current candidate SHA;
+- a successful late envelope may continue only its original attempt through the ordinary gates, candidate publication, review, merge, and downstream DAG; it never waives acceptance or mints a replacement attempt;
 - raw output and pane text are evidence only;
-- SQLite records plan digest, run, nodes, edges, attempts, launcher routes/sessions, Herdr panes/agents, processes, envelopes, gate items, worktrees, commits, merges, costs, and events;
+- SQLite records plan digest/name, run, authored and derived nodes, immutable candidates/reviews/handoffs, lane phase, retry spends, actor generations, launcher routes/sessions, Herdr panes/agents, processes, envelopes, gate items, worktrees, commits, merges, costs, and events;
 - one query path serves live and history;
 - no dashboard-only schema or fixture-only truth.
 
@@ -530,16 +535,21 @@ The architecture and implementation plan must prove this using fake Herdr/launch
 9. replay performs no second review/publication;
 10. scheduler starts the two independent nodes concurrently in separate worktrees and visible fake Herdr panes;
 11. pane cwd matches each worktree;
-12. at least two launcher kinds execute; full matrix covers Claude, OMP, Kimi, Grok;
-13. dependent cannot start early;
-14. each success binds typed envelope, attempt, worktree, and Git commit;
-15. gates reject missing/wrong output, zero/skipped tests, unrelated tests, and unauthorized writes;
-16. commits merge in deterministic order with ancestry proof;
-17. conflict enters one explicit blocked/resolution state;
-18. post-merge acceptance proves nonzero real checks;
-19. after restart, a proven-absent completed generation with a successful identity-bound late envelope continues the same attempt through verification and merge without another builder launch;
-20. SQLite reconstructs identical run/node/attempt/pane/merge state after quiescent restart;
-21. run accepts only after DAG completion, merge, and integration gates.
+12. one Herdr workspace is labelled with the persisted plan name; each lane owns one tab; tester, builder, and reviewer panes in that tab are labelled by role and session generation;
+13. at least two launcher kinds execute; full matrix covers Claude, OMP, Kimi, Grok;
+14. dependent cannot start early;
+15. each success binds typed envelope, attempt, worktree, and Git commit;
+16. gates reject missing/wrong output, zero/skipped tests, unrelated tests, and unauthorized writes;
+17. one build's first immutable candidate is deterministically rejected exactly once, with one atomic findings handoff to the still-open builder;
+18. the builder acknowledges the rejected SHA, repairs in the same session/worktree/attempt, and publishes a distinct descendant candidate;
+19. the same reviewer pane reviews only that new SHA, accepts it, and only the accepted SHA merges;
+20. duplicate delivery and quiescent restart dispatch neither candidate twice;
+21. commits merge in deterministic order with ancestry proof;
+22. conflict enters one explicit blocked/resolution state;
+23. post-merge acceptance proves nonzero real checks;
+24. after restart, typed presence re-adopts the persisted actor ids, typed absence permits a fenced generation replacement, and unknown liveness refuses without mutation;
+25. SQLite reconstructs identical run/node/candidate/review/handoff/actor/merge state after quiescent restart;
+26. run accepts only after DAG completion, exact accepted-candidate merge, integration gates, and proven terminal closure of both lane panes.
 
 # Required negatives and anti-inert cases
 

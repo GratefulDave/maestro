@@ -16,6 +16,7 @@ import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { Ban, ChevronRight, GitBranch, TriangleAlert, UserRound } from 'lucide-vue-next'
 import type { MaestroAttempt, MaestroNode, MaestroRunDetail } from '../lib/types'
 import { ApiHttpError, fetchRun } from '../lib/api'
+import { candidateLifecycleForNode, nodeAuthorityState } from '../lib/maestroLifecycle'
 import { fmtDate, fmtDuration, ts } from '../lib/format'
 import MaestroStateChip from './MaestroStateChip.vue'
 
@@ -134,6 +135,16 @@ const columns = computed(() => {
     .map(([depth, nodes]) => ({ depth, nodes }))
 })
 
+const candidateLifecycleByNode = computed(
+  () =>
+    new Map(
+      (run.value?.nodes ?? []).map((node) => [
+        node.node_id,
+        run.value ? candidateLifecycleForNode(run.value, node) : [],
+      ]),
+    ),
+)
+
 /** Every attempt still in flight, anywhere in the graph. */
 const inFlight = computed(() =>
   (run.value?.nodes ?? []).flatMap((node) => node.attempts.filter((a) => a.running)),
@@ -181,7 +192,10 @@ const rejectingMerges = computed(() =>
 function expanded(node: MaestroNode): boolean {
   if (open.value.has(node.node_id)) return true
   if (open.value.size > 0) return false
-  return node.state === 'RUNNING' || node.state === 'BLOCKED' || mergedRejecting(node).length > 0
+  return (
+    ['BLOCKED', 'RUNNING', 'CANDIDATE_READY', 'REVIEWING', 'REPAIR_HANDOFF', 'REPAIRING', 'WAITING_FOR_NEW_CANDIDATE'].includes(nodeAuthorityState(node)) ||
+    mergedRejecting(node).length > 0
+  )
 }
 </script>
 
@@ -296,14 +310,17 @@ function expanded(node: MaestroNode): boolean {
             v-for="node in column.nodes"
             :key="node.node_id"
             class="node"
-            :class="[node.state.toLowerCase(), { open: expanded(node) }]"
+            :class="[nodeAuthorityState(node).toLowerCase(), { open: expanded(node) }]"
           >
             <button class="node-head" type="button" @click="toggle(node.node_id)">
               <ChevronRight class="caret" :class="{ down: expanded(node) }" :size="17" />
               <span class="node-id">{{ node.node_id }}</span>
               <span class="node-meta">
                 <span class="kind">{{ node.kind ?? '?' }}</span>
-                <MaestroStateChip :state="node.state" small />
+                <MaestroStateChip :state="nodeAuthorityState(node)" small />
+              </span>
+              <span v-if="node.lane_phase" class="node-ledger-state">
+                node {{ node.state.toLowerCase() }}
               </span>
             </button>
 
@@ -363,6 +380,40 @@ function expanded(node: MaestroNode): boolean {
             <div v-if="node.merge_cause === 'UNRECORDED'" class="accepted-why">
               <TriangleAlert :size="15" /> merged before this ledger recorded
               how — run-merged or operator-accepted cannot be told apart here
+            </div>
+
+            <div
+              v-if="candidateLifecycleByNode.get(node.node_id)?.length"
+              class="review-ledger"
+            >
+              <span class="review-ledger-title">candidate review authority</span>
+              <div
+                v-for="item in candidateLifecycleByNode.get(node.node_id)"
+                :key="item.candidate.candidate_sha"
+                class="candidate-row"
+              >
+                <div class="candidate-head">
+                  <span>c{{ item.candidate.candidate_seq }}</span>
+                  <code :title="item.candidate.candidate_sha">
+                    {{ item.candidate.candidate_sha.slice(0, 12) }}
+                  </code>
+                  <MaestroStateChip :state="item.review?.state ?? 'NOT_DISPATCHED'" small />
+                  <strong v-if="item.review?.verdict">{{ item.review.verdict }}</strong>
+                </div>
+                <details v-if="item.review?.findings.length" class="candidate-findings">
+                  <summary>{{ item.review.findings.length }} blocking findings</summary>
+                  <ul class="a-findings">
+                    <li v-for="(finding, i) in item.review.findings" :key="i">
+                      <code>{{ finding.check_id }}</code>
+                      {{ finding.object_id }}
+                      <div>{{ finding.message }}</div>
+                    </li>
+                  </ul>
+                </details>
+                <div v-if="item.handoff" class="handoff-state">
+                  repair handoff · {{ item.handoff.state }} · builder g{{ item.handoff.builder_generation }}
+                </div>
+              </div>
             </div>
 
             <div v-if="expanded(node)" class="attempts">
@@ -632,6 +683,17 @@ function expanded(node: MaestroNode): boolean {
   border-left-color: var(--red);
 }
 
+.node.reviewing,
+.node.candidate_ready,
+.node.waiting_for_new_candidate {
+  border-left-color: var(--blue);
+}
+
+.node.repair_handoff,
+.node.repairing {
+  border-left-color: var(--amber);
+}
+
 .node-head {
   display: flex;
   align-items: center;
@@ -665,6 +727,12 @@ function expanded(node: MaestroNode): boolean {
   color: var(--purple);
 }
 
+
+.node-ledger-state {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 12px;
+}
 .caret {
   flex: none;
   color: var(--faint);
@@ -768,6 +836,56 @@ function expanded(node: MaestroNode): boolean {
 
 .a-findings code {
   font-family: var(--mono);
+  font-size: 13px;
+}
+
+.review-ledger {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.review-ledger-title {
+  color: var(--faint);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.candidate-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  background: var(--panel-3);
+  border-radius: 8px;
+}
+
+.candidate-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.candidate-head strong {
+  color: var(--text);
+}
+
+.handoff-state {
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.candidate-findings summary {
+  color: var(--amber);
+  cursor: pointer;
   font-size: 13px;
 }
 

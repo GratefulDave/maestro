@@ -6,6 +6,7 @@ an observation about an argv, not a launch gate.
 
 Run:  uv run adw_test.py -k delegation_capability
 """
+
 from __future__ import annotations
 
 import json
@@ -19,8 +20,9 @@ from adw_modules import permissions
 from adw_modules import route_admission
 
 
-def _spec(route: str, session_dir: Path, prompt: Path,
-          restrict_tools: bool = False) -> lch.LaunchSpec:
+def _spec(
+    route: str, session_dir: Path, prompt: Path, restrict_tools: bool = False
+) -> lch.LaunchSpec:
     return lch.LaunchSpec(
         correlation_token="cap-test",
         worktree=session_dir,
@@ -43,13 +45,16 @@ class RouteCapabilityPolicyTests(unittest.TestCase):
         # A route absent from this table is a route whose actors are
         # unconstrained, which is the state the whole run above was in.
         self.assertEqual(
-            set(permissions.DELEGATION_TOOLS), {"omp", "claude"},
-            "a route Maestro launches must declare what delegation means on it")
+            set(permissions.DELEGATION_TOOLS),
+            {"omp", "claude"},
+            "a route Maestro launches must declare what delegation means on it",
+        )
         self.assertIn("task", permissions.DELEGATION_TOOLS["omp"])
         self.assertIn("hub", permissions.DELEGATION_TOOLS["omp"])
 
     def test_the_allowlist_subtracts_delegation_rather_than_agreeing_with_it(
-            self) -> None:
+        self,
+    ) -> None:
         """B15's shape: the invariant is a computation, not two lists in sync.
 
         Adding a delegation tool to `ROUTE_TOOLS` must not re-grant it. If the
@@ -73,8 +78,7 @@ class RouteCapabilityPolicyTests(unittest.TestCase):
         would contain the actor by breaking it.
         """
         allowed = set(permissions.route_tool_allowlist("omp"))
-        for tool in ("read", "write", "bash", "grep", "glob", "todo", "edit",
-                     "eval"):
+        for tool in ("read", "write", "bash", "grep", "glob", "todo", "edit", "eval"):
             self.assertIn(tool, allowed)
 
     def test_an_unknown_route_yields_no_flags(self) -> None:
@@ -100,36 +104,37 @@ class BuiltArgvTests(unittest.TestCase):
         the detector reports that as not-denied.
         """
         argv = lch.build_omp_argv(
-            Path("/usr/local/bin/omp"),
-            _spec("omp", self.session, self.prompt))
+            Path("/usr/local/bin/omp"), _spec("omp", self.session, self.prompt)
+        )
         self.assertIn("--profile", argv)
-        self.assertEqual(argv[argv.index("--profile") + 1],
-                         "openai-performance")
+        self.assertEqual(argv[argv.index("--profile") + 1], "openai-performance")
         self.assertNotIn("--tools", argv)
         self.assertFalse(permissions.argv_denies_delegation("omp", argv))
 
     def test_the_claude_argv_denies_delegation(self) -> None:
         argv = lch.build_claude_argv(
-            Path("/usr/local/bin/claude"),
-            _spec("claude", self.session, self.prompt))
+            Path("/usr/local/bin/claude"), _spec("claude", self.session, self.prompt)
+        )
         self.assertNotIn("--disallowedTools", argv)
         self.assertNotIn("--disallowed-tools", argv)
         self.assertFalse(permissions.argv_denies_delegation("claude", argv))
 
-    def test_the_omp_argv_keeps_capability_flags_before_session_state(self) -> None:
-        """Interactive OMP receives its prompt through ``agent prompt``."""
+    def test_the_omp_argv_keeps_the_prompt_out_of_startup(self) -> None:
+        """OMP reaches its interactive composer before prompt submission."""
         argv = lch.build_omp_argv(
             Path("/usr/local/bin/omp"),
-            _spec("omp", self.session, self.prompt, restrict_tools=True))
-        self.assertNotIn("@{}".format(self.prompt), argv)
+            _spec("omp", self.session, self.prompt, restrict_tools=True),
+        )
+        self.assertFalse(any(arg.startswith("@") for arg in argv))
         self.assertEqual(
-            argv[argv.index("--tools") + 1],
-            "read,write,edit,bash,grep,glob,todo,eval")
+            argv[argv.index("--tools") + 1], "read,write,edit,bash,grep,glob,todo,eval"
+        )
 
     def test_the_restriction_hatch_actually_restricts(self) -> None:
         argv = lch.build_omp_argv(
             Path("/usr/local/bin/omp"),
-            _spec("omp", self.session, self.prompt, restrict_tools=True))
+            _spec("omp", self.session, self.prompt, restrict_tools=True),
+        )
         self.assertIn("--tools", argv)
         granted = argv[argv.index("--tools") + 1].split(",")
         self.assertNotIn("task", granted)
@@ -138,13 +143,17 @@ class BuiltArgvTests(unittest.TestCase):
     def test_the_admission_capture_argv_denies_delegation(self) -> None:
         """Admission uses the same builders. Default: no `--tools` hatch."""
         spec = route_admission.RouteCaptureSpec(
-            route="omp", cwd=self.root, herdr=Path("/usr/local/bin/herdr"),
+            route="omp",
+            cwd=self.root,
+            herdr=Path("/usr/local/bin/herdr"),
             binary=Path("/usr/local/bin/omp"),
-            model="openai-codex/gpt-5.6-luna", effort="high",
-            profile="openai-performance", session_dir=self.session,
-            timeout_s=60.0)
-        argv = route_admission._route_argv(
-            spec, continuing=False, session_id=None)
+            model="openai-codex/gpt-5.6-luna",
+            effort="high",
+            profile="openai-performance",
+            session_dir=self.session,
+            timeout_s=60.0,
+        )
+        argv = route_admission._route_argv(spec, continuing=False, session_id=None)
         self.assertNotIn("--tools", argv)
         self.assertFalse(permissions.argv_denies_delegation("omp", argv))
 
@@ -155,15 +164,22 @@ class DetectorTests(unittest.TestCase):
     def test_an_argv_with_no_containment_at_all_is_convicted(self) -> None:
         # This is verbatim what `build_omp_argv` produces.
         unconstrained = (
-            "/usr/local/bin/omp", "--profile", "openai-performance",
-            "--session-dir", "/tmp/s", "@/tmp/prompt.md")
-        self.assertFalse(
-            permissions.argv_denies_delegation("omp", unconstrained))
+            "/usr/local/bin/omp",
+            "--profile",
+            "openai-performance",
+            "--session-dir",
+            "/tmp/s",
+            "@/tmp/prompt.md",
+        )
+        self.assertFalse(permissions.argv_denies_delegation("omp", unconstrained))
 
-    def test_an_allowlist_that_admits_a_delegation_tool_is_convicted(
-            self) -> None:
-        planted = ("/usr/local/bin/omp", "--tools", "read,write,task",
-                   "@/tmp/prompt.md")
+    def test_an_allowlist_that_admits_a_delegation_tool_is_convicted(self) -> None:
+        planted = (
+            "/usr/local/bin/omp",
+            "--tools",
+            "read,write,task",
+            "@/tmp/prompt.md",
+        )
         self.assertFalse(permissions.argv_denies_delegation("omp", planted))
 
     def test_a_deny_list_missing_one_spelling_is_convicted(self) -> None:
@@ -180,9 +196,11 @@ class DetectorTests(unittest.TestCase):
 
     def test_an_argv_that_grants_eval_does_not_deny_delegation(self) -> None:
         planted = (
-            "/usr/local/bin/omp", "--tools",
+            "/usr/local/bin/omp",
+            "--tools",
             "read,write,edit,bash,grep,glob,todo,eval",
-            "@/tmp/prompt.md")
+            "@/tmp/prompt.md",
+        )
         self.assertFalse(permissions.argv_denies_delegation("omp", planted))
 
 
@@ -190,8 +208,9 @@ class RestrictActorToolsConfigTests(unittest.TestCase):
     """The hatch is reachable from maestro.config.yaml, default off."""
 
     def test_the_shipped_config_leaves_the_hatch_off(self) -> None:
-        raw = (Path(__file__).resolve().parent.parent
-               / "maestro.config.yaml").read_text(encoding="utf-8")
+        raw = (
+            Path(__file__).resolve().parent.parent / "maestro.config.yaml"
+        ).read_text(encoding="utf-8")
         self.assertIn("restrict_actor_tools: false", raw)
 
     def test_the_config_switch_reaches_the_layout(self) -> None:
@@ -219,15 +238,22 @@ class RestrictActorToolsConfigTests(unittest.TestCase):
                 "executables": binaries,
                 "route_receipts": {"omp": "route-receipts/omp.json"},
                 "reviewer": {
-                    "route": "omp", "model": "review-model", "effort": "high",
-                    "finalization_timeout_s": 60, "turn_timeout_s": 20,
+                    "route": "omp",
+                    "model": "review-model",
+                    "effort": "high",
+                    "finalization_timeout_s": 60,
+                    "turn_timeout_s": 20,
                     "poll_interval_s": 1,
                 },
                 "execution": {
-                    "route": "omp", "model": "execution-model",
-                    "effort": "medium", "concurrency": 2,
-                    "node_timeout_s": 120, "turn_timeout_s": 30,
-                    "final_acceptance_timeout_s": 45, "backstop_t_s": 600,
+                    "route": "omp",
+                    "model": "execution-model",
+                    "effort": "medium",
+                    "concurrency": 2,
+                    "node_timeout_s": 120,
+                    "turn_timeout_s": 30,
+                    "final_acceptance_timeout_s": 45,
+                    "backstop_t_s": 600,
                     "semantic_ceiling": 3,
                     "restrict_actor_tools": True,
                 },

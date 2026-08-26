@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { NAV_ICONS } from "@/lib/icons";
+import { RunHierarchyNav } from "@/components/RunHierarchyNav";
 
 const SECTIONS = [
   {
@@ -47,6 +48,7 @@ export function Sidebar() {
           <small>operator console</small>
         </span>
       </Link>
+      <RunHierarchyNav pathname={pathname} />
       <nav aria-label="Primary navigation">
         {SECTIONS.map((section) => (
           <div className="nav-section" key={section.label}>

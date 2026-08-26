@@ -44,7 +44,7 @@ from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
-from test_scheduler import SchedulerFixture, green  # noqa: E402
+from test_scheduler import SchedulerFixture  # noqa: E402
 
 
 class _Cell:
@@ -59,8 +59,9 @@ class _Cell:
 class _Review:
     """A reviewer verdict, duck-typed as the scheduler consumes it."""
 
-    def __init__(self, passed: bool, findings=(), advisories=(),
-                 subject_digest: str = "digest-1"):
+    def __init__(
+        self, passed: bool, findings=(), advisories=(), subject_digest: str = "digest-1"
+    ):
         self.passed = passed
         self.findings = list(findings)
         self.advisories = list(advisories)
@@ -88,33 +89,54 @@ class LedgerSemanticsTests(unittest.TestCase):
 
     def test_review_does_not_erase_verification_and_vice_versa(self):
         ledger = rp.GuidanceLedger()
-        ledger = ledger.with_verification(rp.VerificationGuidance(
-            reason="clause 4", offending_paths=("rogue.py",), failed_clause=4))
-        ledger = ledger.with_review(rp.ReviewGuidance(
-            subject_digest="d1",
-            findings=(rp.ReviewFinding("diff.introduces_no_obvious_defect",
-                                       "app.py", "naive datetime", True),)))
+        ledger = ledger.with_verification(
+            rp.VerificationGuidance(
+                reason="clause 4", offending_paths=("rogue.py",), failed_clause=4
+            )
+        )
+        ledger = ledger.with_review(
+            rp.ReviewGuidance(
+                subject_digest="d1",
+                findings=(
+                    rp.ReviewFinding(
+                        "diff.introduces_no_obvious_defect",
+                        "app.py",
+                        "naive datetime",
+                        True,
+                    ),
+                ),
+            )
+        )
         self.assertEqual(len(ledger.verification), 1)
         self.assertEqual(len(ledger.review), 1)
         # And the other direction: a later verification failure keeps review.
-        ledger = ledger.with_verification(rp.VerificationGuidance(
-            reason="clause 4 again", offending_paths=("rogue2.py",),
-            failed_clause=4))
+        ledger = ledger.with_verification(
+            rp.VerificationGuidance(
+                reason="clause 4 again", offending_paths=("rogue2.py",), failed_clause=4
+            )
+        )
         self.assertEqual(
             [item.offending_paths for item in ledger.verification],
-            [("rogue.py",), ("rogue2.py",)])
+            [("rogue.py",), ("rogue2.py",)],
+        )
         self.assertEqual(len(ledger.review), 1)
 
     def test_same_surface_history_is_appended_not_replaced(self):
         """The bug this replaced: the slot held one entry, so a second
         finding from the same surface erased the first and the next prompt
         named only the newer one. Both must survive."""
-        ledger = rp.GuidanceLedger().with_review(rp.ReviewGuidance(
-            subject_digest="d1",
-            findings=(rp.ReviewFinding("c1", "o1", "old finding", True),)))
-        ledger = ledger.with_review(rp.ReviewGuidance(
-            subject_digest="d2",
-            findings=(rp.ReviewFinding("c2", "o2", "new finding", True),)))
+        ledger = rp.GuidanceLedger().with_review(
+            rp.ReviewGuidance(
+                subject_digest="d1",
+                findings=(rp.ReviewFinding("c1", "o1", "old finding", True),),
+            )
+        )
+        ledger = ledger.with_review(
+            rp.ReviewGuidance(
+                subject_digest="d2",
+                findings=(rp.ReviewFinding("c2", "o2", "new finding", True),),
+            )
+        )
         messages = [f.message for g in ledger.review for f in g.findings]
         self.assertEqual(messages, ["old finding", "new finding"])
 
@@ -125,16 +147,29 @@ class LedgerSemanticsTests(unittest.TestCase):
 
 class RenderingTests(unittest.TestCase):
     def _full_ledger(self) -> rp.GuidanceLedger:
-        return rp.GuidanceLedger().with_verification(
-            rp.VerificationGuidance(
-                reason="the measured delta failed the permission check",
-                offending_paths=("rogue.py",), failed_clause=4),
-        ).with_review(rp.ReviewGuidance(
-            subject_digest="d1",
-            findings=(rp.ReviewFinding(
-                "diff.introduces_no_obvious_defect", "app.py",
-                "WrittenOpinionsStage reads the wall clock", True),),
-        ))
+        return (
+            rp.GuidanceLedger()
+            .with_verification(
+                rp.VerificationGuidance(
+                    reason="the measured delta failed the permission check",
+                    offending_paths=("rogue.py",),
+                    failed_clause=4,
+                ),
+            )
+            .with_review(
+                rp.ReviewGuidance(
+                    subject_digest="d1",
+                    findings=(
+                        rp.ReviewFinding(
+                            "diff.introduces_no_obvious_defect",
+                            "app.py",
+                            "WrittenOpinionsStage reads the wall clock",
+                            True,
+                        ),
+                    ),
+                )
+            )
+        )
 
     def test_both_surfaces_render_into_one_prompt(self):
         rendered = rp.render_guidance(_Node(), self._full_ledger())
@@ -148,9 +183,11 @@ class RenderingTests(unittest.TestCase):
         the oscillation bug reintroduced by the safety mechanism."""
         many = tuple(
             rp.ReviewFinding(f"check-{i}", f"obj-{i}", "m" * 400, True)
-            for i in range(50))
+            for i in range(50)
+        )
         ledger = self._full_ledger().with_review(
-            rp.ReviewGuidance(subject_digest="d2", findings=many))
+            rp.ReviewGuidance(subject_digest="d2", findings=many)
+        )
         rendered = rp.render_guidance(_Node(), ledger, char_budget=800)
         self.assertLess(len(rendered), 2_000)
         self.assertIn("Verification", rendered)
@@ -164,78 +201,97 @@ class RenderingTests(unittest.TestCase):
 
 
 class ConvergenceTests(SchedulerFixture):
-    """The incident, reproduced and closed, through the real scheduler.
-
-    clause 4 → review-plus-falsification → clause 4 again, then an attempt
-    that satisfies everything at once. The middle failure used to be the
-    review rejection by itself; since §19 M35 a rejection recycles nothing, so
-    the middle attempt is recycled by §7.4's falsification refusal with the
-    reviewer's finding recorded first and riding the same prompt. Every retry prompt after the second failure must carry
-    the standing constraints of BOTH surfaces, and the verification
-    constraint must carry its full same-surface history: an offending path
-    absent from the latest evaluation may be absent because the attempt
-    stopped writing that file rather than because the constraint was
-    satisfied, and the two are indistinguishable from the surface's output.
-    """
+    """Standing constraints converge inside one retained builder lifecycle."""
 
     def test_constraints_accumulate_across_surfaces_until_the_node_converges(self):
-        finding = _Cell("diff.introduces_no_obvious_defect", "a.py",
-                        "WrittenOpinionsStage reads the wall clock")
-        reviews = [_Review(False, findings=[finding]), _Review(True)]
+        finding = _Cell(
+            "diff.introduces_no_obvious_defect",
+            "a.py",
+            "WrittenOpinionsStage reads the wall clock",
+        )
+        review_calls = {"n": 0}
+        repair_calls = {"n": 0}
+        worktrees = []
 
-        def review_attempt(attempt, node, record, base_sha, output_sha):
-            return reviews.pop(0)
+        def review_attempt(
+            attempt, node, record, base_sha, output_sha, _resume_existing
+        ):
+            review_calls["n"] += 1
+            return _Review(
+                review_calls["n"] == 2,
+                findings=() if review_calls["n"] == 2 else (finding,),
+                subject_digest=output_sha,
+            )
 
-        # §19 M35: the reviewer's rejection is advisory and recycles nothing on
-        # its own, so what sends attempt 2 back is §7.4's post-work
-        # falsification refusal — a green falsify gate, meaning the node's own
-        # gate did not need the code it shipped. The review constraint is
-        # recorded first and rides the same retry prompt, which is the
-        # accumulation this test is about.
-        self.gate_script[("a", "falsify")] = [green()]
-
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
+            worktrees.append(attempt.path)
             on_launch(None)
-            files = {"a.py": "A\n"}
-            if record.attempt_no == 1:
-                files["rogue1.py"] = "X\n"     # clause 4, first shape
-            elif record.attempt_no == 3:
-                files["rogue3.py"] = "X\n"     # clause 4 again, new shape
-            for rel, content in files.items():
-                (attempt.path / rel).write_text(content)
+            (attempt.path / "a.py").write_text("A0\n")
+            (attempt.path / "rogue1.py").write_text("X\n")
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        def continue_node(
+            attempt,
+            node,
+            record,
+            repair_prompt,
+            rejected_candidate_sha,
+            builder_generation,
+            cancel_requested,
+        ):
+            self.prompts.setdefault(node.node_id, []).append(repair_prompt)
+            worktrees.append(attempt.path)
+            repair_calls["n"] += 1
+            if repair_calls["n"] == 1:
+                (attempt.path / "rogue1.py").unlink()
+                (attempt.path / "a.py").write_text("A1\n")
+            elif repair_calls["n"] == 2:
+                (attempt.path / "a.py").write_text("A2\n")
+                (attempt.path / "rogue3.py").write_text("X\n")
+            else:
+                (attempt.path / "rogue3.py").unlink()
+                (attempt.path / "a.py").write_text("A3\n")
+            return sch.RepairExecution(
+                execution=sch.NodeExecution(envelope_parsed=True, exit_code=0),
+                acknowledged_rejected_sha=rejected_candidate_sha,
+                builder_generation=builder_generation,
+            )
 
         report = self.schedule(
             [self.agent("a")],
-            # Four, not three. §19 M35 merged the review budget into this one,
-            # so the three content failures this scenario spends — clause 4,
-            # falsification, clause 4 again — all count here, where the middle
-            # one used to be charged to `review_ceiling` instead.
             config=self.config(semantic_ceiling=4),
-            deps=self.deps(run_node=run_node,
-                           review_attempt=review_attempt)).run()
+            deps=self.deps(
+                run_node=run_node,
+                continue_node=continue_node,
+                review_attempt=review_attempt,
+            ),
+        ).run()
 
         node = self.store.get_node("run1", "a")
         self.assertIs(node.state, st.NodeState.MERGED)
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        self.assertEqual(len(set(worktrees)), 1)
+        self.assertEqual(len(self.store.attempts_for("run1", node_id="a")), 1)
+
+        candidates = self.store.lane_candidates("run1", "a")
+        reviews = self.store.candidate_reviews("run1", "a::review")
+        handoff = self.store.repair_handoff("run1", "a", candidates[0].candidate_sha)
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            [item.verdict for item in reviews],
+            [st.ReviewVerdict.REJECTED, st.ReviewVerdict.PASS],
+        )
+        self.assertIsNotNone(handoff)
+        self.assertIs(handoff.state, st.RepairHandoffState.ACKNOWLEDGED)
+        self.assertEqual(node.output_sha, candidates[-1].candidate_sha)
 
         prompts = self.prompts["a"]
         self.assertEqual(len(prompts), 4)
         self.assertIsNone(prompts[0])
-
-        # After a1's clause-4 conviction: verification guidance only.
         self.assertIn("rogue1.py", prompts[1])
-
-        # After a2's review rejection: BOTH constraints — this is the incident
-        # fix. The old code overwrote the slot and rogue1.py vanished here.
         self.assertIn("rogue1.py", prompts[2])
         self.assertIn("WrittenOpinionsStage reads the wall clock", prompts[2])
-
-        # After a3's second clause-4 conviction: the review constraint is
-        # still standing, and the verification surface carries both of its
-        # own entries rather than only the newer one.
         self.assertIn("rogue3.py", prompts[3])
         self.assertIn("WrittenOpinionsStage reads the wall clock", prompts[3])
         self.assertIn("rogue1.py", prompts[3])
@@ -243,119 +299,152 @@ class ConvergenceTests(SchedulerFixture):
     def test_a_pure_verification_history_still_mutates_the_prompt(self):
         """The pre-ledger behaviour §7.5 requires is unchanged: a clause-4
         failure alone still names the offending paths in the next prompt."""
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
             on_launch(None)
-            files = ({"a.py": "A\n", "rogue.py": "X\n"}
-                     if record.attempt_no == 1 else {"a.py": "A\n"})
+            if retry_prompt is None:
+                files = {"a.py": "A\n", "rogue.py": "X\n"}
+            else:
+                (attempt.path / "rogue.py").unlink()
+                files = {"a.py": "A\n"}
             for rel, content in files.items():
                 (attempt.path / rel).write_text(content)
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
 
-        self.schedule([self.agent("a")],
-                      deps=self.deps(run_node=run_node)).run()
+        def continue_node(
+            attempt,
+            node,
+            record,
+            repair_prompt,
+            rejected_candidate_sha,
+            builder_generation,
+            cancel_requested,
+        ):
+            execution = run_node(
+                attempt,
+                node,
+                record,
+                repair_prompt,
+                lambda _pid: None,
+                cancel_requested,
+            )
+            return sch.RepairExecution(
+                execution=execution,
+                acknowledged_rejected_sha=rejected_candidate_sha,
+                builder_generation=builder_generation,
+            )
+
+        self.schedule(
+            [self.agent("a")],
+            deps=self.deps(run_node=run_node, continue_node=continue_node),
+        ).run()
         self.assertIn("rogue.py", self.prompts["a"][1])
-        self.assertIs(self.store.get_node("run1", "a").state,
-                      st.NodeState.MERGED)
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.MERGED)
 
     def test_resume_reloads_guidance_into_the_next_prompt(self):
-        """The durability half, driven through the store.
+        """Resume rebuilds same-attempt failures from the lane retry ledger."""
 
-        A second scheduler object is constructed over the same store — the
-        shape a resume actually takes — and the assertion is that its ledger
-        came back from `attempts_for`, not from anything the first object
-        held. The in-process ledger was the only copy, so before this the
-        resumed builder was dispatched with no guidance at all.
-        """
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
             on_launch(None)
-            files = ({"a.py": "A\n", "rogue.py": "X\n"}
-                     if record.attempt_no < 3 else {"a.py": "A\n"})
-            for rel, content in files.items():
-                (attempt.path / rel).write_text(content)
+            (attempt.path / "a.py").write_text("A\n")
+            if retry_prompt is None:
+                (attempt.path / "rogue.py").write_text("X\n")
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        def keep_failing(
+            attempt,
+            node,
+            record,
+            repair_prompt,
+            rejected_candidate_sha,
+            builder_generation,
+            cancel_requested,
+        ):
+            self.prompts.setdefault(node.node_id, []).append(repair_prompt)
+            (attempt.path / "rogue.py").write_text("X\n")
+            return sch.RepairExecution(
+                execution=sch.NodeExecution(envelope_parsed=True, exit_code=0),
+                acknowledged_rejected_sha=rejected_candidate_sha,
+                builder_generation=builder_generation,
+            )
 
         first = self.schedule(
             [self.agent("a")],
             config=self.config(semantic_ceiling=2),
-            deps=self.deps(run_node=run_node)).run()
+            deps=self.deps(run_node=run_node, continue_node=keep_failing),
+        ).run()
         self.assertIs(first.outcome, st.RunOutcome.BLOCKED)
-        rebuilt = rp.guidance_from_attempts(self.store.attempts_for("run1"))
-        self.assertTrue(any(not ledger.empty for ledger in rebuilt.values()))
+        spends = self.store.lane_retry_spends("run1", "a")
+        rebuilt = rp.guidance_from_lane_history(spends, ())
+        self.assertFalse(rebuilt.empty)
+
         self.store.retry("run1", "a", force=True)
         resumed = self.schedule(
             [self.agent("a")],
             config=self.config(semantic_ceiling=2),
-            deps=self.deps(run_node=run_node))
+            deps=self.deps(run_node=run_node, continue_node=keep_failing),
+        )
         resumed.project()
-        self.assertEqual(set(resumed._guidance), set(rebuilt))
-        resumed.run()
+        self.assertTrue(any(not ledger.empty for ledger in resumed._guidance.values()))
+        report = resumed.run()
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
         self.assertIn("rogue.py", self.prompts["a"][-1])
 
     def test_the_capped_semantic_failure_persists_its_guidance(self):
-        """Both failures reach the resumed prompt, including the capped one.
+        """The capped retained cycle is restored beside its predecessor."""
 
-        The attempt that hits the semantic ceiling takes `mark_blocked`
-        rather than `fail_attempt`, so its guidance rides a different write.
-        A node blocked on the ceiling is also the one most likely to be
-        resumed, which makes it the worst entry to lose. Two distinct
-        offending paths go in; both come back out of the store.
-        """
-        def run_node(attempt, node, record, retry_prompt, on_launch,
-                     cancel_requested):
+        def run_node(attempt, node, record, retry_prompt, on_launch, cancel_requested):
             self.prompts.setdefault(node.node_id, []).append(retry_prompt)
             on_launch(None)
-            files = {"a.py": "A\n"}
-            if record.attempt_no == 1:
-                files["rogue1.py"] = "X\n"
-            elif record.attempt_no == 2:
-                files["rogue2.py"] = "X\n"
-            for rel, content in files.items():
-                (attempt.path / rel).write_text(content)
+            (attempt.path / "a.py").write_text("A\n")
+            if retry_prompt is None:
+                (attempt.path / "rogue1.py").write_text("X\n")
             return sch.NodeExecution(envelope_parsed=True, exit_code=0)
+
+        def introduce_second_failure(
+            attempt,
+            node,
+            record,
+            repair_prompt,
+            rejected_candidate_sha,
+            builder_generation,
+            cancel_requested,
+        ):
+            self.prompts.setdefault(node.node_id, []).append(repair_prompt)
+            (attempt.path / "rogue1.py").unlink()
+            (attempt.path / "rogue2.py").write_text("X\n")
+            return sch.RepairExecution(
+                execution=sch.NodeExecution(envelope_parsed=True, exit_code=0),
+                acknowledged_rejected_sha=rejected_candidate_sha,
+                builder_generation=builder_generation,
+            )
 
         first = self.schedule(
             [self.agent("a")],
             config=self.config(semantic_ceiling=2),
-            deps=self.deps(run_node=run_node)).run()
+            deps=self.deps(run_node=run_node, continue_node=introduce_second_failure),
+        ).run()
         self.assertIs(first.outcome, st.RunOutcome.BLOCKED)
-        capped = next(item for item in self.store.attempts_for("run1")
-                      if item.attempt_no == 2)
-        self.assertIn("rogue2.py",
-                      (capped.extra or {}).get(rp.GUIDANCE_KEY, {})
-                      .get("offending_paths") or [])
+        spends = self.store.lane_retry_spends("run1", "a")
+        self.assertEqual(len(spends), 2)
+        self.assertIn("rogue1.py", spends[0].detail["offending_paths"])
+        self.assertIn("rogue2.py", spends[1].detail["offending_paths"])
+
         self.store.retry("run1", "a", force=True)
-        self.schedule(
+        report = self.schedule(
             [self.agent("a")],
             config=self.config(semantic_ceiling=2),
-            deps=self.deps(run_node=run_node)).run()
+            deps=self.deps(run_node=run_node, continue_node=introduce_second_failure),
+        ).run()
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
         self.assertIn("rogue1.py", self.prompts["a"][-1])
         self.assertIn("rogue2.py", self.prompts["a"][-1])
 
 
 class ReviewStalledClassificationTests(SchedulerFixture):
-    """The reviewer-stall arm, executed through the scheduler.
-
-    `rp.Classification(retry_class=..., reason=...)` was written at the
-    scheduler's `except cr.ReviewStalled` arm before `Classification` had a
-    `reason` field, so the first real reviewer stall would have raised
-    TypeError inside the except handler instead of classifying ENVIRONMENTAL.
-    No test drove that arm; this one does, and it also pins the §7.5 contract
-    around it: a stall spends an infra retry, mutates no prompt, and its
-    reason reaches the durable transition row.
-
-    **What the stall spends changed with issue #90 and this test changed with
-    it.** It used to assert two builder launches, because the stall failed the
-    whole attempt and the node was re-derived from the integration head — which
-    is the defect, asserted as the contract. The infra retry is now spent on
-    re-dispatching the *reviewer* against the attempt's existing commit, so the
-    builder launches once; the durable ENVIRONMENTAL row and its reason arrive
-    only once the re-dispatch budget is spent, which is what the second case
-    below drives. `tests/test_reviewer_redispatch.py` holds the rest.
-    """
+    """Reviewer stalls spend lane infrastructure budget, never builder work."""
 
     def test_a_reviewer_stall_does_not_re_run_the_builder(self):
         from adw_modules import code_review as cr
@@ -367,15 +456,17 @@ class ReviewStalledClassificationTests(SchedulerFixture):
         self.written = {"a": {"a.py": "A\n"}}
         calls = {"n": 0}
 
-        def review_attempt(attempt, node, record, base_sha, output_sha):
+        def review_attempt(
+            attempt, node, record, base_sha, output_sha, _resume_existing
+        ):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise _Stall()
             return _Review(True)
 
         report = self.schedule(
-            [self.agent("a")],
-            deps=self.deps(review_attempt=review_attempt)).run()
+            [self.agent("a")], deps=self.deps(review_attempt=review_attempt)
+        ).run()
 
         node = self.store.get_node("run1", "a")
         self.assertIs(node.state, st.NodeState.MERGED)
@@ -388,34 +479,42 @@ class ReviewStalledClassificationTests(SchedulerFixture):
 
     def test_an_exhausted_redispatch_budget_is_environmental_and_durable(self):
         from adw_modules import code_review as cr
-        from adw_modules import lifecycle as lc
 
         class _Stall(cr.ReviewStalled):
             def __init__(self):
                 RuntimeError.__init__(self, "stall")
 
         self.written = {"a": {"a.py": "A\n"}}
+        calls = {"n": 0}
 
-        def review_attempt(attempt, node, record, base_sha, output_sha):
+        def review_attempt(
+            attempt, node, record, base_sha, output_sha, _resume_existing
+        ):
+            calls["n"] += 1
             raise _Stall()
 
-        self.schedule(
+        report = self.schedule(
             [self.agent("a")],
             config=self.config(environmental_retries=1, semantic_ceiling=1),
-            deps=self.deps(review_attempt=review_attempt)).run()
+            deps=self.deps(review_attempt=review_attempt),
+        ).run()
 
-        # The classifier's reason survives into the durable transition row —
-        # the evidence gap `_failure_detail` closes, now closed for stalls too.
-        reader = lc.LifecycleReader.open(self.root / "lifecycle.db")
-        try:
-            rows = [t for t in reader.transitions("run1")
-                    if t.get("reason") == "retry:ENVIRONMENTAL"]
-        finally:
-            reader.close()
-        self.assertEqual(len(rows), 1)
+        node = self.store.get_node("run1", "a")
+        spends = self.store.lane_retry_spends("run1", "a")
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
+        self.assertIs(node.state, st.NodeState.BLOCKED)
+        self.assertIs(node.block_reason, st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(len(self.store.attempts_for("run1", node_id="a")), 1)
+        self.assertEqual(len(self.store.lane_candidates("run1", "a")), 1)
+        self.assertEqual(len(spends), 2)
+        self.assertTrue(
+            all(item.retry_class is st.LaneRetryClass.ENVIRONMENTAL for item in spends)
+        )
         self.assertEqual(
-            rows[0].get("detail", {}).get("reason"),
-            "the code reviewer stalled without reporting")
+            spends[-1].detail.get("reason"),
+            "the code reviewer stalled without reporting",
+        )
 
 
 if __name__ == "__main__":

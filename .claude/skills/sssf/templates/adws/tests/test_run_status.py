@@ -29,13 +29,21 @@ from adw_modules import scheduler_types as st
 
 
 AGENT_NODE = st.PlanNode(
-    node_id="lane-one", kind=st.NodeKind.AGENT, depth=0,
+    node_id="lane-one",
+    kind=st.NodeKind.AGENT,
+    depth=0,
     instruction="Build lane one.",
-    gate_command=("pytest",), gate_selector="tests/test_one.py")
+    gate_command=("pytest",),
+    gate_selector="tests/test_one.py",
+)
 SECOND_NODE = st.PlanNode(
-    node_id="lane-two", kind=st.NodeKind.AGENT, depth=0,
+    node_id="lane-two",
+    kind=st.NodeKind.AGENT,
+    depth=0,
     instruction="Build lane two.",
-    gate_command=("pytest",), gate_selector="tests/test_two.py")
+    gate_command=("pytest",),
+    gate_selector="tests/test_two.py",
+)
 
 
 class RunStatusFixture(unittest.TestCase):
@@ -73,11 +81,11 @@ class RunStatusFixture(unittest.TestCase):
         seed = receipt_crypto.generate_seed()
         route_seed = receipt_crypto.generate_seed()
         self.environment = {
-            "MAESTRO_TEST_VERIFY_KEY":
-                receipt_crypto.seed_to_public_key(seed).hex(),
+            "MAESTRO_TEST_VERIFY_KEY": receipt_crypto.seed_to_public_key(seed).hex(),
             "MAESTRO_TEST_SIGNING_SEED": seed.hex(),
-            "MAESTRO_TEST_ROUTE_VERIFY_KEY":
-                receipt_crypto.seed_to_public_key(route_seed).hex(),
+            "MAESTRO_TEST_ROUTE_VERIFY_KEY": receipt_crypto.seed_to_public_key(
+                route_seed
+            ).hex(),
         }
         config = {
             "schema": "maestro-config.v1",
@@ -89,19 +97,33 @@ class RunStatusFixture(unittest.TestCase):
                 "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
             },
             "executables": binaries,
-            "route_receipts": {"omp": "route-receipts/omp.json",
-                               "claude": "route-receipts/claude.json"},
-            "reviewer": {"route": "claude", "model": "review-model",
-                         "effort": "high", "finalization_timeout_s": 60,
-                         "turn_timeout_s": 20, "poll_interval_s": 1},
-            "execution": {"route": "omp", "model": "execution-model",
-                          "effort": "medium", "concurrency": 2,
-                          "node_timeout_s": 120, "turn_timeout_s": 30,
-                          "final_acceptance_timeout_s": 45,
-                          "backstop_t_s": 600, "semantic_ceiling": 3},
+            "route_receipts": {
+                "omp": "route-receipts/omp.json",
+                "claude": "route-receipts/claude.json",
+            },
+            "reviewer": {
+                "route": "claude",
+                "model": "review-model",
+                "effort": "high",
+                "finalization_timeout_s": 60,
+                "turn_timeout_s": 20,
+                "poll_interval_s": 1,
+            },
+            "execution": {
+                "route": "omp",
+                "model": "execution-model",
+                "effort": "medium",
+                "concurrency": 2,
+                "node_timeout_s": 120,
+                "turn_timeout_s": 30,
+                "final_acceptance_timeout_s": 45,
+                "backstop_t_s": 600,
+                "semantic_ceiling": 3,
+            },
         }
         (self.repo / "adws" / "maestro.config.yaml").write_text(
-            json.dumps(config), encoding="utf-8")
+            json.dumps(config), encoding="utf-8"
+        )
 
     @property
     def database(self) -> Path:
@@ -121,8 +143,10 @@ class RunStatusFixture(unittest.TestCase):
         previous = Path.cwd()
         os.chdir(self.repo)
         try:
-            with mock.patch.dict(os.environ, self.environment, clear=False), \
-                    contextlib.redirect_stdout(output):
+            with (
+                mock.patch.dict(os.environ, self.environment, clear=False),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro.main(argv)
         finally:
             os.chdir(previous)
@@ -138,11 +162,19 @@ class RunStatusFixture(unittest.TestCase):
             store.fail_attempt(run_id, "lane-one", st.RetryClass.ENVIRONMENTAL)
             store.start_attempt(run_id, "lane-one", "a" * 40)
             store.fail_attempt(
-                run_id, "lane-one", st.RetryClass.SEMANTIC,
-                detail={"clause": 4, "verdict": "the gate stayed red"})
+                run_id,
+                "lane-one",
+                st.RetryClass.SEMANTIC,
+                detail={"clause": 4, "verdict": "the gate stayed red"},
+            )
             attempt_no = store.start_attempt(run_id, "lane-one", "a" * 40)
-            store.mark_launched(run_id, "lane-one", attempt_no, 4321,
-                                extra={"session_path": "/tmp/session.jsonl"})
+            store.mark_launched(
+                run_id,
+                "lane-one",
+                attempt_no,
+                4321,
+                extra={"session_path": "/tmp/session.jsonl"},
+            )
         return run_id
 
     def _accepted_run(self, run_id="run-done", digest=None):
@@ -156,13 +188,15 @@ class RunStatusFixture(unittest.TestCase):
 
     def _blocked_run(self, run_id="run-bad", digest=None):
         with self._store() as store:
-            store.create_run(run_id, digest or self.digest,
-                             [AGENT_NODE, SECOND_NODE])
+            store.create_run(run_id, digest or self.digest, [AGENT_NODE, SECOND_NODE])
             store.start_attempt(run_id, "lane-one", "d" * 40)
             store.mark_blocked(
-                run_id, "lane-one", st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                run_id,
+                "lane-one",
+                st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
                 detail={"verdict": "three attempts, still red"},
-                retry_class=st.RetryClass.SEMANTIC)
+                retry_class=st.RetryClass.SEMANTIC,
+            )
             store.declare_outcome(run_id)
         return run_id
 
@@ -199,16 +233,16 @@ class RunStatusTest(RunStatusFixture):
         self.assertEqual(progress["plan_name"], "named")
         self.assertEqual(progress["state"], "RUNNING")
         self.assertIsNone(progress["declared_outcome"])
-        self.assertEqual([item["attempt_no"] for item in progress["in_flight"]],
-                         [3])
+        self.assertEqual([item["attempt_no"] for item in progress["in_flight"]], [3])
         node = progress["nodes"][0]
         self.assertEqual(node["state"], "RUNNING")
         self.assertEqual(node["attempt_no"], 3)
-        self.assertEqual([item["retry_class"] for item in node["attempts"]],
-                         ["ENVIRONMENTAL", "SEMANTIC", None])
+        self.assertEqual(
+            [item["retry_class"] for item in node["attempts"]],
+            ["ENVIRONMENTAL", "SEMANTIC", None],
+        )
         self.assertEqual(node["attempts"][1]["verdict"], "the gate stayed red")
-        self.assertEqual(node["attempts"][2]["session_path"],
-                         "/tmp/session.jsonl")
+        self.assertEqual(node["attempts"][2]["session_path"], "/tmp/session.jsonl")
         self.assertTrue(node["attempts"][2]["running"])
         self.assertIsNotNone(node["attempts"][2]["elapsed_s"])
         self.assertIsNotNone(progress["elapsed_s"])
@@ -239,10 +273,12 @@ class RunStatusTest(RunStatusFixture):
         progress = json.loads(output)
         self.assertEqual(progress["declared_outcome"], "BLOCKED")
         blocked = {node["node_id"]: node for node in progress["nodes"]}
-        self.assertEqual(blocked["lane-one"]["block_reason"],
-                         "SEMANTIC_BUDGET_EXHAUSTED")
-        self.assertEqual(blocked["lane-one"]["attempts"][0]["verdict"],
-                         "three attempts, still red")
+        self.assertEqual(
+            blocked["lane-one"]["block_reason"], "SEMANTIC_BUDGET_EXHAUSTED"
+        )
+        self.assertEqual(
+            blocked["lane-one"]["attempts"][0]["verdict"], "three attempts, still red"
+        )
         self.assertEqual(blocked["lane-two"]["state"], "PENDING")
         code, text = self._run(["run", "status", "named"])
         self.assertEqual(code, 0, text)
@@ -264,7 +300,8 @@ class RunStatusTest(RunStatusFixture):
         run_id = self._live_run()
         with self._store() as store:
             store.conn.execute(
-                "UPDATE runs SET cancel_requested=1 WHERE run_id=?", (run_id,))
+                "UPDATE runs SET cancel_requested=1 WHERE run_id=?", (run_id,)
+            )
         code, output = self._run(["run", "status", "named", "--json"])
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["state"], "CANCELLING")
@@ -281,7 +318,8 @@ class RunSelectionTest(RunStatusFixture):
         self.assertEqual(json.loads(output)["run_id"], newest)
 
         code, output = self._run(
-            ["run", "status", "named", "--run-id", "run-first", "--json"])
+            ["run", "status", "named", "--run-id", "run-first", "--json"]
+        )
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["run_id"], "run-first")
 
@@ -294,8 +332,7 @@ class RunSelectionTest(RunStatusFixture):
 
     def test_an_unknown_run_id_is_a_typed_refusal(self):
         self._live_run()
-        code, output = self._run(
-            ["run", "status", "named", "--run-id", "run-nope"])
+        code, output = self._run(["run", "status", "named", "--run-id", "run-nope"])
         self.assertEqual(code, 3)
         self.assertEqual(json.loads(output)["outcome"], "RUN_NOT_FOUND")
 
@@ -313,15 +350,16 @@ class RunSelectionTest(RunStatusFixture):
         code, output = self._run(["run", "list", "--json"])
         self.assertEqual(code, 0, output)
         rows = json.loads(output)
-        self.assertEqual([row["run_id"] for row in rows],
-                         ["run-other", "run-third", "run-first"])
-        self.assertEqual({row["plan_name"] for row in rows},
-                         {"named", "other"})
+        self.assertEqual(
+            [row["run_id"] for row in rows], ["run-other", "run-third", "run-first"]
+        )
+        self.assertEqual({row["plan_name"] for row in rows}, {"named", "other"})
 
         code, output = self._run(["run", "list", "named", "--json"])
         self.assertEqual(code, 0, output)
-        self.assertEqual([row["run_id"] for row in json.loads(output)],
-                         ["run-third", "run-first"])
+        self.assertEqual(
+            [row["run_id"] for row in json.loads(output)], ["run-third", "run-first"]
+        )
 
     def test_run_list_text_view_survives_an_empty_ledger(self):
         self._accepted_run("run-first")
@@ -340,21 +378,25 @@ class RunMutationSelectionTest(RunStatusFixture):
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["run_id"], newest)
         with self._store() as store:
-            self.assertEqual(store.get_node(newest, "lane-one").state,
-                             st.NodeState.CANCELLED)
-            self.assertEqual(store.get_node("run-first", "lane-one").state,
-                             st.NodeState.MERGED)
+            self.assertEqual(
+                store.get_node(newest, "lane-one").state, st.NodeState.CANCELLED
+            )
+            self.assertEqual(
+                store.get_node("run-first", "lane-one").state, st.NodeState.MERGED
+            )
 
     def test_cancel_reaches_an_older_run_by_id(self):
         older = self._live_run("run-first")
         self._live_run("run-third")
-        code, output = self._run(["run", "cancel", "named", "--discard",
-                                  "--run-id", older])
+        code, output = self._run(
+            ["run", "cancel", "named", "--discard", "--run-id", older]
+        )
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["run_id"], older)
         with self._store() as store:
-            self.assertEqual(store.get_node("run-third", "lane-one").state,
-                             st.NodeState.RUNNING)
+            self.assertEqual(
+                store.get_node("run-third", "lane-one").state, st.NodeState.RUNNING
+            )
 
     def test_resume_re_enters_the_existing_run_instead_of_minting_one(self):
         run_id = self._blocked_run("run-second")
@@ -374,8 +416,7 @@ class RunMutationSelectionTest(RunStatusFixture):
         older = self._blocked_run("run-first")
         self._live_run("run-third")
         with mock.patch.object(maestro, "_run_resume", return_value=0) as resume:
-            code, output = self._run(
-                ["run", "resume", "named", "--run-id", older])
+            code, output = self._run(["run", "resume", "named", "--run-id", older])
         self.assertEqual(code, 0, output)
         self.assertEqual(resume.call_args.args[0].run_id, older)
 
@@ -406,8 +447,7 @@ class RunReaderTest(RunStatusFixture):
         before = self.database.stat().st_mtime_ns
         reader = lc.LifecycleReader.open(self.database)
         try:
-            self.assertEqual([record.run_id for record in reader.runs()],
-                             ["run-done"])
+            self.assertEqual([record.run_id for record in reader.runs()], ["run-done"])
             with self.assertRaises(Exception):
                 reader.conn.execute("DELETE FROM runs")
         finally:
@@ -433,8 +473,8 @@ class RunManualInvocationTest(RunStatusFixture):
     def test_an_explicit_db_still_drives_the_verb_by_hand(self):
         self._live_run()
         code, output = self._run(
-            ["run", "status", "run-live", "--db", str(self.database),
-             "--json"])
+            ["run", "status", "run-live", "--db", str(self.database), "--json"]
+        )
         self.assertEqual(code, 0, output)
         progress = json.loads(output)
         self.assertEqual(progress["run_id"], "run-live")
@@ -456,11 +496,9 @@ class RunManualInvocationTest(RunStatusFixture):
         self.assertEqual(payload["outcome"], "RUN_CONFIGURATION_REQUIRED")
 
     def test_start_still_refuses_runtime_flags_under_configuration(self):
-        code, output = self._run(
-            ["run", "start", "named", "--db", str(self.database)])
+        code, output = self._run(["run", "start", "named", "--db", str(self.database)])
         self.assertEqual(code, 3)
-        self.assertEqual(json.loads(output)["outcome"],
-                         "MAESTRO_CONFIGURATION_INVALID")
+        self.assertEqual(json.loads(output)["outcome"], "MAESTRO_CONFIGURATION_INVALID")
 
 
 class RunListStopsReportingDeadRunsAsLive(RunStatusFixture):
@@ -479,8 +517,9 @@ class RunListStopsReportingDeadRunsAsLive(RunStatusFixture):
         """
         with self._store() as store:
             store.conn.execute(
-                "UPDATE runs SET scheduler_pid=?, scheduler_host=?"
-                " WHERE run_id=?", (pid, lc.scheduler_host(), run_id))
+                "UPDATE runs SET scheduler_pid=?, scheduler_host=? WHERE run_id=?",
+                (pid, lc.scheduler_host(), run_id),
+            )
 
     def test_a_run_whose_scheduler_died_reads_abandoned_not_running(self):
         run_id = self._live_run()
@@ -555,8 +594,9 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         """Point the run's recorded owner at a pid that is not a process."""
         with self._store() as store:
             store.conn.execute(
-                "UPDATE runs SET scheduler_pid=?, scheduler_host=?"
-                " WHERE run_id=?", (pid, lc.scheduler_host(), run_id))
+                "UPDATE runs SET scheduler_pid=?, scheduler_host=? WHERE run_id=?",
+                (pid, lc.scheduler_host(), run_id),
+            )
 
     def _misrecord_the_start_epoch(self, run_id, epoch=1.0):
         """Leave the pid alive and correct; falsify only its start epoch.
@@ -568,7 +608,8 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         with self._store() as store:
             store.conn.execute(
                 "UPDATE runs SET scheduler_start_epoch=? WHERE run_id=?",
-                (epoch, run_id))
+                (epoch, run_id),
+            )
 
     def test_run_pause_is_the_named_non_terminal_stop(self):
         run_id = self._live_run()
@@ -579,17 +620,24 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         self.assertEqual(payload["outcome"], "PAUSE_REQUESTED")
         self.assertEqual(payload["run_id"], run_id)
         self.assertEqual(
-            [call.args for call in killed.call_args_list
-             if call.args[1] == signal.SIGINT],
-            [(os.getpid(), signal.SIGINT)])
+            [
+                call.args
+                for call in killed.call_args_list
+                if call.args[1] == signal.SIGINT
+            ],
+            [(os.getpid(), signal.SIGINT)],
+        )
         with self._store() as store:
             # Nothing moved. That is the whole property (§1.2).
             self.assertIsNone(store.latest_outcome(run_id))
-            self.assertIs(store.get_node(run_id, "lane-one").state,
-                          st.NodeState.RUNNING)
-            self.assertFalse(store.conn.execute(
-                "SELECT cancel_requested FROM runs WHERE run_id=?",
-                (run_id,)).fetchone()[0])
+            self.assertIs(
+                store.get_node(run_id, "lane-one").state, st.NodeState.RUNNING
+            )
+            self.assertFalse(
+                store.conn.execute(
+                    "SELECT cancel_requested FROM runs WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+            )
 
     def test_pause_refuses_to_signal_an_unproven_pid(self):
         """The recorded pid is alive and is this process; only the recorded
@@ -606,8 +654,14 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
             code, output = self._run(["run", "pause", "named"])
         self.assertEqual(code, 3, output)
         self.assertEqual(json.loads(output)["outcome"], "PAUSE_PID_UNPROVEN")
-        self.assertEqual([call.args for call in killed.call_args_list
-                          if call.args[1] == signal.SIGINT], [])
+        self.assertEqual(
+            [
+                call.args
+                for call in killed.call_args_list
+                if call.args[1] == signal.SIGINT
+            ],
+            [],
+        )
 
     def test_pause_reports_an_already_stopped_scheduler_without_signalling(self):
         run_id = self._live_run()
@@ -625,12 +679,17 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         self.assertEqual(payload["outcome"], "PAUSE_REQUESTED")
         self.assertEqual(payload["run_id"], run_id)
         self.assertEqual(
-            [call.args for call in killed.call_args_list
-             if call.args[1] == signal.SIGINT],
-            [(os.getpid(), signal.SIGINT)])
+            [
+                call.args
+                for call in killed.call_args_list
+                if call.args[1] == signal.SIGINT
+            ],
+            [(os.getpid(), signal.SIGINT)],
+        )
         with self._store() as store:
-            self.assertIs(store.get_node(run_id, "lane-one").state,
-                          st.NodeState.RUNNING)
+            self.assertIs(
+                store.get_node(run_id, "lane-one").state, st.NodeState.RUNNING
+            )
             self.assertIsNone(store.latest_outcome(run_id))
 
     def test_discard_declares_cancelled_and_refuses_resume(self):
@@ -639,10 +698,8 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         self.assertEqual(code, 0, output)
         self.assertEqual(json.loads(output)["outcome"], "CANCELLED")
         with self._store() as store:
-            self.assertIs(store.latest_outcome(run_id),
-                          st.RunOutcome.CANCELLED)
-            self.assertIs(store.run_cancel_cause(run_id),
-                          st.CancelCause.DISCARDED)
+            self.assertIs(store.latest_outcome(run_id), st.RunOutcome.CANCELLED)
+            self.assertIs(store.run_cancel_cause(run_id), st.CancelCause.DISCARDED)
             with self.assertRaises(lc.ResumeRefused):
                 store.resume_run(run_id)
 
@@ -657,9 +714,11 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         previous = Path.cwd()
         os.chdir(self.repo)
         try:
-            with mock.patch.dict(os.environ, self.environment, clear=False), \
-                    contextlib.redirect_stdout(output), \
-                    contextlib.redirect_stderr(err):
+            with (
+                mock.patch.dict(os.environ, self.environment, clear=False),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(err),
+            ):
                 code = maestro.main(["run", "cancel", run_id, "--discard"])
         finally:
             os.chdir(previous)
@@ -676,8 +735,18 @@ class PauseAndDiscardCancelTest(RunStatusFixture):
         self.assertEqual(code, 3, output)
         self.assertEqual(json.loads(output)["outcome"], "RUN_ALREADY_TERMINAL")
         with self._store() as store:
-            self.assertIs(store.latest_outcome(run_id),
-                          st.RunOutcome.ACCEPTED)
+            self.assertIs(store.latest_outcome(run_id), st.RunOutcome.ACCEPTED)
+
+
+class LegacyAttemptDetailTest(unittest.TestCase):
+    """Old free-form transition detail must not break run status."""
+
+    def test_a_string_detail_is_ignored_before_a_typed_verdict(self):
+        entries = (
+            {"detail": "legacy free-form detail"},
+            {"detail": {"verdict": "accepted"}},
+        )
+        self.assertEqual(maestro._attempt_verdict(entries), "accepted")
 
 
 if __name__ == "__main__":

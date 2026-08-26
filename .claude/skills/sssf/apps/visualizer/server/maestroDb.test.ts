@@ -36,6 +36,14 @@ function runtimeSchema(): string {
   return match[1] as string;
 }
 
+function runtimeTableSchema(table: string): string {
+  const match = runtimeSchema().match(
+    new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\([\\s\\S]*?\\n\\);`),
+  );
+  if (!match) throw new Error(`no ${table} table in runtime schema`);
+  return match[0];
+}
+
 let root: string;
 
 /** A ledger with the runtime's schema and whatever rows a case needs. */
@@ -115,6 +123,7 @@ function insertNode(
     cancel_cause: string | null;
     merge_cause: string | null;
     output_sha: string | null;
+    lane_phase: string | null;
     plan_digest: string;
   }> = {},
 ) {
@@ -125,6 +134,7 @@ function insertNode(
     block_reason: null as string | null,
     cancel_cause: null as string | null,
     merge_cause: null as string | null,
+    lane_phase: null as string | null,
     output_sha: null as string | null,
     plan_digest: "d".repeat(64),
     ...opts,
@@ -135,11 +145,11 @@ function insertNode(
      VALUES (?, ?, ?, 'agent', ?, ?, '[]', '[]')`,
   ).run(runId, nodeId, o.plan_digest, o.depth, JSON.stringify(o.needs));
   db.query(
-    `INSERT INTO node_lifecycle (run_id, node_id, state, attempt_no, block_reason,
-                                 cancel_cause, merge_cause, output_sha,
+    `INSERT INTO node_lifecycle (run_id, node_id, state, lane_phase, attempt_no,
+                                 block_reason, cancel_cause, merge_cause, output_sha,
                                  granted_extra_attempts, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '2026-08-17T06:05:00+00:00')`,
-  ).run(runId, nodeId, state, o.attempt_no, o.block_reason, o.cancel_cause,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '2026-08-17T06:05:00+00:00')`,
+  ).run(runId, nodeId, state, o.lane_phase, o.attempt_no, o.block_reason, o.cancel_cause,
         o.merge_cause, o.output_sha);
 }
 
@@ -485,6 +495,7 @@ describe("whether a cancelled run can be resumed", () => {
     const path = ledger("premigration", (seed) => {
       seed.exec("ALTER TABLE runs DROP COLUMN cancel_cause");
       seed.exec("ALTER TABLE node_lifecycle DROP COLUMN cancel_cause");
+      seed.exec("ALTER TABLE node_lifecycle DROP COLUMN lane_phase");
       seed
         .query(
           `INSERT INTO runs (run_id, plan_digest, created_at,
@@ -516,6 +527,7 @@ describe("whether a cancelled run can be resumed", () => {
     expect(run?.cancel_cause).toBeNull();
     expect(run?.resumable).toBe(false);
     expect(run?.nodes[0]?.cancel_cause).toBeNull();
+    expect(run?.nodes[0]?.lane_phase).toBeNull();
     db.close();
   });
 
@@ -1114,3 +1126,184 @@ describe("run scheduler liveness", () => {
   });
 });
 
+describe("persistent review lifecycle projection", () => {
+  test("lane phase, candidates, reviews, findings, and handoffs are authoritative", () => {
+    const candidateSha = "a".repeat(40);
+    const findings = [{
+      check_id: "diff.contract",
+      object_id: "src/lane.ts",
+      message: "repair the rejected contract",
+      blocking: true,
+    }];
+    const path = ledger("review-lifecycle", (seed) => {
+      insertRun(seed, "run-review");
+      insertNode(seed, "run-review", "lane-bronze", "RUNNING", {
+        attempt_no: 1,
+        lane_phase: "REPAIRING",
+      });
+      insertNode(seed, "run-review", "lane-bronze::review", "RUNNING");
+      seed.query("UPDATE dag_nodes SET kind='review' WHERE run_id=? AND node_id=?")
+        .run("run-review", "lane-bronze::review");
+      seed.query(
+        `INSERT INTO lane_candidates
+           (run_id, build_node_id, candidate_seq, candidate_sha,
+            parent_candidate_sha, builder_generation, created_at)
+         VALUES (?, ?, 1, ?, NULL, 2, ?)`,
+      ).run("run-review", "lane-bronze", candidateSha, "2026-08-26T00:00:00Z");
+      seed.query(
+        `INSERT INTO candidate_reviews
+           (run_id, review_node_id, candidate_sha, reviewer_generation, state,
+            review_digest, receipt_path, findings_json, verdict, completed_at)
+         VALUES (?, ?, ?, 3, 'COMPLETED', 'digest', '/receipt.json', ?,
+                 'REJECTED', ?)`,
+      ).run(
+        "run-review",
+        "lane-bronze::review",
+        candidateSha,
+        JSON.stringify(findings),
+        "2026-08-26T00:01:00Z",
+      );
+      seed.query(
+        `INSERT INTO repair_handoffs
+           (run_id, build_node_id, rejected_candidate_sha, findings_json, state,
+            builder_generation, submitted_at, acknowledged_at)
+         VALUES (?, ?, ?, ?, 'ACKNOWLEDGED', 2, ?, ?)`,
+      ).run(
+        "run-review",
+        "lane-bronze",
+        candidateSha,
+        JSON.stringify(findings),
+        "2026-08-26T00:02:00Z",
+        "2026-08-26T00:03:00Z",
+      );
+    });
+
+    const db = new MaestroDb(path);
+    const run = db.run("run-review")!;
+
+    expect(run.nodes.find((node) => node.node_id === "lane-bronze")?.lane_phase)
+      .toBe("REPAIRING");
+    expect(run.lane_candidates[0]?.candidate_sha).toBe(candidateSha);
+    expect(run.candidate_reviews[0]?.verdict).toBe("REJECTED");
+    expect(run.candidate_reviews[0]?.findings).toEqual(findings);
+    expect(run.repair_handoffs[0]?.state).toBe("ACKNOWLEDGED");
+    expect(run.repair_handoffs[0]?.findings).toEqual(findings);
+    db.close();
+  });
+
+  test("a live non-immutable reader sees actor and review tables created after first open", () => {
+    const path = ledger("late-review-schema", (seed) => {
+      insertRun(seed, "run-late");
+      insertNode(seed, "run-late", "lane", "RUNNING", { lane_phase: "BUILDING" });
+    });
+    const writer = new Database(path);
+    writer.exec("PRAGMA journal_mode=WAL");
+    for (const table of [
+      "actor_sessions",
+      "repair_handoffs",
+      "candidate_reviews",
+      "lane_candidates",
+    ]) {
+      writer.exec(`DROP TABLE ${table}`);
+    }
+    const db = new MaestroDb(path);
+    const before = db.run("run-late")!;
+    expect(before.actor_sessions).toEqual([]);
+    expect(before.lane_candidates).toEqual([]);
+    expect(before.candidate_reviews).toEqual([]);
+    expect(before.repair_handoffs).toEqual([]);
+
+    for (const table of [
+      "lane_candidates",
+      "candidate_reviews",
+      "repair_handoffs",
+      "actor_sessions",
+    ]) {
+      writer.exec(runtimeTableSchema(table));
+    }
+    const candidateSha = "b".repeat(40);
+    writer.query(
+      `INSERT INTO lane_candidates
+         (run_id, build_node_id, candidate_seq, candidate_sha,
+          parent_candidate_sha, builder_generation, created_at)
+       VALUES ('run-late', 'lane', 1, ?, NULL, 1, '2026-08-26T00:00:00Z')`,
+    ).run(candidateSha);
+    writer.query(
+      `INSERT INTO candidate_reviews
+         (run_id, review_node_id, candidate_sha, reviewer_generation, state,
+          review_digest, receipt_path, findings_json, verdict, completed_at)
+       VALUES ('run-late', 'lane::review', ?, 1, 'DISPATCHED',
+               NULL, NULL, '[]', NULL, NULL)`,
+    ).run(candidateSha);
+    writer.query(
+      `INSERT INTO actor_sessions
+         (run_id, build_node_id, actor_role, generation, state, pane_id,
+          session_path, correlation_token, updated_at)
+       VALUES ('run-late', 'lane', 'reviewer', 1, 'ACTIVE', 'pane-1',
+               '/reviewer.jsonl', 'token', '2026-08-26T00:00:00Z')`,
+    ).run();
+
+    const after = db.run("run-late")!;
+    expect(after.actor_sessions[0]?.actor_role).toBe("reviewer");
+    expect(after.lane_candidates[0]?.candidate_sha).toBe(candidateSha);
+    expect(after.candidate_reviews[0]?.state).toBe("DISPATCHED");
+    expect(after.repair_handoffs).toEqual([]);
+    db.close();
+    writer.close();
+  });
+});
+
+
+
+describe("actor session projection", () => {
+  test("retained Herdr actor generations are exposed with the run", () => {
+    const path = ledger("actor-sessions", (seed) => {
+      insertRun(seed, "run-actors", { plan_name: "corpus recovery" });
+      insertNode(seed, "run-actors", "lane-bronze", "RUNNING", {
+        attempt_no: 7,
+        lane_phase: "REVIEWING",
+      });
+      seed.query(
+        `INSERT INTO actor_sessions
+           (run_id, build_node_id, actor_role, generation, state, pane_id,
+            session_path, correlation_token, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        "run-actors",
+        "lane-bronze",
+        "builder",
+        7,
+        "ACTIVE",
+        "w1C%2:p1",
+        "/sessions/builder.jsonl",
+        "builder-token",
+        "2026-08-25T07:00:00+00:00",
+      );
+    });
+    const db = new MaestroDb(path);
+    expect(db.run("run-actors")?.actor_sessions).toEqual([
+      {
+        build_node_id: "lane-bronze",
+        actor_role: "builder",
+        generation: 7,
+        state: "ACTIVE",
+        pane_id: "w1C%2:p1",
+        session_path: "/sessions/builder.jsonl",
+        correlation_token: "builder-token",
+        updated_at: "2026-08-25T07:00:00+00:00",
+      },
+    ]);
+    db.close();
+  });
+
+  test("a pre-actor-session ledger remains readable", () => {
+    const path = ledger("no-actor-sessions", (seed) => {
+      insertRun(seed, "run-old");
+      insertNode(seed, "run-old", "lane", "PENDING");
+      seed.exec("DROP TABLE actor_sessions");
+    });
+    const db = new MaestroDb(path);
+    expect(db.run("run-old")?.actor_sessions).toEqual([]);
+    db.close();
+  });
+});

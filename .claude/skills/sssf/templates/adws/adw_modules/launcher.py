@@ -18,8 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import (Callable, Dict, List, Mapping, Optional, Protocol,
-                    Sequence, Tuple)
+from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from . import handoff_budget as hb
 from . import permissions
@@ -155,8 +154,9 @@ class LaunchRefusal(Enum):
     #: unmeasured window is not a passing one.
     PROMPT_UNMEASURED = ("PROMPT_UNMEASURED", False, True)
 
-    def __init__(self, code: str, pane_created: Optional[bool],
-                 deterministic: bool) -> None:
+    def __init__(
+        self, code: str, pane_created: Optional[bool], deterministic: bool
+    ) -> None:
         self.code = code
         #: `None` means "the raise site must state it". A refusal raised after
         #: the split cannot answer this as a class constant: whether a pane
@@ -179,10 +179,15 @@ class LaunchRefused(RuntimeError):
     and the message Herdr may reword at any release.
     """
 
-    def __init__(self, refusal: LaunchRefusal, detail: str = "",
-                 pane_created: Optional[bool] = None) -> None:
-        super().__init__("LAUNCH_REFUSED:{}{}".format(
-            refusal.code, ":" + detail if detail else ""))
+    def __init__(
+        self,
+        refusal: LaunchRefusal,
+        detail: str = "",
+        pane_created: Optional[bool] = None,
+    ) -> None:
+        super().__init__(
+            "LAUNCH_REFUSED:{}{}".format(refusal.code, ":" + detail if detail else "")
+        )
         self.refusal = refusal
         self.detail = detail
         self._pane_created = pane_created
@@ -210,8 +215,28 @@ class LaunchRefused(RuntimeError):
 class HarnessCancelled(RuntimeError):
     """A harness-owned process was cancelled and its process group quiesced."""
 
+
 class HarnessQuiescenceError(RuntimeError):
     """A harness-owned process group could not be proven absent."""
+
+
+class HandleOwnershipError(RuntimeError):
+    """A live Herdr actor could not be proven to own the persisted handle."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = str(code)
+        self.detail = str(detail)
+        super().__init__(
+            "{}{}".format(self.code, ":" + self.detail if self.detail else "")
+        )
+
+
+class HandleAbsent(HandleOwnershipError):
+    """Herdr proved the persisted pane or actor id no longer exists."""
+
+
+class HandleAdoptionRefused(HandleOwnershipError):
+    """Herdr answered, but its typed identity disagreed with the ledger."""
 
 
 class _WorkspaceGone(RuntimeError):
@@ -295,7 +320,6 @@ def pytest_worker_cap(concurrency: int, cpu_count: Optional[int] = None) -> int:
     return max(1, int(cores) // concurrency)
 
 
-
 def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
     """`--env KEY=VALUE` flags carrying §8.3's redirection into the pane shell.
 
@@ -327,38 +351,11 @@ def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
     """
     missing = [key for key in SCRATCH_ENV_KEYS if not environment.get(key)]
     if missing:
-        raise LaunchRefused(LaunchRefusal.SCRATCH_REDIRECT_MISSING,
-                            ",".join(missing))
+        raise LaunchRefused(LaunchRefusal.SCRATCH_REDIRECT_MISSING, ",".join(missing))
     flags: List[str] = []
     for key in SCRATCH_ENV_KEYS:
         flags.extend(("--env", "{}={}".format(key, environment[key])))
     return tuple(flags)
-
-
-#: The prefix every lane node id carries in an authored plan
-#: (`lane-p2-s3-inventory`). Dropping it is the whole of the display
-#: transform: what is left is already `<depth>-<short-node-name>`.
-LANE_ID_PREFIX = "lane-p"
-
-
-def display_name(node_id: str) -> str:
-    """`lane-p2-s3-inventory` -> `2-s3-inventory`; anything else unchanged.
-
-    Herdr's sidebar is the operator's index into a running factory, and it is
-    one narrow column. `lane-p` is on every lane of every plan, so it
-    distinguishes nothing while costing six characters of the single line an
-    operator reads to find the node they are looking for. What remains is the
-    depth and the short name, which is what the entry is for.
-
-    A pure function of a typed field, applied once at launch and stored as the
-    item's label -- §9.7's rule that the human-visible label is built at
-    launch rather than derived at the display edge, which is the pattern that
-    needed five separate fixes the other way round.
-    """
-    text = str(node_id)
-    if text.startswith(LANE_ID_PREFIX):
-        return text[len(LANE_ID_PREFIX):]
-    return text
 
 
 #: The hard ceiling on one tab's grid, in both dimensions. Three columns of a
@@ -442,17 +439,19 @@ class LaunchSpec:
     #: catalog means importing `agent_pi`, which `enforcement.py`'s
     #: `base-execution-import` forbids every module in this package to do.
     context_window_tokens: Optional[int] = None
-    #: The tab this pane belongs to, named by the node it serves. One tab per
-    #: node is what puts a node's builder and its reviewer side by side and
-    #: keeps an unrelated node out of the same rectangle, which is the whole
-    #: of the operator's complaint that a flat tab of scattered panes cannot
-    #: be read. Empty names this launcher's default group -- the lanes that
-    #: are not a node's, such as the plan author.
-    pane_group: str = ""
-    #: This agent's part in that node: `builder`, `reviewer`, `tester`. Display
-    #: only, and part of the pane's stored label so a pane says what it is
-    #: without anyone reading its working directory.
+    #: The authored plan name shown on the Herdr workspace. Runtime identity
+    #: remains in `correlation_token`; it is never parsed for placement.
+    workspace_label: str = ""
+    #: Durable lane identity used only as the tab-adoption key. A derived
+    #: reviewer receives its build lane's key rather than its derived node id.
+    lane_key: str = ""
+    #: Authored lane name shown on the Herdr tab and actor pane labels.
+    lane_label: str = ""
+    #: This actor's role in the lane: `builder`, `reviewer`, or `tester`.
     pane_role: str = ""
+    #: Actor attempt/session generation shown as `aN`. Standalone author and
+    #: deliver panes leave it unset and retain their role-only label.
+    attempt_no: Optional[int] = None
     #: How many agent panes the caller expects this tab to hold. The tab's
     #: column count is computed from it and then only ever grows, so a
     #: declared size is what makes the grid exact: a node declaring 2 gets one
@@ -467,14 +466,22 @@ class LaunchSpec:
     #: asked.
     restrict_tools: bool = False
 
+
 #: Direct Claude sessions must delegate substantial work rather than silently
-#: duplicating a spawned subagent's task in the parent. This is part of every
-#: Claude prompt, at the universal launch chokepoint rather than at individual
-#: scheduler call sites.
+#: duplicating a spawned subagent's task in the parent, and must judge a
+#: teammate idle only on positive evidence. This is part of every Claude
+#: prompt, at the universal launch chokepoint rather than at individual
+#: scheduler call sites. The idle-evidence sentence is the agent-side twin of
+#: the runtime-side law: LIVE_WORKING_STATUSES (watchdog.py /
+#: finalization_window.py) excludes "idle" for the same reason -- silence,
+#: flat mtime, and idle_notification are heartbeats, not completion.
 CLAUDE_TEAM_PROMPT_PREFIX = (
     "/team spawn subagents for tasks. If you get impatient do not duplicate "
     "the work yourself. Poll them. Make sure they use SendMessage to respond "
-    "back to you. "
+    "back to you. Operating rule: a teammate is idle only when it sent you a "
+    "real SendMessage result, or `herdr agent list` no longer reports it as "
+    "running. Silence, flat transcript mtime, and idle_notification are never "
+    "evidence of idle -- never start its work yourself on those. "
 )
 
 
@@ -528,10 +535,45 @@ class LaunchHandle:
     #: own shell, and the attempt keeps exactly the two clocks it has today.
     liveness_pid: Optional[int] = None
     environment: Mapping[str, str] = field(default_factory=dict)
+    #: Durable Herdr placement captured from the pane's resolved tab layout.
+    #: Empty only for non-run launchers that intentionally have no workspace/tab.
+    workspace_id: str = ""
+    tab_id: str = ""
+    lane_key: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "environment",
-                           MappingProxyType(dict(self.environment)))
+        object.__setattr__(
+            self, "environment", MappingProxyType(dict(self.environment))
+        )
+
+
+@dataclass(frozen=True)
+class PersistedActorHandle:
+    """The durable identity required to reclaim one interactive actor.
+
+    Labels and prompt bytes are intentionally absent: both are display/content
+    and neither establishes that this process owns the pane.  Resume names the
+    Herdr pane, workspace, tab, and agent ids recorded at launch, then verifies
+    that exact placement and the worktree binding before restoring an in-memory
+    ``LaunchHandle``.
+    """
+
+    correlation_token: str
+    pane_id: str
+    agent_name: str
+    launched_cwd: Path
+    transcript_path: Optional[Path] = None
+    envelope_path: Optional[Path] = None
+    environment: Mapping[str, str] = field(default_factory=dict)
+    workspace_id: str = ""
+    tab_id: str = ""
+    lane_key: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "launched_cwd", Path(self.launched_cwd))
+        object.__setattr__(
+            self, "environment", MappingProxyType(dict(self.environment))
+        )
 
 
 @dataclass(frozen=True)
@@ -548,6 +590,17 @@ class LauncherAdapter(Protocol):
     def reclaim(self, token: str) -> Tuple[LaunchHandle, ...]: ...
     def classify(self, exc: BaseException) -> ErrorClass: ...
     def provision(self, worktree: Path) -> None: ...
+    def resubmit(
+        self,
+        handle: LaunchHandle,
+        prompt_path: Path,
+        *,
+        route: str = "",
+        expected_token: Optional[str] = None,
+        timeout_s: float = 60.0,
+    ) -> LaunchHandle: ...
+    def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle: ...
+    def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None: ...
 
 
 def preflight_launch_prompt(spec: LaunchSpec) -> Optional[int]:
@@ -586,42 +639,47 @@ def preflight_launch_prompt(spec: LaunchSpec) -> Optional[int]:
     if not window or window <= 0:
         raise LaunchRefused(
             LaunchRefusal.PROMPT_UNMEASURED,
-            "{0}:no-window:{1}".format(spec.route, spec.model))
+            "{0}:no-window:{1}".format(spec.route, spec.model),
+        )
     try:
         size = spec.prompt_path.stat().st_size
     except OSError as exc:
         raise LaunchRefused(
             LaunchRefusal.PROMPT_UNMEASURED,
-            "{0}:unreadable-prompt:{1}".format(spec.route, exc)) from exc
+            "{0}:unreadable-prompt:{1}".format(spec.route, exc),
+        ) from exc
     estimate = hb.estimate_tokens_for_bytes(size)
     budget = hb.handoff_budget(window)
     if estimate > budget:
         raise LaunchRefused(
             LaunchRefusal.PROMPT_TOO_LARGE,
-            "{0} bytes is ~{1} tokens against a {2}-token window"
-            " (budget {3})".format(size, estimate, window, budget))
+            "{0} bytes is ~{1} tokens against a {2}-token window (budget {3})".format(
+                size, estimate, window, budget
+            ),
+        )
     return estimate
 
 
 def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
-    """omp's argv, without the node prompt.
+    """Build omp's argv without the node prompt.
 
     OMP must first reach its interactive composer. Passing `@<prompt-path>` as
     a startup positional races that readiness boundary: the process can consume
-    only the prompt's first command (for example `/team`) before the full node
-    instruction is available. `launch` therefore starts an empty interactive
-    session, waits for Herdr to prove it is ready, and only then submits the
-    prompt atomically through `herdr agent prompt`.
+    only the prompt's first command before the full node instruction is
+    available. `launch` therefore starts an empty interactive session, waits
+    for readiness, and submits the complete prompt atomically through Herdr.
 
     Tool policy is the configured `--profile`. `--tools` is a secondary hatch,
-    off unless `spec.restrict_tools` is set. Continuation remains an argv flag;
-    it restores the session before the same post-readiness prompt submission.
+    off unless `spec.restrict_tools` is set.
     """
     if not spec.profile:
         raise ValueError("OMP_PROFILE_REQUIRED")
     argv = [
-        str(binary), "--profile", spec.profile,
-        "--session-dir", str(spec.session_dir),
+        str(binary),
+        "--profile",
+        spec.profile,
+        "--session-dir",
+        str(spec.session_dir),
     ]
     if spec.restrict_tools:
         argv.extend(permissions.route_capability_argv(spec.route))
@@ -640,11 +698,17 @@ def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
     capture — the same evidence level §9.6 already records for
     `--dangerously-skip-permissions` and `--remote-control` beside it.
     """
-    denial = (permissions.route_capability_argv(spec.route)
-              if spec.restrict_tools else ())
+    denial = (
+        permissions.route_capability_argv(spec.route) if spec.restrict_tools else ()
+    )
     return (
-        str(binary), "--model", spec.model, "--effort", spec.effort,
-        "--dangerously-skip-permissions", "--remote-control",
+        str(binary),
+        "--model",
+        spec.model,
+        "--effort",
+        spec.effort,
+        "--dangerously-skip-permissions",
+        "--remote-control",
         *denial,
     )
 
@@ -666,7 +730,7 @@ class TranscriptTailer:
         boundary = chunk.rfind(b"\n")
         if boundary < 0:
             return ()
-        complete = chunk[:boundary + 1]
+        complete = chunk[: boundary + 1]
         self._offset += len(complete)
         parsed = []
         for raw in complete.splitlines():
@@ -682,8 +746,9 @@ class TranscriptTailer:
         return tuple(parsed)
 
     def synthesized_exit(self) -> Tuple[int, str]:
-        envelopes = [row for row in self._records
-                     if row.get("type") == "maestro_envelope"]
+        envelopes = [
+            row for row in self._records if row.get("type") == "maestro_envelope"
+        ]
         if not envelopes:
             return 1, "NO_ENVELOPE"
         if envelopes[-1].get("success") is True:
@@ -700,8 +765,7 @@ class TranscriptTailer:
         at all must not read that 1 as an answer, which is exactly the
         conflation that scored a completed successful turn as a failure.
         """
-        if not any(row.get("type") == "maestro_envelope"
-                   for row in self._records):
+        if not any(row.get("type") == "maestro_envelope" for row in self._records):
             return None
         return self.synthesized_exit()
 
@@ -744,10 +808,12 @@ def _process_group_absent(process_group: int) -> bool:
 
 
 def run_harness_process(
-        argv: Sequence[str], *, cwd: Path,
-        env: Optional[Mapping[str, str]] = None,
-        timeout: Optional[float] = None,
-        cancel_requested: Optional[Callable[[], bool]] = None,
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: Optional[float] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> subprocess.CompletedProcess:
     """Run one bounded, cancellable harness context in its own process group."""
     if cancel_requested is not None and cancel_requested():
@@ -756,8 +822,12 @@ def run_harness_process(
     if env:
         merged.update(env)
     process = subprocess.Popen(
-        list(argv), cwd=str(cwd), env=merged,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        list(argv),
+        cwd=str(cwd),
+        env=merged,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
         start_new_session=True,
     )
     # start_new_session makes the leader PID the group identity. Keep it even
@@ -789,8 +859,7 @@ def run_harness_process(
         except (subprocess.TimeoutExpired, OSError):
             pass
         if not _process_group_absent(process_group):
-            raise HarnessQuiescenceError(
-                "HARNESS_CONTEXT_QUIESCENCE_UNPROVEN") from exc
+            raise HarnessQuiescenceError("HARNESS_CONTEXT_QUIESCENCE_UNPROVEN") from exc
         raise
     quiesce_process_group(process_group, time.monotonic() + 0.1)
     if not _process_group_absent(process_group):
@@ -803,6 +872,11 @@ def run_harness_process(
 def _agent_name(token: str) -> str:
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
     return "maestro-{}".format(digest)
+
+
+def agent_name_for(correlation_token: str) -> str:
+    """The deterministic Herdr agent id persisted with one actor session."""
+    return _agent_name(correlation_token)
 
 
 def _extract(payload: Mapping[str, object], key: str) -> object:
@@ -847,8 +921,7 @@ def _available_shell(payload: Mapping[str, object]) -> bool:
     shell_pid = _optional_int(info.get("shell_pid"))
     pgid = _optional_int(info.get("foreground_process_group_id"))
     proc_pid = _optional_int(proc.get("pid"))
-    if None not in (shell_pid, pgid, proc_pid) and not (
-            shell_pid == pgid == proc_pid):
+    if None not in (shell_pid, pgid, proc_pid) and not (shell_pid == pgid == proc_pid):
         return False
     token = str(proc.get("name") or proc.get("argv0") or "")
     argv = proc.get("argv")
@@ -858,8 +931,7 @@ def _available_shell(payload: Mapping[str, object]) -> bool:
     return base in ("zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh")
 
 
-def pane_liveness_pid(herdr_call: Callable[..., dict],
-                      pane_id: str) -> Optional[int]:
+def pane_liveness_pid(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int]:
     """The pane's foreground process group, for asking whether it still exists.
 
     §7.6 names three liveness signals and §16.3 item 17 records that one of
@@ -928,9 +1000,9 @@ def _is_text_read(args: Sequence[str]) -> bool:
 
 
 def _agent_transcript_path(
-        agent: object,
-        launched_cwd: Optional[Path] = None,
-        environment: Optional[Mapping[str, str]] = None,
+    agent: object,
+    launched_cwd: Optional[Path] = None,
+    environment: Optional[Mapping[str, str]] = None,
 ) -> Optional[Path]:
     """Resolve the transcript Herdr identifies for an agent.
 
@@ -953,17 +1025,21 @@ def _agent_transcript_path(
         return None
     if session.get("kind") == "path":
         return Path(str(value))
-    if (session.get("kind") != "id"
-            or session.get("source") != "herdr:claude"
-            or launched_cwd is None):
+    if (
+        session.get("kind") != "id"
+        or session.get("source") != "herdr:claude"
+        or launched_cwd is None
+    ):
         return None
     supplied = environment or {}
-    config_root = (supplied.get("CLAUDE_CONFIG_DIR")
-                   or os.environ.get("CLAUDE_CONFIG_DIR"))
+    config_root = supplied.get("CLAUDE_CONFIG_DIR") or os.environ.get(
+        "CLAUDE_CONFIG_DIR"
+    )
     root = Path(config_root).expanduser() if config_root else Path.home() / ".claude"
     project = "".join(
         character if character.isalnum() or character == "-" else "-"
-        for character in str(launched_cwd.resolve()))
+        for character in str(launched_cwd.resolve())
+    )
     candidate = root / "projects" / project / (str(value) + ".jsonl")
     return candidate if candidate.is_file() else None
 
@@ -1024,16 +1100,16 @@ def pane_revision(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int
 
 
 def submit_agent_prompt(
-        herdr_call: Callable[..., dict],
-        pane_id: str,
-        text: str,
-        agent_name: Optional[str] = None,
-        *,
-        timeout_s: float = 30.0,
-        until: Sequence[str] = ("idle",),
-        attempts: int = SUBMIT_ATTEMPTS,
-        working_proves: bool = False,
-        sleep: Callable[[float], None] = time.sleep,
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    text: str,
+    agent_name: Optional[str] = None,
+    *,
+    timeout_s: float = 30.0,
+    until: Sequence[str] = ("idle",),
+    attempts: int = SUBMIT_ATTEMPTS,
+    working_proves: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Submit one atomic prompt and prove the agent actually accepted it.
 
@@ -1075,6 +1151,14 @@ def submit_agent_prompt(
     # the structural fact D9 turns on: it says the meter was never readable,
     # which is not the same claim as "the meter did not move".
     readings: List[int] = []
+    # Recovery must not wait on `idle`: the unsubmitted composer is already
+    # idle, so Herdr would return immediately and all Enter attempts would be
+    # spent back-to-back before the composer had another chance to become
+    # interactive. A fast accepted turn is still proven by the revision read
+    # after this wait. Direct sessions may additionally prove `working`.
+    recovery_until = tuple(status for status in until if status != "idle")
+    if not recovery_until:
+        recovery_until = ("working",)
 
     def consumed() -> bool:
         """Whether the pane or agent proves it accepted the offered prompt.
@@ -1101,16 +1185,33 @@ def submit_agent_prompt(
         return False
 
     def wait_for(budget_s: float) -> bool:
-        argv = ["agent", "wait", target, *until_argv,
-                "--timeout", str(int(budget_s * 1000))]
+        recovery_argv: List[str] = []
+        for status in recovery_until:
+            recovery_argv.extend(["--until", status])
+        argv = [
+            "agent",
+            "wait",
+            target,
+            *recovery_argv,
+            "--timeout",
+            str(int(budget_s * 1000)),
+        ]
         try:
             herdr_call(*argv, timeout=budget_s + 5.0)
         except Exception:
             return False
         return consumed()
 
-    argv = ["agent", "prompt", target, text, "--wait", *until_argv,
-            "--timeout", str(int(total_s * 1000))]
+    argv = [
+        "agent",
+        "prompt",
+        target,
+        text,
+        "--wait",
+        *until_argv,
+        "--timeout",
+        str(int(total_s * 1000)),
+    ]
     try:
         herdr_call(*argv, timeout=total_s + 5.0)
         if consumed():
@@ -1142,29 +1243,55 @@ def submit_agent_prompt(
         # the wedged case is.
         raise PromptSubmissionUnobservable(
             "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts".format(
-                target, rounds))
+                target, rounds
+            )
+        )
     raise PromptNotSubmitted(
-        "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(
-            target, rounds))
+        "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(target, rounds)
+    )
+
 
 def wait_for_interactive_agent(
-        herdr_call: Callable[..., dict], name: str, timeout_s: float = 180.0,
+    herdr_call: Callable[..., dict],
+    name: str,
+    timeout_s: float = 180.0,
 ) -> None:
-    """Block until Herdr reports the coding agent idle at its composer.
+    """Block until Herdr reports a reusable coding-agent composer.
 
-    `herdr agent wait` is the documented readiness gate for coding agents. It
-    replaces polling `agent get` for an undocumented `interactive_ready` field
-    and scraping the visible pane for a per-agent banner string.
+    Herdr reports an OMP turn that has rendered its final response as either
+    ``idle`` or ``done``. Both leave the composer available for the next
+    SHA-bound repair prompt; ``working`` still requires the bounded idle wait.
     """
+
+    def ready() -> bool:
+        try:
+            payload = herdr_call("agent", "get", name)
+        except RuntimeError:
+            return False
+        agent = _extract(payload, "agent")
+        if not isinstance(agent, dict):
+            return False
+        status = agent.get("agent_status") or agent.get("status")
+        return status in ("idle", "done")
+
+    if ready():
+        return
     timeout_ms = max(1, int(max(0.001, timeout_s) * 1000))
     try:
         herdr_call(
-            "agent", "wait", name, "--until", "idle",
-            "--timeout", str(timeout_ms),
-            timeout=timeout_s + 5.0)
+            "agent",
+            "wait",
+            name,
+            "--until",
+            "idle",
+            "--timeout",
+            str(timeout_ms),
+            timeout=timeout_s + 5.0,
+        )
     except RuntimeError as exc:
-        raise RuntimeError(
-            "AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
+        if ready():
+            return
+        raise RuntimeError("AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
 
 
 #: How long `launch` waits for Herdr to report the agent's transcript.
@@ -1175,11 +1302,13 @@ TRANSCRIPT_PATH_TIMEOUT_S = 60.0
 
 
 def wait_for_agent_transcript(
-        herdr_call: Callable[..., dict], name: str, timeout_s: float,
-        poll_interval_s: float = 0.25,
-        sleep: Callable[[float], None] = time.sleep,
-        launched_cwd: Optional[Path] = None,
-        environment: Optional[Mapping[str, str]] = None,
+    herdr_call: Callable[..., dict],
+    name: str,
+    timeout_s: float,
+    poll_interval_s: float = 0.25,
+    sleep: Callable[[float], None] = time.sleep,
+    launched_cwd: Optional[Path] = None,
+    environment: Optional[Mapping[str, str]] = None,
 ) -> Optional[Path]:
     """Poll until Herdr's typed session value resolves to a transcript.
 
@@ -1199,16 +1328,20 @@ def wait_for_agent_transcript(
             # deadline rather than converting it into a decision.
             payload = {}
         transcript = _agent_transcript_path(
-            _extract(payload, "agent"), launched_cwd, environment)
+            _extract(payload, "agent"), launched_cwd, environment
+        )
         if transcript is not None:
             return transcript
         if time.monotonic() >= deadline:
             return None
         sleep(poll_interval_s)
 
+
 def _wait_for_available_shell(
-        herdr_call: Callable[..., dict], pane_id: str, timeout_s: float = 30.0,
-        settle_polls: int = 5,
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    timeout_s: float = 30.0,
+    settle_polls: int = 5,
 ) -> None:
     """
     Worth waiting for, and nothing more. This used to *gate* the launch,
@@ -1253,10 +1386,11 @@ AGENT_START_BUSY_POLL_S = 0.5
 
 
 def _start_agent_when_free(
-        start: Callable[[], dict], window_s: float = AGENT_START_BUSY_WINDOW_S,
-        poll_s: float = AGENT_START_BUSY_POLL_S,
-        sleep: Callable[[float], None] = time.sleep,
-        monotonic: Callable[[], float] = time.monotonic,
+    start: Callable[[], dict],
+    window_s: float = AGENT_START_BUSY_WINDOW_S,
+    poll_s: float = AGENT_START_BUSY_POLL_S,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict:
     """Offer the pane to `agent start` until herdr stops calling it busy.
 
@@ -1290,8 +1424,7 @@ def _start_agent_when_free(
         try:
             return start()
         except HerdrCallError as exc:
-            if (exc.code not in TRANSIENT_HERDR_ERROR_CODES
-                    or monotonic() >= deadline):
+            if exc.code not in TRANSIENT_HERDR_ERROR_CODES or monotonic() >= deadline:
                 raise
             sleep(poll_s)
             # The poll is spent *inside* the window, not on top of it. Checking
@@ -1319,8 +1452,7 @@ class _TabLayout:
 
     __slots__ = ("tab_id", "panes", "claimed", "cols", "lock")
 
-    def __init__(self, tab_id: str, panes: List[Optional[str]],
-                 claimed: int) -> None:
+    def __init__(self, tab_id: str, panes: List[Optional[str]], claimed: int) -> None:
         self.tab_id = tab_id
         #: Grid slot -> pane id, positional. A reaped pane leaves `None`
         #: behind rather than shifting its neighbours, because the slots after
@@ -1338,10 +1470,10 @@ class _TabLayout:
         """The nearest surviving pane to `index`, searching back then forward.
 
         The grid's chosen parent may have been reaped since it was created --
-        a node's builder pane is closed when its attempt settles, and its
-        reviewer arrives afterwards. Falling back to the nearest live pane
-        keeps the split inside this node's tab, which is the guarantee that
-        matters, and costs only the exactness of one cell. Backwards first
+        a lane's earlier pane may be closed before its later actor arrives.
+        Falling back to the nearest live pane keeps the split inside this
+        lane's tab, which is the guarantee that matters, and costs only the
+        exactness of one cell. Backwards first
         because an earlier slot is the parent the grid would have chosen next;
         forwards after, because refusing a launch while a live pane sits one
         slot later would be a refusal about bookkeeping rather than about
@@ -1370,10 +1502,16 @@ class _TabLayout:
 
 
 class HerdrLauncher:
-    def __init__(self, *, herdr_path: Path, omp_path: Path, claude_path: Path,
-                 admitted_routes: AdmittedRouteSet,
-                 provision_argv: Sequence[str] = (),
-                 workspace_label: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        herdr_path: Path,
+        omp_path: Path,
+        claude_path: Path,
+        admitted_routes: AdmittedRouteSet,
+        provision_argv: Sequence[str] = (),
+        workspace_label: str = "",
+    ) -> None:
         if not isinstance(admitted_routes, AdmittedRouteSet):
             raise TypeError("VERIFIED_ADMITTED_ROUTES_REQUIRED")
         self.herdr_path = Path(herdr_path)
@@ -1423,23 +1561,34 @@ class HerdrLauncher:
         #: herdr refuses, correctly (§3.5 F2).
         self._seed_tab_id: str = ""
 
-    def _herdr(self, *args: str, env: Optional[Mapping[str, str]] = None,
-               timeout: float = 30.0) -> dict:
+    @property
+    def workspace_id(self) -> str:
+        """The immutable Herdr workspace bound to this run launcher."""
+        with self._handles_lock:
+            return self._workspace_id
+
+    def _herdr(
+        self, *args: str, env: Optional[Mapping[str, str]] = None, timeout: float = 30.0
+    ) -> dict:
         merged = dict(os.environ)
         if env:
             merged.update(env)
         try:
             result = subprocess.run(
-                [str(self.herdr_path), *args], capture_output=True, text=True,
-                env=merged, timeout=timeout, check=False,
+                [str(self.herdr_path), *args],
+                capture_output=True,
+                text=True,
+                env=merged,
+                timeout=timeout,
+                check=False,
             )
         except (OSError, ValueError) as exc:
             raise RuntimeError("LAUNCH_REFUSED:{}".format(exc)) from exc
         if result.returncode != 0:
             refusal = (result.stderr or result.stdout).strip()
             raise HerdrCallError(
-                "LAUNCH_REFUSED:{}".format(refusal[-400:]),
-                herdr_error_code(refusal))
+                "LAUNCH_REFUSED:{}".format(refusal[-400:]), herdr_error_code(refusal)
+            )
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -1490,13 +1639,14 @@ class HerdrLauncher:
                 except BaseException as exc:
                     raise LaunchRefused(
                         LaunchRefusal.SPLIT_PARENT_UNRESOLVED,
-                        "{0}: {1}".format(type(exc).__name__, exc)) from exc
+                        "{0}: {1}".format(type(exc).__name__, exc),
+                    ) from exc
                 pane = _extract(payload, "pane")
-                pane_id = (pane.get("pane_id")
-                           if isinstance(pane, dict) else None)
+                pane_id = pane.get("pane_id") if isinstance(pane, dict) else None
                 if not pane_id:
                     raise LaunchRefused(
-                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED, "NO_PANE_ID")
+                        LaunchRefusal.SPLIT_PARENT_UNRESOLVED, "NO_PANE_ID"
+                    )
                 self._split_parent_id = str(pane_id)
                 self._workspace_id = workspace_of(self._split_parent_id)
             return self._split_parent_id
@@ -1521,19 +1671,27 @@ class HerdrLauncher:
             if self._workspace_id:
                 return self._workspace_id
             try:
-                payload = self._herdr("workspace", "create",
-                                      "--label", self.workspace_label,
-                                      "--no-focus", env=environment)
+                payload = self._herdr(
+                    "workspace",
+                    "create",
+                    "--label",
+                    self.workspace_label,
+                    "--no-focus",
+                    env=environment,
+                )
             except BaseException as exc:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_UNRESOLVED,
-                    "{0}: {1}".format(type(exc).__name__, exc)) from exc
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                ) from exc
             workspace = _extract(payload, "workspace")
-            workspace_id = (workspace.get("workspace_id")
-                            if isinstance(workspace, dict) else None)
+            workspace_id = (
+                workspace.get("workspace_id") if isinstance(workspace, dict) else None
+            )
             if not workspace_id:
-                raise LaunchRefused(LaunchRefusal.WORKSPACE_UNRESOLVED,
-                                    "NO_WORKSPACE_ID")
+                raise LaunchRefused(
+                    LaunchRefusal.WORKSPACE_UNRESOLVED, "NO_WORKSPACE_ID"
+                )
             self._workspace_id = str(workspace_id)
             seed = _extract(payload, "tab")
             if isinstance(seed, dict) and seed.get("tab_id"):
@@ -1556,9 +1714,14 @@ class HerdrLauncher:
         except BaseException:
             return
 
-    def _tab_create(self, workspace_id: str, label: str, worktree: Path,
-                    env_flags: Sequence[str],
-                    environment: Mapping[str, str]) -> dict:
+    def _tab_create(
+        self,
+        workspace_id: str,
+        label: str,
+        worktree: Path,
+        env_flags: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> dict:
         """One `tab create`, raising `_WorkspaceGone` when the id is dead.
 
         Keyed on herdr's typed `error.code`, never on the message text: §1.2
@@ -1572,25 +1735,46 @@ class HerdrLauncher:
         """
         try:
             return self._herdr(
-                "tab", "create", "--workspace", workspace_id,
-                "--label", label, "--cwd", str(worktree), "--no-focus",
-                *env_flags, env=environment)
+                "tab",
+                "create",
+                "--workspace",
+                workspace_id,
+                "--label",
+                label,
+                "--cwd",
+                str(worktree),
+                "--no-focus",
+                *env_flags,
+                env=environment,
+            )
         except HerdrCallError as exc:
             if _herdr_error_code_of(exc) != "workspace_not_found":
                 raise
-            if self._workspace_id == workspace_id:
-                self._workspace_id = ""
+            self._invalidate_workspace_layout(workspace_id)
             raise _WorkspaceGone(str(exc)) from exc
 
-    def _tab_for(self, spec: LaunchSpec, worktree: Path,
-                 env_flags: Sequence[str],
-                 environment: Mapping[str, str]) -> _TabLayout:
-        """The tab this node's panes live in, created on its first launch.
+    def _invalidate_workspace_layout(self, workspace_id: str) -> None:
+        """Release placement state whose workspace Herdr has proved absent."""
+        with self._handles_lock:
+            if self._workspace_id != workspace_id:
+                return
+            self._workspace_id = ""
+            self._seed_tab_id = ""
+            self._tabs.clear()
 
-        One tab per node, labelled with the node's own display name, is what
-        S2 buys: the sidebar becomes an index of the nodes in flight instead
-        of a flat list of panes identifiable only by working directory, and a
-        node's builder and reviewer are neighbours rather than strangers.
+    def _tab_for(
+        self,
+        spec: LaunchSpec,
+        worktree: Path,
+        env_flags: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> _TabLayout:
+        """The tab this lane's panes live in, created on its first launch.
+
+        One tab per lane, labelled with the authored build-lane name, is what
+        S2 buys: the sidebar becomes an index of the lanes in flight instead
+        of a flat list of panes identifiable only by working directory. Its
+        tester, builder, and reviewer are neighbours rather than strangers.
 
         The tab is created with the launch's `--cwd` and `--env`, so its root
         pane is a usable shell for the first agent rather than a spare cell.
@@ -1599,8 +1783,23 @@ class HerdrLauncher:
         `_split_parent` is: two concurrent launches of one node must produce
         one tab, and a tab created twice is two rectangles for one node.
         """
-        group = spec.pane_group or ""
+        group = spec.lane_key or ""
         with self._handles_lock:
+            requested_workspace = str(spec.workspace_label or "")
+            if (
+                self.workspace_label
+                and requested_workspace
+                and requested_workspace != self.workspace_label
+            ):
+                raise LaunchRefused(
+                    LaunchRefusal.WORKSPACE_DRIFT,
+                    "workspace label {} != {}".format(
+                        requested_workspace, self.workspace_label
+                    ),
+                    pane_created=False,
+                )
+            if requested_workspace and not self.workspace_label:
+                self.workspace_label = requested_workspace
             existing = self._tabs.get(group)
             if existing is not None and not existing.empty():
                 return existing
@@ -1614,10 +1813,11 @@ class HerdrLauncher:
                 self._tabs[group] = layout
                 return layout
             workspace_id = self._run_workspace(environment)
-            label = display_name(group) if group else self.workspace_label
+            label = str(spec.lane_label or group or self.workspace_label)
             try:
                 payload = self._tab_create(
-                    workspace_id, label, worktree, env_flags, environment)
+                    workspace_id, label, worktree, env_flags, environment
+                )
             except _WorkspaceGone:
                 # The cached workspace no longer exists. Re-resolve once and
                 # ask again: `_run_workspace` creates a fresh one, so the
@@ -1629,7 +1829,8 @@ class HerdrLauncher:
                 workspace_id = self._run_workspace(environment)
                 try:
                     payload = self._tab_create(
-                        workspace_id, label, worktree, env_flags, environment)
+                        workspace_id, label, worktree, env_flags, environment
+                    )
                 except _WorkspaceGone as exc:
                     # Twice in a row is not a stale cache. Something is
                     # destroying workspaces as fast as this makes them, and a
@@ -1637,31 +1838,37 @@ class HerdrLauncher:
                     # answered the same way twice.
                     raise LaunchRefused(
                         LaunchRefusal.TAB_UNRESOLVED,
-                        "workspace vanished twice: {0}".format(exc)) from exc
+                        "workspace vanished twice: {0}".format(exc),
+                    ) from exc
                 except BaseException as exc:
                     raise LaunchRefused(
                         LaunchRefusal.TAB_UNRESOLVED,
-                        "{0}: {1}".format(type(exc).__name__, exc)) from exc
+                        "{0}: {1}".format(type(exc).__name__, exc),
+                    ) from exc
             except BaseException as exc:
                 raise LaunchRefused(
                     LaunchRefusal.TAB_UNRESOLVED,
-                    "{0}: {1}".format(type(exc).__name__, exc)) from exc
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                ) from exc
             tab = _extract(payload, "tab")
             root = _extract(payload, "root_pane")
             tab_id = tab.get("tab_id") if isinstance(tab, dict) else None
             root_id = root.get("pane_id") if isinstance(root, dict) else None
             if not tab_id or not root_id:
                 raise LaunchRefused(LaunchRefusal.TAB_UNRESOLVED, "NO_TAB")
-            layout = _TabLayout(tab_id=str(tab_id), panes=[str(root_id)],
-                                claimed=0)
+            layout = _TabLayout(tab_id=str(tab_id), panes=[str(root_id)], claimed=0)
             self._tabs[group] = layout
             self._close_seed_tab(environment)
             return layout
 
-    def _acquire_pane(self, spec: LaunchSpec, worktree: Path,
-                      env_flags: Sequence[str],
-                      environment: Mapping[str, str]) -> str:
-        """One pane for this launch, in this node's tab, at its grid slot.
+    def _acquire_pane(
+        self,
+        spec: LaunchSpec,
+        worktree: Path,
+        env_flags: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> Tuple[str, _TabLayout]:
+        """One pane for this launch, in this lane's tab, at its grid slot.
 
         The slot is reserved and the split taken under the tab's own lock, so
         launch *k* into a tab always finds slot *k-1* already created. The
@@ -1674,55 +1881,84 @@ class HerdrLauncher:
         column count that shrank would ask for a grid the existing panes are
         not in.
         """
-        layout = self._tab_for(spec, worktree, env_flags, environment)
-        with layout.lock:
-            index = layout.claimed
-            layout.claimed += 1
-            declared = max(int(spec.pane_group_size or 0), index + 1)
-            layout.cols = max(layout.cols, grid_for(declared)[1])
-            if index < len(layout.panes) and layout.panes[index]:
-                # The tab's own root pane, already opened with this launch's
-                # working directory and redirection. Nothing to split.
-                return str(layout.panes[index])
-            parent_index, direction = split_plan(index, layout.cols)
-            parent_id = layout.nearest_live(parent_index)
-            if parent_id is None:
-                raise LaunchRefused(LaunchRefusal.TAB_UNRESOLVED,
-                                    "NO_LIVE_PARENT")
-            split = self._herdr("pane", "split", parent_id,
-                                "--direction", direction,
-                                "--cwd", str(worktree), "--no-focus",
-                                *env_flags, env=environment)
-            pane = _extract(split, "pane")
-            if not isinstance(pane, dict) or not pane.get("pane_id"):
-                # No id means nothing to close: herdr may hold a pane it did
-                # not report, and an unreapable pane is exactly the case
-                # `pane_created` exists to keep honest.
-                raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
-            pane_id = str(pane["pane_id"])
-            while len(layout.panes) <= index:
-                layout.panes.append(None)
-            layout.panes[index] = pane_id
-            return pane_id
+        for recovery in range(2):
+            layout = self._tab_for(spec, worktree, env_flags, environment)
+            with layout.lock:
+                index = layout.claimed
+                layout.claimed += 1
+                declared = max(int(spec.pane_group_size or 0), index + 1)
+                layout.cols = max(layout.cols, grid_for(declared)[1])
+                if index < len(layout.panes) and layout.panes[index]:
+                    # The tab's own root pane, already opened with this launch's
+                    # working directory and redirection. Nothing to split.
+                    return str(layout.panes[index]), layout
+                parent_index, direction = split_plan(index, layout.cols)
+                parent_id = layout.nearest_live(parent_index)
+                if parent_id is None:
+                    raise LaunchRefused(LaunchRefusal.TAB_UNRESOLVED, "NO_LIVE_PARENT")
+                try:
+                    split = self._herdr(
+                        "pane",
+                        "split",
+                        parent_id,
+                        "--direction",
+                        direction,
+                        "--cwd",
+                        str(worktree),
+                        "--no-focus",
+                        *env_flags,
+                        env=environment,
+                    )
+                except HerdrCallError as exc:
+                    if _herdr_error_code_of(exc) != "workspace_not_found":
+                        raise
+                    vanished_workspace = workspace_of(parent_id)
+                else:
+                    pane = _extract(split, "pane")
+                    if not isinstance(pane, dict) or not pane.get("pane_id"):
+                        # No id means nothing to close: herdr may hold a pane it did
+                        # not report, and an unreapable pane is exactly the case
+                        # `pane_created` exists to keep honest.
+                        raise LaunchRefused(LaunchRefusal.NO_PANE, pane_created=True)
+                    pane_id = str(pane["pane_id"])
+                    while len(layout.panes) <= index:
+                        layout.panes.append(None)
+                    layout.panes[index] = pane_id
+                    return pane_id, layout
+            # `workspace_not_found` is proof that every cached tab and slot in
+            # this workspace is stale. Drop them together before re-resolving:
+            # keeping the claimed split slot would make the fresh tab start at
+            # its second cell, and keeping the old layout would re-split its
+            # dead root on the next launch.
+            self._invalidate_workspace_layout(vanished_workspace)
+            if recovery:
+                raise LaunchRefused(
+                    LaunchRefusal.TAB_UNRESOLVED,
+                    "workspace vanished twice while splitting",
+                )
+        raise AssertionError("UNREACHABLE")
 
-    def _label_pane(self, pane_id: str, spec: LaunchSpec,
-                    environment: Mapping[str, str]) -> None:
-        """Name the pane after the node it runs, once, at launch.
+    def _label_pane(
+        self, pane_id: str, spec: LaunchSpec, environment: Mapping[str, str]
+    ) -> None:
+        """Name the pane after its role and generation, once, at launch.
+
+        The lane is already the tab label. Repeating it on every pane hides the
+        part an operator needs to distinguish inside that tab: tester, builder,
+        or reviewer, and the actor generation currently occupying the pane.
 
         `label` is herdr's own durable per-pane field and survives the agent
         taking over the terminal -- verified against the real binary: a pane
         renamed and then given a `claude` agent still reports its label while
-        `terminal_title` reads `Claude Code`. Without it a pane is identifiable
-        only by its working directory, which is how two panes were lost track
-        of in one session.
+        `terminal_title` reads `Claude Code`.
 
         Display-only, so a refused rename is dropped rather than spent as a
         launch refusal: a run that stops because a pane could not be named has
         traded the work for the caption.
         """
-        stem = display_name(spec.pane_group) if spec.pane_group else ""
         role = str(spec.pane_role or "")
-        label = "-".join(part for part in (stem, role) if part)
+        attempt = "a{}".format(spec.attempt_no) if spec.attempt_no is not None else ""
+        label = "-".join(part for part in (role, attempt) if part)
         if not label:
             return
         try:
@@ -1742,8 +1978,7 @@ class HerdrLauncher:
                 if layout.forget(pane_id):
                     return
 
-    def _reap_pane(self, pane_id: str,
-                   environment: Mapping[str, str]) -> bool:
+    def _reap_pane(self, pane_id: str, environment: Mapping[str, str]) -> bool:
         """Close one pane a failed launch is about to abandon; say if it went.
 
         The return value is the whole point. Every post-split failure path in
@@ -1775,7 +2010,8 @@ class HerdrLauncher:
                 if str(exc) != "OMP_PROFILE_REQUIRED":
                     raise
                 raise LaunchRefused(
-                    LaunchRefusal.OMP_PROFILE_REQUIRED, spec.route) from exc
+                    LaunchRefusal.OMP_PROFILE_REQUIRED, spec.route
+                ) from exc
         elif spec.route == "claude":
             route_argv = build_claude_argv(self.claude_path, spec)
         else:
@@ -1795,7 +2031,22 @@ class HerdrLauncher:
         # Placement, in three steps that are each a property of the run rather
         # than of whatever holds focus: the run's own workspace, this node's
         # own tab inside it, and this agent's own grid slot inside that tab.
-        pane_id = self._acquire_pane(spec, worktree, env_flags, environment)
+        pane_id, layout = self._acquire_pane(spec, worktree, env_flags, environment)
+        with layout.lock:
+            pane_is_in_layout = pane_id in layout.panes
+            placement_tab_id = layout.tab_id
+        if not pane_is_in_layout:
+            closed = self._reap_pane(pane_id, environment)
+            raise LaunchRefused(
+                LaunchRefusal.TAB_UNRESOLVED,
+                "ACQUIRED_PANE_NOT_IN_LAYOUT",
+                pane_created=not closed,
+            )
+        placement_workspace_id = (
+            workspace_of(placement_tab_id)
+            or self._workspace_id
+            or workspace_of(pane_id)
+        )
         # Every pane of one run belongs to one workspace. A split of a fixed
         # parent lands beside that parent, so a child reporting a different
         # workspace means the placement escaped — the shape that scattered one
@@ -1809,29 +2060,63 @@ class HerdrLauncher:
             raise LaunchRefused(
                 LaunchRefusal.WORKSPACE_DRIFT,
                 "{0}!={1}".format(landed, self._workspace_id),
-                pane_created=not closed)
+                pane_created=not closed,
+            )
         self._label_pane(pane_id, spec, environment)
         name = _agent_name(spec.correlation_token)
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
-        actual = (Path(str(bound.get("cwd"))).resolve()
-                  if isinstance(bound, dict) and bound.get("cwd") else None)
+        if placement_tab_id:
+            bound_tab_id = str(bound.get("tab_id") if isinstance(bound, dict) else "")
+            if bound_tab_id != placement_tab_id:
+                closed = self._reap_pane(pane_id, environment)
+                raise LaunchRefused(
+                    LaunchRefusal.TAB_UNRESOLVED,
+                    "{}!={}".format(bound_tab_id, placement_tab_id),
+                    pane_created=not closed,
+                )
+            if workspace_of(bound_tab_id) != placement_workspace_id:
+                closed = self._reap_pane(pane_id, environment)
+                raise LaunchRefused(
+                    LaunchRefusal.TAB_UNRESOLVED,
+                    "{}!={}".format(workspace_of(bound_tab_id), placement_workspace_id),
+                    pane_created=not closed,
+                )
+        actual = (
+            Path(str(bound.get("cwd"))).resolve()
+            if isinstance(bound, dict) and bound.get("cwd")
+            else None
+        )
         if actual != worktree:
             closed = self._reap_pane(pane_id, environment)
             raise LaunchRefused(
                 LaunchRefusal.BINDING_MISMATCH,
-                "{}!={}".format(actual, worktree), pane_created=not closed)
+                "{}!={}".format(actual, worktree),
+                pane_created=not closed,
+            )
         try:
             _wait_for_available_shell(
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
-                pane_id)
+                pane_id,
+            )
             started = _start_agent_when_free(
                 lambda: self._herdr(
-                    "agent", "start", name, "--kind", spec.route,
-                    "--pane", pane_id, "--timeout", "180000",
-                    "--", *route_argv[1:],
-                    env=environment, timeout=185.0),
-                window_s=self.agent_start_busy_window_s)
+                    "agent",
+                    "start",
+                    name,
+                    "--kind",
+                    spec.route,
+                    "--pane",
+                    pane_id,
+                    "--timeout",
+                    "180000",
+                    "--",
+                    *route_argv[1:],
+                    env=environment,
+                    timeout=185.0,
+                ),
+                window_s=self.agent_start_busy_window_s,
+            )
         except BaseException as exc:
             # Reap first, then state what the reap achieved. Re-raising
             # herdr's own `HerdrCallError` from here was the 2026-08-18
@@ -1847,80 +2132,412 @@ class HerdrLauncher:
             raise LaunchRefused(
                 LaunchRefusal.AGENT_START_REFUSED,
                 "{0}: {1}".format(type(exc).__name__, exc),
-                pane_created=not closed) from exc
+                pane_created=not closed,
+            ) from exc
         current = self._herdr("pane", "get", pane_id, env=environment)
         bound = _extract(current, "pane")
-        actual = (Path(str(bound.get("cwd"))).resolve()
-                  if isinstance(bound, dict) and bound.get("cwd") else None)
+        actual = (
+            Path(str(bound.get("cwd"))).resolve()
+            if isinstance(bound, dict) and bound.get("cwd")
+            else None
+        )
         if actual != worktree:
             # An agent is running in this pane, so the reap is `cancel`'s
             # (process group first, then the pane) rather than a bare close.
             # It raises `HarnessQuiescenceError` when it cannot finish, which
             # is the one case here that must not be restated as a refusal:
             # something is still owned and the caller has to know.
-            self.cancel(LaunchHandle(spec.correlation_token, pane_id, name,
-                                     actual or Path("/"),
-                                     environment=environment),
-                        time.monotonic() + 1.0)
+            self.cancel(
+                LaunchHandle(
+                    spec.correlation_token,
+                    pane_id,
+                    name,
+                    actual or Path("/"),
+                    environment=environment,
+                ),
+                time.monotonic() + 1.0,
+            )
             raise LaunchRefused(
                 LaunchRefusal.BINDING_MISMATCH,
-                "{}!={}".format(actual, worktree), pane_created=False)
+                "{}!={}".format(actual, worktree),
+                pane_created=False,
+            )
         agent = _extract(started, "agent")
         transcript = _agent_transcript_path(agent, worktree, environment)
-        handle = LaunchHandle(spec.correlation_token, pane_id, name, worktree,
-                              transcript_path=transcript,
-                              envelope_path=spec.envelope_path,
-                              environment=environment)
+        handle = LaunchHandle(
+            spec.correlation_token,
+            pane_id,
+            name,
+            worktree,
+            transcript_path=transcript,
+            envelope_path=spec.envelope_path,
+            environment=environment,
+            workspace_id=placement_workspace_id,
+            tab_id=placement_tab_id,
+            lane_key=spec.lane_key,
+        )
         with self._handles_lock:
             self._handles[spec.correlation_token] = handle
             self._proven_absent.pop(spec.correlation_token, None)
             if transcript:
                 self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
         try:
-            wait_for_interactive_agent(
-                lambda *args, **kwargs: self._herdr(
-                    *args, env=environment, **kwargs),
-                name)
             # Every coding route receives the complete node instruction only
-            # after its composer is ready. Startup delivery can race OMP
+            # after its composer is ready. Startup delivery can race agent
             # initialization and execute only the prompt's leading command.
+            wait_for_interactive_agent(
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                name,
+            )
             bootstrap = "@{0}".format(spec.prompt_path.resolve())
+
             submit_agent_prompt(
-                lambda *args, **kwargs: self._herdr(
-                    *args, env=environment, **kwargs),
-                pane_id, bootstrap, name, timeout_s=60.0,
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                pane_id,
+                bootstrap,
+                name,
+                timeout_s=60.0,
                 until=("working", "idle"),
-                working_proves=spec.route == "claude")
+                working_proves=True,
+            )
             if transcript is None:
                 transcript = wait_for_agent_transcript(
                     lambda *args, **kwargs: self._herdr(
-                        *args, env=environment, **kwargs),
-                    name, TRANSCRIPT_PATH_TIMEOUT_S, launched_cwd=worktree,
-                    environment=environment)
+                        *args, env=environment, **kwargs
+                    ),
+                    name,
+                    TRANSCRIPT_PATH_TIMEOUT_S,
+                    launched_cwd=worktree,
+                    environment=environment,
+                )
                 if transcript is not None:
                     object.__setattr__(handle, "transcript_path", transcript)
                     with self._handles_lock:
                         self._tailers[spec.correlation_token] = TranscriptTailer(
-                            transcript)
+                            transcript
+                        )
 
             # The pane's foreground group is meaningful only after submission.
             liveness_pid = pane_liveness_pid(
-                lambda *args, **kwargs: self._herdr(
-                    *args, env=environment, **kwargs),
-                pane_id)
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                pane_id,
+            )
             if liveness_pid is not None:
                 object.__setattr__(handle, "liveness_pid", liveness_pid)
             return handle
         except BaseException as exc:
-            # A started agent is owned execution. Cancel it before returning a
-            # launch refusal; cancellation failure remains a quiescence error.
+            # Submission proof is only an observation of the launch path. The
+            # attempt's own terminal declaration outranks it, exactly as it
+            # outranks stale pane status in `poll`. A fast agent can accept,
+            # finish, and write its envelope while Herdr's revision meter
+            # remains static; cancelling here would discard completed work and
+            # relaunch the original assignment from its base commit.
+            if self._declared_result(handle) is not None:
+                return handle
+            # No declaration exists, so a started agent is still owned
+            # execution. Cancel it before returning a launch refusal;
+            # cancellation failure remains a quiescence error.
             self.cancel(handle, time.monotonic() + 5.0)
             if not isinstance(exc, Exception):
                 raise
             raise LaunchRefused(
                 LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
                 "{0}: {1}".format(type(exc).__name__, exc),
-                pane_created=False) from exc
+                pane_created=False,
+            ) from exc
+
+    def _verified_handle_binding(self, handle: LaunchHandle) -> None:
+        """Prove a registered handle still names its pane, actor, and cwd.
+
+        A resubmission must never follow a label or an in-memory convenience
+        map alone.  Herdr ids plus the pane cwd are the ownership proof; a
+        mismatch means a replacement session may have reused display text and
+        must not receive this lane's repair prompt.
+        """
+        token = str(handle.correlation_token or "")
+        if not token or handle.agent_name != _agent_name(token):
+            raise HandleAdoptionRefused("HANDLE_TOKEN_MISMATCH", token)
+        with self._handles_lock:
+            if self._handles.get(token) is not handle:
+                raise HandleAdoptionRefused("HANDLE_NOT_OWNED", token)
+        try:
+            pane_payload = self._herdr(
+                "pane", "get", handle.pane_id, env=handle.environment
+            )
+        except HerdrCallError as exc:
+            if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
+                raise HandleAbsent("PANE_ABSENT", handle.pane_id) from exc
+            raise
+        pane = _extract(pane_payload, "pane")
+        if (
+            not isinstance(pane, dict)
+            or str(pane.get("pane_id") or "") != handle.pane_id
+        ):
+            raise HandleAdoptionRefused("PANE_ID_MISMATCH", handle.pane_id)
+        cwd = pane.get("cwd")
+        actual = Path(str(cwd)).resolve() if cwd else None
+        if actual != handle.launched_cwd.resolve():
+            raise HandleAdoptionRefused(
+                "PANE_CWD_MISMATCH", "{}!={}".format(actual, handle.launched_cwd)
+            )
+        try:
+            agent_payload = self._herdr(
+                "agent", "get", handle.agent_name, env=handle.environment
+            )
+        except HerdrCallError as exc:
+            if exc.code == AGENT_NOT_FOUND:
+                raise HandleAbsent("AGENT_ABSENT", handle.agent_name) from exc
+            raise
+        agent = _extract(agent_payload, "agent")
+        if not isinstance(agent, dict):
+            raise HandleAbsent("AGENT_ABSENT", handle.agent_name)
+        if str(agent.get("name") or "") != handle.agent_name:
+            raise HandleAdoptionRefused("AGENT_ID_MISMATCH", handle.agent_name)
+        agent_pane = agent.get("pane_id")
+        if agent_pane is not None and str(agent_pane) != handle.pane_id:
+            raise HandleAdoptionRefused(
+                "AGENT_PANE_MISMATCH", "{}!={}".format(agent_pane, handle.pane_id)
+            )
+
+    def resubmit(
+        self,
+        handle: LaunchHandle,
+        prompt_path: Path,
+        *,
+        route: str = "",
+        expected_token: Optional[str] = None,
+        timeout_s: float = 60.0,
+    ) -> LaunchHandle:
+        """Submit one new prompt to an already-owned interactive actor.
+
+        The original pane, actor name, correlation token, and worktree binding
+        are re-read before calling Herdr.  This deliberately returns the
+        existing handle: a correction cycle has one actor session, rather than
+        a sequence of visually similar replacement panes.
+        """
+        if expected_token is not None and handle.correlation_token != expected_token:
+            raise HandleAdoptionRefused(
+                "HANDLE_TOKEN_MISMATCH",
+                "{}!={}".format(handle.correlation_token, expected_token),
+            )
+        prompt = Path(prompt_path)
+        if not prompt.is_file():
+            raise HandleAdoptionRefused("PROMPT_PATH_MISSING", str(prompt))
+        if route:
+            text = prompt.read_text(encoding="utf-8")
+            prepared = prepare_route_prompt_text(route, text)
+            if prepared != text:
+                prompt.write_text(prepared, encoding="utf-8")
+        self._verified_handle_binding(handle)
+        wait_for_interactive_agent(
+            lambda *args, **kwargs: self._herdr(
+                *args, env=handle.environment, **kwargs
+            ),
+            handle.agent_name,
+        )
+        submit_agent_prompt(
+            lambda *args, **kwargs: self._herdr(
+                *args, env=handle.environment, **kwargs
+            ),
+            handle.pane_id,
+            "@{}".format(prompt.resolve()),
+            handle.agent_name,
+            timeout_s=timeout_s,
+            until=("working", "idle"),
+            working_proves=True,
+        )
+        return handle
+
+    def _prove_tab_contains_pane(
+        self,
+        workspace_id: str,
+        tab_id: str,
+        pane_id: str,
+        environment: Mapping[str, str],
+    ) -> None:
+        """Prove a pane's reported tab remains live without reading focus.
+
+        `pane get` already reported `tab_id` for this exact pane; `tab list`
+        proves that tab still exists in the same workspace.  Both facts are
+        required before an absent agent may cause replacement, because opening
+        a replacement in a freshly-created tab would silently split a lane.
+        """
+        try:
+            payload = self._herdr(
+                "tab", "list", "--workspace", workspace_id, env=environment
+            )
+        except HerdrCallError as exc:
+            if exc.code in ("workspace_not_found", "tab_not_found"):
+                raise HandleAdoptionRefused("TAB_ABSENT", tab_id) from exc
+            raise
+        tabs = _extract(payload, "tabs")
+        if not isinstance(tabs, list):
+            raise HandleAdoptionRefused("TAB_LIST_UNPROVEN", tab_id)
+        if any(
+            isinstance(tab, dict) and str(tab.get("tab_id") or "") == tab_id
+            for tab in tabs
+        ):
+            return
+        raise HandleAdoptionRefused("TAB_ABSENT", tab_id)
+
+    def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle:
+        """Restore a handle only when persisted Herdr ids still prove ownership.
+
+        Absence is a distinct typed outcome that allows the durable lifecycle
+        to replace a generation.  Transport/protocol failures and identity
+        mismatches stay refusals: neither is evidence that the old actor died.
+        """
+        token = str(persisted.correlation_token or "")
+        pane_id = str(persisted.pane_id or "")
+        agent_name = str(persisted.agent_name or "")
+        if (
+            not token
+            or not pane_id
+            or not agent_name
+            or agent_name != _agent_name(token)
+        ):
+            raise HandleAdoptionRefused("PERSISTED_IDENTITY_INVALID", token)
+        environment = MappingProxyType(dict(persisted.environment))
+        launched_cwd = Path(persisted.launched_cwd).resolve()
+        try:
+            pane_payload = self._herdr("pane", "get", pane_id, env=environment)
+        except HerdrCallError as exc:
+            if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
+                raise HandleAbsent("PANE_ABSENT", pane_id) from exc
+            raise
+        pane = _extract(pane_payload, "pane")
+        if not isinstance(pane, dict) or str(pane.get("pane_id") or "") != pane_id:
+            raise HandleAdoptionRefused("PANE_ID_MISMATCH", pane_id)
+        cwd = pane.get("cwd")
+        actual = Path(str(cwd)).resolve() if cwd else None
+        if actual != launched_cwd:
+            raise HandleAdoptionRefused(
+                "PANE_CWD_MISMATCH", "{}!={}".format(actual, launched_cwd)
+            )
+        pane_workspace = str(pane.get("workspace_id") or "")
+        persisted_tab_id = str(persisted.tab_id or "")
+        pane_tab_id = str(pane.get("tab_id") or "")
+        if persisted_tab_id:
+            if pane_tab_id != persisted_tab_id:
+                raise HandleAdoptionRefused(
+                    "TAB_ID_MISMATCH",
+                    "{}!={}".format(pane_tab_id, persisted_tab_id),
+                )
+            tab_id = persisted_tab_id
+        elif pane_tab_id:
+            # Legacy rows may have no tab id.  A direct pane response is the
+            # only recovery authority; workspace or focus never fills it in.
+            tab_id = pane_tab_id
+        else:
+            raise HandleAdoptionRefused("TAB_ID_UNPROVEN", pane_id)
+        lane_key = str(persisted.lane_key or "")
+        if not lane_key:
+            raise HandleAdoptionRefused("LANE_KEY_UNPROVEN", pane_id)
+        pane_id_workspace = workspace_of(pane_id)
+        tab_workspace = workspace_of(tab_id)
+        workspace_id = str(
+            persisted.workspace_id or pane_workspace or pane_id_workspace
+        )
+        if (
+            not workspace_id
+            or workspace_id != pane_id_workspace
+            or workspace_id != tab_workspace
+            or (pane_workspace and pane_workspace != workspace_id)
+        ):
+            raise HandleAdoptionRefused(
+                "WORKSPACE_ID_MISMATCH",
+                "{}!={}".format(workspace_id, pane_workspace or pane_id_workspace),
+            )
+        self._prove_tab_contains_pane(workspace_id, tab_id, pane_id, environment)
+        candidate = LaunchHandle(
+            correlation_token=token,
+            pane_id=pane_id,
+            agent_name=agent_name,
+            launched_cwd=launched_cwd,
+            transcript_path=persisted.transcript_path,
+            envelope_path=persisted.envelope_path,
+            environment=environment,
+            workspace_id=workspace_id,
+            tab_id=tab_id,
+            lane_key=lane_key,
+        )
+        # The pane's ID/cwd are already proven.  Keep that verified placement
+        # even if Herdr then proves the actor absent, so a replacement opens
+        # in this lane's workspace/tab rather than creating a second workspace.
+        with self._handles_lock:
+            existing = self._handles.get(token)
+            if existing is not None and existing != candidate:
+                raise HandleAdoptionRefused("HANDLE_TOKEN_COLLISION", token)
+            if self._workspace_id and self._workspace_id != workspace_id:
+                raise HandleAdoptionRefused(
+                    "WORKSPACE_ID_MISMATCH",
+                    "{}!={}".format(self._workspace_id, workspace_id),
+                )
+            if not self._workspace_id:
+                self._workspace_id = workspace_id
+            layout = self._tabs.get(lane_key)
+            if layout is None:
+                self._tabs[lane_key] = _TabLayout(
+                    tab_id=tab_id, panes=[pane_id], claimed=1
+                )
+            elif layout.tab_id != tab_id:
+                raise HandleAdoptionRefused(
+                    "TAB_ID_MISMATCH",
+                    "{}!={}".format(layout.tab_id, tab_id),
+                )
+            else:
+                with layout.lock:
+                    if pane_id not in layout.panes:
+                        try:
+                            slot = layout.panes.index(None)
+                            layout.panes[slot] = pane_id
+                        except ValueError:
+                            slot = len(layout.panes)
+                            layout.panes.append(pane_id)
+                        layout.claimed = max(layout.claimed, slot + 1)
+                        layout.cols = max(
+                            layout.cols,
+                            grid_for(layout.claimed)[1],
+                        )
+        try:
+            agent_payload = self._herdr("agent", "get", agent_name, env=environment)
+        except HerdrCallError as exc:
+            if exc.code == AGENT_NOT_FOUND:
+                raise HandleAbsent("AGENT_ABSENT", agent_name) from exc
+            raise
+        agent = _extract(agent_payload, "agent")
+        if not isinstance(agent, dict):
+            raise HandleAbsent("AGENT_ABSENT", agent_name)
+        if str(agent.get("name") or "") != agent_name:
+            raise HandleAdoptionRefused("AGENT_ID_MISMATCH", agent_name)
+        agent_pane = agent.get("pane_id")
+        if agent_pane is not None and str(agent_pane) != pane_id:
+            raise HandleAdoptionRefused(
+                "AGENT_PANE_MISMATCH", "{}!={}".format(agent_pane, pane_id)
+            )
+        with self._handles_lock:
+            self._handles[token] = candidate
+            self._proven_absent.pop(token, None)
+            if candidate.transcript_path is not None:
+                self._tailers[token] = TranscriptTailer(candidate.transcript_path)
+        return candidate
+
+    def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None:
+        """Wait for a completed turn to return to its retained composer.
+
+        The envelope is written before the coding agent finishes rendering its
+        final response. A one-shot status read therefore races ``working`` even
+        though the declaration is complete. Herdr's bounded lifecycle wait is
+        the authority here; the pane remains open for the correction loop.
+        """
+        self._verified_handle_binding(handle)
+        wait_for_interactive_agent(
+            lambda *args, **kwargs: self._herdr(
+                *args, env=handle.environment, **kwargs
+            ),
+            handle.agent_name,
+            timeout_s=timeout_s,
+        )
 
     def agent_status(self, handle: LaunchHandle) -> Optional[str]:
         """The route's raw per-pane status, uncollapsed — B14's seam.
@@ -1937,8 +2554,9 @@ class HerdrLauncher:
         such rather than as a stall.
         """
         try:
-            payload = self._herdr("agent", "get", handle.agent_name,
-                                  env=handle.environment)
+            payload = self._herdr(
+                "agent", "get", handle.agent_name, env=handle.environment
+            )
         except RuntimeError:
             return None
         agent = _extract(payload, "agent")
@@ -1960,8 +2578,9 @@ class HerdrLauncher:
         a fact about the process, never about the work it produced.
         """
         try:
-            payload = self._herdr("agent", "get", handle.agent_name,
-                                  env=handle.environment)
+            payload = self._herdr(
+                "agent", "get", handle.agent_name, env=handle.environment
+            )
         except HerdrCallError as exc:
             # An agent whose pane is closed is not reported as an agent with no
             # record: herdr exits nonzero with `agent_not_found`. Reading that
@@ -1991,8 +2610,11 @@ class HerdrLauncher:
             except (OSError, ValueError, UnicodeError):
                 return PollResult(PollState.EXITED, 1, "ENVELOPE_UNPARSED")
             success = isinstance(payload, dict) and payload.get("success") is True
-            return PollResult(PollState.EXITED, 0 if success else 1,
-                              "ENVELOPE_SUCCESS" if success else "ENVELOPE_FAILURE")
+            return PollResult(
+                PollState.EXITED,
+                0 if success else 1,
+                "ENVELOPE_SUCCESS" if success else "ENVELOPE_FAILURE",
+            )
         with self._handles_lock:
             tailer = self._tailers.get(handle.correlation_token)
         # `terminal_envelope` returns None rather than a failing exit when the
@@ -2027,8 +2649,9 @@ class HerdrLauncher:
         if declared is not None:
             return declared
         try:
-            payload = self._herdr("agent", "get", handle.agent_name,
-                                  env=handle.environment)
+            payload = self._herdr(
+                "agent", "get", handle.agent_name, env=handle.environment
+            )
         except HerdrCallError as exc:
             if exc.code != AGENT_NOT_FOUND:
                 raise
@@ -2092,25 +2715,27 @@ class HerdrLauncher:
                 quiesce_process_group(handle.process_group, deadline)
             except BaseException as exc:
                 raise HarnessQuiescenceError(
-                    "HERDR_QUIESCENCE_UNPROVEN:{}".format(token)) from exc
+                    "HERDR_QUIESCENCE_UNPROVEN:{}".format(token)
+                ) from exc
             if not _process_group_absent(handle.process_group):
                 raise HarnessQuiescenceError(
-                    "HERDR_QUIESCENCE_UNPROVEN:{}".format(token))
+                    "HERDR_QUIESCENCE_UNPROVEN:{}".format(token)
+                )
         try:
             # herdr confirms a close as `{"result": {"type": "ok"}}`; there is
             # no `closed` flag. Demanding one turned every successful close
             # into PANE_CLOSE_UNCONFIRMED, which is raised inside the block
             # that proves quiescence, so the proof could never succeed.
-            response = self._herdr("pane", "close", handle.pane_id,
-                                   env=handle.environment)
+            response = self._herdr(
+                "pane", "close", handle.pane_id, env=handle.environment
+            )
             result = response.get("result")
             closed = _extract(response, "closed")
-            confirmed = (closed is True
-                         or (isinstance(result, dict)
-                             and result.get("type") == "ok"))
+            confirmed = closed is True or (
+                isinstance(result, dict) and result.get("type") == "ok"
+            )
             if not confirmed:
-                raise RuntimeError("PANE_CLOSE_UNCONFIRMED:{}".format(
-                    handle.pane_id))
+                raise RuntimeError("PANE_CLOSE_UNCONFIRMED:{}".format(handle.pane_id))
             # `_agent_absent`, not `poll`: a successful attempt leaves an
             # envelope, and `poll` now reports that declaration in preference
             # to any observation of the pane. Asking `poll` here would read a
@@ -2120,7 +2745,8 @@ class HerdrLauncher:
                 raise RuntimeError("PANE_STILL_LIVE:{}".format(handle.pane_id))
         except BaseException as exc:
             raise HarnessQuiescenceError(
-                "HERDR_QUIESCENCE_UNPROVEN:{}".format(token)) from exc
+                "HERDR_QUIESCENCE_UNPROVEN:{}".format(token)
+            ) from exc
         self._forget_pane(handle.pane_id)
         with self._handles_lock:
             if self._handles.get(token) is handle:
@@ -2167,14 +2793,50 @@ class FakeLauncher:
         self._statuses: Dict[str, Optional[str]] = {}
 
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
-        handle = LaunchHandle(spec.correlation_token, "fake:" + spec.correlation_token,
-                              _agent_name(spec.correlation_token), spec.worktree.resolve())
+        handle = LaunchHandle(
+            spec.correlation_token,
+            "fake:" + spec.correlation_token,
+            _agent_name(spec.correlation_token),
+            spec.worktree.resolve(),
+        )
         self._handles[spec.correlation_token] = handle
         self._states[spec.correlation_token] = PollResult(PollState.RUNNING)
         return handle
 
-    def complete(self, token: str, exit_code: int = 0,
-                 detail: str = "ENVELOPE_SUCCESS") -> None:
+    def resubmit(
+        self,
+        handle: LaunchHandle,
+        prompt_path: Path,
+        *,
+        route: str = "",
+        expected_token: Optional[str] = None,
+        timeout_s: float = 60.0,
+    ) -> LaunchHandle:
+        del route, timeout_s
+        if expected_token is not None and expected_token != handle.correlation_token:
+            raise HandleAdoptionRefused("HANDLE_TOKEN_MISMATCH")
+        if self._handles.get(handle.correlation_token) is not handle:
+            raise HandleAdoptionRefused("HANDLE_NOT_OWNED")
+        if not Path(prompt_path).is_file():
+            raise HandleAdoptionRefused("PROMPT_PATH_MISSING")
+        self._states[handle.correlation_token] = PollResult(PollState.RUNNING)
+        return handle
+
+    def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle:
+        handle = self._handles.get(persisted.correlation_token)
+        if handle is None:
+            raise HandleAbsent("AGENT_ABSENT", persisted.agent_name)
+        if (
+            handle.pane_id != persisted.pane_id
+            or handle.agent_name != persisted.agent_name
+            or handle.launched_cwd != persisted.launched_cwd.resolve()
+        ):
+            raise HandleAdoptionRefused("PERSISTED_IDENTITY_INVALID")
+        return handle
+
+    def complete(
+        self, token: str, exit_code: int = 0, detail: str = "ENVELOPE_SUCCESS"
+    ) -> None:
         self._states[token] = PollResult(PollState.EXITED, exit_code, detail)
 
     def set_agent_status(self, token: str, status: Optional[str]) -> None:
@@ -2183,13 +2845,22 @@ class FakeLauncher:
     def agent_status(self, handle: LaunchHandle) -> Optional[str]:
         return self._statuses.get(handle.correlation_token)
 
+    def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None:
+        del timeout_s
+        if self.agent_status(handle) != "idle":
+            raise RuntimeError(
+                "AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(handle.agent_name)
+            )
+
     def poll(self, handle: LaunchHandle) -> PollResult:
-        return self._states.get(handle.correlation_token,
-                                PollResult(PollState.GONE, detail="AGENT_GONE"))
+        return self._states.get(
+            handle.correlation_token, PollResult(PollState.GONE, detail="AGENT_GONE")
+        )
 
     def cancel(self, handle: LaunchHandle, deadline: float) -> None:
-        self._states[handle.correlation_token] = PollResult(PollState.GONE,
-                                                            detail="CANCELLED")
+        self._states[handle.correlation_token] = PollResult(
+            PollState.GONE, detail="CANCELLED"
+        )
 
     def reclaim(self, token: str) -> Tuple[LaunchHandle, ...]:
         handle = self._handles.get(token)

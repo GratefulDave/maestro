@@ -83,8 +83,7 @@ import threading
 import time
 from enum import Enum
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, NamedTuple, Optional,
-                     Tuple)
+from typing import Any, Callable, Dict, Iterable, NamedTuple, Optional, Tuple
 
 try:
     from typing import Protocol
@@ -100,6 +99,7 @@ SESSION_PATH_KEY = "session_path"
 
 
 # ── §7.6 why an attempt was declared stalled or timed out ───────────────────
+
 
 class StallReason(str, Enum):
     """Which of the three signals convicted the attempt."""
@@ -118,6 +118,7 @@ LIVE_WORKING_STATUSES = frozenset({"working", "blocked"})
 
 # ── the watchdog's private heartbeat cache ───────────────────────────────────
 
+
 class _HeartbeatState(NamedTuple):
     """The last observed turn count and when it was last seen to advance.
 
@@ -134,7 +135,9 @@ class _HeartbeatState(NamedTuple):
     observed_at: float
     actor_status_current: Optional[str] = None
 
+
 # ── injected collaborators (Protocols; the lead wires these to lane w1) ─────
+
 
 class AttemptsProvider(Protocol):
     """Returns every attempt currently in RUNNING state."""
@@ -146,8 +149,9 @@ class HeartbeatWriter(Protocol):
     """Records that the watchdog observed `turn_count` at `observed_at`
     for `attempt`. Called only by the watchdog, never by the worker."""
 
-    def __call__(self, attempt: st.AttemptRecord, turn_count: int,
-                 observed_at: float) -> None: ...
+    def __call__(
+        self, attempt: st.AttemptRecord, turn_count: int, observed_at: float
+    ) -> None: ...
 
 
 class AttemptKiller(Protocol):
@@ -160,8 +164,9 @@ class AttemptKiller(Protocol):
 class AttemptFailer(Protocol):
     """Returns the node to pending, classified by `retry_class`."""
 
-    def __call__(self, attempt: st.AttemptRecord, retry_class: st.RetryClass,
-                 reason: str) -> None: ...
+    def __call__(
+        self, attempt: st.AttemptRecord, retry_class: st.RetryClass, reason: str
+    ) -> None: ...
 
 
 class ActorStatusReader(Protocol):
@@ -213,19 +218,32 @@ class DiagnosticProvider(Protocol):
 
 # ── the three structural signals ─────────────────────────────────────────────
 
+
 def process_is_alive(pid: int) -> bool:
-    """Is the launched process still there? Polled directly (§7.6) --
-    never pane text (§9.7). `os.kill(pid, 0)` sends no signal; it only
-    asks whether the pid exists and is reachable."""
+    """Return whether ``pid`` can still execute work.
+
+    ``kill(pid, 0)`` reports a zombie as present.  A zombie cannot advance a
+    scheduler or attempt and only waits for its parent to reap it, so treating
+    it as live permanently fences recovery.  Linux exposes that state in
+    ``/proc``; Darwin's ``proc_pidinfo`` no longer returns a complete BSD
+    record for the zombie and therefore has no start epoch.
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Exists, owned by someone else -- still alive.
         return True
     except OSError:
         return False
+    if sys.platform == "darwin":
+        return _darwin_process_start_epoch(pid) is not None
+    if sys.platform.startswith("linux"):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return False
+        return state != "Z"
     return True
 
 
@@ -263,9 +281,12 @@ def _darwin_process_start_epoch(pid: int) -> Optional[float]:
         libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
         info = _ProcBsdInfo()
         got = libc.proc_pidinfo(
-            ctypes.c_int(pid), ctypes.c_int(PROC_PIDTBSDINFO),
-            ctypes.c_uint64(0), ctypes.byref(info),
-            ctypes.c_int(ctypes.sizeof(info)))
+            ctypes.c_int(pid),
+            ctypes.c_int(PROC_PIDTBSDINFO),
+            ctypes.c_uint64(0),
+            ctypes.byref(info),
+            ctypes.c_int(ctypes.sizeof(info)),
+        )
     except (OSError, AttributeError):
         return None
     if got != ctypes.sizeof(info) or int(info.pbi_pid) != int(pid):
@@ -310,6 +331,7 @@ def process_start_epoch(pid: int) -> Optional[float]:
     if sys.platform == "darwin":
         return _darwin_process_start_epoch(pid)
     return None
+
 
 def count_complete_transcript_records(path: Any) -> int:
     """Count complete JSONL records in a transcript file (§7.6, §17 item 82).
@@ -356,6 +378,7 @@ def _default_transcript_record_count(attempt: st.AttemptRecord) -> int:
 
 # ── the watchdog thread ──────────────────────────────────────────────────────
 
+
 class Watchdog:
     """The single scheduler-owned thread polling every RUNNING attempt.
 
@@ -374,11 +397,14 @@ class Watchdog:
         poll_interval_s: float = 1.0,
         process_alive: Callable[[int], bool] = process_is_alive,
         exit_status_observed: Callable[[st.AttemptRecord], bool] = (
-            lambda attempt: False),
+            lambda attempt: False
+        ),
         declared_result_observed: Callable[[st.AttemptRecord], bool] = (
-            lambda attempt: False),
+            lambda attempt: False
+        ),
         transcript_record_count: Callable[[st.AttemptRecord], int] = (
-            _default_transcript_record_count),
+            _default_transcript_record_count
+        ),
         actor_status: Optional[ActorStatusReader] = None,
         preserve_unpublished: Optional[UnpublishedWorkPreserver] = None,
         time_source: Callable[[], float] = time.monotonic,
@@ -412,7 +438,8 @@ class Watchdog:
             raise RuntimeError("watchdog already started")
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run, name="maestro-watchdog", daemon=True)
+            target=self._run, name="maestro-watchdog", daemon=True
+        )
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -484,9 +511,11 @@ class Watchdog:
             # Pre-launch: no process and no transcript exist yet, by
             # construction. Only the wall-clock check applies.
             if elapsed > self._config.node_timeout_s:
-                bound = (self._config.backstop_t_s
-                         if self._declared_result_observed(attempt)
-                         else self._config.node_timeout_s)
+                bound = (
+                    self._config.backstop_t_s
+                    if self._declared_result_observed(attempt)
+                    else self._config.node_timeout_s
+                )
                 if elapsed > bound:
                     self._heartbeats.pop(key, None)
                     self._stall(attempt, StallReason.NODE_TIMEOUT)
@@ -539,10 +568,12 @@ class Watchdog:
         # The guard costs one ledger read on an attempt whose process is
         # already gone, and it means no route whose agent *does* exit on
         # completion can have its accepted work convicted for finishing.
-        if (attempt.pid is not None
-                and not self._exit_status_observed(attempt)
-                and not self._declared_result_observed(attempt)
-                and self._attempt_process_dead(attempt)):
+        if (
+            attempt.pid is not None
+            and not self._exit_status_observed(attempt)
+            and not self._declared_result_observed(attempt)
+            and self._attempt_process_dead(attempt)
+        ):
             self._heartbeats.pop(key, None)
             self._stall(attempt, StallReason.PROCESS_DEAD)
             return
@@ -554,13 +585,16 @@ class Watchdog:
             # First observation since arming: the turn clock starts at
             # launch, not at attempt start and not at this first poll.
             state = _HeartbeatState(
-                turn_count=record_count, observed_at=attempt.launched_at)
+                turn_count=record_count, observed_at=attempt.launched_at
+            )
             self._heartbeats[key] = state
             self._write_heartbeat(attempt, state.turn_count, state.observed_at)
         elif turns_advanced:
             state = _HeartbeatState(
-                turn_count=record_count, observed_at=now,
-                actor_status_current=prev.actor_status_current)
+                turn_count=record_count,
+                observed_at=now,
+                actor_status_current=prev.actor_status_current,
+            )
             self._heartbeats[key] = state
             self._write_heartbeat(attempt, state.turn_count, state.observed_at)
         else:
@@ -579,15 +613,18 @@ class Watchdog:
 
         route_reports_working = (
             self._actor_status is not None
-            and state.actor_status_current in LIVE_WORKING_STATUSES)
+            and state.actor_status_current in LIVE_WORKING_STATUSES
+        )
 
         # Armed wall clock. Defer while turns advance or the route reports
         # the actor live — that is the 163-turn discard. Convict when
         # neither is true. A declared result still defers to backstop_t_s.
         if elapsed > self._config.node_timeout_s:
-            bound = (self._config.backstop_t_s
-                     if self._declared_result_observed(attempt)
-                     else self._config.node_timeout_s)
+            bound = (
+                self._config.backstop_t_s
+                if self._declared_result_observed(attempt)
+                else self._config.node_timeout_s
+            )
             if elapsed > bound:
                 declared = bound is self._config.backstop_t_s
                 if not declared and (turns_advanced or route_reports_working):
@@ -626,11 +663,12 @@ class Watchdog:
         # silence is not quiescence. Absence of a reader is not an
         # observation of work, so the clock still fires there.
         since_progress = now - state.observed_at
-        if (since_progress > self._config.turn_timeout_s
-                and not self._declared_result_observed(attempt)
-                and not route_reports_working):
+        if (
+            since_progress > self._config.turn_timeout_s
+            and not self._declared_result_observed(attempt)
+            and not route_reports_working
+        ):
             self._stall(attempt, StallReason.TURN_TIMEOUT)
-
 
     def _attempt_process_dead(self, attempt: st.AttemptRecord) -> bool:
         """True only when this attempt's own process is proven absent.
@@ -641,11 +679,16 @@ class Watchdog:
         cannot drift into two answers.
         """
         from . import lifecycle as lc
-        return lc.attempt_liveness(
-            attempt,
-            is_alive=self._process_alive,
-            start_epoch=self._start_epoch,
-            host=self._host) is False
+
+        return (
+            lc.attempt_liveness(
+                attempt,
+                is_alive=self._process_alive,
+                start_epoch=self._start_epoch,
+                host=self._host,
+            )
+            is False
+        )
 
     def _stall(self, attempt: st.AttemptRecord, reason: StallReason) -> None:
         self._kill(attempt)
@@ -669,6 +712,7 @@ class Watchdog:
 
 
 # ── the run-level backstop ───────────────────────────────────────────────────
+
 
 class RunBackstop:
     """One run-level "no progress" timer, beside the watchdog's per-attempt

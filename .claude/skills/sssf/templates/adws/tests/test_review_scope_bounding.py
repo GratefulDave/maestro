@@ -58,11 +58,14 @@ import pydantic  # noqa: E402
 
 from adw_modules import code_review as cr  # noqa: E402
 from adw_modules import finalization as fin  # noqa: E402
-from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
-from test_graded_findings import (ScriptedReviewer, a_handoff,  # noqa: E402
-                                  make_store, run_review)
+from test_graded_findings import (
+    ScriptedReviewer,
+    a_handoff,  # noqa: E402
+    make_store,
+    run_review,
+)
 from test_scheduler import SchedulerFixture  # noqa: E402
 
 
@@ -71,26 +74,31 @@ from test_scheduler import SchedulerFixture  # noqa: E402
 UNREACHABLE_MESSAGE = (
     "enrichment_gate.py:1 — the module defines the ordering predicate but the "
     "diff changes no production caller to use it; no existing production entry "
-    "point is changed to import it")
+    "point is changed to import it"
+)
 
 #: The consequence, honestly stated. Note that it is an ERROR by the rubric's
 #: own anchor — "the node's stated work not actually done" — which is why
 #: grading alone could never have carried this case.
 UNREACHABLE_RATIONALE = (
     "the feature is unreachable at runtime, so the stated work is not "
-    "delivered end to end")
+    "delivered end to end"
+)
 
 #: The control: the same grade and the same check, inside the node's own paths.
 LAZY_MESSAGE = (
     "enrichment_gate.py:41 — the predicate returns the constant the one "
-    "assertion checks and never reads the ordering it was asked to enforce")
+    "assertion checks and never reads the ordering it was asked to enforce"
+)
 
 LAZY_RATIONALE = (
     "the behaviour the node was asked for is absent from the file the node "
-    "owns and does write")
+    "owns and does write"
+)
 
 
 # ── B9: the questions are bounded, and the reviewer is told the bound ───────
+
 
 class TheRubricBoundsItsDemandsTest(unittest.TestCase):
     """The two checks that carried the unbounded shape, and the five that did
@@ -107,8 +115,10 @@ class TheRubricBoundsItsDemandsTest(unittest.TestCase):
     work and about the whole of the gate, and both fired on the incident node.
     """
 
-    BOUNDED = ("diff.implements_the_stated_instruction",
-               "diff.gate_is_passed_on_the_merits")
+    BOUNDED = (
+        "diff.implements_the_stated_instruction",
+        "diff.gate_is_passed_on_the_merits",
+    )
 
     def test_the_two_unbounded_checks_now_name_the_declared_write_scope(self):
         for check_id in self.BOUNDED:
@@ -120,13 +130,19 @@ class TheRubricBoundsItsDemandsTest(unittest.TestCase):
         """The other five are named here so that adding a check without asking
         the question forces this list to be revisited."""
         self.assertEqual(
-            {"diff.no_unrelated_change_rides_along",
-             "diff.introduces_no_obvious_defect",
-             "diff.is_coherent_with_its_surroundings",
-             "file.change_is_justified_by_the_instruction",
-             "file.no_secret_or_credential_introduced"},
-            {c.check_id for c in cr.CODE_RUBRIC.checks
-             if c.check_id not in self.BOUNDED})
+            {
+                "diff.no_unrelated_change_rides_along",
+                "diff.introduces_no_obvious_defect",
+                "diff.is_coherent_with_its_surroundings",
+                "file.change_is_justified_by_the_instruction",
+                "file.no_secret_or_credential_introduced",
+            },
+            {
+                c.check_id
+                for c in cr.CODE_RUBRIC.checks
+                if c.check_id not in self.BOUNDED
+            },
+        )
 
     def test_the_rubric_version_moved_so_a_v1_receipt_cannot_replay(self):
         """B10 replays a byte-identical subject, and `review_digest` binds the
@@ -136,9 +152,11 @@ class TheRubricBoundsItsDemandsTest(unittest.TestCase):
 
     def test_the_prompt_states_the_bound_beside_the_paths_it_bounds(self):
         matrix = fin.compute_matrix(
-            cr.CODE_RUBRIC, "a" * 64, cr.review_objects(("a.py",), "b" * 40))
-        text = a_handoff("a" * 64, matrix,
-                         declared_outputs=["enrichment_gate.py"]).render()
+            cr.CODE_RUBRIC, "a" * 64, cr.review_objects(("a.py",), "b" * 40)
+        )
+        text = a_handoff(
+            "a" * 64, matrix, declared_outputs=["enrichment_gate.py"]
+        ).render()
 
         paths_at = text.index("## Paths this node was permitted to write")
         bound_at = text.index("Every question below is asked inside those paths")
@@ -152,7 +170,8 @@ class TheRubricBoundsItsDemandsTest(unittest.TestCase):
         to record the finding at a lower grade is being told to misreport the
         consequence, and A9's remedy is grading the bar, never lowering it."""
         matrix = fin.compute_matrix(
-            cr.CODE_RUBRIC, "a" * 64, cr.review_objects(("a.py",), "b" * 40))
+            cr.CODE_RUBRIC, "a" * 64, cr.review_objects(("a.py",), "b" * 40)
+        )
         text = a_handoff("a" * 64, matrix).render()
 
         self.assertIn("Grade and scope are independent", text)
@@ -161,17 +180,22 @@ class TheRubricBoundsItsDemandsTest(unittest.TestCase):
 
 # ── B8: the axis is structurally required, from v1 ──────────────────────────
 
+
 class TheScopeAxisIsNotOptionalTest(unittest.TestCase):
     """B8's rule is that a field added after reports exist is optional forever.
     An optional scope is one every reviewer omits, and an omitted scope reads
     as in-scope, which is the unbounded demand again."""
 
     def _cell(self, **kw: Any) -> Dict[str, Any]:
-        base = {"check_id": "diff.implements_the_stated_instruction",
-                "object_id": "diff:" + "b" * 40, "status": "finding",
-                "message": UNREACHABLE_MESSAGE, "grade": "error",
-                "grade_rationale": UNREACHABLE_RATIONALE,
-                "scope": "out_of_scope"}
+        base = {
+            "check_id": "diff.implements_the_stated_instruction",
+            "object_id": "diff:" + "b" * 40,
+            "status": "finding",
+            "message": UNREACHABLE_MESSAGE,
+            "grade": "error",
+            "grade_rationale": UNREACHABLE_RATIONALE,
+            "scope": "out_of_scope",
+        }
         base.update(kw)
         return base
 
@@ -189,9 +213,13 @@ class TheScopeAxisIsNotOptionalTest(unittest.TestCase):
     def test_a_cleared_cell_carrying_a_scope_does_not_parse(self):
         with self.assertRaises(pydantic.ValidationError):
             cr.CodeReportCell.model_validate(
-                {"check_id": "diff.implements_the_stated_instruction",
-                 "object_id": "diff:" + "b" * 40, "status": "clear",
-                 "scope": "in_scope"})
+                {
+                    "check_id": "diff.implements_the_stated_instruction",
+                    "object_id": "diff:" + "b" * 40,
+                    "status": "clear",
+                    "scope": "in_scope",
+                }
+            )
 
     def test_an_unknown_scope_does_not_parse(self):
         with self.assertRaises(pydantic.ValidationError):
@@ -207,13 +235,23 @@ class TheScopeAxisIsNotOptionalTest(unittest.TestCase):
 
 # ── §1.2: the typed record, and what it does to the derived verdict ─────────
 
-class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
 
+class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
     def _run(self, scope: str, grade: str = "error") -> cr.ReviewOutcome:
         with tempfile.TemporaryDirectory() as tmp:
-            return run_review(Path(tmp), ScriptedReviewer({
-                "diff.implements_the_stated_instruction": (
-                    grade, UNREACHABLE_MESSAGE, UNREACHABLE_RATIONALE, scope)}))
+            return run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.implements_the_stated_instruction": (
+                            grade,
+                            UNREACHABLE_MESSAGE,
+                            UNREACHABLE_RATIONALE,
+                            scope,
+                        )
+                    }
+                ),
+            )
 
     def test_an_out_of_scope_error_does_not_refuse_the_merge(self):
         outcome = self._run("out_of_scope")
@@ -229,8 +267,7 @@ class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
         carried for a human and reads nothing."""
         cell = self._run("out_of_scope").unreachable[0]
 
-        self.assertEqual("diff.implements_the_stated_instruction",
-                         cell.check_id)
+        self.assertEqual("diff.implements_the_stated_instruction", cell.check_id)
         self.assertIs(fin.Severity.BLOCKING, cell.severity)
         self.assertIs(cr.FindingGrade.ERROR, cell.grade)
         self.assertIs(cr.FindingScope.OUT_OF_SCOPE, cell.scope)
@@ -259,10 +296,19 @@ class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
         """Severity still binds first. An ADVISORY question cannot refuse a
         merge, so it also cannot claim the plan is broken."""
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.is_coherent_with_its_surroundings": (
-                    "error", "it does not match the module's conventions",
-                    "the merged tree reads inconsistently", "out_of_scope")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.is_coherent_with_its_surroundings": (
+                            "error",
+                            "it does not match the module's conventions",
+                            "the merged tree reads inconsistently",
+                            "out_of_scope",
+                        )
+                    }
+                ),
+            )
 
         self.assertIs(fin.Verdict.PASS, outcome.verdict)
         self.assertEqual((), outcome.unreachable)
@@ -273,15 +319,20 @@ class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
         level up."""
         graded = cr.GradedVerdict(
             verdict=fin.Verdict.PASS,
-            cells=(cr.GradedCell(
-                check_id="diff.implements_the_stated_instruction",
-                object_id="diff:" + "b" * 40,
-                status=fin.CellStatus.FINDING,
-                severity=fin.Severity.BLOCKING,
-                grade=cr.FindingGrade.ERROR, message="   ",
-                rationale=UNREACHABLE_RATIONALE,
-                scope=cr.FindingScope.OUT_OF_SCOPE),),
-            reject_at=cr.FindingGrade.ERROR)
+            cells=(
+                cr.GradedCell(
+                    check_id="diff.implements_the_stated_instruction",
+                    object_id="diff:" + "b" * 40,
+                    status=fin.CellStatus.FINDING,
+                    severity=fin.Severity.BLOCKING,
+                    grade=cr.FindingGrade.ERROR,
+                    message="   ",
+                    rationale=UNREACHABLE_RATIONALE,
+                    scope=cr.FindingScope.OUT_OF_SCOPE,
+                ),
+            ),
+            reject_at=cr.FindingGrade.ERROR,
+        )
 
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(graded)
@@ -290,11 +341,16 @@ class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
         """The receipt's frozen schema carries no scope, so a cell rebuilt from
         one is read exactly as it was before the axis existed. A replay must
         return the verdict that was signed, never a re-derivation of it."""
-        cell = cr.GradedCell.from_receipt_cell(fin.DerivedCell(
-            check_id="diff.implements_the_stated_instruction",
-            object_id="diff:" + "b" * 40, status=fin.CellStatus.FINDING,
-            severity=fin.Severity.BLOCKING, message=UNREACHABLE_MESSAGE,
-            grade="error"))
+        cell = cr.GradedCell.from_receipt_cell(
+            fin.DerivedCell(
+                check_id="diff.implements_the_stated_instruction",
+                object_id="diff:" + "b" * 40,
+                status=fin.CellStatus.FINDING,
+                severity=fin.Severity.BLOCKING,
+                message=UNREACHABLE_MESSAGE,
+                grade="error",
+            )
+        )
 
         self.assertIsNone(cell.scope)
         self.assertFalse(cell.out_of_scope)
@@ -303,6 +359,7 @@ class AForbiddenRemedyCannotRejectTest(unittest.TestCase):
 
 
 # ── the lane, end to end: the trap, and the ordinary rejection ──────────────
+
 
 class TheReviewLaneFixture(SchedulerFixture):
     """The scheduler end. The review runs for real — real matrix, real report
@@ -314,37 +371,46 @@ class TheReviewLaneFixture(SchedulerFixture):
         kw.setdefault("review_ceiling", 3)
         return super().config(**kw)
 
-    def _review_stage(self, reviewer: ScriptedReviewer,
-                      ledgers: Dict[str, Path]):
+    def _review_stage(self, reviewer: ScriptedReviewer, ledgers: Dict[str, Path]):
         store = make_store(self.root / "review-store")
 
-        def review(attempt, node, record, base_sha, output_sha):
+        def review(attempt, node, record, base_sha, output_sha, _resume_existing):
             digest = cr.review_digest(
-                run_id="run1", node_id=node.node_id, base_sha=base_sha,
+                run_id="run1",
+                node_id=node.node_id,
+                base_sha=base_sha,
                 output_sha=output_sha,
-                rubric_version=cr.CODE_RUBRIC.version)
+                rubric_version=cr.CODE_RUBRIC.version,
+            )
             ledger = self.root / "review" / digest / "findings.json"
             ledgers[node.node_id] = ledger
             objects = cr.review_objects((f"{node.node_id}.py",), output_sha)
             matrix = fin.compute_matrix(cr.CODE_RUBRIC, digest, objects)
             return cr.review_attempt(
                 subject_digest=digest,
-                handoff=a_handoff(digest, matrix, node_id=node.node_id,
-                                  declared_outputs=[f"{node.node_id}.py"]),
-                objects=objects, rubric=cr.CODE_RUBRIC, store=store,
+                handoff=a_handoff(
+                    digest,
+                    matrix,
+                    node_id=node.node_id,
+                    declared_outputs=[f"{node.node_id}.py"],
+                ),
+                objects=objects,
+                rubric=cr.CODE_RUBRIC,
+                store=store,
                 window_factory=reviewer.window_factory,
                 occupancy_reader=lambda _s: 0.1,
-                ledger_path=ledger)
+                ledger_path=ledger,
+            )
 
         return review
 
     def run_lane(self, reviewer: ScriptedReviewer) -> Dict[str, Path]:
         ledgers: Dict[str, Path] = {}
         self.written["build"] = {"build.py": "ok\n"}
-        self.schedule([self.agent("build")],
-                      deps=self.deps(
-                          review_attempt=self._review_stage(reviewer, ledgers))
-                      ).run()
+        self.schedule(
+            [self.agent("build")],
+            deps=self.deps(review_attempt=self._review_stage(reviewer, ledgers)),
+        ).run()
         return ledgers
 
 
@@ -354,10 +420,16 @@ class TheTrapNoLongerConsumesTheCeilingTest(TheReviewLaneFixture):
     clear it writes a path this node may not write."""
 
     def test_the_lane_stops_on_the_first_review_instead_of_the_third(self):
-        reviewer = ScriptedReviewer({
-            "diff.implements_the_stated_instruction": (
-                "error", UNREACHABLE_MESSAGE, UNREACHABLE_RATIONALE,
-                "out_of_scope")})
+        reviewer = ScriptedReviewer(
+            {
+                "diff.implements_the_stated_instruction": (
+                    "error",
+                    UNREACHABLE_MESSAGE,
+                    UNREACHABLE_RATIONALE,
+                    "out_of_scope",
+                )
+            }
+        )
         self.run_lane(reviewer)
 
         node = self.store.get_node("run1", "build")
@@ -370,28 +442,48 @@ class TheTrapNoLongerConsumesTheCeilingTest(TheReviewLaneFixture):
         """`REVIEW_BUDGET_EXHAUSTED` reads "the agent could not do the work".
         For this node that was false — the gate went green on every one of the
         six attempts — so the assertion is that the reason never appears."""
-        self.run_lane(ScriptedReviewer({
-            "diff.implements_the_stated_instruction": (
-                "error", UNREACHABLE_MESSAGE, UNREACHABLE_RATIONALE,
-                "out_of_scope")}))
+        self.run_lane(
+            ScriptedReviewer(
+                {
+                    "diff.implements_the_stated_instruction": (
+                        "error",
+                        UNREACHABLE_MESSAGE,
+                        UNREACHABLE_RATIONALE,
+                        "out_of_scope",
+                    )
+                }
+            )
+        )
 
         self.assertNotEqual(
             st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-            self.store.get_node("run1", "build").block_reason)
+            self.store.get_node("run1", "build").block_reason,
+        )
 
     def test_the_plan_level_fact_survives_into_the_ledger(self):
         """Not discarded. The merged node's ledger carries the finding, its
         grade, its scope, and the flag an operator reads to learn that a
         blocking ERROR went unfixed because no path this node could write
         would have fixed it."""
-        ledgers = self.run_lane(ScriptedReviewer({
-            "diff.implements_the_stated_instruction": (
-                "error", UNREACHABLE_MESSAGE, UNREACHABLE_RATIONALE,
-                "out_of_scope")}))
+        ledgers = self.run_lane(
+            ScriptedReviewer(
+                {
+                    "diff.implements_the_stated_instruction": (
+                        "error",
+                        UNREACHABLE_MESSAGE,
+                        UNREACHABLE_RATIONALE,
+                        "out_of_scope",
+                    )
+                }
+            )
+        )
 
         recorded = cr.read_finding_ledger(ledgers["build"])
-        cells = [c for c in recorded
-                 if c.check_id == "diff.implements_the_stated_instruction"]
+        cells = [
+            c
+            for c in recorded
+            if c.check_id == "diff.implements_the_stated_instruction"
+        ]
         self.assertEqual(1, len(cells))
         self.assertIs(cr.FindingScope.OUT_OF_SCOPE, cells[0].scope)
         self.assertIs(cr.FindingGrade.ERROR, cells[0].grade)
@@ -399,37 +491,46 @@ class TheTrapNoLongerConsumesTheCeilingTest(TheReviewLaneFixture):
         self.assertFalse(cells[0].rejects(cr.FindingGrade.ERROR))
 
 
-class TheOrdinaryRejectionIsUntouchedTest(TheReviewLaneFixture):
-    """The control for the class above, and the reason the fix is a bound
-    rather than a hole: a diff that stayed inside its declared paths and did
-    something adjacent to its instruction is still *refused by the reviewer*,
-    and the refusal is still recorded against the node.
+class TheOrdinaryRejectionRemainsAuthoritativeTest(TheReviewLaneFixture):
+    """In-scope ERROR findings reject candidates and drive bounded repair."""
 
-    What it no longer does is block, because since §19 M35 nothing a reviewer
-    says causes a lifecycle transition. The scope axis this file is about is
-    unaffected either way — it decides which findings reject, and that
-    verdict is now advice rather than authority.
-    """
-
-    def test_a_lazy_diff_inside_its_declared_paths_is_still_rejected(self):
-        reviewer = ScriptedReviewer({
-            "diff.implements_the_stated_instruction": (
-                "error", LAZY_MESSAGE, LAZY_RATIONALE, "in_scope")})
+    def test_a_lazy_diff_inside_its_declared_paths_is_rejected(self):
+        reviewer = ScriptedReviewer(
+            {
+                "diff.implements_the_stated_instruction": (
+                    "error",
+                    LAZY_MESSAGE,
+                    LAZY_RATIONALE,
+                    "in_scope",
+                )
+            }
+        )
         ledgers = self.run_lane(reviewer)
 
         node = self.store.get_node("run1", "build")
-        # The reviewer said no, and the row says it said no.
-        rows = self.store.attempts_for("run1", "build")
-        self.assertTrue(rows[0].extra[rp.REVIEW_REJECTED_KEY])
+        reviews = self.store.candidate_reviews(
+            "run1", review_node_id="build::review", limit=100
+        )
+        self.assertTrue(reviews)
+        self.assertTrue(
+            all(row.verdict is st.ReviewVerdict.REJECTED for row in reviews)
+        )
         recorded = cr.read_finding_ledger(ledgers["build"])
-        cells = [c for c in recorded
-                 if c.check_id == "diff.implements_the_stated_instruction"]
+        cells = [
+            cell
+            for cell in recorded
+            if cell.check_id == "diff.implements_the_stated_instruction"
+        ]
         self.assertTrue(cells[0].rejects(cr.FindingGrade.ERROR))
         self.assertFalse(cells[0].unreachable(cr.FindingGrade.ERROR))
-        # And the node merged anyway, on the counts that adjudicate it.
-        self.assertEqual(st.NodeState.MERGED.value, self.states()["build"])
-        self.assertIsNone(node.block_reason)
-        self.assertEqual(1, len(reviewer.reports))
+        self.assertEqual(st.NodeState.BLOCKED.value, self.states()["build"])
+        self.assertIn(
+            node.block_reason,
+            {
+                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+            },
+        )
 
     def test_a_mixed_review_rejects_and_tells_the_builder_what_not_to_try(self):
         """One finding of each scope. The lane is refused on the in-scope one,
@@ -437,18 +538,35 @@ class TheOrdinaryRejectionIsUntouchedTest(TheReviewLaneFixture):
         tells the builder not to attempt it — without which the next attempt is
         spent discovering that the permission check convicts it."""
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.implements_the_stated_instruction": (
-                    "error", UNREACHABLE_MESSAGE, UNREACHABLE_RATIONALE,
-                    "out_of_scope"),
-                "diff.gate_is_passed_on_the_merits": (
-                    "error", LAZY_MESSAGE, LAZY_RATIONALE, "in_scope")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.implements_the_stated_instruction": (
+                            "error",
+                            UNREACHABLE_MESSAGE,
+                            UNREACHABLE_RATIONALE,
+                            "out_of_scope",
+                        ),
+                        "diff.gate_is_passed_on_the_merits": (
+                            "error",
+                            LAZY_MESSAGE,
+                            LAZY_RATIONALE,
+                            "in_scope",
+                        ),
+                    }
+                ),
+            )
 
         self.assertIs(fin.Verdict.FAIL, outcome.verdict)
-        self.assertEqual(["diff.gate_is_passed_on_the_merits"],
-                         [c.check_id for c in outcome.findings])
-        self.assertEqual(["diff.implements_the_stated_instruction"],
-                         [c.check_id for c in outcome.unreachable])
+        self.assertEqual(
+            ["diff.gate_is_passed_on_the_merits"],
+            [c.check_id for c in outcome.findings],
+        )
+        self.assertEqual(
+            ["diff.implements_the_stated_instruction"],
+            [c.check_id for c in outcome.unreachable],
+        )
 
         text = outcome.findings_text()
         self.assertIn("Out of this node's scope", text)

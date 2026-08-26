@@ -26,11 +26,15 @@ import { Database, constants } from "bun:sqlite";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
+  MaestroActorSession,
   MaestroAttempt,
+  MaestroCandidateReview,
   MaestroIntegration,
   MaestroNode,
+  MaestroLaneCandidate,
   MaestroReviewFinding,
   MaestroRunDetail,
+  MaestroRepairHandoff,
   MaestroRunSummary,
   MaestroTransition,
 } from "../shared/types.ts";
@@ -123,6 +127,7 @@ interface NodeRow {
   needs_json: string | null;
   outputs_json: string | null;
   state: string;
+  lane_phase: string | null;
   attempt_no: number | null;
   block_reason: string | null;
   cancel_cause: string | null;
@@ -145,6 +150,48 @@ interface AttemptRow {
   extra_json: string | null;
   attempt_host: string | null;
   attempt_start_epoch: number | null;
+}
+
+interface ActorSessionRow {
+  build_node_id: string;
+  actor_role: string;
+  generation: number;
+  state: string;
+  pane_id: string | null;
+  session_path: string | null;
+  correlation_token: string | null;
+  updated_at: string | null;
+}
+
+interface LaneCandidateRow {
+  build_node_id: string;
+  candidate_seq: number;
+  candidate_sha: string;
+  parent_candidate_sha: string | null;
+  builder_generation: number;
+  created_at: string | null;
+}
+
+interface CandidateReviewRow {
+  review_node_id: string;
+  candidate_sha: string;
+  reviewer_generation: number;
+  state: string;
+  review_digest: string | null;
+  receipt_path: string | null;
+  findings_json: string | null;
+  verdict: string | null;
+  completed_at: string | null;
+}
+
+interface RepairHandoffRow {
+  build_node_id: string;
+  rejected_candidate_sha: string;
+  findings_json: string | null;
+  state: string;
+  builder_generation: number;
+  submitted_at: string | null;
+  acknowledged_at: string | null;
 }
 
 interface TransitionRow {
@@ -218,6 +265,8 @@ export class MaestroDb {
   private planNames = new Map<string, string>();
   private planNamesStamp = 0;
   private declaredConfig: DeclaredConfig;
+  /** Invalidates optional-table/column probes when a live writer migrates. */
+  private schemaVersion = -1;
 
   constructor(path: string, plansDir: string | null = null) {
     if (!existsSync(path)) {
@@ -234,6 +283,7 @@ export class MaestroDb {
     // A readonly connection cannot set journal_mode; take the busy_timeout so a
     // transacting scheduler never turns a poll into a failed request.
     this.db.exec("PRAGMA busy_timeout = 5000");
+    this.refreshSchemaVersion(this.db);
     this.journalMode =
       this.db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()
         ?.journal_mode ?? "unknown";
@@ -258,19 +308,31 @@ export class MaestroDb {
    * query actually observe a per-request state of the file.
    */
   private freshDb(): Database {
-    if (!this.immutable) return this.db;
-    const stamp = statSync(this.path).mtimeMs;
-    if (stamp === this.dbStamp) return this.db;
-    const opened = openLedgerReadonly(this.path);
-    this.db.close();
-    this.db = opened.db;
-    this.immutable = opened.immutable;
-    this.dbStamp = stamp;
-    this.db.exec("PRAGMA busy_timeout = 5000");
-    // A reopened file may be a different schema version from the one this
-    // object booted against, so the column map goes with the connection.
-    this.columnCache.clear();
+    if (this.immutable) {
+      const stamp = statSync(this.path).mtimeMs;
+      if (stamp !== this.dbStamp) {
+        const opened = openLedgerReadonly(this.path);
+        this.db.close();
+        this.db = opened.db;
+        this.immutable = opened.immutable;
+        this.dbStamp = stamp;
+        this.db.exec("PRAGMA busy_timeout = 5000");
+        // The replacement can coincidentally carry the same schema_version.
+        this.schemaVersion = -1;
+        this.columnCache.clear();
+      }
+    }
+    this.refreshSchemaVersion(this.db);
     return this.db;
+  }
+
+  private refreshSchemaVersion(db: Database): void {
+    const version =
+      db.query<{ schema_version: number }, []>("PRAGMA schema_version").get()
+        ?.schema_version ?? -1;
+    if (version === this.schemaVersion) return;
+    this.schemaVersion = version;
+    this.columnCache.clear();
   }
 
   /**
@@ -369,12 +431,13 @@ export class MaestroDb {
     // pre-existing MERGED node claim an evidence chain nobody checked.
     const merged = this.optionalColumn(
       db, "node_lifecycle", "l", "merge_cause");
+    const phase = this.optionalColumn(
+      db, "node_lifecycle", "l", "lane_phase");
     return db
       .query<NodeRow, [string]>(
         `SELECT d.node_id, d.kind, d.depth, d.needs_json, d.outputs_json,
-                l.state, l.attempt_no, l.block_reason, ${cause}, ${merged},
-                l.output_sha,
-                l.granted_extra_attempts, l.updated_at
+                l.state, ${phase}, l.attempt_no, l.block_reason, ${cause}, ${merged},
+                l.output_sha, l.granted_extra_attempts, l.updated_at
            FROM dag_nodes d
            JOIN node_lifecycle l
              ON l.run_id = d.run_id AND l.node_id = d.node_id
@@ -459,6 +522,54 @@ export class MaestroDb {
            FROM results WHERE run_id = ? ORDER BY id`,
       )
       .all(runId);
+    const actorSessionRows: MaestroActorSession[] =
+      this.columns(db, "actor_sessions").size === 0
+        ? []
+        : db
+            .query<ActorSessionRow, [string]>(
+              `SELECT build_node_id, actor_role, generation, state, pane_id,
+                      session_path, correlation_token, updated_at
+                 FROM actor_sessions
+                WHERE run_id = ?
+                ORDER BY build_node_id, actor_role, generation`,
+            )
+            .all(runId);
+    const candidateRows: LaneCandidateRow[] =
+      this.columns(db, "lane_candidates").size === 0
+        ? []
+        : db
+            .query<LaneCandidateRow, [string]>(
+              `SELECT build_node_id, candidate_seq, candidate_sha,
+                      parent_candidate_sha, builder_generation, created_at
+                 FROM lane_candidates
+                WHERE run_id = ?
+                ORDER BY build_node_id, candidate_seq`,
+            )
+            .all(runId);
+    const candidateReviewRows: CandidateReviewRow[] =
+      this.columns(db, "candidate_reviews").size === 0
+        ? []
+        : db
+            .query<CandidateReviewRow, [string]>(
+              `SELECT review_node_id, candidate_sha, reviewer_generation, state,
+                      review_digest, receipt_path, findings_json, verdict, completed_at
+                 FROM candidate_reviews
+                WHERE run_id = ?
+                ORDER BY review_node_id, candidate_sha`,
+            )
+            .all(runId);
+    const repairHandoffRows: RepairHandoffRow[] =
+      this.columns(db, "repair_handoffs").size === 0
+        ? []
+        : db
+            .query<RepairHandoffRow, [string]>(
+              `SELECT build_node_id, rejected_candidate_sha, findings_json, state,
+                      builder_generation, submitted_at, acknowledged_at
+                 FROM repair_handoffs
+                WHERE run_id = ?
+                ORDER BY build_node_id, rejected_candidate_sha`,
+            )
+            .all(runId);
 
     const acceptedAttempts = new Set<string>();
     for (const result of resultRows) {
@@ -529,6 +640,7 @@ export class MaestroDb {
       needs: parseJson<string[]>(node.needs_json, []),
       outputs: parseJson<string[]>(node.outputs_json, []),
       state: node.state,
+      lane_phase: node.lane_phase,
       attempt_no: node.attempt_no ?? 0,
       block_reason: node.block_reason,
       cancel_cause: node.cancel_cause,
@@ -569,6 +681,28 @@ export class MaestroDb {
       server_now_ms: Date.now(),
       integration: this.integration(runId),
       nodes,
+      actor_sessions: actorSessionRows,
+      lane_candidates: candidateRows satisfies MaestroLaneCandidate[],
+      candidate_reviews: candidateReviewRows.map((review) => ({
+        review_node_id: review.review_node_id,
+        candidate_sha: review.candidate_sha,
+        reviewer_generation: review.reviewer_generation,
+        state: review.state,
+        review_digest: review.review_digest,
+        receipt_path: review.receipt_path,
+        findings: parseJson<MaestroReviewFinding[]>(review.findings_json, []),
+        verdict: review.verdict,
+        completed_at: review.completed_at,
+      })) satisfies MaestroCandidateReview[],
+      repair_handoffs: repairHandoffRows.map((handoff) => ({
+        build_node_id: handoff.build_node_id,
+        rejected_candidate_sha: handoff.rejected_candidate_sha,
+        findings: parseJson<MaestroReviewFinding[]>(handoff.findings_json, []),
+        state: handoff.state,
+        builder_generation: handoff.builder_generation,
+        submitted_at: handoff.submitted_at,
+        acknowledged_at: handoff.acknowledged_at,
+      })) satisfies MaestroRepairHandoff[],
       results: resultRows.map((result) => ({
         node_id: result.node_id,
         attempt_no: result.attempt_no,
