@@ -77,8 +77,9 @@ LANE_PHASE_TERMINAL: Tuple[LanePhase, ...] = (
 
 
 class CandidateReviewState(str, Enum):
-    """A reviewer dispatch is either outstanding or has one final verdict."""
+    """A reviewer dispatch is published before prompt submission, then final."""
 
+    PUBLISHED = "PUBLISHED"
     DISPATCHED = "DISPATCHED"
     COMPLETED = "COMPLETED"
 
@@ -948,6 +949,7 @@ class CandidateReview:
     candidate_sha: str
     reviewer_generation: int
     state: CandidateReviewState
+    dispatched_at: Optional[str]
     review_digest: Optional[str]
     receipt_path: Optional[str]
     findings: Tuple[Mapping[str, Any], ...]

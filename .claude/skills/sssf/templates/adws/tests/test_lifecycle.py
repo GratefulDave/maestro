@@ -427,20 +427,53 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
                     detail={"reason": "different debit"},
                 )
 
-    def test_first_terminal_review_wins_and_late_output_is_ignored(self):
+    def test_published_review_dispatches_once_and_completes_only_after_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))
             _review_lane(store)
             store.publish_candidate("run1", "build", self.sha_a, builder_generation=0)
+
             started = store.begin_review(
                 "run1", "build::review", self.sha_a, reviewer_generation=0
             )
+            self.assertTrue(started.created)
+            self.assertTrue(started.should_dispatch)
+            self.assertIs(started.review.state, st.CandidateReviewState.PUBLISHED)
+            self.assertIsNone(started.review.dispatched_at)
             resumed = store.begin_review(
                 "run1", "build::review", self.sha_a, reviewer_generation=9
             )
-            self.assertTrue(started.should_dispatch)
-            self.assertFalse(resumed.should_dispatch)
+            self.assertFalse(resumed.created)
+            self.assertTrue(resumed.should_dispatch)
             self.assertEqual(resumed.review.reviewer_generation, 0)
+
+            with self.assertRaises(lc.LifecycleError):
+                store.complete_review(
+                    "run1",
+                    "build::review",
+                    self.sha_a,
+                    reviewer_generation=0,
+                    verdict=st.ReviewVerdict.PASS,
+                    review_digest="before-dispatch",
+                    receipt_path="/receipts/before-dispatch",
+                    findings=(),
+                )
+
+            dispatched = store.mark_review_dispatched(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
+            replay = store.mark_review_dispatched(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
+            self.assertIs(dispatched.state, st.CandidateReviewState.DISPATCHED)
+            self.assertIsNotNone(dispatched.dispatched_at)
+            self.assertEqual(replay, dispatched)
+            self.assertFalse(
+                store.begin_review(
+                    "run1", "build::review", self.sha_a, reviewer_generation=0
+                ).should_dispatch
+            )
+
             completed = store.complete_review(
                 "run1",
                 "build::review",
@@ -462,9 +495,36 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
                 findings=(),
             )
             self.assertTrue(completed.completed)
+            self.assertEqual(completed.review.dispatched_at, dispatched.dispatched_at)
             self.assertFalse(late.completed)
             self.assertEqual(late.review.verdict, st.ReviewVerdict.PASS)
             self.assertEqual(len(store.candidate_reviews("run1", "build::review")), 1)
+
+    def test_recovery_advances_generation_and_republishes_unfinished_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            _review_lane(store)
+            store.publish_candidate("run1", "build", self.sha_a, builder_generation=0)
+            store.begin_review(
+                "run1", "build::review", self.sha_a, reviewer_generation=4
+            )
+            store.mark_review_dispatched(
+                "run1", "build::review", self.sha_a, reviewer_generation=4
+            )
+
+            recovered = store.recover_review_dispatch(
+                "run1",
+                "build::review",
+                self.sha_a,
+                expected_reviewer_generation=4,
+                reviewer_generation=5,
+            )
+
+            self.assertFalse(recovered.created)
+            self.assertTrue(recovered.should_dispatch)
+            self.assertEqual(recovered.review.reviewer_generation, 5)
+            self.assertIs(recovered.review.state, st.CandidateReviewState.PUBLISHED)
+            self.assertIsNone(recovered.review.dispatched_at)
 
     def test_rejection_and_handoff_are_one_durable_operation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -472,6 +532,9 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             _review_lane(store)
             store.publish_candidate("run1", "build", self.sha_a, builder_generation=0)
             store.begin_review(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
+            store.mark_review_dispatched(
                 "run1", "build::review", self.sha_a, reviewer_generation=0
             )
             rejected = store.reject_and_create_handoff(
@@ -505,6 +568,9 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             _review_lane(store)
             store.publish_candidate("run1", "build", self.sha_a, builder_generation=0)
             store.begin_review(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
+            store.mark_review_dispatched(
                 "run1", "build::review", self.sha_a, reviewer_generation=0
             )
             store.reject_and_create_handoff(
@@ -564,6 +630,9 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             store.begin_review(
                 "run1", "build::review", self.sha_a, reviewer_generation=0
             )
+            store.mark_review_dispatched(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
             store.reject_and_create_handoff(
                 "run1",
                 "build::review",
@@ -618,6 +687,9 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             _review_lane(store)
             store.publish_candidate("run1", "build", self.sha_a, builder_generation=0)
             store.begin_review(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
+            store.mark_review_dispatched(
                 "run1", "build::review", self.sha_a, reviewer_generation=0
             )
             store.reject_and_create_handoff(
@@ -677,6 +749,9 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             )
             store.publish_candidate("run1", "build", self.sha_a, builder_generation=0)
             store.begin_review(
+                "run1", "build::review", self.sha_a, reviewer_generation=0
+            )
+            store.mark_review_dispatched(
                 "run1", "build::review", self.sha_a, reviewer_generation=0
             )
             store.complete_review(
@@ -774,6 +849,9 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
             _review_lane(store)
             store.publish_candidate("run1", "build", self.sha_a, builder_generation=30)
             store.begin_review(
+                "run1", "build::review", self.sha_a, reviewer_generation=30
+            )
+            store.mark_review_dispatched(
                 "run1", "build::review", self.sha_a, reviewer_generation=30
             )
             store.complete_review(
@@ -1568,6 +1646,9 @@ class CancellationTests(unittest.TestCase):
             store.begin_review(
                 "run1", "build::review", candidate_sha, reviewer_generation=1
             )
+            store.mark_review_dispatched(
+                "run1", "build::review", candidate_sha, reviewer_generation=1
+            )
             store.reject_and_create_handoff(
                 "run1",
                 "build::review",
@@ -1664,6 +1745,9 @@ class CancellationTests(unittest.TestCase):
                 "run1", "a", candidate_sha=sha, builder_generation=1
             )
             store.begin_review("run1", "a::review", sha, reviewer_generation=1)
+            store.mark_review_dispatched(
+                "run1", "a::review", sha, reviewer_generation=1
+            )
             store.reject_and_create_handoff(
                 "run1",
                 "a::review",

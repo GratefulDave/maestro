@@ -169,6 +169,12 @@ class FindingsLedgerFixture(unittest.TestCase):
             store.begin_review(
                 run_id, REVIEW_NODE, CANDIDATE_ONE, reviewer_generation=1
             )
+            store.mark_review_dispatched(
+                run_id,
+                REVIEW_NODE,
+                CANDIDATE_ONE,
+                reviewer_generation=1,
+            )
             if reject:
                 store.reject_and_create_handoff(
                     run_id,
@@ -205,6 +211,12 @@ class FindingsLedgerFixture(unittest.TestCase):
                 )
                 store.begin_review(
                     run_id, REVIEW_NODE, CANDIDATE_TWO, reviewer_generation=1
+                )
+                store.mark_review_dispatched(
+                    run_id,
+                    REVIEW_NODE,
+                    CANDIDATE_TWO,
+                    reviewer_generation=1,
                 )
                 store.complete_review(
                     run_id,

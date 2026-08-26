@@ -1937,22 +1937,36 @@ def _code_review_runner(
         handle = handles.pop(build_node_id, None)
         session = active_session(build_node_id)
         if handle is None and session is not None:
+            persisted = launcher.PersistedActorHandle(
+                correlation_token=session.correlation_token,
+                pane_id=session.pane_id,
+                agent_name=launcher.agent_name_for(session.correlation_token),
+                launched_cwd=Path(args.repo),
+                transcript_path=Path(session.session_path),
+                workspace_id=launcher.workspace_of(_session_tab_id(session)),
+                tab_id=_session_tab_id(session),
+                lane_key=build_node_id,
+            )
             try:
-                handle = runner.adopt(
-                    launcher.PersistedActorHandle(
-                        correlation_token=session.correlation_token,
-                        pane_id=session.pane_id,
-                        agent_name=launcher.agent_name_for(session.correlation_token),
-                        launched_cwd=Path(args.repo),
-                        transcript_path=Path(session.session_path),
-                        workspace_id=launcher.workspace_of(_session_tab_id(session)),
-                        tab_id=_session_tab_id(session),
-                        lane_key=build_node_id,
-                    )
-                )
+                handle = runner.adopt(persisted)
             except launcher.HandleAbsent:
-                # A typed absence is sufficient terminal proof.  Unknown
-                # liveness and mismatched ids escape without closing the row.
+                # Adoption already proved this persisted pane's cwd and
+                # placement before finding its actor record absent. Retire the
+                # remaining shell before closing the durable actor generation.
+                runner.close_actorless_pane(persisted)
+                lifecycle_store.close_actor_session(
+                    args.run_id,
+                    build_node_id,
+                    "reviewer",
+                    generation=session.generation,
+                )
+                return
+            except launcher.HandleAdoptionRefused:
+                # A live actor in a superseded run layout still requires
+                # identity-proven physical retirement before its row closes.
+                runner.retire_for_replacement(
+                    persisted, finalization_window.time.monotonic() + 5.0
+                )
                 lifecycle_store.close_actor_session(
                     args.run_id,
                     build_node_id,
@@ -2017,52 +2031,129 @@ def _code_review_runner(
             # A durable dispatch may leave a syntactically valid draft while
             # its reviewer is still writing.  Only the common poller's
             # completeness contract may adopt a persisted report.
-            persisted_report = (
-                _poll_reviewer_report(report_path) if resume_existing_dispatch else None
-            )
-            if not resume_existing_dispatch:
+            persisted_report = _poll_reviewer_report(report_path)
+            dispatch_is_proven = resume_existing_dispatch
+            recovering_unproven_dispatch = False
+            if lifecycle_store is not None:
+                durable_review = lifecycle_store.candidate_review(
+                    args.run_id,
+                    "{}::review".format(build_node_id),
+                    output_sha,
+                )
+                if durable_review is not None:
+                    dispatch_is_proven = (
+                        durable_review.state
+                        is scheduler_types.CandidateReviewState.DISPATCHED
+                    )
+                    recovering_unproven_dispatch = (
+                        resume_existing_dispatch
+                        and durable_review.state
+                        is scheduler_types.CandidateReviewState.PUBLISHED
+                    )
+            if not dispatch_is_proven and not recovering_unproven_dispatch:
                 _clear_stale_reviewer_report(report_path)
+                persisted_report = None
             submitted = False
+
+            def mark_dispatched(handle) -> None:
+                nonlocal dispatch_is_proven, recovering_unproven_dispatch
+                if lifecycle_store is not None:
+                    # Direct callback consumers (including offline contract
+                    # tests) may use actor-session persistence without the
+                    # scheduler's candidate ledger. The scheduler owns that
+                    # ledger and records the same edge before terminal CAS.
+                    if (
+                        lifecycle_store.candidate_review(
+                            args.run_id,
+                            "{}::review".format(build_node_id),
+                            output_sha,
+                        )
+                        is None
+                    ):
+                        dispatch_is_proven = True
+                        recovering_unproven_dispatch = False
+                        return
+                    session = active_session(build_node_id)
+                    if (
+                        session is None
+                        or session.correlation_token != handle.correlation_token
+                    ):
+                        raise scheduler.AttemptOwnershipLost(
+                            "reviewer dispatch actor binding changed"
+                        )
+                    lifecycle_store.mark_review_dispatched(
+                        args.run_id,
+                        "{}::review".format(build_node_id),
+                        output_sha,
+                        reviewer_generation=session.generation,
+                    )
+                dispatch_is_proven = True
+                recovering_unproven_dispatch = False
+
+            def recover_transcript_dispatch(handle) -> bool:
+                if dispatch_is_proven:
+                    return True
+                recorded = launcher.prompt_submission_recorded(handle, prompt_path)
+                if not recorded and recovering_unproven_dispatch:
+                    recorded = launcher.wait_for_prompt_submission_record(
+                        handle, prompt_path
+                    )
+                if not recorded:
+                    return False
+                mark_dispatched(handle)
+                return True
 
             def launch_reviewer():
                 nonlocal submitted
                 handle = handles.get(build_node_id)
                 if handle is not None:
-                    # A retained handle already owns a dispatched turn.  On
-                    # resume, poll its report rather than prompt it again;
-                    # only a fresh candidate needs another submission.
-                    if not resume_existing_dispatch and not submitted:
+                    # PUBLISHED can be the crash gap after Herdr consumed the
+                    # prompt but before SQLite advanced to DISPATCHED. The
+                    # exact @<digest/prompt.md> transcript record closes that
+                    # gap without a duplicate turn.
+                    recover_transcript_dispatch(handle)
+                    if not dispatch_is_proven and not submitted:
                         runner.resubmit(
                             handle,
                             prompt_path,
                             route=args.reviewer_route,
                             expected_token=handle.correlation_token,
                         )
+                        mark_dispatched(handle)
                         submitted = True
                 else:
                     session = active_session(build_node_id)
                     adopted_existing = False
                     if session is not None:
+                        persisted = launcher.PersistedActorHandle(
+                            correlation_token=session.correlation_token,
+                            pane_id=session.pane_id,
+                            agent_name=launcher.agent_name_for(
+                                session.correlation_token
+                            ),
+                            launched_cwd=Path(args.repo),
+                            transcript_path=Path(session.session_path),
+                            envelope_path=report_path,
+                            workspace_id=launcher.workspace_of(
+                                _session_tab_id(session)
+                            ),
+                            tab_id=_session_tab_id(session),
+                            lane_key=build_node_id,
+                        )
                         try:
-                            handle = runner.adopt(
-                                launcher.PersistedActorHandle(
-                                    correlation_token=session.correlation_token,
-                                    pane_id=session.pane_id,
-                                    agent_name=launcher.agent_name_for(
-                                        session.correlation_token
-                                    ),
-                                    launched_cwd=Path(args.repo),
-                                    transcript_path=Path(session.session_path),
-                                    envelope_path=report_path,
-                                    workspace_id=launcher.workspace_of(
-                                        _session_tab_id(session)
-                                    ),
-                                    tab_id=_session_tab_id(session),
-                                    lane_key=build_node_id,
-                                )
-                            )
+                            handle = runner.adopt(persisted)
                             adopted_existing = True
-                        except launcher.HandleAbsent:
+                        except (
+                            launcher.HandleAbsent,
+                            launcher.HandleAdoptionRefused,
+                        ) as exc:
+                            if isinstance(exc, launcher.HandleAbsent):
+                                runner.close_actorless_pane(persisted)
+                            else:
+                                runner.retire_for_replacement(
+                                    persisted,
+                                    finalization_window.time.monotonic() + 5.0,
+                                )
                             generation = session.generation + 1
                             handle = _typed_launch_pane(
                                 runner,
@@ -2171,14 +2262,19 @@ def _code_review_runner(
                                 correlation_token=handle.correlation_token,
                                 tab_id=handle.tab_id,
                             )
-                    if adopted_existing and not resume_existing_dispatch:
-                        runner.resubmit(
-                            handle,
-                            prompt_path,
-                            route=args.reviewer_route,
-                            expected_token=handle.correlation_token,
-                        )
-                        submitted = True
+                    if adopted_existing:
+                        recover_transcript_dispatch(handle)
+                        if not dispatch_is_proven:
+                            runner.resubmit(
+                                handle,
+                                prompt_path,
+                                route=args.reviewer_route,
+                                expected_token=handle.correlation_token,
+                            )
+                            mark_dispatched(handle)
+                            submitted = True
+                    if not dispatch_is_proven and submitted:
+                        mark_dispatched(handle)
                     handles[build_node_id] = handle
                 return finalization_window.ReviewerSession(
                     route=args.reviewer_route,
@@ -5533,26 +5629,29 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     handle = builder_handles.get(node.node_id)
                 launched_replacement = False
                 if handle is None:
+                    persisted = launcher.PersistedActorHandle(
+                        correlation_token=session.correlation_token,
+                        pane_id=session.pane_id,
+                        agent_name=launcher.agent_name_for(session.correlation_token),
+                        launched_cwd=attempt.path,
+                        transcript_path=Path(session.session_path),
+                        envelope_path=envelope_path,
+                        environment=launch_environment,
+                        workspace_id=launcher.workspace_of(_session_tab_id(session)),
+                        tab_id=_session_tab_id(session),
+                        lane_key=node.node_id,
+                    )
                     try:
-                        handle = route_runner.adopt(
-                            launcher.PersistedActorHandle(
-                                correlation_token=session.correlation_token,
-                                pane_id=session.pane_id,
-                                agent_name=launcher.agent_name_for(
-                                    session.correlation_token
-                                ),
-                                launched_cwd=attempt.path,
-                                transcript_path=Path(session.session_path),
-                                envelope_path=envelope_path,
-                                environment=launch_environment,
-                                workspace_id=launcher.workspace_of(
-                                    _session_tab_id(session)
-                                ),
-                                tab_id=_session_tab_id(session),
-                                lane_key=node.node_id,
+                        handle = route_runner.adopt(persisted)
+                    except (
+                        launcher.HandleAbsent,
+                        launcher.HandleAdoptionRefused,
+                    ) as exc:
+                        if isinstance(exc, launcher.HandleAdoptionRefused):
+                            route_runner.retire_for_replacement(
+                                persisted,
+                                finalization_window.time.monotonic() + 5.0,
                             )
-                        )
-                    except launcher.HandleAbsent:
                         handle = launch_replacement()
                         launched_replacement = True
                     with handles_lock:

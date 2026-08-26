@@ -32,6 +32,12 @@ class CandidateReviewAuthorityTests(SchedulerFixture):
             "run1", "a::review", candidate.candidate_sha, reviewer_generation=1
         )
         self.assertTrue(first.should_dispatch)
+        self.store.mark_review_dispatched(
+            "run1",
+            "a::review",
+            candidate.candidate_sha,
+            reviewer_generation=1,
+        )
         completed = self.store.complete_review(
             "run1",
             "a::review",
