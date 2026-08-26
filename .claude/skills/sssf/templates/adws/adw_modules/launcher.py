@@ -475,6 +475,26 @@ class LaunchSpec:
 #: the runtime-side law: LIVE_WORKING_STATUSES (watchdog.py /
 #: finalization_window.py) excludes "idle" for the same reason -- silence,
 #: flat mtime, and idle_notification are heartbeats, not completion.
+#: The pane status that means "back at the composer, not doing anything" --
+#: and equally "between a tool result and the next message" and "blocked
+#: inside a tool call", which is why one sample of it decides nothing.
+#:
+#: Stated here rather than imported from `finalization_window`, which names
+#: the same string for the reviewer. That module reaches this one through
+#: `watchdog -> scheduler_types -> worktree`, so the dependency runs one way
+#: only. `test_step7_launcher` asserts the two stay equal, which is what keeps
+#: a restatement from becoming a divergence.
+AGENT_QUIESCENT_STATUS = "idle"
+
+#: How long `AGENT_QUIESCENT_STATUS` must hold, with no transcript record
+#: appearing, before `poll` reads it as a turn that stopped without declaring.
+#: B14's rule and the reviewer window's own number
+#: (`finalization_window.DEFAULT_QUIESCENCE_CONFIRM_S`), bound to it by the
+#: same test: two numbers for one clock is how a raised default comes to look
+#: like it did nothing.
+AGENT_QUIESCENCE_CONFIRM_S = 60.0
+
+
 CLAUDE_TEAM_PROMPT_PREFIX = (
     "/team spawn subagents for tasks. If you get impatient do not duplicate "
     "the work yourself. Poll them. Make sure they use SendMessage to respond "
@@ -1321,27 +1341,29 @@ def wait_for_interactive_agent(
     SHA-bound repair prompt; ``working`` still requires the bounded idle wait.
     """
 
+    def settled(payload: Any) -> bool:
+        agent = _extract(payload, "agent")
+        if not isinstance(agent, dict):
+            result = payload.get("result") if isinstance(payload, dict) else None
+            agent = result if isinstance(result, dict) else {}
+        status = agent.get("agent_status") or agent.get("status")
+        return status in ("idle", "done")
+
     def ready() -> bool:
         try:
             payload = herdr_call("agent", "get", name)
         except RuntimeError:
             return False
-        agent = _extract(payload, "agent")
-        if not isinstance(agent, dict):
-            return False
-        status = agent.get("agent_status") or agent.get("status")
-        return status in ("idle", "done")
+        return settled(payload)
 
     if ready():
         return
     timeout_ms = max(1, int(max(0.001, timeout_s) * 1000))
     try:
-        herdr_call(
+        outcome = herdr_call(
             "agent",
             "wait",
             name,
-            "--until",
-            "idle",
             "--timeout",
             str(timeout_ms),
             timeout=timeout_s + 5.0,
@@ -1350,6 +1372,9 @@ def wait_for_interactive_agent(
         if ready():
             return
         raise RuntimeError("AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
+    if settled(outcome) or ready():
+        return
+    raise RuntimeError("AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name))
 
 
 #: How long `launch` waits for Herdr to report the agent's transcript.
@@ -1590,9 +1615,19 @@ class HerdrLauncher:
         #: the refusal path without spending the production window; nothing in
         #: the runtime sets it.
         self.agent_start_busy_window_s = AGENT_START_BUSY_WINDOW_S
+        #: How long `idle` must hold, with no transcript record appearing,
+        #: before `poll` convicts a builder turn of ending without an
+        #: envelope. An attribute for the same reason
+        #: `agent_start_busy_window_s` is one: a test drives the branch
+        #: without spending the production window. Nothing in the runtime
+        #: sets it.
+        self.quiescence_confirm_s = AGENT_QUIESCENCE_CONFIRM_S
         self._handles_lock = threading.RLock()
         self._handles: Dict[str, LaunchHandle] = {}
         self._tailers: Dict[str, TranscriptTailer] = {}
+        #: token -> (monotonic stamp the current `idle` run began, transcript
+        #: record count at that stamp). Guarded by `_handles_lock`.
+        self._quiescent_since: Dict[str, Tuple[float, int]] = {}
         self._proven_absent: Dict[str, LaunchHandle] = {}
         #: The pane every split is taken from, resolved once from herdr's
         #: `--current` selector and then never re-read. `None` until the first
@@ -2048,6 +2083,13 @@ class HerdrLauncher:
         """
         try:
             self._herdr("pane", "close", pane_id, env=environment)
+        except HerdrCallError as exc:
+            if exc.code not in ("pane_not_found", "workspace_not_found"):
+                return False
+            if exc.code == "workspace_not_found":
+                self._invalidate_workspace_layout(workspace_of(pane_id))
+            self._forget_pane(pane_id)
+            return True
         except BaseException:
             return False
         self._forget_pane(pane_id)
@@ -2404,6 +2446,10 @@ class HerdrLauncher:
             until=("working", "idle"),
             working_proves=True,
         )
+        # A new prompt is a new turn. Any confirmation window still open from
+        # the previous one measures a pane that has since been handed work,
+        # and would convict this turn on the last one's silence.
+        self._clear_quiescence(handle.correlation_token)
         return handle
 
     def _prove_tab_contains_pane(
@@ -2425,7 +2471,10 @@ class HerdrLauncher:
                 "tab", "list", "--workspace", workspace_id, env=environment
             )
         except HerdrCallError as exc:
-            if exc.code in ("workspace_not_found", "tab_not_found"):
+            if exc.code == "workspace_not_found":
+                self._invalidate_workspace_layout(workspace_id)
+                raise HandleAbsent("WORKSPACE_ABSENT", workspace_id) from exc
+            if exc.code == "tab_not_found":
                 raise HandleAdoptionRefused("TAB_ABSENT", tab_id) from exc
             raise
         tabs = _extract(payload, "tabs")
@@ -2437,6 +2486,79 @@ class HerdrLauncher:
         ):
             return
         raise HandleAdoptionRefused("TAB_ABSENT", tab_id)
+
+    def restore_placement(
+        self,
+        *,
+        workspace_id: str,
+        lane_key: str,
+        tab_id: str,
+        pane_id: str,
+        environment: Mapping[str, str],
+    ) -> None:
+        """Restore a run/lane layout from a durable pane without adopting its actor.
+
+        Resume may need to launch a reviewer after the builder declaration has
+        completed.  The builder actor token is then no longer the attempt token,
+        so actor adoption is not the authority for locating the run's workspace.
+        The persisted Herdr pane and tab IDs are.  Validate both against Herdr
+        before caching them; a dead pane is typed absence, while mismatched IDs
+        are a refusal rather than permission to create a second workspace.
+        """
+        workspace_id = str(workspace_id or "")
+        lane_key = str(lane_key or "")
+        tab_id = str(tab_id or "")
+        pane_id = str(pane_id or "")
+        if not workspace_id or not lane_key or not tab_id or not pane_id:
+            raise HandleAdoptionRefused("PLACEMENT_ID_UNPROVEN", pane_id or tab_id)
+        if (
+            workspace_of(tab_id) != workspace_id
+            or workspace_of(pane_id) != workspace_id
+        ):
+            raise HandleAdoptionRefused(
+                "WORKSPACE_ID_MISMATCH",
+                "{}!={}".format(workspace_id, workspace_of(pane_id)),
+            )
+        try:
+            payload = self._herdr("pane", "get", pane_id, env=environment)
+        except HerdrCallError as exc:
+            if exc.code == "workspace_not_found":
+                self._invalidate_workspace_layout(workspace_id)
+                raise HandleAbsent("WORKSPACE_ABSENT", workspace_id) from exc
+            if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
+                raise HandleAbsent("PANE_ABSENT", pane_id) from exc
+            raise
+        pane = _extract(payload, "pane")
+        if not isinstance(pane, dict) or str(pane.get("pane_id") or "") != pane_id:
+            raise HandleAdoptionRefused("PANE_ID_MISMATCH", pane_id)
+        pane_workspace = str(pane.get("workspace_id") or workspace_of(pane_id))
+        pane_tab = str(pane.get("tab_id") or "")
+        if pane_workspace != workspace_id:
+            raise HandleAdoptionRefused(
+                "WORKSPACE_ID_MISMATCH",
+                "{}!={}".format(workspace_id, pane_workspace),
+            )
+        if pane_tab != tab_id:
+            raise HandleAdoptionRefused(
+                "TAB_ID_MISMATCH", "{}!={}".format(tab_id, pane_tab)
+            )
+        self._prove_tab_contains_pane(workspace_id, tab_id, pane_id, environment)
+        with self._handles_lock:
+            if self._workspace_id and self._workspace_id != workspace_id:
+                raise HandleAdoptionRefused(
+                    "WORKSPACE_ID_MISMATCH",
+                    "{}!={}".format(self._workspace_id, workspace_id),
+                )
+            self._workspace_id = workspace_id
+            layout = self._tabs.get(lane_key)
+            if layout is not None and layout.tab_id != tab_id:
+                raise HandleAdoptionRefused(
+                    "TAB_ID_MISMATCH", "{}!={}".format(layout.tab_id, tab_id)
+                )
+            if layout is None:
+                self._tabs[lane_key] = _TabLayout(
+                    tab_id=tab_id, panes=[pane_id], claimed=1
+                )
 
     def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle:
         """Restore a handle only when persisted Herdr ids still prove ownership."""
@@ -2451,7 +2573,10 @@ class HerdrLauncher:
         still prove ownership.  Persisted workspace/tab mismatches are deliberately
         ignored here because they are the reason this actor must be retired.
         """
-        handle = self._adopt(persisted, allow_stale_placement=True)
+        try:
+            handle = self._adopt(persisted, allow_stale_placement=True)
+        except HandleAbsent:
+            return
         self.cancel(handle, deadline)
 
     def close_actorless_pane(self, persisted: PersistedActorHandle) -> None:
@@ -2488,6 +2613,10 @@ class HerdrLauncher:
         try:
             pane_payload = self._herdr("pane", "get", pane_id, env=environment)
         except HerdrCallError as exc:
+            if exc.code == "workspace_not_found":
+                workspace_id = persisted.workspace_id or workspace_of(pane_id)
+                self._invalidate_workspace_layout(workspace_id)
+                raise HandleAbsent("WORKSPACE_ABSENT", workspace_id) from exc
             if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
                 raise HandleAbsent("PANE_ABSENT", pane_id) from exc
             raise
@@ -2611,6 +2740,7 @@ class HerdrLauncher:
         with self._handles_lock:
             self._handles[token] = candidate
             self._proven_absent.pop(token, None)
+            self._quiescent_since.pop(token, None)
             if candidate.transcript_path is not None:
                 self._tailers[token] = TranscriptTailer(candidate.transcript_path)
         return candidate
@@ -2789,14 +2919,63 @@ class HerdrLauncher:
         # about absence of output before liveness, the other about presence of
         # output after it; both resolve the same way — the artifact wins.
         if status in ("starting", "unknown"):
+            self._clear_quiescence(handle.correlation_token)
             return PollResult(PollState.STARTING)
-        # Idle after at least one turn and still no envelope: the agent
-        # finished its turn without writing one. That is a failed attempt, not
-        # a running one -- waiting would hold the node until its timeout with
-        # nothing left to observe.
-        if status == "idle" and turns:
-            return PollResult(PollState.EXITED, 1, "NO_ENVELOPE")
+        # Idle after at least one turn and still no envelope: the agent may
+        # have finished its turn without writing one. That is a failed
+        # attempt, not a running one -- waiting would hold the node until its
+        # timeout with nothing left to observe.
+        #
+        # But a *single* `idle` sample cannot say that. `idle` is herdr's
+        # answer for the gap between a tool result landing and the next
+        # assistant message starting, and for a pane blocked inside a tool
+        # call, exactly as it is for a composer whose turn is over. Reading
+        # one sample as the end of the turn convicted a live builder on
+        # run-8d1a71f463e4430f92a125a8f8b3731d: `lane-acquisition-manifest`'s
+        # generation-3 repair was scored EXITED/NO_ENVELOPE at 15:55:33Z in
+        # the 14-second gap before its next message, the scheduler's
+        # `repair-idle` quiescence proof then correctly observed the same
+        # agent still working and timed out, and the lane ended terminal
+        # QUIESCENCE_UNPROVEN -- 75 seconds before that agent wrote a complete
+        # envelope. Poll and the quiescence proof read the same pane seconds
+        # apart and disagreed; the proof was right.
+        #
+        # So the idle has to *hold*, over `quiescence_confirm_s`, with no
+        # transcript record appearing inside it -- B14's rule, and the same
+        # one `FinalizationWindow.poll` applies to a reviewer. Any record, and
+        # any status that is not `idle`, restarts the confirmation. The
+        # envelope still outranks all of it: `_declared_result` ran at the top
+        # of this method, so a turn that declares mid-window ends here as its
+        # own declaration rather than as a stop.
+        if status == AGENT_QUIESCENT_STATUS and turns:
+            if self._quiescence_confirmed(handle.correlation_token, turns):
+                return PollResult(PollState.EXITED, 1, "NO_ENVELOPE")
+            return PollResult(PollState.RUNNING)
+        self._clear_quiescence(handle.correlation_token)
         return PollResult(PollState.RUNNING)
+
+    def _quiescence_confirmed(self, token: str, turns: int) -> bool:
+        """Whether `idle` has held long enough to mean the turn stopped.
+
+        Latching rather than sampling. The first `idle` poll of a run opens
+        the window and answers `False`; a later poll answers `True` only once
+        the window has been open longer than `quiescence_confirm_s` *and* the
+        transcript has not grown since it opened. A record appearing inside
+        the window reopens it from that record, because growth is positive
+        evidence of work and outranks the pane's status either way.
+        """
+        now = time.monotonic()
+        with self._handles_lock:
+            latched = self._quiescent_since.get(token)
+            if latched is None or turns > latched[1]:
+                self._quiescent_since[token] = (now, turns)
+                return False
+            return (now - latched[0]) > self.quiescence_confirm_s
+
+    def _clear_quiescence(self, token: str) -> None:
+        """Drop any open confirmation window; the actor is not quiescent."""
+        with self._handles_lock:
+            self._quiescent_since.pop(token, None)
 
     def cancel(self, handle: LaunchHandle, deadline: float) -> None:
         token = handle.correlation_token

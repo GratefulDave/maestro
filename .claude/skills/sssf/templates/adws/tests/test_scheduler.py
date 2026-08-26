@@ -1790,6 +1790,59 @@ class ResumeTests(SchedulerFixture):
         self.assertEqual((self.integration / "a.py").read_text(), "late\n")
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
+    def test_late_recovery_quiesces_builder_before_inventory(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo,
+            "run1",
+            "a",
+            attempt_no,
+            base,
+            self.root / "wt",
+            self.root / "scratch",
+        )
+        baseline = wt.take_baseline(attempt)
+        self.store.record_baseline(
+            "run1", "a", attempt_no, baseline, attempt.ignored_at_base
+        )
+        (attempt.path / "a.py").write_text("partial\n")
+        self.store.mark_blocked("run1", "a", st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.store.declare_outcome("run1")
+        self.store.resume_run("run1")
+        self.store.prepare_late_envelope_recovery("run1", "a", attempt_no)
+
+        def quiesce(record, phase):
+            self.quiesce_attempt(record, phase)
+            if phase == "late-envelope-before-inventory":
+                (attempt.path / "a.py").write_text("finished\n")
+
+        report = self.schedule(
+            [node],
+            deps=self.deps(
+                run_node=mock.Mock(side_effect=AssertionError("relaunch")),
+                recover_node=mock.Mock(
+                    return_value=sch.NodeExecution(
+                        envelope_parsed=True,
+                        envelope_payload={"success": True},
+                        exit_code=0,
+                    )
+                ),
+                quiesce_attempt=quiesce,
+            ),
+        ).run()
+
+        self.assertIn(
+            (("run1", "a", attempt_no), "late-envelope-before-inventory"),
+            self.quiesce_calls,
+        )
+        self.assertEqual(self.store.get_node("run1", "a").attempt_no, attempt_no)
+        self.assertEqual((self.integration / "a.py").read_text(), "finished\n")
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
     def test_inherited_running_success_recovers_without_relaunch(self):
         node = self.agent("a")
         scheduler = self.schedule([node])
@@ -1926,7 +1979,7 @@ class ResumeTests(SchedulerFixture):
         )
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
-    def test_late_recovery_failure_consumes_marker_then_relaunches(self):
+    def test_late_recovery_failure_blocks_retained_attempt_without_relaunch(self):
         node = self.agent("a")
         scheduler = self.schedule([node])
         scheduler.project()
@@ -1949,22 +2002,21 @@ class ResumeTests(SchedulerFixture):
         self.store.declare_outcome("run1")
         self.store.resume_run("run1")
         self.store.prepare_late_envelope_recovery("run1", "a", attempt_no)
-        self.written = {"a": {"a.py": "fresh\n"}}
 
         recover = mock.Mock(side_effect=RuntimeError("unreadable envelope"))
-        relaunch = mock.Mock(side_effect=self.run_node)
+        relaunch = mock.Mock(side_effect=AssertionError("relaunch"))
         report = self.schedule(
             [node], deps=self.deps(run_node=relaunch, recover_node=recover)
         ).run()
 
-        self.assertEqual(recover.call_count, 1)
-        self.assertEqual(relaunch.call_count, 1)
-        self.assertEqual(self.store.get_node("run1", "a").attempt_no, attempt_no + 1)
-        self.assertNotIn(
-            lc.LATE_ENVELOPE_RECOVERY_KEY,
-            self.store.get_attempt("run1", "a", attempt_no).extra,
-        )
-        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        recover.assert_called_once()
+        relaunch.assert_not_called()
+        lifecycle = self.store.get_node("run1", "a")
+        self.assertEqual(lifecycle.attempt_no, attempt_no)
+        self.assertIs(lifecycle.state, st.NodeState.BLOCKED)
+        self.assertIs(lifecycle.block_reason, st.BlockReason.OUTPUT_IDENTITY_INVALID)
+        self.assertEqual(len(self.store.attempts_for("run1", "a")), 1)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
 
     def test_crash_after_lane_acceptance_reconciles_and_merges_once(self):
         node = self.agent("a")

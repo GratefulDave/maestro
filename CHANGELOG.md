@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **A review-budget grant preserves the blocked attempt.** Semantic `--force` /
+  `--grant N` still move the node to `PENDING`. A `REVIEW_BUDGET_EXHAUSTED`
+  grant writes `granted_extra_attempts` and a durable recovery marker, and
+  leaves the node `BLOCKED` on the same attempt, candidate, repair handoff,
+  worktree, actor generation, and lane phase. Only a later `run resume` that
+  proves the worktree exists and the prior actor is absent returns that exact
+  attempt to the frontier. Resume never allocates a replacement worktree for
+  that grant. Typed `workspace_not_found` is absence proof for every pane in
+  that workspace; resume invalidates cached lane layouts and recreates the
+  workspace under the persisted plan label. Persistent builder/reviewer
+  adoption still requires exact pane, cwd, session-path, correlation-token,
+  role, and generation. Ordinary late-envelope resume is unchanged:
+  `QUIESCENCE_UNPROVEN` stays blocked until an explicit retry.
+
 - **Persistent candidate-review lifecycle replaces inline advisory review.**
   Every reviewable build now projects one derived `build::review` DAG node.
   The scheduler publishes immutable candidate SHAs, reviews each SHA exactly

@@ -21,7 +21,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 from rich.console import Console as RichConsole
@@ -3840,6 +3840,48 @@ def _runtime_launcher(
     )
 
 
+def _restore_run_placement(
+    runner: "launcher.HerdrLauncher",
+    store: "lc.LifecycleStore",
+    run_id: str,
+    lane_ids: Iterable[str],
+) -> None:
+    """Seed a resumed launcher from each lane's newest live durable pane.
+
+    Actor adoption is intentionally not the placement authority. A completed
+    builder may have advanced to a later session generation while the node
+    attempt being recovered retains its original generation. The pane and tab
+    IDs still identify the run workspace and lane tab, so prove and restore
+    those before any resumed reviewer is allowed to launch.
+    """
+    for lane_id in sorted(set(lane_ids)):
+        restored = False
+        for actor_role in ("builder", "reviewer"):
+            sessions = reversed(
+                store.actor_sessions(
+                    run_id, lane_id, actor_role=actor_role, limit=10_000
+                )
+            )
+            for session in sessions:
+                tab_id = _session_tab_id(session)
+                if not session.pane_id or not tab_id:
+                    continue
+                try:
+                    runner.restore_placement(
+                        workspace_id=launcher.workspace_of(tab_id),
+                        lane_key=lane_id,
+                        tab_id=tab_id,
+                        pane_id=session.pane_id,
+                        environment={},
+                    )
+                except launcher.HandleAbsent:
+                    continue
+                restored = True
+                break
+            if restored:
+                break
+
+
 class _ConfiguredProvisioner:
     """§9.3's `provision(worktree)` for a run that launches no agent.
 
@@ -4676,7 +4718,7 @@ class _RunProgress:
             return "bold green"
         if state in {"BLOCKED", "FAILED", "REJECTED", "CANCELLED"}:
             return "bold red"
-        if state in {"PENDING", "DISPATCHED", "WAITING"}:
+        if state in {"PENDING", "PUBLISHED", "DISPATCHED", "WAITING"}:
             return "bold yellow"
         if state in {"RUNNING", "REVIEWING"}:
             return "bold cyan"
@@ -4695,29 +4737,41 @@ class _RunProgress:
         ):
             node_id = str(row["node_id"])
             role = "tester" if node_id.endswith("-tests") else "builder"
+            detail = (
+                row["block_reason"]
+                if str(row["state"]) == "BLOCKED"
+                else row["lane_phase"]
+            )
             rows.append(
                 (
                     node_id,
                     role,
                     "a{}".format(row["attempt_no"]),
                     str(row["state"]),
-                    self._short(row["lane_phase"] or row["block_reason"] or ""),
+                    self._short(detail or ""),
                 )
             )
         for row in conn.execute(
-            "SELECT review_node_id,state,reviewer_generation "
-            "FROM candidate_reviews WHERE run_id=? AND state='DISPATCHED' "
-            "ORDER BY review_node_id",
+            "SELECT review_node_id,candidate_sha,state,reviewer_generation "
+            "FROM candidate_reviews WHERE run_id=? "
+            "AND state IN ('PUBLISHED','DISPATCHED') ORDER BY review_node_id",
             (self.run_id,),
         ):
             review_node_id = str(row["review_node_id"])
+            state = str(row["state"])
+            candidate = self._short(row["candidate_sha"], limit=12)
+            evidence = (
+                "candidate {} · dispatch pending".format(candidate)
+                if state == "PUBLISHED"
+                else "candidate {} · signed verdict pending".format(candidate)
+            )
             rows.append(
                 (
                     review_node_id.removesuffix("::review"),
                     "reviewer",
                     "r{}".format(row["reviewer_generation"]),
-                    str(row["state"]),
-                    "signed verdict pending",
+                    state,
+                    evidence,
                 )
             )
         return rows
@@ -4769,11 +4823,25 @@ class _RunProgress:
 
     def _emit_transition(self, row: sqlite3.Row) -> None:
         node = str(row["node_id"] or "run")
-        destination = str(row["to_state"] or "EVENT")
         try:
             payload = json.loads(row["detail_json"] or "{}")
         except (TypeError, ValueError):
             payload = {}
+        reason = str(row["reason"])
+        if reason == "lane-phase" and payload.get("from") and payload.get("to"):
+            line = RichText()
+            line.append("● ", style="cyan")
+            line.append(node, style="bold white")
+            line.append("  PHASE  ", style="bold cyan")
+            line.append(
+                "{} → {}".format(
+                    self._short(payload["from"]), self._short(payload["to"])
+                ),
+                style="cyan",
+            )
+            self.console.print(line)
+            return
+        destination = str(row["to_state"] or "EVENT")
         phase = payload.get("phase") or payload.get("lane_phase")
         line = RichText()
         line.append("● ", style=self._state_style(destination))
@@ -4781,7 +4849,7 @@ class _RunProgress:
         line.append("  ")
         line.append(destination, style=self._state_style(destination))
         line.append("  ")
-        line.append(self._short(row["reason"]), style="bold magenta")
+        line.append(self._short(reason), style="bold magenta")
         if phase:
             line.append("  ·  {}".format(self._short(phase)), style="cyan")
         self.console.print(line)
@@ -4940,6 +5008,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         lane_placement = _lane_placement_by_node(plan)
         builder_node_ids = frozenset(node.node_id for node in plan.agent_nodes)
         store = lc.LifecycleStore(args.db)
+        if resuming and route_runner is not None:
+            _restore_run_placement(route_runner, store, args.run_id, builder_node_ids)
         run_console.print(
             "[dim]preflight · reconciling durable attempts and actor sessions[/dim]"
         )
@@ -4957,7 +5027,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         created_integration_path: Optional[Path] = None
         try:
             late_envelope_recovery = []
-            running_late_envelope_recovery = []
+            proven_late_envelope_recovery = []
             if resuming:
                 # A completed interactive declaration belongs to its original
                 # generation. Validate every durable input, then either prove
@@ -5085,12 +5155,16 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                         proven_absent.add((node_id, attempt_no))
                     late_envelope_recovery.append((node_id, attempt_no))
                 # A scheduler can die after a fast agent has declared success
-                # but before launch returns a handle. That leaves RUNNING in
-                # the ledger rather than QUIESCENCE_UNPROVEN. Apply the same
-                # evidence gate before `resume_run` closes inherited attempts,
-                # or the accepted declaration is discarded and the original
-                # assignment is relaunched from its base.
-                for node_id, attempt_no in store.running_attempts(args.run_id):
+                # but before launch returns a handle, or after preserving that
+                # candidate while exhausting a reviewer infrastructure budget.
+                # Both states need the same evidence gate before `resume_run`;
+                # otherwise the accepted declaration is discarded and the
+                # original builder assignment is relaunched from its base.
+                recoverable_attempts = set(store.running_attempts(args.run_id))
+                recoverable_attempts.update(
+                    store.retry_budget_blocked_attempts(args.run_id)
+                )
+                for node_id, attempt_no in sorted(recoverable_attempts):
                     if node_id not in interactive_node_ids:
                         continue
                     try:
@@ -5105,7 +5179,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     except _RunRefused as refused:
                         return refused.emit()
                     if execution is not None:
-                        running_late_envelope_recovery.append((node_id, attempt_no))
+                        proven_late_envelope_recovery.append((node_id, attempt_no))
                         token = "{}-{}-{}".format(args.run_id, node_id, attempt_no)
                         presence = route_runner.agent_presence(token)
                         key = (node_id, attempt_no)
@@ -5176,7 +5250,8 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                                 builder_handles[node_id] = handle
                                 proven_absent.discard(key)
                 store.resume_run(
-                    args.run_id, late_envelope_attempts=running_late_envelope_recovery
+                    args.run_id,
+                    late_envelope_attempts=proven_late_envelope_recovery,
                 )
                 for node_id, attempt_no in late_envelope_recovery:
                     store.prepare_late_envelope_recovery(
@@ -5488,15 +5563,32 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 session = store.current_actor_session(
                     args.run_id, node.node_id, "builder"
                 )
+                prior_sessions = store.actor_sessions(
+                    args.run_id,
+                    node.node_id,
+                    actor_role="builder",
+                    limit=10_000,
+                )
                 if session is None:
-                    prior_sessions = store.actor_sessions(
-                        args.run_id, node.node_id, actor_role="builder"
+                    session = next(
+                        (
+                            prior
+                            for prior in reversed(prior_sessions)
+                            if prior.generation == builder_generation
+                        ),
+                        None,
                     )
-                    session = prior_sessions[-1] if prior_sessions else None
                 if session is None or session.generation != builder_generation:
                     raise scheduler.AttemptOwnershipLost(
                         "{}: builder generation changed".format(node.node_id)
                     )
+                replacement_generation = (
+                    max(
+                        (prior.generation for prior in prior_sessions),
+                        default=session.generation,
+                    )
+                    + 1
+                )
                 key = (node.node_id, record.attempt_no)
                 envelope_path = attempt.scratch / "agent-envelope.json"
                 acknowledgement_path = attempt.scratch / "repair-acknowledgement.json"
@@ -5554,7 +5646,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
 
                 def launch_replacement():
                     nonlocal session, builder_generation
-                    generation = session.generation + 1
+                    generation = replacement_generation
                     # A proven-absent session cannot own its old envelope or
                     # acknowledgement; its replacement gets a fresh turn.
                     _clear_turn_artifact(envelope_path)
@@ -6452,14 +6544,16 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         )
     if findings:
         lines.append("")
-        lines.append("  rejecting findings on merged nodes")
-        for node in findings:
+        lines.append("  rejected candidate reviews")
+        for review in findings:
             lines.append(
-                "  {}  a{}  {} blocking".format(
-                    node["node_id"], node["attempt_no"], len(node.get("findings") or ())
+                "  {}  {}  {} blocking".format(
+                    review["review_node_id"],
+                    review["candidate_sha"][:12],
+                    len(review.get("findings") or ()),
                 )
             )
-            for finding in node.get("findings") or ():
+            for finding in review.get("findings") or ():
                 lines.append(
                     "    {}  {}".format(
                         finding.get("check_id") or "", finding.get("object_id") or ""

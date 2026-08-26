@@ -346,6 +346,9 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   -- NULL, and NULL is read as 0 -- no boundary recorded, counted from the
   -- beginning of the node's life, which is the behaviour that predates it.
   retry_spend_floor      INTEGER,
+  -- The retained-lane twin of retry_spend_floor, expressed as the highest
+  -- durable cycle_seq recorded before the latest operator boundary.
+  lane_retry_spend_floor INTEGER,
   updated_at             TEXT NOT NULL,
   PRIMARY KEY (run_id, node_id)
 );
@@ -589,6 +592,7 @@ _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
         ),
     ),
     ("retry_spend_floor", "INTEGER"),
+    ("lane_retry_spend_floor", "INTEGER"),
 )
 
 #: Every table an older ledger may be missing a column from, in one place so
@@ -652,6 +656,29 @@ _RETRY_SPEND_FLOOR_SQL = (
 
 #: Every node of one run — the resume boundary is a property of the run.
 _RAISE_RUN_RETRY_SPEND_FLOOR = _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=?"
+
+#: Retained correction-loop spend has its own ledger and therefore needs its
+#: own boundary. Keep all rows for guidance and evidence; only budget accounting
+#: begins after this cycle sequence.
+_LANE_RETRY_SPEND_FLOOR_SQL = (
+    "UPDATE node_lifecycle SET lane_retry_spend_floor = ("
+    "SELECT COALESCE(MAX(s.cycle_seq), 0) FROM lane_retry_spend s"
+    " WHERE s.run_id = node_lifecycle.run_id"
+    " AND s.build_node_id = node_lifecycle.node_id)"
+)
+_RAISE_RUN_LANE_RETRY_SPEND_FLOOR = _LANE_RETRY_SPEND_FLOOR_SQL + " WHERE run_id=?"
+_RAISE_NODE_LANE_RETRY_SPEND_FLOOR = (
+    _LANE_RETRY_SPEND_FLOOR_SQL + " WHERE run_id=? AND node_id=?"
+)
+
+#: Resume refreshes infrastructure retry spend, so nodes blocked only because
+#: launcher or environmental faults reached their ceilings return to the
+#: frontier in the same transaction. Semantic and review ceilings are
+#: adjudication bounds; they require an explicit grant and remain blocked.
+_RESUME_REFRESHED_BLOCK_REASONS = (
+    st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED,
+    st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+)
 
 #: One node — the escape boundary is a decision about that node alone, which
 #: is what a `run resume` flag cannot express (§11.3).
@@ -1385,8 +1412,10 @@ MERGE_EVIDENCE_KEY = "merge_evidence"
 #: fails to verify instead of quietly redefining what the attempt started from.
 ATTEMPT_BASELINE_DIGEST_KEY = "baseline_digest"
 LATE_ENVELOPE_RECOVERY_KEY = "late_envelope_recovery"
+LATE_ENVELOPE_PHASE_KEY = "late_envelope_phase"
 SEALED_OUTPUT_SHA_KEY = "sealed_output_sha"
 REPAIR_HANDOFF_RECOVERY_KEY = "repair_handoff_recovery"
+REVIEW_BUDGET_RECOVERY_KEY = "review_budget_recovery"
 
 
 def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
@@ -3329,6 +3358,35 @@ class LifecycleStore:
             " detail_json, created_at FROM lane_retry_spend"
             " WHERE run_id=? AND build_node_id=? ORDER BY cycle_seq LIMIT ?",
             (run_id, build_node_id, limit),
+        ).fetchall()
+        return tuple(_lane_retry_spend_from_row(row) for row in rows)
+
+    @serialized
+    def lane_retry_spend_floor(self, run_id: str, build_node_id: str) -> int:
+        """The cycle sequence retained-lane budgets are counted from."""
+        row = self.conn.execute(
+            "SELECT lane_retry_spend_floor FROM node_lifecycle"
+            " WHERE run_id=? AND node_id=?",
+            (run_id, build_node_id),
+        ).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{build_node_id} has no lifecycle row")
+        return int(row[0] or 0)
+
+    @serialized
+    def current_lane_retry_spends(
+        self, run_id: str, build_node_id: str, *, limit: int = 100
+    ) -> Tuple[st.LaneRetrySpend, ...]:
+        """Correction-loop debits recorded after the latest operator boundary."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("lane retry read limit must be a positive integer")
+        floor = self.lane_retry_spend_floor(run_id, build_node_id)
+        rows = self.conn.execute(
+            "SELECT run_id, build_node_id, retry_class, cycle_seq, candidate_sha,"
+            " detail_json, created_at FROM lane_retry_spend"
+            " WHERE run_id=? AND build_node_id=? AND cycle_seq>?"
+            " ORDER BY cycle_seq LIMIT ?",
+            (run_id, build_node_id, floor, limit),
         ).fetchall()
         return tuple(_lane_retry_spend_from_row(row) for row in rows)
 
@@ -5363,7 +5421,12 @@ class LifecycleStore:
             raise
 
     @serialized
-    def _write_resume_transition(self, run_id: str) -> None:
+    def _write_resume_transition(
+        self,
+        run_id: str,
+        *,
+        late_envelope_attempts: Iterable[Tuple[str, int]] = (),
+    ) -> None:
         """Atomically claim a dead run and write its resume boundary.
 
         `cancel_requested` is cleared here because the operator withdrew the
@@ -5378,11 +5441,20 @@ class LifecycleStore:
         remains legal. A recorded owner on another host is unknown, never dead.
 
         Every node's retry-budget floor is raised in the same transaction to
-        the highest attempt already classified. The inherited-attempt
-        accounting below remains separate: a newly classified inherited
-        attempt is still charged against the refreshed floor, while an
-        UNCLASSIFIED attempt costs nothing.
+        the highest attempt already classified. Infrastructure-budget blocks
+        return to PENDING directly. A review-budget block returns only after
+        an explicit grant marked its retained attempt and runtime preflight
+        supplied absence-proven recovery authority for that exact generation.
+        Credential, quiescence, and other adjudicated blocks remain blocked.
+        The inherited-attempt accounting below remains separate: a newly
+        classified inherited attempt is still charged against the refreshed
+        floor, while an UNCLASSIFIED attempt costs nothing.
+
+        `late_envelope_attempts` is absence-proven recovery authority supplied
+        by the runtime preflight. A successful result row alone is not proof
+        that the retained worktree or declaration still exists.
         """
+        proven_late_envelopes = set(late_envelope_attempts)
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             claim = self.conn.execute(
@@ -5433,6 +5505,103 @@ class LifecycleStore:
                 ),
             )
             self.conn.execute(_RAISE_RUN_RETRY_SPEND_FLOOR, (run_id,))
+            self.conn.execute(_RAISE_RUN_LANE_RETRY_SPEND_FLOOR, (run_id,))
+            refreshed_reasons = tuple(
+                reason.value
+                for reason in (
+                    *_RESUME_REFRESHED_BLOCK_REASONS,
+                    st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                )
+            )
+            placeholders = ",".join("?" for _ in refreshed_reasons)
+            refreshed_nodes = self.conn.execute(
+                "SELECT node_id, attempt_no, block_reason FROM node_lifecycle"
+                " WHERE run_id=? AND state=?"
+                f" AND block_reason IN ({placeholders}) ORDER BY node_id",
+                (
+                    run_id,
+                    st.NodeState.BLOCKED.value,
+                    *refreshed_reasons,
+                ),
+            ).fetchall()
+            for node_id, attempt_no, block_reason in refreshed_nodes:
+                late_envelope = (str(node_id), int(attempt_no)) in proven_late_envelopes
+                review_budget = (
+                    block_reason is not None
+                    and st.BlockReason(block_reason)
+                    is st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+                )
+                attempt = None
+                payload: Dict[str, Any] = {}
+                if late_envelope or review_budget:
+                    attempt = self.conn.execute(
+                        "SELECT extra_json FROM attempts"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (run_id, node_id, attempt_no),
+                    ).fetchone()
+                    if attempt is None:
+                        raise UnknownNode(
+                            f"{run_id}/{node_id}#{attempt_no}: attempt row is absent"
+                        )
+                    payload = json.loads(attempt[0] or "{}")
+                    if not isinstance(payload, dict):
+                        payload = {}
+                if review_budget and (
+                    payload.get(REVIEW_BUDGET_RECOVERY_KEY) is not True
+                    or not late_envelope
+                ):
+                    continue
+                phase = (
+                    self._late_envelope_resume_phase(
+                        run_id, str(node_id), payload
+                    ).value
+                    if late_envelope
+                    else None
+                )
+                if late_envelope:
+                    payload.pop(REVIEW_BUDGET_RECOVERY_KEY, None)
+                    payload[LATE_ENVELOPE_RECOVERY_KEY] = True
+                    self.conn.execute(
+                        "UPDATE attempts SET state=?, extra_json=?"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (
+                            CLOSED_ATTEMPT_STATE.value,
+                            json.dumps(payload, sort_keys=True),
+                            run_id,
+                            node_id,
+                            attempt_no,
+                        ),
+                    )
+                self.conn.execute(
+                    "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
+                    " pending_cause=?, lane_phase=?, updated_at=?"
+                    " WHERE run_id=? AND node_id=? AND state=?",
+                    (
+                        st.NodeState.PENDING.value,
+                        st.PendingCause.OPERATOR_RESUME.value,
+                        phase,
+                        now,
+                        run_id,
+                        node_id,
+                        st.NodeState.BLOCKED.value,
+                    ),
+                )
+                self.conn.execute(
+                    "INSERT INTO transitions"
+                    " (run_id, node_id, kind, from_state, to_state, reason,"
+                    " actor, detail_json, created_at)"
+                    " VALUES (?,?,'node',?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        node_id,
+                        st.NodeState.BLOCKED.value,
+                        st.NodeState.PENDING.value,
+                        "resume:retry-budget",
+                        "operator",
+                        "{}",
+                        now,
+                    ),
+                )
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -5459,6 +5628,43 @@ class LifecycleStore:
         return tuple((str(row[0]), int(row[1])) for row in rows)
 
     @serialized
+    def retry_budget_blocked_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
+        """Budget-blocked generations eligible for proof-backed recovery.
+
+        Infrastructure blocks are always eligible at a resume boundary.
+        Review-budget blocks are eligible only after an operator grant marked
+        the exact retained attempt; a bare resume cannot erase adjudication.
+        """
+        reasons = tuple(
+            reason.value
+            for reason in (
+                *_RESUME_REFRESHED_BLOCK_REASONS,
+                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+            )
+        )
+        placeholders = ",".join("?" for _ in reasons)
+        rows = self.conn.execute(
+            "SELECT nl.node_id, nl.attempt_no, nl.block_reason, a.extra_json"
+            " FROM node_lifecycle nl"
+            " LEFT JOIN attempts a ON a.run_id=nl.run_id"
+            " AND a.node_id=nl.node_id AND a.attempt_no=nl.attempt_no"
+            " WHERE nl.run_id=? AND nl.state=?"
+            f" AND nl.block_reason IN ({placeholders}) ORDER BY nl.node_id",
+            (run_id, st.NodeState.BLOCKED.value, *reasons),
+        ).fetchall()
+        eligible = []
+        for node_id, attempt_no, block_reason, extra_json in rows:
+            if block_reason == st.BlockReason.REVIEW_BUDGET_EXHAUSTED.value:
+                payload = json.loads(extra_json or "{}")
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get(REVIEW_BUDGET_RECOVERY_KEY) is not True
+                ):
+                    continue
+            eligible.append((str(node_id), int(attempt_no)))
+        return tuple(eligible)
+
+    @serialized
     def running_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
         """Current RUNNING generations a resumed scheduler may recover."""
         rows = self.conn.execute(
@@ -5467,6 +5673,36 @@ class LifecycleStore:
             (run_id, st.NodeState.RUNNING.value),
         ).fetchall()
         return tuple((str(row[0]), int(row[1])) for row in rows)
+
+    def _late_envelope_resume_phase(
+        self, run_id: str, node_id: str, payload: Mapping[str, Any]
+    ) -> st.LanePhase:
+        """Restore the retained lane phase instead of restarting at BUILDING."""
+        stored = payload.get(LATE_ENVELOPE_PHASE_KEY)
+        if isinstance(stored, str):
+            try:
+                phase = st.LanePhase(stored)
+            except ValueError:
+                phase = None
+            if phase is not None and phase is not st.LanePhase.BLOCKED:
+                return phase
+        if isinstance(payload.get(REPAIR_HANDOFF_RECOVERY_KEY), str):
+            return st.LanePhase.REPAIRING
+        handoff = self.conn.execute(
+            "SELECT state FROM repair_handoffs"
+            " WHERE run_id=? AND build_node_id=?"
+            " ORDER BY rowid DESC LIMIT 1",
+            (run_id, node_id),
+        ).fetchone()
+        if handoff is not None:
+            state = st.RepairHandoffState(str(handoff[0]))
+            if state is st.RepairHandoffState.PENDING:
+                return st.LanePhase.REPAIR_HANDOFF
+            if state is st.RepairHandoffState.SUBMITTED:
+                return st.LanePhase.REPAIRING
+            if state is st.RepairHandoffState.ACKNOWLEDGED:
+                return st.LanePhase.WAITING_FOR_NEW_CANDIDATE
+        return st.LanePhase.BUILDING
 
     @serialized
     def prepare_late_envelope_recovery(
@@ -5497,6 +5733,7 @@ class LifecycleStore:
             payload = json.loads(row[0] or "{}")
             if not isinstance(payload, dict):
                 payload = {}
+            phase = self._late_envelope_resume_phase(run_id, node_id, payload)
             payload[LATE_ENVELOPE_RECOVERY_KEY] = True
             return [
                 (
@@ -5507,7 +5744,7 @@ class LifecycleStore:
                 (
                     "UPDATE node_lifecycle SET lane_phase=?"
                     " WHERE run_id=? AND node_id=? AND lane_phase IS NOT NULL",
-                    (st.LanePhase.BUILDING.value, run_id, node_id),
+                    (phase.value, run_id, node_id),
                 ),
             ]
 
@@ -5591,8 +5828,9 @@ class LifecycleStore:
         This recovery is legal only when all three durable authorities agree:
         the current attempt already has an accepted result, the named immutable
         candidate has a terminal rejection, and its handoff remains recoverable.
-        The guarded node PENDING -> RUNNING transition and cancelled attempt-row
-        reopening are one transaction, so a second scheduler cannot claim a sibling attempt.
+        The guarded node PENDING -> RUNNING transition and closed blocking
+        attempt-row reopening are one transaction, so a second scheduler cannot
+        claim a sibling attempt.
         """
 
         def extra(lifecycle: st.NodeLifecycle):
@@ -5610,10 +5848,13 @@ class LifecycleStore:
                 raise UnknownNode(
                     f"{run_id}/{build_node_id}#{attempt_no}: attempt row is absent"
                 )
-            if attempt[0] != st.NodeState.CANCELLED.value:
+            if attempt[0] not in (
+                st.NodeState.CANCELLED.value,
+                st.NodeState.BLOCKED.value,
+            ):
                 raise IllegalTransition(
                     f"{run_id}/{build_node_id}#{attempt_no}: "
-                    f"attempt is {attempt[0]}, not CANCELLED"
+                    f"attempt is {attempt[0]}, not CANCELLED or BLOCKED"
                 )
             if attempt[1] not in (
                 None,
@@ -5848,12 +6089,14 @@ class LifecycleStore:
         facts, and guessing that an unrecorded cancellation was merely a pause
         is the guess that reopens an adjudicated run."""
         requested_recoveries = set(late_envelope_attempts)
-        current_running = set(self.running_attempts(run_id))
-        unknown_recoveries = requested_recoveries - current_running
+        recoverable_attempts = set(self.running_attempts(run_id))
+        recoverable_attempts.update(self.retry_budget_blocked_attempts(run_id))
+        unknown_recoveries = requested_recoveries - recoverable_attempts
         if unknown_recoveries:
             raise ResumeRefused(
                 f"{run_id}: late-envelope recovery does not name current "
-                f"RUNNING attempts: {sorted(unknown_recoveries)!r}"
+                "RUNNING or retry-budget-blocked attempts: "
+                f"{sorted(unknown_recoveries)!r}"
             )
         outcome = self.latest_outcome(run_id)
         cause = self.run_cancel_cause(run_id)
@@ -5889,7 +6132,9 @@ class LifecycleStore:
                 f"only a run stopped by an operator's `run cancel` is "
                 f"reopenable; this one {why}"
             )
-        self._write_resume_transition(run_id)
+        self._write_resume_transition(
+            run_id, late_envelope_attempts=requested_recoveries
+        )
         # Before the inherited attempts, and deliberately: these nodes hold no
         # attempt this process could inherit -- `cancel_run` closed every one
         # of them in the transaction that wrote the state -- so reopening them
@@ -6136,38 +6381,28 @@ class LifecycleStore:
     def retry(
         self, run_id: str, node_id: str, *, force: bool = False, grant: int = 0
     ) -> st.NodeLifecycle:
-        """BLOCKED -> PENDING, or stranded RUNNING -> PENDING when the
-        scheduler is provably dead. `force` grants exactly one extra attempt
-        beyond the semantic ceiling, and `grant` grants exactly that many,
-        neither raising the cap itself (§7.5, §11.3).
+        """Issue an operator retry or grant against one blocked generation.
+
+        Most retries move ``BLOCKED`` to ``PENDING`` and begin a new attempt.
+        A positive grant against ``REVIEW_BUDGET_EXHAUSTED`` is different:
+        the rejected candidate, repair handoff, worktree, and actor generation
+        belong to the current attempt. The grant therefore leaves that attempt
+        blocked and marks it for proof-backed recovery by ``run resume``.
+        Runtime preflight must still prove the retained worktree and actor
+        absence before the same attempt may return to the frontier.
 
         ``grant`` sizes the durable semantic and review-rejection budgets.
         Semantic spend is counted from classified attempts; review spend is
         counted independently in ``lane_retry_spends``. Both are cumulative
-        across candidate bases for this run and node, so a grant must name the
-        full additional distance in the one legal state transition.
+        across candidate bases for this run and node.
 
-        The escape's *identity* is unchanged: any grant is still
-        `Escape.RETRY_FORCE`, because a grant of three is the same operator
-        decision as a grant of one taken three rounds later, and a second
-        escape verb would have to be threaded through `exits_for` and every
-        refusal surface to say nothing new. The magnitude is a typed field on
-        the transition's detail, where `run status` reads it back, rather than
-        a distinction in the vocabulary.
+        The escape's identity is unchanged: any positive grant is
+        ``Escape.RETRY_FORCE``. Its magnitude is recorded in transition detail.
 
-        **The retry-class budgets are refreshed here, and they take no
-        magnitude.** `grant` sizes the two *ceilings* — review and semantic —
-        which count a node's judged work and where the right answer is "how
-        many more rounds", a number only the operator knows. The retry classes
-        count infrastructure faults, and a node handed back to the scheduler
-        after its launcher budget went to a defect that has since been fixed
-        needs the whole allowance rather than a number reverse-engineered from
-        a count no report carries: the escape exists to put the node back on
-        the frontier, and returning it there already exhausted schedules it
-        only to block again on first contact (#92). So the floor is raised for
-        the one node this escape names — which is the granularity a `run
-        resume` flag cannot express, since it raises the ceiling for every
-        node in the run and leaves the deployment's configuration edited (#91).
+        Retry-class budgets are refreshed here without a magnitude. Launcher
+        and environmental failures are infrastructure tolerance, so the named
+        node gets a fresh configured allowance rather than an operator-sized
+        adjudication budget.
         """
         if grant < 0:
             raise EscapeRefused(f"{node_id}: retry grant must be positive, got {grant}")
@@ -6182,6 +6417,64 @@ class LifecycleStore:
             )
         delta = grant if grant else (1 if force else 0)
         self._require_escape_legal(run_id)
+        current = self.get_node(run_id, node_id)
+        retained_review = (
+            delta > 0
+            and current.state is st.NodeState.BLOCKED
+            and current.block_reason is st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+        )
+        if retained_review:
+
+            def retain_attempt(lifecycle: st.NodeLifecycle):
+                row = self.conn.execute(
+                    "SELECT extra_json FROM attempts"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (run_id, node_id, lifecycle.attempt_no),
+                ).fetchone()
+                if row is None:
+                    raise UnknownNode(
+                        f"{run_id}/{node_id}#{lifecycle.attempt_no}: attempt row is absent"
+                    )
+                payload = json.loads(row[0] or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+                if payload.get(REVIEW_BUDGET_RECOVERY_KEY) is True:
+                    raise EscapeRefused(
+                        f"{node_id}: review-budget recovery is already granted"
+                    )
+                payload[REVIEW_BUDGET_RECOVERY_KEY] = True
+                return [
+                    (
+                        "UPDATE attempts SET extra_json=?"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (
+                            json.dumps(payload, sort_keys=True),
+                            run_id,
+                            node_id,
+                            lifecycle.attempt_no,
+                        ),
+                    ),
+                    (_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+                    (_RAISE_NODE_LANE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+                ]
+
+            self._transition_node(
+                run_id,
+                node_id,
+                st.NodeState.BLOCKED,
+                actor="operator",
+                reason=st.Escape.RETRY_FORCE.value,
+                block_reason=st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                require_state=(st.NodeState.BLOCKED,),
+                granted_extra_delta=delta,
+                detail={
+                    "granted_extra_delta": delta,
+                    "retained_attempt_recovery_requested": True,
+                },
+                extra_writes=retain_attempt,
+            )
+            return self.get_node(run_id, node_id)
+
         stranded, detail = self._prepare_stranded_running(
             run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL
         )
@@ -6205,6 +6498,7 @@ class LifecycleStore:
             return [
                 reset_phase,
                 (_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+                (_RAISE_NODE_LANE_RETRY_SPEND_FLOOR, (run_id, node_id)),
             ] + list(stranded(lifecycle) if stranded else ())
 
         reason = st.Escape.RETRY_FORCE.value if delta else st.Escape.RETRY.value
