@@ -327,6 +327,40 @@ def attempt_ref_commit(
     )
 
 
+def is_attempt_lineage_commit(
+    repo: Path,
+    output_sha: str,
+    *,
+    run_id: str,
+    node_id: str,
+    attempt_no: int,
+    expected_base: str,
+) -> bool:
+    """Whether SHA is a published commit retained by this attempt's ref.
+
+    Persistent builders advance one attempt ref for every immutable candidate.
+    Recovery may therefore find the last published candidate behind a newer,
+    not-yet-published repair commit.  The candidate remains owned by the
+    attempt only while it is an ancestor of that attempt's current ref.
+    """
+    if not is_valid_output_commit(repo, output_sha, expected_base=expected_base):
+        return False
+    tip = attempt_ref_commit(repo, run_id, node_id, attempt_no)
+    if tip is None:
+        return False
+    return (
+        _git(
+            Path(repo),
+            "merge-base",
+            "--is-ancestor",
+            output_sha,
+            tip,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
 # ── §8.2 identity ───────────────────────────────────────────────────────────
 
 
@@ -1121,6 +1155,74 @@ def prepare_descendant_candidate(attempt: AttemptWorktree, parent: str) -> None:
     attempt.tracked_at_base = tracked_at_parent
     attempt.baseline = None
     attempt.ignored_at_base = None
+
+
+def _recover_candidate_baseline(
+    attempt: AttemptWorktree,
+    parent: str,
+    original_base: str,
+    original_baseline: Inventory,
+) -> Inventory:
+    """Rebuild a repair bracket without trusting mutable worktree bytes."""
+    original_tracked = inventory_at_commit(attempt.repo, original_base)
+    parent_tree = inventory_at_commit(attempt.repo, parent)
+    baseline = {
+        path: entry
+        for path, entry in original_baseline.items()
+        if path not in original_tracked and path not in parent_tree
+    }
+    baseline.update(parent_tree)
+    attempt.base = parent
+    attempt.tracked_at_base = frozenset(parent_tree)
+    attempt.baseline = baseline
+    return baseline
+
+
+def recover_unsealed_descendant(
+    attempt: AttemptWorktree,
+    parent: str,
+    original_baseline: Inventory,
+) -> Inventory:
+    """Recover a repair bracket before its descendant commit is sealed."""
+    original_base = attempt.base
+    prepare_descendant_candidate(attempt, parent)
+    return _recover_candidate_baseline(
+        attempt, parent, original_base, original_baseline
+    )
+
+
+def recover_sealed_descendant(
+    attempt: AttemptWorktree,
+    parent: str,
+    original_baseline: Inventory,
+) -> Tuple[Inventory, str]:
+    """Recover one harness-sealed repair committed after its published parent.
+
+    The private-index commit can survive a scheduler crash before
+    ``record_sealed_output`` advances the attempt ledger.  Its direct parent
+    and the attempt ref prove which candidate cycle produced it.  The original
+    provisioned baseline supplies the untracked paths that git cannot retain;
+    the published parent tree supplies the tracked side of the repair bracket.
+    """
+    tip = attempt_ref_commit(
+        attempt.repo, attempt.run_id, attempt.node_id, attempt.attempt_no
+    )
+    head = _out(attempt.path, "rev-parse", "HEAD")
+    if tip is None or tip != head:
+        raise HeadMoved(
+            f"attempt ref is {tip or 'absent'}, but worktree HEAD is {head}"
+        )
+    parents = _out(attempt.repo, "rev-list", "--parents", "-n", "1", tip).split()
+    if len(parents) != 2 or parents[1] != parent:
+        raise HeadMoved(
+            f"sealed repair {tip[:10]} is not a direct child of candidate {parent[:10]}"
+        )
+
+    original_base = attempt.base
+    baseline = _recover_candidate_baseline(
+        attempt, parent, original_base, original_baseline
+    )
+    return baseline, tip
 
 
 def commit_measured_delta(

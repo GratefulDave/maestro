@@ -12,8 +12,8 @@ import json
 import os
 import signal
 import subprocess
-import time
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -600,6 +600,10 @@ class LauncherAdapter(Protocol):
         timeout_s: float = 60.0,
     ) -> LaunchHandle: ...
     def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle: ...
+    def retire_for_replacement(
+        self, persisted: PersistedActorHandle, deadline: float
+    ) -> None: ...
+    def close_actorless_pane(self, persisted: PersistedActorHandle) -> None: ...
     def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None: ...
 
 
@@ -1249,6 +1253,60 @@ def submit_agent_prompt(
     raise PromptNotSubmitted(
         "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(target, rounds)
     )
+
+
+TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = 10.0
+
+
+def prompt_submission_recorded(
+    handle: LaunchHandle, prompt_path: Path, *, chunk_size: int = 64 * 1024
+) -> bool:
+    """Whether the actor transcript durably names this exact prompt submission.
+
+    Herdr's revision advance proves a live submission to the caller, but that
+    proof disappears if the scheduler dies before its next SQLite write.  The
+    transcript's user-message record survives that gap.  Match the absolute
+    ``@<path>`` bootstrap rather than pane text or a candidate label, and scan
+    in bounded chunks so a long-lived reviewer session is not copied into
+    memory merely to recover its latest dispatch.
+    """
+    transcript = handle.transcript_path
+    if transcript is None:
+        return False
+    marker = ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
+    if chunk_size < len(marker):
+        chunk_size = len(marker)
+    overlap = b""
+    try:
+        with Path(transcript).open("rb") as source:
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    return False
+                window = overlap + chunk
+                if marker in window:
+                    return True
+                overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
+    except OSError:
+        return False
+
+
+def wait_for_prompt_submission_record(
+    handle: LaunchHandle,
+    prompt_path: Path,
+    timeout_s: float = TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Wait boundedly for the durable transcript half of submission proof."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        if prompt_submission_recorded(handle, prompt_path):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        sleep(min(0.1, remaining))
 
 
 def wait_for_interactive_agent(
@@ -2381,10 +2439,38 @@ class HerdrLauncher:
         raise HandleAdoptionRefused("TAB_ABSENT", tab_id)
 
     def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle:
-        """Restore a handle only when persisted Herdr ids still prove ownership.
+        """Restore a handle only when persisted Herdr ids still prove ownership."""
+        return self._adopt(persisted, allow_stale_placement=False)
+
+    def retire_for_replacement(
+        self, persisted: PersistedActorHandle, deadline: float
+    ) -> None:
+        """Close an owned actor whose durable placement belongs to an old run layout.
+
+        Replacement is legal only after the pane cwd and deterministic actor identity
+        still prove ownership.  Persisted workspace/tab mismatches are deliberately
+        ignored here because they are the reason this actor must be retired.
+        """
+        handle = self._adopt(persisted, allow_stale_placement=True)
+        self.cancel(handle, deadline)
+
+    def close_actorless_pane(self, persisted: PersistedActorHandle) -> None:
+        """Close the pane left after adoption proved its actor record absent."""
+        if not self._reap_pane(persisted.pane_id, persisted.environment):
+            raise HarnessQuiescenceError(
+                "ACTORLESS_PANE_CLOSE_UNPROVEN:{}".format(persisted.pane_id)
+            )
+
+    def _adopt(
+        self,
+        persisted: PersistedActorHandle,
+        *,
+        allow_stale_placement: bool,
+    ) -> LaunchHandle:
+        """Validate one persisted actor, optionally outside the current run layout.
 
         Absence is a distinct typed outcome that allows the durable lifecycle
-        to replace a generation.  Transport/protocol failures and identity
+        to replace a generation. Transport/protocol failures and identity
         mismatches stay refusals: neither is evidence that the old actor died.
         """
         token = str(persisted.correlation_token or "")
@@ -2417,7 +2503,11 @@ class HerdrLauncher:
         pane_workspace = str(pane.get("workspace_id") or "")
         persisted_tab_id = str(persisted.tab_id or "")
         pane_tab_id = str(pane.get("tab_id") or "")
-        if persisted_tab_id:
+        if allow_stale_placement:
+            if not pane_tab_id:
+                raise HandleAdoptionRefused("TAB_ID_UNPROVEN", pane_id)
+            tab_id = pane_tab_id
+        elif persisted_tab_id:
             if pane_tab_id != persisted_tab_id:
                 raise HandleAdoptionRefused(
                     "TAB_ID_MISMATCH",
@@ -2436,7 +2526,9 @@ class HerdrLauncher:
         pane_id_workspace = workspace_of(pane_id)
         tab_workspace = workspace_of(tab_id)
         workspace_id = str(
-            persisted.workspace_id or pane_workspace or pane_id_workspace
+            (pane_workspace or pane_id_workspace)
+            if allow_stale_placement
+            else (persisted.workspace_id or pane_workspace or pane_id_workspace)
         )
         if (
             not workspace_id
@@ -2468,37 +2560,38 @@ class HerdrLauncher:
             existing = self._handles.get(token)
             if existing is not None and existing != candidate:
                 raise HandleAdoptionRefused("HANDLE_TOKEN_COLLISION", token)
-            if self._workspace_id and self._workspace_id != workspace_id:
-                raise HandleAdoptionRefused(
-                    "WORKSPACE_ID_MISMATCH",
-                    "{}!={}".format(self._workspace_id, workspace_id),
-                )
-            if not self._workspace_id:
-                self._workspace_id = workspace_id
-            layout = self._tabs.get(lane_key)
-            if layout is None:
-                self._tabs[lane_key] = _TabLayout(
-                    tab_id=tab_id, panes=[pane_id], claimed=1
-                )
-            elif layout.tab_id != tab_id:
-                raise HandleAdoptionRefused(
-                    "TAB_ID_MISMATCH",
-                    "{}!={}".format(layout.tab_id, tab_id),
-                )
-            else:
-                with layout.lock:
-                    if pane_id not in layout.panes:
-                        try:
-                            slot = layout.panes.index(None)
-                            layout.panes[slot] = pane_id
-                        except ValueError:
-                            slot = len(layout.panes)
-                            layout.panes.append(pane_id)
-                        layout.claimed = max(layout.claimed, slot + 1)
-                        layout.cols = max(
-                            layout.cols,
-                            grid_for(layout.claimed)[1],
-                        )
+            if not allow_stale_placement:
+                if self._workspace_id and self._workspace_id != workspace_id:
+                    raise HandleAdoptionRefused(
+                        "WORKSPACE_ID_MISMATCH",
+                        "{}!={}".format(self._workspace_id, workspace_id),
+                    )
+                if not self._workspace_id:
+                    self._workspace_id = workspace_id
+                layout = self._tabs.get(lane_key)
+                if layout is None:
+                    self._tabs[lane_key] = _TabLayout(
+                        tab_id=tab_id, panes=[pane_id], claimed=1
+                    )
+                elif layout.tab_id != tab_id:
+                    raise HandleAdoptionRefused(
+                        "TAB_ID_MISMATCH",
+                        "{}!={}".format(layout.tab_id, tab_id),
+                    )
+                else:
+                    with layout.lock:
+                        if pane_id not in layout.panes:
+                            try:
+                                slot = layout.panes.index(None)
+                                layout.panes[slot] = pane_id
+                            except ValueError:
+                                slot = len(layout.panes)
+                                layout.panes.append(pane_id)
+                            layout.claimed = max(layout.claimed, slot + 1)
+                            layout.cols = max(
+                                layout.cols,
+                                grid_for(layout.claimed)[1],
+                            )
         try:
             agent_payload = self._herdr("agent", "get", agent_name, env=environment)
         except HerdrCallError as exc:
@@ -2833,6 +2926,18 @@ class FakeLauncher:
         ):
             raise HandleAdoptionRefused("PERSISTED_IDENTITY_INVALID")
         return handle
+
+    def retire_for_replacement(
+        self, persisted: PersistedActorHandle, deadline: float
+    ) -> None:
+        handle = self.adopt(persisted)
+        self.cancel(handle, deadline)
+
+    def close_actorless_pane(self, persisted: PersistedActorHandle) -> None:
+        if persisted.correlation_token in self._handles:
+            raise HarnessQuiescenceError(
+                "ACTOR_STILL_PRESENT:{}".format(persisted.correlation_token)
+            )
 
     def complete(
         self, token: str, exit_code: int = 0, detail: str = "ENVELOPE_SUCCESS"

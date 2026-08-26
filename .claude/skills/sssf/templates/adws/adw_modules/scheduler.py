@@ -841,6 +841,34 @@ class Scheduler:
             store.mark_verified(self.run_id, node.node_id, output_sha)
             self._output_shas[node.node_id] = output_sha
 
+    def _attempt_retains_output(
+        self,
+        node_id: str,
+        attempt_no: int,
+        base_sha: str,
+        output_sha: str,
+    ) -> bool:
+        """Whether an attempt still owns an exact or published prior output."""
+        if wt.is_attempt_output_commit(
+            self.deps.repo,
+            output_sha,
+            run_id=self.run_id,
+            node_id=node_id,
+            attempt_no=attempt_no,
+            expected_base=base_sha,
+        ):
+            return True
+        return self.deps.store.candidate(
+            self.run_id, node_id, output_sha
+        ) is not None and wt.is_attempt_lineage_commit(
+            self.deps.repo,
+            output_sha,
+            run_id=self.run_id,
+            node_id=node_id,
+            attempt_no=attempt_no,
+            expected_base=base_sha,
+        )
+
     def project(self) -> None:
         """Write the DAG projection, once (§7.1)."""
         if self._projected:
@@ -903,13 +931,11 @@ class Scheduler:
                 else:
                     valid = (
                         attempt.state is st.NodeState.VERIFIED
-                        and wt.is_attempt_output_commit(
-                            Path(self.deps.repo),
+                        and self._attempt_retains_output(
+                            node_id,
+                            row.attempt_no,
+                            attempt.base_sha,
                             output_sha,
-                            run_id=self.run_id,
-                            node_id=node_id,
-                            attempt_no=row.attempt_no,
-                            expected_base=attempt.base_sha,
                         )
                     )
             elif valid:
@@ -2077,17 +2103,16 @@ class Scheduler:
         sealed_output_sha = store.attempt_sealed_output(
             self.run_id, node.node_id, stranded.attempt_no
         )
-        if sealed_output_sha is not None and not wt.is_attempt_output_commit(
-            self.deps.repo,
+        if sealed_output_sha is not None and not self._attempt_retains_output(
+            node.node_id,
+            stranded.attempt_no,
+            stranded.base_sha,
             sealed_output_sha,
-            run_id=self.run_id,
-            node_id=node.node_id,
-            attempt_no=stranded.attempt_no,
-            expected_base=stranded.base_sha,
         ):
             raise DurableOutputIdentityError(
                 f"{stranded.node_id}#{stranded.attempt_no}: "
-                f"sealed output {sealed_output_sha} is not the attempt ref"
+                f"sealed output {sealed_output_sha} is neither the attempt "
+                "ref nor a published ancestor retained by it"
             )
         baseline = store.attempt_baseline(
             self.run_id, node.node_id, stranded.attempt_no
@@ -2100,10 +2125,105 @@ class Scheduler:
                 f"{self.run_id}/{node.node_id}#{stranded.attempt_no}: "
                 "ignored-at-base evidence was not recorded"
             )
+        repair_parent = record.extra.get(lc.REPAIR_HANDOFF_RECOVERY_KEY)
+        repair_handoff = None
+        unsealed_repair = False
+        if sealed_output_sha is not None and repair_parent == sealed_output_sha:
+            attempt_tip = wt.attempt_ref_commit(
+                self.deps.repo,
+                self.run_id,
+                node.node_id,
+                stranded.attempt_no,
+            )
+            if attempt_tip == sealed_output_sha:
+                baseline = wt.recover_unsealed_descendant(
+                    attempt, sealed_output_sha, baseline
+                )
+                unsealed_repair = True
+            else:
+                baseline, sealed_output_sha = wt.recover_sealed_descendant(
+                    attempt, sealed_output_sha, baseline
+                )
+                store.record_sealed_output(
+                    self.run_id,
+                    node.node_id,
+                    stranded.attempt_no,
+                    sealed_output_sha,
+                )
+                repair_handoff = store.repair_handoff(
+                    self.run_id, node.node_id, repair_parent
+                )
+                if repair_handoff is None:
+                    raise DurableOutputIdentityError(
+                        f"{stranded.node_id}#{stranded.attempt_no}: "
+                        "recovered repair descendant has no matching handoff"
+                    )
+                submitted = store.mark_handoff_submitted(
+                    self.run_id,
+                    node.node_id,
+                    repair_parent,
+                    builder_generation=repair_handoff.builder_generation,
+                )
+                acknowledged = store.acknowledge_handoff(
+                    self.run_id,
+                    node.node_id,
+                    repair_parent,
+                    builder_generation=repair_handoff.builder_generation,
+                )
+                if not submitted.submitted or not acknowledged.acknowledged:
+                    raise DurableOutputIdentityError(
+                        f"{stranded.node_id}#{stranded.attempt_no}: "
+                        "recovered repair descendant could not reconcile its handoff"
+                    )
         attempt.baseline = baseline
         attempt.ignored_at_base = ignored
         with self._lock:
             self._attempt_worktrees[node.node_id] = attempt
+
+        if unsealed_repair:
+            repair_handoff = store.repair_handoff(
+                self.run_id, node.node_id, str(repair_parent)
+            )
+            candidate = store.candidate(self.run_id, node.node_id, str(repair_parent))
+            if repair_handoff is None or candidate is None:
+                raise DurableOutputIdentityError(
+                    f"{stranded.node_id}#{stranded.attempt_no}: "
+                    "unsealed repair recovery has no matching candidate and handoff"
+                )
+            basis = rp.RepairBasis(
+                base_sha=str(repair_parent),
+                integration_head=record.integration_head,
+                repair_of_attempt=record.attempt_no,
+                chain_length=candidate.candidate_seq + 1,
+            )
+            guidance = self._refresh_lane_guidance(node.node_id, record)
+            repair_prompt = rp.render_guidance(node, guidance, repair=basis)
+            if repair_prompt is None:
+                repair_prompt = self._repair_prompt(str(repair_parent), repair_handoff)
+            repair = self._continue_repair_handoff(
+                node,
+                context,
+                attempt,
+                record,
+                repair_prompt,
+                str(repair_parent),
+                repair_handoff.builder_generation,
+            )
+            if repair is None:
+                return
+            self._complete_attempt(
+                node,
+                context,
+                attempt,
+                record,
+                basis,
+                _pending_gate(),
+                baseline,
+                repair.execution,
+                record.integration_head,
+                record_result=False,
+            )
+            return
 
         execution = (
             None if already_claimed else self.deps.recover_node(attempt, stranded)
@@ -2133,6 +2253,19 @@ class Scheduler:
                 integration_head=record.integration_head,
                 repair_of_attempt=record.repair_of_attempt,
                 chain_length=record.repair_chain_length,
+            )
+        elif isinstance(repair_parent, str):
+            candidate = store.candidate(self.run_id, node.node_id, repair_parent)
+            if candidate is None:
+                raise DurableOutputIdentityError(
+                    f"{node.node_id}#{record.attempt_no}: repair parent "
+                    f"{repair_parent} is not a published candidate"
+                )
+            basis = rp.RepairBasis(
+                base_sha=repair_parent,
+                integration_head=record.integration_head,
+                repair_of_attempt=record.attempt_no,
+                chain_length=candidate.candidate_seq + 1,
             )
         self._complete_attempt(
             node,
@@ -2658,6 +2791,11 @@ class Scheduler:
                     retry_class,
                     candidate_sha=rejected_candidate_sha,
                     detail=detail,
+                    launcher_failure=(
+                        exc.classified_failure
+                        if isinstance(exc, LaunchFailed)
+                        else None
+                    ),
                 )
                 if allowed:
                     builder_generation = self._active_actor_generation(
@@ -2690,10 +2828,18 @@ class Scheduler:
                 self._close_persistent_reviewer(node.node_id, record)
                 self._settle_context(context)
                 self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+                block_reason = (
+                    _budget_reason(
+                        st.RetryClass.LAUNCHER_TRANSIENT,
+                        exc.classified_failure,
+                    )
+                    if isinstance(exc, LaunchFailed)
+                    else st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+                )
                 self.deps.store.mark_blocked(
                     self.run_id,
                     node.node_id,
-                    st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                    block_reason,
                     detail=detail,
                 )
                 return None
@@ -2746,6 +2892,7 @@ class Scheduler:
         *,
         candidate_sha: Optional[str],
         detail: Mapping[str, Any],
+        launcher_failure: Optional[rp.LauncherFailure] = None,
     ) -> bool:
         """Spend one durable same-session correction-loop budget unit."""
         previous = self.deps.store.lane_retry_spends(
@@ -2767,7 +2914,7 @@ class Scheduler:
         elif retry_class is st.LaneRetryClass.SEMANTIC:
             ceiling = self.config.semantic_ceiling + lifecycle.granted_extra_attempts
         elif retry_class is st.LaneRetryClass.LAUNCHER_TRANSIENT:
-            ceiling = self.config.launcher_retries
+            ceiling = rp.launcher_retry_budget(self.config, launcher_failure)
         else:
             ceiling = self.config.environmental_retries
         spent = sum(
@@ -2878,7 +3025,9 @@ class Scheduler:
         ):
             return False
         classification = self._verdict_classification(node, verdict, execution)
-        if classification.retry_class is None:
+        if classification.retry_class is None or not st.mutates_prompt(
+            classification.retry_class
+        ):
             return False
         retry_class = st.LaneRetryClass(classification.retry_class.value)
         subject_sha = basis.base_sha if basis is not None else attempt.base
@@ -2970,7 +3119,9 @@ class Scheduler:
         ):
             return False
         classification = self._verdict_classification(node, verdict, execution)
-        if classification.retry_class is None:
+        if classification.retry_class is None or not st.mutates_prompt(
+            classification.retry_class
+        ):
             return False
         retry_class = st.LaneRetryClass(classification.retry_class.value)
         detail = _failure_detail(classification, verdict)
@@ -3130,13 +3281,17 @@ class Scheduler:
             reviewer_generation=reviewer_generation,
         )
         durable_review = begun.review
-        if durable_review.state is st.CandidateReviewState.DISPATCHED:
-            # A DISPATCHED row is an unfinished review, not proof that the
-            # scheduler consumed its report. Resume the same durable review
-            # callback; the callback adopts the retained reviewer and replays
-            # an already-written report/receipt without submitting a second
-            # prompt. Only a terminal row suppresses the callback.
-            resume_existing_dispatch = not begun.should_dispatch
+        if durable_review.state in {
+            st.CandidateReviewState.PUBLISHED,
+            st.CandidateReviewState.DISPATCHED,
+        }:
+            # PUBLISHED means the candidate is durable but no reviewer prompt
+            # has been proven submitted. DISPATCHED means the exact prompt was
+            # submitted but no terminal report was consumed. Both need the
+            # callback. The creation bit distinguishes a fresh publication
+            # from recovery: replayed PUBLISHED checks the exact transcript
+            # marker first; replayed DISPATCHED only polls.
+            resume_existing_dispatch = not begun.created
             if durable_review.reviewer_generation != reviewer_generation:
                 recovered = self.deps.store.recover_review_dispatch(
                     self.run_id,
@@ -3148,7 +3303,10 @@ class Scheduler:
                 durable_review = recovered.review
                 resume_existing_dispatch = True
             review = None
-            while durable_review.state is st.CandidateReviewState.DISPATCHED:
+            while durable_review.state in {
+                st.CandidateReviewState.PUBLISHED,
+                st.CandidateReviewState.DISPATCHED,
+            }:
                 self._require_actor_generation(
                     node.node_id, "reviewer", reviewer_generation, record
                 )
@@ -3224,13 +3382,27 @@ class Scheduler:
                     )
                     durable_review = recovered.review
                     reviewer_generation = replacement_generation
-                    if durable_review.state is st.CandidateReviewState.DISPATCHED:
+                    if durable_review.state in {
+                        st.CandidateReviewState.PUBLISHED,
+                        st.CandidateReviewState.DISPATCHED,
+                    }:
                         resume_existing_dispatch = True
                         continue
                     break
                 review = callback_review
                 break
             if review is not None:
+                # A returned candidate-bound report is itself durable
+                # submission evidence for custom/offline reviewers. The
+                # production callback records this immediately after Herdr's
+                # prompt proof; this idempotent edge closes the faster-report
+                # case before either terminal CAS.
+                durable_review = self.deps.store.mark_review_dispatched(
+                    self.run_id,
+                    review_node.node_id,
+                    candidate.candidate_sha,
+                    reviewer_generation=reviewer_generation,
+                )
                 digest, receipt_path, findings = self._review_evidence(review)
                 if bool(getattr(review, "passed", False)):
                     durable_review = self.deps.store.complete_review(
@@ -3550,6 +3722,52 @@ class Scheduler:
                 return
 
             retry_class = classification.retry_class or st.DEFAULT_RETRY_CLASS
+            if self._review_for_build(node.node_id) is not None:
+                lane_retry_class = st.LaneRetryClass(retry_class.value)
+                candidates = store.lane_candidates(
+                    self.run_id, node.node_id, limit=10_000
+                )
+                candidate_sha = candidates[-1].candidate_sha if candidates else None
+                extra = None
+                if st.mutates_prompt(retry_class):
+                    extra = dict(rp.guidance_extra_verification(detail))
+                    if extra_facts:
+                        extra.update(extra_facts)
+                allowed = self._lane_retry(
+                    node,
+                    lane_retry_class,
+                    candidate_sha=candidate_sha,
+                    detail=detail,
+                    launcher_failure=classification.launcher_failure,
+                )
+                self._refresh_lane_guidance(node.node_id, record)
+                if not allowed:
+                    self._mark_lane_blocked(
+                        node, record, allow_watchdog_fence=allow_watchdog_fence
+                    )
+                    block_detail = (
+                        self._lane_semantic_budget_detail(detail, node.node_id)
+                        if lane_retry_class is st.LaneRetryClass.SEMANTIC
+                        else detail
+                    )
+                    store.mark_blocked(
+                        self.run_id,
+                        node.node_id,
+                        _budget_reason(retry_class, classification.launcher_failure),
+                        detail=block_detail or None,
+                        retry_class=retry_class,
+                        attempt_extra=extra,
+                    )
+                    return
+                store.fail_attempt(
+                    self.run_id,
+                    node.node_id,
+                    retry_class,
+                    detail=detail or None,
+                    attempt_extra=extra,
+                )
+                return
+
             # `st.mutates_prompt`, not an inline `is SEMANTIC`: §7.5's rule
             # about which class rewrites the agent's instructions was written
             # twice, once as that predicate and once as this branch, and two
@@ -3557,12 +3775,6 @@ class Scheduler:
             # convicts. The predicate owns the rule; this owns acting on it.
             extra = None
             if st.mutates_prompt(retry_class):
-                # Only SEMANTIC mutates the prompt, and the offending paths
-                # are named in it — which is what makes the retry genuinely
-                # new instructions rather than the same request repeated
-                # (§7.5). The entry consumes the same typed `detail` record
-                # the store rows get — one representation of the failure, not
-                # two — and is written to the attempt row as well as to
                 # memory, because memory does not survive the process and the
                 # next attempt may be dispatched by a different one.
                 extra = dict(rp.guidance_extra_verification(detail))

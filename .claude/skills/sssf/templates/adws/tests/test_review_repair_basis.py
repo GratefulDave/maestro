@@ -8,9 +8,11 @@ from pathlib import Path
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
+from adw_modules import lifecycle as lc  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import worktree as wt  # noqa: E402
 from test_scheduler import SchedulerFixture, _git, green, red  # noqa: E402
 
 
@@ -354,6 +356,7 @@ class PersistentCandidateLoopTests(SchedulerFixture):
             _Review(True, "review-c2"),
         ]
         continued = []
+        crashed_during_handoff = False
 
         def review(attempt, node, record, base_sha, candidate_sha, _resume_existing):
             return reviews.pop(0)
@@ -367,10 +370,14 @@ class PersistentCandidateLoopTests(SchedulerFixture):
             builder_generation,
             cancel_requested,
         ):
-            continued.append((record.attempt_no, rejected_sha, prompt))
-            if len(continued) == 1:
+            nonlocal crashed_during_handoff
+            if not crashed_during_handoff:
+                crashed_during_handoff = True
                 raise SystemExit("scheduler process stopped during handoff")
-            self.assertEqual((attempt.path / "a.py").read_text(), "first candidate\n")
+            continued.append((record.attempt_no, rejected_sha, prompt))
+            self.assertEqual(
+                (attempt.path / "a.py").read_text(), "unpublished repair\n"
+            )
             (attempt.path / "a.py").write_text("second candidate\n")
             return sch.RepairExecution(
                 execution=sch.NodeExecution(envelope_parsed=True, exit_code=0),
@@ -403,6 +410,41 @@ class PersistentCandidateLoopTests(SchedulerFixture):
             ).verdict,
             st.ReviewVerdict.REJECTED,
         )
+        handoff = self.store.repair_handoff("run1", "a", candidate.candidate_sha)
+        self.assertIsNotNone(handoff)
+        self.assertIs(handoff.state, st.RepairHandoffState.PENDING)
+        self.assertEqual(
+            self.store.get_attempt("run1", "a", 1).extra[
+                lc.REPAIR_HANDOFF_RECOVERY_KEY
+            ],
+            candidate.candidate_sha,
+        )
+
+        attempt_record = self.store.get_attempt("run1", "a", 1)
+        attempt = wt.reopen_attempt_worktree(
+            self.repo,
+            "run1",
+            "a",
+            1,
+            attempt_record.base_sha,
+            self.root / "wt",
+            self.root / "scratch",
+        )
+        wt.prepare_descendant_candidate(attempt, candidate.candidate_sha)
+        repair_baseline = wt.take_baseline(attempt)
+        (attempt.path / "a.py").write_text("unpublished repair\n")
+        after = wt.inventory(attempt.path)
+        unpublished_repair = wt.commit_measured_delta(
+            attempt,
+            wt.delta(repair_baseline, after),
+            after,
+            "unpublished repair",
+        )
+        self.assertNotEqual(unpublished_repair, candidate.candidate_sha)
+        self.assertEqual(
+            wt.attempt_ref_commit(self.repo, "run1", "a", 1),
+            unpublished_repair,
+        )
 
         report = self.schedule([self.agent("a")], deps=deps).run()
 
@@ -411,10 +453,90 @@ class PersistentCandidateLoopTests(SchedulerFixture):
             [attempt.attempt_no for attempt in self.store.attempts_for("run1", "a")],
             [1],
         )
-        self.assertEqual([item[0] for item in continued], [1, 1])
-        self.assertIn(candidate.candidate_sha, continued[1][2])
-        self.assertIn("the candidate is complete except for metadata", continued[1][2])
+        self.assertEqual(continued, [])
+        candidates = self.store.lane_candidates("run1", "a")
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(candidates[1].candidate_sha, unpublished_repair)
         self.assertEqual(
+            self.store.repair_handoff("run1", "a", candidate.candidate_sha).state,
+            st.RepairHandoffState.ACKNOWLEDGED,
+        )
+
+    def test_scheduler_restart_resumes_unsealed_repair_handoff(self):
+        reviews = [
+            _Review(
+                False,
+                "review-c1",
+                (
+                    {
+                        "check_id": "direct-metadata",
+                        "object_id": "a.py",
+                        "message": "finish the rejected candidate",
+                    },
+                ),
+            ),
+            _Review(True, "review-c2"),
+        ]
+        continued = []
+        crashed_during_handoff = False
+
+        def review(attempt, node, record, base_sha, candidate_sha, _resume_existing):
+            return reviews.pop(0)
+
+        def continue_node(
+            attempt,
+            node,
+            record,
+            prompt,
+            rejected_sha,
+            builder_generation,
+            cancel_requested,
+        ):
+            nonlocal crashed_during_handoff
+            if not crashed_during_handoff:
+                crashed_during_handoff = True
+                raise SystemExit("scheduler stopped before the repair commit")
+            continued.append((record.attempt_no, rejected_sha))
+            (attempt.path / "a.py").write_text("second candidate\n")
+            return sch.RepairExecution(
+                execution=sch.NodeExecution(envelope_parsed=True, exit_code=0),
+                acknowledged_rejected_sha=rejected_sha,
+                builder_generation=builder_generation,
+            )
+
+        def run_node(attempt, node, record, prompt, on_launch, cancel_requested):
+            execution = self.run_node(
+                attempt, node, record, prompt, on_launch, cancel_requested
+            )
+            execution.envelope_payload = {"success": True}
+            return execution
+
+        self.written = {"a": {"a.py": "first candidate\n"}}
+        deps = self.deps(
+            run_node=run_node, review_attempt=review, continue_node=continue_node
+        )
+        first = self.schedule([self.agent("a")], deps=deps)
+        first.project()
+        first._attempt("a")
+
+        candidate = self.store.lane_candidates("run1", "a")[0]
+        self.assertEqual(
+            wt.attempt_ref_commit(self.repo, "run1", "a", 1),
+            candidate.candidate_sha,
+        )
+        self.assertEqual(
+            self.store.get_attempt("run1", "a", 1).extra[
+                lc.REPAIR_HANDOFF_RECOVERY_KEY
+            ],
+            candidate.candidate_sha,
+        )
+
+        report = self.schedule([self.agent("a")], deps=deps).run()
+
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        self.assertEqual(continued, [(1, candidate.candidate_sha)])
+        self.assertEqual(len(self.store.lane_candidates("run1", "a")), 2)
+        self.assertIs(
             self.store.repair_handoff("run1", "a", candidate.candidate_sha).state,
             st.RepairHandoffState.ACKNOWLEDGED,
         )

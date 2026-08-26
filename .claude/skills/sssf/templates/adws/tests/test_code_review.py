@@ -1704,16 +1704,20 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
             report.write_text(json.dumps(draft), encoding="utf-8")
 
             class FakeRunner:
-                def __init__(self, absent):
-                    self.absent = absent
+                def __init__(self, adoption):
+                    self.adoption = adoption
                     self.adopted = []
+                    self.retired = []
                     self.launched = []
                     self.resubmitted = []
+                    self.actorless_closed = []
 
                 def adopt(self, persisted):
                     self.adopted.append(persisted)
-                    if self.absent:
+                    if self.adoption == "absent":
                         raise lch.HandleAbsent("HANDLE_ABSENT")
+                    if self.adoption == "stale-placement":
+                        raise lch.HandleAdoptionRefused("WORKSPACE_ID_MISMATCH")
                     return lch.LaunchHandle(
                         correlation_token=persisted.correlation_token,
                         pane_id=persisted.pane_id,
@@ -1721,6 +1725,16 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                         launched_cwd=persisted.launched_cwd,
                         transcript_path=persisted.transcript_path,
                     )
+
+                def retire_for_replacement(self, persisted, _deadline):
+                    if self.adoption != "stale-placement":
+                        raise AssertionError("only stale placement may be retired")
+                    self.retired.append(persisted)
+
+                def close_actorless_pane(self, persisted):
+                    if self.adoption != "absent":
+                        raise AssertionError("only an actorless pane may be closed")
+                    self.actorless_closed.append(persisted)
 
                 def launch(self, spec):
                     self.launched.append(spec)
@@ -1767,7 +1781,7 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 mock.patch.object(maestro.code_review, "review_attempt", run_window),
             )
             with patches[0], patches[1], patches[2], patches[3]:
-                replacement = FakeRunner(absent=True)
+                replacement = FakeRunner("absent")
                 review = maestro._code_review_runner(
                     args, cast(lch.HerdrLauncher, replacement), store
                 )
@@ -1783,10 +1797,29 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 )
                 self.assertEqual(len(replacement.launched), 1)
                 self.assertEqual(replacement.resubmitted, [])
+                self.assertEqual(len(replacement.actorless_closed), 1)
+
+                stale = FakeRunner("stale-placement")
+                review = maestro._code_review_runner(
+                    args, cast(lch.HerdrLauncher, stale), store
+                )
+                self.assertIsNone(
+                    review(
+                        None,
+                        a_node(),
+                        SimpleNamespace(attempt_no=1),
+                        base_sha,
+                        output_sha,
+                        resume_existing_dispatch=True,
+                    )
+                )
+                self.assertEqual(len(stale.retired), 1)
+                self.assertEqual(len(stale.launched), 1)
+                self.assertEqual(stale.resubmitted, [])
 
                 complete = dict(draft, pair_count=1)
                 report.write_text(json.dumps(complete), encoding="utf-8")
-                adopted = FakeRunner(absent=False)
+                adopted = FakeRunner("present")
                 review = maestro._code_review_runner(
                     args, cast(lch.HerdrLauncher, adopted), store
                 )

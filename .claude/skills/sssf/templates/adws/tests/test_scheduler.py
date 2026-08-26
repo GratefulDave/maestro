@@ -60,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import maestro  # noqa: E402
 from adw_modules import lifecycle as lc  # noqa: E402
+from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import verification as vf  # noqa: E402
@@ -1991,6 +1992,9 @@ class ResumeTests(SchedulerFixture):
             "run1", "a", output_sha, builder_generation=1, repo_path=attempt.repo
         )
         self.store.begin_review("run1", "a::review", output_sha, reviewer_generation=1)
+        self.store.mark_review_dispatched(
+            "run1", "a::review", output_sha, reviewer_generation=1
+        )
         self.store.complete_review(
             "run1",
             "a::review",
@@ -2056,6 +2060,12 @@ class ResumeTests(SchedulerFixture):
         )
         self.store.begin_review(
             "run1", "build::review", candidate_sha, reviewer_generation=attempt_no
+        )
+        self.store.mark_review_dispatched(
+            "run1",
+            "build::review",
+            candidate_sha,
+            reviewer_generation=attempt_no,
         )
         self.store.complete_review(
             "run1",
@@ -2139,6 +2149,28 @@ class ResumeTests(SchedulerFixture):
 
         self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.RUNNING)
 
+    def test_persistent_lane_failure_spends_durable_cycle_budget(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        record = self.store.get_attempt("run1", "a", attempt_no)
+
+        scheduler._settle_failure(
+            node,
+            rp.Classification(
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+                reason="recovery identity check failed",
+            ),
+            record=record,
+        )
+
+        spends = self.store.lane_retry_spends("run1", "a")
+        self.assertEqual(len(spends), 1)
+        self.assertIs(spends[0].retry_class, st.LaneRetryClass.ENVIRONMENTAL)
+        self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.PENDING)
+
     def test_rehydration_refuses_a_descendant_not_owned_by_the_attempt(self):
         """A forged row may name a real descendant, but not this attempt's ref."""
         node = self.agent("a")
@@ -2174,6 +2206,9 @@ class ResumeTests(SchedulerFixture):
             "run1", "a", forged_descendant, builder_generation=1
         )
         self.store.begin_review(
+            "run1", "a::review", forged_descendant, reviewer_generation=1
+        )
+        self.store.mark_review_dispatched(
             "run1", "a::review", forged_descendant, reviewer_generation=1
         )
         self.store.complete_review(

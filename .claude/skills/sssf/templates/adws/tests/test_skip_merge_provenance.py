@@ -344,6 +344,12 @@ class SkipRecordsTheEvidenceGapTests(unittest.TestCase):
                 store.begin_review(
                     RUN_ID, f"{SKIPPED}::review", candidate_sha, reviewer_generation=1
                 )
+                store.mark_review_dispatched(
+                    RUN_ID,
+                    f"{SKIPPED}::review",
+                    candidate_sha,
+                    reviewer_generation=1,
+                )
                 store.reject_and_create_handoff(
                     RUN_ID,
                     f"{SKIPPED}::review",

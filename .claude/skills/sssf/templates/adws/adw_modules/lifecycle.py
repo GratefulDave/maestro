@@ -202,7 +202,42 @@ NODE_BUDGET_ALLOWANCE_REASON = "allow-exhausted-node"
 
 # ── schema ───────────────────────────────────────────────────────────────────
 
-SCHEMA = """
+
+def _candidate_reviews_ddl(table: str, *, if_not_exists: bool) -> str:
+    """The one candidate-review shape used for creation and table rebuilds."""
+    prefix = "IF NOT EXISTS " if if_not_exists else ""
+    return f"""CREATE TABLE {prefix}{table} (
+  run_id              TEXT NOT NULL REFERENCES runs(run_id),
+  review_node_id      TEXT NOT NULL,
+  candidate_sha       TEXT NOT NULL CHECK (
+    length(candidate_sha) IN (40, 64)
+    AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  reviewer_generation INTEGER NOT NULL CHECK (reviewer_generation >= 0),
+  state               TEXT NOT NULL CHECK (
+    state IN ('PUBLISHED', 'DISPATCHED', 'COMPLETED')),
+  dispatched_at       TEXT,
+  review_digest       TEXT,
+  receipt_path        TEXT,
+  findings_json       TEXT NOT NULL CHECK (
+    json_valid(findings_json) AND json_type(findings_json) = 'array'),
+  verdict             TEXT CHECK (verdict IS NULL OR verdict IN ('PASS', 'REJECTED')),
+  completed_at        TEXT,
+  CHECK (
+    (state = 'PUBLISHED' AND dispatched_at IS NULL AND verdict IS NULL
+     AND review_digest IS NULL AND receipt_path IS NULL AND completed_at IS NULL)
+    OR
+    (state = 'DISPATCHED' AND dispatched_at IS NOT NULL AND verdict IS NULL
+     AND review_digest IS NULL AND receipt_path IS NULL AND completed_at IS NULL)
+    OR
+    (state = 'COMPLETED' AND verdict IN ('PASS', 'REJECTED')
+     AND review_digest IS NOT NULL AND receipt_path IS NOT NULL
+     AND completed_at IS NOT NULL)),
+  PRIMARY KEY (run_id, review_node_id, candidate_sha)
+);"""
+
+
+SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS runs (
   run_id             TEXT PRIMARY KEY,
   plan_digest        TEXT NOT NULL,
@@ -385,29 +420,9 @@ CREATE TABLE IF NOT EXISTS lane_candidates (
   PRIMARY KEY (run_id, build_node_id, candidate_seq),
   UNIQUE (run_id, build_node_id, candidate_sha)
 );
-CREATE TABLE IF NOT EXISTS candidate_reviews (
-  run_id              TEXT NOT NULL REFERENCES runs(run_id),
-  review_node_id      TEXT NOT NULL,
-  candidate_sha       TEXT NOT NULL CHECK (
-    length(candidate_sha) IN (40, 64)
-    AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
-  reviewer_generation INTEGER NOT NULL CHECK (reviewer_generation >= 0),
-  state               TEXT NOT NULL CHECK (state IN ('DISPATCHED', 'COMPLETED')),
-  review_digest       TEXT,
-  receipt_path        TEXT,
-  findings_json       TEXT NOT NULL CHECK (
-    json_valid(findings_json) AND json_type(findings_json) = 'array'),
-  verdict             TEXT CHECK (verdict IS NULL OR verdict IN ('PASS', 'REJECTED')),
-  completed_at        TEXT,
-  CHECK (
-    (state = 'DISPATCHED' AND verdict IS NULL AND review_digest IS NULL
-     AND receipt_path IS NULL AND completed_at IS NULL)
-    OR
-    (state = 'COMPLETED' AND verdict IN ('PASS', 'REJECTED')
-     AND review_digest IS NOT NULL AND receipt_path IS NOT NULL
-     AND completed_at IS NOT NULL)),
-  PRIMARY KEY (run_id, review_node_id, candidate_sha)
-);
+"""
+    + _candidate_reviews_ddl("candidate_reviews", if_not_exists=True)
+    + """
 CREATE TABLE IF NOT EXISTS repair_handoffs (
   run_id                TEXT NOT NULL REFERENCES runs(run_id),
   build_node_id         TEXT NOT NULL,
@@ -515,6 +530,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_actor_session
 CREATE INDEX IF NOT EXISTS idx_legacy_review_migration_blocks
   ON legacy_review_migration_blocks(run_id, build_node_id);
 """
+)
 
 #: §10.3's partial unique index — "at most one live attempt per node as a
 #: declarative constraint that releases automatically when status changes".
@@ -694,25 +710,25 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, ...]:
 
 
 def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
-    """Add any column this version needs and an older ledger lacks.
+    """Add nullable columns and rebuild review checks an old ledger lacks.
 
-    `ADD COLUMN` is the only shape used, and every added column is nullable
-    with no default: an existing row keeps NULL, and NULL is read everywhere
-    below as "nobody recorded this", never as a value. So the migration cannot
-    invent a fact about a run that predates the column. A pre-migration
-    `CANCELLED` therefore carries no cause, and `run resume` refuses it — the
-    safe direction, since the alternative is guessing that a run nobody
-    recorded a cause for was merely paused.
+    Every added column is nullable with no default: an existing row keeps NULL,
+    and NULL is read everywhere below as "nobody recorded this", never as a
+    value. So the migration cannot invent a fact about a run that predates the
+    column. A pre-migration `CANCELLED` therefore carries no cause, and `run
+    resume` refuses it — the safe direction, since the alternative is guessing
+    that a run nobody recorded a cause for was merely paused.
+
+    `candidate_reviews` is the exception to additive migration: SQLite cannot
+    alter its state CHECK. Rebuilding it inside this transaction changes every
+    unfinished legacy `DISPATCHED` row to `PUBLISHED`, deliberately removing a
+    dispatch claim no pre-submission receipt can prove. Terminal evidence is
+    copied byte-for-byte except `dispatched_at`, which remains NULL because old
+    ledgers never recorded it.
 
     Concurrent openers are a supported case — `_enable_wal` says so
-    explicitly. The `PRAGMA table_info` check and the `ALTER TABLE` that
-    follows therefore have to be one serialized transaction: two processes
-    that both observe a missing column would otherwise both issue ALTER, and
-    the second dies with `duplicate column name` at the first run or resume
-    that touches a pre-migration ledger.
-
-    Returns `table.column` for each addition, so a caller cannot mistake two
-    same-named columns on different tables for one.
+    explicitly. The `PRAGMA table_info` check and every migration DDL statement
+    therefore run in one serialized transaction.
     """
     added = []
     conn.execute("BEGIN IMMEDIATE")
@@ -731,6 +747,9 @@ def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
                         raise
                     continue
                 added.append("{0}.{1}".format(table, name))
+        if _candidate_reviews_rebuild_needed(conn):
+            _rebuild_candidate_reviews(conn)
+            added.append("candidate_reviews.rebuilt")
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -757,12 +776,49 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     )
 
 
+def _candidate_reviews_rebuild_needed(conn: sqlite3.Connection) -> bool:
+    """Whether an existing review table predates the durable dispatch state."""
+    if not _has_table(conn, "candidate_reviews"):
+        return False
+    columns = set(_table_columns(conn, "candidate_reviews"))
+    if "dispatched_at" not in columns:
+        return True
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='candidate_reviews'"
+    ).fetchone()
+    return row is None or "PUBLISHED" not in str(row[0]).upper()
+
+
+def _rebuild_candidate_reviews(conn: sqlite3.Connection) -> None:
+    """Atomically replace the old immutable-state CHECK with the new lifecycle."""
+    conn.execute(
+        _candidate_reviews_ddl("candidate_reviews_rebuild", if_not_exists=False)
+    )
+    conn.execute(
+        "INSERT INTO candidate_reviews_rebuild"
+        " (run_id, review_node_id, candidate_sha, reviewer_generation, state,"
+        "  dispatched_at, review_digest, receipt_path, findings_json, verdict,"
+        "  completed_at)"
+        " SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
+        "  CASE state WHEN 'DISPATCHED' THEN 'PUBLISHED' ELSE state END,"
+        "  NULL, review_digest, receipt_path, findings_json, verdict, completed_at"
+        " FROM candidate_reviews"
+    )
+    conn.execute("DROP TABLE candidate_reviews")
+    conn.execute("ALTER TABLE candidate_reviews_rebuild RENAME TO candidate_reviews")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_candidate_reviews_active"
+        " ON candidate_reviews(run_id, review_node_id, state)"
+    )
+
+
 def _persistent_review_migration_needed(conn: sqlite3.Connection) -> bool:
     """Whether this opener will add persistent-review authority to an old DB."""
     if any(not _has_table(conn, table) for table in _REVIEW_MIGRATION_TABLES):
         return True
     return (
-        "review_of" not in _table_columns(conn, "dag_nodes")
+        _candidate_reviews_rebuild_needed(conn)
+        or "review_of" not in _table_columns(conn, "dag_nodes")
         or "lane_phase" not in _table_columns(conn, "node_lifecycle")
         or "tab_id" not in _table_columns(conn, "actor_sessions")
     )
@@ -1007,7 +1063,7 @@ def _candidate_from_row(row: Sequence[Any]) -> st.LaneCandidate:
 
 
 def _review_from_row(row: Sequence[Any]) -> st.CandidateReview:
-    raw_findings = json.loads(row[7])
+    raw_findings = json.loads(row[8])
     if not isinstance(raw_findings, list) or any(
         not isinstance(finding, dict) for finding in raw_findings
     ):
@@ -1018,11 +1074,12 @@ def _review_from_row(row: Sequence[Any]) -> st.CandidateReview:
         candidate_sha=row[2],
         reviewer_generation=int(row[3]),
         state=st.CandidateReviewState(row[4]),
-        review_digest=row[5],
-        receipt_path=row[6],
+        dispatched_at=row[5],
+        review_digest=row[6],
+        receipt_path=row[7],
         findings=tuple(dict(finding) for finding in raw_findings),
-        verdict=st.ReviewVerdict(row[8]) if row[8] else None,
-        completed_at=row[9],
+        verdict=st.ReviewVerdict(row[9]) if row[9] else None,
+        completed_at=row[10],
     )
 
 
@@ -1329,6 +1386,7 @@ MERGE_EVIDENCE_KEY = "merge_evidence"
 ATTEMPT_BASELINE_DIGEST_KEY = "baseline_digest"
 LATE_ENVELOPE_RECOVERY_KEY = "late_envelope_recovery"
 SEALED_OUTPUT_SHA_KEY = "sealed_output_sha"
+REPAIR_HANDOFF_RECOVERY_KEY = "repair_handoff_recovery"
 
 
 def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
@@ -1844,7 +1902,8 @@ class LifecycleStore:
     ) -> Optional[st.CandidateReview]:
         row = self.conn.execute(
             "SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
-            " state, review_digest, receipt_path, findings_json, verdict, completed_at"
+            " state, dispatched_at, review_digest, receipt_path, findings_json,"
+            " verdict, completed_at"
             " FROM candidate_reviews WHERE run_id=? AND review_node_id=?"
             " AND candidate_sha=?",
             (run_id, review_node_id, candidate_sha),
@@ -1901,7 +1960,8 @@ class LifecycleStore:
             raise LifecycleError("review read limit must be a positive integer")
         sql = (
             "SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
-            " state, review_digest, receipt_path, findings_json, verdict, completed_at"
+            " state, dispatched_at, review_digest, receipt_path, findings_json,"
+            " verdict, completed_at"
             " FROM candidate_reviews WHERE run_id=?"
         )
         params: Tuple[Any, ...] = (run_id,)
@@ -2208,8 +2268,9 @@ class LifecycleStore:
                     self.conn.execute(
                         "INSERT INTO candidate_reviews"
                         " (run_id, review_node_id, candidate_sha, reviewer_generation,"
-                        "  state, review_digest, receipt_path, findings_json, verdict,"
-                        "  completed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        "  state, dispatched_at, review_digest, receipt_path,"
+                        "  findings_json, verdict, completed_at)"
+                        " VALUES (?,?,?,?,?,NULL,?,?,?,?,?)",
                         (
                             run_id,
                             review_node_id,
@@ -2238,6 +2299,7 @@ class LifecycleStore:
                         candidate_sha=candidate_sha,
                         reviewer_generation=item.reviewer_generation,
                         state=st.CandidateReviewState.COMPLETED,
+                        dispatched_at=None,
                         review_digest=item.review_digest,
                         receipt_path=item.receipt_path,
                         findings=typed_findings,
@@ -2469,12 +2531,7 @@ class LifecycleStore:
         *,
         reviewer_generation: int,
     ) -> st.ReviewBegin:
-        """Create the sole dispatch row for a candidate review.
-
-        An existing row always wins: a completed row cannot be redispatched,
-        and an outstanding row remains owned by its original reviewer
-        generation until the explicit recovery writer proves replacement.
-        """
+        """Publish one review before any reviewer prompt is submitted."""
         candidate_sha = _require_candidate_sha(candidate_sha)
         reviewer_generation = _require_generation(
             reviewer_generation, field_name="reviewer_generation"
@@ -2490,19 +2547,24 @@ class LifecycleStore:
             if existing is not None:
                 self.conn.execute("COMMIT")
                 return st.ReviewBegin(
-                    review=existing, created=False, should_dispatch=False
+                    review=existing,
+                    created=False,
+                    should_dispatch=(
+                        existing.state is st.CandidateReviewState.PUBLISHED
+                    ),
                 )
             self.conn.execute(
                 "INSERT INTO candidate_reviews"
                 " (run_id, review_node_id, candidate_sha, reviewer_generation, state,"
-                "  review_digest, receipt_path, findings_json, verdict, completed_at)"
-                " VALUES (?,?,?,?,?,NULL,NULL,'[]',NULL,NULL)",
+                "  dispatched_at, review_digest, receipt_path, findings_json, verdict,"
+                "  completed_at)"
+                " VALUES (?,?,?,?,?,NULL,NULL,NULL,'[]',NULL,NULL)",
                 (
                     run_id,
                     review_node_id,
                     candidate_sha,
                     reviewer_generation,
-                    st.CandidateReviewState.DISPATCHED.value,
+                    st.CandidateReviewState.PUBLISHED.value,
                 ),
             )
             created = st.CandidateReview(
@@ -2510,7 +2572,8 @@ class LifecycleStore:
                 review_node_id=review_node_id,
                 candidate_sha=candidate_sha,
                 reviewer_generation=reviewer_generation,
-                state=st.CandidateReviewState.DISPATCHED,
+                state=st.CandidateReviewState.PUBLISHED,
+                dispatched_at=None,
                 review_digest=None,
                 receipt_path=None,
                 findings=(),
@@ -2519,6 +2582,76 @@ class LifecycleStore:
             )
             self.conn.execute("COMMIT")
             return st.ReviewBegin(review=created, created=True, should_dispatch=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def mark_review_dispatched(
+        self,
+        run_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        *,
+        reviewer_generation: int,
+    ) -> st.CandidateReview:
+        """Record transcript-proven prompt submission exactly once."""
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        reviewer_generation = _require_generation(
+            reviewer_generation, field_name="reviewer_generation"
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_review_candidate(run_id, review_node_id, candidate_sha)
+            existing = self._review(run_id, review_node_id, candidate_sha)
+            if existing is None:
+                raise LifecycleError("a review dispatch requires a published review")
+            if existing.reviewer_generation != reviewer_generation:
+                raise LifecycleError("review dispatch generation is stale")
+            if existing.state is not st.CandidateReviewState.PUBLISHED:
+                self.conn.execute("COMMIT")
+                return existing
+            dispatched_at = now_iso()
+            changed = self.conn.execute(
+                "UPDATE candidate_reviews SET state=?, dispatched_at=?"
+                " WHERE run_id=? AND review_node_id=? AND candidate_sha=?"
+                " AND state=? AND reviewer_generation=?",
+                (
+                    st.CandidateReviewState.DISPATCHED.value,
+                    dispatched_at,
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    st.CandidateReviewState.PUBLISHED.value,
+                    reviewer_generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise LifecycleError("candidate review dispatch CAS lost unexpectedly")
+            dispatched = self._review(run_id, review_node_id, candidate_sha)
+            self.conn.execute(
+                "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+                " reason, actor, detail_json, created_at)"
+                " VALUES (?,?,'node',?,?,?,'scheduler',?,?)",
+                (
+                    run_id,
+                    review_node_id,
+                    st.CandidateReviewState.PUBLISHED.value,
+                    st.CandidateReviewState.DISPATCHED.value,
+                    "candidate-review-dispatched",
+                    json.dumps(
+                        {
+                            "candidate_sha": candidate_sha,
+                            "reviewer_generation": reviewer_generation,
+                            "dispatched_at": dispatched_at,
+                        },
+                        sort_keys=True,
+                    ),
+                    dispatched_at,
+                ),
+            )
+            self.conn.execute("COMMIT")
+            return dispatched
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
@@ -2533,11 +2666,7 @@ class LifecycleStore:
         expected_reviewer_generation: int,
         reviewer_generation: int,
     ) -> st.ReviewBegin:
-        """Claim an unfinished dispatch for a proven replacement reviewer.
-
-        A caller must first establish typed session death.  This method only
-        fences the durable owner change; it cannot revive a completed result.
-        """
+        """Re-publish an unfinished review for a proven replacement reviewer."""
         candidate_sha = _require_candidate_sha(candidate_sha)
         expected_reviewer_generation = _require_generation(
             expected_reviewer_generation, field_name="expected_reviewer_generation"
@@ -2558,7 +2687,7 @@ class LifecycleStore:
             self._require_review_candidate(run_id, review_node_id, candidate_sha)
             existing = self._review(run_id, review_node_id, candidate_sha)
             if existing is None:
-                raise LifecycleError("an undispatched review cannot be recovered")
+                raise LifecycleError("an unpublished review cannot be recovered")
             if (
                 existing.terminal
                 or existing.reviewer_generation != expected_reviewer_generation
@@ -2567,28 +2696,35 @@ class LifecycleStore:
                 return st.ReviewBegin(
                     review=existing, created=False, should_dispatch=False
                 )
-            self.conn.execute(
-                "UPDATE candidate_reviews SET reviewer_generation=?"
+            changed = self.conn.execute(
+                "UPDATE candidate_reviews SET reviewer_generation=?, state=?,"
+                " dispatched_at=NULL"
                 " WHERE run_id=? AND review_node_id=? AND candidate_sha=?"
-                " AND state=? AND reviewer_generation=?",
+                " AND state IN (?,?) AND reviewer_generation=?",
                 (
                     reviewer_generation,
+                    st.CandidateReviewState.PUBLISHED.value,
                     run_id,
                     review_node_id,
                     candidate_sha,
+                    st.CandidateReviewState.PUBLISHED.value,
                     st.CandidateReviewState.DISPATCHED.value,
                     expected_reviewer_generation,
                 ),
-            )
+            ).rowcount
+            if changed != 1:
+                raise LifecycleError("candidate review recovery CAS lost unexpectedly")
             updated = self._review(run_id, review_node_id, candidate_sha)
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
-                " VALUES (?,?,'node',NULL,NULL,'candidate-review-recovered',"
-                " 'scheduler',?,?)",
+                " VALUES (?,?,'node',?,?,?,'scheduler',?,?)",
                 (
                     run_id,
                     review_node_id,
+                    existing.state.value,
+                    st.CandidateReviewState.PUBLISHED.value,
+                    "candidate-review-recovered",
                     json.dumps(
                         {
                             "candidate_sha": candidate_sha,
@@ -2667,6 +2803,8 @@ class LifecycleStore:
                 )
                 self.conn.execute("COMMIT")
                 return st.ReviewCompletion(review=existing, completed=False)
+            if existing.state is not st.CandidateReviewState.DISPATCHED:
+                raise LifecycleError("a review result requires durable dispatch proof")
             if verdict is st.ReviewVerdict.REJECTED:
                 raise LifecycleError(
                     "a rejected review must use reject_and_create_handoff atomically"
@@ -2701,6 +2839,7 @@ class LifecycleStore:
                 candidate_sha=candidate_sha,
                 reviewer_generation=reviewer_generation,
                 state=st.CandidateReviewState.COMPLETED,
+                dispatched_at=existing.dispatched_at,
                 review_digest=review_digest,
                 receipt_path=receipt_path,
                 findings=typed_findings,
@@ -2712,6 +2851,45 @@ class LifecycleStore:
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+    def _bind_repair_parent_to_current_attempt(
+        self, run_id: str, build_node_id: str, rejected_candidate_sha: str
+    ) -> bool:
+        """Bind recovery when this review belongs to an active build attempt."""
+        lifecycle = self.conn.execute(
+            "SELECT attempt_no FROM node_lifecycle WHERE run_id=? AND node_id=?",
+            (run_id, build_node_id),
+        ).fetchone()
+        if lifecycle is None or int(lifecycle[0]) < 1:
+            return False
+        attempt_no = int(lifecycle[0])
+        attempt = self.conn.execute(
+            "SELECT extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, build_node_id, attempt_no),
+        ).fetchone()
+        if attempt is None:
+            raise LifecycleError("a repair handoff requires an owning attempt row")
+        try:
+            payload = json.loads(attempt[0] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LifecycleError("owning attempt extras are not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise LifecycleError("owning attempt extras are not an object")
+        payload[REPAIR_HANDOFF_RECOVERY_KEY] = rejected_candidate_sha
+        changed = self.conn.execute(
+            "UPDATE attempts SET extra_json=?"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (
+                json.dumps(payload, sort_keys=True),
+                run_id,
+                build_node_id,
+                attempt_no,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise LifecycleError("repair handoff attempt binding CAS lost unexpectedly")
+        return True
 
     @serialized
     def reject_and_create_handoff(
@@ -2769,6 +2947,9 @@ class LifecycleStore:
                     receipt_path=receipt_path,
                     findings_json=findings_json,
                 )
+                self._bind_repair_parent_to_current_attempt(
+                    run_id, build_node_id, candidate_sha
+                )
                 self.conn.execute("COMMIT")
                 return st.RejectionHandoff(
                     review=existing, handoff=handoff, completed=False, created=False
@@ -2788,6 +2969,10 @@ class LifecycleStore:
                 self.conn.execute("COMMIT")
                 return st.RejectionHandoff(
                     review=existing, handoff=None, completed=False, created=False
+                )
+            if existing.state is not st.CandidateReviewState.DISPATCHED:
+                raise LifecycleError(
+                    "a rejected review requires durable dispatch proof"
                 )
             now = now_iso()
             changed = self.conn.execute(
@@ -2825,12 +3010,16 @@ class LifecycleStore:
                     builder_generation,
                 ),
             )
+            self._bind_repair_parent_to_current_attempt(
+                run_id, build_node_id, candidate_sha
+            )
             review = st.CandidateReview(
                 run_id=run_id,
                 review_node_id=review_node_id,
                 candidate_sha=candidate_sha,
                 reviewer_generation=reviewer_generation,
                 state=st.CandidateReviewState.COMPLETED,
+                dispatched_at=existing.dispatched_at,
                 review_digest=review_digest,
                 receipt_path=receipt_path,
                 findings=typed_findings,
@@ -5480,7 +5669,7 @@ class LifecycleStore:
                 payload = {}
             if not isinstance(payload, dict):
                 payload = {}
-            payload["repair_handoff_recovery"] = rejected_candidate_sha
+            payload[REPAIR_HANDOFF_RECOVERY_KEY] = rejected_candidate_sha
             return [
                 (
                     "UPDATE attempts SET state=?, started_at=?, launched_at=NULL,"
@@ -6841,9 +7030,15 @@ class LifecycleReader:
             return ()
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise LifecycleError("review read limit must be a positive integer")
+        dispatched_at = (
+            "dispatched_at"
+            if "dispatched_at" in _table_columns(self.conn, "candidate_reviews")
+            else "NULL AS dispatched_at"
+        )
         sql = (
             "SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
-            " state, review_digest, receipt_path, findings_json, verdict, completed_at"
+            f" state, {dispatched_at}, review_digest, receipt_path, findings_json,"
+            " verdict, completed_at"
             " FROM candidate_reviews WHERE run_id=?"
         )
         params: Tuple[Any, ...] = (run_id,)

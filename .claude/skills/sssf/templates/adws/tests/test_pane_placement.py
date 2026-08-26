@@ -765,6 +765,55 @@ class PanePlacementTest(unittest.TestCase):
         self.assertEqual(adopted.workspace_id, original.workspace_id)
         self.assertEqual(resumed.reclaim(original.correlation_token), (adopted,))
 
+    def test_actorless_adopted_pane_is_closed_before_replacement(self):
+        class ActorlessHerdr(_WorkspaceHerdr):
+            agent_missing = False
+
+            def __call__(self, *args, env=None, timeout=30.0):
+                if self.agent_missing and tuple(args[:2]) == ("agent", "get"):
+                    self.calls.append(list(args))
+                    return {"result": {}}
+                return super().__call__(*args, env=env, timeout=timeout)
+
+        runtime, fake = self.build(
+            workspace_label="approved-plan", factory=ActorlessHerdr
+        )
+        original = runtime.launch(
+            self.spec(
+                "run1-review-a1",
+                group="build",
+                role="reviewer",
+                attempt=1,
+                workspace_label="approved-plan",
+            )
+        )
+        persisted = lch.PersistedActorHandle(
+            correlation_token=original.correlation_token,
+            pane_id=original.pane_id,
+            agent_name=original.agent_name,
+            launched_cwd=original.launched_cwd,
+            transcript_path=original.transcript_path,
+            environment=original.environment,
+            workspace_id=original.workspace_id,
+            tab_id=original.tab_id,
+            lane_key=original.lane_key,
+        )
+        resumed = lch.HerdrLauncher(
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted,
+            workspace_label="approved-plan",
+        )
+        resumed._herdr = fake
+        fake.agent_missing = True
+
+        with self.assertRaises(lch.HandleAbsent):
+            resumed.adopt(persisted)
+        resumed.close_actorless_pane(persisted)
+
+        self.assertEqual(fake.closed, [original.pane_id])
+
     def test_proven_tab_survives_agent_absence_and_replacement_reuses_it(self):
         runtime, fake = self.build(workspace_label="approved-plan")
         original = runtime.launch(
@@ -919,6 +968,42 @@ class PanePlacementTest(unittest.TestCase):
                     resumed.adopt(persisted)
 
         self.assertEqual(resumed.workspace_id, "wRUN1")
+
+    def test_stale_workspace_actor_is_retired_only_after_identity_proof(self):
+        resumed, fake = self.build(workspace_label="approved-plan")
+        fake.register_existing_tab("wRUN1:t2", "wRUN1:p1")
+        fake.register_existing_tab("wOLD:t7", "wOLD:p9")
+        current = lch.PersistedActorHandle(
+            correlation_token="run1-build-a1",
+            pane_id="wRUN1:p1",
+            agent_name=lch.agent_name_for("run1-build-a1"),
+            launched_cwd=self.worktree,
+            environment=fake_env(),
+            workspace_id="wRUN1",
+            tab_id="wRUN1:t2",
+            lane_key="build",
+        )
+        stale = lch.PersistedActorHandle(
+            correlation_token="run1-review-a1",
+            pane_id="wOLD:p9",
+            agent_name=lch.agent_name_for("run1-review-a1"),
+            launched_cwd=self.worktree,
+            environment=fake_env(),
+            workspace_id="wOLD",
+            tab_id="wOLD:t7",
+            lane_key="build",
+        )
+        fake.split_pane_id = current.pane_id
+        resumed.adopt(current)
+        fake.split_pane_id = stale.pane_id
+
+        with self.assertRaisesRegex(lch.HandleAdoptionRefused, "WORKSPACE_ID_MISMATCH"):
+            resumed.adopt(stale)
+        resumed.retire_for_replacement(stale, 0.0)
+
+        self.assertEqual(fake.closed, [stale.pane_id])
+        self.assertEqual(resumed.workspace_id, "wRUN1")
+        self.assertEqual(resumed._tabs["build"].tab_id, "wRUN1:t2")
 
 
 class LanePlacementMappingTest(unittest.TestCase):

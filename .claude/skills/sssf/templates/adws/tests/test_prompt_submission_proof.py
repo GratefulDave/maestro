@@ -301,6 +301,54 @@ class SubmissionProof(unittest.TestCase):
             )
         self.assertIn("pane_not_found", str(caught.exception))
 
+    def test_the_exact_prompt_path_is_recoverable_from_a_persistent_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "review" / "digest" / "prompt.md"
+            prompt.parent.mkdir(parents=True)
+            prompt.write_text("review", encoding="utf-8")
+            transcript = root / "session.jsonl"
+            transcript.write_text(
+                '{"type":"message","message":{"role":"user","content":'
+                '[{"type":"text","text":"@' + str(prompt.resolve()) + '"}]}}\n',
+                encoding="utf-8",
+            )
+            handle = lch.LaunchHandle(
+                "review-run-lane-a1",
+                "w1:p1",
+                "agent",
+                root,
+                transcript_path=transcript,
+            )
+
+            self.assertTrue(lch.prompt_submission_recorded(handle, prompt))
+            self.assertFalse(
+                lch.prompt_submission_recorded(
+                    handle, prompt.parent.parent / "other" / "prompt.md"
+                )
+            )
+
+    def test_prompt_path_match_crosses_a_transcript_chunk_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "review" / "prompt.md"
+            prompt.parent.mkdir(parents=True)
+            prompt.write_text("review", encoding="utf-8")
+            marker = ("@" + str(prompt.resolve())).encode("utf-8")
+            transcript = root / "session.jsonl"
+            transcript.write_bytes(b"x" * 29 + marker + b"\n")
+            handle = lch.LaunchHandle(
+                "review-run-lane-a1",
+                "w1:p1",
+                "agent",
+                root,
+                transcript_path=transcript,
+            )
+
+            self.assertTrue(
+                lch.prompt_submission_recorded(handle, prompt, chunk_size=32)
+            )
+
 
 class OmpStartsAtInteractiveComposer(unittest.TestCase):
     """OMP startup argv never races the immutable prompt against readiness."""
