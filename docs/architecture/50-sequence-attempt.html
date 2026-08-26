@@ -9,6 +9,7 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
+      color-scheme: dark;
       --color-paper:      #2d3142;
       --color-paper-2:    #393e53;
       --color-ink:        #f5f5f5;
@@ -22,6 +23,7 @@
       --font-mono:        'Geist Mono', ui-monospace, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -70,11 +72,11 @@
   <div class="frame">
     <p class="eyebrow">Sequence · Maestro</p>
     <h1>One agent attempt · Envelope then gate</h1>
-    <p class="lede">Scheduler owns the attempt. HerdrLauncher is transport only. The typed envelope and post-node gate decide merge or SEMANTIC retry.</p>
+    <p class="lede">Scheduler owns the attempt. HerdrLauncher is transport only. Candidate publish then a derived build::review PASS decide merge; SEMANTIC retry is still the repair trigger.</p>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="50-sequence-attempt-title 50-sequence-attempt-desc">
       <title id="50-sequence-attempt-title">One agent attempt · Envelope then gate</title>
-      <desc id="50-sequence-attempt-desc">Scheduler opens a live attempt, isolates a worktree, and uses HerdrLauncher only as transport into an agent pane; the typed envelope and post-node gate decide whether the attempt merges or retries as SEMANTIC.</desc>
+      <desc id="50-sequence-attempt-desc">Scheduler opens a live attempt, isolates a worktree, and uses HerdrLauncher only as transport into an agent pane; the typed envelope and post-node gate publish a candidate SHA, then merge waits on a derived build::review PASS for that exact commit. A SEMANTIC failure with an output SHA still opens a repair chain.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
           <polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/>
@@ -102,7 +104,7 @@
       <rect x="112" y="384" width="40" height="16" rx="2"
             fill="#2d3142" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
       <text x="132" y="396" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">ALT</text>
-      <text x="124" y="412" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[verified]</text>
+      <text x="124" y="412" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[verified · review PASS]</text>
       <line x1="120" y1="496" x2="664" y2="496" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
       <text x="124" y="520" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[else · SEMANTIC]</text>
 
@@ -157,10 +159,10 @@
       <text x="518" y="346" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POST-GATE</text>
 
       <rect x="214" y="420" width="104" height="12" rx="2" fill="#2d3142"/>
-      <text x="266" y="430" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MARK_VERIFIED</text>
+      <text x="266" y="430" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PUBLISH CAND</text>
 
       <rect x="490" y="444" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="518" y="454" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGE SHA</text>
+      <text x="518" y="454" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REVIEW PASS</text>
 
       <rect x="214" y="528" width="104" height="12" rx="2" fill="#2d3142"/>
       <text x="266" y="538" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MUTATES_PROMPT</text>
@@ -220,7 +222,7 @@
 
       <rect x="864" y="638" width="28" height="16" rx="2" fill="rgba(245,245,245,0.04)" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
       <text x="878" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ALT</text>
-      <text x="900" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">MERGE OR RETRY</text>
+      <text x="900" y="650" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">REVIEW THEN MERGE</text>
     </svg>
   </div>
 </body>

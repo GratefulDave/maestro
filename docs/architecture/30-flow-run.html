@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 840" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="30-flow-run-title 30-flow-run-desc">
       <title id="30-flow-run-title">Scheduler.run · ready_nodes until _declare</title>
-      <desc id="30-flow-run-desc">Scheduler.run loop: admission checks the PASS receipt, plan eligibility, and each node's SEMANTIC budget summed across every earlier run of the same plan digest, refusing before any ledger write (RUN_RECEIPT_NOT_PASS, RUN_RECEIPT_ABSENT, RUN_PLAN_NOT_CANONICAL_OR_ELIGIBLE, schema unrunnable, NODE_BUDGET_EXHAUSTED_ACROSS_RUNS). Otherwise create_run, ready_nodes whose deps are MERGED dispatch concurrent worktree take_baseline launch attempts. Post-gate fail is fail_attempt (PENDING retry), not an immediate BLOCKED. For an agent node whose post-node gate PASSED, falsify_outputs runs before mark_verified. A gate still green with its subject reverted is SEMANTIC into fail_attempt / the repair chain. Quiescence goes to _declare (ACCEPTED, BLOCKED, STUCK, or CANCELLED), not straight to ACCEPTED.</desc>
+      <desc id="30-flow-run-desc">Scheduler.run loop: admission checks the PASS receipt, plan eligibility, and each node's SEMANTIC budget summed across every earlier run of the same plan digest, refusing before any ledger write. Otherwise create_run, ready_nodes whose deps are MERGED dispatch concurrent worktree take_baseline launch attempts. Post-gate fail is fail_attempt (PENDING retry), not an immediate BLOCKED. For an agent node whose post-node gate PASSED, falsify_outputs runs before mark_verified. Merge waits on a derived build::review PASS for the current candidate SHA. A gate still green with its subject reverted is SEMANTIC into fail_attempt / the repair chain. Quiescence goes to _declare.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -191,8 +191,8 @@
 
       <!-- Step: merge_frontier -->
       <rect x="460" y="696" width="200" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="560" y="716" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">mark_verified · merge</text>
-      <text x="560" y="732" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">after falsify · (depth, node_id)</text>
+      <text x="560" y="716" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review PASS · merge</text>
+      <text x="560" y="732" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">build::review on candidate SHA</text>
 
       <!-- Callout: the reverted-subject question is asked, not assumed -->
       <text x="1240" y="552" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">A test file its author wrote cannot certify code its author wrote.</text>

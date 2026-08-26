@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="32-flow-escape-title 32-flow-escape-desc">
       <title id="32-flow-escape-title">Escapes from BLOCKED</title>
-      <desc id="32-flow-escape-desc">Flowchart of operator escapes from a BLOCKED node: retry (plain RETRY, or RETRY_FORCE via --force/--grant when SEMANTIC or REVIEW budget is exhausted), skip --accept-sha, and abandon. A RUNNING escape fails closed on SCHEDULER_STILL_ALIVE or SCHEDULER_LIVENESS_UNKNOWN. skip requires git ancestry proof. run resume is refused against ACCEPTED and CANCELLED.</desc>
+      <desc id="32-flow-escape-desc">Flowchart of operator escapes from a BLOCKED node: retry (plain RETRY, or RETRY_FORCE via --force/--grant when SEMANTIC budget is exhausted, which goes PENDING immediately), skip --accept-sha, and abandon. A review-budget grant stays BLOCKED on the exact attempt; only absence-proven run resume returns that same attempt to PENDING, with no replacement worktree. A RUNNING escape fails closed on SCHEDULER_STILL_ALIVE or SCHEDULER_LIVENESS_UNKNOWN. skip requires git ancestry proof. run resume is refused against ACCEPTED and CANCELLED.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -120,7 +120,7 @@
       <rect x="280" y="40" width="200" height="48" rx="20" fill="#2d3142"/>
       <rect x="280" y="40" width="200" height="48" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
       <text x="380" y="60" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
-      <text x="380" y="76" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">operator-terminal</text>
+      <text x="380" y="76" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">REVIEW grant stays</text>
 
       <!-- RUNNING? -->
       <polygon points="380,120 480,168 380,216 280,168" fill="#2d3142"/>
@@ -144,13 +144,13 @@
       <polygon points="380,376 500,424 380,472 260,424" fill="#2d3142"/>
       <polygon points="380,376 500,424 380,472 260,424" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="380" y="420" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Which Escape?</text>
-      <text x="380" y="436" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">exits_for · RETRY_FORCE</text>
+      <text x="380" y="436" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SEMANTIC RETRY_FORCE</text>
 
       <!-- PENDING -->
       <rect x="40" y="400" width="160" height="48" rx="20" fill="#2d3142"/>
       <rect x="40" y="400" width="160" height="48" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
       <text x="120" y="420" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PENDING</text>
-      <text x="120" y="436" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">retry · --force/--grant</text>
+      <text x="120" y="436" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SEMANTIC --force/--grant</text>
 
       <!-- skip --accept-sha -->
       <rect x="280" y="504" width="200" height="48" rx="6" fill="#2d3142"/>
@@ -186,6 +186,7 @@
 
       <rect x="432" y="688" width="24" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
       <text x="464" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Fail-closed liveness</text>
+      <text x="40" y="712" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">SEMANTIC --force/--grant → PENDING · REVIEW --grant stays BLOCKED · absence-proven resume recovers that attempt</text>
     </svg>
   </div>
 </body>

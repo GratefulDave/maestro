@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="11-classes-scheduler-title 11-classes-scheduler-desc">
       <title id="11-classes-scheduler-title">Scheduler · UML class diagram</title>
-      <desc id="11-classes-scheduler-desc">Class diagram showing Scheduler depending on SchedulerDeps and LifecycleStore, consuming PlanNode, and LifecycleStore owning AttemptRecord rows keyed by node_id; LifecycleStore is the SQLite authority.</desc>
+      <desc id="11-classes-scheduler-desc">Class diagram showing Scheduler depending on SchedulerDeps and LifecycleStore, consuming PlanNode, and LifecycleStore owning AttemptRecord rows keyed by node_id plus CandidateReview, ActorSession, handoff, and granted_extra_attempts; LifecycleStore is the SQLite authority.</desc>
       <defs>
         <marker id="uml-triangle" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
           <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
@@ -158,10 +158,10 @@
       <line x1="840" y1="120" x2="1240" y2="120" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
       <text x="1040" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LifecycleStore</text>
       <text x="856" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ db_path: str</text>
-      <text x="856" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ create_run(run_id, plan_digest, nodes): None</text>
-      <text x="856" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ start_attempt(run_id, node_id, base_sha): int</text>
-      <text x="856" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_verified(run_id, node_id, output_sha): NodeLifecycle</text>
-      <text x="856" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_merged(run_id, node_id): NodeLifecycle</text>
+      <text x="856" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ CandidateReview · ActorSession</text>
+      <text x="856" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ handoff · granted_extra_attempts</text>
+      <text x="856" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ start_attempt(run_id, node_id, base_sha): int</text>
+      <text x="856" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_merged after build::review PASS</text>
       <text x="856" y="220" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ declare_outcome(run_id): OutcomeReport</text>
 
       <!-- Class: RunReport -->

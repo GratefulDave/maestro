@@ -9,6 +9,7 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
+      color-scheme: dark;
       --color-paper:       #2d3142;
       --color-paper-2:     #393e53;
       --color-ink:         #f5f5f5;
@@ -22,6 +23,7 @@
       --font-mono:         'Geist Mono', ui-monospace, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -65,7 +67,7 @@
 
     <svg viewBox="0 0 1280 768" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="13-uml-runtime-title 13-uml-runtime-desc">
       <title id="13-uml-runtime-title">Live runtime · UML class diagram</title>
-      <desc id="13-uml-runtime-desc">Class diagram of the live ADW runtime: Scheduler owns SchedulerDeps, uses LifecycleStore and HerdrLauncher as transport, and consumes Plan / PlanV2, which owns AgentNode and CodeNode.</desc>
+      <desc id="13-uml-runtime-desc">Class diagram of the live ADW runtime: Scheduler owns SchedulerDeps, uses LifecycleStore and HerdrLauncher as transport, and consumes Plan / PlanV3, which owns AgentNode, TestsNode, and CodeNode. LifecycleStore owns CandidateReview, ActorSession, handoff, and granted_extra_attempts.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
           <polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/>
@@ -172,10 +174,10 @@
       <line x1="880" y1="120" x2="1240" y2="120" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
       <text x="1060" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LifecycleStore</text>
       <text x="896" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ db_path: str</text>
-      <text x="896" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ create_run(id, digest, nodes): None</text>
-      <text x="896" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ start_attempt(id, node, sha): int</text>
-      <text x="896" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_verified(id, node, sha): NodeLifecycle</text>
-      <text x="896" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_merged(id, node): NodeLifecycle</text>
+      <text x="896" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ CandidateReview · ActorSession</text>
+      <text x="896" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ handoff · granted_extra_attempts</text>
+      <text x="896" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ start_attempt(id, node, sha): int</text>
+      <text x="896" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ mark_merged after build::review PASS</text>
       <text x="896" y="220" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ declare_outcome(id): OutcomeReport</text>
 
       <!-- Class: HerdrLauncher -->
@@ -196,10 +198,10 @@
       <rect x="440" y="360" width="360" height="180" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <line x1="440" y1="400" x2="800" y2="400" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
       <line x1="440" y1="500" x2="800" y2="500" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="620" y="384" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan / PlanV2</text>
-      <text x="456" y="420" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: v1 | v2</text>
+      <text x="620" y="384" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan / PlanV3</text>
+      <text x="456" y="420" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: v3</text>
       <text x="456" y="440" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ plan_id: str</text>
-      <text x="456" y="460" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Tuple[Node, ...]</text>
+      <text x="456" y="460" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Agent · Tests · Code</text>
       <text x="456" y="480" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ merge_policy: MergePolicy</text>
       <text x="456" y="520" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ to_plan_nodes(): Tuple[PlanNode, ...]</text>
 

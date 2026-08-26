@@ -313,7 +313,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Scheduler lifecycle classes</h3>
               </div>
-              <p>Scheduler, SchedulerDeps, LifecycleStore owning AttemptRecord, and PlanNode.</p>
+              <p>LifecycleStore owns AttemptRecord, CandidateReview, ActorSession, handoff, and granted_extra_attempts.</p>
             </a>
           </li>
           <li>
@@ -369,7 +369,7 @@
                 <span class="card-dot soft" aria-hidden="true"></span>
                 <h3>Attempt retry class</h3>
               </div>
-              <p>Attempt settle and retry class — only SEMANTIC mutates_prompt.</p>
+              <p>Attempt settle plus resume: identity-bound envelope, QUIESCENCE_UNPROVEN, exact actor adopt, workspace_not_found is absence.</p>
             </a>
           </li>
         </ul>
@@ -405,7 +405,7 @@
                 <span class="card-dot soft" aria-hidden="true"></span>
                 <h3>Operator escape flowchart</h3>
               </div>
-              <p>Escapes from BLOCKED: retry / --force --grant, skip --accept-sha, and abandon.</p>
+              <p>SEMANTIC --force/--grant goes PENDING; review-budget grant stays BLOCKED until absence-proven resume.</p>
             </a>
           </li>
           <li>
@@ -441,7 +441,7 @@
                 <span class="card-dot coral" aria-hidden="true"></span>
                 <h3>Attempt sequence</h3>
               </div>
-              <p>One agent attempt: isolate, launch, typed envelope, gate, merge or SEMANTIC retry.</p>
+              <p>Publish candidate SHA, then derived build::review PASS, then merge — or SEMANTIC retry.</p>
             </a>
           </li>
         </ul>
