@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="22-state-attempt-title 22-state-attempt-desc">
       <title id="22-state-attempt-title">Attempt settle · Only SEMANTIC mutates_prompt</title>
-      <desc id="22-state-attempt-desc">One live AttemptRecord starts RUNNING under idx_one_live_attempt_per_node; _settle_failure classifies SEMANTIC, ENVIRONMENTAL, or LAUNCHER_TRANSIENT, while _release_unclassified_attempt leaves retry_class NULL; CLOSED_ATTEMPT_STATE CANCELLED releases the index; only SEMANTIC mutates_prompt; CREDENTIAL and DETERMINISTIC_REFUSAL spend launcher_retry_budget 0.</desc>
+      <desc id="22-state-attempt-desc">One live AttemptRecord starts RUNNING under idx_one_live_attempt_per_node; _settle_failure classifies SEMANTIC, ENVIRONMENTAL, or LAUNCHER_TRANSIENT, while _release_unclassified_attempt leaves retry_class NULL; CLOSED_ATTEMPT_STATE CANCELLED releases the index; only SEMANTIC mutates_prompt; CREDENTIAL and DETERMINISTIC_REFUSAL spend launcher_retry_budget 0. Resume: an identity-bound late envelope continues; an absent envelope stays QUIESCENCE_UNPROVEN; a persistent actor adopts only on exact pane, cwd, session, correlation, role, and generation; workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -201,6 +201,7 @@
 
       <circle cx="920" cy="674" r="4" fill="#f5f5f5"/>
       <text x="932" y="678" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">START / END</text>
+      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">resume: identity-bound late envelope continues · absent envelope QUIESCENCE_UNPROVEN · adopt only exact pane/cwd/session/correlation/role/generation · workspace_not_found is absence</text>
     </svg>
   </div>
 </body>

@@ -267,12 +267,14 @@ anything load-bearing unowned.
 
 ## What a review rejection costs
 
-A rejection is not a fresh start. When code review rejects an attempt, the next attempt branches
-from the commit that attempt produced and the builder is asked to change it — the reviewer's
-located findings name what to change, and the lane's `instruction` still leads the prompt and still
-bounds the work. Consecutive rejections are therefore rounds of refinement on one artifact rather
-than independent implementations, and a `review_ceiling` of six buys six rounds rather than six
-one-shot guesses.
+A rejection is not a fresh start. It records typed findings and one repair
+handoff, then returns to the retained builder session and worktree. Review is
+not the repair trigger: a `SEMANTIC` failure with a proven output SHA still
+opens the chain. The builder is asked to change the rejected candidate — the
+findings name what to change, and the lane's `instruction` still leads the
+prompt and still bounds the work. Consecutive rejections are therefore rounds
+of refinement on one artifact rather than independent implementations, and a
+`review_ceiling` of six buys six rounds rather than six one-shot guesses.
 
 Two consequences for authoring. First, write the `instruction` so it reads correctly a second time,
 against a tree that already contains a partial answer: a sentence that only makes sense as a

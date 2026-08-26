@@ -120,7 +120,7 @@ maestro plan finalize</pre>
       <p>Exactly one lane may own a path (<code>SINGLE_OUTPUT_OWNER</code>). Ask: could an agent satisfy this instruction by changing only these files? If not, the lane will burn its review budget between “instruction not met” and “undeclared write.” Finalize no longer judges that; a person must, at <code>maestro plan review</code>.</p>
 
       <h2>Review rejection</h2>
-      <p>The next attempt repairs the rejected commit unless a sibling merge moved the integration head. <code>REPAIR_CHAIN_LIMIT</code> and <code>review_ceiling</code> bound the chain. <code>maestro run convergence</code> reports findings per attempt and will not call a live run finished.</p>
+      <p>Review rejection records findings and one handoff, then returns to the retained builder and worktree. Review is not the repair trigger; <code>SEMANTIC</code> plus a proven output SHA still opens a repair chain. <code>maestro run convergence</code> reports findings per attempt and will not call a live run finished.</p>
 
       <h2>Several repositories</h2>
       <p>No multi-repo Plan IR. Each repo finishes to a PASS finalization receipt, then a <code>maestro-workspace.v1</code> manifest binds participation and order.</p>

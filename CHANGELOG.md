@@ -21,6 +21,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   role, and generation. Ordinary late-envelope resume is unchanged:
   `QUIESCENCE_UNPROVEN` stays blocked until an explicit retry.
 
+- **Architecture HTML now shows persistent review plus review-budget grant/resume.**
+  Merge waits on a derived `build::review` PASS for the current candidate SHA.
+  Semantic `--force`/`--grant` goes PENDING immediately; a review-budget grant
+  stays BLOCKED on that exact attempt until absence-proven `run resume` recovers
+  it. `workspace_not_found` is absence for every pane.
 - **Persistent candidate-review lifecycle replaces inline advisory review.**
   Every reviewable build now projects one derived `build::review` DAG node.
   The scheduler publishes immutable candidate SHAs, reviews each SHA exactly
