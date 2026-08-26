@@ -1886,13 +1886,20 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 session_path=str(root / "old.jsonl"),
                 correlation_token="run-1-build-builder-g1",
             )
-            new_session = SimpleNamespace(
+            stale_session = SimpleNamespace(
                 generation=2,
-                pane_id="replacement-pane",
-                session_path=str(root / "replacement.jsonl"),
+                pane_id="stale-pane",
+                session_path=str(root / "stale.jsonl"),
                 correlation_token="run-1-build-builder-g2",
             )
-            store.current_actor_session.return_value = old_session
+            new_session = SimpleNamespace(
+                generation=3,
+                pane_id="replacement-pane",
+                session_path=str(root / "replacement.jsonl"),
+                correlation_token="run-1-build-builder-g3",
+            )
+            store.current_actor_session.return_value = None
+            store.actor_sessions.return_value = [old_session, stale_session]
             store.repair_handoff.return_value = None
             store.recover_actor_session.return_value = SimpleNamespace(
                 recovered=True, session=new_session
@@ -1986,8 +1993,15 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                         lambda: False,
                     )
             self.assertIs(repaired.execution, execution)
-            store.recover_actor_session.assert_called_once()
             store.recover_builder_handoff.assert_not_called()
+            store.recover_actor_session.assert_called_once()
+            recovery = store.recover_actor_session.call_args
+            self.assertEqual(recovery.kwargs["expected_generation"], 1)
+            self.assertEqual(recovery.kwargs["generation"], 3)
+            self.assertEqual(
+                runner.launched[0].correlation_token,
+                "run-1-build-builder-g3",
+            )
             store.mark_handoff_submitted.assert_not_called()
             self.assertEqual(len(runner.launched), 1)
 

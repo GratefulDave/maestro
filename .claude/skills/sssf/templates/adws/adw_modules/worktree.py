@@ -1196,13 +1196,16 @@ def recover_sealed_descendant(
     parent: str,
     original_baseline: Inventory,
 ) -> Tuple[Inventory, str]:
-    """Recover one harness-sealed repair committed after its published parent.
+    """Recover one quiesced repair lineage after its published parent.
 
     The private-index commit can survive a scheduler crash before
-    ``record_sealed_output`` advances the attempt ledger.  Its direct parent
-    and the attempt ref prove which candidate cycle produced it.  The original
-    provisioned baseline supplies the untracked paths that git cannot retain;
-    the published parent tree supplies the tracked side of the repair bracket.
+    ``record_sealed_output`` advances the attempt ledger. The retained builder
+    may then add follow-up commits in the same declared generation before the
+    harness consumes its final envelope. The attempt ref and a merge-free
+    parent-to-tip ancestry prove which candidate cycle produced that lineage.
+    The original provisioned baseline supplies the untracked paths that git
+    cannot retain; the published parent tree supplies the tracked side of the
+    repair bracket.
     """
     tip = attempt_ref_commit(
         attempt.repo, attempt.run_id, attempt.node_id, attempt.attempt_no
@@ -1212,10 +1215,14 @@ def recover_sealed_descendant(
         raise HeadMoved(
             f"attempt ref is {tip or 'absent'}, but worktree HEAD is {head}"
         )
-    parents = _out(attempt.repo, "rev-list", "--parents", "-n", "1", tip).split()
-    if len(parents) != 2 or parents[1] != parent:
+    ancestor = _git(
+        attempt.repo, "merge-base", "--is-ancestor", parent, tip, check=False
+    )
+    merges = _out(attempt.repo, "rev-list", "--merges", f"{parent}..{tip}")
+    if tip == parent or ancestor.returncode != 0 or merges:
         raise HeadMoved(
-            f"sealed repair {tip[:10]} is not a direct child of candidate {parent[:10]}"
+            f"sealed repair {tip[:10]} is not a linear descendant of "
+            f"candidate {parent[:10]}"
         )
 
     original_base = attempt.base

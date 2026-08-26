@@ -1196,7 +1196,11 @@ class Scheduler:
                 seen.add(id(current))
                 chain.append("{0}: {1}".format(type(current).__name__, current))
                 current = current.__cause__ or current.__context__
+            prior_phase = None
             if self._review_for_build(node.node_id) is not None:
+                prior_phase = self.deps.store.get_node(
+                    self.run_id, node.node_id
+                ).lane_phase
                 self._set_lane_phase(
                     node.node_id,
                     st.LanePhase.BLOCKED,
@@ -1214,6 +1218,12 @@ class Scheduler:
                     "exception_type": type(cause).__name__,
                     "causes": chain[:6],
                 },
+                attempt_extra=(
+                    {lc.LATE_ENVELOPE_PHASE_KEY: prior_phase.value}
+                    if prior_phase is not None
+                    and prior_phase is not st.LanePhase.BLOCKED
+                    else None
+                ),
             )
 
     def _contain_quiescence_failure(
@@ -1696,6 +1706,30 @@ class Scheduler:
             self._contain_quiescence_failure(
                 node, context.record, QuiescenceFailure("harness-gate", exc)
             )
+        except DurableOutputIdentityError as exc:
+            # A recovery row that cannot prove its durable output identity is
+            # not permission to mint another attempt. The retained worktree
+            # and generation are the evidence that needs repair; replacing
+            # them repeats authored work and can race the still-finishing
+            # builder a second time.
+            try:
+                self._settle_context(context, in_flight=exc)
+            except QuiescenceFailure as quiescence:
+                self._contain_quiescence_failure(node, context.record, quiescence)
+                return
+            if (
+                context.record is not None
+                and not self._cancelled.is_set()
+                and self._owns_running(context.record)
+            ):
+                self._settle_failure(
+                    node,
+                    rp.Classification(
+                        block_reason=st.BlockReason.OUTPUT_IDENTITY_INVALID,
+                        reason=_exception_reason(exc),
+                    ),
+                    record=context.record,
+                )
         except BaseException as exc:  # noqa: BLE001 — containment is the point
             try:
                 # `exc` is handed to the settle, not merely caught around it.
@@ -2225,9 +2259,17 @@ class Scheduler:
             )
             return
 
-        execution = (
-            None if already_claimed else self.deps.recover_node(attempt, stranded)
-        )
+        try:
+            execution = (
+                None if already_claimed else self.deps.recover_node(attempt, stranded)
+            )
+        except (KeyboardInterrupt, SigintInterrupt):
+            raise
+        except BaseException as exc:
+            raise DurableOutputIdentityError(
+                f"{stranded.node_id}#{stranded.attempt_no}: "
+                f"late-envelope recovery failed: {_exception_reason(exc)}"
+            ) from exc
         if execution is None or not execution.envelope_parsed:
             payload = store.accepted_result_payload(
                 self.run_id, node.node_id, stranded.attempt_no
@@ -2240,6 +2282,15 @@ class Scheduler:
             execution = NodeExecution(
                 envelope_parsed=True, exit_code=0, envelope_payload=payload
             )
+        if not already_claimed:
+            # A late envelope proves that the retained builder declared a
+            # result; it does not prove that the builder has stopped writing.
+            # Close that actor boundary before taking any inventory or
+            # reconciling a sealed descendant. Otherwise recovery can commit a
+            # partial tree, observe the builder's final writes as post-commit
+            # divergence, and incorrectly release a fresh attempt.
+            self._quiesce(record, "late-envelope-before-inventory")
+            context.settled = True
         pre_verdict = vf.GateVerdict(
             green=False,
             unparseable=False,
@@ -2622,11 +2673,19 @@ class Scheduler:
     def _active_actor_generation(
         self, node_id: str, actor_role: str, record: st.AttemptRecord
     ) -> int:
-        """Read the durable actor generation that fences a callback."""
+        """Read the latest durable actor generation that fences a callback."""
         session = self.deps.store.current_actor_session(
             self.run_id, node_id, actor_role
         )
-        return session.generation if session is not None else record.attempt_no
+        if session is not None:
+            return session.generation
+        sessions = self.deps.store.actor_sessions(
+            self.run_id, node_id, actor_role=actor_role, limit=10_000
+        )
+        return max(
+            record.attempt_no,
+            max((item.generation for item in sessions), default=0),
+        )
 
     def _require_actor_generation(
         self, node_id: str, actor_role: str, generation: int, record: st.AttemptRecord
@@ -2917,12 +2976,20 @@ class Scheduler:
             ceiling = rp.launcher_retry_budget(self.config, launcher_failure)
         else:
             ceiling = self.config.environmental_retries
-        spent = sum(
-            item.retry_class is retry_class
-            for item in self.deps.store.lane_retry_spends(
+        budget_spends = (
+            self.deps.store.current_lane_retry_spends(
+                self.run_id, node.node_id, limit=10_000
+            )
+            if retry_class
+            in (
+                st.LaneRetryClass.ENVIRONMENTAL,
+                st.LaneRetryClass.LAUNCHER_TRANSIENT,
+            )
+            else self.deps.store.lane_retry_spends(
                 self.run_id, node.node_id, limit=10_000
             )
         )
+        spent = sum(item.retry_class is retry_class for item in budget_spends)
         if retry_class in (
             st.LaneRetryClass.SEMANTIC,
             st.LaneRetryClass.REVIEW_REJECTION,
@@ -3333,7 +3400,7 @@ class Scheduler:
                     replacement_generation = self._active_actor_generation(
                         node.node_id, "reviewer", record
                     )
-                    if replacement_generation != reviewer_generation:
+                    if replacement_generation > reviewer_generation:
                         recovered = self.deps.store.recover_review_dispatch(
                             self.run_id,
                             review_node.node_id,
@@ -3374,11 +3441,14 @@ class Scheduler:
                 replacement_generation = self._active_actor_generation(
                     node.node_id, "reviewer", record
                 )
-                if replacement_generation != reviewer_generation:
+                if replacement_generation > reviewer_generation:
                     # The callback returned from a superseded reviewer. Move
                     # the unfinished durable dispatch to the replacement and
                     # call it again there. Never apply the old callback's
-                    # evidence under the replacement generation.
+                    # evidence under the replacement generation. A closed
+                    # reviewer leaves the builder attempt as the fallback
+                    # generation; that lower number is absence, not a
+                    # replacement, and must never move this fence backward.
                     recovered = self.deps.store.recover_review_dispatch(
                         self.run_id,
                         review_node.node_id,
@@ -3892,36 +3962,11 @@ class Scheduler:
         )
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
-        """§7.5's cumulative ceiling: at most `K + granted` SEMANTIC attempts
-        per `(run_id, node_id)` across all bases, counting the attempt that is
-        failing right now.
+        """Enforce the cumulative semantic ceiling across every attempt base.
 
-        The ceiling closes the refund loop the per-base scope alone leaves
-        unbounded — every unrelated merge mints a new base and re-arms
-        `(node_id, base_sha)`, so without a cumulative bound total spend scales
-        with the number of merges rather than with the node.
-
-        `granted` is read from the node's lifecycle row
-        (`NodeLifecycle.granted_extra_attempts`) — the authority tier, never
-        the audit tier, per §5.3's runtime-read allowlist — and grants exactly
-        one attempt beyond `K` per `retry --force` invocation without raising
-        the cap.
-
-        This is the only enforcer. `retry_policy.semantic_budget_exhausted`
-        stated the same rule without the increment below and had no production
-        caller; it was deleted rather than kept as a second, wrong copy, and
-        its justification is the two paragraphs above.
-
-        The retry policy counts SEMANTIC rows that already exist, and the
-        attempt currently failing is not one of them yet — its class is
-        written by `fail_attempt`, which is the call this decision gates. So
-        the in-flight attempt is added here rather than in the policy: the
-        policy owns the rule, and the scheduler owns knowing that one more
-        attempt has just been spent.
-
-        Without the increment, K would admit K+1 attempts, which is the
-        off-by-one that turns a stated ceiling into a slightly higher unstated
-        one.
+        Operator boundaries refresh infrastructure tolerance, not semantic
+        adjudication. Semantic recovery requires an explicit grant. The
+        in-flight failure is not classified yet and contributes the `+ 1`.
         """
         attempts = self.deps.store.attempts_for(self.run_id, node_id)
         already = rp.semantic_attempts_total(attempts, node_id)

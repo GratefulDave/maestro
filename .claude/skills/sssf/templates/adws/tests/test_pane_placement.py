@@ -765,6 +765,49 @@ class PanePlacementTest(unittest.TestCase):
         self.assertEqual(adopted.workspace_id, original.workspace_id)
         self.assertEqual(resumed.reclaim(original.correlation_token), (adopted,))
 
+    def test_resume_restores_lane_placement_without_adopting_actor_token(self):
+        runtime, fake = self.build(workspace_label="approved-plan")
+        builder = runtime.launch(
+            self.spec(
+                "run1-build-a3",
+                group="build",
+                role="builder",
+                attempt=3,
+                workspace_label="approved-plan",
+            )
+        )
+        resumed = lch.HerdrLauncher(
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted,
+            workspace_label="approved-plan",
+        )
+        resumed._herdr = fake
+
+        resumed.restore_placement(
+            workspace_id=builder.workspace_id,
+            lane_key=builder.lane_key,
+            tab_id=builder.tab_id,
+            pane_id=builder.pane_id,
+            environment=builder.environment,
+        )
+        reviewer = resumed.launch(
+            self.spec(
+                "review-run1-build-a5",
+                group="build",
+                role="reviewer",
+                attempt=5,
+                size=3,
+                workspace_label="approved-plan",
+            )
+        )
+
+        self.assertEqual(reviewer.workspace_id, builder.workspace_id)
+        self.assertEqual(reviewer.tab_id, builder.tab_id)
+        self.assertEqual(len(fake.argv_for(("workspace", "create"))), 1)
+        self.assertEqual(len(fake.argv_for(("tab", "create"))), 1)
+
     def test_actorless_adopted_pane_is_closed_before_replacement(self):
         class ActorlessHerdr(_WorkspaceHerdr):
             agent_missing = False
@@ -1171,6 +1214,35 @@ class _SplitVanishingWorkspaceHerdr(_WorkspaceHerdr):
         return super().__call__(*args, env=env, timeout=timeout)
 
 
+class _AdoptionVanishingWorkspaceHerdr(_WorkspaceHerdr):
+    """A persisted actor whose entire workspace disappeared before resume."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.destroyed_workspace = ""
+
+    def destroy_workspace(self) -> None:
+        self.destroyed_workspace = self._workspace
+        self._live_tabs = {
+            tab_id
+            for tab_id in self._live_tabs
+            if lch.workspace_of(tab_id) != self.destroyed_workspace
+        }
+
+    def __call__(self, *args, env=None, timeout=30.0):
+        if (
+            tuple(args[:2]) in {("pane", "get"), ("pane", "close")}
+            and lch.workspace_of(args[2]) == self.destroyed_workspace
+        ):
+            self.calls.append(list(args))
+            raise lch.HerdrCallError(
+                'LAUNCH_REFUSED:{"error":{"code":"workspace_not_found",'
+                '"message":"workspace %s not found"}}' % self.destroyed_workspace,
+                "workspace_not_found",
+            )
+        return super().__call__(*args, env=env, timeout=timeout)
+
+
 class DestroyedWorkspaceTest(PanePlacementTest):
     """#79. A run's workspace id is memoized, and nothing invalidated it when
     herdr answered `workspace_not_found` — so every relaunch named the same
@@ -1208,6 +1280,46 @@ class DestroyedWorkspaceTest(PanePlacementTest):
         self.assertEqual(harness._tabs[lane].claimed, 1)
         self.assertEqual(fake.renames[first.pane_id], "builder-a3")
         self.assertEqual(fake.renames[second.pane_id], "reviewer-a5")
+
+    def test_resume_replaces_an_actor_whose_workspace_is_proven_absent(self):
+        lane = "lane-p2-s3-inventory"
+        original_runtime, fake = self.build(
+            workspace_label="run-1", factory=_AdoptionVanishingWorkspaceHerdr
+        )
+        original = original_runtime.launch(
+            self.spec("run1-builder-3", group=lane, role="builder", attempt=3)
+        )
+        fake.destroy_workspace()
+        resumed = lch.HerdrLauncher(
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted,
+            workspace_label="run-1",
+        )
+        resumed._herdr = fake
+        persisted = lch.PersistedActorHandle(
+            correlation_token=original.correlation_token,
+            pane_id=original.pane_id,
+            agent_name=original.agent_name,
+            launched_cwd=original.launched_cwd,
+            environment=original.environment,
+            workspace_id=original.workspace_id,
+            tab_id=original.tab_id,
+            lane_key=original.lane_key,
+        )
+
+        with self.assertRaisesRegex(lch.HandleAbsent, "WORKSPACE_ABSENT"):
+            resumed.adopt(persisted)
+        resumed.close_actorless_pane(persisted)
+        replacement = resumed.launch(
+            self.spec("run1-builder-4", group=lane, role="builder", attempt=4)
+        )
+
+        self.assertNotEqual(replacement.workspace_id, original.workspace_id)
+        self.assertEqual(resumed.workspace_id, replacement.workspace_id)
+        self.assertEqual(replacement.lane_key, lane)
+        self.assertEqual(len(fake.argv_for(("workspace", "create"))), 2)
 
     def test_a_vanished_workspace_is_re_resolved_and_the_launch_succeeds(self):
         harness, fake = self.build(

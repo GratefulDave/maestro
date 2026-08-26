@@ -63,6 +63,25 @@ def _spend(store: lc.LifecycleStore, node_id: str, retry_class: st.RetryClass,
         store.fail_attempt(run_id, node_id, retry_class)
 
 
+def _spend_lane(
+    store: lc.LifecycleStore,
+    node_id: str,
+    retry_class: st.LaneRetryClass,
+    times: int,
+    run_id: str = "run1",
+) -> None:
+    """Spend durable retained-lane cycles without rewriting their history."""
+    first = len(store.lane_retry_spends(run_id, node_id))
+    for offset in range(times):
+        store.spend_lane_retry(
+            run_id,
+            node_id,
+            retry_class,
+            cycle_seq=first + offset + 1,
+            candidate_sha=None,
+            detail={"reason": "fixture"},
+        )
+
 #: A pid no process holds, so `scheduler_liveness` answers False and an escape
 #: against a stranded RUNNING node is legal (§11.3).
 DEAD_PID = 2_000_000_000
@@ -124,17 +143,75 @@ class ResumeRefreshesEveryNodesBudget(unittest.TestCase):
                              [make_node("a", 0), make_node("b", 0)])
             _spend(store, "a", st.RetryClass.LAUNCHER_TRANSIENT, 2)
             _spend(store, "b", st.RetryClass.ENVIRONMENTAL, 2)
-
             store.resume_run("run1")
 
             self.assertEqual(
-                store.attempts_spent("run1", "a",
-                                     st.RetryClass.LAUNCHER_TRANSIENT), 0)
+                store.attempts_spent(
+                    "run1", "a", st.RetryClass.LAUNCHER_TRANSIENT
+                ),
+                0,
+            )
             self.assertEqual(
-                store.attempts_spent("run1", "b",
-                                     st.RetryClass.ENVIRONMENTAL), 0)
+                store.attempts_spent("run1", "b", st.RetryClass.ENVIRONMENTAL),
+                0,
+            )
             self.assertEqual(store.retry_spend_floor("run1", "a"), 2)
             self.assertEqual(store.retry_spend_floor("run1", "b"), 2)
+
+    def test_resume_reopens_only_blocks_whose_retry_budget_was_refreshed(self):
+        """Refreshing spend must make budget-exhausted nodes schedulable; it
+        must not erase an unrelated adjudication merely because the same run
+        was resumed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            self.addCleanup(store.close)
+            cases = (
+                (
+                    "launcher",
+                    st.RetryClass.LAUNCHER_TRANSIENT,
+                    st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED,
+                ),
+                (
+                    "environmental",
+                    st.RetryClass.ENVIRONMENTAL,
+                    st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                ),
+            )
+            terminal = (
+                ("semantic", st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED),
+                ("review", st.BlockReason.REVIEW_BUDGET_EXHAUSTED),
+                ("credential", st.BlockReason.CREDENTIAL_REFUSED),
+            )
+            nodes = [make_node(node_id, 0) for node_id, _, _ in cases]
+            nodes.extend(make_node(node_id, 0) for node_id, _ in terminal)
+            store.create_run("run1", "d", nodes)
+            for node_id, retry_class, reason in cases:
+                _block(store, node_id, retry_class, reason)
+            for node_id, reason in terminal:
+                _block(store, node_id, st.RetryClass.SEMANTIC, reason)
+            store.declare_outcome("run1")
+
+            store.resume_run("run1")
+
+            for node_id, _, _ in cases:
+                with self.subTest(node_id=node_id):
+                    lifecycle = store.get_node("run1", node_id)
+                    self.assertIs(lifecycle.state, st.NodeState.PENDING)
+                    self.assertIsNone(lifecycle.block_reason)
+                    self.assertIs(
+                        lifecycle.pending_cause,
+                        st.PendingCause.OPERATOR_RESUME,
+                    )
+                    transition = store.conn.execute(
+                        "SELECT reason FROM transitions"
+                        " WHERE run_id=? AND node_id=? ORDER BY id DESC LIMIT 1",
+                        ("run1", node_id),
+                    ).fetchone()
+                    self.assertEqual(transition[0], "resume:retry-budget")
+            for node_id, reason in terminal:
+                lifecycle = store.get_node("run1", node_id)
+                self.assertIs(lifecycle.state, st.NodeState.BLOCKED)
+                self.assertIs(lifecycle.block_reason, reason)
 
     def test_every_class_is_refreshed_by_one_boundary(self):
         """The floor is an attempt number, so it orders every class at once —
@@ -195,6 +272,34 @@ class ResumeRefreshesEveryNodesBudget(unittest.TestCase):
                                      st.RetryClass.ENVIRONMENTAL), 0)
 
 
+class ResumeRefreshesLaneRetryBudgets(unittest.TestCase):
+    """§11.3 applies to retained-lane spends as well as attempt rows."""
+
+    def test_environmental_lane_spend_starts_again_after_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            self.addCleanup(store.close)
+            store.create_run("run1", "d", [make_node("a", 0)])
+            _spend_lane(store, "a", st.LaneRetryClass.ENVIRONMENTAL, 2)
+            _block(
+                store,
+                "a",
+                st.RetryClass.ENVIRONMENTAL,
+                st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+            )
+            store.declare_outcome("run1")
+
+            store.resume_run("run1")
+
+            self.assertEqual(len(store.lane_retry_spends("run1", "a")), 2)
+            self.assertEqual(store.current_lane_retry_spends("run1", "a"), ())
+            self.assertIs(store.get_node("run1", "a").state, st.NodeState.PENDING)
+
+            _spend_lane(store, "a", st.LaneRetryClass.ENVIRONMENTAL, 1)
+            current = store.current_lane_retry_spends("run1", "a")
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0].cycle_seq, 3)
+
 class RetryRefreshesTheNodeItNames(unittest.TestCase):
     """§11.3 — the per-node half. A `run resume` flag raises the ceiling for
     every node in the run and edits a deployment-owned file to do it (#91);
@@ -221,6 +326,20 @@ class RetryRefreshesTheNodeItNames(unittest.TestCase):
             self.assertEqual(
                 store.attempts_spent("run1", "a",
                                      st.RetryClass.LAUNCHER_TRANSIENT), 0)
+
+    def test_the_escape_forgives_the_named_nodes_lane_spend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            self.addCleanup(store.close)
+            store.create_run("run1", "d", [make_node("a", 0)])
+            _spend_lane(store, "a", st.LaneRetryClass.ENVIRONMENTAL, 2)
+            _block(store, "a")
+            store.declare_outcome("run1")
+
+            store.retry("run1", "a")
+
+            self.assertEqual(store.current_lane_retry_spends("run1", "a"), ())
+            self.assertEqual(len(store.lane_retry_spends("run1", "a")), 2)
 
     def test_the_escape_leaves_every_other_nodes_budget_alone(self):
         """The granularity that is the point of doing this per node."""

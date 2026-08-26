@@ -1680,6 +1680,193 @@ class CancellationTests(unittest.TestCase):
             self.assertIsNotNone(handoff)
             self.assertIs(handoff.state, st.RepairHandoffState.PENDING)
 
+    def test_retry_budget_resume_recovers_declared_candidate_without_new_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            _review_lane(store)
+            candidate_sha = "b" * 40
+            store.start_attempt("run1", "build", base_sha="base")
+            store.record_result(
+                "run1",
+                st.ResultRecord(
+                    node_id="build",
+                    attempt_no=1,
+                    subject_sha=candidate_sha,
+                    payload={"status": "success"},
+                    adjudication=st.Adjudication.ACCEPTED,
+                ),
+            )
+            store.publish_candidate(
+                "run1", "build", candidate_sha=candidate_sha, builder_generation=1
+            )
+            store.begin_review(
+                "run1", "build::review", candidate_sha, reviewer_generation=1
+            )
+            store.mark_review_dispatched(
+                "run1", "build::review", candidate_sha, reviewer_generation=1
+            )
+            store.reject_and_create_handoff(
+                "run1",
+                "build::review",
+                candidate_sha,
+                reviewer_generation=1,
+                builder_generation=1,
+                review_digest="d" * 64,
+                receipt_path="/tmp/review.json",
+                findings=(
+                    {
+                        "check_id": "diff.correctness",
+                        "grade": "error",
+                        "message": "candidate is incorrect",
+                    },
+                ),
+            )
+            store.set_lane_phase("run1", "build", st.LanePhase.BLOCKED)
+            store.mark_blocked(
+                "run1",
+                "build",
+                st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+            )
+            store.declare_outcome("run1")
+
+            store.resume_run("run1", late_envelope_attempts=(("build", 1),))
+
+            node = store.get_node("run1", "build")
+            self.assertIs(node.state, st.NodeState.PENDING)
+            self.assertIs(node.lane_phase, st.LanePhase.REPAIRING)
+            attempt = store.get_attempt("run1", "build", 1)
+            self.assertIs(attempt.state, lc.CLOSED_ATTEMPT_STATE)
+            self.assertIs(attempt.extra[lc.LATE_ENVELOPE_RECOVERY_KEY], True)
+
+            claimed = store.claim_late_envelope_attempt("run1", "build", 1)
+
+            self.assertIs(claimed.state, st.NodeState.RUNNING)
+            self.assertEqual(claimed.attempt_no, 1)
+            self.assertIs(
+                store.get_attempt("run1", "build", 1).state,
+                st.NodeState.RUNNING,
+            )
+
+    def test_review_grant_recovers_retained_candidate_without_new_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            self.addCleanup(store.close)
+            _review_lane(store)
+            candidate_sha = "c" * 40
+            store.start_attempt("run1", "build", base_sha="base")
+            store.record_result(
+                "run1",
+                st.ResultRecord(
+                    node_id="build",
+                    attempt_no=1,
+                    subject_sha=candidate_sha,
+                    payload={"status": "success"},
+                    adjudication=st.Adjudication.ACCEPTED,
+                ),
+            )
+            store.publish_candidate(
+                "run1", "build", candidate_sha=candidate_sha, builder_generation=1
+            )
+            store.begin_review(
+                "run1", "build::review", candidate_sha, reviewer_generation=1
+            )
+            store.mark_review_dispatched(
+                "run1", "build::review", candidate_sha, reviewer_generation=1
+            )
+            store.reject_and_create_handoff(
+                "run1",
+                "build::review",
+                candidate_sha,
+                reviewer_generation=1,
+                builder_generation=1,
+                review_digest="d" * 64,
+                receipt_path="/tmp/review.json",
+                findings=(
+                    {
+                        "check_id": "diff.correctness",
+                        "grade": "error",
+                        "message": "candidate is incorrect",
+                    },
+                ),
+            )
+            store.set_lane_phase("run1", "build", st.LanePhase.BLOCKED)
+            store.mark_blocked(
+                "run1",
+                "build",
+                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                retry_class=st.RetryClass.SEMANTIC,
+            )
+            store.declare_outcome("run1")
+
+            granted = store.retry("run1", "build", grant=1)
+
+            self.assertIs(granted.state, st.NodeState.BLOCKED)
+            self.assertEqual(granted.attempt_no, 1)
+            self.assertIs(granted.lane_phase, st.LanePhase.BLOCKED)
+            self.assertEqual(granted.granted_extra_attempts, 1)
+            self.assertEqual(
+                store.retry_budget_blocked_attempts("run1"), (("build", 1),)
+            )
+            self.assertEqual(len(store.attempts_for("run1", "build")), 1)
+            self.assertIsNotNone(store.repair_handoff("run1", "build", candidate_sha))
+            self.assertIsNotNone(
+                store.candidate_review("run1", "build::review", candidate_sha)
+            )
+
+            store.resume_run("run1")
+            still_blocked = store.get_node("run1", "build")
+            self.assertIs(still_blocked.state, st.NodeState.BLOCKED)
+            self.assertEqual(still_blocked.attempt_no, 1)
+            self.assertEqual(len(store.attempts_for("run1", "build")), 1)
+
+            store.resume_run("run1", late_envelope_attempts=(("build", 1),))
+
+            resumed = store.get_node("run1", "build")
+            self.assertIs(resumed.state, st.NodeState.PENDING)
+            self.assertEqual(resumed.attempt_no, 1)
+            self.assertIs(resumed.lane_phase, st.LanePhase.REPAIRING)
+            self.assertEqual(len(store.attempts_for("run1", "build")), 1)
+
+            claimed = store.claim_late_envelope_attempt("run1", "build", 1)
+            self.assertIs(claimed.state, st.NodeState.RUNNING)
+            self.assertEqual(claimed.attempt_no, 1)
+            self.assertEqual(len(store.attempts_for("run1", "build")), 1)
+
+    def test_retry_budget_resume_does_not_infer_recovery_from_result_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("build", 0)])
+            store.start_attempt("run1", "build", base_sha="base")
+            store.record_result(
+                "run1",
+                st.ResultRecord(
+                    node_id="build",
+                    attempt_no=1,
+                    subject_sha="b" * 40,
+                    payload={"status": "success"},
+                    adjudication=st.Adjudication.ACCEPTED,
+                ),
+            )
+            store.mark_blocked(
+                "run1",
+                "build",
+                st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+            )
+            store.declare_outcome("run1")
+            self.assertEqual(
+                store.retry_budget_blocked_attempts("run1"), (("build", 1),)
+            )
+
+            store.resume_run("run1")
+
+            node = store.get_node("run1", "build")
+            self.assertIs(node.state, st.NodeState.PENDING)
+            self.assertIsNone(node.lane_phase)
+            attempt = store.get_attempt("run1", "build", 1)
+            self.assertNotIn(lc.LATE_ENVELOPE_RECOVERY_KEY, attempt.extra)
+
     def test_a_discarding_cancel_is_absolutely_terminal(self):
         """`run cancel --discard` records DISCARDED at both levels, and that
         cause is what refuses the resume — not the verb's name, and not
@@ -1934,9 +2121,11 @@ class EscapeTests(unittest.TestCase):
             self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
 
     def test_every_stored_block_reason_admits_its_declared_escapes(self):
-        """§11.3's tested property, executed rather than asserted from the table:
-        for every BlockReason, every escape scheduler_types.exits_for() names
-        actually runs and moves the node out of BLOCKED."""
+        """§11.3's tested property, executed rather than asserted from the table.
+
+        Every declared escape either leaves ``BLOCKED`` immediately or, for a
+        retained review attempt, durably authorizes proof-backed recovery.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -1963,11 +2152,22 @@ class EscapeTests(unittest.TestCase):
                             self.fail(f"unhandled escape {escape!r}")
 
                         final = store.get_node("run1", "a").state
-                        self.assertNotEqual(
-                            final,
-                            st.NodeState.BLOCKED,
-                            f"{reason} -> {escape} did not leave BLOCKED (still {final})",
-                        )
+                        if (
+                            reason is st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+                            and escape is st.Escape.RETRY_FORCE
+                        ):
+                            self.assertIs(final, st.NodeState.BLOCKED)
+                            self.assertEqual(
+                                store.retry_budget_blocked_attempts("run1"),
+                                (("a", 1),),
+                            )
+                        else:
+                            self.assertNotEqual(
+                                final,
+                                st.NodeState.BLOCKED,
+                                f"{reason} -> {escape} did not leave BLOCKED"
+                                f" (still {final})",
+                            )
 
 
 # ── concurrency ──────────────────────────────────────────────────────────────

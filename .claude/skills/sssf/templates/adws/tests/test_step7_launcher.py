@@ -36,6 +36,7 @@ from adw_modules.launcher import (
 )
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
 from adw_modules import worktree as worktree_module
+from adw_modules import finalization_window as fw
 
 
 FAKE_HERDR = r"""#!/usr/bin/env python3
@@ -557,7 +558,8 @@ class LauncherContractTest(unittest.TestCase):
         ]
         self.assertEqual(len(wait_indexes), 1)
         wait = calls[wait_indexes[0]]
-        self.assertEqual(wait[:5], ["agent", "wait", start[2], "--until", "idle"])
+        self.assertEqual(wait[:3], ["agent", "wait", start[2]])
+        self.assertNotIn("--until", wait)
         self.assertIn("--timeout", wait)
         route_argv = start[start.index("--") + 1 :]
         self.assertFalse(any(arg.startswith("@") for arg in route_argv))
@@ -1020,6 +1022,119 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(state.state, PollState.EXITED)
         self.assertEqual(state.exit_code, 0)
         self.assertEqual(state.detail, "ENVELOPE_SUCCESS")
+
+    def _write_transcript_records(self, count: int) -> None:
+        self.transcript.write_text(
+            "".join(
+                json.dumps({"type": "assistant", "seq": index}) + "\n"
+                for index in range(count)
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_transient_idle_mid_turn_is_not_the_end_of_the_turn(self):
+        """run-8d1a71f463e4430f92a125a8f8b3731d, `lane-acquisition-manifest`.
+
+        The generation-3 repair builder was scored EXITED/NO_ENVELOPE at
+        15:55:33Z on one `idle` sample taken in the 14-second gap between a
+        tool result landing and its next message. The scheduler's `repair-idle`
+        quiescence proof then read the same pane, correctly found it still
+        working, timed out, and the lane ended terminal QUIESCENCE_UNPROVEN --
+        75 seconds before that agent wrote a complete envelope. Poll and the
+        proof disagreed about one pane seconds apart; the proof was right.
+
+        One sample must therefore decide nothing. The production window is
+        used here rather than a shortened one: the failure is that the very
+        first `idle` convicted, and a window a test could outrun would not
+        show that.
+        """
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        self._write_transcript_records(1)
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
+        for _ in range(3):
+            state = route.poll(handle)
+            self.assertEqual(state.state, PollState.RUNNING)
+            self.assertIsNone(state.exit_code)
+
+    def test_a_record_inside_the_window_reopens_it(self):
+        """Transcript growth is positive evidence of work.
+
+        The confirmation is deliberately collapsed to nothing here so that
+        *only* the growth can be what holds the conviction off.
+        """
+        route = self._launcher()
+        route.quiescence_confirm_s = 0.0
+        handle = route.launch(self.spec())
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
+        self._write_transcript_records(1)
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        self._write_transcript_records(2)
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        # Nothing new since the window reopened, and the window has expired:
+        # the turn really did stop without declaring, and still converts.
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.EXITED)
+        self.assertEqual(state.exit_code, 1)
+        self.assertEqual(state.detail, "NO_ENVELOPE")
+
+    def test_a_working_status_inside_the_window_reopens_it(self):
+        """`idle` has to *hold*; a live status in the middle is not a hold."""
+        route = self._launcher()
+        route.quiescence_confirm_s = 0.0
+        handle = route.launch(self.spec())
+        self._write_transcript_records(1)
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        os.environ["FAKE_AGENT_STATUS"] = "working"
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        self.assertEqual(route.poll(handle).state, PollState.EXITED)
+
+    def test_a_stopped_turn_still_converts_once_the_window_holds(self):
+        """The fix must not cost the branch its whole job.
+
+        A builder that finished without writing an envelope still has to end
+        as a failed attempt rather than hold the node to its timeout.
+        """
+        route = self._launcher()
+        route.quiescence_confirm_s = 0.0
+        handle = route.launch(self.spec())
+        self._write_transcript_records(2)
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.EXITED)
+        self.assertEqual(state.exit_code, 1)
+        self.assertEqual(state.detail, "NO_ENVELOPE")
+
+    def test_a_declared_envelope_outranks_an_open_window(self):
+        """The artifact still wins, mid-confirmation as anywhere else."""
+        route = self._launcher()
+        handle = route.launch(self.spec())
+        self._write_transcript_records(1)
+        os.environ["FAKE_AGENT_STATUS"] = "idle"
+        self.assertEqual(route.poll(handle).state, PollState.RUNNING)
+        self.envelope.write_text(json.dumps({"success": True}), encoding="utf-8")
+        state = route.poll(handle)
+        self.assertEqual(state.state, PollState.EXITED)
+        self.assertEqual(state.exit_code, 0)
+        self.assertEqual(state.detail, "ENVELOPE_SUCCESS")
+
+    def test_builder_and_reviewer_share_one_quiescence_vocabulary(self):
+        """The restatement `launcher` is forced into must not drift.
+
+        `finalization_window` reaches `launcher` through
+        `watchdog -> scheduler_types -> worktree`, so the constants cannot be
+        imported downward and are stated twice. Two numbers for one clock is
+        how a raised default comes to look like it did nothing; this is what
+        keeps the second copy honest.
+        """
+        self.assertEqual(launcher.AGENT_QUIESCENT_STATUS, fw.QUIESCENT_STATUS)
+        self.assertEqual(
+            launcher.AGENT_QUIESCENCE_CONFIRM_S, fw.DEFAULT_QUIESCENCE_CONFIRM_S
+        )
 
     def test_explicit_absence_is_gone(self):
         route = self._launcher()
