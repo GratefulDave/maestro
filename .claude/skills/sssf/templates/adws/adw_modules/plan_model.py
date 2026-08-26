@@ -56,7 +56,10 @@ import posixpath
 from typing import (Annotated, Any, Dict, Iterable, List, Literal, Mapping,
                     Optional, Sequence, Tuple, Type, Union)
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+import re
+
+from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
+                      model_validator)
 
 from . import scheduler_types as st
 
@@ -89,6 +92,25 @@ SCHEMA_V2 = "maestro-plan.v2"
 #: IR has no tests/build split yet, and inventing one at projection would
 #: change every shipped lane's graph.
 SCHEMA_V3 = "maestro-plan.v3"
+
+#: The version whose `tests` node carries an executable **test-strength
+#: contract** — the coverage obligations its cases must discharge and the
+#: falsifiability strategy a negative control must execute.
+#:
+#: It is a new version rather than an optional field on `TestsNode` for the
+#: reason §3.6 B8 states and §6.3 enforces: a field added later is optional
+#: forever, and an optional gate-strength contract is a gate-strength contract
+#: nothing has. Under v3 a tests node's acceptance was "the new cases are red
+#: at the parent commit", which run-8d1a71f463e4430f92a125a8f8b3731d shows is
+#: not discrimination proof: `lane-acquisition-manifest-tests` reached MERGED
+#: on four non-skipped cases while every implementation candidate its tests
+#: were written to gate was independently rejected.
+#:
+#: v3 stays frozen and stays runnable, because a run created under it is
+#: pinned to it (`runs.test_strength_contract`). What v3 cannot do is start a
+#: *new* run: `maestro run start` refuses a plan whose tests nodes carry no
+#: contract, and the remedy is to re-ship the plan, never to edit it.
+SCHEMA_V4 = "maestro-plan.v4"
 
 #: The closed set of gate runners. §6.2 deleted the plain-argv arm for agent
 #: nodes: an exit-code-only gate cannot satisfy the counting rule.
@@ -420,6 +442,164 @@ class NodeEffect(BaseModel):
     meaning: str = Field(min_length=1)
 
 
+# ── the test-strength contract (§6.2, and §3.6 B8's reason it is typed) ─────
+
+#: The behavioural aspects a coverage obligation may name. Closed, because an
+#: open string here would let an author discharge "negative behaviour" by
+#: naming an aspect nobody checks, which is the shape of the defect this
+#: contract exists to refuse.
+COVERAGE_ASPECTS: Tuple[str, ...] = (
+    "positive", "negative", "boundary", "precedence", "transition",
+    "failure_mode")
+
+#: The two aspects every covered requirement must carry. A test suite that
+#: only ever asserts the happy path passes on an implementation that never
+#: rejects anything, which is exactly how a MERGED test node failed to
+#: discriminate four rejected implementation candidates.
+REQUIRED_ASPECTS: Tuple[str, ...] = ("positive", "negative")
+
+
+class CoverageObligation(BaseModel):
+    """One requirement × one behavioural aspect, bound to a case selector.
+
+    The selector is what makes this **measured** rather than claimed. The
+    runtime collects the tests node's own cases, keeps those whose node id
+    contains this selector, executes them, and counts. §1.2 forbids keying a
+    transition on an agent's account of its own work, so the tester is never
+    asked whether it covered a requirement — the plan says which cases would
+    prove it did, and code counts them.
+    """
+
+    model_config = _STRICT
+
+    requirement_id: str = Field(min_length=1)
+    aspect: Literal["positive", "negative", "boundary", "precedence",
+                    "transition", "failure_mode"]
+    #: A substring of the case node id (`path::case`) that selects the cases
+    #: discharging this obligation. A substring rather than a runner
+    #: expression because it must mean the same thing under pytest and under
+    #: vitest, and the two disagree about `-k` and `--testNamePattern`.
+    case_selector: str = Field(min_length=1)
+    min_cases: int = Field(ge=1, default=1)
+
+
+class ControlledMutation(BaseModel):
+    """A deterministic, reversible negative control over real behaviour.
+
+    `revert_paths` restores the named paths to the plan's `base_commit` in an
+    isolated scratch checkout. It is a behavioural reversal — the code under
+    test genuinely is not there — rather than a source-text substitution,
+    which the contract forbids as a stand-in whenever a runtime boundary is
+    named.
+    """
+
+    model_config = _STRICT
+
+    kind: Literal["revert_paths"]
+    paths: Tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _paths_are_non_empty(self) -> "ControlledMutation":
+        for path in self.paths:
+            if not str(path).strip():
+                raise ValueError(
+                    "a controlled mutation names paths; an empty one reverts "
+                    "nothing and would pass as a negative control")
+        return self
+
+
+class Falsifiability(BaseModel):
+    """How this node's tests are proven able to fail for the right reason.
+
+    `baseline_absent` runs the candidate's new cases against the attempt's
+    own parent commit, where the implementation does not exist yet. It is the
+    strategy a test-first node declares.
+
+    `controlled_mutation` runs them against a named, reverted behaviour. It is
+    the strategy a node whose implementation already exists declares, because
+    its parent commit is already green.
+
+    Either way the failure must **match** `expected_reason_pattern`. A random
+    exception, an import error, or a collection failure is not proof that the
+    tests discriminate: it is proof that the tree does not import.
+    """
+
+    model_config = _STRICT
+
+    strategy: Literal["baseline_absent", "controlled_mutation"]
+    mutation: Optional[ControlledMutation] = None
+    #: Which of this node's cases the negative control must turn red. A
+    #: substring of the case node id, as in `CoverageObligation`.
+    expected_failing_selector: str = Field(min_length=1)
+    #: A Python regular expression the failing case's reported reason must
+    #: match. Compiled here so an unparseable pattern is a plan that does not
+    #: parse, never a negative control that silently matches nothing.
+    expected_reason_pattern: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _strategy_carries_its_own_mechanism(self) -> "Falsifiability":
+        if self.strategy == "controlled_mutation" and self.mutation is None:
+            raise ValueError(
+                "a controlled_mutation strategy declares the mutation it "
+                "applies; without one there is no negative control to run")
+        if self.strategy == "baseline_absent" and self.mutation is not None:
+            raise ValueError(
+                "a baseline_absent strategy runs against the parent commit; a "
+                "mutation here is a field nothing reads (§12.3)")
+        try:
+            re.compile(self.expected_reason_pattern)
+        except re.error as exc:
+            raise ValueError(
+                "expected_reason_pattern is not a regular expression: "
+                "{0}".format(exc)) from exc
+        return self
+
+
+class TestStrength(BaseModel):
+    """The contract a tests node's candidate must discharge to be accepted.
+
+    Both halves are required. Coverage without falsifiability accepts tests
+    that assert nothing; falsifiability without coverage accepts one
+    discriminating case standing in for a whole requirement set.
+    """
+
+    model_config = _STRICT
+
+    coverage: Tuple[CoverageObligation, ...] = Field(min_length=1)
+    falsifiability: Falsifiability
+
+    @property
+    def requirement_ids(self) -> Tuple[str, ...]:
+        seen: List[str] = []
+        for item in self.coverage:
+            if item.requirement_id not in seen:
+                seen.append(item.requirement_id)
+        return tuple(seen)
+
+    def aspects_for(self, requirement_id: str) -> Tuple[str, ...]:
+        return tuple(sorted({item.aspect for item in self.coverage
+                             if item.requirement_id == requirement_id}))
+
+    @model_validator(mode="after")
+    def _every_requirement_states_both_polarities(self) -> "TestStrength":
+        for requirement_id in self.requirement_ids:
+            aspects = set(self.aspects_for(requirement_id))
+            missing = [a for a in REQUIRED_ASPECTS if a not in aspects]
+            if missing:
+                raise ValueError(
+                    "{0} declares no {1} obligation; a requirement covered "
+                    "only by its happy path cannot refuse an implementation "
+                    "that never rejects anything".format(
+                        requirement_id, " or ".join(missing)))
+        pairs = [(item.requirement_id, item.aspect, item.case_selector)
+                 for item in self.coverage]
+        if len(set(pairs)) != len(pairs):
+            raise ValueError(
+                "two coverage obligations are identical; a duplicate is two "
+                "answers to one fact and counts the same cases twice")
+        return self
+
+
 # ── prompt assets, which are part of the identity (§6.3) ────────────────────
 
 class PromptAsset(BaseModel):
@@ -496,8 +676,24 @@ class TestsNode(_NodeBase):
     effects: Tuple[NodeEffect, ...] = ()
 
 
+class TestsNodeV4(TestsNode):
+    """A tests node that declares what its cases must prove.
+
+    Subclasses the frozen v3 class rather than restating it, exactly as
+    `PlanV2` subclasses `Plan`: v4's obligations *are* v3's obligations plus
+    one required field. `TestsNode` itself cannot grow the field — §6.3
+    freezes a shipped class, and an optional one would be optional forever.
+    """
+
+    model_config = _STRICT
+
+    test_strength: TestStrength
+
+
 Node = Annotated[Union[AgentNode, CodeNode], Field(discriminator="kind")]
 V3Node = Annotated[Union[AgentNode, CodeNode, TestsNode],
+                   Field(discriminator="kind")]
+V4Node = Annotated[Union[AgentNode, CodeNode, TestsNodeV4],
                    Field(discriminator="kind")]
 
 
@@ -645,6 +841,11 @@ class Plan(BaseModel):
                     gate_selector=selector_of(node.gate),
                     gate_min_cases=node.gate.min_cases,
                     instruction=node.instruction,
+                    # Carried verbatim, and `None` on a v3 node that declares
+                    # none. The projection does not invent one: a synthesised
+                    # contract would be indistinguishable downstream from an
+                    # authored one, which is §19 M26's shape.
+                    test_strength=getattr(node, "test_strength", None),
                     effects=tuple(node.effects), **common)
             else:
                 result = st.PlanNode(
@@ -700,6 +901,24 @@ class PlanV3(Plan):
 
     schema_version: Literal["maestro-plan.v3"]
     nodes: Tuple[V3Node, ...]  # type: ignore[assignment]
+
+
+class PlanV4(Plan):
+    """`maestro-plan.v4`. Its `tests` nodes declare a test-strength contract.
+
+    v3 stays frozen: its `nodes` union carries `TestsNode`, which has no
+    `test_strength` field and forbids extras, so a v4 tests node cannot parse
+    as a v3 one and a v3 plan cannot acquire the contract by being re-read
+    under this class. That is the whole point of the version string here —
+    "this plan's tests nodes were authored knowing they would have to prove
+    discrimination" is not a fact any structural check on v3 bytes can
+    recover.
+    """
+
+    model_config = _STRICT
+
+    schema_version: Literal["maestro-plan.v4"]
+    nodes: Tuple[V4Node, ...]  # type: ignore[assignment]
 
 
 # ── the projection is total, or it raises (§6.2, §3.6 B15) ─────────────────
@@ -818,7 +1037,8 @@ def _assert_projection_is_total(node: "_NodeBase", projected: st.PlanNode) -> No
 
 IN_PLAN_TYPES: Tuple[Type[BaseModel], ...] = (
     Plan, Observed, Produced, Hypothesis, Gate, AgentNode, CodeNode,
-    TestsNode, MergePolicy, PromptAsset, NodeEffect)
+    TestsNode, TestsNodeV4, MergePolicy, PromptAsset, NodeEffect,
+    CoverageObligation, ControlledMutation, Falsifiability, TestStrength)
 
 
 # ── the append-only parser registry (§6.3) ──────────────────────────────────
@@ -854,6 +1074,7 @@ def registered_versions() -> Tuple[str, ...]:
 register_parser(SCHEMA_V1, Plan)
 register_parser(SCHEMA_V2, PlanV2)
 register_parser(SCHEMA_V3, PlanV3)
+register_parser(SCHEMA_V4, PlanV4)
 
 
 def _pointer(loc: Sequence[Any]) -> str:

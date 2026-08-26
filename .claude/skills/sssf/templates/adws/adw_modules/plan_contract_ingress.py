@@ -376,8 +376,42 @@ _UNEMITTED_NODE_KINDS: Dict[str, str] = {
 #: Destination node types the next projection (`to_plan_nodes`) accepts.
 #: The guard covers every kind, not only `agent`, so a TestsNode field
 #: cannot be dropped by being out of this module's current emit set.
+#: `TestsNodeV4` is the tests kind this projection emits; `TestsNode` stays
+#: listed because a v3 plan already shipped still parses to it.
 _DESTINATION_NODE_TYPES: Tuple[type, ...] = (
-    plan_model.AgentNode, plan_model.CodeNode, plan_model.TestsNode)
+    plan_model.AgentNode, plan_model.CodeNode, plan_model.TestsNode,
+    plan_model.TestsNodeV4)
+
+
+def _projected_test_strength(declared: Any, lane_id: str,
+                             verifier_id: Any) -> Dict[str, Any]:
+    """The verifier's authored test-strength contract, validated and carried.
+
+    Validated by constructing the plan model rather than by re-checking its
+    rules here: `TestStrength` already refuses a requirement covered only by
+    its happy path, a `controlled_mutation` with no mutation, and an
+    `expected_reason_pattern` that is not a regular expression. A second copy
+    of those rules in this module would be one contract with two definitions,
+    which is the shape this whole design convicts.
+
+    Carried as the model's own JSON dump, so the plan file holds exactly what
+    the plan model will parse back — never a hand-built dict that happens to
+    resemble it.
+    """
+    if declared is None or not isinstance(declared, Mapping):
+        raise IngressError(
+            "UNMAPPABLE_VERIFIERS:{0}.test_strength".format(lane_id))
+    try:
+        contract = plan_model.TestStrength.model_validate(dict(declared))
+    except ValueError as error:
+        # `ValidationError` is a `ValueError`, and so is every rule
+        # `TestStrength` states itself. Anything else raised from a
+        # `model_validate` is this module's bug rather than the author's, and
+        # it must not be reported as a malformed contract.
+        raise IngressError(
+            "UNMAPPABLE_VERIFIERS:{0}.test_strength:{1}".format(
+                verifier_id or lane_id, error)) from None
+    return contract.model_dump(mode="json")
 
 
 #: Lane fields this projection carries onto the node, or `None` if dropped.
@@ -446,6 +480,12 @@ _VERIFIER_PROJECTION: Dict[str, Optional[str]] = {
     "oracle": None,
     "falsifiability": None,
     "independent": None,
+    # The one verifier field that *is* carried onto the node, and only onto a
+    # tests node. `falsifiability` above stays exempt because it is free text
+    # and §1.2 forbids a transition keyed on prose; this is the typed thing
+    # that replaces it — coverage obligations bound to case ids and an
+    # executable negative control — so it has a destination and a reader.
+    "test_strength": "test_strength",
     "requirement_ids": None,
     "fixture_ids": None,
     "seam_ids": None,
@@ -694,23 +734,37 @@ def _assert_ingress_projection_is_total(
             "lane {0}: project_draft emitted unsupported kind {1!r}{2}.".format(
                 lane_id, kind, (": " + reason) if reason else ""))
 
-    # AgentNode and TestsNode share a launch shape; a field TestsNode
-    # declares that the emitted node does not carry is the #96 drop
-    # arriving on a kind this projection does not yet emit.
+    # AgentNode and TestsNodeV4 share a launch shape; a field either declares
+    # that the emitted node does not carry is the #96 drop arriving on a kind
+    # this projection does not yet emit.
+    #
+    # Checked against the class for the kind actually emitted, **plus** the
+    # fields the two kinds share. Checking every lane against both classes
+    # outright was right only while the two had identical field sets: v4's
+    # `test_strength` belongs to a tests node and to no other, so demanding it
+    # of a build lane refuses every plan that has one. The shared set is what
+    # preserves the original guard — a field added to `AgentNode` is still a
+    # raise on a tests lane, and the other way round.
     emitted_names = set(node)
-    for cls in (plan_model.AgentNode, plan_model.TestsNode):
+    for cls in (plan_model.AgentNode, plan_model.TestsNodeV4):
         if cls not in _DESTINATION_NODE_TYPES:
             raise IngressProjectionIncomplete(
                 "{0} is not in _DESTINATION_NODE_TYPES; the guard must "
                 "cover every node kind, including those PR #124 "
                 "added.".format(cls.__name__))
-        missing = sorted(set(cls.model_fields) - emitted_names)
-        if missing:
-            raise IngressProjectionIncomplete(
-                "lane {0}: {1} declares {2} which the emitted node "
-                "does not carry. A new field on a destination kind is "
-                "a raise, not a silent drop.".format(
-                    lane_id, cls.__name__, ", ".join(missing)))
+    shared = (set(plan_model.AgentNode.model_fields)
+              & set(plan_model.TestsNodeV4.model_fields))
+    own = {
+        "agent": set(plan_model.AgentNode.model_fields),
+        "tests": set(plan_model.TestsNodeV4.model_fields),
+    }.get(str(kind), set())
+    missing = sorted((shared | own) - emitted_names)
+    if missing:
+        raise IngressProjectionIncomplete(
+            "lane {0}: the {1} destination declares {2} which the emitted "
+            "node does not carry. A new field on a destination kind is a "
+            "raise, not a silent drop.".format(
+                lane_id, kind, ", ".join(missing)))
 
     if node.get("node_id") != lane.get("lane_id"):
         raise IngressProjectionIncomplete(
@@ -938,6 +992,21 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             # executing materializer compliant.
             "effects": _node_effects(ir, lane),
         }
+        # A tests lane's verifier carries the contract its cases must
+        # discharge, and a tests lane without one cannot be emitted.
+        #
+        # Refusing here rather than emitting a contract-less tests node is
+        # what keeps the remedy real. `maestro run start` refuses a plan whose
+        # tests nodes declare none, and if this projection could still emit
+        # one, the operator's only route -- re-ship from the IR -- would
+        # produce the same refused plan forever.
+        strength = verifier.get("test_strength")
+        if node_kind == "tests":
+            node["test_strength"] = _projected_test_strength(
+                strength, lane_id, verifier.get("verifier_id"))
+        elif strength is not None:
+            raise IngressError(
+                "UNMAPPABLE_VERIFIERS:{}.test_strength".format(lane_id))
         _assert_ingress_projection_is_total(ir, lane, verifier, node)
         nodes.append(node)
 
@@ -1033,7 +1102,12 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         # registered parser class are the same fact, and a literal beside
         # them is a second place for it to be wrong.
         "schema_version": (
-            plan_model.SCHEMA_V3
+            # v4, not v3: every tests node this projection emits carries a
+            # test-strength contract, and v3's `TestsNode` forbids extras so
+            # such a node cannot parse under it. Emitting v3 here would ship a
+            # plan `run start` refuses, with no verb able to produce one it
+            # would accept.
+            plan_model.SCHEMA_V4
             if any(node["kind"] == "tests" for node in nodes)
             else plan_model.SCHEMA_V2),
         "plan_id": plan_id,

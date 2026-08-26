@@ -477,6 +477,53 @@ class ReviewStalledClassificationTests(SchedulerFixture):
         self.assertEqual(self.prompts["a"], [None])
         self.assertEqual(calls["n"], 2)
 
+    def test_closed_reviewer_never_moves_generation_fence_backward(self):
+        from adw_modules import code_review as cr
+
+        class _Stall(cr.ReviewStalled):
+            def __init__(self):
+                RuntimeError.__init__(self, "stall")
+
+        self.written = {"a": {"a.py": "A\n"}}
+
+        calls = {"n": 0}
+
+        def review_attempt(
+            attempt, node, record, base_sha, output_sha, _resume_existing
+        ):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _Stall()
+            return _Review(True)
+
+        scheduler = self.schedule(
+            [self.agent("a")], deps=self.deps(review_attempt=review_attempt)
+        )
+        scheduler.project()
+        self.store.register_actor_session(
+            "run1",
+            "a",
+            "reviewer",
+            generation=5,
+            pane_id="closed-reviewer-pane",
+            session_path="/sessions/closed-reviewer",
+            correlation_token="closed-reviewer",
+        )
+        self.assertTrue(
+            self.store.close_actor_session("run1", "a", "reviewer", generation=5)
+        )
+
+        report = scheduler.run()
+
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        self.assertEqual(calls["n"], 2)
+        candidate = self.store.lane_candidates("run1", "a")[0]
+        review = self.store.candidate_review(
+            "run1", "a::review", candidate.candidate_sha
+        )
+        self.assertEqual(review.reviewer_generation, 5)
+        self.assertIs(review.verdict, st.ReviewVerdict.PASS)
+
     def test_an_exhausted_redispatch_budget_is_environmental_and_durable(self):
         from adw_modules import code_review as cr
 
@@ -515,6 +562,47 @@ class ReviewStalledClassificationTests(SchedulerFixture):
             spends[-1].detail.get("reason"),
             "the code reviewer stalled without reporting",
         )
+
+    def test_resume_refreshes_an_exhausted_reviewer_infrastructure_budget(self):
+        from adw_modules import code_review as cr
+
+        class _Stall(cr.ReviewStalled):
+            def __init__(self):
+                RuntimeError.__init__(self, "stall")
+
+        self.written = {"a": {"a.py": "A\n"}}
+        calls = {"n": 0}
+
+        def review_attempt(
+            attempt, node, record, base_sha, output_sha, _resume_existing
+        ):
+            calls["n"] += 1
+            raise _Stall()
+
+        config = self.config(environmental_retries=1, semantic_ceiling=1)
+        deps = self.deps(
+            review_attempt=review_attempt,
+            recover_node=lambda _attempt, _record: sch.NodeExecution(
+                envelope_parsed=True,
+                envelope_payload={"success": True},
+                exit_code=0,
+            ),
+        )
+        first = self.schedule([self.agent("a")], config=config, deps=deps).run()
+        self.assertIs(first.outcome, st.RunOutcome.BLOCKED)
+        self.assertEqual(calls["n"], 2)
+
+        self.store.resume_run("run1", late_envelope_attempts=(("a", 1),))
+        second = self.schedule([self.agent("a")], config=config, deps=deps).run()
+
+        self.assertIs(second.outcome, st.RunOutcome.BLOCKED)
+        self.assertEqual(
+            calls["n"],
+            4,
+            "resume charged the fresh reviewer generation for pre-boundary stalls",
+        )
+        self.assertEqual(len(self.store.current_lane_retry_spends("run1", "a")), 2)
+        self.assertEqual(len(self.store.lane_retry_spends("run1", "a")), 4)
 
 
 if __name__ == "__main__":

@@ -112,12 +112,148 @@ TERMINAL_WITHOUT_MERGE: Tuple[NodeState, ...] = (NodeState.BLOCKED, NodeState.CA
 
 
 class LaneRetryClass(str, Enum):
-    """Durable correction-loop budget classes, separate from attempts."""
+    """Durable correction-loop budget classes, separate from attempts.
+
+    `TEST_REVIEW_REJECTION` is its own class rather than a use of
+    `REVIEW_REJECTION`, because the two loops converge differently and
+    sharing one budget makes the shorter one govern both. An implementation
+    review rejects a diff whose gate already passes; a test review rejects a
+    candidate whose whole purpose is to be able to fail, and the corrections
+    it asks for -- a missing negative case, a fixture that is not real, an
+    assertion on plumbing -- are rewrites rather than repairs. A tester that
+    spends the implementation lane's budget arriving at a strong test suite
+    leaves nothing for the implementation it was written to gate.
+    """
 
     SEMANTIC = "SEMANTIC"
     ENVIRONMENTAL = "ENVIRONMENTAL"
     LAUNCHER_TRANSIENT = "LAUNCHER_TRANSIENT"
     REVIEW_REJECTION = "REVIEW_REJECTION"
+    TEST_REVIEW_REJECTION = "TEST_REVIEW_REJECTION"
+
+
+class TestStrengthContract(str, Enum):
+    """Which test-acceptance rules a run was **created** under.
+
+    A run is pinned to this at creation and it is never rewritten. That is the
+    whole rollout invariant: a run created before executable gate-strength
+    existed stays reproducible under the contract it was created with, and a
+    run created after it cannot escape into the older one.
+
+    ``LEGACY`` is what a NULL ledger column reads as — a run created when a
+    tests node was accepted on "new cases, red at the parent". Its tests nodes
+    are classified (`LEGACY_TEST_STRENGTH_UNPROVEN`) and reported, never
+    retroactively reopened, invalidated, or rerun.
+
+    ``STRENGTH_V1`` is the contract this runtime creates runs under: an
+    independently reviewed test candidate, measured coverage, an executed
+    negative control, and an implementation bound to the exact accepted test
+    bytes.
+    """
+
+    LEGACY = "LEGACY"
+    STRENGTH_V1 = "test-strength.v1"
+
+
+#: The contract a run is pinned to when its ledger records none. Named rather
+#: than spelled `LEGACY` at each reader, because "NULL means legacy" is one
+#: decision and three copies of it would be three places to disagree.
+DEFAULT_TEST_STRENGTH_CONTRACT = TestStrengthContract.LEGACY
+
+
+class TestStrengthPhase(str, Enum):
+    """What an operator surface calls a node under the strength contract.
+
+    A projection of `(kind, NodeState, LanePhase, accepted?, paired?)`, not a
+    fourth state machine. Nothing transitions on these and nothing stores one:
+    a second durable lifecycle beside `NodeState` and `LanePhase` would be two
+    representations of one fact, which is the shape this design convicts
+    everywhere else.
+
+    It exists because the surfaces were lying by omission. A tests node whose
+    candidate had been authored and committed rendered as `tester MERGED`,
+    which reads as "these tests are done and good" — and in
+    run-8d1a71f463e4430f92a125a8f8b3731d it meant "these bytes reached the
+    integration branch", nothing more. The distinction between *private
+    acceptance* and *paired merge* is the one an operator most needs and the
+    one the old vocabulary could not express.
+    """
+
+    TEST_BUILDING = "TEST_BUILDING"
+    TEST_CANDIDATE_READY = "TEST_CANDIDATE_READY"
+    TEST_REVIEWING = "TEST_REVIEWING"
+    TEST_REJECTED = "TEST_REJECTED"
+    TEST_REPAIRING = "TEST_REPAIRING"
+    TEST_ACCEPTED = "TEST_ACCEPTED"
+    TEST_BLOCKED = "TEST_BLOCKED"
+    #: Integrated, and with no evidence attributable to the exact candidate
+    #: its state rests on. The rollout's classification, rendered: the node
+    #: stays terminal and its dependants stay admitted, and an operator
+    #: reading the run is told what is unproven rather than shown
+    #: `TEST_BUILDING`, which is false, or `TEST_ACCEPTED`, which is worse.
+    TEST_LEGACY_UNPROVEN = "TEST_LEGACY_UNPROVEN"
+    IMPLEMENTATION_PENDING = "IMPLEMENTATION_PENDING"
+    IMPLEMENTATION_BUILDING = "IMPLEMENTATION_BUILDING"
+    IMPLEMENTATION_REVIEWING = "IMPLEMENTATION_REVIEWING"
+    IMPLEMENTATION_ACCEPTED = "IMPLEMENTATION_ACCEPTED"
+    PAIRED_MERGED = "PAIRED_MERGED"
+
+
+#: Where a tests node's bytes are, which `MERGED` alone cannot say.
+class TestBytesLocation(str, Enum):
+    PRIVATE = "private"        # committed to the attempt's candidate ref only
+    STAGED = "staged"          # accepted, not yet on the integration branch
+    INTEGRATED = "integrated"  # merged into the integration branch
+
+
+def test_strength_phase(
+    kind: "NodeKind",
+    state: NodeState,
+    lane_phase: Optional[LanePhase],
+    *,
+    accepted: bool = False,
+    paired: bool = False,
+) -> Optional[TestStrengthPhase]:
+    """Name this node's position in the test-strength lifecycle.
+
+    `None` for a kind the lifecycle does not describe — a code node, a derived
+    review node — so a surface renders nothing rather than an invented phase.
+    """
+    if kind is NodeKind.TESTS:
+        if state is NodeState.BLOCKED:
+            return TestStrengthPhase.TEST_BLOCKED
+        if accepted:
+            # TEST_ACCEPTED whether or not the bytes reached the integration
+            # branch, because acceptance and integration are different facts
+            # and the surface reports the second one separately
+            # (`TestBytesLocation`). Collapsing them is what made a private
+            # acceptance render as `tester MERGED`.
+            return TestStrengthPhase.TEST_ACCEPTED
+        if state in (NodeState.MERGED, NodeState.ACCEPTED):
+            return TestStrengthPhase.TEST_LEGACY_UNPROVEN
+        if lane_phase is LanePhase.CANDIDATE_READY:
+            return TestStrengthPhase.TEST_CANDIDATE_READY
+        if lane_phase is LanePhase.REVIEWING:
+            return TestStrengthPhase.TEST_REVIEWING
+        if lane_phase is LanePhase.REPAIR_HANDOFF:
+            return TestStrengthPhase.TEST_REJECTED
+        if lane_phase in (LanePhase.REPAIRING,
+                          LanePhase.WAITING_FOR_NEW_CANDIDATE):
+            return TestStrengthPhase.TEST_REPAIRING
+        return TestStrengthPhase.TEST_BUILDING
+    if kind is NodeKind.AGENT:
+        if state is NodeState.MERGED:
+            return (TestStrengthPhase.PAIRED_MERGED if paired
+                    else TestStrengthPhase.IMPLEMENTATION_ACCEPTED)
+        if lane_phase is LanePhase.ACCEPTED:
+            return TestStrengthPhase.IMPLEMENTATION_ACCEPTED
+        if lane_phase in (LanePhase.REVIEWING, LanePhase.CANDIDATE_READY,
+                          LanePhase.REPAIR_HANDOFF):
+            return TestStrengthPhase.IMPLEMENTATION_REVIEWING
+        if state is NodeState.PENDING:
+            return TestStrengthPhase.IMPLEMENTATION_PENDING
+        return TestStrengthPhase.IMPLEMENTATION_BUILDING
+    return None
 
 
 class ActorSessionState(str, Enum):
@@ -669,6 +805,19 @@ class PlanNode:
     #: re-encoding them, so there is one representation and
     #: `_assert_projection_is_total` compares them by value.
     effects: Tuple[Any, ...] = ()
+    #: The tests node's authored test-strength contract, or `None`.
+    #:
+    #: `None` is the v3 shape and only the v3 shape. It is not a default this
+    #: runtime works around: `maestro run start` refuses to *create* a run
+    #: whose tests nodes carry none, and the run row records which contract
+    #: the run was created under, so a v3 run resumes under v3 rules while a
+    #: new run cannot be started under them (`TEST_STRENGTH_CONTRACT_ABSENT`).
+    #:
+    #: Typed as `Any` for the reason `effects` is: the concrete type is
+    #: `plan_model.TestStrength`, `plan_model` imports this module, and naming
+    #: it here would close the cycle. The projection carries the object
+    #: verbatim so `_assert_projection_is_total` compares it by value.
+    test_strength: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not str(self.node_id).strip():
@@ -677,6 +826,12 @@ class PlanNode:
             raise ValueError(f"{self.node_id}: depth is a graph fact, never negative")
         if self.node_id in self.needs:
             raise ValueError(f"{self.node_id}: a node cannot depend on itself")
+
+        if self.test_strength is not None and self.kind is not NodeKind.TESTS:
+            raise ValueError(
+                f"{self.node_id}: a test-strength contract belongs to a tests "
+                "node; on any other kind it is a field nothing reads (§12.3)"
+            )
 
         if self.kind is NodeKind.REVIEW:
             raise ValueError(
@@ -827,6 +982,15 @@ class SchedulerConfig:
     #: counter would let a node with two gate failures merge unreviewed on its
     #: third try because the shared budget was already spent.
     review_ceiling: int = 3
+    #: §7.5's ceiling applied to **test** review, counted separately from
+    #: `review_ceiling` for the reason that one is counted separately from
+    #: `semantic_ceiling`: they bound different loops. A rejected test
+    #: candidate is corrected by writing cases that did not exist, which is a
+    #: different and usually longer convergence than repairing a diff whose
+    #: gate is already green. Sharing one counter would let a lane whose tests
+    #: took three rounds to become strong reach its implementation review with
+    #: no budget left, and block a lane that never failed a diff review.
+    test_review_ceiling: int = 3
     environmental_retries: int = 2
     launcher_retries: int = 2
     credential_retries: int = 0
@@ -843,6 +1007,12 @@ class SchedulerConfig:
             raise ValueError(
                 "a review ceiling of zero blocks every node on its first review "
                 "rejection, which is a different design, not a setting"
+            )
+        if self.test_review_ceiling < 1:
+            raise ValueError(
+                "a test review ceiling of zero blocks every tests node on its "
+                "first review rejection, which is a different design, not a "
+                "setting"
             )
         for name in (
             "node_timeout_s",

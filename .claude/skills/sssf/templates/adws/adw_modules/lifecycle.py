@@ -194,6 +194,72 @@ class LegacyReviewMigration:
     reviews: Tuple[st.CandidateReview, ...] = ()
 
 
+@dataclass(frozen=True)
+class TestGateEvidenceRecord:
+    """One test candidate's measured gate strength, as the ledger holds it."""
+
+    tests_node_id: str
+    candidate_sha: str
+    runner: str
+    selector: str
+    strong: bool
+    refusal: Optional[str]
+    evidence: Mapping[str, Any]
+    created_at: str
+    #: Whether *this* call inserted the row. A replay reads False, which is
+    #: how a resumed scheduler tells "measured now" from "measured before the
+    #: crash" without comparing timestamps.
+    created: bool = False
+
+
+@dataclass(frozen=True)
+class TestPairing:
+    """The exact (accepted test bytes, implementation bytes) pair."""
+
+    build_node_id: str
+    tests_node_id: str
+    accepted_test_sha: str
+    implementation_sha: str
+    verifier_command: str
+    selector: str
+    executed_cases: int
+    coverage: Mapping[str, Any]
+    created_at: str
+
+
+#: The classification a tests node carries when it reached a terminal state
+#: under the legacy contract with no evidence uniquely attributable to its
+#: candidate. Informational by construction: it names what is unproven, and
+#: nothing keys a transition on it unless an operator migrates the run.
+LEGACY_TEST_STRENGTH_UNPROVEN = "LEGACY_TEST_STRENGTH_UNPROVEN"
+
+
+@dataclass(frozen=True)
+class LegacyTestStrengthFinding:
+    """One tests node's disposition under the new contract, for an old run."""
+
+    tests_node_id: str
+    state: str
+    candidate_sha: Optional[str]
+    classification: str
+    blocking: bool
+    detail: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class TestStrengthMigrationReport:
+    """What migrating one run would do, or did. Dry-run and apply share it."""
+
+    run_id: str
+    contract: str
+    applied: bool
+    backup_path: Optional[str]
+    findings: Tuple[LegacyTestStrengthFinding, ...] = ()
+    blocked_nodes: Tuple[str, ...] = ()
+    migrated_nodes: Tuple[str, ...] = ()
+    reason: str = ""
+
+
 #: The transition `reason` an operator's `--allow-exhausted-node` leaves
 #: behind. Declared once so the writer and every reader name the same string,
 #: rather than each spelling a literal that drifts.
@@ -274,7 +340,11 @@ CREATE TABLE IF NOT EXISTS runs (
   -- is what separates authority to signal a process from a guess that it is
   -- the same one (#37). NULL on a ledger written before this column, and on
   -- a platform that cannot answer -- both read as unproven, never as proven.
-  scheduler_start_epoch REAL
+  scheduler_start_epoch REAL,
+  -- The test-acceptance contract this run was created under. See
+  -- `_RUNS_ADDED_COLUMNS` for why NULL is the legacy pin and why nothing
+  -- rewrites this column after `create_run`.
+  test_strength_contract TEXT
 );
 CREATE TABLE IF NOT EXISTS dag_nodes (
   run_id       TEXT NOT NULL REFERENCES runs(run_id),
@@ -346,6 +416,9 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   -- NULL, and NULL is read as 0 -- no boundary recorded, counted from the
   -- beginning of the node's life, which is the behaviour that predates it.
   retry_spend_floor      INTEGER,
+  -- The retained-lane twin of retry_spend_floor, expressed as the highest
+  -- durable cycle_seq recorded before the latest operator boundary.
+  lane_retry_spend_floor INTEGER,
   updated_at             TEXT NOT NULL,
   PRIMARY KEY (run_id, node_id)
 );
@@ -453,11 +526,62 @@ CREATE TABLE IF NOT EXISTS legacy_review_migration_blocks (
   created_at    TEXT NOT NULL,
   PRIMARY KEY (run_id, build_node_id)
 );
+CREATE TABLE IF NOT EXISTS test_gate_evidence (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  tests_node_id TEXT NOT NULL,
+  -- The identity of the acceptance. Keyed on the candidate rather than the
+  -- node because what is accepted is *those bytes*: a later or substituted
+  -- test tree has a different sha, finds no row, and cannot inherit this.
+  candidate_sha TEXT NOT NULL CHECK (
+    length(candidate_sha) IN (40, 64)
+    AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  runner        TEXT NOT NULL,
+  selector      TEXT NOT NULL,
+  strong        INTEGER NOT NULL CHECK (strong IN (0, 1)),
+  refusal       TEXT,
+  evidence_json TEXT NOT NULL CHECK (
+    json_valid(evidence_json) AND json_type(evidence_json) = 'object'),
+  created_at    TEXT NOT NULL,
+  -- Strength and its refusal are one fact with two representations, so the
+  -- table refuses the pair that would let a reader disagree with itself.
+  CHECK ((strong = 1 AND refusal IS NULL)
+         OR (strong = 0 AND refusal IS NOT NULL)),
+  PRIMARY KEY (run_id, tests_node_id, candidate_sha)
+);
+CREATE TABLE IF NOT EXISTS test_implementation_pairings (
+  run_id             TEXT NOT NULL REFERENCES runs(run_id),
+  build_node_id      TEXT NOT NULL,
+  tests_node_id      TEXT NOT NULL,
+  -- The exact accepted test bytes this implementation was verified against.
+  accepted_test_sha  TEXT NOT NULL CHECK (
+    length(accepted_test_sha) IN (40, 64)
+    AND accepted_test_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  implementation_sha TEXT NOT NULL CHECK (
+    length(implementation_sha) IN (40, 64)
+    AND implementation_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  verifier_command   TEXT NOT NULL,
+  selector           TEXT NOT NULL,
+  executed_cases     INTEGER NOT NULL CHECK (executed_cases >= 0),
+  coverage_json      TEXT NOT NULL CHECK (
+    json_valid(coverage_json) AND json_type(coverage_json) = 'object'),
+  created_at         TEXT NOT NULL,
+  PRIMARY KEY (run_id, build_node_id, implementation_sha, tests_node_id)
+);
+CREATE TABLE IF NOT EXISTS legacy_test_strength_blocks (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  tests_node_id TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  detail_json   TEXT NOT NULL CHECK (
+    json_valid(detail_json) AND json_type(detail_json) = 'object'),
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (run_id, tests_node_id)
+);
 CREATE TABLE IF NOT EXISTS lane_retry_spend (
   run_id        TEXT NOT NULL REFERENCES runs(run_id),
   build_node_id TEXT NOT NULL,
   retry_class   TEXT NOT NULL CHECK (retry_class IN (
-    'SEMANTIC', 'ENVIRONMENTAL', 'LAUNCHER_TRANSIENT', 'REVIEW_REJECTION')),
+    'SEMANTIC', 'ENVIRONMENTAL', 'LAUNCHER_TRANSIENT', 'REVIEW_REJECTION',
+    'TEST_REVIEW_REJECTION')),
   cycle_seq     INTEGER NOT NULL CHECK (cycle_seq > 0),
   candidate_sha TEXT CHECK (
     candidate_sha IS NULL OR (
@@ -525,6 +649,12 @@ CREATE INDEX IF NOT EXISTS idx_repair_handoffs_state
   ON repair_handoffs(run_id, build_node_id, state);
 CREATE INDEX IF NOT EXISTS idx_lane_retry_spend_class
   ON lane_retry_spend(run_id, build_node_id, retry_class, cycle_seq);
+CREATE INDEX IF NOT EXISTS idx_test_gate_evidence_node
+  ON test_gate_evidence(run_id, tests_node_id, strong);
+CREATE INDEX IF NOT EXISTS idx_test_pairings_build
+  ON test_implementation_pairings(run_id, build_node_id);
+CREATE INDEX IF NOT EXISTS idx_legacy_test_strength_blocks
+  ON legacy_test_strength_blocks(run_id, tests_node_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_actor_session
   ON actor_sessions(run_id, build_node_id, actor_role) WHERE state='ACTIVE';
 CREATE INDEX IF NOT EXISTS idx_legacy_review_migration_blocks
@@ -565,6 +695,17 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("cancel_cause", "TEXT"),
     ("scheduler_start_epoch", "REAL"),
     ("plan_name", "TEXT"),
+    # Which test-acceptance contract this run was **created** under. Written
+    # once at run creation and never rewritten: a run is pinned to the rules
+    # it started with, so a resumed run keeps its own admission and lifecycle
+    # semantics rather than acquiring the ones the binary happens to ship.
+    #
+    # NULL is the legacy pin and is read as one everywhere: a ledger written
+    # before this column, or a run created under `maestro-plan.v3`, accepted
+    # its tests nodes on their case count. That is classified, reported, and
+    # left standing — never silently upgraded, and never retroactively
+    # invalidated (see `legacy_test_strength_audit`).
+    ("test_strength_contract", "TEXT"),
 )
 
 #: Columns added to `dag_nodes` after the first ledgers were written.  Derived
@@ -589,6 +730,7 @@ _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
         ),
     ),
     ("retry_spend_floor", "INTEGER"),
+    ("lane_retry_spend_floor", "INTEGER"),
 )
 
 #: Every table an older ledger may be missing a column from, in one place so
@@ -652,6 +794,29 @@ _RETRY_SPEND_FLOOR_SQL = (
 
 #: Every node of one run — the resume boundary is a property of the run.
 _RAISE_RUN_RETRY_SPEND_FLOOR = _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=?"
+
+#: Retained correction-loop spend has its own ledger and therefore needs its
+#: own boundary. Keep all rows for guidance and evidence; only budget accounting
+#: begins after this cycle sequence.
+_LANE_RETRY_SPEND_FLOOR_SQL = (
+    "UPDATE node_lifecycle SET lane_retry_spend_floor = ("
+    "SELECT COALESCE(MAX(s.cycle_seq), 0) FROM lane_retry_spend s"
+    " WHERE s.run_id = node_lifecycle.run_id"
+    " AND s.build_node_id = node_lifecycle.node_id)"
+)
+_RAISE_RUN_LANE_RETRY_SPEND_FLOOR = _LANE_RETRY_SPEND_FLOOR_SQL + " WHERE run_id=?"
+_RAISE_NODE_LANE_RETRY_SPEND_FLOOR = (
+    _LANE_RETRY_SPEND_FLOOR_SQL + " WHERE run_id=? AND node_id=?"
+)
+
+#: Resume refreshes infrastructure retry spend, so nodes blocked only because
+#: launcher or environmental faults reached their ceilings return to the
+#: frontier in the same transaction. Semantic and review ceilings are
+#: adjudication bounds; they require an explicit grant and remain blocked.
+_RESUME_REFRESHED_BLOCK_REASONS = (
+    st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED,
+    st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+)
 
 #: One node — the escape boundary is a decision about that node alone, which
 #: is what a `run resume` flag cannot express (§11.3).
@@ -1385,8 +1550,10 @@ MERGE_EVIDENCE_KEY = "merge_evidence"
 #: fails to verify instead of quietly redefining what the attempt started from.
 ATTEMPT_BASELINE_DIGEST_KEY = "baseline_digest"
 LATE_ENVELOPE_RECOVERY_KEY = "late_envelope_recovery"
+LATE_ENVELOPE_PHASE_KEY = "late_envelope_phase"
 SEALED_OUTPUT_SHA_KEY = "sealed_output_sha"
 REPAIR_HANDOFF_RECOVERY_KEY = "repair_handoff_recovery"
+REVIEW_BUDGET_RECOVERY_KEY = "review_budget_recovery"
 
 
 def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
@@ -1486,9 +1653,20 @@ class LifecycleStore:
         plan_digest: str,
         nodes: Sequence[st.PlanNode],
         plan_name: Optional[str] = None,
+        test_strength_contract: Optional[st.TestStrengthContract] = None,
     ) -> None:
         """Project the plan's nodes into `dag_nodes`, seed every node PENDING,
-        in one transaction (§7.1)."""
+        in one transaction (§7.1).
+
+        `test_strength_contract` is written here and nowhere else. Pinning it
+        at creation is what makes the rollout safe in both directions: a run
+        created under the legacy rules keeps them for every resume, and a run
+        created under `STRENGTH_V1` cannot later be resumed into the weaker
+        ones by a binary that happens to be older. `None` records the legacy
+        pin explicitly rather than leaving the column unwritten, so "created
+        before the column" and "created under legacy rules" stay
+        distinguishable in an audit.
+        """
         existing = self.conn.execute(
             "SELECT 1 FROM runs WHERE run_id=?", (run_id,)
         ).fetchone()
@@ -1501,8 +1679,8 @@ class LifecycleStore:
                 "INSERT INTO runs (run_id, plan_digest, created_at, last_transition_at,"
                 " latest_outcome, latest_outcome_at, cancel_requested,"
                 " scheduler_pid, scheduler_host, scheduler_claimed_at,"
-                " scheduler_start_epoch, plan_name)"
-                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?,?,?)",
+                " scheduler_start_epoch, plan_name, test_strength_contract)"
+                " VALUES (?,?,?,?,NULL,NULL,0,?,?,?,?,?,?)",
                 (
                     run_id,
                     plan_digest,
@@ -1513,6 +1691,9 @@ class LifecycleStore:
                     now,
                     wd.process_start_epoch(os.getpid()),
                     plan_name,
+                    st.TestStrengthContract(test_strength_contract).value
+                    if test_strength_contract is not None
+                    else None,
                 ),
             )
             for node in nodes:
@@ -1583,10 +1764,16 @@ class LifecycleStore:
                 raise LifecycleError(
                     f"{run_id}/{build_node_id}: dag plan digest does not match its run"
                 )
-            if build[1] != st.NodeKind.AGENT.value:
+            if build[1] not in (st.NodeKind.AGENT.value, st.NodeKind.TESTS.value):
+                # A tests node owns a derived review for the same reason an
+                # agent node does, and excluding it here was half of why a
+                # tests node could reach MERGED unread. A code node still
+                # cannot: its acceptance is its command's exit code (§6.2),
+                # there is no diff a reviewer is being asked about, and a
+                # review row for one would be state nothing evaluates.
                 raise LifecycleError(
-                    f"{run_id}/{build_node_id}: only an agent build lane can own "
-                    "a derived review node"
+                    f"{run_id}/{build_node_id}: only an agent or tests build "
+                    "lane can own a derived review node"
                 )
 
             review = self.conn.execute(
@@ -2013,6 +2200,542 @@ class LifecycleStore:
                 rejected_candidate_sha, field_name="rejected_candidate_sha"
             ),
         )
+
+    # ── the test-strength ledger (§TS) ───────────────────────────────────────
+
+    @serialized
+    def test_strength_contract(self, run_id: str) -> st.TestStrengthContract:
+        """The contract this run was created under. NULL reads as LEGACY.
+
+        Read, never inferred from what the runtime currently supports. A run
+        whose ledger predates the column is legacy by the fact that nobody
+        pinned it, and answering anything else here is what would retroactively
+        change the rules an already-terminal node was decided under.
+        """
+        row = self.conn.execute(
+            "SELECT test_strength_contract FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise LifecycleError("no run row for {0}".format(run_id))
+        if row[0] is None:
+            return st.DEFAULT_TEST_STRENGTH_CONTRACT
+        try:
+            return st.TestStrengthContract(str(row[0]))
+        except ValueError:
+            raise LifecycleError(
+                "run {0} is pinned to an unknown test-strength contract "
+                "{1!r}; there is no default and none is guessed".format(
+                    run_id, row[0])) from None
+
+    @serialized
+    def record_test_gate_evidence(
+        self,
+        run_id: str,
+        tests_node_id: str,
+        candidate_sha: str,
+        *,
+        runner: str,
+        selector: str,
+        strong: bool,
+        refusal: Optional[str],
+        evidence: Mapping[str, Any],
+    ) -> "TestGateEvidenceRecord":
+        """Record one candidate's measured gate strength, exactly once.
+
+        Exactly-once by `(run_id, tests_node_id, candidate_sha)`: re-measuring
+        the same immutable bytes must not be able to reach a different answer,
+        which is B10's lesson applied to the evidence rather than to the
+        verdict. A second write whose facts differ is refused rather than
+        merged, because the two disagreeing measurements are the finding.
+        """
+        sha = _require_candidate_sha(candidate_sha)
+        if bool(strong) == bool(refusal):
+            raise LifecycleError(
+                "test gate evidence is strong xor refused; "
+                "strong={0!r} refusal={1!r}".format(strong, refusal))
+        _detail, evidence_json = _canonical_detail(evidence)
+        now = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.conn.execute(
+                "SELECT runner, selector, strong, refusal, evidence_json,"
+                " created_at FROM test_gate_evidence"
+                " WHERE run_id=? AND tests_node_id=? AND candidate_sha=?",
+                (run_id, tests_node_id, sha),
+            ).fetchone()
+            if existing is not None:
+                stored = (str(existing[0]), str(existing[1]),
+                          bool(existing[2]),
+                          None if existing[3] is None else str(existing[3]),
+                          str(existing[4]))
+                offered = (runner, selector, bool(strong), refusal,
+                           evidence_json)
+                if stored != offered:
+                    raise LifecycleError(
+                        "test gate evidence for {0}@{1} already exists and "
+                        "differs; the same bytes cannot be measured twice to "
+                        "two answers".format(tests_node_id, sha))
+                self.conn.execute("COMMIT")
+                return TestGateEvidenceRecord(
+                    tests_node_id=tests_node_id, candidate_sha=sha,
+                    runner=stored[0], selector=stored[1], strong=stored[2],
+                    refusal=stored[3], evidence=json.loads(stored[4]),
+                    created_at=str(existing[5]), created=False)
+            self.conn.execute(
+                "INSERT INTO test_gate_evidence (run_id, tests_node_id,"
+                " candidate_sha, runner, selector, strong, refusal,"
+                " evidence_json, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (run_id, tests_node_id, sha, runner, selector,
+                 1 if strong else 0, refusal, evidence_json, now),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return TestGateEvidenceRecord(
+            tests_node_id=tests_node_id, candidate_sha=sha, runner=runner,
+            selector=selector, strong=bool(strong), refusal=refusal,
+            evidence=dict(evidence), created_at=now, created=True)
+
+    @serialized
+    def test_gate_evidence(
+        self, run_id: str, tests_node_id: Optional[str] = None,
+        candidate_sha: Optional[str] = None, *, limit: int = 1000
+    ) -> Tuple["TestGateEvidenceRecord", ...]:
+        """Recorded gate-strength measurements, newest last."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("test gate evidence limit must be positive")
+        sql = ("SELECT tests_node_id, candidate_sha, runner, selector, strong,"
+               " refusal, evidence_json, created_at FROM test_gate_evidence"
+               " WHERE run_id=?")
+        params: Tuple[Any, ...] = (run_id,)
+        if tests_node_id is not None:
+            sql += " AND tests_node_id=?"
+            params += (tests_node_id,)
+        if candidate_sha is not None:
+            sql += " AND candidate_sha=?"
+            params += (_require_candidate_sha(candidate_sha),)
+        rows = self.conn.execute(
+            sql + " ORDER BY tests_node_id, created_at, rowid LIMIT ?",
+            params + (limit,)).fetchall()
+        return tuple(
+            TestGateEvidenceRecord(
+                tests_node_id=str(row[0]), candidate_sha=str(row[1]),
+                runner=str(row[2]), selector=str(row[3]),
+                strong=bool(row[4]),
+                refusal=None if row[5] is None else str(row[5]),
+                evidence=json.loads(str(row[6])), created_at=str(row[7]),
+                created=False)
+            for row in rows)
+
+    @serialized
+    def accepted_test_candidate(
+        self, run_id: str, tests_node_id: str
+    ) -> Optional["TestGateEvidenceRecord"]:
+        """The one test candidate that carries **both** halves of acceptance.
+
+        Strong measured evidence *and* a completed independent review that
+        passed, joined here rather than by two calls at each reader, because a
+        reader that asks only one of the two questions is exactly the gap that
+        let a tests node reach MERGED on a case count. A tests node with no
+        such row has no accepted candidate, and its dependants do not run.
+        """
+        review_node_id = "{0}::review".format(tests_node_id)
+        row = self.conn.execute(
+            "SELECT e.tests_node_id, e.candidate_sha, e.runner, e.selector,"
+            " e.strong, e.refusal, e.evidence_json, e.created_at"
+            " FROM test_gate_evidence e"
+            " JOIN candidate_reviews r"
+            "   ON r.run_id = e.run_id"
+            "  AND r.candidate_sha = e.candidate_sha"
+            "  AND r.review_node_id = ?"
+            " WHERE e.run_id=? AND e.tests_node_id=? AND e.strong=1"
+            "   AND r.state='COMPLETED' AND r.verdict='PASS'"
+            " ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1",
+            (review_node_id, run_id, tests_node_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return TestGateEvidenceRecord(
+            tests_node_id=str(row[0]), candidate_sha=str(row[1]),
+            runner=str(row[2]), selector=str(row[3]), strong=bool(row[4]),
+            refusal=None if row[5] is None else str(row[5]),
+            evidence=json.loads(str(row[6])), created_at=str(row[7]),
+            created=False)
+
+    @serialized
+    def record_test_pairing(
+        self,
+        run_id: str,
+        build_node_id: str,
+        tests_node_id: str,
+        *,
+        accepted_test_sha: str,
+        implementation_sha: str,
+        verifier_command: str,
+        selector: str,
+        executed_cases: int,
+        coverage: Mapping[str, Any],
+    ) -> "TestPairing":
+        """Bind one implementation candidate to the exact test bytes it passed.
+
+        The row is the merge check's authority. Without it a merge would have
+        to re-derive "was this implementation verified against the accepted
+        test candidate" from mutable state at merge time, and the answer would
+        be yes for any test tree that happened to be present.
+        """
+        accepted = _require_candidate_sha(accepted_test_sha,
+                                          field_name="accepted_test_sha")
+        implementation = _require_candidate_sha(implementation_sha,
+                                                field_name="implementation_sha")
+        if not isinstance(executed_cases, int) or isinstance(executed_cases, bool):
+            raise LifecycleError("executed_cases is a count")
+        if executed_cases < 0:
+            raise LifecycleError("executed_cases cannot be negative")
+        _detail, coverage_json = _canonical_detail(coverage)
+        now = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.conn.execute(
+                "SELECT accepted_test_sha, verifier_command, selector,"
+                " executed_cases, coverage_json, created_at"
+                " FROM test_implementation_pairings"
+                " WHERE run_id=? AND build_node_id=? AND implementation_sha=?"
+                "   AND tests_node_id=?",
+                (run_id, build_node_id, implementation, tests_node_id),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) != accepted:
+                    raise LifecycleError(
+                        "{0}@{1} is already paired with test candidate {2}; "
+                        "rebinding it to {3} would let a substituted test tree "
+                        "inherit an earlier acceptance".format(
+                            build_node_id, implementation, existing[0],
+                            accepted))
+                self.conn.execute("COMMIT")
+                return TestPairing(
+                    build_node_id=build_node_id, tests_node_id=tests_node_id,
+                    accepted_test_sha=str(existing[0]),
+                    implementation_sha=implementation,
+                    verifier_command=str(existing[1]),
+                    selector=str(existing[2]),
+                    executed_cases=int(existing[3]),
+                    coverage=json.loads(str(existing[4])),
+                    created_at=str(existing[5]))
+            self.conn.execute(
+                "INSERT INTO test_implementation_pairings (run_id,"
+                " build_node_id, tests_node_id, accepted_test_sha,"
+                " implementation_sha, verifier_command, selector,"
+                " executed_cases, coverage_json, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (run_id, build_node_id, tests_node_id, accepted,
+                 implementation, verifier_command, selector,
+                 int(executed_cases), coverage_json, now),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return TestPairing(
+            build_node_id=build_node_id, tests_node_id=tests_node_id,
+            accepted_test_sha=accepted, implementation_sha=implementation,
+            verifier_command=verifier_command, selector=selector,
+            executed_cases=int(executed_cases), coverage=dict(coverage),
+            created_at=now)
+
+    @serialized
+    def test_pairings(
+        self, run_id: str, build_node_id: Optional[str] = None,
+        implementation_sha: Optional[str] = None, *, limit: int = 1000
+    ) -> Tuple["TestPairing", ...]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("test pairing read limit must be positive")
+        sql = ("SELECT build_node_id, tests_node_id, accepted_test_sha,"
+               " implementation_sha, verifier_command, selector,"
+               " executed_cases, coverage_json, created_at"
+               " FROM test_implementation_pairings WHERE run_id=?")
+        params: Tuple[Any, ...] = (run_id,)
+        if build_node_id is not None:
+            sql += " AND build_node_id=?"
+            params += (build_node_id,)
+        if implementation_sha is not None:
+            sql += " AND implementation_sha=?"
+            params += (_require_candidate_sha(implementation_sha,
+                                              field_name="implementation_sha"),)
+        rows = self.conn.execute(
+            sql + " ORDER BY build_node_id, tests_node_id, rowid LIMIT ?",
+            params + (limit,)).fetchall()
+        return tuple(
+            TestPairing(
+                build_node_id=str(row[0]), tests_node_id=str(row[1]),
+                accepted_test_sha=str(row[2]),
+                implementation_sha=str(row[3]),
+                verifier_command=str(row[4]), selector=str(row[5]),
+                executed_cases=int(row[6]),
+                coverage=json.loads(str(row[7])), created_at=str(row[8]))
+            for row in rows)
+
+    # ── the rollout: classify old runs, never rewrite them ───────────────────
+
+    def _legacy_test_strength_block(
+        self, run_id: str, tests_node_id: str
+    ) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT reason FROM legacy_test_strength_blocks"
+            " WHERE run_id=? AND tests_node_id=?",
+            (run_id, tests_node_id),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def _audit_one_tests_node(
+        self, run_id: str, tests_node_id: str
+    ) -> LegacyTestStrengthFinding:
+        """Classify one tests node against the new contract. Read-only.
+
+        Attribution is exact or it is absent. The candidate this node's state
+        rests on is `node_lifecycle.output_sha` — an immutable git object id
+        written when the attempt was sealed — and evidence is only ever looked
+        up against that exact sha. Nothing here reads `extra_json`, a report
+        file, a branch name, or a timestamp: inferring acceptance from mutable
+        metadata is precisely the shortcut this classification exists to
+        refuse.
+        """
+        row = self.conn.execute(
+            "SELECT state, output_sha, merge_cause FROM node_lifecycle"
+            " WHERE run_id=? AND node_id=?",
+            (run_id, tests_node_id),
+        ).fetchone()
+        if row is None:
+            raise UnknownNode(
+                "{0} has no lifecycle row in {1}".format(tests_node_id, run_id))
+        state = str(row[0])
+        candidate_sha = None if row[1] is None else str(row[1])
+        merge_cause = None if row[2] is None else str(row[2])
+        evidence = self.conn.execute(
+            "SELECT strong, refusal FROM test_gate_evidence"
+            " WHERE run_id=? AND tests_node_id=? AND candidate_sha=?",
+            (run_id, tests_node_id, candidate_sha),
+        ).fetchone() if candidate_sha else None
+        review = self.conn.execute(
+            "SELECT state, verdict FROM candidate_reviews"
+            " WHERE run_id=? AND review_node_id=? AND candidate_sha=?",
+            (run_id, "{0}::review".format(tests_node_id), candidate_sha),
+        ).fetchone() if candidate_sha else None
+        reviewed = (review is not None and str(review[0]) == "COMPLETED"
+                    and str(review[1]) == "PASS")
+        strong = evidence is not None and bool(evidence[0])
+        detail: Dict[str, Any] = {
+            "state": state,
+            "candidate_sha": candidate_sha,
+            "merge_cause": merge_cause,
+            "has_gate_evidence": evidence is not None,
+            "gate_evidence_strong": strong,
+            "independently_reviewed": reviewed,
+        }
+        if evidence is not None and evidence[1] is not None:
+            detail["gate_evidence_refusal"] = str(evidence[1])
+        if strong and reviewed:
+            classification = "TEST_ACCEPTED"
+        elif state in {st.NodeState.MERGED.value, st.NodeState.ACCEPTED.value}:
+            classification = LEGACY_TEST_STRENGTH_UNPROVEN
+        elif state in {st.NodeState.BLOCKED.value,
+                       st.NodeState.CANCELLED.value}:
+            classification = "TEST_TERMINAL_WITHOUT_MERGE"
+        else:
+            classification = "TEST_STRENGTH_PENDING"
+        return LegacyTestStrengthFinding(
+            tests_node_id=tests_node_id,
+            state=state,
+            candidate_sha=candidate_sha,
+            classification=classification,
+            blocking=self._legacy_test_strength_block(
+                run_id, tests_node_id) is not None,
+            detail=detail,
+        )
+
+    @serialized
+    def legacy_test_strength_audit(
+        self, run_id: str, *, limit: int = 1000
+    ) -> Tuple[LegacyTestStrengthFinding, ...]:
+        """Classify every tests node in a run. Reads only; changes nothing.
+
+        This is the whole of what an existing run gets by default. A tests node
+        that reached MERGED without evidence attributable to its exact
+        candidate is reported `LEGACY_TEST_STRENGTH_UNPROVEN` and **stays
+        MERGED**: the classification is informational, its dependants stay
+        admitted, and no terminal row becomes nonterminal. Turning that
+        classification into a fence is an explicit operator migration under an
+        explicit policy, never a side effect of running a newer binary.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("legacy test strength audit limit must be positive")
+        rows = self.conn.execute(
+            "SELECT node_id FROM dag_nodes WHERE run_id=? AND kind=?"
+            " ORDER BY node_id LIMIT ?",
+            (run_id, st.NodeKind.TESTS.value, limit),
+        ).fetchall()
+        return tuple(self._audit_one_tests_node(run_id, str(row[0]))
+                     for row in rows)
+
+    @serialized
+    def migrate_test_strength(
+        self,
+        run_id: str,
+        *,
+        apply: bool = False,
+        policy: str = "classify",
+        backup: bool = True,
+    ) -> TestStrengthMigrationReport:
+        """Migrate one run onto the test-strength contract, or report what would.
+
+        Bounded, reversible, and evidence-preserving by construction:
+
+        * it writes nothing at all unless `apply` is true, so the dry-run
+          report is produced by the same code that would perform the change
+          rather than by a second description of it;
+        * it takes a SQLite backup first and names it in the report, so
+          "reversible" is a file an operator can restore rather than a claim;
+        * every write happens in one transaction and any failure rolls the
+          whole thing back before anything is scheduled;
+        * it never discards a commit, undoes a merge, erases a review or a
+          receipt, reopens an implementation lane, alters a candidate
+          identity, or resets a retry budget. The only rows it writes are
+          `legacy_test_strength_blocks`, which is new state about unadmitted
+          work, and only under the `block_unadmitted` policy.
+
+        `policy="classify"` records the audit and blocks nothing.
+        `policy="block_unadmitted"` additionally fences the dependants of
+        every `LEGACY_TEST_STRENGTH_UNPROVEN` tests node **that have not yet
+        been admitted** — a dependant still PENDING, with no attempt. A
+        dependant already RUNNING, VERIFIED, or MERGED was admitted under the
+        pinned contract and is left exactly as it is.
+        """
+        if policy not in ("classify", "block_unadmitted"):
+            raise LifecycleError(
+                "{0!r} is not a migration policy; expected classify or "
+                "block_unadmitted".format(policy))
+        # The lock is re-entrant, so one guarded method may call another.
+        contract = self.test_strength_contract(run_id)
+        # The audit is the definition of "what is unproven here"; a migration
+        # is that audit plus, under one policy, a fence. Calling it rather
+        # than re-deriving it is what keeps the dry-run report and the
+        # read-only verb from ever disagreeing about a run.
+        findings = self.legacy_test_strength_audit(run_id, limit=100_000)
+        unproven = tuple(f for f in findings
+                         if f.classification == LEGACY_TEST_STRENGTH_UNPROVEN)
+        would_block: List[str] = []
+        if policy == "block_unadmitted":
+            for finding in unproven:
+                for dependant in self._unadmitted_dependants(
+                        run_id, finding.tests_node_id):
+                    would_block.append(dependant)
+        would_block = sorted(set(would_block))
+        if not apply:
+            return TestStrengthMigrationReport(
+                run_id=run_id, contract=contract.value, applied=False,
+                backup_path=None, findings=findings,
+                blocked_nodes=tuple(would_block),
+                reason=("dry run: {0} tests node(s), {1} unproven, {2} "
+                        "unadmitted dependant(s) would be fenced".format(
+                            len(findings), len(unproven), len(would_block))))
+        backup_path: Optional[Path] = None
+        if backup:
+            backup_path = _sqlite_backup(self.conn, Path(self.db_path))
+        migrated: List[str] = []
+        now = now_iso()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for finding in unproven:
+                if policy != "block_unadmitted":
+                    continue
+                dependants = self._unadmitted_dependants(
+                    run_id, finding.tests_node_id)
+                if not dependants:
+                    continue
+                _detail, detail_json = _canonical_detail({
+                    "policy": policy,
+                    "tests_node_id": finding.tests_node_id,
+                    "candidate_sha": finding.candidate_sha,
+                    "unadmitted_dependants": list(dependants),
+                })
+                self.conn.execute(
+                    "INSERT INTO legacy_test_strength_blocks (run_id,"
+                    " tests_node_id, reason, detail_json, created_at)"
+                    " VALUES (?,?,?,?,?)"
+                    " ON CONFLICT(run_id, tests_node_id) DO NOTHING",
+                    (run_id, finding.tests_node_id,
+                     LEGACY_TEST_STRENGTH_UNPROVEN, detail_json, now))
+                migrated.append(finding.tests_node_id)
+            self.conn.execute("COMMIT")
+        except Exception as error:
+            self.conn.execute("ROLLBACK")
+            if backup_path is not None:
+                _restore_sqlite_backup(Path(self.db_path), backup_path)
+            raise LifecycleError(
+                "test-strength migration of {0} failed and was rolled back; "
+                "backup {1}".format(run_id, backup_path)) from error
+        refreshed = self.legacy_test_strength_audit(run_id, limit=100_000)
+        return TestStrengthMigrationReport(
+            run_id=run_id, contract=contract.value, applied=True,
+            backup_path=None if backup_path is None else str(backup_path),
+            findings=refreshed, blocked_nodes=tuple(would_block),
+            migrated_nodes=tuple(sorted(set(migrated))),
+            reason="applied policy {0}".format(policy))
+
+    def _unadmitted_dependants(
+        self, run_id: str, tests_node_id: str
+    ) -> Tuple[str, ...]:
+        """Dependants of `tests_node_id` that no attempt has ever started.
+
+        "Not yet admitted" is a structural fact, not a judgement: the node is
+        PENDING and the ledger holds no attempt row for it. A node that ever
+        ran was admitted under the pinned contract, and the rollout invariant
+        forbids reaching back through it.
+        """
+        found: List[str] = []
+        for row in self.conn.execute(
+                "SELECT node_id, needs_json FROM dag_nodes WHERE run_id=?",
+                (run_id,)).fetchall():
+            node_id = str(row[0])
+            try:
+                needs = json.loads(str(row[1]))
+            except ValueError:
+                continue
+            if tests_node_id not in (needs or []):
+                continue
+            state = self.conn.execute(
+                "SELECT state FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (run_id, node_id)).fetchone()
+            if state is None or str(state[0]) != st.NodeState.PENDING.value:
+                continue
+            attempted = self.conn.execute(
+                "SELECT 1 FROM attempts WHERE run_id=? AND node_id=? LIMIT 1",
+                (run_id, node_id)).fetchone()
+            if attempted is None:
+                found.append(node_id)
+        return tuple(sorted(found))
+
+    @serialized
+    def legacy_test_strength_blocks(
+        self, run_id: str, *, limit: int = 1000
+    ) -> Tuple[LegacyTestStrengthFinding, ...]:
+        """Tests nodes an operator migration explicitly fenced."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("legacy test strength block limit must be positive")
+        rows = self.conn.execute(
+            "SELECT tests_node_id, reason, detail_json FROM"
+            " legacy_test_strength_blocks WHERE run_id=?"
+            " ORDER BY tests_node_id LIMIT ?",
+            (run_id, limit)).fetchall()
+        return tuple(
+            LegacyTestStrengthFinding(
+                tests_node_id=str(row[0]),
+                state="",
+                candidate_sha=None,
+                classification=str(row[1]),
+                blocking=True,
+                detail=json.loads(str(row[2])))
+            for row in rows)
 
     def _legacy_review_migration_block(
         self, run_id: str, build_node_id: str
@@ -3329,6 +4052,35 @@ class LifecycleStore:
             " detail_json, created_at FROM lane_retry_spend"
             " WHERE run_id=? AND build_node_id=? ORDER BY cycle_seq LIMIT ?",
             (run_id, build_node_id, limit),
+        ).fetchall()
+        return tuple(_lane_retry_spend_from_row(row) for row in rows)
+
+    @serialized
+    def lane_retry_spend_floor(self, run_id: str, build_node_id: str) -> int:
+        """The cycle sequence retained-lane budgets are counted from."""
+        row = self.conn.execute(
+            "SELECT lane_retry_spend_floor FROM node_lifecycle"
+            " WHERE run_id=? AND node_id=?",
+            (run_id, build_node_id),
+        ).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{build_node_id} has no lifecycle row")
+        return int(row[0] or 0)
+
+    @serialized
+    def current_lane_retry_spends(
+        self, run_id: str, build_node_id: str, *, limit: int = 100
+    ) -> Tuple[st.LaneRetrySpend, ...]:
+        """Correction-loop debits recorded after the latest operator boundary."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("lane retry read limit must be a positive integer")
+        floor = self.lane_retry_spend_floor(run_id, build_node_id)
+        rows = self.conn.execute(
+            "SELECT run_id, build_node_id, retry_class, cycle_seq, candidate_sha,"
+            " detail_json, created_at FROM lane_retry_spend"
+            " WHERE run_id=? AND build_node_id=? AND cycle_seq>?"
+            " ORDER BY cycle_seq LIMIT ?",
+            (run_id, build_node_id, floor, limit),
         ).fetchall()
         return tuple(_lane_retry_spend_from_row(row) for row in rows)
 
@@ -5363,7 +6115,12 @@ class LifecycleStore:
             raise
 
     @serialized
-    def _write_resume_transition(self, run_id: str) -> None:
+    def _write_resume_transition(
+        self,
+        run_id: str,
+        *,
+        late_envelope_attempts: Iterable[Tuple[str, int]] = (),
+    ) -> None:
         """Atomically claim a dead run and write its resume boundary.
 
         `cancel_requested` is cleared here because the operator withdrew the
@@ -5378,11 +6135,20 @@ class LifecycleStore:
         remains legal. A recorded owner on another host is unknown, never dead.
 
         Every node's retry-budget floor is raised in the same transaction to
-        the highest attempt already classified. The inherited-attempt
-        accounting below remains separate: a newly classified inherited
-        attempt is still charged against the refreshed floor, while an
-        UNCLASSIFIED attempt costs nothing.
+        the highest attempt already classified. Infrastructure-budget blocks
+        return to PENDING directly. A review-budget block returns only after
+        an explicit grant marked its retained attempt and runtime preflight
+        supplied absence-proven recovery authority for that exact generation.
+        Credential, quiescence, and other adjudicated blocks remain blocked.
+        The inherited-attempt accounting below remains separate: a newly
+        classified inherited attempt is still charged against the refreshed
+        floor, while an UNCLASSIFIED attempt costs nothing.
+
+        `late_envelope_attempts` is absence-proven recovery authority supplied
+        by the runtime preflight. A successful result row alone is not proof
+        that the retained worktree or declaration still exists.
         """
+        proven_late_envelopes = set(late_envelope_attempts)
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             claim = self.conn.execute(
@@ -5433,6 +6199,103 @@ class LifecycleStore:
                 ),
             )
             self.conn.execute(_RAISE_RUN_RETRY_SPEND_FLOOR, (run_id,))
+            self.conn.execute(_RAISE_RUN_LANE_RETRY_SPEND_FLOOR, (run_id,))
+            refreshed_reasons = tuple(
+                reason.value
+                for reason in (
+                    *_RESUME_REFRESHED_BLOCK_REASONS,
+                    st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                )
+            )
+            placeholders = ",".join("?" for _ in refreshed_reasons)
+            refreshed_nodes = self.conn.execute(
+                "SELECT node_id, attempt_no, block_reason FROM node_lifecycle"
+                " WHERE run_id=? AND state=?"
+                f" AND block_reason IN ({placeholders}) ORDER BY node_id",
+                (
+                    run_id,
+                    st.NodeState.BLOCKED.value,
+                    *refreshed_reasons,
+                ),
+            ).fetchall()
+            for node_id, attempt_no, block_reason in refreshed_nodes:
+                late_envelope = (str(node_id), int(attempt_no)) in proven_late_envelopes
+                review_budget = (
+                    block_reason is not None
+                    and st.BlockReason(block_reason)
+                    is st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+                )
+                attempt = None
+                payload: Dict[str, Any] = {}
+                if late_envelope or review_budget:
+                    attempt = self.conn.execute(
+                        "SELECT extra_json FROM attempts"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (run_id, node_id, attempt_no),
+                    ).fetchone()
+                    if attempt is None:
+                        raise UnknownNode(
+                            f"{run_id}/{node_id}#{attempt_no}: attempt row is absent"
+                        )
+                    payload = json.loads(attempt[0] or "{}")
+                    if not isinstance(payload, dict):
+                        payload = {}
+                if review_budget and (
+                    payload.get(REVIEW_BUDGET_RECOVERY_KEY) is not True
+                    or not late_envelope
+                ):
+                    continue
+                phase = (
+                    self._late_envelope_resume_phase(
+                        run_id, str(node_id), payload
+                    ).value
+                    if late_envelope
+                    else None
+                )
+                if late_envelope:
+                    payload.pop(REVIEW_BUDGET_RECOVERY_KEY, None)
+                    payload[LATE_ENVELOPE_RECOVERY_KEY] = True
+                    self.conn.execute(
+                        "UPDATE attempts SET state=?, extra_json=?"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (
+                            CLOSED_ATTEMPT_STATE.value,
+                            json.dumps(payload, sort_keys=True),
+                            run_id,
+                            node_id,
+                            attempt_no,
+                        ),
+                    )
+                self.conn.execute(
+                    "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
+                    " pending_cause=?, lane_phase=?, updated_at=?"
+                    " WHERE run_id=? AND node_id=? AND state=?",
+                    (
+                        st.NodeState.PENDING.value,
+                        st.PendingCause.OPERATOR_RESUME.value,
+                        phase,
+                        now,
+                        run_id,
+                        node_id,
+                        st.NodeState.BLOCKED.value,
+                    ),
+                )
+                self.conn.execute(
+                    "INSERT INTO transitions"
+                    " (run_id, node_id, kind, from_state, to_state, reason,"
+                    " actor, detail_json, created_at)"
+                    " VALUES (?,?,'node',?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        node_id,
+                        st.NodeState.BLOCKED.value,
+                        st.NodeState.PENDING.value,
+                        "resume:retry-budget",
+                        "operator",
+                        "{}",
+                        now,
+                    ),
+                )
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -5459,6 +6322,43 @@ class LifecycleStore:
         return tuple((str(row[0]), int(row[1])) for row in rows)
 
     @serialized
+    def retry_budget_blocked_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
+        """Budget-blocked generations eligible for proof-backed recovery.
+
+        Infrastructure blocks are always eligible at a resume boundary.
+        Review-budget blocks are eligible only after an operator grant marked
+        the exact retained attempt; a bare resume cannot erase adjudication.
+        """
+        reasons = tuple(
+            reason.value
+            for reason in (
+                *_RESUME_REFRESHED_BLOCK_REASONS,
+                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+            )
+        )
+        placeholders = ",".join("?" for _ in reasons)
+        rows = self.conn.execute(
+            "SELECT nl.node_id, nl.attempt_no, nl.block_reason, a.extra_json"
+            " FROM node_lifecycle nl"
+            " LEFT JOIN attempts a ON a.run_id=nl.run_id"
+            " AND a.node_id=nl.node_id AND a.attempt_no=nl.attempt_no"
+            " WHERE nl.run_id=? AND nl.state=?"
+            f" AND nl.block_reason IN ({placeholders}) ORDER BY nl.node_id",
+            (run_id, st.NodeState.BLOCKED.value, *reasons),
+        ).fetchall()
+        eligible = []
+        for node_id, attempt_no, block_reason, extra_json in rows:
+            if block_reason == st.BlockReason.REVIEW_BUDGET_EXHAUSTED.value:
+                payload = json.loads(extra_json or "{}")
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get(REVIEW_BUDGET_RECOVERY_KEY) is not True
+                ):
+                    continue
+            eligible.append((str(node_id), int(attempt_no)))
+        return tuple(eligible)
+
+    @serialized
     def running_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
         """Current RUNNING generations a resumed scheduler may recover."""
         rows = self.conn.execute(
@@ -5467,6 +6367,36 @@ class LifecycleStore:
             (run_id, st.NodeState.RUNNING.value),
         ).fetchall()
         return tuple((str(row[0]), int(row[1])) for row in rows)
+
+    def _late_envelope_resume_phase(
+        self, run_id: str, node_id: str, payload: Mapping[str, Any]
+    ) -> st.LanePhase:
+        """Restore the retained lane phase instead of restarting at BUILDING."""
+        stored = payload.get(LATE_ENVELOPE_PHASE_KEY)
+        if isinstance(stored, str):
+            try:
+                phase = st.LanePhase(stored)
+            except ValueError:
+                phase = None
+            if phase is not None and phase is not st.LanePhase.BLOCKED:
+                return phase
+        if isinstance(payload.get(REPAIR_HANDOFF_RECOVERY_KEY), str):
+            return st.LanePhase.REPAIRING
+        handoff = self.conn.execute(
+            "SELECT state FROM repair_handoffs"
+            " WHERE run_id=? AND build_node_id=?"
+            " ORDER BY rowid DESC LIMIT 1",
+            (run_id, node_id),
+        ).fetchone()
+        if handoff is not None:
+            state = st.RepairHandoffState(str(handoff[0]))
+            if state is st.RepairHandoffState.PENDING:
+                return st.LanePhase.REPAIR_HANDOFF
+            if state is st.RepairHandoffState.SUBMITTED:
+                return st.LanePhase.REPAIRING
+            if state is st.RepairHandoffState.ACKNOWLEDGED:
+                return st.LanePhase.WAITING_FOR_NEW_CANDIDATE
+        return st.LanePhase.BUILDING
 
     @serialized
     def prepare_late_envelope_recovery(
@@ -5497,6 +6427,7 @@ class LifecycleStore:
             payload = json.loads(row[0] or "{}")
             if not isinstance(payload, dict):
                 payload = {}
+            phase = self._late_envelope_resume_phase(run_id, node_id, payload)
             payload[LATE_ENVELOPE_RECOVERY_KEY] = True
             return [
                 (
@@ -5507,7 +6438,7 @@ class LifecycleStore:
                 (
                     "UPDATE node_lifecycle SET lane_phase=?"
                     " WHERE run_id=? AND node_id=? AND lane_phase IS NOT NULL",
-                    (st.LanePhase.BUILDING.value, run_id, node_id),
+                    (phase.value, run_id, node_id),
                 ),
             ]
 
@@ -5591,8 +6522,9 @@ class LifecycleStore:
         This recovery is legal only when all three durable authorities agree:
         the current attempt already has an accepted result, the named immutable
         candidate has a terminal rejection, and its handoff remains recoverable.
-        The guarded node PENDING -> RUNNING transition and cancelled attempt-row
-        reopening are one transaction, so a second scheduler cannot claim a sibling attempt.
+        The guarded node PENDING -> RUNNING transition and closed blocking
+        attempt-row reopening are one transaction, so a second scheduler cannot
+        claim a sibling attempt.
         """
 
         def extra(lifecycle: st.NodeLifecycle):
@@ -5610,10 +6542,13 @@ class LifecycleStore:
                 raise UnknownNode(
                     f"{run_id}/{build_node_id}#{attempt_no}: attempt row is absent"
                 )
-            if attempt[0] != st.NodeState.CANCELLED.value:
+            if attempt[0] not in (
+                st.NodeState.CANCELLED.value,
+                st.NodeState.BLOCKED.value,
+            ):
                 raise IllegalTransition(
                     f"{run_id}/{build_node_id}#{attempt_no}: "
-                    f"attempt is {attempt[0]}, not CANCELLED"
+                    f"attempt is {attempt[0]}, not CANCELLED or BLOCKED"
                 )
             if attempt[1] not in (
                 None,
@@ -5848,12 +6783,14 @@ class LifecycleStore:
         facts, and guessing that an unrecorded cancellation was merely a pause
         is the guess that reopens an adjudicated run."""
         requested_recoveries = set(late_envelope_attempts)
-        current_running = set(self.running_attempts(run_id))
-        unknown_recoveries = requested_recoveries - current_running
+        recoverable_attempts = set(self.running_attempts(run_id))
+        recoverable_attempts.update(self.retry_budget_blocked_attempts(run_id))
+        unknown_recoveries = requested_recoveries - recoverable_attempts
         if unknown_recoveries:
             raise ResumeRefused(
                 f"{run_id}: late-envelope recovery does not name current "
-                f"RUNNING attempts: {sorted(unknown_recoveries)!r}"
+                "RUNNING or retry-budget-blocked attempts: "
+                f"{sorted(unknown_recoveries)!r}"
             )
         outcome = self.latest_outcome(run_id)
         cause = self.run_cancel_cause(run_id)
@@ -5889,7 +6826,9 @@ class LifecycleStore:
                 f"only a run stopped by an operator's `run cancel` is "
                 f"reopenable; this one {why}"
             )
-        self._write_resume_transition(run_id)
+        self._write_resume_transition(
+            run_id, late_envelope_attempts=requested_recoveries
+        )
         # Before the inherited attempts, and deliberately: these nodes hold no
         # attempt this process could inherit -- `cancel_run` closed every one
         # of them in the transaction that wrote the state -- so reopening them
@@ -6136,38 +7075,28 @@ class LifecycleStore:
     def retry(
         self, run_id: str, node_id: str, *, force: bool = False, grant: int = 0
     ) -> st.NodeLifecycle:
-        """BLOCKED -> PENDING, or stranded RUNNING -> PENDING when the
-        scheduler is provably dead. `force` grants exactly one extra attempt
-        beyond the semantic ceiling, and `grant` grants exactly that many,
-        neither raising the cap itself (§7.5, §11.3).
+        """Issue an operator retry or grant against one blocked generation.
+
+        Most retries move ``BLOCKED`` to ``PENDING`` and begin a new attempt.
+        A positive grant against ``REVIEW_BUDGET_EXHAUSTED`` is different:
+        the rejected candidate, repair handoff, worktree, and actor generation
+        belong to the current attempt. The grant therefore leaves that attempt
+        blocked and marks it for proof-backed recovery by ``run resume``.
+        Runtime preflight must still prove the retained worktree and actor
+        absence before the same attempt may return to the frontier.
 
         ``grant`` sizes the durable semantic and review-rejection budgets.
         Semantic spend is counted from classified attempts; review spend is
         counted independently in ``lane_retry_spends``. Both are cumulative
-        across candidate bases for this run and node, so a grant must name the
-        full additional distance in the one legal state transition.
+        across candidate bases for this run and node.
 
-        The escape's *identity* is unchanged: any grant is still
-        `Escape.RETRY_FORCE`, because a grant of three is the same operator
-        decision as a grant of one taken three rounds later, and a second
-        escape verb would have to be threaded through `exits_for` and every
-        refusal surface to say nothing new. The magnitude is a typed field on
-        the transition's detail, where `run status` reads it back, rather than
-        a distinction in the vocabulary.
+        The escape's identity is unchanged: any positive grant is
+        ``Escape.RETRY_FORCE``. Its magnitude is recorded in transition detail.
 
-        **The retry-class budgets are refreshed here, and they take no
-        magnitude.** `grant` sizes the two *ceilings* — review and semantic —
-        which count a node's judged work and where the right answer is "how
-        many more rounds", a number only the operator knows. The retry classes
-        count infrastructure faults, and a node handed back to the scheduler
-        after its launcher budget went to a defect that has since been fixed
-        needs the whole allowance rather than a number reverse-engineered from
-        a count no report carries: the escape exists to put the node back on
-        the frontier, and returning it there already exhausted schedules it
-        only to block again on first contact (#92). So the floor is raised for
-        the one node this escape names — which is the granularity a `run
-        resume` flag cannot express, since it raises the ceiling for every
-        node in the run and leaves the deployment's configuration edited (#91).
+        Retry-class budgets are refreshed here without a magnitude. Launcher
+        and environmental failures are infrastructure tolerance, so the named
+        node gets a fresh configured allowance rather than an operator-sized
+        adjudication budget.
         """
         if grant < 0:
             raise EscapeRefused(f"{node_id}: retry grant must be positive, got {grant}")
@@ -6182,6 +7111,64 @@ class LifecycleStore:
             )
         delta = grant if grant else (1 if force else 0)
         self._require_escape_legal(run_id)
+        current = self.get_node(run_id, node_id)
+        retained_review = (
+            delta > 0
+            and current.state is st.NodeState.BLOCKED
+            and current.block_reason is st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+        )
+        if retained_review:
+
+            def retain_attempt(lifecycle: st.NodeLifecycle):
+                row = self.conn.execute(
+                    "SELECT extra_json FROM attempts"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (run_id, node_id, lifecycle.attempt_no),
+                ).fetchone()
+                if row is None:
+                    raise UnknownNode(
+                        f"{run_id}/{node_id}#{lifecycle.attempt_no}: attempt row is absent"
+                    )
+                payload = json.loads(row[0] or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+                if payload.get(REVIEW_BUDGET_RECOVERY_KEY) is True:
+                    raise EscapeRefused(
+                        f"{node_id}: review-budget recovery is already granted"
+                    )
+                payload[REVIEW_BUDGET_RECOVERY_KEY] = True
+                return [
+                    (
+                        "UPDATE attempts SET extra_json=?"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (
+                            json.dumps(payload, sort_keys=True),
+                            run_id,
+                            node_id,
+                            lifecycle.attempt_no,
+                        ),
+                    ),
+                    (_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+                    (_RAISE_NODE_LANE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+                ]
+
+            self._transition_node(
+                run_id,
+                node_id,
+                st.NodeState.BLOCKED,
+                actor="operator",
+                reason=st.Escape.RETRY_FORCE.value,
+                block_reason=st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                require_state=(st.NodeState.BLOCKED,),
+                granted_extra_delta=delta,
+                detail={
+                    "granted_extra_delta": delta,
+                    "retained_attempt_recovery_requested": True,
+                },
+                extra_writes=retain_attempt,
+            )
+            return self.get_node(run_id, node_id)
+
         stranded, detail = self._prepare_stranded_running(
             run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL
         )
@@ -6205,6 +7192,7 @@ class LifecycleStore:
             return [
                 reset_phase,
                 (_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+                (_RAISE_NODE_LANE_RETRY_SPEND_FLOOR, (run_id, node_id)),
             ] + list(stranded(lifecycle) if stranded else ())
 
         reason = st.Escape.RETRY_FORCE.value if delta else st.Escape.RETRY.value
@@ -7002,6 +7990,17 @@ class LifecycleReader:
             is not None
         )
 
+    def _columns(self, table: str) -> Tuple[str, ...]:
+        """The columns a table actually has. A read-only handle cannot run
+        `_migrate`, so an older ledger is read for what it holds rather than
+        for what this binary would have created."""
+        return tuple(
+            str(row[1])
+            for row in self.conn.execute(
+                "PRAGMA table_info({0})".format(table)
+            ).fetchall()
+        )
+
     def lane_candidates(
         self, run_id: str, build_node_id: Optional[str] = None, *, limit: int = 100
     ) -> Tuple[st.LaneCandidate, ...]:
@@ -7095,6 +8094,104 @@ class LifecycleReader:
             )
             for row in rows
         )
+
+    def test_strength_contract(self, run_id: str) -> st.TestStrengthContract:
+        """The contract this run was created under. NULL, and a ledger with no
+        column at all, both read as the legacy pin."""
+        if "test_strength_contract" not in self._columns("runs"):
+            return st.DEFAULT_TEST_STRENGTH_CONTRACT
+        rows = self._rows(
+            "SELECT test_strength_contract FROM runs WHERE run_id=?", (run_id,))
+        if not rows or rows[0]["test_strength_contract"] is None:
+            return st.DEFAULT_TEST_STRENGTH_CONTRACT
+        try:
+            return st.TestStrengthContract(str(rows[0]["test_strength_contract"]))
+        except ValueError:
+            raise LifecycleError(
+                "run {0} is pinned to an unknown test-strength contract".format(
+                    run_id)) from None
+
+    def test_gate_evidence(
+        self, run_id: str, tests_node_id: Optional[str] = None, *,
+        limit: int = 1000
+    ) -> Tuple[TestGateEvidenceRecord, ...]:
+        """Recorded gate-strength measurements. Empty on a ledger without the
+        table, which is a run that predates the contract, never a run whose
+        tests were measured and found strong."""
+        if not self._has_table("test_gate_evidence"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("test gate evidence limit must be positive")
+        sql = ("SELECT tests_node_id, candidate_sha, runner, selector, strong,"
+               " refusal, evidence_json, created_at FROM test_gate_evidence"
+               " WHERE run_id=?")
+        params: Tuple[Any, ...] = (run_id,)
+        if tests_node_id is not None:
+            sql += " AND tests_node_id=?"
+            params += (tests_node_id,)
+        rows = self._rows(
+            sql + " ORDER BY tests_node_id, created_at, rowid LIMIT ?",
+            params + (limit,))
+        return tuple(
+            TestGateEvidenceRecord(
+                tests_node_id=row["tests_node_id"],
+                candidate_sha=row["candidate_sha"],
+                runner=row["runner"], selector=row["selector"],
+                strong=bool(row["strong"]),
+                refusal=row["refusal"],
+                evidence=json.loads(row["evidence_json"]),
+                created_at=row["created_at"], created=False)
+            for row in rows)
+
+    def test_pairings(
+        self, run_id: str, build_node_id: Optional[str] = None, *,
+        limit: int = 1000
+    ) -> Tuple[TestPairing, ...]:
+        if not self._has_table("test_implementation_pairings"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("test pairing read limit must be positive")
+        sql = ("SELECT build_node_id, tests_node_id, accepted_test_sha,"
+               " implementation_sha, verifier_command, selector,"
+               " executed_cases, coverage_json, created_at"
+               " FROM test_implementation_pairings WHERE run_id=?")
+        params: Tuple[Any, ...] = (run_id,)
+        if build_node_id is not None:
+            sql += " AND build_node_id=?"
+            params += (build_node_id,)
+        rows = self._rows(
+            sql + " ORDER BY build_node_id, tests_node_id, rowid LIMIT ?",
+            params + (limit,))
+        return tuple(
+            TestPairing(
+                build_node_id=row["build_node_id"],
+                tests_node_id=row["tests_node_id"],
+                accepted_test_sha=row["accepted_test_sha"],
+                implementation_sha=row["implementation_sha"],
+                verifier_command=row["verifier_command"],
+                selector=row["selector"],
+                executed_cases=int(row["executed_cases"]),
+                coverage=json.loads(row["coverage_json"]),
+                created_at=row["created_at"])
+            for row in rows)
+
+    def legacy_test_strength_blocks(
+        self, run_id: str, *, limit: int = 1000
+    ) -> Tuple[LegacyTestStrengthFinding, ...]:
+        if not self._has_table("legacy_test_strength_blocks"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("legacy test strength block limit must be positive")
+        rows = self._rows(
+            "SELECT tests_node_id, reason, detail_json FROM"
+            " legacy_test_strength_blocks WHERE run_id=?"
+            " ORDER BY tests_node_id LIMIT ?", (run_id, limit))
+        return tuple(
+            LegacyTestStrengthFinding(
+                tests_node_id=row["tests_node_id"], state="",
+                candidate_sha=None, classification=row["reason"],
+                blocking=True, detail=json.loads(row["detail_json"]))
+            for row in rows)
 
     def lane_retry_spends(
         self, run_id: str, build_node_id: str, *, limit: int = 100

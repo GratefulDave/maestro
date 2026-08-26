@@ -434,16 +434,21 @@ class PersistentCandidateLoopTests(SchedulerFixture):
         repair_baseline = wt.take_baseline(attempt)
         (attempt.path / "a.py").write_text("unpublished repair\n")
         after = wt.inventory(attempt.path)
-        unpublished_repair = wt.commit_measured_delta(
+        first_repair_commit = wt.commit_measured_delta(
             attempt,
             wt.delta(repair_baseline, after),
             after,
             "unpublished repair",
         )
-        self.assertNotEqual(unpublished_repair, candidate.candidate_sha)
+        self.assertNotEqual(first_repair_commit, candidate.candidate_sha)
+        (attempt.path / "a.py").write_text("final unpublished repair\n")
+        _git(attempt.path, "add", "a.py")
+        _git(attempt.path, "commit", "-m", "builder follow-up")
+        final_repair_commit = _git(attempt.path, "rev-parse", "HEAD")
+        self.assertNotEqual(final_repair_commit, first_repair_commit)
         self.assertEqual(
             wt.attempt_ref_commit(self.repo, "run1", "a", 1),
-            unpublished_repair,
+            final_repair_commit,
         )
 
         report = self.schedule([self.agent("a")], deps=deps).run()
@@ -456,7 +461,7 @@ class PersistentCandidateLoopTests(SchedulerFixture):
         self.assertEqual(continued, [])
         candidates = self.store.lane_candidates("run1", "a")
         self.assertEqual(len(candidates), 2)
-        self.assertEqual(candidates[1].candidate_sha, unpublished_repair)
+        self.assertEqual(candidates[1].candidate_sha, final_repair_commit)
         self.assertEqual(
             self.store.repair_handoff("run1", "a", candidate.candidate_sha).state,
             st.RepairHandoffState.ACKNOWLEDGED,

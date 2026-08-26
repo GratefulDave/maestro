@@ -1271,6 +1271,7 @@ class OperatorCliTest(unittest.TestCase):
             store = mock.Mock()
             store.quiescence_blocked_attempts.return_value = (("code", 1),)
             store.running_attempts.return_value = ()
+            store.retry_budget_blocked_attempts.return_value = ()
             store.resume_run.side_effect = ResumeReached
             output = io.StringIO()
             with (
@@ -1411,7 +1412,7 @@ class OperatorCliTest(unittest.TestCase):
                     maestro,
                     "_load_runnable_plan",
                     return_value=SimpleNamespace(
-                        agent_nodes=(),
+                                agent_nodes=(),
                         merge_policy=SimpleNamespace(
                             integration_branch="main",
                             integration_gate=SimpleNamespace(
@@ -1857,6 +1858,7 @@ class RunProgressTest(unittest.TestCase):
                 CREATE TABLE candidate_reviews (
                     run_id TEXT NOT NULL,
                     review_node_id TEXT NOT NULL,
+                    candidate_sha TEXT NOT NULL,
                     state TEXT NOT NULL,
                     reviewer_generation INTEGER NOT NULL
                 );
@@ -1867,8 +1869,8 @@ class RunProgressTest(unittest.TestCase):
                 ("run-1", "lane-a", "RUNNING", 2, "REVIEWING", None),
             )
             conn.execute(
-                "INSERT INTO candidate_reviews VALUES (?,?,?,?)",
-                ("run-1", "lane-a::review", "DISPATCHED", 2),
+                "INSERT INTO candidate_reviews VALUES (?,?,?,?,?)",
+                ("run-1", "lane-a::review", "abc123def456", "DISPATCHED", 2),
             )
             conn.commit()
             err = io.StringIO()
@@ -1889,6 +1891,18 @@ class RunProgressTest(unittest.TestCase):
                             json.dumps({"phase": "reviewing"}),
                         ),
                     )
+                    conn.execute(
+                        "INSERT INTO transitions "
+                        "(run_id,node_id,to_state,reason,detail_json) "
+                        "VALUES (?,?,?,?,?)",
+                        (
+                            "run-1",
+                            "lane-a",
+                            None,
+                            "lane-phase",
+                            json.dumps({"from": "BUILDING", "to": "REVIEWING"}),
+                        ),
+                    )
                     conn.commit()
                     deadline = time.monotonic() + 1.0
                     while (
@@ -1907,6 +1921,10 @@ class RunProgressTest(unittest.TestCase):
         self.assertIn("RUNNING", rendered)
         self.assertIn("DISPATCHED", rendered)
         self.assertIn("candidate-review-dispatched", rendered)
+        self.assertIn("candidate abc123def45", rendered)
+        self.assertIn("PHASE", rendered)
+        self.assertIn("BUILDING → REVIEWING", rendered)
+        self.assertNotIn("EVENT  lane-phase", rendered)
         self.assertIn("WAITING", rendered)
 
 

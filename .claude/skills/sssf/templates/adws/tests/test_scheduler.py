@@ -442,7 +442,15 @@ class ReviewProjectionTests(SchedulerFixture):
         self.assertEqual(tuple(scheduler.authored_nodes), ("tests", "build"))
         self.assertIs(scheduler.authored_nodes["tests"], tests)
         self.assertEqual(scheduler.nodes["tests"], tests)
-        self.assertEqual(scheduler.nodes["build"].needs, ("tests",))
+        # The build node now depends on the tests node's *review*, exactly as
+        # it would on another build node's. A tests node is reviewable: it was
+        # not, and a tests node therefore went VERIFIED -> MERGED with no
+        # independent reader, which is the defect
+        # run-8d1a71f463e4430f92a125a8f8b3731d exposed. What "preserved
+        # unchanged" still means, and what this asserts above, is that the
+        # *authored* node is carried verbatim -- the projection adds an edge
+        # and rewrites nothing.
+        self.assertEqual(scheduler.nodes["build"].needs, ("tests::review",))
 
     def test_projects_one_stable_review_per_reviewable_build(self):
         template = self.agent("tests", outputs=("tests/test_build.py",))
@@ -453,8 +461,17 @@ class ReviewProjectionTests(SchedulerFixture):
         scheduler = self.schedule([tests, build, code], deps=self.review_deps())
 
         reviews = scheduler._derived_review_nodes()
-        self.assertEqual({review.node_id for review in reviews}, {"build::review"})
+        # One per *reviewable* node, and a tests node is one. A code node is
+        # not: its acceptance is its command's exit code (§6.2), so there is
+        # no diff a reviewer would be asked about.
+        self.assertEqual(
+            {review.node_id for review in reviews},
+            {"build::review", "tests::review"},
+        )
         self.assertNotIn("code::review", scheduler.nodes)
+        tests_review = scheduler.nodes["tests::review"]
+        self.assertIs(tests_review.kind, st.NodeKind.REVIEW)
+        self.assertEqual(tests_review.review_of, "tests")
         build_review = scheduler.nodes["build::review"]
         self.assertIs(build_review.kind, st.NodeKind.REVIEW)
         self.assertEqual(build_review.review_of, "build")
@@ -1790,6 +1807,59 @@ class ResumeTests(SchedulerFixture):
         self.assertEqual((self.integration / "a.py").read_text(), "late\n")
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
+    def test_late_recovery_quiesces_builder_before_inventory(self):
+        node = self.agent("a")
+        scheduler = self.schedule([node])
+        scheduler.project()
+        base = _git(self.integration, "rev-parse", "HEAD")
+        attempt_no = self.store.start_attempt("run1", "a", base)
+        attempt = wt.create_attempt_worktree(
+            self.repo,
+            "run1",
+            "a",
+            attempt_no,
+            base,
+            self.root / "wt",
+            self.root / "scratch",
+        )
+        baseline = wt.take_baseline(attempt)
+        self.store.record_baseline(
+            "run1", "a", attempt_no, baseline, attempt.ignored_at_base
+        )
+        (attempt.path / "a.py").write_text("partial\n")
+        self.store.mark_blocked("run1", "a", st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.store.declare_outcome("run1")
+        self.store.resume_run("run1")
+        self.store.prepare_late_envelope_recovery("run1", "a", attempt_no)
+
+        def quiesce(record, phase):
+            self.quiesce_attempt(record, phase)
+            if phase == "late-envelope-before-inventory":
+                (attempt.path / "a.py").write_text("finished\n")
+
+        report = self.schedule(
+            [node],
+            deps=self.deps(
+                run_node=mock.Mock(side_effect=AssertionError("relaunch")),
+                recover_node=mock.Mock(
+                    return_value=sch.NodeExecution(
+                        envelope_parsed=True,
+                        envelope_payload={"success": True},
+                        exit_code=0,
+                    )
+                ),
+                quiesce_attempt=quiesce,
+            ),
+        ).run()
+
+        self.assertIn(
+            (("run1", "a", attempt_no), "late-envelope-before-inventory"),
+            self.quiesce_calls,
+        )
+        self.assertEqual(self.store.get_node("run1", "a").attempt_no, attempt_no)
+        self.assertEqual((self.integration / "a.py").read_text(), "finished\n")
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
     def test_inherited_running_success_recovers_without_relaunch(self):
         node = self.agent("a")
         scheduler = self.schedule([node])
@@ -1926,7 +1996,7 @@ class ResumeTests(SchedulerFixture):
         )
         self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
 
-    def test_late_recovery_failure_consumes_marker_then_relaunches(self):
+    def test_late_recovery_failure_blocks_retained_attempt_without_relaunch(self):
         node = self.agent("a")
         scheduler = self.schedule([node])
         scheduler.project()
@@ -1949,22 +2019,21 @@ class ResumeTests(SchedulerFixture):
         self.store.declare_outcome("run1")
         self.store.resume_run("run1")
         self.store.prepare_late_envelope_recovery("run1", "a", attempt_no)
-        self.written = {"a": {"a.py": "fresh\n"}}
 
         recover = mock.Mock(side_effect=RuntimeError("unreadable envelope"))
-        relaunch = mock.Mock(side_effect=self.run_node)
+        relaunch = mock.Mock(side_effect=AssertionError("relaunch"))
         report = self.schedule(
             [node], deps=self.deps(run_node=relaunch, recover_node=recover)
         ).run()
 
-        self.assertEqual(recover.call_count, 1)
-        self.assertEqual(relaunch.call_count, 1)
-        self.assertEqual(self.store.get_node("run1", "a").attempt_no, attempt_no + 1)
-        self.assertNotIn(
-            lc.LATE_ENVELOPE_RECOVERY_KEY,
-            self.store.get_attempt("run1", "a", attempt_no).extra,
-        )
-        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+        recover.assert_called_once()
+        relaunch.assert_not_called()
+        lifecycle = self.store.get_node("run1", "a")
+        self.assertEqual(lifecycle.attempt_no, attempt_no)
+        self.assertIs(lifecycle.state, st.NodeState.BLOCKED)
+        self.assertIs(lifecycle.block_reason, st.BlockReason.OUTPUT_IDENTITY_INVALID)
+        self.assertEqual(len(self.store.attempts_for("run1", "a")), 1)
+        self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
 
     def test_crash_after_lane_acceptance_reconciles_and_merges_once(self):
         node = self.agent("a")

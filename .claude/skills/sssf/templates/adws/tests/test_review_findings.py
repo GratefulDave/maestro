@@ -338,6 +338,15 @@ class FindingsVerbTest(FindingsLedgerFixture):
             progress["nodes"][0]["attempts"][0]["legacy_review_findings"], []
         )
 
+    def test_text_status_names_rejected_candidate_review(self):
+        self._create_run()
+        code, output = self._run(["run", "status", "named"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("rejected candidate reviews", output)
+        self.assertIn(REVIEW_NODE, output)
+        self.assertIn(CANDIDATE_ONE[:12], output)
+        self.assertNotIn("merged nodes", output)
+
     def test_unknown_run_refuses_and_missing_ledger_is_not_created(self):
         self._create_run()
         code, output = self._run(["run", "findings", "named", "--run-id", "run-nope"])

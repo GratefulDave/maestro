@@ -391,6 +391,7 @@ class PersistentHandleSubmission(unittest.TestCase):
         runtime = object.__new__(lch.HerdrLauncher)
         runtime._handles_lock = threading.RLock()
         runtime._handles = {handle.correlation_token: handle}
+        runtime._quiescent_since = {}
         runtime._herdr = herdr
         return runtime
 
@@ -451,7 +452,15 @@ class PersistentHandleSubmission(unittest.TestCase):
                 root,
                 environment={"MAESTRO_TEST_ENV": "retained"},
             )
-            herdr = FakeHerdr(agent_status="working")
+
+            class SettlingHerdr(FakeHerdr):
+                def __call__(self, *argv, **kwargs):
+                    result = super().__call__(*argv, **kwargs)
+                    if argv[:2] == ("agent", "wait"):
+                        self.agent_status = "done"
+                    return result
+
+            herdr = SettlingHerdr(agent_status="working")
             runtime = self._runtime(herdr, handle)
             runtime._verified_handle_binding = lambda _handle: None
             observed = []
@@ -464,7 +473,8 @@ class PersistentHandleSubmission(unittest.TestCase):
 
             waits = [call for call in herdr.calls if call[:2] == ("agent", "wait")]
             self.assertEqual(len(waits), 1)
-            self.assertEqual(waits[0][2:5], (handle.agent_name, "--until", "idle"))
+            self.assertEqual(waits[0][2], handle.agent_name)
+            self.assertNotIn("--until", waits[0])
             self.assertIn("7000", waits[0])
             self.assertTrue(observed)
             self.assertTrue(all(env == handle.environment for env in observed))

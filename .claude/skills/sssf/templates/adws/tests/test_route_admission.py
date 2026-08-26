@@ -32,7 +32,7 @@ from adw_modules import route_admission as ra
 from adw_modules.route_receipts import load_admitted_routes, load_route_receipt
 
 
-FAKE_HERDR = r'''#!/usr/bin/env python3
+FAKE_HERDR = r"""#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 root = os.environ["FAKE_ADMIT_ROOT"]
@@ -208,7 +208,7 @@ elif argv[:2] == ["agent", "get"]:
             "interactive_ready": True, "pane_id": reported}}}))
 else:
     print(json.dumps({"result": {}}))
-'''
+"""
 
 
 class RouteAdmissionTest(unittest.TestCase):
@@ -247,8 +247,8 @@ class RouteAdmissionTest(unittest.TestCase):
         # blinds the composer-visibility wait and the receipt scan.
         script = self.root / "text-herdr"
         script.write_text(
-            "#!/bin/sh\nprintf '%s\\n' 'MAESTRO_CLAUDE_RECEIPT_OK'\n",
-            encoding="utf-8")
+            "#!/bin/sh\nprintf '%s\\n' 'MAESTRO_CLAUDE_RECEIPT_OK'\n", encoding="utf-8"
+        )
         script.chmod(0o755)
         payload = ra._herdr(script, "agent", "read", "n", "--source", "visible")
         self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK", ra._pane_text(payload))
@@ -269,11 +269,11 @@ class RouteAdmissionTest(unittest.TestCase):
             "> Reply with exactly MAESTRO_CLAUDE_RECEIPT_OK\n"
             "  and nothing else.\n"
             "\n"
-            "  esc to interrupt\n")
+            "  esc to interrupt\n"
+        )
         self.assertEqual(ra._first_text([{"text": wrapped}], marker, prompt), "")
         answered = wrapped + "\n MAESTRO_CLAUDE_RECEIPT_OK\n"
-        self.assertEqual(
-            ra._first_text([{"text": answered}], marker, prompt), marker)
+        self.assertEqual(ra._first_text([{"text": answered}], marker, prompt), marker)
 
     def test_agent_start_waits_for_a_settled_shell(self) -> None:
         # One ready snapshot can land in the gap before login hooks spawn their
@@ -282,21 +282,41 @@ class RouteAdmissionTest(unittest.TestCase):
 
         def call(*args, timeout=None):
             polls.append(args)
-            return {"result": {"process_info": {
-                "shell_pid": 1, "foreground_process_group_id": 1,
-                "foreground_processes": [{"name": "zsh", "pid": 1}]}}}
+            return {
+                "result": {
+                    "process_info": {
+                        "shell_pid": 1,
+                        "foreground_process_group_id": 1,
+                        "foreground_processes": [{"name": "zsh", "pid": 1}],
+                    }
+                }
+            }
 
         ra._wait_for_available_shell(call, "w1:p2", timeout_s=5.0)
         self.assertGreaterEqual(len(polls), 5)
 
     def test_a_flickering_shell_restarts_the_settle_count(self) -> None:
-        ready = {"result": {"process_info": {
-            "shell_pid": 1, "foreground_process_group_id": 1,
-            "foreground_processes": [{"name": "zsh", "pid": 1}]}}}
-        busy = {"result": {"process_info": {
-            "shell_pid": 1, "foreground_process_group_id": 2,
-            "foreground_processes": [
-                {"name": "security", "pid": 2}, {"name": "zsh", "pid": 1}]}}}
+        ready = {
+            "result": {
+                "process_info": {
+                    "shell_pid": 1,
+                    "foreground_process_group_id": 1,
+                    "foreground_processes": [{"name": "zsh", "pid": 1}],
+                }
+            }
+        }
+        busy = {
+            "result": {
+                "process_info": {
+                    "shell_pid": 1,
+                    "foreground_process_group_id": 2,
+                    "foreground_processes": [
+                        {"name": "security", "pid": 2},
+                        {"name": "zsh", "pid": 1},
+                    ],
+                }
+            }
+        }
         # Ready, ready, then a login hook appears: the count must restart.
         replies = [ready, ready, busy] + [ready] * 8
         seen = []
@@ -335,7 +355,13 @@ class RouteAdmissionTest(unittest.TestCase):
         for route in ("omp", "claude"):
             with self.subTest(route=route):
                 os.environ.pop("closed", None)
-                for name in ("closed", "argv.jsonl", "starts.jsonl", "pane_seq", "launched"):
+                for name in (
+                    "closed",
+                    "argv.jsonl",
+                    "starts.jsonl",
+                    "pane_seq",
+                    "launched",
+                ):
                     leftover = self.root / name
                     if leftover.exists():
                         leftover.unlink()
@@ -345,25 +371,32 @@ class RouteAdmissionTest(unittest.TestCase):
                 self.assertTrue(receipt["visible_pane_cwd_verified"])
                 self.assertTrue(receipt["cancellation_clean"])
                 self.assertEqual(
-                    receipt["first_turn"]["text"],
-                    receipt["continuation_turn"]["text"])
+                    receipt["first_turn"]["text"], receipt["continuation_turn"]["text"]
+                )
                 self.assertEqual(receipt["first_turn"]["exit_code"], 0)
                 if route == "omp":
-                    self.assertEqual(receipt["continuation_turn"]["continued_with"], "-c")
+                    self.assertEqual(
+                        receipt["continuation_turn"]["continued_with"], "-c"
+                    )
                 else:
                     self.assertEqual(
-                        receipt["continuation_turn"]["continued_with"], "--resume")
+                        receipt["continuation_turn"]["continued_with"], "--resume"
+                    )
                     self.assertEqual(
-                        receipt["session_id"],
-                        "11111111-1111-4111-8111-111111111111")
+                        receipt["session_id"], "11111111-1111-4111-8111-111111111111"
+                    )
                 argv = [
-                    entry["argv"] for entry in (
-                        json.loads(line) for line in
-                        (self.root / "argv.jsonl").read_text(
-                            encoding="utf-8").splitlines())
+                    entry["argv"]
+                    for entry in (
+                        json.loads(line)
+                        for line in (self.root / "argv.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    )
                 ]
                 starts = [
-                    (index, command) for index, command in enumerate(argv)
+                    (index, command)
+                    for index, command in enumerate(argv)
                     if command[:2] == ["agent", "start"]
                 ]
                 self.assertEqual(len(starts), 2)
@@ -374,7 +407,8 @@ class RouteAdmissionTest(unittest.TestCase):
                     pane_id = command[command.index("--pane") + 1]
                     self.assertEqual(command[command.index("--timeout") + 1], "180000")
                     wait_indexes = [
-                        wait_index for wait_index, wait in enumerate(argv[:index])
+                        wait_index
+                        for wait_index, wait in enumerate(argv[:index])
                         if wait[:4] == ["pane", "process-info", "--pane", pane_id]
                         and wait_index > last_start
                     ]
@@ -388,41 +422,49 @@ class RouteAdmissionTest(unittest.TestCase):
                     prefix = "admit-{}-{}-".format(route, role)
                     self.assertTrue(
                         name.startswith(prefix),
-                        "{!r} does not start with {!r}".format(name, prefix))
-                    self.assertTrue(name[len(prefix):])
+                        "{!r} does not start with {!r}".format(name, prefix),
+                    )
+                    self.assertTrue(name[len(prefix) :])
                 # Each start must be followed by the documented readiness gate
                 # before its prompt is submitted to the agent composer.
                 for name in started_names:
                     waits = [
-                        index for index, command in enumerate(argv)
+                        index
+                        for index, command in enumerate(argv)
                         if command[:3] == ["agent", "wait", name]
                     ]
                     self.assertEqual(len(waits), 1)
-                    self.assertEqual(
-                        argv[waits[0]][:5],
-                        ["agent", "wait", name, "--until", "idle"])
+                    self.assertEqual(argv[waits[0]][:3], ["agent", "wait", name])
+                    self.assertNotIn("--until", argv[waits[0]])
                     self.assertIn("--timeout", argv[waits[0]])
                     prompts = [
-                        index for index, command in enumerate(argv)
+                        index
+                        for index, command in enumerate(argv)
                         if command[:3] == ["agent", "prompt", name]
                     ]
                     self.assertEqual(len(prompts), 1)
                     self.assertLess(waits[0], prompts[0])
                 submitted = [
-                    command[3] for command in argv
-                    if command[:2] == ["agent", "prompt"]
+                    command[3] for command in argv if command[:2] == ["agent", "prompt"]
                 ]
                 self.assertEqual(len(submitted), 2)
                 for prompt in submitted:
                     self.assertEqual(
                         prompt.startswith(launcher.CLAUDE_TEAM_PROMPT_PREFIX),
-                        route == "claude")
+                        route == "claude",
+                    )
                 # A prompt that submits cleanly needs no key recovery.
-                self.assertFalse(any(
-                    command[:2] in (
-                        ["pane", "run"], ["pane", "send-keys"],
-                        ["agent", "send-keys"])
-                    for command in argv))
+                self.assertFalse(
+                    any(
+                        command[:2]
+                        in (
+                            ["pane", "run"],
+                            ["pane", "send-keys"],
+                            ["agent", "send-keys"],
+                        )
+                        for command in argv
+                    )
+                )
 
     def test_a_stalled_prompt_is_submitted_with_enter_not_prompted_again(self):
         # Herdr reports `agent_prompt_stalled` when the composer took the text
@@ -432,13 +474,19 @@ class RouteAdmissionTest(unittest.TestCase):
         receipt = ra.capture_route(self.spec("omp"))
         self.assertEqual(receipt["first_turn"]["text"], "MAESTRO_OMP_RECEIPT_OK")
         argv = [
-            entry["argv"] for entry in (
-                json.loads(line) for line in
-                (self.root / "argv.jsonl").read_text(encoding="utf-8").splitlines())
+            entry["argv"]
+            for entry in (
+                json.loads(line)
+                for line in (self.root / "argv.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
         ]
         first = next(
-            c[2] for c in argv
-            if c[:2] == ["agent", "start"] and c[2].startswith("admit-omp-first-"))
+            c[2]
+            for c in argv
+            if c[:2] == ["agent", "start"] and c[2].startswith("admit-omp-first-")
+        )
         prompts = [c for c in argv if c[:3] == ["agent", "prompt", first]]
         self.assertEqual(len(prompts), 1)
         keys = [c for c in argv if c[:3] == ["agent", "send-keys", first]]
@@ -464,8 +512,13 @@ class RouteAdmissionTest(unittest.TestCase):
         # name registered, which is exactly that leftover.
         first = ra.capture_route(self.spec("omp"))
         self.assertEqual(self._turn_text(first), "MAESTRO_OMP_RECEIPT_OK")
-        for leftover in ("closed", "argv.jsonl", "starts.jsonl", "pane_seq",
-                         "launched"):
+        for leftover in (
+            "closed",
+            "argv.jsonl",
+            "starts.jsonl",
+            "pane_seq",
+            "launched",
+        ):
             path = self.root / leftover
             if path.exists():
                 path.unlink()
@@ -478,15 +531,22 @@ class RouteAdmissionTest(unittest.TestCase):
         # request a single name twice.
         names = []
         for _ in range(2):
-            for leftover in ("closed", "argv.jsonl", "starts.jsonl",
-                             "pane_seq", "launched"):
+            for leftover in (
+                "closed",
+                "argv.jsonl",
+                "starts.jsonl",
+                "pane_seq",
+                "launched",
+            ):
                 path = self.root / leftover
                 if path.exists():
                     path.unlink()
             ra.capture_route(self.spec("omp"))
             names.extend(
-                command[2] for command in self._argv_log()
-                if command[:2] == ["agent", "start"])
+                command[2]
+                for command in self._argv_log()
+                if command[:2] == ["agent", "start"]
+            )
         self.assertEqual(len(names), 4)
         self.assertEqual(len(set(names)), 4)
 
@@ -495,14 +555,19 @@ class RouteAdmissionTest(unittest.TestCase):
         # reports a healthy agent between turns as `idle` exactly like an
         # abandoned one. So the collision is answered with a different name and
         # never with a rename, a close, or any other removal of the record.
-        names = iter(["admit-omp-first-" + "aa" * 4,
-                      "admit-omp-first-" + "bb" * 4,
-                      "admit-omp-cont-" + "cc" * 4,
-                      "admit-omp-cont-" + "dd" * 4])
+        names = iter(
+            [
+                "admit-omp-first-" + "aa" * 4,
+                "admit-omp-first-" + "bb" * 4,
+                "admit-omp-cont-" + "cc" * 4,
+                "admit-omp-cont-" + "dd" * 4,
+            ]
+        )
         taken = "admit-omp-first-" + "aa" * 4
         os.environ["FAKE_TAKEN_NAMES"] = taken
-        with mock.patch.object(ra, "_admission_agent_name",
-                               lambda route, *, continuing: next(names)):
+        with mock.patch.object(
+            ra, "_admission_agent_name", lambda route, *, continuing: next(names)
+        ):
             receipt = ra.capture_route(self.spec("omp"))
         self.assertEqual(self._turn_text(receipt), "MAESTRO_OMP_RECEIPT_OK")
         argv = self._argv_log()
@@ -511,8 +576,9 @@ class RouteAdmissionTest(unittest.TestCase):
         self.assertEqual(starts[:2], [taken, "admit-omp-first-" + "bb" * 4])
         self.assertFalse([c for c in argv if c[:2] == ["agent", "rename"]])
         self.assertFalse([c for c in argv if c[:2] == ["agent", "stop"]])
-        self.assertFalse([c for c in argv if c[:2] == ["agent", "prompt"]
-                          and c[2] == taken])
+        self.assertFalse(
+            [c for c in argv if c[:2] == ["agent", "prompt"] and c[2] == taken]
+        )
 
     def test_the_taken_name_refusal_is_read_as_a_code_not_as_prose(self):
         # §1.2: the retry keys on Herdr's typed `error.code`. A refusal whose
@@ -521,9 +587,10 @@ class RouteAdmissionTest(unittest.TestCase):
         script.write_text(
             "#!/bin/sh\n"
             "printf '%s' "
-            "'{\"error\":{\"code\":\"agent_name_taken\",\"message\":\"x\"}}'\n"
+            '\'{"error":{"code":"agent_name_taken","message":"x"}}\'\n'
             "exit 1\n",
-            encoding="utf-8")
+            encoding="utf-8",
+        )
         script.chmod(0o755)
         with self.assertRaises(ra.AdmissionError) as caught:
             ra._herdr(script, "agent", "start", "n")
@@ -531,8 +598,8 @@ class RouteAdmissionTest(unittest.TestCase):
 
         prose = self.root / "prose-herdr"
         prose.write_text(
-            "#!/bin/sh\nprintf '%s' 'agent_name_taken'\nexit 1\n",
-            encoding="utf-8")
+            "#!/bin/sh\nprintf '%s' 'agent_name_taken'\nexit 1\n", encoding="utf-8"
+        )
         prose.chmod(0o755)
         with self.assertRaises(ra.AdmissionError) as caught:
             ra._herdr(prose, "agent", "start", "n")
@@ -542,11 +609,17 @@ class RouteAdmissionTest(unittest.TestCase):
         self.assertEqual(
             ra.herdr_error_code(
                 '{"error":{"code":"agent_name_taken","message":"x"},'
-                '"id":"cli:agent:start"}'),
-            "agent_name_taken")
-        for text in ("agent_name_taken", "", "[]",
-                     '{"error":"agent_name_taken"}',
-                     '{"error":{"message":"agent_name_taken"}}'):
+                '"id":"cli:agent:start"}'
+            ),
+            "agent_name_taken",
+        )
+        for text in (
+            "agent_name_taken",
+            "",
+            "[]",
+            '{"error":"agent_name_taken"}',
+            '{"error":{"message":"agent_name_taken"}}',
+        ):
             self.assertEqual(ra.herdr_error_code(text), "")
 
     def test_the_node_launcher_name_is_left_deterministic(self):
@@ -573,7 +646,8 @@ class RouteAdmissionTest(unittest.TestCase):
         argv = self._argv_log()
         self.assertFalse(
             [c for c in argv if c[:2] == ["agent", "prompt"]],
-            "prompt text was submitted to an unproven target")
+            "prompt text was submitted to an unproven target",
+        )
 
     def test_busy_agent_pane_retries_after_shell_recheck(self):
         os.environ["FAKE_BUSY_STARTS"] = "1"
@@ -585,12 +659,15 @@ class RouteAdmissionTest(unittest.TestCase):
         os.environ["FAKE_DELAY_MARKER"] = "1"
         receipt = ra.capture_route(self.spec("omp"))
         self.assertEqual(receipt["first_turn"]["text"], "MAESTRO_OMP_RECEIPT_OK")
-        self.assertEqual(
-            receipt["continuation_turn"]["text"], "MAESTRO_OMP_RECEIPT_OK")
+        self.assertEqual(receipt["continuation_turn"]["text"], "MAESTRO_OMP_RECEIPT_OK")
         prompt_argvs = [
-            entry["argv"] for entry in (
-                json.loads(line) for line in
-                (self.root / "argv.jsonl").read_text(encoding="utf-8").splitlines())
+            entry["argv"]
+            for entry in (
+                json.loads(line)
+                for line in (self.root / "argv.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
             if entry["argv"][:2] == ["agent", "prompt"]
         ]
         self.assertEqual(len(prompt_argvs), 2)
@@ -608,8 +685,8 @@ class RouteAdmissionTest(unittest.TestCase):
             "claude": self.root / "state" / "claude.json",
         }
         written = ra.admit_routes(
-            (self.spec("omp"), self.spec("claude")),
-            destinations, route_seed=seed)
+            (self.spec("omp"), self.spec("claude")), destinations, route_seed=seed
+        )
         self.assertEqual([item.route for item in written], ["omp", "claude"])
         self.assertFalse(any(item.reused for item in written))
         fixtures = Path(__file__).parent / "fixtures" / "step8"
@@ -618,7 +695,9 @@ class RouteAdmissionTest(unittest.TestCase):
         self.assertTrue(admitted.admits("omp"))
         self.assertTrue(admitted.admits("claude"))
         for route, path in destinations.items():
-            self.assertNotEqual(path.read_bytes(), (fixtures / (route + ".json")).read_bytes())
+            self.assertNotEqual(
+                path.read_bytes(), (fixtures / (route + ".json")).read_bytes()
+            )
             load_route_receipt(path, verify_keys=(key,))
 
     def test_second_admit_reuses_verified_bytes_and_does_not_recapture(self):
@@ -630,7 +709,8 @@ class RouteAdmissionTest(unittest.TestCase):
         self.assertFalse(first[0].reused)
         self.assertTrue(second[0].reused)
         self.assertEqual(
-            (self.root / "starts.jsonl").read_text(encoding="utf-8"), starts)
+            (self.root / "starts.jsonl").read_text(encoding="utf-8"), starts
+        )
 
     def test_invalid_existing_receipt_is_not_overwritten(self):
         seed = receipt_crypto.generate_seed()
@@ -646,36 +726,49 @@ class RouteAdmissionTest(unittest.TestCase):
         path = self.root / "state" / "omp.json"
         with self.assertRaisesRegex(ra.AdmissionError, "ROUTE_CWD_UNPROVEN"):
             ra.admit_routes(
-                (self.spec("omp"),), {"omp": path},
-                route_seed=receipt_crypto.generate_seed())
+                (self.spec("omp"),),
+                {"omp": path},
+                route_seed=receipt_crypto.generate_seed(),
+            )
         self.assertFalse(path.exists())
         self.assertFalse(Path(str(path) + ".sig").exists())
 
     def test_composer_text_is_not_a_receipt(self):
         prompt = ra.FIRST_PROMPT.format(marker="MAESTRO_CLAUDE_RECEIPT_OK")
-        self.assertEqual(ra._first_text(
-            [{"text": prompt}], "MAESTRO_CLAUDE_RECEIPT_OK", prompt), "")
-        self.assertEqual(ra._first_text(
-            [{"text": prompt + "\nMAESTRO_CLAUDE_RECEIPT_OK"}],
-            "MAESTRO_CLAUDE_RECEIPT_OK", prompt),
-            "MAESTRO_CLAUDE_RECEIPT_OK")
+        self.assertEqual(
+            ra._first_text([{"text": prompt}], "MAESTRO_CLAUDE_RECEIPT_OK", prompt), ""
+        )
+        self.assertEqual(
+            ra._first_text(
+                [{"text": prompt + "\nMAESTRO_CLAUDE_RECEIPT_OK"}],
+                "MAESTRO_CLAUDE_RECEIPT_OK",
+                prompt,
+            ),
+            "MAESTRO_CLAUDE_RECEIPT_OK",
+        )
 
     def test_missing_marker_writes_no_receipt(self):
         os.environ["FAKE_OMIT_MARKER"] = "1"
         path = self.root / "state" / "omp.json"
         with self.assertRaises(ra.AdmissionError):
             ra.admit_routes(
-                (self.spec("omp"),), {"omp": path},
-                route_seed=receipt_crypto.generate_seed())
+                (self.spec("omp"),),
+                {"omp": path},
+                route_seed=receipt_crypto.generate_seed(),
+            )
         self.assertFalse(path.exists())
 
     def test_failed_cancel_writes_no_receipt(self):
         os.environ["FAKE_CLOSE_FAIL"] = "1"
         path = self.root / "state" / "omp.json"
-        with self.assertRaisesRegex(ra.AdmissionError, "LAUNCH_REFUSED|ROUTE_CANCELLATION"):
+        with self.assertRaisesRegex(
+            ra.AdmissionError, "LAUNCH_REFUSED|ROUTE_CANCELLATION"
+        ):
             ra.admit_routes(
-                (self.spec("omp"),), {"omp": path},
-                route_seed=receipt_crypto.generate_seed())
+                (self.spec("omp"),),
+                {"omp": path},
+                route_seed=receipt_crypto.generate_seed(),
+            )
         self.assertFalse(path.exists())
 
     def test_provision_keys_are_0600_and_reusable(self):
@@ -684,9 +777,11 @@ class RouteAdmissionTest(unittest.TestCase):
         mode = stat.S_IMODE(os.stat(keys_dir / "signing.seed").st_mode)
         self.assertEqual(mode, 0o600)
         env = ra.write_env_file(
-            first, verify_key_env="MAESTRO_VERIFY_KEY",
+            first,
+            verify_key_env="MAESTRO_VERIFY_KEY",
             signing_seed_env="MAESTRO_SIGNING_SEED",
-            route_verify_key_env="MAESTRO_ROUTE_VERIFY_KEY")
+            route_verify_key_env="MAESTRO_ROUTE_VERIFY_KEY",
+        )
         self.assertTrue(env.is_file())
         second = ra.provision_keys(keys_dir)
         self.assertEqual(first.signing_seed, second.signing_seed)
@@ -707,14 +802,19 @@ class BootstrapCliTest(unittest.TestCase):
             (Path(tmp) / "herdr").write_text(FAKE_HERDR, encoding="utf-8")
             (Path(tmp) / "herdr").chmod(0o755)
             (Path(tmp) / "omp").write_text("#!/bin/sh\necho 17.3.4\n", encoding="utf-8")
-            (Path(tmp) / "claude").write_text("#!/bin/sh\necho 2.1.232\n", encoding="utf-8")
+            (Path(tmp) / "claude").write_text(
+                "#!/bin/sh\necho 2.1.232\n", encoding="utf-8"
+            )
             (Path(tmp) / "omp").chmod(0o755)
             (Path(tmp) / "claude").chmod(0o755)
             output = io.StringIO()
-            with helper._repository_cwd(fixture["repo"]), mock_env({
-                    "FAKE_ADMIT_ROOT": tmp,
-                    "FAKE_HERDR_CWD": str(fixture["repo"])}), \
-                    contextlib.redirect_stdout(output):
+            with (
+                helper._repository_cwd(fixture["repo"]),
+                mock_env(
+                    {"FAKE_ADMIT_ROOT": tmp, "FAKE_HERDR_CWD": str(fixture["repo"])}
+                ),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro.main(["bootstrap"])
             payload = json.loads(output.getvalue())
             self.assertEqual(code, 0)
@@ -722,7 +822,8 @@ class BootstrapCliTest(unittest.TestCase):
             keys = ra.provision_keys(fixture["state"] / "keys")
             admitted = load_admitted_routes(
                 {route: Path(path) for route, path in payload["receipts"].items()},
-                verify_keys=(keys.route_public,))
+                verify_keys=(keys.route_public,),
+            )
             self.assertTrue(admitted.admits("omp"))
             self.assertTrue(admitted.admits("claude"))
             # The env-file split, end to end through the real verb rather than
@@ -739,12 +840,16 @@ class BootstrapCliTest(unittest.TestCase):
             author_body = author_env.read_text(encoding="ascii")
             self.assertNotIn("PLANCTL_REVIEWER_HMAC_KEY", author_body)
             self.assertNotIn(keys.reviewer_hmac.hex(), author_body)
-            self.assertIn("PLANCTL_REVIEWER_HMAC_KEY=" + keys.reviewer_hmac.hex(),
-                          reviewer_env.read_text(encoding="ascii"))
+            self.assertIn(
+                "PLANCTL_REVIEWER_HMAC_KEY=" + keys.reviewer_hmac.hex(),
+                reviewer_env.read_text(encoding="ascii"),
+            )
 
             output = io.StringIO()
-            with helper._repository_cwd(fixture["repo"]), \
-                    contextlib.redirect_stdout(output):
+            with (
+                helper._repository_cwd(fixture["repo"]),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro.main(["plan", "validate", "named"])
             self.assertEqual(code, 2)
             self.assertIn("AUTHORING_BLOCKED", output.getvalue())
@@ -782,17 +887,20 @@ class BootstrapCliTest(unittest.TestCase):
                 (fixture["state"] / "route-receipts" / (route + ".json")).unlink()
             (Path(tmp) / "herdr").write_text(FAKE_HERDR, encoding="utf-8")
             (Path(tmp) / "herdr").chmod(0o755)
-            (Path(tmp) / "omp").write_text(
-                "#!/bin/sh\necho 17.3.4\n", encoding="utf-8")
+            (Path(tmp) / "omp").write_text("#!/bin/sh\necho 17.3.4\n", encoding="utf-8")
             (Path(tmp) / "claude").write_text(
-                "#!/bin/sh\necho 2.1.232\n", encoding="utf-8")
+                "#!/bin/sh\necho 2.1.232\n", encoding="utf-8"
+            )
             (Path(tmp) / "omp").chmod(0o755)
             (Path(tmp) / "claude").chmod(0o755)
             output = io.StringIO()
-            with helper._repository_cwd(fixture["repo"]), mock_env({
-                    "FAKE_ADMIT_ROOT": tmp,
-                    "FAKE_HERDR_CWD": str(fixture["repo"])}), \
-                    contextlib.redirect_stdout(output):
+            with (
+                helper._repository_cwd(fixture["repo"]),
+                mock_env(
+                    {"FAKE_ADMIT_ROOT": tmp, "FAKE_HERDR_CWD": str(fixture["repo"])}
+                ),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro.main(["bootstrap"])
             payload = json.loads(output.getvalue())
             self.assertEqual(code, 0)
@@ -800,9 +908,9 @@ class BootstrapCliTest(unittest.TestCase):
             self.assertEqual(sorted(payload["routes"]), ["claude", "omp"])
             keys = ra.provision_keys(fixture["state"] / "keys")
             admitted = load_admitted_routes(
-                {route: Path(path)
-                 for route, path in payload["receipts"].items()},
-                verify_keys=(keys.route_public,))
+                {route: Path(path) for route, path in payload["receipts"].items()},
+                verify_keys=(keys.route_public,),
+            )
             self.assertTrue(admitted.admits("claude"))
             self.assertTrue(admitted.admits("omp"))
 
@@ -820,8 +928,10 @@ class BootstrapCliTest(unittest.TestCase):
             for route in ("omp", "claude"):
                 (fixture["state"] / "route-receipts" / (route + ".json")).unlink()
             output = io.StringIO()
-            with helper._repository_cwd(fixture["repo"]), \
-                    contextlib.redirect_stdout(output):
+            with (
+                helper._repository_cwd(fixture["repo"]),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro.main(["bootstrap"])
             payload = json.loads(output.getvalue())
             self.assertEqual(code, 3)

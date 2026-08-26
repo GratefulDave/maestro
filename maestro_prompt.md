@@ -483,6 +483,7 @@ Preserve SSSF boundaries but make them DAG/Herdr safe:
 - rejection atomically records typed findings and a generation-fenced handoff to the existing builder; a distinct descendant candidate alone reactivates review;
 - builder, reviewer, and worktree remain open through the correction loop and close only after proven terminal acceptance, cancellation, or block cleanup;
 - independent durable retry spends for builder semantics, review rejection, environment, and launcher faults;
+- a forced review-budget grant preserves the blocked candidate, handoff, attempt, worktree, actor generation, and lane phase; only absence-proven resume may reactivate that exact attempt, and it must never allocate a replacement attempt;
 - merge is impossible until the derived review node has an exact PASS receipt for the source node's current candidate SHA;
 - a successful late envelope may continue only its original attempt through the ordinary gates, candidate publication, review, merge, and downstream DAG; it never waives acceptance or mints a replacement attempt;
 - raw output and pane text are evidence only;

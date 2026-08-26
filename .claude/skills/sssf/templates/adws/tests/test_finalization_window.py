@@ -1128,14 +1128,23 @@ class TheFailedStartClocksAreOperatorTunable(unittest.TestCase):
 
 
 def _every_flag(parser) -> "set[str]":
-    """Every option string the CLI exposes, subparsers included."""
+    """Every option string the CLI exposes, subparsers included.
+
+    `choices` is a mapping only on a subparsers action; on an ordinary
+    `--flag` with a value set it is a plain sequence. Descending on the
+    mapping shape rather than assuming one is what keeps this walker from
+    raising the first time any flag declares `choices=(...)`.
+    """
     flags = set()
     pending = [parser]
     while pending:
         current = pending.pop()
         for action in current._actions:
             flags.update(action.option_strings)
-            for choice in (getattr(action, "choices", None) or {}).values():
+            choices = getattr(action, "choices", None)
+            if not hasattr(choices, "values"):
+                continue
+            for choice in choices.values():
                 if hasattr(choice, "_actions"):
                     pending.append(choice)
     return flags

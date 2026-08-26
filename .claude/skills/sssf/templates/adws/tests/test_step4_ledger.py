@@ -558,6 +558,9 @@ class OneQueryPathTests(LedgerFixture):
                 "repair_handoffs",
                 "lane_retry_spend",
                 "legacy_review_migration_blocks",
+                "test_gate_evidence",
+                "test_implementation_pairings",
+                "legacy_test_strength_blocks",
             },
         )
 

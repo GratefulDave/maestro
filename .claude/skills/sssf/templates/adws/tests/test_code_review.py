@@ -1886,13 +1886,20 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 session_path=str(root / "old.jsonl"),
                 correlation_token="run-1-build-builder-g1",
             )
-            new_session = SimpleNamespace(
+            stale_session = SimpleNamespace(
                 generation=2,
-                pane_id="replacement-pane",
-                session_path=str(root / "replacement.jsonl"),
+                pane_id="stale-pane",
+                session_path=str(root / "stale.jsonl"),
                 correlation_token="run-1-build-builder-g2",
             )
-            store.current_actor_session.return_value = old_session
+            new_session = SimpleNamespace(
+                generation=3,
+                pane_id="replacement-pane",
+                session_path=str(root / "replacement.jsonl"),
+                correlation_token="run-1-build-builder-g3",
+            )
+            store.current_actor_session.return_value = None
+            store.actor_sessions.return_value = [old_session, stale_session]
             store.repair_handoff.return_value = None
             store.recover_actor_session.return_value = SimpleNamespace(
                 recovered=True, session=new_session
@@ -1986,8 +1993,15 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                         lambda: False,
                     )
             self.assertIs(repaired.execution, execution)
-            store.recover_actor_session.assert_called_once()
             store.recover_builder_handoff.assert_not_called()
+            store.recover_actor_session.assert_called_once()
+            recovery = store.recover_actor_session.call_args
+            self.assertEqual(recovery.kwargs["expected_generation"], 1)
+            self.assertEqual(recovery.kwargs["generation"], 3)
+            self.assertEqual(
+                runner.launched[0].correlation_token,
+                "run-1-build-builder-g3",
+            )
             store.mark_handoff_submitted.assert_not_called()
             self.assertEqual(len(runner.launched), 1)
 
@@ -2024,6 +2038,21 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
             )
             store = lc.LifecycleStore(root / "lifecycle.sqlite3")
             store.create_run("run-1", "digest", [a_node()])
+            store.ensure_derived_review_node(
+                "run-1", "build", depth=1, downstream_needs=()
+            )
+            store.publish_candidate(
+                "run-1",
+                "build",
+                output_sha,
+                builder_generation=1,
+            )
+            store.begin_review(
+                "run-1",
+                "build::review",
+                output_sha,
+                reviewer_generation=1,
+            )
             store.register_actor_session(
                 "run-1",
                 "build",
@@ -2088,6 +2117,13 @@ class ReviewerLaunchEnvironmentTests(unittest.TestCase):
                 [(session.generation, session.state) for session in sessions],
                 [(1, st.ActorSessionState.CLOSED), (2, st.ActorSessionState.ACTIVE)],
             )
+            durable_review = store.candidate_review(
+                "run-1", "build::review", output_sha
+            )
+            self.assertIsNotNone(durable_review)
+            assert durable_review is not None
+            self.assertEqual(durable_review.reviewer_generation, 2)
+            self.assertIs(durable_review.state, st.CandidateReviewState.DISPATCHED)
             store.close()
 
 

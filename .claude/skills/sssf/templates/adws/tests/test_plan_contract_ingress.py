@@ -233,18 +233,77 @@ class PlanContractIngressTest(unittest.TestCase):
         with self.assertRaisesRegex(pci.IngressError, "UNMAPPABLE_OUTPUTS"):
             pci.project_draft(ir, self.repo)
 
-    def test_projects_a_tests_lane_as_maestro_plan_v3(self):
+    #: A well-formed test-strength contract, as a verifier declares one.
+    STRENGTH = {
+        "coverage": [
+            {"requirement_id": "R1", "aspect": "positive",
+             "case_selector": "test_freeze_pins_the_manifest", "min_cases": 1},
+            {"requirement_id": "R1", "aspect": "negative",
+             "case_selector": "test_freeze_rejects_an_unpinned_source",
+             "min_cases": 1},
+        ],
+        "falsifiability": {
+            "strategy": "baseline_absent",
+            "mutation": None,
+            "expected_failing_selector": "test_freeze",
+            "expected_reason_pattern": "AssertionError",
+        },
+    }
+
+    def _tests_lane_ir(self):
         ir = _ir()
         ir["lanes"][0]["lane_kind"] = "tests"
         ir["requirements"][0]["surface"][0]["path"] = (
             "tests/test_existing.py")
         ir["extensions"]["maestro"]["outputs"]["lane-freeze"] = [
             "tests/test_existing.py"]
+        return ir
+
+    def test_projects_a_tests_lane_as_maestro_plan_v4(self):
+        """v4, not v3: the emitted tests node carries a test-strength
+        contract, which v3's frozen `TestsNode` cannot represent."""
+        ir = self._tests_lane_ir()
+        ir["verifiers"][0]["test_strength"] = dict(self.STRENGTH)
 
         draft = pci.project_draft(ir, self.repo)
 
-        self.assertEqual(pm.SCHEMA_V3, draft["schema_version"])
+        self.assertEqual(pm.SCHEMA_V4, draft["schema_version"])
         self.assertEqual("tests", draft["nodes"][0]["kind"])
+        self.assertEqual(
+            self.STRENGTH["coverage"],
+            draft["nodes"][0]["test_strength"]["coverage"])
+        # It parses back under the version it declares, which is what makes
+        # the projection's output a plan rather than a shape resembling one.
+        parsed = pm.parse_mapping(dict(draft, base_commit="0" * 40))
+        self.assertEqual(1, len(parsed.tests_nodes))
+
+    def test_a_tests_lane_without_a_contract_is_refused(self):
+        """The refusal that keeps `run start`'s remedy real: if this emitted
+        a contract-less tests node, re-shipping from the IR would produce the
+        same refused plan forever."""
+        ir = self._tests_lane_ir()
+        with self.assertRaisesRegex(
+                pci.IngressError, "UNMAPPABLE_VERIFIERS:lane-freeze"
+                ".test_strength"):
+            pci.project_draft(ir, self.repo)
+
+    def test_a_malformed_contract_is_refused_by_the_model_s_own_rules(self):
+        ir = self._tests_lane_ir()
+        broken = dict(self.STRENGTH)
+        broken["coverage"] = [self.STRENGTH["coverage"][0]]
+        ir["verifiers"][0]["test_strength"] = broken
+        with self.assertRaisesRegex(pci.IngressError, "test_strength"):
+            pci.project_draft(ir, self.repo)
+
+    def test_a_contract_on_a_build_lane_is_refused(self):
+        """A field nothing reads (§12.3): a build lane's verifier has no
+        tests node to carry it onto."""
+        ir = _ir()
+        ir["verifiers"][0]["test_strength"] = dict(self.STRENGTH)
+        with self.assertRaisesRegex(
+                pci.IngressError, "UNMAPPABLE_VERIFIERS:lane-freeze"
+                ".test_strength"):
+            pci.project_draft(ir, self.repo)
 
 
 if __name__ == "__main__":
