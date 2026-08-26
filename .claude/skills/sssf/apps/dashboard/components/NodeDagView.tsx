@@ -38,12 +38,13 @@ export function NodeDagView({
               <Link className="dag-node-content" href={`${base}/${encodeURIComponent(node.node_id)}`}>
                 <strong>{node.node_id}</strong>
                 <small>
-                  {node.kind ?? "node"} · {node.state}
+                  {node.kind ?? "node"} · {node.lane_phase ?? node.state}
+                  {node.lane_phase ? ` · node ${node.state}` : ""}
                 </small>
               </Link>
             ),
           },
-          className: `dag-node dag-node-${node.state.toLowerCase()}`,
+          className: `dag-node dag-node-${(node.lane_phase ?? node.state).toLowerCase()}`,
         });
       });
     }
@@ -113,6 +114,7 @@ export function NodeDagView({
                 <th>Node</th>
                 <th>Kind</th>
                 <th>State</th>
+                <th>Lane phase</th>
                 <th>Needs</th>
                 <th>Attempt</th>
               </tr>
@@ -128,6 +130,13 @@ export function NodeDagView({
                   <td>{node.kind ?? "—"}</td>
                   <td>
                     <StatusPill status={node.state} />
+                  </td>
+                  <td>
+                    {node.lane_phase ? (
+                      <StatusPill status={node.lane_phase} />
+                    ) : (
+                      <span className="muted">legacy · use state</span>
+                    )}
                   </td>
                   <td>
                     {node.needs.length === 0 ? (

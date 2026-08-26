@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adw_modules import launcher
+
 # Aliased as well, because several tests below bind a local named `launcher`
 # to a `HerdrLauncher` instance and would otherwise shadow the module.
 from adw_modules import launcher as launcher_module
@@ -37,7 +38,7 @@ from adw_modules.route_receipts import load_admitted_routes, load_public_key
 from adw_modules import worktree as worktree_module
 
 
-FAKE_HERDR = r'''#!/usr/bin/env python3
+FAKE_HERDR = r"""#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 record = os.environ.get("FAKE_HERDR_ARGV")
@@ -170,7 +171,7 @@ elif argv[:2] == ["pane", "send-keys"]:
     print(json.dumps({"result": {"ok": True}}))
 else:
     print(json.dumps({"result": {}}))
-'''
+"""
 
 
 class LauncherContractTest(unittest.TestCase):
@@ -189,17 +190,20 @@ class LauncherContractTest(unittest.TestCase):
         self.herdr.write_text(FAKE_HERDR)
         self.herdr.chmod(0o755)
         self._before = dict(os.environ)
-        os.environ.update({
-            "FAKE_HERDR_ARGV": str(self.root / "argv.jsonl"),
-            "FAKE_HERDR_CLOSE_MARKER": str(self.root / "pane-closed"),
-            "FAKE_HERDR_CWD": str(self.worktree),
-            "FAKE_TRANSCRIPT": str(self.transcript),
-        })
+        os.environ.update(
+            {
+                "FAKE_HERDR_ARGV": str(self.root / "argv.jsonl"),
+                "FAKE_HERDR_CLOSE_MARKER": str(self.root / "pane-closed"),
+                "FAKE_HERDR_CWD": str(self.worktree),
+                "FAKE_TRANSCRIPT": str(self.transcript),
+            }
+        )
         fixtures = Path(__file__).parent / "fixtures" / "step8"
         key = load_public_key(fixtures / "route_receipts.pub")
         self.admitted_routes = load_admitted_routes(
             {"omp": fixtures / "omp.json", "claude": fixtures / "claude.json"},
-            verify_keys=(key,))
+            verify_keys=(key,),
+        )
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -229,8 +233,9 @@ class LauncherContractTest(unittest.TestCase):
         """The one `pane split` argv, which is the pane's whole launch surface."""
         splits = [call for call in calls if call[:2] == ["pane", "split"]]
         if len(splits) != 1:
-            raise AssertionError("expected exactly one pane split, got {}".format(
-                len(splits)))
+            raise AssertionError(
+                "expected exactly one pane split, got {}".format(len(splits))
+            )
         return splits[0]
 
     @staticmethod
@@ -250,34 +255,57 @@ class LauncherContractTest(unittest.TestCase):
         return pane_env
 
     def recorded_calls(self):
-        return [json.loads(line)["argv"]
-                for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        return [
+            json.loads(line)["argv"]
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
 
     def test_launch_verifies_pane_cwd_not_foreground_cwd(self):
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         handle = launcher.launch(self.spec())
         self.assertEqual(handle.launched_cwd, self.worktree.resolve())
         self.assertEqual(handle.pane_id, "w1:p2")
 
     def test_claude_prompt_has_the_required_team_prefix(self):
         launcher = HerdrLauncher(
-            herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=self.admitted_routes)
+            admitted_routes=self.admitted_routes,
+        )
         launcher.launch(self.spec("claude"))
         self.assertEqual(
             self.prompt.read_text(),
-            launcher_module.CLAUDE_TEAM_PROMPT_PREFIX + "do the work")
+            launcher_module.CLAUDE_TEAM_PROMPT_PREFIX + "do the work",
+        )
 
     def test_claude_prompt_prefix_is_idempotent(self):
         spec = self.spec("claude")
         launcher_module.prepare_route_prompt(spec)
         launcher_module.prepare_route_prompt(spec)
         self.assertEqual(
-            self.prompt.read_text().count(
-                launcher_module.CLAUDE_TEAM_PROMPT_PREFIX), 1)
+            self.prompt.read_text().count(launcher_module.CLAUDE_TEAM_PROMPT_PREFIX), 1
+        )
+
+    def test_claude_prompt_prefix_carries_the_idle_evidence_rule(self):
+        """The operating rule the prefix must state: a teammate is idle only
+        on a real SendMessage result or ListAgents no longer reporting it
+        running. Silence, flat mtime, and idle_notification are never
+        evidence -- the same law LIVE_WORKING_STATUSES enforces runtime-side.
+        """
+        self.assertIn("idle only when", launcher_module.CLAUDE_TEAM_PROMPT_PREFIX)
+        self.assertIn("SendMessage result", launcher_module.CLAUDE_TEAM_PROMPT_PREFIX)
+        self.assertIn("herdr agent list", launcher_module.CLAUDE_TEAM_PROMPT_PREFIX)
+        for non_evidence in ("Silence", "flat transcript mtime", "idle_notification"):
+            self.assertIn(non_evidence, launcher_module.CLAUDE_TEAM_PROMPT_PREFIX)
+        self.assertIn(
+            "never start its work yourself", launcher_module.CLAUDE_TEAM_PROMPT_PREFIX
+        )
 
     def test_omp_prompt_does_not_get_the_claude_team_prefix(self):
         launcher_module.prepare_route_prompt(self.spec("omp"))
@@ -288,12 +316,14 @@ class LauncherContractTest(unittest.TestCase):
         # have no JSON output mode. Rejecting that as PROTOCOL_INVALID_JSON
         # blinds the composer-visibility wait and the receipt scan.
         script = self.root / "text-herdr"
-        script.write_text(
-            "#!/bin/sh\nprintf '%s\\n' 'MAESTRO_CLAUDE_RECEIPT_OK'\n")
+        script.write_text("#!/bin/sh\nprintf '%s\\n' 'MAESTRO_CLAUDE_RECEIPT_OK'\n")
         script.chmod(0o755)
-        harness = HerdrLauncher(herdr_path=script, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=script,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         payload = harness._herdr("agent", "read", "n", "--source", "visible")
         self.assertIn("MAESTRO_CLAUDE_RECEIPT_OK", payload["result"]["text"])
         payload = harness._herdr("pane", "read", "w1:p2", "--source", "visible")
@@ -306,10 +336,14 @@ class LauncherContractTest(unittest.TestCase):
         fixtures = Path(__file__).parent / "fixtures" / "step8"
         claude_only = load_admitted_routes(
             {"claude": fixtures / "claude.json"},
-            verify_keys=(load_public_key(fixtures / "route_receipts.pub"),))
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=claude_only)
+            verify_keys=(load_public_key(fixtures / "route_receipts.pub"),),
+        )
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=claude_only,
+        )
         with self.assertRaisesRegex(RuntimeError, "ROUTE_NOT_ADMITTED:omp"):
             launcher.launch(self.spec("omp"))
         self.assertFalse((self.root / "argv.jsonl").exists())
@@ -323,9 +357,12 @@ class LauncherContractTest(unittest.TestCase):
         # agent whose pane never received these wrote 226 `.pyc` files and a
         # `.pytest_cache` into its worktree running its own tests, and was
         # convicted under the permission check for the harness's omission.
-        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         harness.launch(self.spec())
         split = self.split_call(self.recorded_calls())
         pane_env = self.pane_environment(split)
@@ -334,12 +371,15 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(pane_env, expected)
         # Every redirected path must land in the attempt's scratch, outside the
         # worktree, or the redirect is decorative.
-        self.assertEqual(pane_env["PYTHONPYCACHEPREFIX"],
-                         str(self.scratch / "pycache"))
-        self.assertIn("cache_dir={}".format(self.scratch / "pytest_cache"),
-                      pane_env["PYTEST_ADDOPTS"])
+        self.assertEqual(pane_env["PYTHONPYCACHEPREFIX"], str(self.scratch / "pycache"))
+        self.assertIn(
+            "cache_dir={}".format(self.scratch / "pytest_cache"),
+            pane_env["PYTEST_ADDOPTS"],
+        )
         for key, value in pane_env.items():
-            path = value.split("cache_dir=", 1)[-1] if key == "PYTEST_ADDOPTS" else value
+            path = (
+                value.split("cache_dir=", 1)[-1] if key == "PYTEST_ADDOPTS" else value
+            )
             self.assertTrue(Path(path).is_relative_to(self.scratch), key)
             self.assertFalse(Path(path).is_relative_to(self.worktree), key)
 
@@ -351,11 +391,8 @@ class LauncherContractTest(unittest.TestCase):
         pane_env = self.pane_environment(("pane", "split") + flags)
         self.assertEqual(
             pane_env["PYTEST_ADDOPTS"],
-            "-o cache_dir={}".format(self.scratch / "pytest_cache"))
-
-
-
-
+            "-o cache_dir={}".format(self.scratch / "pytest_cache"),
+        )
 
     def test_launch_refuses_when_herdr_cannot_name_the_current_pane(self):
         """No pane to split from is a refusal, not a fall back to `--current`.
@@ -373,36 +410,47 @@ class LauncherContractTest(unittest.TestCase):
         The refusal is the fail-closed floor under that check, not a path the
         runtime is expected to take.
         """
-        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         os.environ["FAKE_NO_CURRENT_PANE"] = "1"
         self.addCleanup(os.environ.pop, "FAKE_NO_CURRENT_PANE", None)
         with self.assertRaises(launcher_module.LaunchRefused) as caught:
             harness.launch(self.spec())
 
-        self.assertIs(caught.exception.refusal,
-                      launcher_module.LaunchRefusal.SPLIT_PARENT_UNRESOLVED)
+        self.assertIs(
+            caught.exception.refusal,
+            launcher_module.LaunchRefusal.SPLIT_PARENT_UNRESOLVED,
+        )
         # Nothing was split, so nothing was left behind and the refusal says so
         # — and it stays retryable, because herdr may answer the next ask.
         self.assertEqual(
-            [call for call in self.recorded_calls()
-             if call[:2] == ["pane", "split"]], [])
+            [call for call in self.recorded_calls() if call[:2] == ["pane", "split"]],
+            [],
+        )
         self.assertFalse(caught.exception.pane_created)
         self.assertFalse(caught.exception.deterministic)
 
     def test_launch_splits_the_resolved_parent_and_stays_in_its_workspace(self):
         """Every pane of a run belongs to one workspace, and it is measured."""
-        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         handle = harness.launch(self.spec())
 
         split = self.split_call(self.recorded_calls())
         self.assertEqual(split[2], "w1:p0")
         self.assertNotIn("--current", split)
-        self.assertEqual(launcher_module.workspace_of(handle.pane_id),
-                         launcher_module.workspace_of("w1:p0"))
+        self.assertEqual(
+            launcher_module.workspace_of(handle.pane_id),
+            launcher_module.workspace_of("w1:p0"),
+        )
         # The direction is a pure function of how many panes this launcher has
         # already split, so the first is deterministic (§ the alternation rule
         # lives in `test_pane_placement.py`).
@@ -414,13 +462,15 @@ class LauncherContractTest(unittest.TestCase):
         # untrusted code runs rather than degraded into a conviction (§8.3).
         environment = worktree_module.launch_env(self.scratch)
         del environment["PYTHONPYCACHEPREFIX"]
-        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         with self.assertRaisesRegex(
-                RuntimeError,
-                "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"
-                ) as caught:
+            RuntimeError, "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:PYTHONPYCACHEPREFIX"
+        ) as caught:
             harness.launch(replace(self.spec(), environment=environment))
         self.assertFalse((self.root / "argv.jsonl").exists())
         # The absence of `argv.jsonl` is what "before creating a pane" means
@@ -428,37 +478,50 @@ class LauncherContractTest(unittest.TestCase):
         # launcher. §8.3's quiesce step is downstream and cannot see it, so the
         # launcher states it as a typed field on the refusal rather than
         # leaving the scheduler to infer it from a message (§16.3 item 45).
-        self.assertIs(caught.exception.refusal,
-                      launcher_module.LaunchRefusal.SCRATCH_REDIRECT_MISSING)
+        self.assertIs(
+            caught.exception.refusal,
+            launcher_module.LaunchRefusal.SCRATCH_REDIRECT_MISSING,
+        )
         self.assertFalse(caught.exception.pane_created)
         self.assertTrue(caught.exception.deterministic)
 
     def test_launch_refuses_wrong_pane_cwd_before_starting_agent(self):
         os.environ["FAKE_HERDR_CWD"] = str(self.root / "wrong")
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         with self.assertRaisesRegex(RuntimeError, "BINDING_MISMATCH"):
             launcher.launch(self.spec())
-        calls = [json.loads(line)["argv"] for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        calls = [
+            json.loads(line)["argv"]
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
         self.assertNotIn(["agent", "start"], [call[:2] for call in calls])
         self.assertIn(["pane", "close", "w1:p2"], calls)
 
     def test_launch_waits_for_shell_then_starts_agent_once(self):
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         handle = launcher.launch(self.spec())
         self.assertEqual(handle.pane_id, "w1:p2")
-        calls = [json.loads(line)["argv"]
-                 for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        calls = [
+            json.loads(line)["argv"]
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
         wait_indexes = [
-            index for index, call in enumerate(calls)
+            index
+            for index, call in enumerate(calls)
             if call[:2] == ["pane", "process-info"]
         ]
         start_indexes = [
-            index for index, call in enumerate(calls)
-            if call[:2] == ["agent", "start"]
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "start"]
         ]
         # The shell must look ready on several consecutive snapshots before we
         # start: one ready snapshot can land in the gap before login hooks
@@ -467,14 +530,22 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(len(start_indexes), 1)
         self.assertLess(wait_indexes[4], start_indexes[0])
         for index in wait_indexes:
-            self.assertEqual(
-                calls[index],
-                ["pane", "process-info", "--pane", "w1:p2"])
+            self.assertEqual(calls[index], ["pane", "process-info", "--pane", "w1:p2"])
         start = calls[start_indexes[0]]
         self.assertEqual(
             start[:9],
-            ["agent", "start", start[2], "--kind", "omp",
-             "--pane", "w1:p2", "--timeout", "180000"])
+            [
+                "agent",
+                "start",
+                start[2],
+                "--kind",
+                "omp",
+                "--pane",
+                "w1:p2",
+                "--timeout",
+                "180000",
+            ],
+        )
         self.assertEqual(start[9], "--")
         self.assertEqual(calls[start_indexes[0] + 1][:2], ["pane", "get"])
         # The coder is waited to its interactive composer before the complete
@@ -482,25 +553,25 @@ class LauncherContractTest(unittest.TestCase):
         # that races OMP initialization and can execute only the prompt's
         # leading command.
         wait_indexes = [
-            index for index, call in enumerate(calls)
-            if call[:2] == ["agent", "wait"]
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
         ]
         self.assertEqual(len(wait_indexes), 1)
         wait = calls[wait_indexes[0]]
         self.assertEqual(wait[:5], ["agent", "wait", start[2], "--until", "idle"])
         self.assertIn("--timeout", wait)
-        route_argv = start[start.index("--") + 1:]
+        route_argv = start[start.index("--") + 1 :]
         self.assertFalse(any(arg.startswith("@") for arg in route_argv))
-        prompts = [call for call in calls
-                   if call[:2] == ["agent", "prompt"]]
+        prompts = [call for call in calls if call[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompts), 1)
-        self.assertEqual(
-            prompts[0][3], "@{0}".format(self.prompt.resolve()))
+        self.assertEqual(prompts[0][3], "@{0}".format(self.prompt.resolve()))
         self.assertLess(wait_indexes[0], calls.index(prompts[0]))
-        self.assertFalse(any(
-            call[:2] in (["pane", "run"], ["pane", "send-keys"],
-                         ["agent", "send-keys"])
-            for call in calls))
+        self.assertFalse(
+            any(
+                call[:2]
+                in (["pane", "run"], ["pane", "send-keys"], ["agent", "send-keys"])
+                for call in calls
+            )
+        )
 
     def test_launch_waits_for_a_transcript_path_that_arrives_after_start(self):
         # `agent start` returns once herdr holds the process, which for the omp
@@ -511,9 +582,12 @@ class LauncherContractTest(unittest.TestCase):
         # that lost it died at turn zero.
         os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
         os.environ["FAKE_SESSION_TAGGED"] = "1"
-        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         handle = harness.launch(self.spec())
         self.assertEqual(handle.transcript_path, self.transcript)
         # The tailer must be registered for the resolved path, not skipped
@@ -522,8 +596,7 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(tailer.path, self.transcript)
         # And the registry must still name the object the caller holds.
         self.assertIs(harness._handles["run1-node_a-1"], handle)
-        self.assertIn(["agent", "get", handle.agent_name],
-                      self.recorded_calls())
+        self.assertIn(["agent", "get", handle.agent_name], self.recorded_calls())
 
     def test_launch_bounds_the_wait_when_no_transcript_ever_arrives(self):
         # The bounded half: when the path genuinely never appears the wait
@@ -531,9 +604,12 @@ class LauncherContractTest(unittest.TestCase):
         # SESSION_PATH_MISSING is still reachable rather than traded for a hang.
         os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
         os.environ["FAKE_SESSION_NEVER"] = "1"
-        harness = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        harness = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         with mock.patch.object(launcher, "TRANSCRIPT_PATH_TIMEOUT_S", 0.05):
             started = time.monotonic()
             handle = harness.launch(self.spec())
@@ -549,19 +625,24 @@ class LauncherContractTest(unittest.TestCase):
 
         def herdr_call(*args, **kwargs):
             calls.append(args)
-            return {"result": {"agent": {
-                "agent_session": {"kind": "id", "value": "abc"}}}}
+            return {
+                "result": {"agent": {"agent_session": {"kind": "id", "value": "abc"}}}
+            }
 
         slept = []
-        self.assertIsNone(launcher.wait_for_agent_transcript(
-            herdr_call, "a", 0.0, poll_interval_s=0.0, sleep=slept.append))
+        self.assertIsNone(
+            launcher.wait_for_agent_transcript(
+                herdr_call, "a", 0.0, poll_interval_s=0.0, sleep=slept.append
+            )
+        )
         self.assertEqual(calls, [("agent", "get", "a")])
 
     def test_claude_session_id_resolves_the_exact_cwd_transcript(self):
         config = self.root / "claude"
         project = "".join(
             character if character.isalnum() or character == "-" else "-"
-            for character in str(self.worktree.resolve()))
+            for character in str(self.worktree.resolve())
+        )
         transcript = config / "projects" / project / "session-123.jsonl"
         transcript.parent.mkdir(parents=True)
         transcript.write_text("{}\n")
@@ -575,17 +656,25 @@ class LauncherContractTest(unittest.TestCase):
 
         self.assertEqual(
             launcher_module._agent_transcript_path(
-                agent, self.worktree, {"CLAUDE_CONFIG_DIR": str(config)}),
-            transcript)
+                agent, self.worktree, {"CLAUDE_CONFIG_DIR": str(config)}
+            ),
+            transcript,
+        )
 
     def test_launch_refusal_closes_the_allocated_pane(self):
         os.environ["FAKE_HERDR_REFUSE"] = "1"
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         with self.assertRaisesRegex(RuntimeError, "LAUNCH_REFUSED") as caught:
             launcher.launch(self.spec())
-        calls = [json.loads(line)["argv"] for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        calls = [
+            json.loads(line)["argv"]
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
         self.assertIn(["pane", "close", "w1:p2"], calls)
         # A pane was allocated and this handler closed it, so the refusal
         # reports the close herdr accepted rather than a constant. Saying
@@ -594,15 +683,18 @@ class LauncherContractTest(unittest.TestCase):
         # launch failure into a terminal QUIESCENCE_UNPROVEN. The close-failed
         # direction is the control, in `test_launch_refusal_cleanup.py`.
         self.assertIsInstance(caught.exception, launcher_module.LaunchRefused)
-        self.assertIs(caught.exception.refusal,
-                      launcher_module.LaunchRefusal.AGENT_START_REFUSED)
+        self.assertIs(
+            caught.exception.refusal, launcher_module.LaunchRefusal.AGENT_START_REFUSED
+        )
         self.assertFalse(caught.exception.pane_created)
 
     def test_launch_refuses_os_failure_as_typed_refusal(self):
-        launcher = HerdrLauncher(herdr_path=self.root / "missing-herdr",
-                                 omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        launcher = HerdrLauncher(
+            herdr_path=self.root / "missing-herdr",
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         with self.assertRaisesRegex(RuntimeError, "LAUNCH_REFUSED"):
             launcher.launch(self.spec())
 
@@ -613,76 +705,97 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(launcher.poll(handle).state, PollState.GONE)
 
     def test_lifecycle_uses_immutable_launch_environment(self):
-        environment = dict(worktree_module.launch_env(self.scratch),
-                           FAKE_LAUNCH_ENV="bound-context")
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        environment = dict(
+            worktree_module.launch_env(self.scratch), FAKE_LAUNCH_ENV="bound-context"
+        )
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         handle = launcher.launch(replace(self.spec(), environment=environment))
         environment["FAKE_LAUNCH_ENV"] = "mutated-context"
         with self.assertRaises(TypeError):
             handle.environment["FAKE_LAUNCH_ENV"] = "other-context"
         launcher.poll(handle)
         launcher.cancel(handle, time.monotonic() + 1.0)
-        calls = [json.loads(line) for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        calls = [
+            json.loads(line)
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
         self.assertTrue(calls)
         self.assertTrue(all(call["environment"] == "bound-context" for call in calls))
 
     def test_cancel_removes_handle_only_after_proving_pane_gone(self):
         runtime = HerdrLauncher(
-            herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=self.admitted_routes)
+            admitted_routes=self.admitted_routes,
+        )
         handle = runtime.launch(self.spec())
 
         runtime.cancel(handle, time.monotonic() + 1.0)
         runtime.cancel(handle, time.monotonic() + 1.0)
 
-        calls = [json.loads(line)["argv"]
-                 for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        calls = [
+            json.loads(line)["argv"]
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
         self.assertEqual(
             [call for call in calls if call[:2] == ["pane", "close"]],
-            [["pane", "close", handle.pane_id]])
+            [["pane", "close", handle.pane_id]],
+        )
         self.assertEqual(runtime.reclaim(handle.correlation_token), ())
 
     def test_cancel_preserves_handle_when_pane_close_fails(self):
         runtime = HerdrLauncher(
-            herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=self.admitted_routes)
+            admitted_routes=self.admitted_routes,
+        )
         handle = runtime.launch(self.spec())
         os.environ["FAKE_HERDR_CLOSE_FAILURE"] = "1"
 
         with self.assertRaisesRegex(
-                HarnessQuiescenceError, "HERDR_QUIESCENCE_UNPROVEN"):
+            HarnessQuiescenceError, "HERDR_QUIESCENCE_UNPROVEN"
+        ):
             runtime.cancel(handle, time.monotonic() + 1.0)
 
         self.assertEqual(runtime.reclaim(handle.correlation_token), (handle,))
 
     def test_cancel_preserves_handle_when_close_does_not_stop_agent(self):
         runtime = HerdrLauncher(
-            herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=self.admitted_routes)
+            admitted_routes=self.admitted_routes,
+        )
         handle = runtime.launch(self.spec())
         os.environ["FAKE_HERDR_CLOSE_DOES_NOT_STOP_AGENT"] = "1"
 
         with self.assertRaisesRegex(
-                HarnessQuiescenceError, "HERDR_QUIESCENCE_UNPROVEN"):
+            HarnessQuiescenceError, "HERDR_QUIESCENCE_UNPROVEN"
+        ):
             runtime.cancel(handle, time.monotonic() + 1.0)
 
         self.assertEqual(runtime.reclaim(handle.correlation_token), (handle,))
 
     def test_cancel_maps_poll_transport_failure_to_unproven_quiescence(self):
         runtime = HerdrLauncher(
-            herdr_path=self.herdr, omp_path=Path("/opt/omp"),
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=self.admitted_routes)
+            admitted_routes=self.admitted_routes,
+        )
         handle = runtime.launch(self.spec())
         os.environ["FAKE_HERDR_GET_FAILURE"] = "1"
 
         with self.assertRaisesRegex(
-                HarnessQuiescenceError, "HERDR_QUIESCENCE_UNPROVEN"):
+            HarnessQuiescenceError, "HERDR_QUIESCENCE_UNPROVEN"
+        ):
             runtime.cancel(handle, time.monotonic() + 1.0)
 
         self.assertEqual(runtime.reclaim(handle.correlation_token), (handle,))
@@ -691,25 +804,35 @@ class LauncherContractTest(unittest.TestCase):
         prompt_bytes = "sensitive prompt bytes " * 2048
         os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
         self.prompt.write_text(prompt_bytes, encoding="utf-8")
-        launcher = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                 claude_path=Path("/opt/claude"),
-                                 admitted_routes=self.admitted_routes)
+        launcher = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
 
         launcher.launch(self.spec("claude"))
 
-        calls = [json.loads(line)["argv"]
-                 for line in (self.root / "argv.jsonl").read_text().splitlines()]
+        calls = [
+            json.loads(line)["argv"]
+            for line in (self.root / "argv.jsonl").read_text().splitlines()
+        ]
         prompt_calls = [call for call in calls if call[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompt_calls), 1)
         bootstrap = prompt_calls[0][3]
         self.assertEqual(bootstrap, "@{0}".format(self.prompt.resolve()))
         self.assertNotIn(prompt_bytes, json.dumps(calls))
-        wait_index = next(index for index, call in enumerate(calls)
-                          if call[:2] == ["agent", "wait"])
-        prompt_index = next(index for index, call in enumerate(calls)
-                            if call[:2] == ["agent", "prompt"])
-        transcript_index = next(index for index, call in enumerate(calls)
-                                if call[:2] == ["agent", "get"])
+        wait_index = next(
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
+        )
+        prompt_index = next(
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "prompt"]
+        )
+        transcript_index = next(
+            index
+            for index, call in enumerate(calls)
+            if index > prompt_index and call[:2] == ["agent", "get"]
+        )
         self.assertLess(wait_index, prompt_index)
         self.assertLess(prompt_index, transcript_index)
 
@@ -719,18 +842,25 @@ class LauncherContractTest(unittest.TestCase):
                 herdr_path=self.herdr,
                 omp_path=Path("/opt/omp"),
                 claude_path=Path("/opt/claude"),
-                admitted_routes=self.admitted_routes)
-            runtime.launch(replace(
-                self.spec("claude"),
-                correlation_token="run1-node_a-{}".format(attempt)))
+                admitted_routes=self.admitted_routes,
+            )
+            runtime.launch(
+                replace(
+                    self.spec("claude"),
+                    correlation_token="run1-node_a-{}".format(attempt),
+                )
+            )
 
         calls = self.recorded_calls()
-        starts = [index for index, call in enumerate(calls)
-                  if call[:2] == ["agent", "start"]]
-        waits = [index for index, call in enumerate(calls)
-                 if call[:2] == ["agent", "wait"]]
-        prompts = [index for index, call in enumerate(calls)
-                   if call[:2] == ["agent", "prompt"]]
+        starts = [
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "start"]
+        ]
+        waits = [
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
+        ]
+        prompts = [
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "prompt"]
+        ]
         self.assertEqual(len(starts), 2)
         self.assertEqual(len(waits), 2)
         self.assertEqual(len(prompts), 2)
@@ -744,18 +874,24 @@ class LauncherContractTest(unittest.TestCase):
                 herdr_path=self.herdr,
                 omp_path=Path("/opt/omp"),
                 claude_path=Path("/opt/claude"),
-                admitted_routes=self.admitted_routes)
-            runtime.launch(replace(
-                self.spec("omp"),
-                correlation_token="run1-node_a-{}".format(attempt)))
+                admitted_routes=self.admitted_routes,
+            )
+            runtime.launch(
+                replace(
+                    self.spec("omp"), correlation_token="run1-node_a-{}".format(attempt)
+                )
+            )
 
         calls = self.recorded_calls()
-        starts = [index for index, call in enumerate(calls)
-                  if call[:2] == ["agent", "start"]]
-        waits = [index for index, call in enumerate(calls)
-                 if call[:2] == ["agent", "wait"]]
-        prompts = [index for index, call in enumerate(calls)
-                   if call[:2] == ["agent", "prompt"]]
+        starts = [
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "start"]
+        ]
+        waits = [
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
+        ]
+        prompts = [
+            index for index, call in enumerate(calls) if call[:2] == ["agent", "prompt"]
+        ]
         self.assertEqual(len(starts), 2)
         self.assertEqual(len(waits), 2)
         self.assertEqual(len(prompts), 2)
@@ -763,23 +899,26 @@ class LauncherContractTest(unittest.TestCase):
             self.assertLess(start, ready)
             self.assertLess(ready, prompt)
 
-
     def test_a_claude_composer_that_stalls_is_recovered_with_enter(self):
-        """A composer that swallows the prompt must still be caught.
+        """A Claude composer that swallows the prompt must still be caught.
 
-        Both routes hand `@<path>` to a ready composer. A composer that
+        Direct Claude hands `@<path>` to a ready composer. A composer that
         swallows the text reports `idle` exactly like one that took it. The
         pane's monotonic `revision` is the only thing that separates them, so
-        this drives the real recovery loop through `launch`.
+        this drives the real Claude recovery loop through `launch`.
         """
         os.environ["FAKE_PROMPT_STALLS"] = "1"
-        runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
+        runtime = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
         runtime.launch(self.spec("claude"))
         calls = self.recorded_calls()
         self.assertEqual(
-            len([call for call in calls if call[:2] == ["agent", "prompt"]]), 1)
+            len([call for call in calls if call[:2] == ["agent", "prompt"]]), 1
+        )
         # Enter was pressed on what the composer was already holding, and the
         # prompt was never re-issued -- a second `agent prompt` would append to
         # the unsubmitted line and send both as one garbled turn.
@@ -796,11 +935,20 @@ class LauncherContractTest(unittest.TestCase):
         """
         os.environ["FAKE_PANE_WITHOUT_REVISION"] = "1"
         os.environ["FAKE_AGENT_STATUS"] = "idle"
-        runtime = HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                                claude_path=Path("/opt/claude"),
-                                admitted_routes=self.admitted_routes)
-        with self.assertRaises(launcher.PromptSubmissionUnobservable):
+        runtime = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
+        with self.assertRaises(launcher.LaunchRefused) as caught:
             runtime.launch(self.spec("claude"))
+        self.assertIs(
+            caught.exception.refusal, launcher.LaunchRefusal.PROMPT_SUBMISSION_REFUSED
+        )
+        self.assertIsInstance(
+            caught.exception.__cause__, launcher.PromptSubmissionUnobservable
+        )
 
     def test_reclaim_matches_exact_token_only(self):
         launcher = FakeLauncher()
@@ -810,16 +958,23 @@ class LauncherContractTest(unittest.TestCase):
 
     def test_classification_is_closed(self):
         launcher = FakeLauncher()
-        self.assertEqual(launcher.classify(FileNotFoundError()), ErrorClass.CONFIGURATION)
+        self.assertEqual(
+            launcher.classify(FileNotFoundError()), ErrorClass.CONFIGURATION
+        )
         self.assertEqual(launcher.classify(TimeoutError()), ErrorClass.TRANSIENT)
-        self.assertEqual(launcher.classify(PermissionError()), ErrorClass.AUTHENTICATION)
+        self.assertEqual(
+            launcher.classify(PermissionError()), ErrorClass.AUTHENTICATION
+        )
         self.assertEqual(launcher.classify(ValueError()), ErrorClass.PROTOCOL)
         self.assertEqual(launcher.classify(RuntimeError()), ErrorClass.EXECUTION)
 
     def _launcher(self) -> HerdrLauncher:
-        return HerdrLauncher(herdr_path=self.herdr, omp_path=Path("/opt/omp"),
-                             claude_path=Path("/opt/claude"),
-                             admitted_routes=self.admitted_routes)
+        return HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
 
     def test_fresh_idle_blocked_done_stay_nonterminal(self):
         route = self._launcher()
@@ -840,7 +995,8 @@ class LauncherContractTest(unittest.TestCase):
         route = self._launcher()
         handle = route.launch(self.spec())
         self.transcript.write_text(
-            json.dumps({"type": "maestro_envelope", "success": True}) + "\n")
+            json.dumps({"type": "maestro_envelope", "success": True}) + "\n"
+        )
         os.environ["FAKE_AGENT_STATUS"] = "working"
         state = route.poll(handle)
         self.assertEqual(state.state, PollState.EXITED)
@@ -857,7 +1013,8 @@ class LauncherContractTest(unittest.TestCase):
         route = self._launcher()
         handle = route.launch(self.spec())
         self.transcript.write_text(
-            json.dumps({"type": "maestro_envelope", "success": True}) + "\n")
+            json.dumps({"type": "maestro_envelope", "success": True}) + "\n"
+        )
         os.environ["FAKE_AGENT_STATUS"] = "idle"
         state = route.poll(handle)
         self.assertEqual(state.state, PollState.EXITED)
@@ -883,8 +1040,8 @@ class LauncherContractTest(unittest.TestCase):
         route = self._launcher()
         handle = route.launch(self.spec())
         self.envelope.write_text(
-            json.dumps({"success": True, "summary": "10 passed"}),
-            encoding="utf-8")
+            json.dumps({"success": True, "summary": "10 passed"}), encoding="utf-8"
+        )
         os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
         state = route.poll(handle)
         self.assertEqual(state.state, PollState.EXITED)
@@ -896,8 +1053,7 @@ class LauncherContractTest(unittest.TestCase):
         # laundered into GONE either, or the retry class is decided by a race.
         route = self._launcher()
         handle = route.launch(self.spec())
-        self.envelope.write_text(
-            json.dumps({"success": False}), encoding="utf-8")
+        self.envelope.write_text(json.dumps({"success": False}), encoding="utf-8")
         os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
         state = route.poll(handle)
         self.assertEqual(state.state, PollState.EXITED)
@@ -910,7 +1066,8 @@ class LauncherContractTest(unittest.TestCase):
         route = self._launcher()
         handle = route.launch(self.spec())
         self.transcript.write_text(
-            json.dumps({"type": "maestro_envelope", "success": True}) + "\n")
+            json.dumps({"type": "maestro_envelope", "success": True}) + "\n"
+        )
         os.environ["FAKE_AGENT_SESSION_EXITED"] = "1"
         state = route.poll(handle)
         self.assertEqual(state.state, PollState.EXITED)
@@ -947,8 +1104,12 @@ class LauncherContractTest(unittest.TestCase):
     def test_an_envelope_without_a_success_verdict_is_not_a_success(self):
         # `success` absent, or present but not the boolean `true`, is not a
         # declaration of success. Only `is True` counts.
-        for payload in ({}, {"summary": "did things"}, {"success": "true"},
-                        {"success": 1}):
+        for payload in (
+            {},
+            {"summary": "did things"},
+            {"success": "true"},
+            {"success": 1},
+        ):
             with self.subTest(payload=payload):
                 route = self._launcher()
                 handle = route.launch(self.spec())
@@ -977,15 +1138,17 @@ class LauncherContractTest(unittest.TestCase):
         # merely contains the word is a different refusal and must surface.
         script = self.root / "prose-herdr"
         script.write_text(
-            "#!/bin/sh\nprintf '%s' 'agent_not_found'\nexit 1\n",
-            encoding="utf-8")
+            "#!/bin/sh\nprintf '%s' 'agent_not_found'\nexit 1\n", encoding="utf-8"
+        )
         script.chmod(0o755)
         route = self._launcher()
         handle = route.launch(self.spec())
         prose = HerdrLauncher(
-            herdr_path=script, omp_path=Path("/opt/omp"),
+            herdr_path=script,
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=self.admitted_routes)
+            admitted_routes=self.admitted_routes,
+        )
         with self.assertRaises(launcher.HerdrCallError) as caught:
             prose.poll(handle)
         self.assertEqual(caught.exception.code, "")
@@ -998,8 +1161,7 @@ class LauncherContractTest(unittest.TestCase):
         # PANE_STILL_LIVE, and refuse quiescence for every node that worked.
         route = self._launcher()
         handle = route.launch(self.spec())
-        self.envelope.write_text(
-            json.dumps({"success": True}), encoding="utf-8")
+        self.envelope.write_text(json.dumps({"success": True}), encoding="utf-8")
         route.cancel(handle, time.monotonic() + 1.0)
         self.assertEqual(route.reclaim(handle.correlation_token), ())
 
@@ -1016,7 +1178,8 @@ class TranscriptAndRouteTest(unittest.TestCase):
         transcript = self.root / "session.jsonl"
         transcript.write_bytes(
             b'{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}\n'
-            b'{"type":"message_end"')
+            b'{"type":"message_end"'
+        )
         tailer = TranscriptTailer(transcript)
         records = tailer.read_new()
         self.assertEqual(len(records), 1)
@@ -1024,7 +1187,9 @@ class TranscriptAndRouteTest(unittest.TestCase):
 
     def test_tailer_synthesizes_success_only_from_success_envelope(self):
         transcript = self.root / "session.jsonl"
-        transcript.write_text(json.dumps({"type": "maestro_envelope", "success": True}) + "\n")
+        transcript.write_text(
+            json.dumps({"type": "maestro_envelope", "success": True}) + "\n"
+        )
         tailer = TranscriptTailer(transcript)
         tailer.read_new()
         self.assertEqual(tailer.synthesized_exit(), (0, "ENVELOPE_SUCCESS"))
@@ -1034,7 +1199,17 @@ class TranscriptAndRouteTest(unittest.TestCase):
         self.assertEqual(empty.synthesized_exit(), (1, "NO_ENVELOPE"))
 
     def test_omp_argv_uses_profile_and_session_only(self):
-        spec = LaunchSpec("t", self.root, self.root / "p", self.root / "e", "omp", "provider/model", "high", "latest-profile", self.root / "s")
+        spec = LaunchSpec(
+            "t",
+            self.root,
+            self.root / "p",
+            self.root / "e",
+            "omp",
+            "provider/model",
+            "high",
+            "latest-profile",
+            self.root / "s",
+        )
         argv = build_omp_argv(Path("/bin/omp"), spec)
         self.assertEqual(argv[0], "/bin/omp")
         self.assertIn("--profile", argv)
@@ -1044,7 +1219,17 @@ class TranscriptAndRouteTest(unittest.TestCase):
         self.assertNotIn("--effort", argv)
 
     def test_claude_argv_is_direct_and_unattended(self):
-        spec = LaunchSpec("t", self.root, self.root / "p", self.root / "e", "claude", "opus", "high", None, self.root / "s")
+        spec = LaunchSpec(
+            "t",
+            self.root,
+            self.root / "p",
+            self.root / "e",
+            "claude",
+            "opus",
+            "high",
+            None,
+            self.root / "s",
+        )
         argv = build_claude_argv(Path("/bin/claude"), spec)
         self.assertEqual(argv[0], "/bin/claude")
         self.assertIn("--dangerously-skip-permissions", argv)
@@ -1063,7 +1248,11 @@ class ProcessGroupTest(unittest.TestCase):
 
     def test_quiesce_kills_the_whole_group(self):
         process = subprocess.Popen(
-            [sys.executable, "-c", "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); time.sleep(60)"],
+            [
+                sys.executable,
+                "-c",
+                "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); time.sleep(60)",
+            ],
             start_new_session=True,
         )
         try:
@@ -1081,10 +1270,8 @@ class ProcessGroupTest(unittest.TestCase):
             signals.append(sig)
             return original_killpg(process_group, sig)
 
-        with mock.patch.object(launcher.os, "killpg",
-                               side_effect=record_signal):
-            result = run_harness_process(
-                [sys.executable, "-c", "pass"], cwd=self.root)
+        with mock.patch.object(launcher.os, "killpg", side_effect=record_signal):
+            result = run_harness_process([sys.executable, "-c", "pass"], cwd=self.root)
 
         self.assertEqual(result.returncode, 0)
         self.assertNotIn(signal.SIGTERM, signals)
@@ -1101,7 +1288,8 @@ class ProcessGroupTest(unittest.TestCase):
         process_group = None
         try:
             result = run_harness_process(
-                [sys.executable, "-c", program, str(marker)], cwd=self.root)
+                [sys.executable, "-c", program, str(marker)], cwd=self.root
+            )
             process_group = int(marker.read_text())
             self.assertEqual(result.returncode, 0)
             with self.assertRaises(ProcessLookupError):

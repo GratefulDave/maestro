@@ -24,6 +24,7 @@ Both arms are driven below. Neither passes under the other's implementation:
 the pre-pane arm fails if quiesce still runs, and the post-pane arm fails if
 the skip is widened to every launch failure.
 """
+
 from __future__ import annotations
 
 import sys
@@ -34,17 +35,19 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from adw_modules import launcher as lch          # noqa: E402
-from adw_modules import retry_policy as rp       # noqa: E402
-from adw_modules import scheduler as sch         # noqa: E402
-from adw_modules import scheduler_types as st    # noqa: E402
+from adw_modules import launcher as lch  # noqa: E402
+from adw_modules import retry_policy as rp  # noqa: E402
+from adw_modules import scheduler as sch  # noqa: E402
+from adw_modules import scheduler_types as st  # noqa: E402
 
-from test_scheduler import SchedulerFixture      # noqa: E402
+from test_scheduler import SchedulerFixture  # noqa: E402
 
 
-def wrapped(refusal: lch.LaunchRefusal, detail: str = "",
-            failure: rp.LauncherFailure = rp.LauncherFailure.STARTUP
-            ) -> sch.LaunchFailed:
+def wrapped(
+    refusal: lch.LaunchRefusal,
+    detail: str = "",
+    failure: rp.LauncherFailure = rp.LauncherFailure.STARTUP,
+) -> sch.LaunchFailed:
     """A refusal as the runtime delivers it to the scheduler.
 
     `maestro._typed_launch` catches whatever the launcher raised and re-raises
@@ -57,40 +60,46 @@ def wrapped(refusal: lch.LaunchRefusal, detail: str = "",
         raise lch.LaunchRefused(refusal, detail)
     except lch.LaunchRefused as exc:
         try:
-            raise sch.LaunchFailed(failure, "{0}: {1}".format(
-                type(exc).__name__, exc)) from exc
+            raise sch.LaunchFailed(
+                failure, "{0}: {1}".format(type(exc).__name__, exc)
+            ) from exc
         except sch.LaunchFailed as wrapper:
             return wrapper
 
 
 # ── the launcher's own typed report ─────────────────────────────────────────
 
-class RefusalFactsTests(unittest.TestCase):
 
+class RefusalFactsTests(unittest.TestCase):
     def test_a_pre_split_refusal_reports_that_no_pane_exists(self):
         """`pane_env_flags` runs while the split's arguments are being built,
         so its refusal is raised before herdr is called at all."""
         with self.assertRaises(lch.LaunchRefused) as caught:
             lch.pane_env_flags({})
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING)
+        self.assertIs(
+            caught.exception.refusal, lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING
+        )
         self.assertFalse(caught.exception.pane_created)
 
     def test_post_split_refusals_report_that_a_pane_may_exist(self):
         """§16.3 item 45 names both by name: marking these proven-absent would
         report a fact nobody measured."""
-        for refusal in (lch.LaunchRefusal.SHELL_NOT_READY,
-                        lch.LaunchRefusal.NO_PANE):
+        for refusal in (lch.LaunchRefusal.SHELL_NOT_READY, lch.LaunchRefusal.NO_PANE):
             with self.subTest(refusal=refusal.code):
                 self.assertTrue(lch.LaunchRefused(refusal).pane_created)
 
     def test_the_message_is_unchanged_so_the_ledger_reads_the_same(self):
         self.assertEqual(
-            str(lch.LaunchRefused(lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING,
-                                  "TMPDIR,PYTEST_ADDOPTS")),
-            "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:TMPDIR,PYTEST_ADDOPTS")
-        self.assertEqual(str(lch.LaunchRefused(lch.LaunchRefusal.NO_PANE)),
-                         "LAUNCH_REFUSED:NO_PANE")
+            str(
+                lch.LaunchRefused(
+                    lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "TMPDIR,PYTEST_ADDOPTS"
+                )
+            ),
+            "LAUNCH_REFUSED:SCRATCH_REDIRECT_MISSING:TMPDIR,PYTEST_ADDOPTS",
+        )
+        self.assertEqual(
+            str(lch.LaunchRefused(lch.LaunchRefusal.NO_PANE)), "LAUNCH_REFUSED:NO_PANE"
+        )
 
     def test_an_untyped_launch_failure_still_demands_the_proof(self):
         """Fail-closed. A `LaunchFailed` that carries no refusal has not
@@ -100,11 +109,12 @@ class RefusalFactsTests(unittest.TestCase):
 
 # ── the scheduler, both arms ────────────────────────────────────────────────
 
-class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
 
+class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
     def _quiesce_phases(self, node_id="a"):
-        return [phase for (run, node, _), phase in self.quiesce_calls
-                if node == node_id]
+        return [
+            phase for (run, node, _), phase in self.quiesce_calls if node == node_id
+        ]
 
     def test_a_pre_pane_refusal_skips_the_proof_and_keeps_its_class(self):
         """The observed incident, driven end to end.
@@ -114,14 +124,16 @@ class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
         refusal. Under the old `finally` this node blocked
         QUIESCENCE_UNPROVEN on attempt 1 and the launcher class was gone.
         """
-        self.raise_for = {"a": wrapped(
-            lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "PYTHONPYCACHEPREFIX")}
+        self.raise_for = {
+            "a": wrapped(
+                lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "PYTHONPYCACHEPREFIX"
+            )
+        }
         self.schedule([self.agent("a")]).run()
 
         record = self.store.get_node("run1", "a")
         self.assertIs(record.state, st.NodeState.BLOCKED)
-        self.assertIsNot(record.block_reason,
-                         st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.assertIsNot(record.block_reason, st.BlockReason.QUIESCENCE_UNPROVEN)
         self.assertNotIn("pre-inventory", self._quiesce_phases())
 
     def test_the_incident_itself_a_raising_proof_over_a_pre_pane_refusal(self):
@@ -137,8 +149,9 @@ class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
         succeeds cannot see the difference, which is why this case exists
         beside the call-count one above.
         """
-        self.raise_for = {"a": wrapped(
-            lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "PYTEST_ADDOPTS")}
+        self.raise_for = {
+            "a": wrapped(lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "PYTEST_ADDOPTS")
+        }
         original = self.quiesce_attempt
 
         def untracked(record, phase):
@@ -146,24 +159,30 @@ class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
             if phase == "pre-inventory":
                 raise RuntimeError(
                     "PROCESS_GROUP_UNTRACKED:pre-inventory:{0}#{1}".format(
-                        record.node_id, record.attempt_no))
+                        record.node_id, record.attempt_no
+                    )
+                )
 
-        self.schedule([self.agent("a")],
-                      deps=self.deps(quiesce_attempt=untracked)).run()
+        self.schedule(
+            [self.agent("a")], deps=self.deps(quiesce_attempt=untracked)
+        ).run()
 
         record = self.store.get_node("run1", "a")
         self.assertIs(record.block_reason, st.BlockReason.LAUNCH_REFUSED)
-        self.assertIsNot(record.block_reason,
-                         st.BlockReason.QUIESCENCE_UNPROVEN)
+        self.assertIsNot(record.block_reason, st.BlockReason.QUIESCENCE_UNPROVEN)
 
     def test_the_refusal_reaches_the_ledger_rather_than_a_quiescence_error(self):
-        self.raise_for = {"a": wrapped(
-            lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "TMPDIR")}
+        self.raise_for = {
+            "a": wrapped(lch.LaunchRefusal.SCRATCH_REDIRECT_MISSING, "TMPDIR")
+        }
         self.schedule([self.agent("a")]).run()
 
-        blocked = [t for t in self.store.audit_transitions("run1")
-                   if t.get("node_id") == "a"
-                   and t.get("to_state") == st.NodeState.BLOCKED.value]
+        blocked = [
+            t
+            for t in self.store.audit_transitions("run1")
+            if t.get("node_id") == "a"
+            and t.get("to_state") == st.NodeState.BLOCKED.value
+        ]
         self.assertTrue(blocked)
         self.assertIn("SCRATCH_REDIRECT_MISSING", str(blocked[-1]))
 
@@ -190,14 +209,16 @@ class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
             if phase == "pre-inventory":
                 raise RuntimeError("PROCESS_GROUP_UNTRACKED:pre-inventory:a#1")
 
-        self.schedule([self.agent("a")],
-                      deps=self.deps(quiesce_attempt=failing)).run()
+        self.schedule([self.agent("a")], deps=self.deps(quiesce_attempt=failing)).run()
 
         record = self.store.get_node("run1", "a")
         self.assertIs(record.block_reason, st.BlockReason.QUIESCENCE_UNPROVEN)
-        blocked = [t for t in self.store.audit_transitions("run1")
-                   if t.get("node_id") == "a"
-                   and t.get("to_state") == st.NodeState.BLOCKED.value]
+        blocked = [
+            t
+            for t in self.store.audit_transitions("run1")
+            if t.get("node_id") == "a"
+            and t.get("to_state") == st.NodeState.BLOCKED.value
+        ]
         detail = str(blocked[-1])
         self.assertIn("PROCESS_GROUP_UNTRACKED", detail)
         self.assertIn("SHELL_NOT_READY", detail)
@@ -208,12 +229,12 @@ class LaunchCauseSurvivesQuiesceTests(SchedulerFixture):
         self.schedule([self.agent("a")]).run()
         self.assertIn("pre-inventory", self._quiesce_phases())
 
-    def test_a_successful_attempt_is_still_quiesced_before_measurement(self):
-        """§8.3's bracket closes over a quiescent tree; the `else` arm is not
-        an optimisation and must not be skippable."""
+    def test_a_successful_attempt_is_quiesced_at_candidate_idle(self):
+        """§8.3 closes the successful launch bracket before candidate
+        measurement; `candidate-idle` is not skippable."""
         self.written = {"a": {"a.py": "A\n"}}
         self.schedule([self.agent("a")]).run()
-        self.assertIn("pre-inventory", self._quiesce_phases())
+        self.assertIn("candidate-idle", self._quiesce_phases())
 
 
 if __name__ == "__main__":

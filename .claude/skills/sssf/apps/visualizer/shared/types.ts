@@ -399,6 +399,43 @@ export interface MaestroReviewFinding {
   blocking: boolean;
 }
 
+/** Persistent phase for a reviewable build lane; null on legacy and ordinary nodes. */
+export type MaestroLanePhase = string;
+
+/** One immutable builder candidate from `lane_candidates`. */
+export interface MaestroLaneCandidate {
+  build_node_id: string;
+  candidate_seq: number;
+  candidate_sha: string;
+  parent_candidate_sha: string | null;
+  builder_generation: number;
+  created_at: string | null;
+}
+
+/** The exactly-once review authority for one candidate SHA. */
+export interface MaestroCandidateReview {
+  review_node_id: string;
+  candidate_sha: string;
+  reviewer_generation: number;
+  state: string;
+  review_digest: string | null;
+  receipt_path: string | null;
+  findings: MaestroReviewFinding[];
+  verdict: string | null;
+  completed_at: string | null;
+}
+
+/** Findings delivery from a rejected candidate back to its retained builder. */
+export interface MaestroRepairHandoff {
+  build_node_id: string;
+  rejected_candidate_sha: string;
+  findings: MaestroReviewFinding[];
+  state: string;
+  builder_generation: number;
+  submitted_at: string | null;
+  acknowledged_at: string | null;
+}
+
 export type AttemptLiveness =
   | "running"
   | "stale"
@@ -467,6 +504,7 @@ export interface MaestroNode {
   needs: string[];
   outputs: string[];
   state: MaestroNodeState;
+  lane_phase: MaestroLanePhase | null;
   attempt_no: number;
   /** Why the node stopped, when it stopped: SEMANTIC_BUDGET_EXHAUSTED, … */
   block_reason: string | null;
@@ -523,6 +561,18 @@ export interface MaestroRunSummary {
   node_states: { node_id: string; state: MaestroNodeState }[];
 }
 
+/** One retained builder/reviewer Herdr actor recorded by the runtime. */
+export interface MaestroActorSession {
+  build_node_id: string;
+  actor_role: string;
+  generation: number;
+  state: string;
+  pane_id: string | null;
+  session_path: string | null;
+  correlation_token: string | null;
+  updated_at: string | null;
+}
+
 /** GET /api/sources/:id/runs/:run_id */
 export interface MaestroRunDetail {
   run_id: string;
@@ -549,6 +599,10 @@ export interface MaestroRunDetail {
   server_now_ms: number;
   integration: MaestroIntegration | null;
   nodes: MaestroNode[];
+  actor_sessions: MaestroActorSession[];
+  lane_candidates: MaestroLaneCandidate[];
+  candidate_reviews: MaestroCandidateReview[];
+  repair_handoffs: MaestroRepairHandoff[];
   results: MaestroResult[];
   /** Run-level transitions: outcome declarations, resumes, acceptance starts. */
   run_transitions: MaestroTransition[];

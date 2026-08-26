@@ -30,6 +30,8 @@ combinations can prove it never raises and never falls outside the four.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -38,11 +40,21 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
-                    Tuple)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from . import retry_policy as rp
 from . import scheduler_types as st
@@ -52,6 +64,7 @@ from .utils import ensure_dir, now_iso
 
 
 # ── errors ───────────────────────────────────────────────────────────────────
+
 
 class LifecycleError(RuntimeError):
     """Base for every refusal this module raises."""
@@ -73,6 +86,7 @@ class EscapeRefused(LifecycleError):
     """An escape verb was attempted against a run whose latest outcome does
     not admit it (§7.3, §11.2) — refusing here is what stops an escape from
     racing a scheduler that may still be alive."""
+
 
 class SchedulerStillAlive(EscapeRefused):
     """An escape against RUNNING was refused because the scheduler pid is
@@ -131,6 +145,55 @@ class LedgerUnavailable(LifecycleError):
     """
 
 
+class ReviewSchemaMigrationFailed(LifecycleError):
+    """Persistent-review schema setup was restored from its SQLite backup."""
+
+
+class LegacyReviewMigrationBlocked(LifecycleError):
+    """Legacy evidence is unsafe, so this lane must not dispatch another review."""
+
+    def __init__(self, run_id: str, build_node_id: str, reason: str) -> None:
+        super().__init__(
+            f"{run_id}/{build_node_id}: legacy review migration is blocked: {reason}"
+        )
+        self.run_id = run_id
+        self.build_node_id = build_node_id
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class LegacyReviewEvidence:
+    """One externally verified terminal inline-review record.
+
+    The lifecycle ledger cannot read detached signed receipts or repositories.
+    Callers therefore provide the immutable receipt facts and a validator below
+    proves their digest/signature binding before this record becomes authority.
+    """
+
+    build_node_id: str
+    candidate_seq: int
+    candidate_sha: str
+    base_sha: str
+    review_digest: str
+    receipt_path: str
+    verdict: st.ReviewVerdict
+    findings: Sequence[Mapping[str, Any]]
+    builder_generation: int = 0
+    reviewer_generation: int = 0
+
+
+@dataclass(frozen=True)
+class LegacyReviewMigration:
+    """The durable disposition for one lane's pre-ledger review evidence."""
+
+    build_node_id: str
+    migrated: bool
+    blocked: bool
+    reason: Optional[str]
+    candidates: Tuple[st.LaneCandidate, ...] = ()
+    reviews: Tuple[st.CandidateReview, ...] = ()
+
+
 #: The transition `reason` an operator's `--allow-exhausted-node` leaves
 #: behind. Declared once so the writer and every reader name the same string,
 #: rather than each spelling a literal that drifts.
@@ -187,6 +250,9 @@ CREATE TABLE IF NOT EXISTS dag_nodes (
   needs_json   TEXT NOT NULL,
   outputs_json TEXT NOT NULL,
   specs_json   TEXT NOT NULL,
+  -- NULL for authored nodes.  A derived review row stores its one source
+  -- build node explicitly, never as an incidental convention in its id.
+  review_of    TEXT,
   PRIMARY KEY (run_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS node_lifecycle (
@@ -220,6 +286,12 @@ CREATE TABLE IF NOT EXISTS node_lifecycle (
   -- transition prose (#103). NULL on a PENDING row written before this
   -- column means *unrecorded*, never `SCHEDULER`.
   pending_cause          TEXT,
+  -- Persistent authority for a reviewable build lane.  Ordinary DAG nodes
+  -- remain NULL, including rows written before this lifecycle existed.
+  lane_phase             TEXT CHECK (lane_phase IS NULL OR lane_phase IN (
+    'BUILDING', 'CANDIDATE_READY', 'REVIEWING', 'REPAIR_HANDOFF',
+    'REPAIRING', 'WAITING_FOR_NEW_CANDIDATE', 'ACCEPTED', 'BLOCKED',
+    'CANCELLED')),
   output_sha             TEXT,
   granted_extra_attempts INTEGER NOT NULL DEFAULT 0,
   -- The attempt number this node's retry-class spend is counted *from*.
@@ -297,6 +369,103 @@ CREATE TABLE IF NOT EXISTS attempt_baselines (
   recorded_at    TEXT NOT NULL,
   PRIMARY KEY (run_id, node_id, attempt_no)
 );
+CREATE TABLE IF NOT EXISTS lane_candidates (
+  run_id               TEXT NOT NULL REFERENCES runs(run_id),
+  build_node_id        TEXT NOT NULL,
+  candidate_seq        INTEGER NOT NULL CHECK (candidate_seq > 0),
+  candidate_sha        TEXT NOT NULL CHECK (
+    length(candidate_sha) IN (40, 64)
+    AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  parent_candidate_sha TEXT CHECK (
+    parent_candidate_sha IS NULL OR (
+      length(parent_candidate_sha) IN (40, 64)
+      AND parent_candidate_sha NOT GLOB '*[^0-9A-Fa-f]*')),
+  builder_generation   INTEGER NOT NULL CHECK (builder_generation >= 0),
+  created_at           TEXT NOT NULL,
+  PRIMARY KEY (run_id, build_node_id, candidate_seq),
+  UNIQUE (run_id, build_node_id, candidate_sha)
+);
+CREATE TABLE IF NOT EXISTS candidate_reviews (
+  run_id              TEXT NOT NULL REFERENCES runs(run_id),
+  review_node_id      TEXT NOT NULL,
+  candidate_sha       TEXT NOT NULL CHECK (
+    length(candidate_sha) IN (40, 64)
+    AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  reviewer_generation INTEGER NOT NULL CHECK (reviewer_generation >= 0),
+  state               TEXT NOT NULL CHECK (state IN ('DISPATCHED', 'COMPLETED')),
+  review_digest       TEXT,
+  receipt_path        TEXT,
+  findings_json       TEXT NOT NULL CHECK (
+    json_valid(findings_json) AND json_type(findings_json) = 'array'),
+  verdict             TEXT CHECK (verdict IS NULL OR verdict IN ('PASS', 'REJECTED')),
+  completed_at        TEXT,
+  CHECK (
+    (state = 'DISPATCHED' AND verdict IS NULL AND review_digest IS NULL
+     AND receipt_path IS NULL AND completed_at IS NULL)
+    OR
+    (state = 'COMPLETED' AND verdict IN ('PASS', 'REJECTED')
+     AND review_digest IS NOT NULL AND receipt_path IS NOT NULL
+     AND completed_at IS NOT NULL)),
+  PRIMARY KEY (run_id, review_node_id, candidate_sha)
+);
+CREATE TABLE IF NOT EXISTS repair_handoffs (
+  run_id                TEXT NOT NULL REFERENCES runs(run_id),
+  build_node_id         TEXT NOT NULL,
+  rejected_candidate_sha TEXT NOT NULL CHECK (
+    length(rejected_candidate_sha) IN (40, 64)
+    AND rejected_candidate_sha NOT GLOB '*[^0-9A-Fa-f]*'),
+  findings_json         TEXT NOT NULL CHECK (
+    json_valid(findings_json) AND json_type(findings_json) = 'array'),
+  state                 TEXT NOT NULL CHECK (
+    state IN ('PENDING', 'SUBMITTED', 'ACKNOWLEDGED', 'FAILED')),
+  builder_generation    INTEGER NOT NULL CHECK (builder_generation >= 0),
+  submitted_at          TEXT,
+  acknowledged_at       TEXT,
+  CHECK (
+    (state = 'PENDING' AND submitted_at IS NULL AND acknowledged_at IS NULL)
+    OR (state = 'SUBMITTED' AND submitted_at IS NOT NULL AND acknowledged_at IS NULL)
+    OR (state = 'ACKNOWLEDGED' AND submitted_at IS NOT NULL
+        AND acknowledged_at IS NOT NULL)
+    OR (state = 'FAILED' AND acknowledged_at IS NULL)),
+  PRIMARY KEY (run_id, build_node_id, rejected_candidate_sha)
+);
+CREATE TABLE IF NOT EXISTS legacy_review_migration_blocks (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  build_node_id TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  detail_json   TEXT NOT NULL CHECK (
+    json_valid(detail_json) AND json_type(detail_json) = 'object'),
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (run_id, build_node_id)
+);
+CREATE TABLE IF NOT EXISTS lane_retry_spend (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  build_node_id TEXT NOT NULL,
+  retry_class   TEXT NOT NULL CHECK (retry_class IN (
+    'SEMANTIC', 'ENVIRONMENTAL', 'LAUNCHER_TRANSIENT', 'REVIEW_REJECTION')),
+  cycle_seq     INTEGER NOT NULL CHECK (cycle_seq > 0),
+  candidate_sha TEXT CHECK (
+    candidate_sha IS NULL OR (
+      length(candidate_sha) IN (40, 64)
+      AND candidate_sha NOT GLOB '*[^0-9A-Fa-f]*')),
+  detail_json   TEXT NOT NULL CHECK (
+    json_valid(detail_json) AND json_type(detail_json) = 'object'),
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (run_id, build_node_id, cycle_seq)
+);
+CREATE TABLE IF NOT EXISTS actor_sessions (
+  run_id            TEXT NOT NULL REFERENCES runs(run_id),
+  build_node_id     TEXT NOT NULL,
+  actor_role        TEXT NOT NULL,
+  generation        INTEGER NOT NULL CHECK (generation >= 0),
+  state             TEXT NOT NULL CHECK (state IN ('ACTIVE', 'CLOSED')),
+  pane_id           TEXT NOT NULL,
+  tab_id            TEXT,
+  session_path      TEXT NOT NULL,
+  correlation_token TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  PRIMARY KEY (run_id, build_node_id, actor_role, generation)
+);
 CREATE TABLE IF NOT EXISTS transitions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id       TEXT NOT NULL,
@@ -333,6 +502,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_one_live_attempt_per_node
   ON attempts(run_id, node_id) WHERE state='RUNNING';
 CREATE INDEX IF NOT EXISTS idx_ready_set
   ON node_lifecycle(run_id, state);
+CREATE INDEX IF NOT EXISTS idx_lane_candidates_latest
+  ON lane_candidates(run_id, build_node_id, candidate_seq DESC);
+CREATE INDEX IF NOT EXISTS idx_candidate_reviews_active
+  ON candidate_reviews(run_id, review_node_id, state);
+CREATE INDEX IF NOT EXISTS idx_repair_handoffs_state
+  ON repair_handoffs(run_id, build_node_id, state);
+CREATE INDEX IF NOT EXISTS idx_lane_retry_spend_class
+  ON lane_retry_spend(run_id, build_node_id, retry_class, cycle_seq);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_actor_session
+  ON actor_sessions(run_id, build_node_id, actor_role) WHERE state='ACTIVE';
+CREATE INDEX IF NOT EXISTS idx_legacy_review_migration_blocks
+  ON legacy_review_migration_blocks(run_id, build_node_id);
 """
 
 #: §10.3's partial unique index — "at most one live attempt per node as a
@@ -370,6 +551,11 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("plan_name", "TEXT"),
 )
 
+#: Columns added to `dag_nodes` after the first ledgers were written.  Derived
+#: review identity needs its source build recorded structurally so a resumed
+#: scheduler never has to infer it from a display id.
+_DAG_NODES_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (("review_of", "TEXT"),)
+
 #: The same, for `node_lifecycle`. Kept as a second list rather than folded
 #: into the one above because the read-only projection selects the `runs`
 #: additions by name and must not be handed a column from another table.
@@ -377,6 +563,15 @@ _NODE_LIFECYCLE_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("cancel_cause", "TEXT"),
     ("merge_cause", "TEXT"),
     ("pending_cause", "TEXT"),
+    (
+        "lane_phase",
+        (
+            "TEXT CHECK (lane_phase IS NULL OR lane_phase IN "
+            "('BUILDING','CANDIDATE_READY','REVIEWING','REPAIR_HANDOFF',"
+            "'REPAIRING','WAITING_FOR_NEW_CANDIDATE','ACCEPTED','BLOCKED',"
+            "'CANCELLED'))"
+        ),
+    ),
     ("retry_spend_floor", "INTEGER"),
 )
 
@@ -400,11 +595,18 @@ _ATTEMPTS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("attempt_start_epoch", "REAL"),
 )
 
+#: A tab id was added after actor sessions had already become durable.  It is
+#: deliberately nullable: a legacy row may not claim a tab it did not record,
+#: and resume must prove one from Herdr's pane metadata rather than invent it.
+_ACTOR_SESSION_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (("tab_id", "TEXT"),)
+
 _ADDED_COLUMNS: Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...] = (
     ("runs", _RUNS_ADDED_COLUMNS),
+    ("dag_nodes", _DAG_NODES_ADDED_COLUMNS),
     ("node_lifecycle", _NODE_LIFECYCLE_ADDED_COLUMNS),
     ("attempt_baselines", _ATTEMPT_BASELINE_ADDED_COLUMNS),
     ("attempts", _ATTEMPTS_ADDED_COLUMNS),
+    ("actor_sessions", _ACTOR_SESSION_ADDED_COLUMNS),
 )
 
 #: Raise a node's retry-budget floor to the highest of its attempts that has
@@ -429,15 +631,15 @@ _RETRY_SPEND_FLOOR_SQL = (
     "SELECT COALESCE(MAX(a.attempt_no), 0) FROM attempts a"
     " WHERE a.run_id = node_lifecycle.run_id"
     " AND a.node_id = node_lifecycle.node_id"
-    " AND a.retry_class IS NOT NULL)")
+    " AND a.retry_class IS NOT NULL)"
+)
 
 #: Every node of one run — the resume boundary is a property of the run.
 _RAISE_RUN_RETRY_SPEND_FLOOR = _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=?"
 
 #: One node — the escape boundary is a decision about that node alone, which
 #: is what a `run resume` flag cannot express (§11.3).
-_RAISE_NODE_RETRY_SPEND_FLOOR = (
-    _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=? AND node_id=?")
+_RAISE_NODE_RETRY_SPEND_FLOOR = _RETRY_SPEND_FLOOR_SQL + " WHERE run_id=? AND node_id=?"
 
 
 def _host_label(name: str) -> str:
@@ -485,8 +687,10 @@ def scheduler_host() -> str:
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, ...]:
     """The column names a table actually has right now."""
-    return tuple(str(row[1]) for row in
-                 conn.execute("PRAGMA table_info({0})".format(table)).fetchall())
+    return tuple(
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info({0})".format(table)).fetchall()
+    )
 
 
 def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
@@ -520,8 +724,8 @@ def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
                     continue
                 try:
                     conn.execute(
-                        "ALTER TABLE {0} ADD COLUMN {1} {2}".format(
-                            table, name, kind))
+                        "ALTER TABLE {0} ADD COLUMN {1} {2}".format(table, name, kind)
+                    )
                 except sqlite3.OperationalError as error:
                     if "duplicate column name" not in str(error).lower():
                         raise
@@ -532,6 +736,90 @@ def _migrate(conn: sqlite3.Connection) -> Tuple[str, ...]:
         conn.execute("ROLLBACK")
         raise
     return tuple(added)
+
+
+_REVIEW_MIGRATION_TABLES: Tuple[str, ...] = (
+    "lane_candidates",
+    "candidate_reviews",
+    "repair_handoffs",
+    "legacy_review_migration_blocks",
+    "lane_retry_spend",
+    "actor_sessions",
+)
+
+
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _persistent_review_migration_needed(conn: sqlite3.Connection) -> bool:
+    """Whether this opener will add persistent-review authority to an old DB."""
+    if any(not _has_table(conn, table) for table in _REVIEW_MIGRATION_TABLES):
+        return True
+    return (
+        "review_of" not in _table_columns(conn, "dag_nodes")
+        or "lane_phase" not in _table_columns(conn, "node_lifecycle")
+        or "tab_id" not in _table_columns(conn, "actor_sessions")
+    )
+
+
+@contextlib.contextmanager
+def _review_migration_lock(db_path: Path) -> Iterator[None]:
+    """Serialize snapshots and restores across first openers of one ledger."""
+    lock_path = db_path.with_name(f".{db_path.name}.review-migration.lock")
+    descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with os.fdopen(descriptor, "a+b", closefd=False) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_path(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sqlite_backup(conn: sqlite3.Connection, db_path: Path) -> Path:
+    """Write a self-contained SQLite snapshot, including WAL-visible changes."""
+    backup_path = db_path.with_name(
+        f"{db_path.name}.pre-review-{int(time.time() * 1_000_000)}-"
+        f"{uuid.uuid4().hex}.sqlite3"
+    )
+    destination = sqlite3.connect(str(backup_path), isolation_level=None)
+    try:
+        conn.backup(destination)
+    finally:
+        destination.close()
+    _fsync_path(backup_path)
+    _fsync_path(backup_path.parent)
+    return backup_path
+
+
+def _restore_sqlite_backup(db_path: Path, backup_path: Path) -> None:
+    """Restore a snapshot through SQLite, never by copying a WAL database."""
+    source = sqlite3.connect(str(backup_path), isolation_level=None)
+    target = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        source.backup(target)
+        target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        target.close()
+        source.close()
+    _fsync_path(db_path)
+    _fsync_path(db_path.parent)
 
 
 def _enable_wal(conn: sqlite3.Connection, attempts: int = 50) -> None:
@@ -556,7 +844,8 @@ def _enable_wal(conn: sqlite3.Connection, attempts: int = 50) -> None:
     mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
     if str(mode).lower() != "wal":
         raise sqlite3.OperationalError(
-            f"could not put the lifecycle database in WAL mode: it is still {mode!r}")
+            f"could not put the lifecycle database in WAL mode: it is still {mode!r}"
+        )
 
 
 def serialized(method):
@@ -573,6 +862,7 @@ def serialized(method):
     def guarded(self, *args, **kwargs):
         with self._lock:
             return method(self, *args, **kwargs)
+
     return guarded
 
 
@@ -619,7 +909,7 @@ def _audit_dict(row: sqlite3.Row) -> Dict[str, Any]:
         if value is None:
             continue
         if key.endswith("_json"):
-            out[key[:-len("_json")]] = json.loads(value)
+            out[key[: -len("_json")]] = json.loads(value)
         else:
             out[key] = value
     return out
@@ -634,11 +924,172 @@ def _is_ancestor(repo_path, sha: str, ref: str = "HEAD") -> bool:
     """
     result = subprocess.run(
         ["git", "-C", str(repo_path), "merge-base", "--is-ancestor", sha, ref],
-        capture_output=True, text=True)
+        capture_output=True,
+        text=True,
+    )
     return result.returncode == 0
 
 
+def _require_candidate_sha(sha: str, *, field_name: str = "candidate_sha") -> str:
+    """Refuse abbreviated, malformed, and non-hex candidate identities."""
+    if (
+        not isinstance(sha, str)
+        or len(sha) not in (40, 64)
+        or any(char not in "0123456789abcdefABCDEF" for char in sha)
+    ):
+        raise LifecycleError(
+            f"{field_name} must be a complete 40- or 64-character hexadecimal SHA"
+        )
+    return sha.lower()
+
+
+def _require_generation(generation: int, *, field_name: str) -> int:
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        raise LifecycleError(f"{field_name} must be a non-negative integer")
+    return generation
+
+
+def _require_optional_tab_id(tab_id: Optional[str]) -> Optional[str]:
+    """Keep a tab id exact when known; map only the empty wire default to NULL."""
+    if tab_id is None or tab_id == "":
+        return None
+    if not isinstance(tab_id, str) or not tab_id.strip():
+        raise LifecycleError("tab_id must be a non-empty string or None")
+    return tab_id
+
+
+def _canonical_findings(
+    findings: Sequence[Mapping[str, Any]],
+) -> Tuple[Tuple[Mapping[str, Any], ...], str]:
+    """Validate the findings ledger as a JSON array of object records once."""
+    if isinstance(findings, (str, bytes)):
+        raise LifecycleError("findings must be a sequence of object records")
+    try:
+        normalized = tuple(dict(finding) for finding in findings)
+    except (TypeError, ValueError) as error:
+        raise LifecycleError("findings must be a sequence of object records") from error
+    try:
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise LifecycleError("findings must be JSON serializable") from error
+    return normalized, encoded
+
+
+def _canonical_detail(
+    detail: Optional[Mapping[str, Any]],
+) -> Tuple[Mapping[str, Any], str]:
+    """Encode an authority detail object without accepting a second JSON shape."""
+    try:
+        normalized = dict(detail or {})
+    except (TypeError, ValueError) as error:
+        raise LifecycleError("detail must be an object mapping") from error
+    try:
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise LifecycleError("detail must be JSON serializable") from error
+    return normalized, encoded
+
+
+def _candidate_from_row(row: Sequence[Any]) -> st.LaneCandidate:
+    return st.LaneCandidate(
+        run_id=row[0],
+        build_node_id=row[1],
+        candidate_seq=int(row[2]),
+        candidate_sha=row[3],
+        parent_candidate_sha=row[4],
+        builder_generation=int(row[5]),
+        created_at=row[6],
+    )
+
+
+def _review_from_row(row: Sequence[Any]) -> st.CandidateReview:
+    raw_findings = json.loads(row[7])
+    if not isinstance(raw_findings, list) or any(
+        not isinstance(finding, dict) for finding in raw_findings
+    ):
+        raise LifecycleError("candidate review findings ledger is not an object array")
+    return st.CandidateReview(
+        run_id=row[0],
+        review_node_id=row[1],
+        candidate_sha=row[2],
+        reviewer_generation=int(row[3]),
+        state=st.CandidateReviewState(row[4]),
+        review_digest=row[5],
+        receipt_path=row[6],
+        findings=tuple(dict(finding) for finding in raw_findings),
+        verdict=st.ReviewVerdict(row[8]) if row[8] else None,
+        completed_at=row[9],
+    )
+
+
+def _handoff_from_row(row: Sequence[Any]) -> st.RepairHandoff:
+    raw_findings = json.loads(row[3])
+    if not isinstance(raw_findings, list) or any(
+        not isinstance(finding, dict) for finding in raw_findings
+    ):
+        raise LifecycleError("repair handoff findings ledger is not an object array")
+    return st.RepairHandoff(
+        run_id=row[0],
+        build_node_id=row[1],
+        rejected_candidate_sha=row[2],
+        findings=tuple(dict(finding) for finding in raw_findings),
+        state=st.RepairHandoffState(row[4]),
+        builder_generation=int(row[5]),
+        submitted_at=row[6],
+        acknowledged_at=row[7],
+    )
+
+
+def _lane_retry_spend_from_row(row: Sequence[Any]) -> st.LaneRetrySpend:
+    raw_detail = json.loads(row[5])
+    if not isinstance(raw_detail, dict):
+        raise LifecycleError("lane retry spend detail is not an object")
+    return st.LaneRetrySpend(
+        run_id=row[0],
+        build_node_id=row[1],
+        retry_class=st.LaneRetryClass(row[2]),
+        cycle_seq=int(row[3]),
+        candidate_sha=row[4],
+        detail=dict(raw_detail),
+        created_at=row[6],
+    )
+
+
+def _actor_session_from_row(row: Sequence[Any]) -> st.ActorSession:
+    return st.ActorSession(
+        run_id=row[0],
+        build_node_id=row[1],
+        actor_role=row[2],
+        generation=int(row[3]),
+        state=st.ActorSessionState(row[4]),
+        pane_id=row[5],
+        tab_id=row[6],
+        session_path=row[7],
+        correlation_token=row[8],
+        updated_at=row[9],
+    )
+
+
+def _review_build_id(review_node_id: str) -> str:
+    build_node_id, marker, suffix = review_node_id.rpartition("::review")
+    if (
+        not marker
+        or suffix
+        or not build_node_id
+        or review_node_id.count("::review") != 1
+    ):
+        raise LifecycleError(
+            "a derived review id must be exactly '<build-node-id>::review'"
+        )
+    return build_node_id
+
+
 # ── the total run outcome function (§7.3) ───────────────────────────────────
+
 
 @dataclass(frozen=True)
 class OutcomeReport:
@@ -686,10 +1137,12 @@ def total_run_outcome(
         return OutcomeReport(outcome=st.RunOutcome.STUCK)
 
     all_cancelled = bool(node_states) and all(
-        state is st.NodeState.CANCELLED for _, state, _ in node_states)
+        state is st.NodeState.CANCELLED for _, state, _ in node_states
+    )
     if cancel_requested or all_cancelled:
-        cancelled = tuple(nid for nid, state, _ in node_states
-                          if state is st.NodeState.CANCELLED)
+        cancelled = tuple(
+            nid for nid, state, _ in node_states if state is st.NodeState.CANCELLED
+        )
         # The two conditions are not interchangeable and the outcome records
         # which one fired. `cancel_requested` is the operator's stop control,
         # under which nothing was adjudicated; `all_cancelled` without it is a
@@ -697,33 +1150,59 @@ def total_run_outcome(
         # work the run should finish without. `run resume` reopens the first
         # and refuses the second (§7.8), and the precedence here is the same
         # precedence the arm above it already had.
-        cause = requested_cause or (st.CancelCause.RUN_CANCEL if cancel_requested
-                                    else st.CancelCause.ABANDONED)
-        return OutcomeReport(outcome=st.RunOutcome.CANCELLED,
-                             abandoned_nodes=cancelled, cancel_cause=cause)
+        cause = requested_cause or (
+            st.CancelCause.RUN_CANCEL if cancel_requested else st.CancelCause.ABANDONED
+        )
+        return OutcomeReport(
+            outcome=st.RunOutcome.CANCELLED,
+            abandoned_nodes=cancelled,
+            cancel_cause=cause,
+        )
 
     merged = [nid for nid, state, _ in node_states if state is st.NodeState.MERGED]
-    cancelled = tuple(nid for nid, state, _ in node_states
-                      if state is st.NodeState.CANCELLED)
-    stragglers = [nid for nid, state, _ in node_states
-                  if state not in (st.NodeState.MERGED, st.NodeState.CANCELLED)]
+    cancelled = tuple(
+        nid for nid, state, _ in node_states if state is st.NodeState.CANCELLED
+    )
+    stragglers = [
+        nid
+        for nid, state, _ in node_states
+        if state
+        not in (st.NodeState.MERGED, st.NodeState.ACCEPTED, st.NodeState.CANCELLED)
+    ]
     if merged and not stragglers and acceptance_result is True:
-        return OutcomeReport(outcome=st.RunOutcome.ACCEPTED,
-                             abandoned_nodes=cancelled,
-                             acceptance_result=acceptance_result)
+        return OutcomeReport(
+            outcome=st.RunOutcome.ACCEPTED,
+            abandoned_nodes=cancelled,
+            acceptance_result=acceptance_result,
+        )
 
-    blocked = tuple(nid for nid, state, _ in node_states if state is st.NodeState.BLOCKED)
-    reasons = {nid: reason for nid, state, reason in node_states
-               if state is st.NodeState.BLOCKED and reason is not None}
-    return OutcomeReport(outcome=st.RunOutcome.BLOCKED, blocked_nodes=blocked,
-                         block_reasons=reasons, abandoned_nodes=cancelled,
-                         acceptance_result=acceptance_result)
+    blocked = tuple(
+        nid for nid, state, _ in node_states if state is st.NodeState.BLOCKED
+    )
+    reasons = {
+        nid: reason
+        for nid, state, reason in node_states
+        if state is st.NodeState.BLOCKED and reason is not None
+    }
+    return OutcomeReport(
+        outcome=st.RunOutcome.BLOCKED,
+        blocked_nodes=blocked,
+        block_reasons=reasons,
+        abandoned_nodes=cancelled,
+        acceptance_result=acceptance_result,
+    )
 
 
 # ── the legal transition guard (§7.3) ───────────────────────────────────────
 
-def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: str,
-                      cancel_cause: Optional[st.CancelCause] = None) -> None:
+
+def _guard_transition(
+    current: st.NodeState,
+    to_state: st.NodeState,
+    *,
+    actor: str,
+    cancel_cause: Optional[st.CancelCause] = None,
+) -> None:
     """The legal-transition guard, with one exception it states rather than hides.
 
     `MERGED` and `CANCELLED` are absolutely terminal (§7.3) — with the single
@@ -739,22 +1218,30 @@ def _guard_transition(current: st.NodeState, to_state: st.NodeState, *, actor: s
     terminal, as does `MERGED`.
     """
     if current in st.ABSOLUTELY_TERMINAL:
-        reopening = (current is st.NodeState.CANCELLED
-                     and to_state is st.NodeState.PENDING
-                     and actor == "operator"
-                     and cancel_cause in st.REOPENABLE_CANCEL_CAUSES)
+        reopening = (
+            current is st.NodeState.CANCELLED
+            and to_state is st.NodeState.PENDING
+            and actor == "operator"
+            and cancel_cause in st.REOPENABLE_CANCEL_CAUSES
+        )
         if not reopening:
             raise IllegalTransition(
                 f"{current.value} is absolutely terminal (§7.3); no transition leaves it, "
-                f"including this attempted move to {to_state.value}")
-    if (current is st.NodeState.BLOCKED and to_state is not st.NodeState.BLOCKED
-            and actor != "operator"):
+                f"including this attempted move to {to_state.value}"
+            )
+    if (
+        current is st.NodeState.BLOCKED
+        and to_state is not st.NodeState.BLOCKED
+        and actor != "operator"
+    ):
         raise IllegalTransition(
             "BLOCKED is operator-terminal (§7.3): no automatic transition leaves it, "
-            f"only an operator escape may — refusing the move to {to_state.value}")
+            f"only an operator escape may — refusing the move to {to_state.value}"
+        )
 
 
 # ── what the ledger could show about a node at the moment it was accepted ────
+
 
 @dataclass(frozen=True)
 class MergeEvidence:
@@ -790,12 +1277,11 @@ class MergeEvidence:
 
     #: Count of `VERIFIED` transitions ever recorded for this node.
     verified_transitions: int
-    #: Count of attempt rows a reviewer rejected the diff of
-    #: (`rp.REVIEW_REJECTED_KEY`). Distinct from the above and not its
-    #: complement — a rejection says a reviewer *looked*, which is more than
-    #: zero says, and is why both are recorded rather than one derived.
+    #: Count of terminal REJECTED rows for this node's derived reviewer.
+    #: Distinct from VERIFIED transitions: a rejection proves a reviewer
+    #: adjudicated an immutable candidate even when no candidate ever passed.
     review_rejections: int
-    #: Count of attempt rows, the denominator the other two are read against.
+    #: Count of scheduler attempt rows, retained as separate execution evidence.
     attempts_recorded: int
     #: The stored `block_reason` the node carried when the operator accepted
     #: it, or `None` where the escape was taken against a stranded RUNNING
@@ -822,8 +1308,7 @@ class MergeEvidence:
             "verified_transitions": self.verified_transitions,
             "review_rejections": self.review_rejections,
             "attempts_recorded": self.attempts_recorded,
-            "block_reason": (self.block_reason.value
-                             if self.block_reason else None),
+            "block_reason": (self.block_reason.value if self.block_reason else None),
         }
 
 
@@ -843,7 +1328,7 @@ MERGE_EVIDENCE_KEY = "merge_evidence"
 #: fails to verify instead of quietly redefining what the attempt started from.
 ATTEMPT_BASELINE_DIGEST_KEY = "baseline_digest"
 LATE_ENVELOPE_RECOVERY_KEY = "late_envelope_recovery"
-
+SEALED_OUTPUT_SHA_KEY = "sealed_output_sha"
 
 
 def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
@@ -861,11 +1346,13 @@ def decode_baseline(encoded: Mapping[str, Any]) -> Dict[str, Tuple[str, str]]:
     for rel, value in encoded.items():
         if not isinstance(value, str):
             raise BaselineCorrupt(
-                "baseline entry for {0!r} is not a string".format(rel))
+                "baseline entry for {0!r} is not a string".format(rel)
+            )
         mode, sep, blob = value.partition(" ")
         if not sep or not mode or not blob:
             raise BaselineCorrupt(
-                "baseline entry for {0!r} is not '<mode> <blob>'".format(rel))
+                "baseline entry for {0!r} is not '<mode> <blob>'".format(rel)
+            )
         inventory[rel] = (mode, blob)
     return inventory
 
@@ -890,31 +1377,63 @@ class LifecycleStore:
     Safe to share across a thread pool."""
 
     def __init__(self, db_path):
-        ensure_dir(Path(db_path).parent)
-        self.db_path = str(db_path)
+        path = Path(db_path)
+        ensure_dir(path.parent)
+        existed = path.exists()
+        self.db_path = str(path)
+        self.review_migration_backup_path: Optional[Path] = None
         self._lock = threading.RLock()
         # One connection outlives every thread that touches it — `serialized`
         # is what makes sharing it safe (mirrors tracer.py, §7.2).
-        self.conn = sqlite3.connect(self.db_path, isolation_level=None,
-                                    check_same_thread=False)
+        self.conn = sqlite3.connect(
+            self.db_path, isolation_level=None, check_same_thread=False
+        )
         # busy_timeout first, before any statement that can contend with the
         # journal-mode switch (mirrors tracer.py's ordering fix).
         self.conn.execute("PRAGMA busy_timeout=5000;")
         _enable_wal(self.conn)
         self.conn.execute("PRAGMA synchronous=NORMAL;")
-        self.conn.executescript(SCHEMA)
-        _migrate(self.conn)
+        with _review_migration_lock(path):
+            backup_path: Optional[Path] = None
+            try:
+                if existed and _persistent_review_migration_needed(self.conn):
+                    backup_path = _sqlite_backup(self.conn, path)
+                    self.review_migration_backup_path = backup_path
+                self.conn.executescript(SCHEMA)
+                _migrate(self.conn)
+            except Exception as error:
+                self.conn.close()
+                if backup_path is not None:
+                    try:
+                        _restore_sqlite_backup(path, backup_path)
+                    except Exception as restore_error:
+                        raise ReviewSchemaMigrationFailed(
+                            "persistent-review migration failed and its SQLite "
+                            f"backup could not be restored: {backup_path}"
+                        ) from restore_error
+                    raise ReviewSchemaMigrationFailed(
+                        "persistent-review migration failed; restored SQLite "
+                        f"backup {backup_path}"
+                    ) from error
+                raise ReviewSchemaMigrationFailed(
+                    "persistent-review schema setup failed before scheduling"
+                ) from error
 
     # ── run / plan projection ────────────────────────────────────────────────
 
     @serialized
-    def create_run(self, run_id: str, plan_digest: str,
-                    nodes: Sequence[st.PlanNode],
-                    plan_name: Optional[str] = None) -> None:
+    def create_run(
+        self,
+        run_id: str,
+        plan_digest: str,
+        nodes: Sequence[st.PlanNode],
+        plan_name: Optional[str] = None,
+    ) -> None:
         """Project the plan's nodes into `dag_nodes`, seed every node PENDING,
         in one transaction (§7.1)."""
         existing = self.conn.execute(
-            "SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            "SELECT 1 FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
         if existing:
             raise RunAlreadyExists(f"run {run_id} already exists")
         now = now_iso()
@@ -926,22 +1445,219 @@ class LifecycleStore:
                 " scheduler_pid, scheduler_host, scheduler_claimed_at,"
                 " scheduler_start_epoch, plan_name)"
                 " VALUES (?,?,?,?,NULL,NULL,0,?,?,?,?,?)",
-                (run_id, plan_digest, now, now,
-                 os.getpid(), scheduler_host(), now,
-                 wd.process_start_epoch(os.getpid()), plan_name))
+                (
+                    run_id,
+                    plan_digest,
+                    now,
+                    now,
+                    os.getpid(),
+                    scheduler_host(),
+                    now,
+                    wd.process_start_epoch(os.getpid()),
+                    plan_name,
+                ),
+            )
             for node in nodes:
                 self.conn.execute(
                     "INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind, depth,"
                     " needs_json, outputs_json, specs_json) VALUES (?,?,?,?,?,?,?,?)",
-                    (run_id, node.node_id, plan_digest, node.kind.value, node.depth,
-                     json.dumps(list(node.needs)), json.dumps(list(node.outputs)),
-                     json.dumps(list(node.specs))))
+                    (
+                        run_id,
+                        node.node_id,
+                        plan_digest,
+                        node.kind.value,
+                        node.depth,
+                        json.dumps(list(node.needs)),
+                        json.dumps(list(node.outputs)),
+                        json.dumps(list(node.specs)),
+                    ),
+                )
                 self.conn.execute(
                     "INSERT INTO node_lifecycle (run_id, node_id, state, attempt_no,"
                     " block_reason, output_sha, granted_extra_attempts, updated_at)"
                     " VALUES (?,?,?,0,NULL,NULL,0,?)",
-                    (run_id, node.node_id, st.NodeState.PENDING.value, now))
+                    (run_id, node.node_id, st.NodeState.PENDING.value, now),
+                )
             self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def ensure_derived_review_node(
+        self,
+        run_id: str,
+        build_node_id: str,
+        *,
+        depth: int,
+        downstream_needs: Sequence[str] = (),
+    ) -> st.NodeLifecycle:
+        """Project one derived review node and its dependency edges exactly once.
+
+        The authoring model must keep refusing ``NodeKind.REVIEW``.  This is
+        therefore the sole runtime projection seam: it derives the id and
+        source binding, inserts the review row and rewires the direct
+        downstream edges in one transaction.  A prior projection is accepted
+        only when every durable fact is identical; it is never repaired by
+        overwriting a possibly ambiguous older ledger.
+        """
+        if depth < 0:
+            raise LifecycleError("a derived review node cannot have negative depth")
+        review_node_id = "{0}::review".format(build_node_id)
+        downstream_ids = tuple(downstream_needs)
+        if len(set(downstream_ids)) != len(downstream_ids):
+            raise LifecycleError("derived review downstream nodes must be distinct")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            run = self.conn.execute(
+                "SELECT plan_digest FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise LifecycleError(f"no run row for {run_id}")
+            plan_digest = str(run[0])
+            build = self.conn.execute(
+                "SELECT plan_digest, kind FROM dag_nodes WHERE run_id=? AND node_id=?",
+                (run_id, build_node_id),
+            ).fetchone()
+            if build is None:
+                raise UnknownNode(f"{run_id}/{build_node_id} has no dag row")
+            if build[0] != plan_digest:
+                raise LifecycleError(
+                    f"{run_id}/{build_node_id}: dag plan digest does not match its run"
+                )
+            if build[1] != st.NodeKind.AGENT.value:
+                raise LifecycleError(
+                    f"{run_id}/{build_node_id}: only an agent build lane can own "
+                    "a derived review node"
+                )
+
+            review = self.conn.execute(
+                "SELECT plan_digest, kind, depth, needs_json, outputs_json,"
+                " specs_json, review_of FROM dag_nodes WHERE run_id=? AND node_id=?",
+                (run_id, review_node_id),
+            ).fetchone()
+            created = review is None
+            if created:
+                now = now_iso()
+                self.conn.execute(
+                    "INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind, depth,"
+                    " needs_json, outputs_json, specs_json, review_of)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        review_node_id,
+                        plan_digest,
+                        st.NodeKind.REVIEW.value,
+                        depth,
+                        json.dumps([build_node_id]),
+                        "[]",
+                        "[]",
+                        build_node_id,
+                    ),
+                )
+                self.conn.execute(
+                    "INSERT INTO node_lifecycle (run_id, node_id, state, attempt_no,"
+                    " block_reason, output_sha, granted_extra_attempts, updated_at)"
+                    " VALUES (?,?,?,0,NULL,NULL,0,?)",
+                    (run_id, review_node_id, st.NodeState.PENDING.value, now),
+                )
+            else:
+                expected = (
+                    plan_digest,
+                    st.NodeKind.REVIEW.value,
+                    depth,
+                    (build_node_id,),
+                    (),
+                    (),
+                    build_node_id,
+                )
+                actual = (
+                    review[0],
+                    review[1],
+                    int(review[2]),
+                    tuple(json.loads(review[3])),
+                    tuple(json.loads(review[4])),
+                    tuple(json.loads(review[5])),
+                    review[6],
+                )
+                if actual != expected:
+                    raise LifecycleError(
+                        f"{run_id}/{review_node_id}: derived review projection mismatch"
+                    )
+                lifecycle = self.conn.execute(
+                    "SELECT 1 FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                    (run_id, review_node_id),
+                ).fetchone()
+                if lifecycle is None:
+                    raise LifecycleError(
+                        f"{run_id}/{review_node_id}: derived review dag row lacks lifecycle"
+                    )
+
+            for downstream_id in downstream_ids:
+                row = self.conn.execute(
+                    "SELECT needs_json FROM dag_nodes WHERE run_id=? AND node_id=?",
+                    (run_id, downstream_id),
+                ).fetchone()
+                if row is None:
+                    raise UnknownNode(f"{run_id}/{downstream_id} has no dag row")
+                needs = tuple(json.loads(row[0]))
+                if created:
+                    if review_node_id in needs or build_node_id not in needs:
+                        raise LifecycleError(
+                            f"{run_id}/{downstream_id}: cannot project review dependency"
+                        )
+                    rewired = tuple(
+                        review_node_id if need == build_node_id else need
+                        for need in needs
+                    )
+                    self.conn.execute(
+                        "UPDATE dag_nodes SET needs_json=? WHERE run_id=? AND node_id=?",
+                        (json.dumps(rewired), run_id, downstream_id),
+                    )
+                elif review_node_id not in needs or build_node_id in needs:
+                    raise LifecycleError(
+                        f"{run_id}/{downstream_id}: derived review dependency mismatch"
+                    )
+
+            if created:
+                now = now_iso()
+                self.conn.execute(
+                    "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+                    " reason, actor, detail_json, created_at)"
+                    " VALUES (?,?,'node',NULL,?,'derived-review-projected','scheduler',?,?)",
+                    (
+                        run_id,
+                        review_node_id,
+                        st.NodeState.PENDING.value,
+                        json.dumps(
+                            {
+                                "review_of": build_node_id,
+                                "downstream_needs": list(downstream_ids),
+                            },
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                self.conn.execute(
+                    "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id)
+                )
+            row = self.conn.execute(
+                "SELECT state, attempt_no, block_reason, output_sha,"
+                " granted_extra_attempts, lane_phase FROM node_lifecycle"
+                " WHERE run_id=? AND node_id=?",
+                (run_id, review_node_id),
+            ).fetchone()
+            self.conn.execute("COMMIT")
+            return st.NodeLifecycle(
+                node_id=review_node_id,
+                state=st.NodeState(row[0]),
+                attempt_no=row[1],
+                block_reason=st.BlockReason(row[2]) if row[2] else None,
+                output_sha=row[3],
+                granted_extra_attempts=row[4],
+                lane_phase=st.LanePhase(row[5]) if row[5] else None,
+            )
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
@@ -951,51 +1667,1929 @@ class LifecycleStore:
     @serialized
     def get_node(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         row = self.conn.execute(
-            "SELECT state, attempt_no, block_reason, output_sha, granted_extra_attempts"
-            " FROM node_lifecycle WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()
+            "SELECT state, attempt_no, block_reason, output_sha,"
+            " granted_extra_attempts, lane_phase, pending_cause"
+            " FROM node_lifecycle WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id} has no lifecycle row")
-        state, attempt_no, block_reason, output_sha, granted = row
+        (
+            state,
+            attempt_no,
+            block_reason,
+            output_sha,
+            granted,
+            lane_phase,
+            pending_cause,
+        ) = row
         return st.NodeLifecycle(
-            node_id=node_id, state=st.NodeState(state), attempt_no=attempt_no,
+            node_id=node_id,
+            state=st.NodeState(state),
+            attempt_no=attempt_no,
             block_reason=st.BlockReason(block_reason) if block_reason else None,
-            output_sha=output_sha, granted_extra_attempts=granted)
+            output_sha=output_sha,
+            granted_extra_attempts=granted,
+            lane_phase=st.LanePhase(lane_phase) if lane_phase else None,
+            pending_cause=st.PendingCause(pending_cause) if pending_cause else None,
+        )
 
     @serialized
-    def get_attempt(self, run_id: str, node_id: str, attempt_no: int) -> st.AttemptRecord:
+    def set_lane_phase(
+        self,
+        run_id: str,
+        build_node_id: str,
+        phase: st.LanePhase,
+        *,
+        expected: Optional[st.LanePhase] = None,
+    ) -> bool:
+        """Compare-and-set a lane's durable phase.
+
+        ``expected=None`` is an intentional initial CAS: it can only claim a
+        lane that has no recorded phase.  Terminal phases cannot be reopened
+        by this runtime surface; an operator escape, if one is ever added,
+        must name a different authority rather than silently relaxing this
+        guard.
+        """
+        try:
+            requested = st.LanePhase(phase)
+        except ValueError as error:
+            raise LifecycleError(f"unknown lane phase {phase!r}") from error
+        expected_phase = None
+        if expected is not None:
+            try:
+                expected_phase = st.LanePhase(expected)
+            except ValueError as error:
+                raise LifecycleError(
+                    f"unknown expected lane phase {expected!r}"
+                ) from error
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT lane_phase FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (run_id, build_node_id),
+            ).fetchone()
+            if row is None:
+                raise UnknownNode(f"{run_id}/{build_node_id} has no lifecycle row")
+            current = st.LanePhase(row[0]) if row[0] else None
+            if current is not expected_phase:
+                self.conn.execute("COMMIT")
+                return False
+            if current in st.LANE_PHASE_TERMINAL and current is not requested:
+                self.conn.execute("COMMIT")
+                return False
+            if current is requested:
+                self.conn.execute("COMMIT")
+                return True
+            now = now_iso()
+            self.conn.execute(
+                "UPDATE node_lifecycle SET lane_phase=?, updated_at=?"
+                " WHERE run_id=? AND node_id=?",
+                (requested.value, now, run_id, build_node_id),
+            )
+            self.conn.execute(
+                "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+                " reason, actor, detail_json, created_at)"
+                " VALUES (?,?,'node',NULL,NULL,'lane-phase','scheduler',?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    json.dumps(
+                        {
+                            "from": current.value if current else None,
+                            "to": requested.value,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            self.conn.execute(
+                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id)
+            )
+            self.conn.execute("COMMIT")
+            return True
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def get_attempt(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> st.AttemptRecord:
         row = self.conn.execute(
             "SELECT base_sha, state, started_at, launched_at, pid, turn_count,"
             " retry_class, extra_json, attempt_host, attempt_start_epoch"
             " FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
-        (base_sha, state, started_at, launched_at, pid, turn_count,
-         retry_class, extra_json, attempt_host, attempt_start_epoch) = row
+        (
+            base_sha,
+            state,
+            started_at,
+            launched_at,
+            pid,
+            turn_count,
+            retry_class,
+            extra_json,
+            attempt_host,
+            attempt_start_epoch,
+        ) = row
         return st.AttemptRecord(
-            run_id=run_id, node_id=node_id, attempt_no=attempt_no, base_sha=base_sha,
-            state=st.NodeState(state), started_at=started_at or 0.0, launched_at=launched_at,
-            pid=pid, turn_count=turn_count,
+            run_id=run_id,
+            node_id=node_id,
+            attempt_no=attempt_no,
+            base_sha=base_sha,
+            state=st.NodeState(state),
+            started_at=started_at or 0.0,
+            launched_at=launched_at,
+            pid=pid,
+            turn_count=turn_count,
             retry_class=st.RetryClass(retry_class) if retry_class else None,
             extra=json.loads(extra_json),
-            attempt_host=attempt_host, attempt_start_epoch=attempt_start_epoch)
+            attempt_host=attempt_host,
+            attempt_start_epoch=attempt_start_epoch,
+        )
 
     @serialized
     def node_outputs(self, run_id: str, node_id: str) -> Tuple[str, ...]:
         """The node's declared outputs, as stored when the run was created."""
         row = self.conn.execute(
             "SELECT outputs_json FROM dag_nodes WHERE run_id=? AND node_id=?",
-            (run_id, node_id)).fetchone()
+            (run_id, node_id),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id} has no dag row")
         return tuple(json.loads(row[0]))
 
+    # ── persistent review authority ─────────────────────────────────────────
+
+    def _candidate(
+        self, run_id: str, build_node_id: str, candidate_sha: str
+    ) -> Optional[st.LaneCandidate]:
+        row = self.conn.execute(
+            "SELECT run_id, build_node_id, candidate_seq, candidate_sha,"
+            " parent_candidate_sha, builder_generation, created_at"
+            " FROM lane_candidates WHERE run_id=? AND build_node_id=?"
+            " AND candidate_sha=?",
+            (run_id, build_node_id, candidate_sha),
+        ).fetchone()
+        return _candidate_from_row(row) if row is not None else None
+
+    def _review(
+        self, run_id: str, review_node_id: str, candidate_sha: str
+    ) -> Optional[st.CandidateReview]:
+        row = self.conn.execute(
+            "SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
+            " state, review_digest, receipt_path, findings_json, verdict, completed_at"
+            " FROM candidate_reviews WHERE run_id=? AND review_node_id=?"
+            " AND candidate_sha=?",
+            (run_id, review_node_id, candidate_sha),
+        ).fetchone()
+        return _review_from_row(row) if row is not None else None
+
+    def _handoff(
+        self, run_id: str, build_node_id: str, rejected_candidate_sha: str
+    ) -> Optional[st.RepairHandoff]:
+        row = self.conn.execute(
+            "SELECT run_id, build_node_id, rejected_candidate_sha, findings_json,"
+            " state, builder_generation, submitted_at, acknowledged_at"
+            " FROM repair_handoffs WHERE run_id=? AND build_node_id=?"
+            " AND rejected_candidate_sha=?",
+            (run_id, build_node_id, rejected_candidate_sha),
+        ).fetchone()
+        return _handoff_from_row(row) if row is not None else None
+
     @serialized
-    def record_baseline(self, run_id: str, node_id: str, attempt_no: int,
-                        baseline: Mapping[str, Sequence[str]],
-                        ignored_at_base: Optional[Mapping[str, str]] = None
-                        ) -> str:
+    def lane_candidates(
+        self, run_id: str, build_node_id: Optional[str] = None, *, limit: int = 100
+    ) -> Tuple[st.LaneCandidate, ...]:
+        """Candidates in stable publication order, optionally for one lane."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("candidate read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, build_node_id, candidate_seq, candidate_sha,"
+            " parent_candidate_sha, builder_generation, created_at"
+            " FROM lane_candidates WHERE run_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id,)
+        if build_node_id is not None:
+            sql += " AND build_node_id=?"
+            params = (run_id, build_node_id)
+        rows = self.conn.execute(
+            sql + " ORDER BY build_node_id, candidate_seq LIMIT ?", params + (limit,)
+        ).fetchall()
+        return tuple(_candidate_from_row(row) for row in rows)
+
+    @serialized
+    def candidate(
+        self, run_id: str, build_node_id: str, candidate_sha: str
+    ) -> Optional[st.LaneCandidate]:
+        return self._candidate(
+            run_id, build_node_id, _require_candidate_sha(candidate_sha)
+        )
+
+    @serialized
+    def candidate_reviews(
+        self, run_id: str, review_node_id: Optional[str] = None, *, limit: int = 100
+    ) -> Tuple[st.CandidateReview, ...]:
+        """Reviews in candidate order; each row is the one durable verdict."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("review read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
+            " state, review_digest, receipt_path, findings_json, verdict, completed_at"
+            " FROM candidate_reviews WHERE run_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id,)
+        if review_node_id is not None:
+            sql += " AND review_node_id=?"
+            params = (run_id, review_node_id)
+        rows = self.conn.execute(
+            sql + " ORDER BY review_node_id, rowid LIMIT ?", params + (limit,)
+        ).fetchall()
+        return tuple(_review_from_row(row) for row in rows)
+
+    @serialized
+    def candidate_review(
+        self, run_id: str, review_node_id: str, candidate_sha: str
+    ) -> Optional[st.CandidateReview]:
+        return self._review(
+            run_id, review_node_id, _require_candidate_sha(candidate_sha)
+        )
+
+    @serialized
+    def repair_handoffs(
+        self, run_id: str, build_node_id: Optional[str] = None, *, limit: int = 100
+    ) -> Tuple[st.RepairHandoff, ...]:
+        """Repair handoffs in rejection order, optionally for one build lane."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("handoff read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, build_node_id, rejected_candidate_sha, findings_json,"
+            " state, builder_generation, submitted_at, acknowledged_at"
+            " FROM repair_handoffs WHERE run_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id,)
+        if build_node_id is not None:
+            sql += " AND build_node_id=?"
+            params = (run_id, build_node_id)
+        rows = self.conn.execute(
+            sql + " ORDER BY build_node_id, rowid LIMIT ?", params + (limit,)
+        ).fetchall()
+        return tuple(_handoff_from_row(row) for row in rows)
+
+    @serialized
+    def repair_handoff(
+        self, run_id: str, build_node_id: str, rejected_candidate_sha: str
+    ) -> Optional[st.RepairHandoff]:
+        return self._handoff(
+            run_id,
+            build_node_id,
+            _require_candidate_sha(
+                rejected_candidate_sha, field_name="rejected_candidate_sha"
+            ),
+        )
+
+    def _legacy_review_migration_block(
+        self, run_id: str, build_node_id: str
+    ) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT reason FROM legacy_review_migration_blocks"
+            " WHERE run_id=? AND build_node_id=?",
+            (run_id, build_node_id),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    @serialized
+    def legacy_review_migrations(
+        self, run_id: str, *, limit: int = 100
+    ) -> Tuple[LegacyReviewMigration, ...]:
+        """Read lanes held before review scheduling by unsafe legacy evidence."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("legacy review migration read limit must be positive")
+        rows = self.conn.execute(
+            "SELECT build_node_id, reason FROM legacy_review_migration_blocks"
+            " WHERE run_id=? ORDER BY build_node_id LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+        return tuple(
+            LegacyReviewMigration(
+                build_node_id=str(row[0]),
+                migrated=False,
+                blocked=True,
+                reason=str(row[1]),
+            )
+            for row in rows
+        )
+
+    def _legacy_review_migration_failure(
+        self, run_id: str, build_node_id: str, reason: str, detail: Mapping[str, Any]
+    ) -> LegacyReviewMigration:
+        """Record a fail-closed lane fence inside the caller's transaction."""
+        _detail, detail_json = _canonical_detail(detail)
+        self.conn.execute(
+            "INSERT INTO legacy_review_migration_blocks"
+            " (run_id, build_node_id, reason, detail_json, created_at)"
+            " VALUES (?,?,?,?,?)"
+            " ON CONFLICT(run_id, build_node_id) DO NOTHING",
+            (run_id, build_node_id, reason, detail_json, now_iso()),
+        )
+        persisted = self._legacy_review_migration_block(run_id, build_node_id)
+        return LegacyReviewMigration(
+            build_node_id=build_node_id,
+            migrated=False,
+            blocked=True,
+            reason=persisted or reason,
+        )
+
+    @serialized
+    def migrate_legacy_inline_reviews(
+        self,
+        run_id: str,
+        evidence: Sequence[LegacyReviewEvidence],
+        *,
+        evidence_validator: Callable[[LegacyReviewEvidence], bool],
+        ancestry_validator: Optional[Callable[[str, str], bool]] = None,
+    ) -> Tuple[LegacyReviewMigration, ...]:
+        """Import uniquely proven terminal inline reviews before scheduling.
+
+        Receipt/digest authentication is injected because this store deliberately
+        does not own the detached receipt root.  An invalid row never degrades
+        into a fresh dispatch: it persists a lane fence that `begin_review`
+        checks before making any dispatch row.
+        """
+        if not callable(evidence_validator):
+            raise LifecycleError("legacy review evidence requires a validator")
+        if isinstance(evidence, (str, bytes)):
+            raise LifecycleError("legacy review evidence must be a sequence")
+        try:
+            supplied = tuple(evidence)
+        except TypeError as error:
+            raise LifecycleError("legacy review evidence must be a sequence") from error
+        if any(not isinstance(item, LegacyReviewEvidence) for item in supplied):
+            raise LifecycleError("legacy review evidence has an untyped record")
+        grouped: Dict[str, List[LegacyReviewEvidence]] = {}
+        for item in supplied:
+            grouped.setdefault(item.build_node_id, []).append(item)
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            outcomes: List[LegacyReviewMigration] = []
+            for build_node_id in sorted(grouped):
+                rows = grouped[build_node_id]
+                review_rows = self.conn.execute(
+                    "SELECT node_id FROM dag_nodes WHERE run_id=? AND kind=?"
+                    " AND review_of=? ORDER BY node_id",
+                    (run_id, st.NodeKind.REVIEW.value, build_node_id),
+                ).fetchall()
+                if len(review_rows) != 1:
+                    outcomes.append(
+                        self._legacy_review_migration_failure(
+                            run_id,
+                            build_node_id,
+                            "LEGACY_REVIEW_BINDING_INVALID",
+                            {"derived_review_count": len(review_rows)},
+                        )
+                    )
+                    continue
+                review_node_id = str(review_rows[0][0])
+                # A canonical candidate ledger means this lane has already
+                # crossed the migration boundary.  Legacy attempt metadata is
+                # then audit history only: later resumes must not compare it
+                # with, or fence, the authoritative candidate/review rows.
+                existing_candidates = self.lane_candidates(
+                    run_id, build_node_id, limit=10_000
+                )
+                existing_reviews = self.candidate_reviews(
+                    run_id, review_node_id, limit=10_000
+                )
+                if existing_candidates or existing_reviews:
+                    self.conn.execute(
+                        "DELETE FROM legacy_review_migration_blocks"
+                        " WHERE run_id=? AND build_node_id=?",
+                        (run_id, build_node_id),
+                    )
+                    outcomes.append(
+                        LegacyReviewMigration(
+                            build_node_id=build_node_id,
+                            migrated=False,
+                            blocked=False,
+                            reason=None,
+                            candidates=existing_candidates,
+                            reviews=existing_reviews,
+                        )
+                    )
+                    continue
+                existing_block = self._legacy_review_migration_block(
+                    run_id, build_node_id
+                )
+                if existing_block is not None:
+                    outcomes.append(
+                        LegacyReviewMigration(
+                            build_node_id=build_node_id,
+                            migrated=False,
+                            blocked=True,
+                            reason=existing_block,
+                        )
+                    )
+                    continue
+                node = self.conn.execute(
+                    "SELECT output_sha FROM node_lifecycle"
+                    " WHERE run_id=? AND node_id=?",
+                    (run_id, build_node_id),
+                ).fetchone()
+                if node is None:
+                    outcomes.append(
+                        self._legacy_review_migration_failure(
+                            run_id, build_node_id, "LEGACY_BUILD_NODE_UNKNOWN", {}
+                        )
+                    )
+                    continue
+                try:
+                    if any(
+                        not isinstance(item.candidate_seq, int)
+                        or isinstance(item.candidate_seq, bool)
+                        for item in rows
+                    ):
+                        raise LifecycleError("LEGACY_CANDIDATE_ORDER_INVALID")
+                    ordered = tuple(sorted(rows, key=lambda item: item.candidate_seq))
+                    sequences = tuple(item.candidate_seq for item in ordered)
+                    if sequences != tuple(range(1, len(ordered) + 1)):
+                        raise LifecycleError("LEGACY_CANDIDATE_ORDER_INVALID")
+                    candidate_shas = tuple(
+                        _require_candidate_sha(
+                            item.candidate_sha, field_name="legacy_candidate_sha"
+                        )
+                        for item in ordered
+                    )
+                    if len(set(candidate_shas)) != len(candidate_shas):
+                        raise LifecycleError("LEGACY_CANDIDATE_DUPLICATE")
+                    for item in ordered:
+                        _require_candidate_sha(
+                            item.base_sha, field_name="legacy_base_sha"
+                        )
+                        _require_candidate_sha(
+                            item.review_digest, field_name="legacy_review_digest"
+                        )
+                        if (
+                            not isinstance(item.receipt_path, str)
+                            or not item.receipt_path.strip()
+                        ):
+                            raise LifecycleError("LEGACY_RECEIPT_PATH_INVALID")
+                        _require_generation(
+                            item.builder_generation,
+                            field_name="legacy_builder_generation",
+                        )
+                        _require_generation(
+                            item.reviewer_generation,
+                            field_name="legacy_reviewer_generation",
+                        )
+                        st.ReviewVerdict(item.verdict)
+                        _canonical_findings(item.findings)
+                        if not evidence_validator(item):
+                            raise LifecycleError("LEGACY_RECEIPT_OR_DIGEST_INVALID")
+                    if any(
+                        ordered[index].builder_generation
+                        < ordered[index - 1].builder_generation
+                        for index in range(1, len(ordered))
+                    ):
+                        raise LifecycleError("LEGACY_BUILDER_GENERATION_REGRESSED")
+                    if len(ordered) > 1 and ancestry_validator is None:
+                        raise LifecycleError("LEGACY_CANDIDATE_ANCESTRY_UNPROVEN")
+                    for index in range(1, len(ordered)):
+                        if not ancestry_validator(
+                            candidate_shas[index - 1], candidate_shas[index]
+                        ):
+                            raise LifecycleError("LEGACY_CANDIDATE_ANCESTRY_UNPROVEN")
+                    output_sha = _require_candidate_sha(
+                        node[0], field_name="legacy_build_output_sha"
+                    )
+                    if output_sha != candidate_shas[-1]:
+                        raise LifecycleError("LEGACY_CANDIDATE_SHA_MISMATCH")
+                except Exception as error:
+                    reason = str(error)
+                    if not reason.startswith("LEGACY_"):
+                        reason = "LEGACY_REVIEW_EVIDENCE_INVALID"
+                    outcomes.append(
+                        self._legacy_review_migration_failure(
+                            run_id, build_node_id, reason, {"error": str(error)}
+                        )
+                    )
+                    continue
+
+                now = now_iso()
+                candidates: List[st.LaneCandidate] = []
+                reviews: List[st.CandidateReview] = []
+                for index, (item, candidate_sha) in enumerate(
+                    zip(ordered, candidate_shas)
+                ):
+                    parent_sha = candidate_shas[index - 1] if index else None
+                    typed_findings, findings_json = _canonical_findings(item.findings)
+                    verdict = st.ReviewVerdict(item.verdict)
+                    self.conn.execute(
+                        "INSERT INTO lane_candidates"
+                        " (run_id, build_node_id, candidate_seq, candidate_sha,"
+                        "  parent_candidate_sha, builder_generation, created_at)"
+                        " VALUES (?,?,?,?,?,?,?)",
+                        (
+                            run_id,
+                            build_node_id,
+                            item.candidate_seq,
+                            candidate_sha,
+                            parent_sha,
+                            item.builder_generation,
+                            now,
+                        ),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO candidate_reviews"
+                        " (run_id, review_node_id, candidate_sha, reviewer_generation,"
+                        "  state, review_digest, receipt_path, findings_json, verdict,"
+                        "  completed_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            run_id,
+                            review_node_id,
+                            candidate_sha,
+                            item.reviewer_generation,
+                            st.CandidateReviewState.COMPLETED.value,
+                            item.review_digest,
+                            item.receipt_path,
+                            findings_json,
+                            verdict.value,
+                            now,
+                        ),
+                    )
+                    candidate = st.LaneCandidate(
+                        run_id=run_id,
+                        build_node_id=build_node_id,
+                        candidate_seq=item.candidate_seq,
+                        candidate_sha=candidate_sha,
+                        parent_candidate_sha=parent_sha,
+                        builder_generation=item.builder_generation,
+                        created_at=now,
+                    )
+                    review = st.CandidateReview(
+                        run_id=run_id,
+                        review_node_id=review_node_id,
+                        candidate_sha=candidate_sha,
+                        reviewer_generation=item.reviewer_generation,
+                        state=st.CandidateReviewState.COMPLETED,
+                        review_digest=item.review_digest,
+                        receipt_path=item.receipt_path,
+                        findings=typed_findings,
+                        verdict=verdict,
+                        completed_at=now,
+                    )
+                    candidates.append(candidate)
+                    reviews.append(review)
+                    if verdict is st.ReviewVerdict.REJECTED:
+                        self.conn.execute(
+                            "INSERT INTO repair_handoffs"
+                            " (run_id, build_node_id, rejected_candidate_sha,"
+                            "  findings_json, state, builder_generation,"
+                            "  submitted_at, acknowledged_at)"
+                            " VALUES (?,?,?,?,?,?,NULL,NULL)",
+                            (
+                                run_id,
+                                build_node_id,
+                                candidate_sha,
+                                findings_json,
+                                st.RepairHandoffState.PENDING.value,
+                                item.builder_generation,
+                            ),
+                        )
+                outcomes.append(
+                    LegacyReviewMigration(
+                        build_node_id=build_node_id,
+                        migrated=True,
+                        blocked=False,
+                        reason=None,
+                        candidates=tuple(candidates),
+                        reviews=tuple(reviews),
+                    )
+                )
+            self.conn.execute("COMMIT")
+            return tuple(outcomes)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def publish_candidate(
+        self,
+        run_id: str,
+        build_node_id: str,
+        candidate_sha: str,
+        *,
+        parent_candidate_sha: Optional[str] = None,
+        builder_generation: int,
+        ancestry_validator: Optional[Callable[[str, str], bool]] = None,
+        repo_path: Optional[Path] = None,
+    ) -> st.CandidatePublication:
+        """Append one proven descendant candidate, or return its exact replay.
+
+        A repository-aware validator receives ``(parent_sha, candidate_sha)``;
+        absent an injected validator, ``repo_path`` is required for every
+        non-initial candidate and git supplies that proof.  Neither a SHA's
+        lexical order nor a builder's assertion is ancestry evidence.
+        """
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        builder_generation = _require_generation(
+            builder_generation, field_name="builder_generation"
+        )
+        parent_sha = (
+            _require_candidate_sha(
+                parent_candidate_sha, field_name="parent_candidate_sha"
+            )
+            if parent_candidate_sha is not None
+            else None
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            node = self.conn.execute(
+                "SELECT 1 FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (run_id, build_node_id),
+            ).fetchone()
+            if node is None:
+                raise UnknownNode(f"{run_id}/{build_node_id} has no lifecycle row")
+            existing = self._candidate(run_id, build_node_id, candidate_sha)
+            blocked = self._legacy_review_migration_block(run_id, build_node_id)
+            if blocked is not None:
+                raise LegacyReviewMigrationBlocked(run_id, build_node_id, blocked)
+            if existing is not None:
+                if (
+                    existing.parent_candidate_sha != parent_sha
+                    or existing.builder_generation != builder_generation
+                ):
+                    raise LifecycleError(
+                        "candidate replay disagrees with the immutable publication"
+                    )
+                self.conn.execute("COMMIT")
+                return st.CandidatePublication(candidate=existing, created=False)
+            previous_row = self.conn.execute(
+                "SELECT run_id, build_node_id, candidate_seq, candidate_sha,"
+                " parent_candidate_sha, builder_generation, created_at"
+                " FROM lane_candidates WHERE run_id=? AND build_node_id=?"
+                " ORDER BY candidate_seq DESC LIMIT 1",
+                (run_id, build_node_id),
+            ).fetchone()
+            previous = _candidate_from_row(previous_row) if previous_row else None
+            if previous is None:
+                if parent_sha is not None:
+                    raise LifecycleError(
+                        "the first lane candidate has no parent candidate SHA"
+                    )
+            else:
+                if parent_sha != previous.candidate_sha:
+                    raise LifecycleError(
+                        "a candidate must name the latest published candidate as parent"
+                    )
+                if builder_generation < previous.builder_generation:
+                    raise LifecycleError(
+                        "a stale builder generation cannot publish a candidate"
+                    )
+                proven = False
+                if ancestry_validator is not None:
+                    try:
+                        proven = bool(ancestry_validator(parent_sha, candidate_sha))
+                    except Exception as error:
+                        raise LifecycleError(
+                            "candidate ancestry validator did not prove descent"
+                        ) from error
+                elif repo_path is not None:
+                    proven = _is_ancestor(repo_path, parent_sha, candidate_sha)
+                else:
+                    raise LifecycleError(
+                        "a descendant candidate requires an ancestry validator or repo_path"
+                    )
+                if not proven:
+                    raise LifecycleError(
+                        "candidate SHA is equal to or not a proven descendant of its parent"
+                    )
+            sequence = 1 if previous is None else previous.candidate_seq + 1
+            now = now_iso()
+            self.conn.execute(
+                "INSERT INTO lane_candidates"
+                " (run_id, build_node_id, candidate_seq, candidate_sha,"
+                "  parent_candidate_sha, builder_generation, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    sequence,
+                    candidate_sha,
+                    parent_sha,
+                    builder_generation,
+                    now,
+                ),
+            )
+            created = st.LaneCandidate(
+                run_id=run_id,
+                build_node_id=build_node_id,
+                candidate_seq=sequence,
+                candidate_sha=candidate_sha,
+                parent_candidate_sha=parent_sha,
+                builder_generation=builder_generation,
+                created_at=now,
+            )
+            self.conn.execute("COMMIT")
+            return st.CandidatePublication(candidate=created, created=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def _require_review_candidate(
+        self, run_id: str, review_node_id: str, candidate_sha: str
+    ) -> st.LaneCandidate:
+        build_node_id = _review_build_id(review_node_id)
+        candidate = self._candidate(run_id, build_node_id, candidate_sha)
+        if candidate is None:
+            raise LifecycleError(
+                f"{run_id}/{review_node_id}: candidate was not published by {build_node_id}"
+            )
+        review = self.conn.execute(
+            "SELECT kind, review_of FROM dag_nodes WHERE run_id=? AND node_id=?",
+            (run_id, review_node_id),
+        ).fetchone()
+        if review is None:
+            raise UnknownNode(f"{run_id}/{review_node_id} has no derived review row")
+        if review[0] != st.NodeKind.REVIEW.value or review[1] != build_node_id:
+            raise LifecycleError(
+                f"{run_id}/{review_node_id}: review/source binding is not durable"
+            )
+        return candidate
+
+    def _record_review_output_audit(
+        self,
+        run_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        *,
+        reason: str,
+        reviewer_generation: int,
+        verdict: st.ReviewVerdict,
+        review_digest: str,
+        receipt_path: str,
+        findings_json: str,
+    ) -> None:
+        """Persist ignored stale/duplicate reviewer output as typed audit evidence."""
+        self.conn.execute(
+            "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+            " reason, actor, detail_json, created_at)"
+            " VALUES (?,?,'node',NULL,NULL,?,'scheduler',?,?)",
+            (
+                run_id,
+                review_node_id,
+                reason,
+                json.dumps(
+                    {
+                        "candidate_sha": candidate_sha,
+                        "reviewer_generation": reviewer_generation,
+                        "verdict": verdict.value,
+                        "review_digest": review_digest,
+                        "receipt_path": receipt_path,
+                        "findings": json.loads(findings_json),
+                    },
+                    sort_keys=True,
+                ),
+                now_iso(),
+            ),
+        )
+
+    @serialized
+    def begin_review(
+        self,
+        run_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        *,
+        reviewer_generation: int,
+    ) -> st.ReviewBegin:
+        """Create the sole dispatch row for a candidate review.
+
+        An existing row always wins: a completed row cannot be redispatched,
+        and an outstanding row remains owned by its original reviewer
+        generation until the explicit recovery writer proves replacement.
+        """
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        reviewer_generation = _require_generation(
+            reviewer_generation, field_name="reviewer_generation"
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            build_node_id = _review_build_id(review_node_id)
+            blocked = self._legacy_review_migration_block(run_id, build_node_id)
+            if blocked is not None:
+                raise LegacyReviewMigrationBlocked(run_id, build_node_id, blocked)
+            self._require_review_candidate(run_id, review_node_id, candidate_sha)
+            existing = self._review(run_id, review_node_id, candidate_sha)
+            if existing is not None:
+                self.conn.execute("COMMIT")
+                return st.ReviewBegin(
+                    review=existing, created=False, should_dispatch=False
+                )
+            self.conn.execute(
+                "INSERT INTO candidate_reviews"
+                " (run_id, review_node_id, candidate_sha, reviewer_generation, state,"
+                "  review_digest, receipt_path, findings_json, verdict, completed_at)"
+                " VALUES (?,?,?,?,?,NULL,NULL,'[]',NULL,NULL)",
+                (
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    reviewer_generation,
+                    st.CandidateReviewState.DISPATCHED.value,
+                ),
+            )
+            created = st.CandidateReview(
+                run_id=run_id,
+                review_node_id=review_node_id,
+                candidate_sha=candidate_sha,
+                reviewer_generation=reviewer_generation,
+                state=st.CandidateReviewState.DISPATCHED,
+                review_digest=None,
+                receipt_path=None,
+                findings=(),
+                verdict=None,
+                completed_at=None,
+            )
+            self.conn.execute("COMMIT")
+            return st.ReviewBegin(review=created, created=True, should_dispatch=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def recover_review_dispatch(
+        self,
+        run_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        *,
+        expected_reviewer_generation: int,
+        reviewer_generation: int,
+    ) -> st.ReviewBegin:
+        """Claim an unfinished dispatch for a proven replacement reviewer.
+
+        A caller must first establish typed session death.  This method only
+        fences the durable owner change; it cannot revive a completed result.
+        """
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        expected_reviewer_generation = _require_generation(
+            expected_reviewer_generation, field_name="expected_reviewer_generation"
+        )
+        reviewer_generation = _require_generation(
+            reviewer_generation, field_name="reviewer_generation"
+        )
+        if reviewer_generation <= expected_reviewer_generation:
+            raise LifecycleError(
+                "a replacement reviewer generation must advance its predecessor"
+            )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            build_node_id = _review_build_id(review_node_id)
+            blocked = self._legacy_review_migration_block(run_id, build_node_id)
+            if blocked is not None:
+                raise LegacyReviewMigrationBlocked(run_id, build_node_id, blocked)
+            self._require_review_candidate(run_id, review_node_id, candidate_sha)
+            existing = self._review(run_id, review_node_id, candidate_sha)
+            if existing is None:
+                raise LifecycleError("an undispatched review cannot be recovered")
+            if (
+                existing.terminal
+                or existing.reviewer_generation != expected_reviewer_generation
+            ):
+                self.conn.execute("COMMIT")
+                return st.ReviewBegin(
+                    review=existing, created=False, should_dispatch=False
+                )
+            self.conn.execute(
+                "UPDATE candidate_reviews SET reviewer_generation=?"
+                " WHERE run_id=? AND review_node_id=? AND candidate_sha=?"
+                " AND state=? AND reviewer_generation=?",
+                (
+                    reviewer_generation,
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    st.CandidateReviewState.DISPATCHED.value,
+                    expected_reviewer_generation,
+                ),
+            )
+            updated = self._review(run_id, review_node_id, candidate_sha)
+            self.conn.execute(
+                "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+                " reason, actor, detail_json, created_at)"
+                " VALUES (?,?,'node',NULL,NULL,'candidate-review-recovered',"
+                " 'scheduler',?,?)",
+                (
+                    run_id,
+                    review_node_id,
+                    json.dumps(
+                        {
+                            "candidate_sha": candidate_sha,
+                            "from_generation": expected_reviewer_generation,
+                            "to_generation": reviewer_generation,
+                        },
+                        sort_keys=True,
+                    ),
+                    now_iso(),
+                ),
+            )
+            self.conn.execute("COMMIT")
+            return st.ReviewBegin(review=updated, created=False, should_dispatch=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def complete_review(
+        self,
+        run_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        *,
+        reviewer_generation: int,
+        verdict: st.ReviewVerdict,
+        review_digest: str,
+        receipt_path: str,
+        findings: Sequence[Mapping[str, Any]],
+    ) -> st.ReviewCompletion:
+        """CAS the first PASS verdict; rejection must atomically create a handoff."""
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        reviewer_generation = _require_generation(
+            reviewer_generation, field_name="reviewer_generation"
+        )
+        try:
+            verdict = st.ReviewVerdict(verdict)
+        except ValueError as error:
+            raise LifecycleError(f"unknown review verdict {verdict!r}") from error
+        if not isinstance(review_digest, str) or not review_digest.strip():
+            raise LifecycleError("review_digest must be a non-empty string")
+        if not isinstance(receipt_path, str) or not receipt_path.strip():
+            raise LifecycleError("receipt_path must be a non-empty string")
+        typed_findings, findings_json = _canonical_findings(findings)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_review_candidate(run_id, review_node_id, candidate_sha)
+            existing = self._review(run_id, review_node_id, candidate_sha)
+            if existing is None:
+                raise LifecycleError("a review result requires a prior dispatch")
+            if existing.terminal:
+                self._record_review_output_audit(
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    reason="candidate-review-duplicate-output",
+                    reviewer_generation=reviewer_generation,
+                    verdict=verdict,
+                    review_digest=review_digest,
+                    receipt_path=receipt_path,
+                    findings_json=findings_json,
+                )
+                self.conn.execute("COMMIT")
+                return st.ReviewCompletion(review=existing, completed=False)
+            if existing.reviewer_generation != reviewer_generation:
+                self._record_review_output_audit(
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    reason="candidate-review-stale-generation",
+                    reviewer_generation=reviewer_generation,
+                    verdict=verdict,
+                    review_digest=review_digest,
+                    receipt_path=receipt_path,
+                    findings_json=findings_json,
+                )
+                self.conn.execute("COMMIT")
+                return st.ReviewCompletion(review=existing, completed=False)
+            if verdict is st.ReviewVerdict.REJECTED:
+                raise LifecycleError(
+                    "a rejected review must use reject_and_create_handoff atomically"
+                )
+            now = now_iso()
+            changed = self.conn.execute(
+                "UPDATE candidate_reviews SET state=?, review_digest=?, receipt_path=?,"
+                " findings_json=?, verdict=?, completed_at=?"
+                " WHERE run_id=? AND review_node_id=? AND candidate_sha=?"
+                " AND state=? AND reviewer_generation=? AND verdict IS NULL",
+                (
+                    st.CandidateReviewState.COMPLETED.value,
+                    review_digest,
+                    receipt_path,
+                    findings_json,
+                    verdict.value,
+                    now,
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    st.CandidateReviewState.DISPATCHED.value,
+                    reviewer_generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise LifecycleError(
+                    "candidate review completion CAS lost unexpectedly"
+                )
+            completed = st.CandidateReview(
+                run_id=run_id,
+                review_node_id=review_node_id,
+                candidate_sha=candidate_sha,
+                reviewer_generation=reviewer_generation,
+                state=st.CandidateReviewState.COMPLETED,
+                review_digest=review_digest,
+                receipt_path=receipt_path,
+                findings=typed_findings,
+                verdict=verdict,
+                completed_at=now,
+            )
+            self.conn.execute("COMMIT")
+            return st.ReviewCompletion(review=completed, completed=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def reject_and_create_handoff(
+        self,
+        run_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        *,
+        reviewer_generation: int,
+        builder_generation: int,
+        review_digest: str,
+        receipt_path: str,
+        findings: Sequence[Mapping[str, Any]],
+    ) -> st.RejectionHandoff:
+        """Atomically record a REJECTED review and its one repair handoff."""
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        reviewer_generation = _require_generation(
+            reviewer_generation, field_name="reviewer_generation"
+        )
+        builder_generation = _require_generation(
+            builder_generation, field_name="builder_generation"
+        )
+        if not isinstance(review_digest, str) or not review_digest.strip():
+            raise LifecycleError("review_digest must be a non-empty string")
+        if not isinstance(receipt_path, str) or not receipt_path.strip():
+            raise LifecycleError("receipt_path must be a non-empty string")
+        typed_findings, findings_json = _canonical_findings(findings)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            candidate = self._require_review_candidate(
+                run_id, review_node_id, candidate_sha
+            )
+            if builder_generation < candidate.builder_generation:
+                raise LifecycleError(
+                    "a stale builder generation cannot receive a repair handoff"
+                )
+            build_node_id = candidate.build_node_id
+            existing = self._review(run_id, review_node_id, candidate_sha)
+            if existing is None:
+                raise LifecycleError("a rejected review requires a prior dispatch")
+            if existing.terminal:
+                handoff = self._handoff(run_id, build_node_id, candidate_sha)
+                if existing.verdict is st.ReviewVerdict.REJECTED and handoff is None:
+                    raise LifecycleError(
+                        "rejected review has no repair handoff; ledger invariant broken"
+                    )
+                self._record_review_output_audit(
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    reason="candidate-review-duplicate-output",
+                    reviewer_generation=reviewer_generation,
+                    verdict=st.ReviewVerdict.REJECTED,
+                    review_digest=review_digest,
+                    receipt_path=receipt_path,
+                    findings_json=findings_json,
+                )
+                self.conn.execute("COMMIT")
+                return st.RejectionHandoff(
+                    review=existing, handoff=handoff, completed=False, created=False
+                )
+            if existing.reviewer_generation != reviewer_generation:
+                self._record_review_output_audit(
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    reason="candidate-review-stale-generation",
+                    reviewer_generation=reviewer_generation,
+                    verdict=st.ReviewVerdict.REJECTED,
+                    review_digest=review_digest,
+                    receipt_path=receipt_path,
+                    findings_json=findings_json,
+                )
+                self.conn.execute("COMMIT")
+                return st.RejectionHandoff(
+                    review=existing, handoff=None, completed=False, created=False
+                )
+            now = now_iso()
+            changed = self.conn.execute(
+                "UPDATE candidate_reviews SET state=?, review_digest=?, receipt_path=?,"
+                " findings_json=?, verdict=?, completed_at=?"
+                " WHERE run_id=? AND review_node_id=? AND candidate_sha=?"
+                " AND state=? AND reviewer_generation=? AND verdict IS NULL",
+                (
+                    st.CandidateReviewState.COMPLETED.value,
+                    review_digest,
+                    receipt_path,
+                    findings_json,
+                    st.ReviewVerdict.REJECTED.value,
+                    now,
+                    run_id,
+                    review_node_id,
+                    candidate_sha,
+                    st.CandidateReviewState.DISPATCHED.value,
+                    reviewer_generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise LifecycleError("candidate review rejection CAS lost unexpectedly")
+            self.conn.execute(
+                "INSERT INTO repair_handoffs"
+                " (run_id, build_node_id, rejected_candidate_sha, findings_json, state,"
+                "  builder_generation, submitted_at, acknowledged_at)"
+                " VALUES (?,?,?,?,?,?,NULL,NULL)",
+                (
+                    run_id,
+                    build_node_id,
+                    candidate_sha,
+                    findings_json,
+                    st.RepairHandoffState.PENDING.value,
+                    builder_generation,
+                ),
+            )
+            review = st.CandidateReview(
+                run_id=run_id,
+                review_node_id=review_node_id,
+                candidate_sha=candidate_sha,
+                reviewer_generation=reviewer_generation,
+                state=st.CandidateReviewState.COMPLETED,
+                review_digest=review_digest,
+                receipt_path=receipt_path,
+                findings=typed_findings,
+                verdict=st.ReviewVerdict.REJECTED,
+                completed_at=now,
+            )
+            handoff = st.RepairHandoff(
+                run_id=run_id,
+                build_node_id=build_node_id,
+                rejected_candidate_sha=candidate_sha,
+                findings=typed_findings,
+                state=st.RepairHandoffState.PENDING,
+                builder_generation=builder_generation,
+                submitted_at=None,
+                acknowledged_at=None,
+            )
+            self.conn.execute("COMMIT")
+            return st.RejectionHandoff(
+                review=review, handoff=handoff, completed=True, created=True
+            )
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def mark_handoff_submitted(
+        self,
+        run_id: str,
+        build_node_id: str,
+        rejected_candidate_sha: str,
+        *,
+        builder_generation: int,
+    ) -> st.HandoffSubmission:
+        """Record successful prompt delivery before its acknowledgement arrives."""
+        rejected_candidate_sha = _require_candidate_sha(
+            rejected_candidate_sha, field_name="rejected_candidate_sha"
+        )
+        builder_generation = _require_generation(
+            builder_generation, field_name="builder_generation"
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            handoff = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+            if handoff is None:
+                raise LifecycleError("no repair handoff exists for this candidate")
+            current_builder = self.current_actor_session(
+                run_id, build_node_id, "builder"
+            )
+            if handoff.builder_generation != builder_generation or (
+                current_builder is not None
+                and current_builder.generation != builder_generation
+            ):
+                self.conn.execute("COMMIT")
+                return st.HandoffSubmission(handoff=handoff, submitted=False)
+            if handoff.state is st.RepairHandoffState.PENDING:
+                now = now_iso()
+                self.conn.execute(
+                    "UPDATE repair_handoffs SET state=?, submitted_at=?"
+                    " WHERE run_id=? AND build_node_id=? AND rejected_candidate_sha=?"
+                    " AND state=? AND builder_generation=?",
+                    (
+                        st.RepairHandoffState.SUBMITTED.value,
+                        now,
+                        run_id,
+                        build_node_id,
+                        rejected_candidate_sha,
+                        st.RepairHandoffState.PENDING.value,
+                        builder_generation,
+                    ),
+                )
+                handoff = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+                self.conn.execute("COMMIT")
+                return st.HandoffSubmission(handoff=handoff, submitted=True)
+            self.conn.execute("COMMIT")
+            return st.HandoffSubmission(
+                handoff=handoff,
+                submitted=handoff.state
+                in (
+                    st.RepairHandoffState.SUBMITTED,
+                    st.RepairHandoffState.ACKNOWLEDGED,
+                ),
+            )
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def acknowledge_handoff(
+        self,
+        run_id: str,
+        build_node_id: str,
+        rejected_candidate_sha: str,
+        *,
+        builder_generation: int,
+    ) -> st.HandoffAcknowledgement:
+        """Acknowledge only the submitted handoff for this SHA and generation."""
+        rejected_candidate_sha = _require_candidate_sha(
+            rejected_candidate_sha, field_name="rejected_candidate_sha"
+        )
+        builder_generation = _require_generation(
+            builder_generation, field_name="builder_generation"
+        )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            handoff = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+            if handoff is None:
+                raise LifecycleError("no repair handoff exists for this candidate")
+            current_builder = self.current_actor_session(
+                run_id, build_node_id, "builder"
+            )
+            if handoff.builder_generation != builder_generation or (
+                current_builder is not None
+                and current_builder.generation != builder_generation
+            ):
+                self.conn.execute("COMMIT")
+                return st.HandoffAcknowledgement(handoff=handoff, acknowledged=False)
+            if handoff.state is st.RepairHandoffState.ACKNOWLEDGED:
+                self.conn.execute("COMMIT")
+                return st.HandoffAcknowledgement(handoff=handoff, acknowledged=True)
+            if handoff.state is not st.RepairHandoffState.SUBMITTED:
+                self.conn.execute("COMMIT")
+                return st.HandoffAcknowledgement(handoff=handoff, acknowledged=False)
+            now = now_iso()
+            changed = self.conn.execute(
+                "UPDATE repair_handoffs SET state=?, acknowledged_at=?"
+                " WHERE run_id=? AND build_node_id=? AND rejected_candidate_sha=?"
+                " AND state=? AND builder_generation=?",
+                (
+                    st.RepairHandoffState.ACKNOWLEDGED.value,
+                    now,
+                    run_id,
+                    build_node_id,
+                    rejected_candidate_sha,
+                    st.RepairHandoffState.SUBMITTED.value,
+                    builder_generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise LifecycleError(
+                    "repair handoff acknowledgement CAS lost unexpectedly"
+                )
+            acknowledged = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+            self.conn.execute("COMMIT")
+            return st.HandoffAcknowledgement(handoff=acknowledged, acknowledged=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def fail_handoff(
+        self,
+        run_id: str,
+        build_node_id: str,
+        rejected_candidate_sha: str,
+        *,
+        builder_generation: int,
+        reason: str,
+    ) -> Optional[st.RepairHandoff]:
+        """Persist bounded handoff failure without changing review truth."""
+        rejected_candidate_sha = _require_candidate_sha(
+            rejected_candidate_sha, field_name="rejected_candidate_sha"
+        )
+        builder_generation = _require_generation(
+            builder_generation, field_name="builder_generation"
+        )
+        if not isinstance(reason, str) or not reason.strip():
+            raise LifecycleError("handoff failure reason must be non-empty")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            handoff = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+            if (
+                handoff is None
+                or handoff.builder_generation != builder_generation
+                or handoff.state
+                in (st.RepairHandoffState.ACKNOWLEDGED, st.RepairHandoffState.FAILED)
+            ):
+                self.conn.execute("COMMIT")
+                return handoff
+            self.conn.execute(
+                "UPDATE repair_handoffs SET state=?"
+                " WHERE run_id=? AND build_node_id=? AND rejected_candidate_sha=?"
+                " AND builder_generation=?",
+                (
+                    st.RepairHandoffState.FAILED.value,
+                    run_id,
+                    build_node_id,
+                    rejected_candidate_sha,
+                    builder_generation,
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
+                " reason, actor, detail_json, created_at)"
+                " VALUES (?,?,'node',NULL,NULL,'repair-handoff-failed','scheduler',?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    json.dumps(
+                        {
+                            "candidate_sha": rejected_candidate_sha,
+                            "builder_generation": builder_generation,
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                    ),
+                    now_iso(),
+                ),
+            )
+            failed = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+            self.conn.execute("COMMIT")
+            return failed
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def spend_lane_retry(
+        self,
+        run_id: str,
+        build_node_id: str,
+        retry_class: st.LaneRetryClass,
+        *,
+        cycle_seq: int,
+        candidate_sha: Optional[str] = None,
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> st.LaneRetrySpendRecord:
+        """Record one correction-loop budget debit without minting an attempt."""
+        try:
+            retry_class = st.LaneRetryClass(retry_class)
+        except ValueError as error:
+            raise LifecycleError(f"unknown lane retry class {retry_class!r}") from error
+        if (
+            not isinstance(cycle_seq, int)
+            or isinstance(cycle_seq, bool)
+            or cycle_seq < 1
+        ):
+            raise LifecycleError("lane retry cycle_seq must be a positive integer")
+        candidate_sha = (
+            _require_candidate_sha(candidate_sha) if candidate_sha is not None else None
+        )
+        typed_detail, detail_json = _canonical_detail(detail)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            node = self.conn.execute(
+                "SELECT 1 FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (run_id, build_node_id),
+            ).fetchone()
+            if node is None:
+                raise UnknownNode(f"{run_id}/{build_node_id} has no lifecycle row")
+            existing = self.conn.execute(
+                "SELECT run_id, build_node_id, retry_class, cycle_seq, candidate_sha,"
+                " detail_json, created_at FROM lane_retry_spend"
+                " WHERE run_id=? AND build_node_id=? AND cycle_seq=?",
+                (run_id, build_node_id, cycle_seq),
+            ).fetchone()
+            if existing is not None:
+                spend = _lane_retry_spend_from_row(existing)
+                if (
+                    spend.retry_class is not retry_class
+                    or spend.candidate_sha != candidate_sha
+                    or dict(spend.detail) != dict(typed_detail)
+                ):
+                    raise LifecycleError(
+                        "lane retry replay disagrees with the immutable spend"
+                    )
+                self.conn.execute("COMMIT")
+                return st.LaneRetrySpendRecord(spend=spend, created=False)
+            now = now_iso()
+            self.conn.execute(
+                "INSERT INTO lane_retry_spend"
+                " (run_id, build_node_id, retry_class, cycle_seq, candidate_sha,"
+                "  detail_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    retry_class.value,
+                    cycle_seq,
+                    candidate_sha,
+                    detail_json,
+                    now,
+                ),
+            )
+            spend = st.LaneRetrySpend(
+                run_id=run_id,
+                build_node_id=build_node_id,
+                retry_class=retry_class,
+                cycle_seq=cycle_seq,
+                candidate_sha=candidate_sha,
+                detail=typed_detail,
+                created_at=now,
+            )
+            self.conn.execute("COMMIT")
+            return st.LaneRetrySpendRecord(spend=spend, created=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def lane_retry_spends(
+        self, run_id: str, build_node_id: str, *, limit: int = 100
+    ) -> Tuple[st.LaneRetrySpend, ...]:
+        """The bounded durable correction-loop spend ledger for one lane."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("lane retry read limit must be a positive integer")
+        rows = self.conn.execute(
+            "SELECT run_id, build_node_id, retry_class, cycle_seq, candidate_sha,"
+            " detail_json, created_at FROM lane_retry_spend"
+            " WHERE run_id=? AND build_node_id=? ORDER BY cycle_seq LIMIT ?",
+            (run_id, build_node_id, limit),
+        ).fetchall()
+        return tuple(_lane_retry_spend_from_row(row) for row in rows)
+
+    def _actor_session(
+        self, run_id: str, build_node_id: str, actor_role: str, generation: int
+    ) -> Optional[st.ActorSession]:
+        row = self.conn.execute(
+            "SELECT run_id, build_node_id, actor_role, generation, state, pane_id,"
+            " tab_id, session_path, correlation_token, updated_at FROM actor_sessions"
+            " WHERE run_id=? AND build_node_id=? AND actor_role=? AND generation=?",
+            (run_id, build_node_id, actor_role, generation),
+        ).fetchone()
+        return _actor_session_from_row(row) if row is not None else None
+
+    @serialized
+    def actor_sessions(
+        self,
+        run_id: str,
+        build_node_id: str,
+        *,
+        actor_role: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[st.ActorSession, ...]:
+        """Bounded session-generation authority for resume and watchdog fencing."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("actor session read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, build_node_id, actor_role, generation, state, pane_id,"
+            " tab_id, session_path, correlation_token, updated_at FROM actor_sessions"
+            " WHERE run_id=? AND build_node_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id, build_node_id)
+        if actor_role is not None:
+            sql += " AND actor_role=?"
+            params = (run_id, build_node_id, actor_role)
+        rows = self.conn.execute(
+            sql + " ORDER BY actor_role, generation LIMIT ?", params + (limit,)
+        ).fetchall()
+        return tuple(_actor_session_from_row(row) for row in rows)
+
+    @serialized
+    def current_actor_session(
+        self, run_id: str, build_node_id: str, actor_role: str
+    ) -> Optional[st.ActorSession]:
+        row = self.conn.execute(
+            "SELECT run_id, build_node_id, actor_role, generation, state, pane_id,"
+            " tab_id, session_path, correlation_token, updated_at FROM actor_sessions"
+            " WHERE run_id=? AND build_node_id=? AND actor_role=? AND state=?",
+            (run_id, build_node_id, actor_role, st.ActorSessionState.ACTIVE.value),
+        ).fetchone()
+        return _actor_session_from_row(row) if row is not None else None
+
+    @serialized
+    def register_actor_session(
+        self,
+        run_id: str,
+        build_node_id: str,
+        actor_role: str,
+        *,
+        generation: int,
+        pane_id: str,
+        session_path: str,
+        correlation_token: str,
+        tab_id: Optional[str] = None,
+    ) -> st.ActorSession:
+        """Register the first active generation; never replace an active peer."""
+        generation = _require_generation(generation, field_name="generation")
+        tab_id = _require_optional_tab_id(tab_id)
+        values = {
+            "actor_role": actor_role,
+            "pane_id": pane_id,
+            "session_path": session_path,
+            "correlation_token": correlation_token,
+        }
+        if any(
+            not isinstance(value, str) or not value.strip() for value in values.values()
+        ):
+            raise LifecycleError(
+                "actor role, pane id, session path, and correlation token are required"
+            )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            node = self.conn.execute(
+                "SELECT 1 FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (run_id, build_node_id),
+            ).fetchone()
+            if node is None:
+                raise UnknownNode(f"{run_id}/{build_node_id} has no lifecycle row")
+            existing = self._actor_session(
+                run_id, build_node_id, actor_role, generation
+            )
+            if existing is not None:
+                if (
+                    existing.state is st.ActorSessionState.ACTIVE
+                    and existing.pane_id == pane_id
+                    and existing.tab_id == tab_id
+                    and existing.session_path == session_path
+                    and existing.correlation_token == correlation_token
+                ):
+                    self.conn.execute("COMMIT")
+                    return existing
+                raise LifecycleError(
+                    "actor session generation already has different durable identity"
+                )
+            active = self.conn.execute(
+                "SELECT generation FROM actor_sessions WHERE run_id=? AND build_node_id=?"
+                " AND actor_role=? AND state=?",
+                (run_id, build_node_id, actor_role, st.ActorSessionState.ACTIVE.value),
+            ).fetchone()
+            if active is not None:
+                raise LifecycleError(
+                    "an active actor session must be recovered, never overwritten"
+                )
+            now = now_iso()
+            self.conn.execute(
+                "INSERT INTO actor_sessions"
+                " (run_id, build_node_id, actor_role, generation, state, pane_id,"
+                "  tab_id, session_path, correlation_token, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    actor_role,
+                    generation,
+                    st.ActorSessionState.ACTIVE.value,
+                    pane_id,
+                    tab_id,
+                    session_path,
+                    correlation_token,
+                    now,
+                ),
+            )
+            session = st.ActorSession(
+                run_id=run_id,
+                build_node_id=build_node_id,
+                actor_role=actor_role,
+                generation=generation,
+                state=st.ActorSessionState.ACTIVE,
+                pane_id=pane_id,
+                tab_id=tab_id,
+                session_path=session_path,
+                correlation_token=correlation_token,
+                updated_at=now,
+            )
+            self.conn.execute("COMMIT")
+            return session
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def recover_builder_handoff(
+        self,
+        run_id: str,
+        build_node_id: str,
+        rejected_candidate_sha: str,
+        *,
+        expected_generation: int,
+        generation: int,
+        pane_id: str,
+        session_path: str,
+        correlation_token: str,
+        tab_id: Optional[str] = None,
+    ) -> st.ActorSessionRecovery:
+        """Atomically replace a proven-absent builder and rebind its handoff."""
+        rejected_candidate_sha = _require_candidate_sha(
+            rejected_candidate_sha, field_name="rejected_candidate_sha"
+        )
+        expected_generation = _require_generation(
+            expected_generation, field_name="expected_generation"
+        )
+        generation = _require_generation(generation, field_name="generation")
+        if generation <= expected_generation:
+            raise LifecycleError(
+                "replacement builder generation must advance its predecessor"
+            )
+        tab_id = _require_optional_tab_id(tab_id)
+        values = (pane_id, session_path, correlation_token)
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise LifecycleError(
+                "replacement pane id, session path, and correlation token are required"
+            )
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            active = self.current_actor_session(run_id, build_node_id, "builder")
+            handoff = self._handoff(run_id, build_node_id, rejected_candidate_sha)
+            if handoff is None:
+                raise LifecycleError(
+                    "builder handoff recovery requires a durable handoff row"
+                )
+            if active is not None and active.generation == generation:
+                if (
+                    active.pane_id == pane_id
+                    and active.tab_id == tab_id
+                    and active.session_path == session_path
+                    and active.correlation_token == correlation_token
+                    and handoff.builder_generation == generation
+                ):
+                    self.conn.execute("COMMIT")
+                    return st.ActorSessionRecovery(session=active, recovered=False)
+                raise LifecycleError(
+                    "builder handoff recovery replay disagrees with durable identity"
+                )
+            if handoff.builder_generation != expected_generation:
+                if active is None:
+                    raise LifecycleError(
+                        "builder handoff recovery lost its predecessor generation"
+                    )
+                self.conn.execute("COMMIT")
+                return st.ActorSessionRecovery(session=active, recovered=False)
+            if active is not None and active.generation != expected_generation:
+                self.conn.execute("COMMIT")
+                return st.ActorSessionRecovery(session=active, recovered=False)
+            now = now_iso()
+            if active is not None:
+                closed = self.conn.execute(
+                    "UPDATE actor_sessions SET state=?, updated_at=?"
+                    " WHERE run_id=? AND build_node_id=? AND actor_role='builder'"
+                    " AND generation=? AND state=?",
+                    (
+                        st.ActorSessionState.CLOSED.value,
+                        now,
+                        run_id,
+                        build_node_id,
+                        expected_generation,
+                        st.ActorSessionState.ACTIVE.value,
+                    ),
+                ).rowcount
+                if closed != 1:
+                    raise LifecycleError(
+                        "builder generation recovery CAS lost unexpectedly"
+                    )
+            else:
+                predecessor = self.conn.execute(
+                    "SELECT state FROM actor_sessions"
+                    " WHERE run_id=? AND build_node_id=? AND actor_role='builder'"
+                    " AND generation=?",
+                    (run_id, build_node_id, expected_generation),
+                ).fetchone()
+                if (
+                    predecessor is None
+                    or predecessor[0] != st.ActorSessionState.CLOSED.value
+                ):
+                    raise LifecycleError(
+                        "builder handoff recovery requires a proven-absent "
+                        "predecessor generation"
+                    )
+            self.conn.execute(
+                "INSERT INTO actor_sessions"
+                " (run_id, build_node_id, actor_role, generation, state, pane_id,"
+                "  tab_id, session_path, correlation_token, updated_at)"
+                " VALUES (?,?,'builder',?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    generation,
+                    st.ActorSessionState.ACTIVE.value,
+                    pane_id,
+                    tab_id,
+                    session_path,
+                    correlation_token,
+                    now,
+                ),
+            )
+            rebound = self.conn.execute(
+                "UPDATE repair_handoffs SET builder_generation=?, state=?,"
+                " submitted_at=NULL, acknowledged_at=NULL"
+                " WHERE run_id=? AND build_node_id=? AND rejected_candidate_sha=?"
+                " AND builder_generation=? AND state IN (?,?,?,?)",
+                (
+                    generation,
+                    st.RepairHandoffState.PENDING.value,
+                    run_id,
+                    build_node_id,
+                    rejected_candidate_sha,
+                    expected_generation,
+                    st.RepairHandoffState.PENDING.value,
+                    st.RepairHandoffState.SUBMITTED.value,
+                    st.RepairHandoffState.ACKNOWLEDGED.value,
+                    st.RepairHandoffState.FAILED.value,
+                ),
+            ).rowcount
+            if rebound != 1:
+                raise LifecycleError(
+                    "repair handoff generation recovery CAS lost unexpectedly"
+                )
+            session = st.ActorSession(
+                run_id=run_id,
+                build_node_id=build_node_id,
+                actor_role="builder",
+                generation=generation,
+                state=st.ActorSessionState.ACTIVE,
+                pane_id=pane_id,
+                tab_id=tab_id,
+                session_path=session_path,
+                correlation_token=correlation_token,
+                updated_at=now,
+            )
+            self.conn.execute("COMMIT")
+            return st.ActorSessionRecovery(session=session, recovered=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def recover_actor_session(
+        self,
+        run_id: str,
+        build_node_id: str,
+        actor_role: str,
+        *,
+        expected_generation: int,
+        generation: int,
+        pane_id: str,
+        session_path: str,
+        correlation_token: str,
+        tab_id: Optional[str] = None,
+    ) -> st.ActorSessionRecovery:
+        """Close one proven-dead generation and atomically claim its replacement."""
+        expected_generation = _require_generation(
+            expected_generation, field_name="expected_generation"
+        )
+        generation = _require_generation(generation, field_name="generation")
+        if generation <= expected_generation:
+            raise LifecycleError(
+                "replacement actor generation must advance its predecessor"
+            )
+        tab_id = _require_optional_tab_id(tab_id)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            active = self.current_actor_session(run_id, build_node_id, actor_role)
+            if active is None:
+                raise LifecycleError(
+                    "actor session recovery requires an active generation"
+                )
+            if active.generation != expected_generation:
+                if active.generation == generation:
+                    if (
+                        active.pane_id == pane_id
+                        and active.tab_id == tab_id
+                        and active.session_path == session_path
+                        and active.correlation_token == correlation_token
+                    ):
+                        self.conn.execute("COMMIT")
+                        return st.ActorSessionRecovery(session=active, recovered=False)
+                    raise LifecycleError(
+                        "actor session recovery replay disagrees with durable identity"
+                    )
+                self.conn.execute("COMMIT")
+                return st.ActorSessionRecovery(session=active, recovered=False)
+            values = (pane_id, session_path, correlation_token)
+            if any(not isinstance(value, str) or not value.strip() for value in values):
+                raise LifecycleError(
+                    "replacement pane id, session path, and correlation token are required"
+                )
+            now = now_iso()
+            self.conn.execute(
+                "UPDATE actor_sessions SET state=?, updated_at=?"
+                " WHERE run_id=? AND build_node_id=? AND actor_role=?"
+                " AND generation=? AND state=?",
+                (
+                    st.ActorSessionState.CLOSED.value,
+                    now,
+                    run_id,
+                    build_node_id,
+                    actor_role,
+                    expected_generation,
+                    st.ActorSessionState.ACTIVE.value,
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO actor_sessions"
+                " (run_id, build_node_id, actor_role, generation, state, pane_id,"
+                "  tab_id, session_path, correlation_token, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    build_node_id,
+                    actor_role,
+                    generation,
+                    st.ActorSessionState.ACTIVE.value,
+                    pane_id,
+                    tab_id,
+                    session_path,
+                    correlation_token,
+                    now,
+                ),
+            )
+            session = st.ActorSession(
+                run_id=run_id,
+                build_node_id=build_node_id,
+                actor_role=actor_role,
+                generation=generation,
+                state=st.ActorSessionState.ACTIVE,
+                pane_id=pane_id,
+                tab_id=tab_id,
+                session_path=session_path,
+                correlation_token=correlation_token,
+                updated_at=now,
+            )
+            self.conn.execute("COMMIT")
+            return st.ActorSessionRecovery(session=session, recovered=True)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def close_actor_session(
+        self, run_id: str, build_node_id: str, actor_role: str, *, generation: int
+    ) -> bool:
+        """Close only the active generation a caller can name exactly."""
+        generation = _require_generation(generation, field_name="generation")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            session = self._actor_session(run_id, build_node_id, actor_role, generation)
+            if session is None:
+                self.conn.execute("COMMIT")
+                return False
+            if session.state is st.ActorSessionState.CLOSED:
+                self.conn.execute("COMMIT")
+                return True
+            changed = self.conn.execute(
+                "UPDATE actor_sessions SET state=?, updated_at=?"
+                " WHERE run_id=? AND build_node_id=? AND actor_role=?"
+                " AND generation=? AND state=?",
+                (
+                    st.ActorSessionState.CLOSED.value,
+                    now_iso(),
+                    run_id,
+                    build_node_id,
+                    actor_role,
+                    generation,
+                    st.ActorSessionState.ACTIVE.value,
+                ),
+            ).rowcount
+            self.conn.execute("COMMIT")
+            return changed == 1
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @serialized
+    def record_baseline(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_no: int,
+        baseline: Mapping[str, Sequence[str]],
+        ignored_at_base: Optional[Mapping[str, str]] = None,
+    ) -> str:
         """Persist the measurement baseline the bracket just opened on.
 
         Written the moment `take_baseline` returns, because that walk is the
@@ -1013,21 +3607,25 @@ class LifecycleStore:
         row = self.conn.execute(
             "SELECT extra_json FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise UnknownNode(
-                f"{run_id}/{node_id}#{attempt_no}: no attempt row to record a baseline on")
+                f"{run_id}/{node_id}#{attempt_no}: no attempt row to record a baseline on"
+            )
         encoded = encode_baseline(baseline)
         digest = baseline_digest(encoded)
         existing = self.conn.execute(
             "SELECT digest FROM attempt_baselines"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if existing is not None and existing[0] != digest:
             raise BaselineCorrupt(
                 f"{run_id}/{node_id}#{attempt_no} already recorded baseline "
                 f"{existing[0]}; a second, different baseline would rewrite "
-                "what the attempt started from")
+                "what the attempt started from"
+            )
         payload = json.loads(row[0] or "{}")
         if not isinstance(payload, dict):
             payload = {}
@@ -1039,16 +3637,25 @@ class LifecycleStore:
                 " (run_id, node_id, attempt_no, digest, inventory_json,"
                 "  ignored_json, recorded_at)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (run_id, node_id, attempt_no, digest,
-                 json.dumps(encoded, sort_keys=True, separators=(",", ":")),
-                 None if ignored_at_base is None else json.dumps(
-                     dict(ignored_at_base), sort_keys=True,
-                     separators=(",", ":")),
-                 now_iso()))
+                (
+                    run_id,
+                    node_id,
+                    attempt_no,
+                    digest,
+                    json.dumps(encoded, sort_keys=True, separators=(",", ":")),
+                    None
+                    if ignored_at_base is None
+                    else json.dumps(
+                        dict(ignored_at_base), sort_keys=True, separators=(",", ":")
+                    ),
+                    now_iso(),
+                ),
+            )
             self.conn.execute(
                 "UPDATE attempts SET extra_json=?"
                 " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (json.dumps(payload, sort_keys=True), run_id, node_id, attempt_no))
+                (json.dumps(payload, sort_keys=True), run_id, node_id, attempt_no),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -1056,8 +3663,9 @@ class LifecycleStore:
         return digest
 
     @serialized
-    def attempt_baseline(self, run_id: str, node_id: str,
-                         attempt_no: int) -> Dict[str, Tuple[str, str]]:
+    def attempt_baseline(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> Dict[str, Tuple[str, str]]:
         """The recorded baseline, or a refusal. Never a reconstruction.
 
         Raises `BaselineUnrecorded` when the attempt predates the recording,
@@ -1070,40 +3678,50 @@ class LifecycleStore:
         row = self.conn.execute(
             "SELECT digest, inventory_json FROM attempt_baselines"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         attempt_row = self.conn.execute(
             "SELECT extra_json FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if attempt_row is None:
             raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
         extra = json.loads(attempt_row[0] or "{}")
-        stamped = extra.get(ATTEMPT_BASELINE_DIGEST_KEY) if isinstance(extra, dict) else None
+        stamped = (
+            extra.get(ATTEMPT_BASELINE_DIGEST_KEY) if isinstance(extra, dict) else None
+        )
         if row is None:
             raise BaselineUnrecorded(
-                f"{run_id}/{node_id}#{attempt_no} recorded no measurement baseline")
+                f"{run_id}/{node_id}#{attempt_no} recorded no measurement baseline"
+            )
         digest, inventory_json = row
         if stamped != digest:
             raise BaselineCorrupt(
                 f"{run_id}/{node_id}#{attempt_no} carries baseline digest "
-                f"{stamped!r} but the stored baseline digests to {digest!r}")
+                f"{stamped!r} but the stored baseline digests to {digest!r}"
+            )
         try:
             encoded = json.loads(inventory_json)
         except json.JSONDecodeError as exc:
             raise BaselineCorrupt(
-                f"{run_id}/{node_id}#{attempt_no} baseline is not JSON: {exc}") from exc
+                f"{run_id}/{node_id}#{attempt_no} baseline is not JSON: {exc}"
+            ) from exc
         if not isinstance(encoded, dict):
             raise BaselineCorrupt(
-                f"{run_id}/{node_id}#{attempt_no} baseline is not an object")
+                f"{run_id}/{node_id}#{attempt_no} baseline is not an object"
+            )
         if baseline_digest(encoded) != digest:
             raise BaselineCorrupt(
                 f"{run_id}/{node_id}#{attempt_no} baseline does not match its "
-                f"recorded digest {digest}")
+                f"recorded digest {digest}"
+            )
         return decode_baseline(encoded)
 
     @serialized
-    def attempt_ignored_at_base(self, run_id: str, node_id: str,
-                                attempt_no: int) -> Optional[Dict[str, str]]:
+    def attempt_ignored_at_base(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> Optional[Dict[str, str]]:
         """The gitignored files present when this attempt's bracket opened.
 
         `None` means **nobody looked** — an attempt whose baseline was
@@ -1125,10 +3743,12 @@ class LifecycleStore:
         row = self.conn.execute(
             "SELECT ignored_json FROM attempt_baselines"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise BaselineUnrecorded(
-                f"{run_id}/{node_id}#{attempt_no} recorded no measurement baseline")
+                f"{run_id}/{node_id}#{attempt_no} recorded no measurement baseline"
+            )
         if row[0] is None:
             return None
         try:
@@ -1136,102 +3756,75 @@ class LifecycleStore:
         except json.JSONDecodeError as exc:
             raise BaselineCorrupt(
                 f"{run_id}/{node_id}#{attempt_no} ignored-at-base map is not "
-                f"JSON: {exc}") from exc
+                f"JSON: {exc}"
+            ) from exc
         if not isinstance(payload, dict):
             raise BaselineCorrupt(
-                f"{run_id}/{node_id}#{attempt_no} ignored-at-base map is not "
-                "an object")
+                f"{run_id}/{node_id}#{attempt_no} ignored-at-base map is not an object"
+            )
         return {str(key): str(value) for key, value in payload.items()}
 
     @serialized
-    def record_review_dispatch(self, run_id: str, node_id: str, attempt_no: int,
-                               dispatch: Mapping[str, Any]) -> None:
-        """Append one typed reviewer-dispatch record to the attempt's own row.
+    def record_sealed_output(
+        self, run_id: str, node_id: str, attempt_no: int, output_sha: str
+    ) -> None:
+        """Record the latest commit sealed by this attempt's private-index CAS.
 
-        **Not a transition, and that is the point.** The attempt is still
-        RUNNING, its base is unchanged, its commit is unchanged, and its
-        evidence chain — envelope, pane correlation, worktree path, output
-        SHA, red pre-gate, green post-gate, permission check — is unchanged
-        and complete. What happened is that one more *reviewer* was sent at
-        that same commit, which is a fact about the reviewer and about
-        nothing else. Writing it as a node transition would be the category
-        error issue #90 is made of: the reviewer's failure recorded as the
-        builder's.
-
-        The row it appends to is the same one the re-dispatch budget counts
-        (`retry_policy.review_dispatches_spent`), which is what makes the
-        budget survive a process boundary. A scheduler that crashed between
-        dispatches and resumed would otherwise re-arm the allowance, and an
-        allowance that re-arms on restart is not a bound.
-
-        Append rather than overwrite: `record_salvage`'s `extra.update` is
-        right for facts that have one value, and wrong for a sequence. A
-        malformed or absent list is replaced rather than raised on — the
-        alternative is a run that cannot make progress because an old row is
-        the wrong shape, and the count that reads it already treats a
-        non-list as zero.
+        This write immediately follows ``commit_measured_delta``. Later gates
+        may be replayed after a crash; the latest commit must not be recreated.
+        A repair cycle may replace an earlier sealed candidate in the same
+        retained attempt after that candidate has been durably rejected.
         """
+        output_sha = _require_candidate_sha(
+            output_sha, field_name=SEALED_OUTPUT_SHA_KEY
+        )
         row = self.conn.execute(
             "SELECT extra_json FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
         try:
-            merged = json.loads(row[0] or "{}")
+            payload = json.loads(row[0] or "{}")
         except json.JSONDecodeError:
-            merged = {}
-        if not isinstance(merged, dict):
-            merged = {}
-        dispatches = merged.get(rp.REVIEW_DISPATCH_KEY)
-        if not isinstance(dispatches, list):
-            dispatches = []
-        merged[rp.REVIEW_DISPATCH_KEY] = dispatches + [dict(dispatch)]
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload[SEALED_OUTPUT_SHA_KEY] = output_sha
         self.conn.execute(
             "UPDATE attempts SET extra_json=?"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (json.dumps(merged, sort_keys=True), run_id, node_id, attempt_no))
+            (json.dumps(payload, sort_keys=True), run_id, node_id, attempt_no),
+        )
 
     @serialized
-    def record_review_advisory(self, run_id: str, node_id: str, attempt_no: int,
-                               extra: Mapping[str, Any]) -> None:
-        """Merge a reviewer's rejection onto the attempt row without failing it.
-
-        **Not a transition, and that is the whole of §19 M35.** A reviewer's
-        verdict is prose about work a count already adjudicated, so it no
-        longer decides whether an attempt lives: the attempt stays RUNNING and
-        goes on to `mark_verified` exactly as it would had the reviewer agreed.
-        What the reviewer produced is still worth keeping — the findings are
-        how the lane learns, and a merged node carrying the advisories it
-        merged with is the operator-facing half of that.
-
-        `record_salvage` merges the same way and additionally closes a RUNNING
-        attempt, which is right for an escape that ends the attempt and wrong
-        here for the same reason: nothing about this ends it. The two are kept
-        apart rather than merged behind a flag, because a boolean deciding
-        whether a write is terminal is exactly the overloaded role RC4 names.
-        """
+    def attempt_sealed_output(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> Optional[str]:
+        """Return the latest sealed commit marker, if one was recorded."""
         row = self.conn.execute(
             "SELECT extra_json FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
         try:
-            merged = json.loads(row[0] or "{}")
+            payload = json.loads(row[0] or "{}")
         except json.JSONDecodeError:
-            merged = {}
-        if not isinstance(merged, dict):
-            merged = {}
-        merged.update(extra)
-        self.conn.execute(
-            "UPDATE attempts SET extra_json=?"
-            " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (json.dumps(merged, sort_keys=True), run_id, node_id, attempt_no))
+            return None
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get(SEALED_OUTPUT_SHA_KEY)
+        if value is None:
+            return None
+        return _require_candidate_sha(value, field_name=SEALED_OUTPUT_SHA_KEY)
 
     @serialized
-    def record_salvage(self, run_id: str, node_id: str, attempt_no: int,
-                       extra: Mapping[str, Any]) -> None:
+    def record_salvage(
+        self, run_id: str, node_id: str, attempt_no: int, extra: Mapping[str, Any]
+    ) -> None:
         """Merge salvage facts into the attempt row and close it if live.
 
         Salvage does not transition the node: the post-gate never ran, so
@@ -1243,7 +3836,8 @@ class LifecycleStore:
         row = self.conn.execute(
             "SELECT extra_json, state FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id}#{attempt_no} has no attempt row")
         try:
@@ -1256,10 +3850,15 @@ class LifecycleStore:
         self.conn.execute(
             "UPDATE attempts SET extra_json=?, state=CASE WHEN state=? THEN ? ELSE state END"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (json.dumps(merged, sort_keys=True),
-             st.NodeState.RUNNING.value, CLOSED_ATTEMPT_STATE.value,
-             run_id, node_id, attempt_no))
-
+            (
+                json.dumps(merged, sort_keys=True),
+                st.NodeState.RUNNING.value,
+                CLOSED_ATTEMPT_STATE.value,
+                run_id,
+                node_id,
+                attempt_no,
+            ),
+        )
 
     @serialized
     def last_transition_at(self, run_id: str) -> float:
@@ -1280,7 +3879,8 @@ class LifecycleStore:
         stay ignorant of how the column is spelled.
         """
         row = self.conn.execute(
-            "SELECT last_transition_at FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            "SELECT last_transition_at FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
         if row is None:
             raise LifecycleError(f"no run row for {run_id}")
         return _epoch_seconds(row[0])
@@ -1302,12 +3902,14 @@ class LifecycleStore:
         try:
             now = now_iso()
             self.conn.execute(
-                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id))
+                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id)
+            )
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
                 " VALUES (?,NULL,'run',NULL,NULL,'acceptance-start','scheduler','{}',?)",
-                (run_id, now))
+                (run_id, now),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -1315,9 +3917,14 @@ class LifecycleStore:
 
     @serialized
     def record_budget_allowance(
-            self, run_id: str, node_id: str, *,
-            cumulative_semantic_attempts: int, effective_ceiling: int,
-            run_ids: Sequence[str]) -> None:
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        cumulative_semantic_attempts: int,
+        effective_ceiling: int,
+        run_ids: Sequence[str],
+    ) -> None:
         """Record that an operator admitted a node whose cross-run fix-loop
         budget was already spent (§3.6 B10).
 
@@ -1346,49 +3953,75 @@ class LifecycleStore:
                 "INSERT INTO transitions (run_id, node_id, kind, from_state,"
                 " to_state, reason, actor, detail_json, created_at)"
                 " VALUES (?,?,'node',NULL,NULL,?,'operator',?,?)",
-                (run_id, node_id, NODE_BUDGET_ALLOWANCE_REASON,
-                 json.dumps({
-                     "cumulative_semantic_attempts":
-                         cumulative_semantic_attempts,
-                     "effective_ceiling": effective_ceiling,
-                     "run_ids": list(run_ids)}, sort_keys=True),
-                 now_iso()))
+                (
+                    run_id,
+                    node_id,
+                    NODE_BUDGET_ALLOWANCE_REASON,
+                    json.dumps(
+                        {
+                            "cumulative_semantic_attempts": cumulative_semantic_attempts,
+                            "effective_ceiling": effective_ceiling,
+                            "run_ids": list(run_ids),
+                        },
+                        sort_keys=True,
+                    ),
+                    now_iso(),
+                ),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
 
     @serialized
-    def attempts_for(self, run_id: str, node_id: Optional[str] = None
-                      ) -> Tuple[st.AttemptRecord, ...]:
+    def attempts_for(
+        self, run_id: str, node_id: Optional[str] = None
+    ) -> Tuple[st.AttemptRecord, ...]:
         """Attempt rows, for the counting the retry policy does over them.
 
         The semantic ceiling is a `COUNT(*)` over rows that already exist
         rather than a counter this store maintains, so what the policy needs
         from here is the rows themselves and nothing more (§7.5).
         """
-        sql = ("SELECT run_id, node_id, attempt_no, base_sha, state, started_at,"
-               " launched_at, pid, turn_count, retry_class, extra_json,"
-               " attempt_host, attempt_start_epoch"
-               " FROM attempts WHERE run_id=?")
+        sql = (
+            "SELECT run_id, node_id, attempt_no, base_sha, state, started_at,"
+            " launched_at, pid, turn_count, retry_class, extra_json,"
+            " attempt_host, attempt_start_epoch"
+            " FROM attempts WHERE run_id=?"
+        )
         params: Tuple[Any, ...] = (run_id,)
         if node_id is not None:
             sql += " AND node_id=?"
             params = (run_id, node_id)
         return tuple(
             st.AttemptRecord(
-                run_id=r[0], node_id=r[1], attempt_no=r[2], base_sha=r[3],
-                state=st.NodeState(r[4]), started_at=r[5] or 0.0,
-                launched_at=r[6], pid=r[7], turn_count=r[8] or 0,
+                run_id=r[0],
+                node_id=r[1],
+                attempt_no=r[2],
+                base_sha=r[3],
+                state=st.NodeState(r[4]),
+                started_at=r[5] or 0.0,
+                launched_at=r[6],
+                pid=r[7],
+                turn_count=r[8] or 0,
                 retry_class=st.RetryClass(r[9]) if r[9] else None,
                 extra=json.loads(r[10]),
-                attempt_host=r[11], attempt_start_epoch=r[12])
-            for r in self.conn.execute(sql + " ORDER BY attempt_no", params).fetchall())
+                attempt_host=r[11],
+                attempt_start_epoch=r[12],
+            )
+            for r in self.conn.execute(sql + " ORDER BY attempt_no", params).fetchall()
+        )
 
     @serialized
-    def mark_launched(self, run_id: str, node_id: str, attempt_no: int,
-                       pid: Optional[int], launched_at: Optional[float] = None,
-                       extra: Optional[Mapping[str, Any]] = None) -> None:
+    def mark_launched(
+        self,
+        run_id: str,
+        node_id: str,
+        attempt_no: int,
+        pid: Optional[int],
+        launched_at: Optional[float] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """Record that the adapter reported the agent launched (§7.6).
 
         This is what **arms** the process-alive and turn-count signals. Until
@@ -1411,10 +4044,12 @@ class LifecycleStore:
         row = self.conn.execute(
             "SELECT extra_json FROM attempts"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None:
             raise UnknownNode(
-                f"{run_id}/{node_id}#{attempt_no}: no attempt row to mark launched")
+                f"{run_id}/{node_id}#{attempt_no}: no attempt row to mark launched"
+            )
         payload = json.loads(row[0] or "{}")
         if extra:
             payload.update(extra)
@@ -1428,13 +4063,22 @@ class LifecycleStore:
             "UPDATE attempts SET launched_at=?, pid=?, extra_json=?,"
             " attempt_host=?, attempt_start_epoch=?"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (launched_at if launched_at is not None else time.time(), pid,
-             json.dumps(payload), attempt_host, attempt_start_epoch,
-             run_id, node_id, attempt_no))
+            (
+                launched_at if launched_at is not None else time.time(),
+                pid,
+                json.dumps(payload),
+                attempt_host,
+                attempt_start_epoch,
+                run_id,
+                node_id,
+                attempt_no,
+            ),
+        )
 
     @serialized
-    def record_heartbeat(self, attempt: st.AttemptRecord, turn_count: int,
-                          observed_at: float) -> None:
+    def record_heartbeat(
+        self, attempt: st.AttemptRecord, turn_count: int, observed_at: float
+    ) -> None:
         """Record a watchdog observation on the attempt row (§7.6).
 
         Deliberately **not** a transition: a heartbeat is not a state change,
@@ -1447,8 +4091,14 @@ class LifecycleStore:
         self.conn.execute(
             "UPDATE attempts SET turn_count=?, launched_at=COALESCE(launched_at, ?)"
             " WHERE run_id=? AND node_id=? AND attempt_no=?",
-            (turn_count, attempt.launched_at, attempt.run_id, attempt.node_id,
-             attempt.attempt_no))
+            (
+                turn_count,
+                attempt.launched_at,
+                attempt.run_id,
+                attempt.node_id,
+                attempt.attempt_no,
+            ),
+        )
 
     @serialized
     def retry_spend_floor(self, run_id: str, node_id: str) -> int:
@@ -1460,14 +4110,16 @@ class LifecycleStore:
         beginning of the node's life is what the absence of a boundary means.
         """
         row = self.conn.execute(
-            "SELECT retry_spend_floor FROM node_lifecycle"
-            " WHERE run_id=? AND node_id=?", (run_id, node_id)).fetchone()
+            "SELECT retry_spend_floor FROM node_lifecycle WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"{run_id}/{node_id} has no lifecycle row")
         return int(row[0] or 0)
 
-    def attempts_spent(self, run_id: str, node_id: str,
-                        retry_class: st.RetryClass) -> int:
+    def attempts_spent(
+        self, run_id: str, node_id: str, retry_class: st.RetryClass
+    ) -> int:
         """How many attempts of this node failed in this class *since its last
         boundary* (§7.5, §11.3).
 
@@ -1493,8 +4145,11 @@ class LifecycleStore:
         about whether its earlier failures still count.
         """
         floor = self.retry_spend_floor(run_id, node_id)
-        return sum(1 for a in self.attempts_for(run_id, node_id)
-                   if a.retry_class is retry_class and a.attempt_no > floor)
+        return sum(
+            1
+            for a in self.attempts_for(run_id, node_id)
+            if a.retry_class is retry_class and a.attempt_no > floor
+        )
 
     def close(self) -> None:
         """Close the shared connection. One connection outlives every thread
@@ -1506,7 +4161,8 @@ class LifecycleStore:
     @serialized
     def latest_outcome(self, run_id: str) -> Optional[st.RunOutcome]:
         row = self.conn.execute(
-            "SELECT latest_outcome FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            "SELECT latest_outcome FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
         if row is None or row[0] is None:
             return None
         return st.RunOutcome(row[0])
@@ -1517,20 +4173,34 @@ class LifecycleStore:
             "SELECT d.node_id, d.depth, d.needs_json, l.state, d.specs_json"
             " FROM dag_nodes d JOIN node_lifecycle l"
             " ON l.run_id = d.run_id AND l.node_id = d.node_id"
-            " WHERE d.run_id=?", (run_id,)).fetchall()
+            " WHERE d.run_id=?",
+            (run_id,),
+        ).fetchall()
         return tuple(
-            wt.NodeRecord(node_id=node_id, depth=depth, needs=tuple(json.loads(needs)),
-                          state=state, specs=tuple(json.loads(specs)))
-            for node_id, depth, needs, state, specs in rows)
+            wt.NodeRecord(
+                node_id=node_id,
+                depth=depth,
+                needs=tuple(json.loads(needs)),
+                state=state,
+                specs=tuple(json.loads(specs)),
+            )
+            for node_id, depth, needs, state, specs in rows
+        )
 
     def ready_nodes(self, run_id: str) -> Tuple[str, ...]:
         """Pending nodes whose deps are all MERGED, sorted `(depth, node_id)` (§7.1).
         The predicate is MERGED, never VERIFIED/SUCCEEDED."""
         records = self.node_records(run_id)
         merged = {r.node_id for r in records if r.state == st.NodeState.MERGED.value}
-        pending = [r for r in records if r.state == st.NodeState.PENDING.value
-                   and all(dep in merged for dep in r.needs)]
-        return tuple(r.node_id for r in sorted(pending, key=lambda r: (r.depth, r.node_id)))
+        pending = [
+            r
+            for r in records
+            if r.state == st.NodeState.PENDING.value
+            and all(dep in merged for dep in r.needs)
+        ]
+        return tuple(
+            r.node_id for r in sorted(pending, key=lambda r: (r.depth, r.node_id))
+        )
 
     def upstream_blocked(self, run_id: str) -> Tuple[str, ...]:
         """The derived `UPSTREAM_BLOCKED` predicate (§8.7) — never stored, so a
@@ -1540,7 +4210,9 @@ class LifecycleStore:
 
     # ── the audit tier (§5.3, §7.7, §7.8, §10.5, §10.6) ─────────────────────
 
-    def _audit_query(self, sql: str, params: Tuple[Any, ...]) -> Tuple[Dict[str, Any], ...]:
+    def _audit_query(
+        self, sql: str, params: Tuple[Any, ...]
+    ) -> Tuple[Dict[str, Any], ...]:
         """§10.6's one query path.
 
         Every audit read — live or post-mortem, renderer or test — goes through
@@ -1558,8 +4230,9 @@ class LifecycleStore:
             cursor.close()
 
     @serialized
-    def audit_transitions(self, run_id: str,
-                           node_id: Optional[str] = None) -> Tuple[Dict[str, Any], ...]:
+    def audit_transitions(
+        self, run_id: str, node_id: Optional[str] = None
+    ) -> Tuple[Dict[str, Any], ...]:
         """The ordered transition history, oldest first (§5.3's audit tier).
 
         Post-mortem only. Nothing in the scheduler may read this at runtime —
@@ -1593,18 +4266,25 @@ class LifecycleStore:
             self.conn.execute(
                 "INSERT INTO results (run_id, node_id, attempt_no, subject_sha,"
                 " payload_json, adjudication, created_at) VALUES (?,?,?,?,?,?,?)",
-                (run_id, result.node_id, result.attempt_no, result.subject_sha,
-                 payload,
-                 result.adjudication.value if result.adjudication else None,
-                 now_iso()))
+                (
+                    run_id,
+                    result.node_id,
+                    result.attempt_no,
+                    result.subject_sha,
+                    payload,
+                    result.adjudication.value if result.adjudication else None,
+                    now_iso(),
+                ),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
 
     @serialized
-    def audit_results(self, run_id: str,
-                       node_id: Optional[str] = None) -> Tuple[Dict[str, Any], ...]:
+    def audit_results(
+        self, run_id: str, node_id: Optional[str] = None
+    ) -> Tuple[Dict[str, Any], ...]:
         """Result rows with their payloads, oldest first (§7.7)."""
         sql = "SELECT * FROM results WHERE run_id=?"
         params: Tuple[Any, ...] = (run_id,)
@@ -1614,8 +4294,9 @@ class LifecycleStore:
         return self._audit_query(sql + " ORDER BY id", params)
 
     @serialized
-    def result_adjudication(self, run_id: str, node_id: str, attempt_no: int
-                             ) -> Optional[st.Adjudication]:
+    def result_adjudication(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> Optional[st.Adjudication]:
         """The typed verdict on one attempt's declared result, or None (§7.7).
 
         The per-attempt lookup `audit_results` never offered: that one returns
@@ -1640,15 +4321,50 @@ class LifecycleStore:
             "SELECT adjudication FROM results"
             " WHERE run_id=? AND node_id=? AND attempt_no=?"
             " ORDER BY id DESC LIMIT 1",
-            (run_id, node_id, attempt_no)).fetchone()
+            (run_id, node_id, attempt_no),
+        ).fetchone()
         if row is None or row[0] is None:
             return None
         return st.Adjudication(row[0])
 
     @serialized
-    def record_orphan(self, run_id: str, *, node_id: Optional[str] = None,
-                       attempt_no: Optional[int] = None, pid: Optional[int] = None,
-                       handle: Optional[str] = None, reason: str = "") -> None:
+    def accepted_result_payload(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> Optional[Mapping[str, Any]]:
+        """The latest accepted envelope for one exact attempt.
+
+        The adjudication enum is checked in the same query before payload data
+        is exposed.  Callers may reconstruct lost envelope transport from this
+        durable row; prose inside the payload never decides whether recovery
+        is authorized.
+        """
+        row = self.conn.execute(
+            "SELECT payload_json, adjudication FROM results"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?"
+            " ORDER BY id DESC LIMIT 1",
+            (run_id, node_id, attempt_no),
+        ).fetchone()
+        if row is None or row[1] != st.Adjudication.ACCEPTED.value:
+            return None
+        payload = json.loads(row[0])
+        if not isinstance(payload, Mapping):
+            raise LifecycleError(
+                f"{run_id}/{node_id}#{attempt_no}: accepted result payload "
+                "is not an object"
+            )
+        return dict(payload)
+
+    @serialized
+    def record_orphan(
+        self,
+        run_id: str,
+        *,
+        node_id: Optional[str] = None,
+        attempt_no: Optional[int] = None,
+        pid: Optional[int] = None,
+        handle: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
         """Record a pane this process cannot reach (§7.8).
 
         Audit, not authority: an orphan row changes no node's state and gates
@@ -1661,7 +4377,8 @@ class LifecycleStore:
             self.conn.execute(
                 "INSERT INTO orphans (run_id, node_id, attempt_no, pid, handle,"
                 " reason, created_at) VALUES (?,?,?,?,?,?,?)",
-                (run_id, node_id, attempt_no, pid, handle, reason or None, now_iso()))
+                (run_id, node_id, attempt_no, pid, handle, reason or None, now_iso()),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -1672,14 +4389,20 @@ class LifecycleStore:
         """Every unreachable pane recorded for this run, oldest first (§7.8).
         `run status` reports these so an operator can kill them by hand."""
         return self._audit_query(
-            "SELECT * FROM orphans WHERE run_id=? ORDER BY id", (run_id,))
+            "SELECT * FROM orphans WHERE run_id=? ORDER BY id", (run_id,)
+        )
 
     # ── the generic guarded transition (§7.9) ───────────────────────────────
 
     @serialized
     def _transition_node(
-        self, run_id: str, node_id: str, to_state: st.NodeState, *,
-        actor: str, reason: str,
+        self,
+        run_id: str,
+        node_id: str,
+        to_state: st.NodeState,
+        *,
+        actor: str,
+        reason: str,
         block_reason: Optional[st.BlockReason] = None,
         output_sha: Optional[str] = None,
         new_attempt: bool = False,
@@ -1689,7 +4412,9 @@ class LifecycleStore:
         cancel_cause: Optional[st.CancelCause] = None,
         merge_cause: Optional[st.MergeCause] = None,
         pending_cause: Optional[st.PendingCause] = None,
-        extra_writes: Optional[Callable[[st.NodeLifecycle], Sequence[Tuple[str, Tuple]]]] = None,
+        extra_writes: Optional[
+            Callable[[st.NodeLifecycle], Sequence[Tuple[str, Tuple]]]
+        ] = None,
     ) -> st.NodeLifecycle:
         """Guard, then write the lifecycle row, the audit row, and the run's
         `last_transition_at`, all inside one `BEGIN IMMEDIATE` (§7.9). Any
@@ -1699,38 +4424,60 @@ class LifecycleStore:
         try:
             row = self.conn.execute(
                 "SELECT state, attempt_no, block_reason, output_sha,"
-                " granted_extra_attempts, cancel_cause"
+                " granted_extra_attempts, cancel_cause, lane_phase"
                 " FROM node_lifecycle WHERE run_id=? AND node_id=?",
-                (run_id, node_id)).fetchone()
+                (run_id, node_id),
+            ).fetchone()
             if row is None:
                 raise UnknownNode(f"{run_id}/{node_id} has no lifecycle row")
             current = st.NodeState(row[0])
             current_cause = st.CancelCause(row[5]) if row[5] else None
-            _guard_transition(current, to_state, actor=actor,
-                              cancel_cause=current_cause)
+            _guard_transition(
+                current, to_state, actor=actor, cancel_cause=current_cause
+            )
             if require_state is not None and current not in require_state:
                 raise IllegalTransition(
                     f"{node_id}: expected state in "
-                    f"{tuple(s.value for s in require_state)}, found {current.value}")
+                    f"{tuple(s.value for s in require_state)}, found {current.value}"
+                )
 
-            new_attempt_no = row[1] + 1 if new_attempt else row[1]
-            new_block_reason = block_reason if to_state is st.NodeState.BLOCKED else None
+            if new_attempt:
+                durable_max = self.conn.execute(
+                    "SELECT COALESCE(MAX(attempt_no), 0) FROM attempts"
+                    " WHERE run_id=? AND node_id=?",
+                    (run_id, node_id),
+                ).fetchone()[0]
+                new_attempt_no = max(int(row[1]), int(durable_max)) + 1
+            else:
+                new_attempt_no = row[1]
+            new_block_reason = (
+                block_reason if to_state is st.NodeState.BLOCKED else None
+            )
             new_output_sha = output_sha if output_sha is not None else row[3]
             new_granted = row[4] + granted_extra_delta
 
             # The vocabulary type itself validates the (state, block_reason)
             # pairing (§7.3) — reused rather than re-checked here.
             lifecycle = st.NodeLifecycle(
-                node_id=node_id, state=to_state, attempt_no=new_attempt_no,
-                block_reason=new_block_reason, output_sha=new_output_sha,
-                granted_extra_attempts=new_granted)
+                node_id=node_id,
+                state=to_state,
+                attempt_no=new_attempt_no,
+                block_reason=new_block_reason,
+                output_sha=new_output_sha,
+                granted_extra_attempts=new_granted,
+                lane_phase=st.LanePhase(row[6]) if row[6] else None,
+                pending_cause=(
+                    pending_cause if to_state is st.NodeState.PENDING else None
+                ),
+            )
 
             # Scoped to CANCELLED exactly as `block_reason` is scoped to
             # BLOCKED: any transition out of CANCELLED clears the cause with
             # the state that made it meaningful, so no row can carry a cause
             # for a cancellation it is no longer under.
-            new_cancel_cause = (cancel_cause
-                                if to_state is st.NodeState.CANCELLED else None)
+            new_cancel_cause = (
+                cancel_cause if to_state is st.NodeState.CANCELLED else None
+            )
             # Scoped to MERGED exactly as the line above is scoped to
             # CANCELLED. Nothing transitions out of MERGED (§7.3), so the
             # clearing arm is unreachable by construction rather than by
@@ -1738,36 +4485,53 @@ class LifecycleStore:
             # rule stated twice rather than a rule and an assumption, and so
             # that a later narrowing of absolute terminality cannot leave a
             # node carrying a merge cause for a merge it is no longer under.
-            new_merge_cause = (merge_cause
-                               if to_state is st.NodeState.MERGED else None)
+            new_merge_cause = merge_cause if to_state is st.NodeState.MERGED else None
             # Scoped to PENDING exactly as the two lines above are scoped to
             # CANCELLED and MERGED. A seeded PENDING never left the frontier
             # and keeps NULL; a transition *to* PENDING stamps who wrote it;
             # a transition *out* of PENDING clears the cause with the state
             # that made it meaningful (#103).
-            new_pending_cause = (pending_cause
-                                 if to_state is st.NodeState.PENDING else None)
+            new_pending_cause = (
+                pending_cause if to_state is st.NodeState.PENDING else None
+            )
             now = now_iso()
             self.conn.execute(
                 "UPDATE node_lifecycle SET state=?, attempt_no=?, block_reason=?,"
                 " output_sha=?, granted_extra_attempts=?, cancel_cause=?,"
                 " merge_cause=?, pending_cause=?, updated_at=?"
                 " WHERE run_id=? AND node_id=?",
-                (lifecycle.state.value, lifecycle.attempt_no,
-                 lifecycle.block_reason.value if lifecycle.block_reason else None,
-                 lifecycle.output_sha, lifecycle.granted_extra_attempts,
-                 new_cancel_cause.value if new_cancel_cause else None,
-                 new_merge_cause.value if new_merge_cause else None,
-                 new_pending_cause.value if new_pending_cause else None, now,
-                 run_id, node_id))
+                (
+                    lifecycle.state.value,
+                    lifecycle.attempt_no,
+                    lifecycle.block_reason.value if lifecycle.block_reason else None,
+                    lifecycle.output_sha,
+                    lifecycle.granted_extra_attempts,
+                    new_cancel_cause.value if new_cancel_cause else None,
+                    new_merge_cause.value if new_merge_cause else None,
+                    new_pending_cause.value if new_pending_cause else None,
+                    now,
+                    run_id,
+                    node_id,
+                ),
+            )
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at) VALUES (?,?,'node',?,?,?,?,?,?)",
-                (run_id, node_id, current.value, to_state.value, reason, actor,
-                 json.dumps(detail or {}), now))
+                (
+                    run_id,
+                    node_id,
+                    current.value,
+                    to_state.value,
+                    reason,
+                    actor,
+                    json.dumps(detail or {}),
+                    now,
+                ),
+            )
             self.conn.execute(
-                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id))
-            for sql, params in (extra_writes(lifecycle) if extra_writes else ()):
+                "UPDATE runs SET last_transition_at=? WHERE run_id=?", (now, run_id)
+            )
+            for sql, params in extra_writes(lifecycle) if extra_writes else ():
                 self.conn.execute(sql, params)
             self.conn.execute("COMMIT")
             return lifecycle
@@ -1777,10 +4541,24 @@ class LifecycleStore:
 
     # ── scheduler-driven transitions ────────────────────────────────────────
 
-    def start_attempt(self, run_id: str, node_id: str, base_sha: str,
-                      attempt_extra: Optional[Mapping[str, Any]] = None,
-                      detail: Optional[Mapping[str, Any]] = None) -> int:
+    def start_attempt(
+        self,
+        run_id: str,
+        node_id: str,
+        base_sha: str,
+        attempt_extra: Optional[Mapping[str, Any]] = None,
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> int:
         """PENDING -> RUNNING, opening a new attempt row (§7.6's attempt window).
+
+        Attempt numbers are allocated above both the lifecycle pointer and the
+        durable attempts ledger. Operator recovery can legitimately restore a
+        node to an older retained attempt while leaving later cancelled rows
+        as audit evidence. Reusing one of those primary keys would roll this
+        transaction back without changing readiness, causing the scheduler to
+        redispatch the same node forever. Taking the maximum inside the same
+        ``BEGIN IMMEDIATE`` transaction preserves monotonic identity and makes
+        that recovery shape schedulable.
 
         `attempt_extra` is written into the row's `extra_json` **in the same
         transaction that creates it**, and that is the point rather than a
@@ -1804,29 +4582,134 @@ class LifecycleStore:
         runtime and nothing does, which is exactly what a diagnosis field
         should be.
         """
-        payload = json.dumps(dict(attempt_extra), sort_keys=True) if attempt_extra else "{}"
+        payload = (
+            json.dumps(dict(attempt_extra), sort_keys=True) if attempt_extra else "{}"
+        )
 
         def extra(lifecycle: st.NodeLifecycle):
-            return [(
-                "INSERT INTO attempts (run_id, node_id, attempt_no, base_sha, state,"
-                " started_at, turn_count, extra_json) VALUES (?,?,?,?,?,?,0,?)",
-                (run_id, node_id, lifecycle.attempt_no, base_sha,
-                 st.NodeState.RUNNING.value, time.time(), payload))]
+            return [
+                (
+                    "INSERT INTO attempts (run_id, node_id, attempt_no, base_sha, state,"
+                    " started_at, turn_count, extra_json) VALUES (?,?,?,?,?,?,0,?)",
+                    (
+                        run_id,
+                        node_id,
+                        lifecycle.attempt_no,
+                        base_sha,
+                        st.NodeState.RUNNING.value,
+                        time.time(),
+                        payload,
+                    ),
+                )
+            ]
+
         lifecycle = self._transition_node(
-            run_id, node_id, st.NodeState.RUNNING, actor="scheduler", reason="attempt-start",
-            new_attempt=True, require_state=(st.NodeState.PENDING,), detail=detail,
-            extra_writes=extra)
+            run_id,
+            node_id,
+            st.NodeState.RUNNING,
+            actor="scheduler",
+            reason="attempt-start",
+            new_attempt=True,
+            require_state=(st.NodeState.PENDING,),
+            detail=detail,
+            extra_writes=extra,
+        )
         return lifecycle.attempt_no
 
-    def mark_verified(self, run_id: str, node_id: str, output_sha: str) -> st.NodeLifecycle:
-        """RUNNING -> VERIFIED (§7.3's four-clause predicate, evaluated by the caller)."""
+    def mark_verified(
+        self, run_id: str, node_id: str, output_sha: str
+    ) -> st.NodeLifecycle:
+        """RUNNING -> VERIFIED only after the exact derived review has passed."""
+        node_row = self.conn.execute(
+            "SELECT kind FROM dag_nodes WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()
+        if node_row is None:
+            raise UnknownNode(f"{run_id}/{node_id} has no dag row")
+        if node_row[0] == st.NodeKind.REVIEW.value:
+            raise LifecycleError(
+                "a derived review reaches ACCEPTED only through mark_review_accepted"
+            )
+        review_row = self.conn.execute(
+            "SELECT node_id FROM dag_nodes WHERE run_id=? AND kind=? AND review_of=?",
+            (run_id, st.NodeKind.REVIEW.value, node_id),
+        ).fetchone()
+        if review_row is not None:
+            output_sha = _require_candidate_sha(output_sha, field_name="output_sha")
+            review_node_id = review_row[0]
+            candidate = self._candidate(run_id, node_id, output_sha)
+            review = self._review(run_id, review_node_id, output_sha)
+            review_state = self.conn.execute(
+                "SELECT state FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (run_id, review_node_id),
+            ).fetchone()
+            if (
+                candidate is None
+                or review is None
+                or review.verdict is not st.ReviewVerdict.PASS
+                or review_state is None
+                or review_state[0] != st.NodeState.ACCEPTED.value
+            ):
+                raise LifecycleError(
+                    f"{run_id}/{node_id}: VERIFIED requires ACCEPTED PASS for its "
+                    "exact published candidate"
+                )
+
         def extra(lifecycle: st.NodeLifecycle):
-            return [(
-                "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (st.NodeState.VERIFIED.value, run_id, node_id, lifecycle.attempt_no))]
+            return [
+                (
+                    "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        st.NodeState.VERIFIED.value,
+                        run_id,
+                        node_id,
+                        lifecycle.attempt_no,
+                    ),
+                )
+            ]
+
         return self._transition_node(
-            run_id, node_id, st.NodeState.VERIFIED, actor="scheduler", reason="verified",
-            output_sha=output_sha, require_state=(st.NodeState.RUNNING,), extra_writes=extra)
+            run_id,
+            node_id,
+            st.NodeState.VERIFIED,
+            actor="scheduler",
+            reason="verified",
+            output_sha=output_sha,
+            require_state=(st.NodeState.RUNNING,),
+            extra_writes=extra,
+        )
+
+    @serialized
+    def mark_review_accepted(
+        self, run_id: str, review_node_id: str, candidate_sha: str
+    ) -> st.NodeLifecycle:
+        """Terminally accept a derived review only after its exact PASS row."""
+        candidate_sha = _require_candidate_sha(candidate_sha)
+        row = self.conn.execute(
+            "SELECT kind FROM dag_nodes WHERE run_id=? AND node_id=?",
+            (run_id, review_node_id),
+        ).fetchone()
+        if row is None:
+            raise UnknownNode(f"{run_id}/{review_node_id} has no dag row")
+        if row[0] != st.NodeKind.REVIEW.value:
+            raise LifecycleError("only a derived review node can reach ACCEPTED")
+        review = self._review(run_id, review_node_id, candidate_sha)
+        if review is None or review.verdict is not st.ReviewVerdict.PASS:
+            raise LifecycleError(
+                "a derived review may be accepted only for its exact PASS candidate"
+            )
+        return self._transition_node(
+            run_id,
+            review_node_id,
+            st.NodeState.ACCEPTED,
+            actor="scheduler",
+            reason="review-accepted",
+            require_state=(
+                st.NodeState.PENDING,
+                st.NodeState.RUNNING,
+                st.NodeState.VERIFIED,
+            ),
+        )
 
     def mark_merged(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         """VERIFIED -> MERGED, absolutely terminal from here on (§7.3, §8.6).
@@ -1841,15 +4724,36 @@ class LifecycleStore:
         passed §7.3's four-clause predicate and, for an agent node, a
         reviewer that did not reject its diff.
         """
+        node_row = self.conn.execute(
+            "SELECT kind FROM dag_nodes WHERE run_id=? AND node_id=?",
+            (run_id, node_id),
+        ).fetchone()
+        if node_row is None:
+            raise UnknownNode(f"{run_id}/{node_id} has no dag row")
+        if node_row[0] == st.NodeKind.REVIEW.value:
+            raise LifecycleError(
+                "a derived review is terminal at ACCEPTED and cannot be merged"
+            )
         return self._transition_node(
-            run_id, node_id, st.NodeState.MERGED, actor="scheduler", reason="merged",
+            run_id,
+            node_id,
+            st.NodeState.MERGED,
+            actor="scheduler",
+            reason="merged",
             merge_cause=st.MergeCause.SCHEDULER,
-            require_state=(st.NodeState.VERIFIED,))
+            require_state=(st.NodeState.VERIFIED,),
+        )
 
-    def mark_blocked(self, run_id: str, node_id: str, reason: st.BlockReason, *,
-                      detail: Optional[Mapping[str, Any]] = None,
-                      retry_class: Optional[st.RetryClass] = None,
-                      attempt_extra: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
+    def mark_blocked(
+        self,
+        run_id: str,
+        node_id: str,
+        reason: st.BlockReason,
+        *,
+        detail: Optional[Mapping[str, Any]] = None,
+        retry_class: Optional[st.RetryClass] = None,
+        attempt_extra: Optional[Mapping[str, Any]] = None,
+    ) -> st.NodeLifecycle:
         """RUNNING or VERIFIED -> BLOCKED with a stored reason (§7.3).
 
         `UPSTREAM_BLOCKED` is never a valid argument here — it is derived,
@@ -1869,15 +4773,22 @@ class LifecycleStore:
         dropped — so `run status` could say the node blocked but not what its
         last attempt actually did.
         """
+
         def extra(lifecycle: st.NodeLifecycle):
-            writes = [(
-                "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (st.NodeState.BLOCKED.value, run_id, node_id, lifecycle.attempt_no))]
+            writes = [
+                (
+                    "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (st.NodeState.BLOCKED.value, run_id, node_id, lifecycle.attempt_no),
+                )
+            ]
             if retry_class is not None:
-                writes.append((
-                    "UPDATE attempts SET retry_class=? WHERE run_id=? AND node_id=?"
-                    " AND attempt_no=?",
-                    (retry_class.value, run_id, node_id, lifecycle.attempt_no)))
+                writes.append(
+                    (
+                        "UPDATE attempts SET retry_class=? WHERE run_id=? AND node_id=?"
+                        " AND attempt_no=?",
+                        (retry_class.value, run_id, node_id, lifecycle.attempt_no),
+                    )
+                )
             if attempt_extra:
                 # The blocking attempt's marker matters as much as a retrying
                 # one's: without it the budget-exhausting attempt leaves no
@@ -1887,28 +4798,47 @@ class LifecycleStore:
                 row = self.conn.execute(
                     "SELECT extra_json FROM attempts"
                     " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                    (run_id, node_id, lifecycle.attempt_no)).fetchone()
+                    (run_id, node_id, lifecycle.attempt_no),
+                ).fetchone()
                 try:
                     merged = dict(json.loads(row[0]) if row and row[0] else {})
                 except (TypeError, ValueError):
                     merged = {}
                 merged.update(dict(attempt_extra))
-                writes.append((
-                    "UPDATE attempts SET extra_json=?"
-                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                    (json.dumps(merged, sort_keys=True),
-                     run_id, node_id, lifecycle.attempt_no)))
+                writes.append(
+                    (
+                        "UPDATE attempts SET extra_json=?"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (
+                            json.dumps(merged, sort_keys=True),
+                            run_id,
+                            node_id,
+                            lifecycle.attempt_no,
+                        ),
+                    )
+                )
             return writes
-        return self._transition_node(
-            run_id, node_id, st.NodeState.BLOCKED, actor="scheduler",
-            reason=f"blocked:{reason.value}", block_reason=reason,
-            require_state=(st.NodeState.RUNNING, st.NodeState.VERIFIED),
-            detail=detail, extra_writes=extra)
 
-    def fail_attempt(self, run_id: str, node_id: str,
-                      retry_class: st.RetryClass,
-                      detail: Optional[Mapping[str, Any]] = None,
-                      attempt_extra: Optional[Mapping[str, Any]] = None) -> st.NodeLifecycle:
+        return self._transition_node(
+            run_id,
+            node_id,
+            st.NodeState.BLOCKED,
+            actor="scheduler",
+            reason=f"blocked:{reason.value}",
+            block_reason=reason,
+            require_state=(st.NodeState.RUNNING, st.NodeState.VERIFIED),
+            detail=detail,
+            extra_writes=extra,
+        )
+
+    def fail_attempt(
+        self,
+        run_id: str,
+        node_id: str,
+        retry_class: st.RetryClass,
+        detail: Optional[Mapping[str, Any]] = None,
+        attempt_extra: Optional[Mapping[str, Any]] = None,
+    ) -> st.NodeLifecycle:
         """RUNNING -> PENDING: an ENVIRONMENTAL/LAUNCHER_TRANSIENT failure that
         earns another attempt automatically (§7.5) — not an operator escape.
 
@@ -1930,93 +4860,120 @@ class LifecycleStore:
         change, and it keeps the count a `COUNT(*)` over stored facts rather
         than a counter this store maintains.
         """
+
         def extra(lifecycle: st.NodeLifecycle):
-            writes = [(
-                "UPDATE attempts SET retry_class=?, state=?"
-                " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (retry_class.value, CLOSED_ATTEMPT_STATE.value,
-                 run_id, node_id, lifecycle.attempt_no))]
+            writes = [
+                (
+                    "UPDATE attempts SET retry_class=?, state=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        retry_class.value,
+                        CLOSED_ATTEMPT_STATE.value,
+                        run_id,
+                        node_id,
+                        lifecycle.attempt_no,
+                    ),
+                )
+            ]
             if attempt_extra:
                 row = self.conn.execute(
                     "SELECT extra_json FROM attempts"
                     " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                    (run_id, node_id, lifecycle.attempt_no)).fetchone()
+                    (run_id, node_id, lifecycle.attempt_no),
+                ).fetchone()
                 try:
                     merged = dict(json.loads(row[0]) if row and row[0] else {})
                 except (TypeError, ValueError):
                     merged = {}
                 merged.update(dict(attempt_extra))
-                writes.append((
-                    "UPDATE attempts SET extra_json=?"
-                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                    (json.dumps(merged, sort_keys=True),
-                     run_id, node_id, lifecycle.attempt_no)))
+                writes.append(
+                    (
+                        "UPDATE attempts SET extra_json=?"
+                        " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                        (
+                            json.dumps(merged, sort_keys=True),
+                            run_id,
+                            node_id,
+                            lifecycle.attempt_no,
+                        ),
+                    )
+                )
             return writes
+
         return self._transition_node(
-            run_id, node_id, st.NodeState.PENDING, actor="scheduler",
-            reason=f"retry:{retry_class.value}", require_state=(st.NodeState.RUNNING,),
+            run_id,
+            node_id,
+            st.NodeState.PENDING,
+            actor="scheduler",
+            reason=f"retry:{retry_class.value}",
+            require_state=(st.NodeState.RUNNING,),
             pending_cause=st.PendingCause.SCHEDULER,
-            detail=detail, extra_writes=extra)
+            detail=detail,
+            extra_writes=extra,
+        )
 
     # ── run-level: cancellation, outcome, resume ────────────────────────────
 
     @serialized
     def adoptable_attempts(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
-        """Completed, non-rejected, unmerged work a discard would lose (§7.3).
+        """Completed, unmerged work a discard would lose (§7.3).
 
-        `VERIFIED` nodes, and nodes whose latest result was adjudicated
-        `ACCEPTED` and which have not merged. Both are work that reached a
-        measured predicate and would simply stop being reachable through
-        Maestro once the run is terminal — which is the one cost of
-        `run cancel --discard` that the operator cannot see from the run's
-        state, because a node in either shape reports as neither finished nor
-        failed.
-
-        Rejected attempts are deliberately not listed: losing those is the
-        correct outcome, not a cost. Review is recorded *after* result
-        acceptance, so an `ACCEPTED` row whose attempt carries
-        `retry_policy.REVIEW_REJECTED_KEY` is rejected work wearing an
-        accepted result, and is filtered on that typed key rather than on
-        anything a reviewer wrote in prose (§1.2).
+        A VERIFIED node is adoptable. An accepted result is adoptable unless
+        the lane's latest immutable candidate has a terminal REJECTED review.
+        Candidate review rows, never attempt extras, supply that exclusion.
         """
         nodes = self.conn.execute(
             "SELECT node_id, state, attempt_no FROM node_lifecycle WHERE run_id=?",
-            (run_id,)).fetchall()
+            (run_id,),
+        ).fetchall()
         found: List[Dict[str, Any]] = []
         for node_id, state, attempt_no in nodes:
             current = st.NodeState(state)
             if current in st.ABSOLUTELY_TERMINAL:
                 continue
             if current is st.NodeState.VERIFIED:
-                found.append({"node_id": node_id, "state": current.value,
-                              "attempt_no": attempt_no, "why": "verified"})
+                found.append(
+                    {
+                        "node_id": node_id,
+                        "state": current.value,
+                        "attempt_no": attempt_no,
+                        "why": "verified",
+                    }
+                )
                 continue
             row = self.conn.execute(
                 "SELECT adjudication FROM results"
                 " WHERE run_id=? AND node_id=? AND attempt_no=?"
                 " ORDER BY id DESC LIMIT 1",
-                (run_id, node_id, attempt_no)).fetchone()
+                (run_id, node_id, attempt_no),
+            ).fetchone()
             if not row or row[0] != st.Adjudication.ACCEPTED.value:
                 continue
-            extra_row = self.conn.execute(
-                "SELECT extra_json FROM attempts"
-                " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (run_id, node_id, attempt_no)).fetchone()
-            try:
-                extra = json.loads(extra_row[0]) if extra_row and extra_row[0] else {}
-            except (TypeError, ValueError):
-                extra = {}
-            if not isinstance(extra, dict) or extra.get(rp.REVIEW_REJECTED_KEY):
+            latest_review = self.conn.execute(
+                "SELECT cr.verdict FROM lane_candidates lc"
+                " LEFT JOIN candidate_reviews cr"
+                " ON cr.run_id=lc.run_id"
+                " AND cr.review_node_id=? AND cr.candidate_sha=lc.candidate_sha"
+                " WHERE lc.run_id=? AND lc.build_node_id=?"
+                " ORDER BY lc.candidate_seq DESC LIMIT 1",
+                (f"{node_id}::review", run_id, node_id),
+            ).fetchone()
+            if latest_review and latest_review[0] == st.ReviewVerdict.REJECTED.value:
                 continue
-            found.append({"node_id": node_id, "state": current.value,
-                          "attempt_no": attempt_no,
-                          "why": "accepted-unmerged"})
+            found.append(
+                {
+                    "node_id": node_id,
+                    "state": current.value,
+                    "attempt_no": attempt_no,
+                    "why": "accepted-unmerged",
+                }
+            )
         return tuple(found)
 
     @serialized
-    def cancel_run(self, run_id: str, *,
-                   cause: st.CancelCause = st.CancelCause.RUN_CANCEL
-                   ) -> Tuple[str, ...]:
+    def cancel_run(
+        self, run_id: str, *, cause: st.CancelCause = st.CancelCause.RUN_CANCEL
+    ) -> Tuple[str, ...]:
         """Write CANCELLED for every non-terminal node in ONE transaction (§7.8).
         Never blocks on a kill — that is the adapter's problem, not this store's.
 
@@ -2035,8 +4992,8 @@ class LifecycleStore:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self.conn.execute(
-                "SELECT node_id, state FROM node_lifecycle WHERE run_id=?",
-                (run_id,)).fetchall()
+                "SELECT node_id, state FROM node_lifecycle WHERE run_id=?", (run_id,)
+            ).fetchall()
             now = now_iso()
             cancelled = []
             for node_id, state in rows:
@@ -2045,27 +5002,42 @@ class LifecycleStore:
                     continue
                 self.conn.execute(
                     "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
-                    " cancel_cause=?, updated_at=?"
+                    " cancel_cause=?, lane_phase=CASE WHEN lane_phase IS NULL"
+                    " THEN NULL ELSE ? END, updated_at=?"
                     " WHERE run_id=? AND node_id=?",
-                    (st.NodeState.CANCELLED.value,
-                     cause.value, now, run_id, node_id))
+                    (
+                        st.NodeState.CANCELLED.value,
+                        cause.value,
+                        st.LanePhase.CANCELLED.value,
+                        now,
+                        run_id,
+                        node_id,
+                    ),
+                )
                 self.conn.execute(
                     "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                     " reason, actor, detail_json, created_at)"
                     " VALUES (?,?,'node',?,?, 'run-cancel','operator','{}',?)",
-                    (run_id, node_id, current.value, st.NodeState.CANCELLED.value, now))
+                    (run_id, node_id, current.value, st.NodeState.CANCELLED.value, now),
+                )
                 # §7.8's "its result is rejected because its attempt is no
                 # longer running" is only true if cancellation writes it. The
                 # scheduler never blocks on the kill, so the surviving pane may
                 # still report — and §7.7 reads this column to refuse it.
                 self.conn.execute(
                     "UPDATE attempts SET state=? WHERE run_id=? AND node_id=? AND state=?",
-                    (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
-                     st.NodeState.RUNNING.value))
+                    (
+                        CLOSED_ATTEMPT_STATE.value,
+                        run_id,
+                        node_id,
+                        st.NodeState.RUNNING.value,
+                    ),
+                )
                 cancelled.append(node_id)
             self.conn.execute(
                 "UPDATE runs SET last_transition_at=?, cancel_requested=1 WHERE run_id=?",
-                (now, run_id))
+                (now, run_id),
+            )
             # `cancel_cause` is written by `declare_outcome` alone -- it is an
             # attribute of the declared outcome, and this verb declares
             # nothing. Writing it here would state a cause for an outcome no
@@ -2078,10 +5050,14 @@ class LifecycleStore:
             raise
 
     @serialized
-    def declare_outcome(self, run_id: str, *, stuck: bool = False,
-                         acceptance_result: Optional[bool] = None,
-                         cancel_cause: Optional[st.CancelCause] = None
-                         ) -> OutcomeReport:
+    def declare_outcome(
+        self,
+        run_id: str,
+        *,
+        stuck: bool = False,
+        acceptance_result: Optional[bool] = None,
+        cancel_cause: Optional[st.CancelCause] = None,
+    ) -> OutcomeReport:
         """Compute and record the run's outcome (§7.3) — a record, not a
         tombstone: `runs` keeps only the latest value; the ordered history is
         the `transitions` row this same transaction appends.
@@ -2094,19 +5070,29 @@ class LifecycleStore:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             run_row = self.conn.execute(
-                "SELECT cancel_requested FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                "SELECT cancel_requested FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
             if run_row is None:
                 raise UnknownNode(f"run {run_id} does not exist")
             rows = self.conn.execute(
                 "SELECT node_id, state, block_reason FROM node_lifecycle WHERE run_id=?",
-                (run_id,)).fetchall()
+                (run_id,),
+            ).fetchall()
             node_states = [
-                (node_id, st.NodeState(state), st.BlockReason(reason) if reason else None)
-                for node_id, state, reason in rows]
+                (
+                    node_id,
+                    st.NodeState(state),
+                    st.BlockReason(reason) if reason else None,
+                )
+                for node_id, state, reason in rows
+            ]
             report = total_run_outcome(
-                node_states, stuck=stuck, cancel_requested=bool(run_row[0]),
+                node_states,
+                stuck=stuck,
+                cancel_requested=bool(run_row[0]),
                 acceptance_result=acceptance_result,
-                requested_cause=cancel_cause)
+                requested_cause=cancel_cause,
+            )
             now = now_iso()
             # `cancel_cause` is written on every declaration, including the
             # ones that clear it. A run that was cancelled, resumed, and then
@@ -2117,19 +5103,36 @@ class LifecycleStore:
             self.conn.execute(
                 "UPDATE runs SET latest_outcome=?, latest_outcome_at=?,"
                 " last_transition_at=?, cancel_cause=? WHERE run_id=?",
-                (report.outcome.value, now, now,
-                 report.cancel_cause.value if report.cancel_cause else None,
-                 run_id))
+                (
+                    report.outcome.value,
+                    now,
+                    now,
+                    report.cancel_cause.value if report.cancel_cause else None,
+                    run_id,
+                ),
+            )
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
                 " VALUES (?,NULL,'run',NULL,?, 'declare-outcome','scheduler',?,?)",
-                (run_id, report.outcome.value,
-                 json.dumps({"blocked_nodes": list(report.blocked_nodes),
+                (
+                    run_id,
+                    report.outcome.value,
+                    json.dumps(
+                        {
+                            "blocked_nodes": list(report.blocked_nodes),
                             "abandoned_nodes": list(report.abandoned_nodes),
                             "acceptance_result": report.acceptance_result,
-                            "cancel_cause": (report.cancel_cause.value
-                                             if report.cancel_cause else None)}), now))
+                            "cancel_cause": (
+                                report.cancel_cause.value
+                                if report.cancel_cause
+                                else None
+                            ),
+                        }
+                    ),
+                    now,
+                ),
+            )
             self.conn.execute("COMMIT")
             return report
         except Exception:
@@ -2157,8 +5160,14 @@ class LifecycleStore:
                 "UPDATE runs SET scheduler_pid=?, scheduler_host=?,"
                 " scheduler_claimed_at=?, scheduler_start_epoch=?"
                 " WHERE run_id=?",
-                (os.getpid(), scheduler_host(), now,
-                 wd.process_start_epoch(os.getpid()), run_id))
+                (
+                    os.getpid(),
+                    scheduler_host(),
+                    now,
+                    wd.process_start_epoch(os.getpid()),
+                    run_id,
+                ),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -2189,128 +5198,323 @@ class LifecycleStore:
         try:
             claim = self.conn.execute(
                 "SELECT scheduler_pid, scheduler_host FROM runs WHERE run_id=?",
-                (run_id,)).fetchone()
+                (run_id,),
+            ).fetchone()
             if claim is None:
                 raise UnknownNode(f"run {run_id} does not exist")
             prior_pid = int(claim[0]) if claim[0] is not None else None
             prior_host = claim[1]
             if prior_pid is not None:
                 prior = RunRecord(
-                    run_id=run_id, plan_digest="", created_at="",
-                    last_transition_at="", latest_outcome=None,
-                    latest_outcome_at=None, cancel_requested=False,
-                    scheduler_pid=prior_pid, scheduler_host=prior_host)
+                    run_id=run_id,
+                    plan_digest="",
+                    created_at="",
+                    last_transition_at="",
+                    latest_outcome=None,
+                    latest_outcome_at=None,
+                    cancel_requested=False,
+                    scheduler_pid=prior_pid,
+                    scheduler_host=prior_host,
+                )
                 alive = scheduler_liveness(prior)
                 if alive is True and prior_pid != os.getpid():
                     raise SchedulerStillAlive(
                         f"{run_id}: scheduler pid {prior_pid} is still alive on "
                         f"{prior_host or scheduler_host()}; resume refused "
-                        "without changing the live run")
+                        "without changing the live run"
+                    )
                 if alive is None:
                     raise SchedulerLivenessUnknown(
                         f"{run_id}: scheduler pid {prior_pid} was recorded on "
                         f"{prior_host or 'an unknown host'}; resume cannot prove "
-                        "that owner is dead")
+                        "that owner is dead"
+                    )
             now = now_iso()
             self.conn.execute(
                 "UPDATE runs SET last_transition_at=?, cancel_requested=0,"
                 " scheduler_pid=?, scheduler_host=?, scheduler_claimed_at=?,"
                 " scheduler_start_epoch=? WHERE run_id=?",
-                (now, os.getpid(), scheduler_host(), now,
-                 wd.process_start_epoch(os.getpid()), run_id))
+                (
+                    now,
+                    os.getpid(),
+                    scheduler_host(),
+                    now,
+                    wd.process_start_epoch(os.getpid()),
+                    run_id,
+                ),
+            )
             self.conn.execute(_RAISE_RUN_RETRY_SPEND_FLOOR, (run_id,))
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
                 " VALUES (?,NULL,'run',NULL,NULL,'resume','operator','{}',?)",
-                (run_id, now))
+                (run_id, now),
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
     @serialized
-    def quiescence_blocked_attempts(
-            self, run_id: str) -> Tuple[Tuple[str, int], ...]:
+    def quiescence_blocked_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
         """Blocked attempts `run resume` may recover after agent absence."""
         rows = self.conn.execute(
             "SELECT node_id, attempt_no FROM node_lifecycle "
             "WHERE run_id=? AND state=? AND block_reason=? ORDER BY node_id",
-            (run_id, st.NodeState.BLOCKED.value,
-             st.BlockReason.QUIESCENCE_UNPROVEN.value)).fetchall()
+            (
+                run_id,
+                st.NodeState.BLOCKED.value,
+                st.BlockReason.QUIESCENCE_UNPROVEN.value,
+            ),
+        ).fetchall()
         return tuple((str(row[0]), int(row[1])) for row in rows)
 
+    @serialized
+    def running_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
+        """Current RUNNING generations a resumed scheduler may recover."""
+        rows = self.conn.execute(
+            "SELECT node_id, attempt_no FROM node_lifecycle "
+            "WHERE run_id=? AND state=? ORDER BY node_id",
+            (run_id, st.NodeState.RUNNING.value),
+        ).fetchall()
+        return tuple((str(row[0]), int(row[1])) for row in rows)
 
     @serialized
     def prepare_late_envelope_recovery(
-            self, run_id: str, node_id: str,
-            attempt_no: int) -> st.NodeLifecycle:
-        """Return a completed generation to the frontier without retrying it."""
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> st.NodeLifecycle:
+        """Return a completed generation to the frontier without retrying it.
+
+        A quiescence block terminalizes both the node and its lane phase.
+        Recovery reopens those two authorities atomically: leaving the lane
+        ``BLOCKED`` makes the recovered worker lose its first phase CAS and
+        strand the node ``RUNNING`` after its future returns.
+        """
+
         def extra(lifecycle: st.NodeLifecycle):
             if lifecycle.attempt_no != attempt_no:
                 raise IllegalTransition(
-                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current")
+                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current"
+                )
             row = self.conn.execute(
                 "SELECT extra_json FROM attempts"
                 " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (run_id, node_id, attempt_no)).fetchone()
+                (run_id, node_id, attempt_no),
+            ).fetchone()
             if row is None:
                 raise UnknownNode(
-                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent")
+                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent"
+                )
             payload = json.loads(row[0] or "{}")
             if not isinstance(payload, dict):
                 payload = {}
             payload[LATE_ENVELOPE_RECOVERY_KEY] = True
-            return [(
-                "UPDATE attempts SET extra_json=?"
-                " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (json.dumps(payload, sort_keys=True),
-                 run_id, node_id, attempt_no))]
+            return [
+                (
+                    "UPDATE attempts SET extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (json.dumps(payload, sort_keys=True), run_id, node_id, attempt_no),
+                ),
+                (
+                    "UPDATE node_lifecycle SET lane_phase=?"
+                    " WHERE run_id=? AND node_id=? AND lane_phase IS NOT NULL",
+                    (st.LanePhase.BUILDING.value, run_id, node_id),
+                ),
+            ]
 
         return self._transition_node(
-            run_id, node_id, st.NodeState.PENDING, actor="operator",
+            run_id,
+            node_id,
+            st.NodeState.PENDING,
+            actor="operator",
             reason="resume:late-envelope",
             pending_cause=st.PendingCause.OPERATOR_RESUME,
-            require_state=(st.NodeState.BLOCKED,), extra_writes=extra)
+            require_state=(st.NodeState.BLOCKED,),
+            extra_writes=extra,
+        )
 
     @serialized
     def claim_late_envelope_attempt(
-            self, run_id: str, node_id: str,
-            attempt_no: int) -> st.NodeLifecycle:
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> st.NodeLifecycle:
         """PENDING -> RUNNING and consume the one-shot recovery marker."""
+
         def extra(lifecycle: st.NodeLifecycle):
             if lifecycle.attempt_no != attempt_no:
                 raise IllegalTransition(
-                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current")
+                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current"
+                )
             row = self.conn.execute(
                 "SELECT extra_json FROM attempts"
                 " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (run_id, node_id, attempt_no)).fetchone()
+                (run_id, node_id, attempt_no),
+            ).fetchone()
             if row is None:
                 raise UnknownNode(
-                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent")
+                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent"
+                )
             payload = json.loads(row[0] or "{}")
-            if not isinstance(payload, dict) or payload.pop(
-                    LATE_ENVELOPE_RECOVERY_KEY, None) is not True:
+            if (
+                not isinstance(payload, dict)
+                or payload.pop(LATE_ENVELOPE_RECOVERY_KEY, None) is not True
+            ):
                 raise IllegalTransition(
-                    f"{run_id}/{node_id}#{attempt_no}: late recovery is not pending")
-            return [(
-                "UPDATE attempts SET state=?, extra_json=?"
-                " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (st.NodeState.RUNNING.value,
-                 json.dumps(payload, sort_keys=True),
-                 run_id, node_id, attempt_no))]
+                    f"{run_id}/{node_id}#{attempt_no}: late recovery is not pending"
+                )
+            return [
+                (
+                    "UPDATE attempts SET state=?, started_at=?, launched_at=NULL,"
+                    " pid=NULL, attempt_host=NULL, attempt_start_epoch=NULL,"
+                    " turn_count=0, extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        st.NodeState.RUNNING.value,
+                        time.time(),
+                        json.dumps(payload, sort_keys=True),
+                        run_id,
+                        node_id,
+                        attempt_no,
+                    ),
+                )
+            ]
 
         return self._transition_node(
-            run_id, node_id, st.NodeState.RUNNING, actor="scheduler",
+            run_id,
+            node_id,
+            st.NodeState.RUNNING,
+            actor="scheduler",
             reason="attempt-recover:late-envelope",
-            require_state=(st.NodeState.PENDING,), extra_writes=extra)
+            require_state=(st.NodeState.PENDING,),
+            extra_writes=extra,
+        )
 
+    @serialized
+    def claim_repair_handoff_attempt(
+        self,
+        run_id: str,
+        build_node_id: str,
+        review_node_id: str,
+        attempt_no: int,
+        rejected_candidate_sha: str,
+    ) -> st.NodeLifecycle:
+        """Resume a persisted repair handoff without minting another attempt.
+
+        This recovery is legal only when all three durable authorities agree:
+        the current attempt already has an accepted result, the named immutable
+        candidate has a terminal rejection, and its handoff remains recoverable.
+        The guarded node PENDING -> RUNNING transition and cancelled attempt-row
+        reopening are one transaction, so a second scheduler cannot claim a sibling attempt.
+        """
+
+        def extra(lifecycle: st.NodeLifecycle):
+            if lifecycle.attempt_no != attempt_no:
+                raise IllegalTransition(
+                    f"{run_id}/{build_node_id}: attempt {attempt_no} "
+                    "is no longer current"
+                )
+            attempt = self.conn.execute(
+                "SELECT state, retry_class, extra_json FROM attempts"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (run_id, build_node_id, attempt_no),
+            ).fetchone()
+            if attempt is None:
+                raise UnknownNode(
+                    f"{run_id}/{build_node_id}#{attempt_no}: attempt row is absent"
+                )
+            if attempt[0] != st.NodeState.CANCELLED.value:
+                raise IllegalTransition(
+                    f"{run_id}/{build_node_id}#{attempt_no}: "
+                    f"attempt is {attempt[0]}, not CANCELLED"
+                )
+            if attempt[1] not in (
+                None,
+                st.RetryClass.ENVIRONMENTAL.value,
+                st.RetryClass.LAUNCHER_TRANSIENT.value,
+            ):
+                raise IllegalTransition(
+                    f"{run_id}/{build_node_id}#{attempt_no}: "
+                    f"{attempt[1]} failure cannot resume a repair handoff"
+                )
+            result = self.conn.execute(
+                "SELECT adjudication FROM results"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?"
+                " ORDER BY id DESC LIMIT 1",
+                (run_id, build_node_id, attempt_no),
+            ).fetchone()
+            if result is None or result[0] != st.Adjudication.ACCEPTED.value:
+                raise IllegalTransition(
+                    f"{run_id}/{build_node_id}#{attempt_no}: "
+                    "accepted result evidence is absent"
+                )
+            candidate = self.conn.execute(
+                "SELECT 1 FROM lane_candidates"
+                " WHERE run_id=? AND build_node_id=? AND candidate_sha=?",
+                (run_id, build_node_id, rejected_candidate_sha),
+            ).fetchone()
+            review = self.conn.execute(
+                "SELECT state, verdict FROM candidate_reviews"
+                " WHERE run_id=? AND review_node_id=? AND candidate_sha=?",
+                (run_id, review_node_id, rejected_candidate_sha),
+            ).fetchone()
+            handoff = self.conn.execute(
+                "SELECT state FROM repair_handoffs"
+                " WHERE run_id=? AND build_node_id=?"
+                " AND rejected_candidate_sha=?",
+                (run_id, build_node_id, rejected_candidate_sha),
+            ).fetchone()
+            if (
+                candidate is None
+                or review is None
+                or review[0] != st.CandidateReviewState.COMPLETED.value
+                or review[1] != st.ReviewVerdict.REJECTED.value
+                or handoff is None
+                or handoff[0] == st.RepairHandoffState.FAILED.value
+            ):
+                raise IllegalTransition(
+                    f"{run_id}/{build_node_id}#{attempt_no}: "
+                    "rejected candidate handoff evidence is incomplete"
+                )
+            try:
+                payload = json.loads(attempt[2] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload["repair_handoff_recovery"] = rejected_candidate_sha
+            return [
+                (
+                    "UPDATE attempts SET state=?, started_at=?, launched_at=NULL,"
+                    " pid=NULL, attempt_host=NULL, attempt_start_epoch=NULL,"
+                    " turn_count=0, retry_class=NULL, extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        st.NodeState.RUNNING.value,
+                        time.time(),
+                        json.dumps(payload, sort_keys=True),
+                        run_id,
+                        build_node_id,
+                        attempt_no,
+                    ),
+                )
+            ]
+
+        return self._transition_node(
+            run_id,
+            build_node_id,
+            st.NodeState.RUNNING,
+            actor="scheduler",
+            reason="attempt-recover:repair-handoff",
+            require_state=(st.NodeState.PENDING,),
+            detail={"candidate_sha": rejected_candidate_sha},
+            extra_writes=extra,
+        )
 
     @serialized
     def _running_node_ids(self, run_id: str) -> Tuple[str, ...]:
         rows = self.conn.execute(
             "SELECT node_id FROM node_lifecycle WHERE run_id=? AND state=?",
-            (run_id, st.NodeState.RUNNING.value)).fetchall()
+            (run_id, st.NodeState.RUNNING.value),
+        ).fetchall()
         return tuple(r[0] for r in rows)
 
     @serialized
@@ -2323,7 +5527,8 @@ class LifecycleStore:
         `resume_run` refuses both.
         """
         row = self.conn.execute(
-            "SELECT cancel_cause FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            "SELECT cancel_cause FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"run {run_id} does not exist")
         return st.CancelCause(row[0]) if row[0] else None
@@ -2340,8 +5545,8 @@ class LifecycleStore:
         rows = self.conn.execute(
             "SELECT node_id FROM node_lifecycle"
             " WHERE run_id=? AND state=? AND cancel_cause=? ORDER BY node_id",
-            (run_id, st.NodeState.CANCELLED.value,
-             st.CancelCause.RUN_CANCEL.value)).fetchall()
+            (run_id, st.NodeState.CANCELLED.value, st.CancelCause.RUN_CANCEL.value),
+        ).fetchall()
         return tuple(r[0] for r in rows)
 
     def _reopen_run_cancelled_node(self, run_id: str, node_id: str) -> st.NodeLifecycle:
@@ -2353,39 +5558,73 @@ class LifecycleStore:
         it had. Nothing about it was adjudicated, so there is nothing to
         charge it for.
         """
-        return self._transition_node(
-            run_id, node_id, st.NodeState.PENDING, actor="operator",
+        reopened = self._transition_node(
+            run_id,
+            node_id,
+            st.NodeState.PENDING,
+            actor="operator",
             reason="resume:run-cancel",
             pending_cause=st.PendingCause.OPERATOR_RESUME,
-            require_state=(st.NodeState.CANCELLED,))
+            require_state=(st.NodeState.CANCELLED,),
+        )
+        if reopened.lane_phase is st.LanePhase.CANCELLED:
+            repair = self.conn.execute(
+                "SELECT cr.verdict, rh.state FROM lane_candidates lc"
+                " JOIN candidate_reviews cr ON cr.run_id=lc.run_id"
+                " AND cr.review_node_id=lc.build_node_id || '::review'"
+                " AND cr.candidate_sha=lc.candidate_sha"
+                " JOIN repair_handoffs rh ON rh.run_id=lc.run_id"
+                " AND rh.build_node_id=lc.build_node_id"
+                " AND rh.rejected_candidate_sha=lc.candidate_sha"
+                " WHERE lc.run_id=? AND lc.build_node_id=?"
+                " ORDER BY lc.candidate_seq DESC LIMIT 1",
+                (run_id, node_id),
+            ).fetchone()
+            phase = (
+                st.LanePhase.REPAIR_HANDOFF.value
+                if repair is not None
+                and repair[0] == st.ReviewVerdict.REJECTED.value
+                and repair[1] != st.RepairHandoffState.FAILED.value
+                else None
+            )
+            self.conn.execute(
+                "UPDATE node_lifecycle SET lane_phase=?"
+                " WHERE run_id=? AND node_id=? AND lane_phase=?",
+                (phase, run_id, node_id, st.LanePhase.CANCELLED.value),
+            )
+            return self.get_node(run_id, node_id)
+        return reopened
 
-    def resume_run(self, run_id: str) -> Tuple[str, ...]:
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        late_envelope_attempts: Sequence[Tuple[str, int]] = (),
+    ) -> Tuple[str, ...]:
         """Legal against BLOCKED, STUCK, NULL, and a run the operator stopped
         with `run cancel`; refused against ACCEPTED and against a run given up
         on node by node (§7.3). Writes the resume transition — refreshing
         `last_transition_at` — BEFORE touching any inherited RUNNING attempt,
         so the backstop measures silence from the resume, not from the dead
-        run's last act (§7.8, §11.2). Every inherited RUNNING attempt is
-        returned to PENDING and re-launched, never adopted — the resumed
-        process owns none of their panes and cannot resume reading an agent
-        mid-turn.
+        run's last act (§7.8, §11.2). An inherited RUNNING attempt with no
+        independently validated success envelope returns to PENDING for a new
+        generation: the resumed process owns none of its pane and cannot adopt
+        work whose completion is unknown.
 
-        What it is *charged* depends on whether it declared a result. §9.7:
-        an artifact a worker wrote outranks any status a supervisor observes
-        about that worker, and a resume is the supervisor here. An inherited
-        attempt may be one that had already finished — envelope written, work
-        committed, result row adjudicated ACCEPTED — and was sitting in review
-        when the scheduler died. Charging that ENVIRONMENTAL debits an infra
-        retry for an attempt that did its work, the same accounting distortion
-        the watchdog's turn clock produced before it learned to read the same
-        row. Such an attempt is closed UNCLASSIFIED instead, and
-        `attempts_spent` counts only classified rows, so it costs nothing.
-        Everything else is charged ENVIRONMENTAL exactly as before.
+        A caller may name generations whose successful envelope, worktree
+        identity, baseline, and agent absence were already validated. Those
+        generations also return to PENDING, but carry a one-shot recovery
+        marker; the scheduler claims the same attempt and runs its normal
+        inventory, gate, review, and merge path without relaunching the builder.
+        This is artifact precedence at the resume boundary: completed work is
+        not discarded because the supervisor died before observing it.
 
-        Re-launched either way, and deliberately: adoption would mean binding
-        the resumed process to a worktree, a pane, and a gate run it never
-        started, which is a different design. Only the budget is corrected
-        here, never the work.
+        A generation with an ACCEPTED result row but without that full recovery
+        proof is closed UNCLASSIFIED rather than charged ENVIRONMENTAL.
+        `attempts_spent` counts only classified rows, so the infrastructure
+        failure costs no budget, but the work is not adopted on a partial
+        evidence chain. Everything else is charged ENVIRONMENTAL exactly as
+        before.
 
         Each one's pane is recorded in `orphans` before its attempt row is
         closed — the pid lives on that row, so reading it afterwards would read
@@ -2419,30 +5658,48 @@ class LifecycleStore:
         column — is refused with the abandoned case. The migration invents no
         facts, and guessing that an unrecorded cancellation was merely a pause
         is the guess that reopens an adjudicated run."""
+        requested_recoveries = set(late_envelope_attempts)
+        current_running = set(self.running_attempts(run_id))
+        unknown_recoveries = requested_recoveries - current_running
+        if unknown_recoveries:
+            raise ResumeRefused(
+                f"{run_id}: late-envelope recovery does not name current "
+                f"RUNNING attempts: {sorted(unknown_recoveries)!r}"
+            )
         outcome = self.latest_outcome(run_id)
         cause = self.run_cancel_cause(run_id)
         if outcome is st.RunOutcome.ACCEPTED:
             raise ResumeRefused(
                 f"{run_id}: resume is refused against a declared "
-                f"{outcome.value} run (§7.3) — it is not reopenable")
-        if (outcome is st.RunOutcome.CANCELLED
-                and cause not in st.REOPENABLE_CANCEL_CAUSES):
+                f"{outcome.value} run (§7.3) — it is not reopenable"
+            )
+        if (
+            outcome is st.RunOutcome.CANCELLED
+            and cause not in st.REOPENABLE_CANCEL_CAUSES
+        ):
             if cause is st.CancelCause.ABANDONED:
-                why = ("was given up on node by node, and each of those nodes "
-                       "was adjudicated as work the run should finish without")
+                why = (
+                    "was given up on node by node, and each of those nodes "
+                    "was adjudicated as work the run should finish without"
+                )
             elif cause is st.CancelCause.DISCARDED:
-                why = ("was discarded — `run cancel --discard` is the verb "
-                       "that ends a run for good, and `run pause` is the one "
-                       "that stops a run you mean to come back to")
+                why = (
+                    "was discarded — `run cancel --discard` is the verb "
+                    "that ends a run for good, and `run pause` is the one "
+                    "that stops a run you mean to come back to"
+                )
             else:
-                why = ("records no cause at all — its ledger predates the "
-                       "column, and reading an unrecorded cancellation as a "
-                       "pause is the guess that reopens an adjudicated run")
+                why = (
+                    "records no cause at all — its ledger predates the "
+                    "column, and reading an unrecorded cancellation as a "
+                    "pause is the guess that reopens an adjudicated run"
+                )
             raise ResumeRefused(
                 f"{run_id}: resume is refused against a run declared CANCELLED "
                 f"with cause {cause.value if cause else 'unrecorded'} (§7.3) — "
                 f"only a run stopped by an operator's `run cancel` is "
-                f"reopenable; this one {why}")
+                f"reopenable; this one {why}"
+            )
         self._write_resume_transition(run_id)
         # Before the inherited attempts, and deliberately: these nodes hold no
         # attempt this process could inherit -- `cancel_run` closed every one
@@ -2461,25 +5718,35 @@ class LifecycleStore:
                 inherited = None
             if inherited is not None:
                 self.record_orphan(
-                    run_id, node_id=node_id, attempt_no=inherited.attempt_no,
+                    run_id,
+                    node_id=node_id,
+                    attempt_no=inherited.attempt_no,
                     pid=inherited.pid,
-                    handle=str(inherited.extra.get("pane")) if inherited.extra.get("pane") else None,
-                    reason="resume: inherited a RUNNING attempt this process does not own")
-            if (self.result_adjudication(run_id, node_id, node.attempt_no)
-                    is st.Adjudication.ACCEPTED):
-                # Only ACCEPTED spares it. The other three verdicts each say
-                # the row does not describe this generation's own work:
-                # SUPERSEDED named an attempt that was no longer live,
-                # UNKNOWN_ATTEMPT names no attempt at all, and SHA_MISMATCH
-                # names a different base (§7.7).
-                self._release_unclassified_attempt(run_id, node_id)
+                    handle=str(inherited.extra.get("pane"))
+                    if inherited.extra.get("pane")
+                    else None,
+                    reason="resume: inherited a RUNNING attempt this process does not own",
+                )
+            key = (node_id, node.attempt_no)
+            if key in requested_recoveries:
+                self._release_late_envelope_attempt(run_id, node_id, node.attempt_no)
+            elif (
+                self.result_adjudication(run_id, node_id, node.attempt_no)
+                is st.Adjudication.ACCEPTED
+            ):
+                # A declared result is durable output from this exact
+                # generation, not permission to create another attempt.
+                # Re-enter completion through the same late-envelope path so
+                # candidate/review/handoff ledgers decide the persisted phase.
+                self._release_late_envelope_attempt(run_id, node_id, node.attempt_no)
             else:
                 self.fail_attempt(run_id, node_id, st.RetryClass.ENVIRONMENTAL)
             reclaimed.append(node_id)
         return tuple(reclaimed)
 
-    def _release_unclassified_attempt(self, run_id: str,
-                                       node_id: str) -> st.NodeLifecycle:
+    def _release_unclassified_attempt(
+        self, run_id: str, node_id: str
+    ) -> st.NodeLifecycle:
         """RUNNING -> PENDING with the attempt row closed but UNCLASSIFIED.
 
         The same write set as `fail_attempt` minus the one column that costs
@@ -2490,17 +5757,74 @@ class LifecycleStore:
         attempt nobody is running, and makes §7.7 adjudicate a late arrival
         ACCEPTED rather than SUPERSEDED.
         """
+
         def extra(lifecycle: st.NodeLifecycle):
-            return [(
-                "UPDATE attempts SET state=?"
-                " WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
-                 lifecycle.attempt_no))]
+            return [
+                (
+                    "UPDATE attempts SET state=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (CLOSED_ATTEMPT_STATE.value, run_id, node_id, lifecycle.attempt_no),
+                )
+            ]
+
         return self._transition_node(
-            run_id, node_id, st.NodeState.PENDING, actor="scheduler",
+            run_id,
+            node_id,
+            st.NodeState.PENDING,
+            actor="scheduler",
             reason="resume:result-declared",
             pending_cause=st.PendingCause.SCHEDULER,
-            require_state=(st.NodeState.RUNNING,), extra_writes=extra)
+            require_state=(st.NodeState.RUNNING,),
+            extra_writes=extra,
+        )
+
+    def _release_late_envelope_attempt(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> st.NodeLifecycle:
+        """RUNNING -> PENDING while retaining this declared generation."""
+
+        def extra(lifecycle: st.NodeLifecycle):
+            if lifecycle.attempt_no != attempt_no:
+                raise IllegalTransition(
+                    f"{run_id}/{node_id}: attempt {attempt_no} is no longer current"
+                )
+            row = self.conn.execute(
+                "SELECT extra_json FROM attempts"
+                " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                (run_id, node_id, attempt_no),
+            ).fetchone()
+            if row is None:
+                raise UnknownNode(
+                    f"{run_id}/{node_id}#{attempt_no}: attempt row is absent"
+                )
+            payload = json.loads(row[0] or "{}")
+            if not isinstance(payload, dict):
+                payload = {}
+            payload[LATE_ENVELOPE_RECOVERY_KEY] = True
+            return [
+                (
+                    "UPDATE attempts SET state=?, extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        CLOSED_ATTEMPT_STATE.value,
+                        json.dumps(payload, sort_keys=True),
+                        run_id,
+                        node_id,
+                        attempt_no,
+                    ),
+                )
+            ]
+
+        return self._transition_node(
+            run_id,
+            node_id,
+            st.NodeState.PENDING,
+            actor="operator",
+            reason="resume:late-envelope",
+            pending_cause=st.PendingCause.OPERATOR_RESUME,
+            require_state=(st.NodeState.RUNNING,),
+            extra_writes=extra,
+        )
 
     # ── operator escapes (§11.3) ────────────────────────────────────────────
 
@@ -2511,13 +5835,14 @@ class LifecycleStore:
                 f"{run_id}: escapes are legal only against a run declared BLOCKED or "
                 f"STUCK (§7.3, §11.2); latest outcome is "
                 f"{outcome.value if outcome else 'NULL'} — an escape against an "
-                "undeclared run would race a scheduler that may still be alive")
+                "undeclared run would race a scheduler that may still be alive"
+            )
 
     @serialized
     def _scheduler_claim(self, run_id: str) -> Tuple[Optional[int], Optional[str]]:
         row = self.conn.execute(
-            "SELECT scheduler_pid, scheduler_host FROM runs WHERE run_id=?",
-            (run_id,)).fetchone()
+            "SELECT scheduler_pid, scheduler_host FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
         if row is None:
             raise UnknownNode(f"run {run_id} does not exist")
         pid = int(row[0]) if row[0] is not None else None
@@ -2532,51 +5857,79 @@ class LifecycleStore:
         """
         pid, recorded_host = self._scheduler_claim(run_id)
         record = RunRecord(
-            run_id=run_id, plan_digest="", created_at="", last_transition_at="",
-            latest_outcome=None, latest_outcome_at=None, cancel_requested=False,
-            scheduler_pid=pid, scheduler_host=recorded_host)
+            run_id=run_id,
+            plan_digest="",
+            created_at="",
+            last_transition_at="",
+            latest_outcome=None,
+            latest_outcome_at=None,
+            cancel_requested=False,
+            scheduler_pid=pid,
+            scheduler_host=recorded_host,
+        )
         alive = scheduler_liveness(record)
         if alive is True:
             raise SchedulerStillAlive(
                 f"{run_id}: scheduler pid {pid} is still alive on "
                 f"{recorded_host or scheduler_host()}; an escape against a "
-                "RUNNING node would race a scheduler that is still there")
+                "RUNNING node would race a scheduler that is still there"
+            )
         if alive is None:
             if not pid or pid <= 0:
                 condition = "no scheduler pid is recorded"
             else:
                 condition = (
                     f"scheduler pid {pid} was recorded on {recorded_host}, "
-                    "not this host")
+                    "not this host"
+                )
             raise SchedulerLivenessUnknown(
                 f"{run_id}: scheduler liveness is unknown ({condition}); "
-                "refusing rather than guessing the scheduler is dead")
+                "refusing rather than guessing the scheduler is dead"
+            )
 
     def _close_running_attempt(
-            self, run_id: str, node_id: str, *,
-            retry_class: Optional[st.RetryClass] = None):
+        self, run_id: str, node_id: str, *, retry_class: Optional[st.RetryClass] = None
+    ):
         """Close the live attempt row in the same transaction as the escape.
 
         The row stays; only its state (and optional classification) change.
         Leaving it RUNNING collides the next attempt with §10.3's partial
         unique index and makes §7.7 adjudicate a late arrival ACCEPTED.
         """
+
         def extra(lifecycle: st.NodeLifecycle):
             if retry_class is None:
-                return [(
-                    "UPDATE attempts SET state=? "
-                    "WHERE run_id=? AND node_id=? AND state=?",
-                    (CLOSED_ATTEMPT_STATE.value, run_id, node_id,
-                     st.NodeState.RUNNING.value))]
-            return [(
-                "UPDATE attempts SET retry_class=?, state=? "
-                "WHERE run_id=? AND node_id=? AND attempt_no=?",
-                (retry_class.value, CLOSED_ATTEMPT_STATE.value,
-                 run_id, node_id, lifecycle.attempt_no))]
+                return [
+                    (
+                        "UPDATE attempts SET state=? "
+                        "WHERE run_id=? AND node_id=? AND state=?",
+                        (
+                            CLOSED_ATTEMPT_STATE.value,
+                            run_id,
+                            node_id,
+                            st.NodeState.RUNNING.value,
+                        ),
+                    )
+                ]
+            return [
+                (
+                    "UPDATE attempts SET retry_class=?, state=? "
+                    "WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        retry_class.value,
+                        CLOSED_ATTEMPT_STATE.value,
+                        run_id,
+                        node_id,
+                        lifecycle.attempt_no,
+                    ),
+                )
+            ]
+
         return extra
 
-    def _prepare_stranded_running(self, run_id: str, node_id: str, *,
-                                    retry_class: Optional[st.RetryClass] = None):
+    def _prepare_stranded_running(
+        self, run_id: str, node_id: str, *, retry_class: Optional[st.RetryClass] = None
+    ):
         """If the node is RUNNING, demand a dead scheduler and close the attempt.
 
         Returns `(extra_writes, detail)` for `_transition_node`. BLOCKED is
@@ -2586,27 +5939,24 @@ class LifecycleStore:
         if current is not st.NodeState.RUNNING:
             return None, None
         self._require_scheduler_dead(run_id)
-        return (self._close_running_attempt(run_id, node_id,
-                                            retry_class=retry_class),
-                {"scheduler_liveness": False})
+        return (
+            self._close_running_attempt(run_id, node_id, retry_class=retry_class),
+            {"scheduler_liveness": False},
+        )
 
-    def retry(self, run_id: str, node_id: str, *, force: bool = False,
-              grant: int = 0) -> st.NodeLifecycle:
+    def retry(
+        self, run_id: str, node_id: str, *, force: bool = False, grant: int = 0
+    ) -> st.NodeLifecycle:
         """BLOCKED -> PENDING, or stranded RUNNING -> PENDING when the
         scheduler is provably dead. `force` grants exactly one extra attempt
         beyond the semantic ceiling, and `grant` grants exactly that many,
         neither raising the cap itself (§7.5, §11.3).
 
-        `grant` exists because the escape was capped at +1 by construction, in
-        the situation that needs more than +1 by construction (#81). The grant
-        is spent by a *cumulative* count — `review_attempts_total` and
-        `semantic_attempts_total` are scoped to `(run_id, node_id)` across
-        every base and never decrease — so a node already past its ceiling
-        needs a grant sized to the distance, not another +1. Repeating
-        `--force` cannot supply that distance: the first call moves the node to
-        PENDING and `require_state` below then refuses the second, which is
-        the guard doing its job rather than a bug in it. So the magnitude
-        belongs on the one call the state admits.
+        ``grant`` sizes the durable semantic and review-rejection budgets.
+        Semantic spend is counted from classified attempts; review spend is
+        counted independently in ``lane_retry_spends``. Both are cumulative
+        across candidate bases for this run and node, so a grant must name the
+        full additional distance in the one legal state transition.
 
         The escape's *identity* is unchanged: any grant is still
         `Escape.RETRY_FORCE`, because a grant of three is the same operator
@@ -2631,8 +5981,7 @@ class LifecycleStore:
         node in the run and leaves the deployment's configuration edited (#91).
         """
         if grant < 0:
-            raise EscapeRefused(
-                f"{node_id}: retry grant must be positive, got {grant}")
+            raise EscapeRefused(f"{node_id}: retry grant must be positive, got {grant}")
         if grant and force:
             # Not a style preference: `--force` *is* a grant of one, so
             # accepting both would leave the total silently ambiguous between
@@ -2640,54 +5989,81 @@ class LifecycleStore:
             # sizing a grant cannot afford to guess at.
             raise EscapeRefused(
                 f"{node_id}: --force is a grant of one; pass one of "
-                "--force or --grant, never both")
+                "--force or --grant, never both"
+            )
         delta = grant if grant else (1 if force else 0)
         self._require_escape_legal(run_id)
         stranded, detail = self._prepare_stranded_running(
-            run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL)
+            run_id, node_id, retry_class=st.RetryClass.ENVIRONMENTAL
+        )
 
         def extra(lifecycle: st.NodeLifecycle):
+            # BLOCKED is a terminal lane phase, not merely a presentation of
+            # the node state. An operator retry starts a new correction cycle;
+            # leaving BLOCKED here makes the next scheduler generation lose
+            # its first BUILDING CAS and strands the node in RUNNING.
+            reset_phase = (
+                "UPDATE node_lifecycle SET lane_phase=NULL"
+                " WHERE run_id=? AND node_id=?",
+                (run_id, node_id),
+            )
             # The floor first, the stranded attempt's classification second,
             # and the order is the semantics rather than a style choice: the
             # floor is the highest attempt *already* classified, so a row this
             # same transaction is about to classify must not be in it. Written
             # the other way round, the escape would forgive the very failure
             # it is being invoked over.
-            return ([(_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id))]
-                    + list(stranded(lifecycle) if stranded else ()))
+            return [
+                reset_phase,
+                (_RAISE_NODE_RETRY_SPEND_FLOOR, (run_id, node_id)),
+            ] + list(stranded(lifecycle) if stranded else ())
 
         reason = st.Escape.RETRY_FORCE.value if delta else st.Escape.RETRY.value
         detail = dict(detail or {})
         if delta:
             detail["granted_extra_delta"] = delta
-        return self._transition_node(
-            run_id, node_id, st.NodeState.PENDING, actor="operator", reason=reason,
+        self._transition_node(
+            run_id,
+            node_id,
+            st.NodeState.PENDING,
+            actor="operator",
+            reason=reason,
             require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
             granted_extra_delta=delta,
             pending_cause=st.PendingCause.OPERATOR_RETRY,
-            detail=detail or None, extra_writes=extra)
+            detail=detail or None,
+            extra_writes=extra,
+        )
+        return self.get_node(run_id, node_id)
 
     def _merge_evidence(self, run_id: str, node_id: str) -> MergeEvidence:
-        """Count what the ledger holds about this node's evidence chain.
-
-        Read *before* the transition is written, and that ordering matters:
-        `skip` closes a stranded RUNNING attempt in the same transaction, so
-        counting afterwards would count a row the escape itself had just
-        changed. Every figure here is a `COUNT(*)` over rows the run wrote,
-        which is what makes the record a fact rather than an assertion (§1.2).
-        """
+        """Count operator-visible evidence from authoritative durable rows."""
         verified = self.conn.execute(
             "SELECT COUNT(*) FROM transitions"
             " WHERE run_id=? AND node_id=? AND kind='node' AND to_state=?",
-            (run_id, node_id, st.NodeState.VERIFIED.value)).fetchone()
+            (run_id, node_id, st.NodeState.VERIFIED.value),
+        ).fetchone()
         attempts = self.attempts_for(run_id, node_id)
+        rejected = self.conn.execute(
+            "SELECT COUNT(*) FROM candidate_reviews"
+            " WHERE run_id=? AND review_node_id=? AND state=? AND verdict=?",
+            (
+                run_id,
+                f"{node_id}::review",
+                st.CandidateReviewState.COMPLETED.value,
+                st.ReviewVerdict.REJECTED.value,
+            ),
+        ).fetchone()
         return MergeEvidence(
             verified_transitions=int(verified[0]) if verified else 0,
-            review_rejections=rp.review_attempts_total(attempts, node_id),
+            review_rejections=int(rejected[0]) if rejected else 0,
             attempts_recorded=len(attempts),
-            block_reason=self.get_node(run_id, node_id).block_reason)
+            block_reason=self.get_node(run_id, node_id).block_reason,
+        )
 
-    def skip(self, run_id: str, node_id: str, *, accept_sha: str, repo_path) -> st.NodeLifecycle:
+    def skip(
+        self, run_id: str, node_id: str, *, accept_sha: str, repo_path
+    ) -> st.NodeLifecycle:
         """BLOCKED -> MERGED, or stranded RUNNING -> MERGED when the
         scheduler is provably dead: the operator supplied the work by hand.
         Verifies `git merge-base --is-ancestor` and the four worktree checks
@@ -2722,17 +6098,22 @@ class LifecycleStore:
         latest_attempt = self.conn.execute(
             "SELECT base_sha FROM attempts"
             " WHERE run_id=? AND node_id=? ORDER BY attempt_no DESC LIMIT 1",
-            (run_id, node_id)).fetchone()
+            (run_id, node_id),
+        ).fetchone()
         if latest_attempt is None:
             raise SkipAncestryRefused(
-                f"{node_id}: no attempt base exists; skip cannot prove output identity")
+                f"{node_id}: no attempt base exists; skip cannot prove output identity"
+            )
         branch = subprocess.run(
             ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if branch.returncode != 0:
             raise SkipAncestryRefused(
                 f"{node_id}: {repo_path} has no checked-out branch; "
-                "skip does not bypass worktree identity (§11.3)")
+                "skip does not bypass worktree identity (§11.3)"
+            )
         # Checked before the predicate below, which folds shape, existence and
         # ancestry into one boolean and so can only be reported as the last of
         # the three. An abbreviated SHA fails on shape and was told it did not
@@ -2747,44 +6128,64 @@ class LifecycleStore:
                 f"{node_id}: {accept_sha} is not a full object digest; skip "
                 "records a durable identity and an abbreviated SHA is "
                 "ambiguous by construction. Pass the full 40- or 64-hex "
-                f"digest: git -C {repo_path} rev-parse {accept_sha}")
+                f"digest: git -C {repo_path} rev-parse {accept_sha}"
+            )
         if not wt.is_valid_output_commit(
-                repo, accept_sha, expected_base=str(latest_attempt[0])):
+            repo, accept_sha, expected_base=str(latest_attempt[0])
+        ):
             raise SkipAncestryRefused(
                 f"{node_id}: {accept_sha} is not a valid output commit descending "
                 f"from attempt base {latest_attempt[0]} in {repo_path}; "
-                "skip does not bypass identity (§11.3)")
+                "skip does not bypass identity (§11.3)"
+            )
         if not _is_ancestor(repo_path, accept_sha):
             raise SkipAncestryRefused(
                 f"{node_id}: {accept_sha} is not an ancestor of HEAD in {repo_path}; "
-                "skip does not bypass the ancestry proof (§11.3)")
+                "skip does not bypass the ancestry proof (§11.3)"
+            )
         head = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "HEAD"],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         resolved = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", accept_sha],
-            capture_output=True, text=True)
-        if head.returncode != 0 or resolved.returncode != 0 or (
-                resolved.stdout.strip() != head.stdout.strip()):
+            capture_output=True,
+            text=True,
+        )
+        if (
+            head.returncode != 0
+            or resolved.returncode != 0
+            or (resolved.stdout.strip() != head.stdout.strip())
+        ):
             raise SkipAncestryRefused(
                 f"{node_id}: {accept_sha} is an older ancestor of HEAD in {repo_path}; "
-                "skip accepts only the current HEAD (§11.3)")
+                "skip accepts only the current HEAD (§11.3)"
+            )
         dirty = subprocess.run(
             ["git", "-C", str(repo), "status", "--porcelain"],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if dirty.returncode != 0 or dirty.stdout.strip():
             raise SkipAncestryRefused(
                 f"{node_id}: {repo_path} is not a clean worktree at {accept_sha}; "
-                "skip does not bypass cleanliness (§11.3)")
+                "skip does not bypass cleanliness (§11.3)"
+            )
         detail = dict(detail or {})
         detail[MERGE_EVIDENCE_KEY] = evidence.as_detail()
         return self._transition_node(
-            run_id, node_id, st.NodeState.MERGED, actor="operator",
+            run_id,
+            node_id,
+            st.NodeState.MERGED,
+            actor="operator",
             reason=st.Escape.SKIP.value,
             require_state=(st.NodeState.BLOCKED, st.NodeState.RUNNING),
             output_sha=accept_sha,
             merge_cause=st.MergeCause.OPERATOR_ACCEPTED,
-            detail=detail, extra_writes=extra)
+            detail=detail,
+            extra_writes=extra,
+        )
 
     def abandon(self, run_id: str, node_id: str) -> st.NodeLifecycle:
         """Any non-absolutely-terminal state -> CANCELLED (§7.3, §7.8, §11.3).
@@ -2807,12 +6208,18 @@ class LifecycleStore:
         if extra is None:
             extra = self._close_running_attempt(run_id, node_id)
         return self._transition_node(
-            run_id, node_id, st.NodeState.CANCELLED, actor="operator",
+            run_id,
+            node_id,
+            st.NodeState.CANCELLED,
+            actor="operator",
             reason=st.Escape.ABANDON.value,
-            cancel_cause=st.CancelCause.ABANDONED, extra_writes=extra)
+            cancel_cause=st.CancelCause.ABANDONED,
+            extra_writes=extra,
+        )
 
 
 # ── the read-only projection the operator's read verbs use (§11.1) ───────────
+
 
 @dataclass(frozen=True)
 class RunRecord:
@@ -2847,6 +6254,10 @@ class RunRecord:
     #: platform that cannot answer; `scheduler_signal_pid` reads both as
     #: unproven, which is the only safe direction (#37).
     scheduler_start_epoch: Optional[float] = None
+    #: The validated authored plan name persisted at run creation. Resume
+    #: reuses it for visible Herdr placement instead of re-deriving a label
+    #: from argparse state.
+    plan_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -2875,6 +6286,9 @@ class NodeRow:
     #: existed. `st.pending_cause_label` is the one derivation — a reader
     #: must not guess `SCHEDULER` from a NULL (RC1).
     pending_cause: Optional[st.PendingCause] = None
+    #: The durable build/review-loop phase, absent on ordinary nodes and on
+    #: ledgers written before persistent review authority existed.
+    lane_phase: Optional[st.LanePhase] = None
 
     @property
     def merge_provenance(self) -> Optional[str]:
@@ -2902,15 +6316,24 @@ class NodeRow:
 #:   half an hour after its scheduler died, with two nodes RUNNING, no pid, and
 #:   nothing left alive to move them.
 RUN_STATES: Tuple[str, ...] = (
-    "EMPTY", "PENDING", "RUNNING", "BLOCKED", "QUIESCENT",
-    "CANCELLING", "CANCELLED", "MERGED", "ABANDONED",
+    "EMPTY",
+    "PENDING",
+    "RUNNING",
+    "BLOCKED",
+    "QUIESCENT",
+    "CANCELLING",
+    "CANCELLED",
+    "MERGED",
+    "ABANDONED",
 )
 
 
 def scheduler_liveness(
-        record: RunRecord, *,
-        is_alive: Callable[[int], bool] = wd.process_is_alive,
-        host: Optional[str] = None) -> Optional[bool]:
+    record: RunRecord,
+    *,
+    is_alive: Callable[[int], bool] = wd.process_is_alive,
+    host: Optional[str] = None,
+) -> Optional[bool]:
     """Is a scheduler process still behind this run? `None` = cannot be said.
 
     Three answers, and the third is the one that keeps this honest:
@@ -2941,10 +6364,12 @@ def scheduler_liveness(
 
 
 def scheduler_signal_pid(
-        record: RunRecord, *,
-        is_alive: Callable[[int], bool] = wd.process_is_alive,
-        start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
-        host: Optional[str] = None) -> Optional[int]:
+    record: RunRecord,
+    *,
+    is_alive: Callable[[int], bool] = wd.process_is_alive,
+    start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
+    host: Optional[str] = None,
+) -> Optional[int]:
     """The pid it is legal to signal, or `None` when identity is unproven.
 
     `scheduler_liveness` answers "is there a process with this number?", and
@@ -2983,10 +6408,12 @@ def scheduler_signal_pid(
 
 
 def attempt_liveness(
-        attempt: st.AttemptRecord, *,
-        is_alive: Callable[[int], bool] = wd.process_is_alive,
-        start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
-        host: Optional[str] = None) -> Optional[bool]:
+    attempt: st.AttemptRecord,
+    *,
+    is_alive: Callable[[int], bool] = wd.process_is_alive,
+    start_epoch: Callable[[int], Optional[float]] = wd.process_start_epoch,
+    host: Optional[str] = None,
+) -> Optional[bool]:
     """Is this attempt's own process still there? `None` = cannot be said.
 
     Three answers, and the third is the one that keeps this honest:
@@ -3024,9 +6451,12 @@ def attempt_liveness(
 
 
 def derive_run_state(
-        record: RunRecord, nodes: Sequence[NodeRow], *,
-        is_alive: Callable[[int], bool] = wd.process_is_alive,
-        host: Optional[str] = None) -> str:
+    record: RunRecord,
+    nodes: Sequence[NodeRow],
+    *,
+    is_alive: Callable[[int], bool] = wd.process_is_alive,
+    host: Optional[str] = None,
+) -> str:
     """What the run *is*, computed from durable facts alone.
 
     `runs.latest_outcome` is written by exactly one actor — a live scheduler
@@ -3071,11 +6501,12 @@ def derive_run_state(
     if not states:
         return "EMPTY"
     if all(state in st.ABSOLUTELY_TERMINAL for state in states):
-        all_merged = all(state is st.NodeState.MERGED for state in states)
-        if all_merged and not record.cancel_requested:
+        all_merge_complete = all(
+            state in (st.NodeState.MERGED, st.NodeState.ACCEPTED) for state in states
+        )
+        if all_merge_complete and not record.cancel_requested:
             return "MERGED"
-        if (record.cancel_requested
-                or record.latest_outcome is st.RunOutcome.CANCELLED):
+        if record.cancel_requested or record.latest_outcome is st.RunOutcome.CANCELLED:
             return "CANCELLED"
         return "QUIESCENT"
     running = any(state is st.NodeState.RUNNING for state in states)
@@ -3097,7 +6528,12 @@ def derive_run_state(
 #: node rows alone; ABANDONED is the scheduler-death case, which
 #: `derive_run_state` has already established from the process table.
 STOPPED_RUN_STATES: Tuple[str, ...] = (
-    "EMPTY", "MERGED", "CANCELLED", "QUIESCENT", "ABANDONED")
+    "EMPTY",
+    "MERGED",
+    "CANCELLED",
+    "QUIESCENT",
+    "ABANDONED",
+)
 
 #: The derived states that establish the opposite from the node rows alone: a
 #: node is RUNNING this instant, or a cancellation has not yet reached every
@@ -3106,9 +6542,12 @@ LIVE_RUN_STATES: Tuple[str, ...] = ("RUNNING", "CANCELLING")
 
 
 def run_in_flight(
-        record: RunRecord, nodes: Sequence[NodeRow], *,
-        is_alive: Callable[[int], bool] = wd.process_is_alive,
-        host: Optional[str] = None) -> Optional[bool]:
+    record: RunRecord,
+    nodes: Sequence[NodeRow],
+    *,
+    is_alive: Callable[[int], bool] = wd.process_is_alive,
+    host: Optional[str] = None,
+) -> Optional[bool]:
     """Is this run still going? `True` / `False` / `None` = cannot be said.
 
     `derive_run_state` answers *what shape* a run is in, and a reader wanting
@@ -3164,7 +6603,7 @@ class LifecycleReader:
         path = Path(db_path)
         if not path.is_file():
             raise LedgerUnavailable(f"no lifecycle database at {path}")
-        located = path.resolve().as_uri()[len("file://"):]
+        located = path.resolve().as_uri()[len("file://") :]
         try:
             conn = cls._probed("file:{}?mode=ro".format(located))
         except sqlite3.OperationalError:
@@ -3203,40 +6642,57 @@ class LifecycleReader:
         # column reads back as `None`, which `scheduler_liveness` already
         # treats as "cannot be said".
         available = set(_table_columns(self.conn, "runs"))
-        optional = tuple(name for name, _ in _RUNS_ADDED_COLUMNS
-                         if name in available)
-        sql = ("SELECT run_id, plan_digest, created_at, last_transition_at,"
-               " latest_outcome, latest_outcome_at, cancel_requested"
-               + "".join(", " + name for name in optional)
-               + " FROM runs")
+        optional = tuple(name for name, _ in _RUNS_ADDED_COLUMNS if name in available)
+        sql = (
+            "SELECT run_id, plan_digest, created_at, last_transition_at,"
+            " latest_outcome, latest_outcome_at, cancel_requested"
+            + "".join(", " + name for name in optional)
+            + " FROM runs"
+        )
         params: Tuple[Any, ...] = ()
         if plan_digest is not None:
             sql += " WHERE plan_digest=?"
             params = (plan_digest,)
         return tuple(
             RunRecord(
-                run_id=row["run_id"], plan_digest=row["plan_digest"],
+                run_id=row["run_id"],
+                plan_digest=row["plan_digest"],
                 created_at=row["created_at"],
                 last_transition_at=row["last_transition_at"],
-                latest_outcome=(st.RunOutcome(row["latest_outcome"])
-                                if row["latest_outcome"] else None),
+                latest_outcome=(
+                    st.RunOutcome(row["latest_outcome"])
+                    if row["latest_outcome"]
+                    else None
+                ),
                 latest_outcome_at=row["latest_outcome_at"],
                 cancel_requested=bool(row["cancel_requested"]),
-                cancel_cause=(st.CancelCause(row["cancel_cause"])
-                              if "cancel_cause" in optional
-                              and row["cancel_cause"] else None),
-                scheduler_pid=(row["scheduler_pid"]
-                               if "scheduler_pid" in optional else None),
-                scheduler_host=(row["scheduler_host"]
-                                if "scheduler_host" in optional else None),
-                scheduler_claimed_at=(row["scheduler_claimed_at"]
-                                      if "scheduler_claimed_at" in optional
-                                      else None),
-                scheduler_start_epoch=(row["scheduler_start_epoch"]
-                                       if "scheduler_start_epoch" in optional
-                                       else None))
-            for row in self._rows(sql + " ORDER BY created_at DESC, run_id DESC",
-                                  params))
+                cancel_cause=(
+                    st.CancelCause(row["cancel_cause"])
+                    if "cancel_cause" in optional and row["cancel_cause"]
+                    else None
+                ),
+                scheduler_pid=(
+                    row["scheduler_pid"] if "scheduler_pid" in optional else None
+                ),
+                scheduler_host=(
+                    row["scheduler_host"] if "scheduler_host" in optional else None
+                ),
+                scheduler_claimed_at=(
+                    row["scheduler_claimed_at"]
+                    if "scheduler_claimed_at" in optional
+                    else None
+                ),
+                scheduler_start_epoch=(
+                    row["scheduler_start_epoch"]
+                    if "scheduler_start_epoch" in optional
+                    else None
+                ),
+                plan_name=(row["plan_name"] if "plan_name" in optional else None),
+            )
+            for row in self._rows(
+                sql + " ORDER BY created_at DESC, run_id DESC", params
+            )
+        )
 
     def run(self, run_id: str) -> Optional[RunRecord]:
         found = [record for record in self.runs() if record.run_id == run_id]
@@ -3252,34 +6708,57 @@ class LifecycleReader:
         # `st.pending_cause_label` leaves as `None` rather than guessing
         # `SCHEDULER` for a PENDING row.
         available = set(_table_columns(self.conn, "node_lifecycle"))
-        merge_cause_sql = (" l.merge_cause,"
-                           if "merge_cause" in available else " NULL AS merge_cause,")
-        pending_cause_sql = (" l.pending_cause,"
-                             if "pending_cause" in available
-                             else " NULL AS pending_cause,")
+        merge_cause_sql = (
+            " l.merge_cause," if "merge_cause" in available else " NULL AS merge_cause,"
+        )
+        pending_cause_sql = (
+            " l.pending_cause,"
+            if "pending_cause" in available
+            else " NULL AS pending_cause,"
+        )
+        lane_phase_sql = (
+            " l.lane_phase," if "lane_phase" in available else " NULL AS lane_phase,"
+        )
         rows = self._rows(
             "SELECT d.node_id, d.kind, d.depth, d.needs_json, l.state,"
             " l.attempt_no, l.block_reason, l.output_sha,"
-            + merge_cause_sql + pending_cause_sql +
-            " l.granted_extra_attempts, l.updated_at"
+            + merge_cause_sql
+            + pending_cause_sql
+            + lane_phase_sql
+            + " l.granted_extra_attempts, l.updated_at"
             " FROM dag_nodes d JOIN node_lifecycle l"
             " ON l.run_id = d.run_id AND l.node_id = d.node_id"
-            " WHERE d.run_id=? ORDER BY d.depth, d.node_id", (run_id,))
+            " WHERE d.run_id=? ORDER BY d.depth, d.node_id",
+            (run_id,),
+        )
         return tuple(
             NodeRow(
-                node_id=row["node_id"], kind=row["kind"], depth=row["depth"],
+                node_id=row["node_id"],
+                kind=row["kind"],
+                depth=row["depth"],
                 needs=tuple(json.loads(row["needs_json"])),
-                state=st.NodeState(row["state"]), attempt_no=row["attempt_no"],
-                block_reason=(st.BlockReason(row["block_reason"])
-                              if row["block_reason"] else None),
+                state=st.NodeState(row["state"]),
+                attempt_no=row["attempt_no"],
+                block_reason=(
+                    st.BlockReason(row["block_reason"]) if row["block_reason"] else None
+                ),
                 output_sha=row["output_sha"],
-                merge_cause=(st.MergeCause(row["merge_cause"])
-                             if row["merge_cause"] else None),
-                pending_cause=(st.PendingCause(row["pending_cause"])
-                               if row["pending_cause"] else None),
+                merge_cause=(
+                    st.MergeCause(row["merge_cause"]) if row["merge_cause"] else None
+                ),
+                pending_cause=(
+                    st.PendingCause(row["pending_cause"])
+                    if row["pending_cause"]
+                    else None
+                ),
+                lane_phase=(
+                    st.LanePhase(row["lane_phase"]) if row["lane_phase"] else None
+                ),
                 granted_extra_attempts=row["granted_extra_attempts"],
-                updated_at=row["updated_at"])
-            for row in rows)
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        )
 
     def attempts(self, run_id: str) -> Tuple[st.AttemptRecord, ...]:
         # `mode=ro`, so this reader cannot migrate a ledger that predates
@@ -3289,36 +6768,183 @@ class LifecycleReader:
         # reads back `None`, which `attempt_liveness` already treats as
         # "cannot be said".
         available = set(_table_columns(self.conn, "attempts"))
-        optional = tuple(name for name, _ in _ATTEMPTS_ADDED_COLUMNS
-                         if name in available)
+        optional = tuple(
+            name for name, _ in _ATTEMPTS_ADDED_COLUMNS if name in available
+        )
         rows = self._rows(
             "SELECT node_id, attempt_no, base_sha, state, started_at,"
             " launched_at, pid, turn_count, retry_class, extra_json"
             + "".join(", " + name for name in optional)
             + " FROM attempts WHERE run_id=? ORDER BY node_id, attempt_no",
-            (run_id,))
+            (run_id,),
+        )
         return tuple(
             st.AttemptRecord(
-                run_id=run_id, node_id=row["node_id"],
-                attempt_no=row["attempt_no"], base_sha=row["base_sha"],
+                run_id=run_id,
+                node_id=row["node_id"],
+                attempt_no=row["attempt_no"],
+                base_sha=row["base_sha"],
                 state=st.NodeState(row["state"]),
                 started_at=row["started_at"] or 0.0,
-                launched_at=row["launched_at"], pid=row["pid"],
+                launched_at=row["launched_at"],
+                pid=row["pid"],
                 turn_count=row["turn_count"] or 0,
-                retry_class=(st.RetryClass(row["retry_class"])
-                             if row["retry_class"] else None),
+                retry_class=(
+                    st.RetryClass(row["retry_class"]) if row["retry_class"] else None
+                ),
                 extra=json.loads(row["extra_json"]),
-                attempt_host=(row["attempt_host"]
-                              if "attempt_host" in optional else None),
-                attempt_start_epoch=(row["attempt_start_epoch"]
-                                     if "attempt_start_epoch" in optional
-                                     else None))
-            for row in rows)
+                attempt_host=(
+                    row["attempt_host"] if "attempt_host" in optional else None
+                ),
+                attempt_start_epoch=(
+                    row["attempt_start_epoch"]
+                    if "attempt_start_epoch" in optional
+                    else None
+                ),
+            )
+            for row in rows
+        )
+
+    def _has_table(self, table: str) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            is not None
+        )
+
+    def lane_candidates(
+        self, run_id: str, build_node_id: Optional[str] = None, *, limit: int = 100
+    ) -> Tuple[st.LaneCandidate, ...]:
+        if not self._has_table("lane_candidates"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("candidate read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, build_node_id, candidate_seq, candidate_sha,"
+            " parent_candidate_sha, builder_generation, created_at"
+            " FROM lane_candidates WHERE run_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id,)
+        if build_node_id is not None:
+            sql += " AND build_node_id=?"
+            params = (run_id, build_node_id)
+        rows = self._rows(
+            sql + " ORDER BY build_node_id, candidate_seq LIMIT ?", params + (limit,)
+        )
+        return tuple(_candidate_from_row(row) for row in rows)
+
+    def candidate_reviews(
+        self, run_id: str, review_node_id: Optional[str] = None, *, limit: int = 100
+    ) -> Tuple[st.CandidateReview, ...]:
+        if not self._has_table("candidate_reviews"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("review read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, review_node_id, candidate_sha, reviewer_generation,"
+            " state, review_digest, receipt_path, findings_json, verdict, completed_at"
+            " FROM candidate_reviews WHERE run_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id,)
+        if review_node_id is not None:
+            sql += " AND review_node_id=?"
+            params = (run_id, review_node_id)
+        rows = self._rows(
+            sql + " ORDER BY review_node_id, rowid LIMIT ?", params + (limit,)
+        )
+        return tuple(_review_from_row(row) for row in rows)
+
+    def repair_handoffs(
+        self, run_id: str, build_node_id: Optional[str] = None, *, limit: int = 100
+    ) -> Tuple[st.RepairHandoff, ...]:
+        if not self._has_table("repair_handoffs"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("handoff read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, build_node_id, rejected_candidate_sha, findings_json,"
+            " state, builder_generation, submitted_at, acknowledged_at"
+            " FROM repair_handoffs WHERE run_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id,)
+        if build_node_id is not None:
+            sql += " AND build_node_id=?"
+            params = (run_id, build_node_id)
+        rows = self._rows(
+            sql + " ORDER BY build_node_id, rowid LIMIT ?", params + (limit,)
+        )
+        return tuple(_handoff_from_row(row) for row in rows)
+
+    def legacy_review_migrations(
+        self, run_id: str, *, limit: int = 100
+    ) -> Tuple[LegacyReviewMigration, ...]:
+        """Lanes held before scheduling because legacy review evidence is unsafe."""
+        if not self._has_table("legacy_review_migration_blocks"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError(
+                "legacy review migration read limit must be a positive integer"
+            )
+        rows = self._rows(
+            "SELECT build_node_id, reason FROM legacy_review_migration_blocks"
+            " WHERE run_id=? ORDER BY build_node_id LIMIT ?",
+            (run_id, limit),
+        )
+        return tuple(
+            LegacyReviewMigration(
+                build_node_id=row["build_node_id"],
+                migrated=False,
+                blocked=True,
+                reason=row["reason"],
+            )
+            for row in rows
+        )
+
+    def lane_retry_spends(
+        self, run_id: str, build_node_id: str, *, limit: int = 100
+    ) -> Tuple[st.LaneRetrySpend, ...]:
+        if not self._has_table("lane_retry_spend"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("lane retry read limit must be a positive integer")
+        rows = self._rows(
+            "SELECT run_id, build_node_id, retry_class, cycle_seq, candidate_sha,"
+            " detail_json, created_at FROM lane_retry_spend"
+            " WHERE run_id=? AND build_node_id=? ORDER BY cycle_seq LIMIT ?",
+            (run_id, build_node_id, limit),
+        )
+        return tuple(_lane_retry_spend_from_row(row) for row in rows)
+
+    def actor_sessions(
+        self,
+        run_id: str,
+        build_node_id: str,
+        *,
+        actor_role: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[st.ActorSession, ...]:
+        if not self._has_table("actor_sessions"):
+            return ()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise LifecycleError("actor session read limit must be a positive integer")
+        sql = (
+            "SELECT run_id, build_node_id, actor_role, generation, state, pane_id,"
+            " session_path, correlation_token, updated_at FROM actor_sessions"
+            " WHERE run_id=? AND build_node_id=?"
+        )
+        params: Tuple[Any, ...] = (run_id, build_node_id)
+        if actor_role is not None:
+            sql += " AND actor_role=?"
+            params = (run_id, build_node_id, actor_role)
+        rows = self._rows(
+            sql + " ORDER BY actor_role, generation LIMIT ?", params + (limit,)
+        )
+        return tuple(_actor_session_from_row(row) for row in rows)
 
     def attempts_by_run_for_plan(
-            self, plan_digest: str,
-            exclude_run_id: Optional[str] = None
-            ) -> Dict[str, Tuple[st.AttemptRecord, ...]]:
+        self, plan_digest: str, exclude_run_id: Optional[str] = None
+    ) -> Dict[str, Tuple[st.AttemptRecord, ...]]:
         """Every run of one plan, and the attempt rows each of them holds.
 
         A node's identity across runs is `(plan_digest, node_id)` and nothing
@@ -3338,13 +6964,15 @@ class LifecycleReader:
         Read-only by construction: this reader opens `mode=ro`, and the
         cross-run budget is decided before the run's own ledger exists.
         """
-        return {record.run_id: self.attempts(record.run_id)
-                for record in self.runs(plan_digest)
-                if record.run_id != exclude_run_id}
+        return {
+            record.run_id: self.attempts(record.run_id)
+            for record in self.runs(plan_digest)
+            if record.run_id != exclude_run_id
+        }
 
     def granted_extra_attempts_for_plan(
-            self, plan_digest: str,
-            exclude_run_id: Optional[str] = None) -> Dict[str, int]:
+        self, plan_digest: str, exclude_run_id: Optional[str] = None
+    ) -> Dict[str, int]:
         """Per node, the operator grants standing on this plan's prior runs.
 
         `retry --force` and `retry --grant N` raise
@@ -3361,14 +6989,23 @@ class LifecycleReader:
             if record.run_id == exclude_run_id:
                 continue
             for row in self.nodes(record.run_id):
-                granted[row.node_id] = (granted.get(row.node_id, 0)
-                                        + (row.granted_extra_attempts or 0))
+                granted[row.node_id] = granted.get(row.node_id, 0) + (
+                    row.granted_extra_attempts or 0
+                )
         return granted
 
     def transitions(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
-        return tuple(_audit_dict(row) for row in self._rows(
-            "SELECT * FROM transitions WHERE run_id=? ORDER BY id", (run_id,)))
+        return tuple(
+            _audit_dict(row)
+            for row in self._rows(
+                "SELECT * FROM transitions WHERE run_id=? ORDER BY id", (run_id,)
+            )
+        )
 
     def results(self, run_id: str) -> Tuple[Dict[str, Any], ...]:
-        return tuple(_audit_dict(row) for row in self._rows(
-            "SELECT * FROM results WHERE run_id=? ORDER BY id", (run_id,)))
+        return tuple(
+            _audit_dict(row)
+            for row in self._rows(
+                "SELECT * FROM results WHERE run_id=? ORDER BY id", (run_id,)
+            )
+        )

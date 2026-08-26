@@ -30,22 +30,36 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from enum import Enum
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
-                    Sequence, Tuple)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from .scheduler_types import (
     AttemptRecord,
     BlockReason,
+    CandidateReview,
+    LaneRetryClass,
+    LaneRetrySpend,
     DEFAULT_RETRY_CLASS,
     NodeKind,
     REPAIR_KEY,
     RetryClass,
+    ReviewVerdict,
     SchedulerConfig,
 )
 from .worktree import PermissionVerdict
 
 
 # ── §7.5 structural inputs — every field a fact, never process output text ──
+
 
 @dataclass(frozen=True)
 class ReportOutcome:
@@ -174,10 +188,12 @@ class Classification:
         if (self.retry_class is None) == (self.block_reason is None):
             raise ValueError(
                 "a classification is exactly one of retry_class or block_reason, "
-                "never both and never neither")
+                "never both and never neither"
+            )
 
 
 # ── §7.5 / §7.3 the classifier ───────────────────────────────────────────────
+
 
 def classify(signal: FailureSignal) -> Classification:
     """Structural, never lexical (§7.5). Evaluated in the order §7.3 and §7.4
@@ -189,8 +205,11 @@ def classify(signal: FailureSignal) -> Classification:
     fail-closed ENVIRONMENTAL default.
     """
     # ── the three failures that fit no retry class at all (§7.3, §7.5) ──────
-    if (signal.node_kind is NodeKind.AGENT and signal.gate is not None
-            and not signal.gate.pre_gate_failed):
+    if (
+        signal.node_kind is NodeKind.AGENT
+        and signal.gate is not None
+        and not signal.gate.pre_gate_failed
+    ):
         return Classification(block_reason=BlockReason.GATE_NOT_FALSIFIABLE)
 
     if signal.permission is not None and not signal.permission.passes:
@@ -210,8 +229,11 @@ def classify(signal: FailureSignal) -> Classification:
     if signal.report is not None and signal.report.parsed and signal.report.failed:
         return Classification(retry_class=RetryClass.SEMANTIC)
 
-    if (signal.gate is not None and signal.gate.pre_gate_failed
-            and not signal.gate.post_gate_passed):
+    if (
+        signal.gate is not None
+        and signal.gate.pre_gate_failed
+        and not signal.gate.post_gate_passed
+    ):
         return Classification(retry_class=RetryClass.SEMANTIC)
 
     # ── LAUNCHER_TRANSIENT: pane allocation, startup, transport ──────────────
@@ -220,8 +242,10 @@ def classify(signal: FailureSignal) -> Classification:
     # launcher failure's one or two, and a budget rule whose input is thrown
     # away here cannot fire anywhere downstream (§7.5).
     if signal.launcher_failure is not None:
-        return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT,
-                              launcher_failure=signal.launcher_failure)
+        return Classification(
+            retry_class=RetryClass.LAUNCHER_TRANSIENT,
+            launcher_failure=signal.launcher_failure,
+        )
 
     if not signal.binary_resolved or not signal.process_started:
         return Classification(retry_class=RetryClass.LAUNCHER_TRANSIENT)
@@ -234,7 +258,9 @@ def classify(signal: FailureSignal) -> Classification:
     return Classification(retry_class=DEFAULT_RETRY_CLASS)
 
 
-def classify_with_containment(build_signal: Callable[[], FailureSignal]) -> Classification:
+def classify_with_containment(
+    build_signal: Callable[[], FailureSignal],
+) -> Classification:
     """§7.5 containment — the worker body's top-level handler.
 
     `build_signal` is whatever the caller does to turn a raw failure into a
@@ -252,17 +278,23 @@ def classify_with_containment(build_signal: Callable[[], FailureSignal]) -> Clas
 
 # ── §7.5 the semantic budget, both halves ────────────────────────────────────
 
-def semantic_attempts_at_base(attempts: Iterable[AttemptRecord], node_id: str,
-                              base_sha: str) -> int:
+
+def semantic_attempts_at_base(
+    attempts: Iterable[AttemptRecord], node_id: str, base_sha: str
+) -> int:
     """The `(node_id, base_sha)` prompt-mutation scope (§7.5).
 
     A new base is genuinely new evidence, so this re-arms with no counter to
     clear and no reset event to fire — it is a `COUNT(*)` over the attempt
     rows that already exist, derived from a stored fact rather than a flag.
     """
-    return sum(1 for a in attempts
-              if a.node_id == node_id and a.base_sha == base_sha
-              and a.retry_class is RetryClass.SEMANTIC)
+    return sum(
+        1
+        for a in attempts
+        if a.node_id == node_id
+        and a.base_sha == base_sha
+        and a.retry_class is RetryClass.SEMANTIC
+    )
 
 
 def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
@@ -273,65 +305,26 @@ def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> 
     can never produce a budget decrement (§7.5). Callers pass rows already
     scoped to one run.
 
-    **This is the fix loop's bound, and it counts every content failure.** It
-    used to exclude rows carrying `REVIEW_REJECTED_KEY`, because a rejection
-    spent `review_ceiling` instead and charging one failure to two budgets
-    would have let a node rejected twice arrive at its third gate failure
-    already out of attempts. §19 M35 removed the second budget: a review
-    rejection no longer fails an attempt at all, so there is no longer a
-    failure this sum could double-charge, and an exclusion that once kept two
-    ceilings honest would now be a hole — a SEMANTIC row that happened also to
-    carry an advisory rejection marker would not be counted by anything.
+    **This is the fix loop's bound, and it counts every content failure.**
+    Candidate-review rejection is not an attempt failure and therefore cannot
+    appear in this sum. Its independent durable budget lives in
+    ``lane_retry_spends``; no attempt-extra marker participates in either
+    budget.
 
     What remains is one number for the loop the reference implementation draws
     as `test_1 -> fix_1` bounded x3: `execution.semantic_ceiling`, counted over
     `(run_id, node_id)` across every base. Stated, counted, never negotiated.
     """
-    return sum(1 for a in attempts
-              if a.node_id == node_id and a.retry_class is RetryClass.SEMANTIC)
-
-
-# ── the review budget, counted the same way and kept separate ───────────────
-
-#: The marker `fail_attempt`/`mark_blocked` write into `attempts.extra_json`
-#: when an attempt was recycled because a reviewer rejected its diff. A key in
-#: a row the count already ranges over, rather than a fourth `RetryClass`,
-#: because §7.5 states three mutually exclusive classes and every guard in the
-#: system is written against exactly those three.
-REVIEW_REJECTED_KEY = "review_rejected"
-
-#: Findings-per-attempt, stored on the same review-rejected extra row the
-#: budget already counts. A rejected diff is only half the operator's
-#: question — the other half is whether the reviewer is finding *less* each
-#: time, which is what says another attempt would land and a flat series says
-#: it would not. The count lives on the durable row rather than in process
-#: memory so a resumed run reports the same series the original would have.
-REVIEW_FINDINGS_COUNT_KEY = "review_findings_count"
-
-
-def review_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
-    """`COUNT(*)` over this node's review-rejected attempt rows.
-
-    Scoped to `(run_id, node_id)` across every base, exactly as
-    `semantic_attempts_total` is, and for the same reason: without the
-    cumulative scope every unrelated merge mints a new base and re-arms a
-    per-base counter, so total spend would scale with the number of merges
-    rather than with the node.
-
-    Deliberately disjoint from the semantic count. A red gate and a rejected
-    diff are different failures — one says the stated behaviour is absent, the
-    other says the code that produces it should not merge — and a shared budget
-    would let a node that burned two attempts on gate failures merge unreviewed
-    on its third because the reviewer had no attempts left to spend.
-    """
-    return sum(1 for a in attempts
-               if a.node_id == node_id
-               and bool((a.extra or {}).get(REVIEW_REJECTED_KEY)))
+    return sum(
+        1
+        for a in attempts
+        if a.node_id == node_id and a.retry_class is RetryClass.SEMANTIC
+    )
 
 
 def semantic_attempts_across_runs(
-        attempts_by_run: Mapping[str, Iterable[AttemptRecord]],
-        node_id: str) -> Tuple[int, Tuple[str, ...]]:
+    attempts_by_run: Mapping[str, Iterable[AttemptRecord]], node_id: str
+) -> Tuple[int, Tuple[str, ...]]:
     """This node's SEMANTIC attempts summed over many runs, and the runs that
     hold them.
 
@@ -374,148 +367,43 @@ def semantic_attempts_across_runs(
     return total, tuple(holders)
 
 
-def review_convergence_from_attempts(
-        attempts: Iterable[AttemptRecord]) -> Dict[str, List[int]]:
-    """Rebuild findings-per-attempt per node from durable review-rejected rows.
-
-    Ordered by `attempt_no` so a resumed process reports the same series the
-    original process appended in memory. A row written before this key
-    existed carries no count and is skipped rather than counted as zero — a
-    zero would read as "the reviewer found nothing", which is the one thing a
-    review-rejected row cannot mean.
-    """
-    by_node: Dict[str, List[Tuple[int, int]]] = {}
-    for attempt in attempts:
-        extra = attempt.extra or {}
-        if not extra.get(REVIEW_REJECTED_KEY):
+def review_convergence_from_reviews(reviews: Iterable[Any]) -> Dict[str, List[int]]:
+    """Rebuild rejected-finding counts from terminal candidate reviews."""
+    by_node: Dict[str, List[int]] = {}
+    for review in reviews:
+        state = getattr(
+            getattr(review, "state", None), "value", getattr(review, "state", None)
+        )
+        verdict = getattr(
+            getattr(review, "verdict", None), "value", getattr(review, "verdict", None)
+        )
+        if state != "COMPLETED" or verdict != "REJECTED":
             continue
-        count = extra.get(REVIEW_FINDINGS_COUNT_KEY)
-        if count is None:
+        review_node_id = str(getattr(review, "review_node_id", ""))
+        if not review_node_id.endswith("::review"):
             continue
-        by_node.setdefault(attempt.node_id, []).append(
-            (attempt.attempt_no, int(count)))
-    return {
-        node_id: [count for _no, count in sorted(items)]
-        for node_id, items in by_node.items()
-    }
+        node_id = review_node_id[: -len("::review")]
+        by_node.setdefault(node_id, []).append(
+            len(getattr(review, "findings", ()) or ())
+        )
+    return by_node
 
 
-# ── the repair basis: a rejected diff is repaired, not re-implemented ────────
+# ── repair markers: keep one rejected diff, never re-implement it ───────────
 #
-# A review rejection classifies SEMANTIC and recycles the attempt, and until
-# this section existed the recycled attempt branched from the integration head
-# like every other attempt — which discards the rejected diff entirely and asks
-# the builder to implement the node again from an empty tree. Consecutive
-# attempts were therefore not iterations of one artifact but independent
-# implementations, each judged fresh, and findings could not descend because
-# nothing accumulated: one production node produced 2, 2, 1, 3 findings over
-# four rejections, all four attempts based on the same commit, rewriting 573
-# lines each time and deleting the 1-finding version rather than repairing it.
-# `review_ceiling` was six chances to guess right in one shot, never six rounds
-# of refinement.
-#
-# This is issue #90's shape applied to the other actor. There, a *reviewer*
-# that failed was re-dispatched against the attempt's surviving output commit
-# rather than the builder being discarded; here, a builder whose diff was
-# rejected is sent back to that same surviving commit rather than to an empty
-# tree. Both decisions read the same three kinds of fact — a git object name, a
-# count of durable rows, and a member of a closed vocabulary — and neither
-# reads a word of the reviewer's prose (§1.2). The findings travel in the
-# prompt, where `render_guidance` already puts them and where nothing
-# transitions on them.
-
-#: The git object name of the commit a rejected attempt actually produced,
-#: stored on the rejected attempt's own row beside the marker that says it was
-#: rejected. `node_lifecycle.output_sha` cannot serve: it is written by
-#: `mark_verified`, which a rejected attempt never reaches, so on this path the
-#: lifecycle row holds nothing at all. The attempt's durable ref does hold the
-#: commit, but a ref read alone proves only what the ref points at *now* — it
-#: cannot say whether that is still what the harness committed. Two facts,
-#: compared, are what make the subject of a repair provable, exactly as
-#: `ReviewStallFacts` keeps `output_sha` and `surviving_sha` as two fields.
-REVIEW_OUTPUT_SHA_KEY = "review_output_sha"
+# Persistent review owns the candidate, handoff, actor generation, and retry
+# ledgers. This module keeps only the attempt-row markers and prompt basis that
+# the scheduler uses while repairing the retained worktree. Review verdicts
+# themselves live in `candidate_reviews`, not in an attempt's free-form extra.
 
 #: Typed marker on a repair attempt that measured an empty delta (#113).
-#: Reader: `repair_subject`, which walks past it the same way it walks past
-#: ENVIRONMENTAL — the row is not a judgement about a new tree.
+#: The scheduler records it for audit and retry guidance; it never stands in
+#: for a new immutable candidate.
 REPAIR_DIFF_EMPTY_KEY = "repair_diff_empty"
 REPAIR_DIFF_EMPTY = (
     "REPAIR_DIFF_EMPTY: a repair attempt wrote nothing, so the tree is "
-    "byte-identical to the rejected attempt and is not a candidate for review")
-
-#: At most this many *consecutive* repair attempts before the chain breaks and
-#: the node is re-derived from the integration head.
-#:
-#: In code and not in `maestro.config.yaml`: the config is deployment-owned and
-#: deliberately not mirrored between the template and its deployments, so a key
-#: added there would exist in one copy of the runtime and not the others.
-#:
-#: Three, and the number matters less than the fact that it is a constant
-#: compared against a count of durable rows. Each admitted repair strictly
-#: increases `chain_length`, so no chain can exceed it; a broken chain restarts
-#: from the integration head at `chain_length` zero, and the *number* of chains
-#: is bounded by `review_ceiling + granted`, which this section does not touch.
-#: The loop therefore adds no attempts at all — it only changes what an attempt
-#: the review budget had already paid for starts from.
-REPAIR_CHAIN_LIMIT = 3
-
-#: Why a rejected diff was not repaired. Module constants, never strings
-#: composed at the call site, for the reason `classify_review_stall`'s reasons
-#: are: the value is written into a durable row and an operator who greps for
-#: it needs a closed set to grep.
-REPAIR_NO_PRIOR_REJECTION = (
-    "the previous attempt failed before it produced a commit to repair")
-REPAIR_OUTPUT_UNPROVEN = (
-    "the rejected attempt has no provable output commit to repair")
-REPAIR_HEAD_MOVED = (
-    "the integration head moved while this node was being reviewed, so the "
-    "rejected diff and the findings about it are both stale")
-REPAIR_CHAIN_EXHAUSTED = (
-    "the repair chain reached its limit without the diff being accepted")
-REPAIR_FINDINGS_ROSE = (
-    "the last repair raised more findings than the rejection it repaired")
-REPAIR_ADMITTED = "repairing the rejected diff"
-
-
-@dataclass(frozen=True)
-class RepairFacts:
-    """The typed facts one repair decision reads (§1.2).
-
-    Every field is a git object name, an integer, a boolean derived from git's
-    own object database, or a member of `RetryClass`. Nothing here is pane
-    text, prompt text, a free-text envelope field, or an agent's claim about
-    its own work — the reviewer's prose reaches the *prompt* and is read
-    nowhere else, and the reviewer's verdict reaches this decision only as the
-    typed marker on the attempt row and as an integer count of findings.
-
-    `prior` is the node's highest-numbered attempt row, which is the attempt
-    the one being opened directly succeeds. `attempts` is the node's full
-    attempt history, newest not required first. When it is non-empty,
-    `decide_repair` walks it past ENVIRONMENTAL and LAUNCHER_TRANSIENT rows
-    to the last attempt that carried a verdict; `prior` still supplies
-    `chain_length`, which must strictly increase even across a machine fault.
-
-    `rejected_ref_sha` is what the *subject* attempt's own durable ref holds
-    *now*, read back from git rather than remembered, and `output_proven` is
-    `worktree.is_attempt_output_commit` over it: the shape test, the object
-    test, the descent-from-its-own-base test, and the exact-ref test, all four.
-    A repair that branched from anything else would be repairing a tree the
-    evidence chain does not name.
-
-    `repaired_findings` is the findings count of the rejection that the
-    subject itself was repairing, or `None` when it repaired nothing or when
-    the count was never stored. `None` is "unknown" and never zero, for the
-    reason `review_convergence_from_attempts` skips it: zero would read as
-    "the reviewer found nothing", which is the one thing a rejection cannot
-    mean.
-    """
-
-    integration_head: str
-    prior: Optional[AttemptRecord]
-    rejected_ref_sha: Optional[str] = None
-    output_proven: bool = False
-    repaired_findings: Optional[int] = None
-    attempts: Tuple[AttemptRecord, ...] = ()
+    "byte-identical to the rejected attempt and is not a candidate for review"
+)
 
 
 @dataclass(frozen=True)
@@ -530,21 +418,8 @@ class RepairBasis:
     integration_head: str
     #: The attempt whose rejected diff is being repaired.
     repair_of_attempt: int
-    #: Including this one. Bounded by `REPAIR_CHAIN_LIMIT`.
+    #: Including this one. Bounded by the durable lane review retry budget.
     chain_length: int
-
-
-@dataclass(frozen=True)
-class RepairDecision:
-    """Exactly one basis or none, with the reason the ledger records for it."""
-
-    basis: Optional[RepairBasis]
-    reason: str
-
-
-def review_output_extra(output_sha: str) -> Dict[str, Any]:
-    """The rejected attempt's output commit, as its own row stores it."""
-    return {REVIEW_OUTPUT_SHA_KEY: output_sha}
 
 
 def repair_extra(basis: RepairBasis) -> Dict[str, Any]:
@@ -559,326 +434,13 @@ def repair_extra(basis: RepairBasis) -> Dict[str, Any]:
     `repaired_findings_count` follows to find the rejection this chain's
     progress is measured against.
     """
-    return {REPAIR_KEY: {
-        "attempt_no": basis.repair_of_attempt,
-        "integration_head": basis.integration_head,
-        "chain_length": basis.chain_length,
-    }}
-
-
-def repaired_findings_count(
-        attempts: Iterable[AttemptRecord],
-        prior: Optional[AttemptRecord]) -> Optional[int]:
-    """The findings count of the rejection `prior` was itself repairing.
-
-    `None` when `prior` repaired nothing, when the attempt it names is not
-    among the rows given, or when that attempt's row predates
-    `REVIEW_FINDINGS_COUNT_KEY`. Unknown, never zero.
-    """
-    if prior is None:
-        return None
-    repaired_no = prior.repair_of_attempt
-    if repaired_no is None:
-        return None
-    for attempt in attempts:
-        if attempt.node_id != prior.node_id or attempt.attempt_no != repaired_no:
-            continue
-        count = (attempt.extra or {}).get(REVIEW_FINDINGS_COUNT_KEY)
-        return int(count) if isinstance(count, int) else None
-    return None
-
-
-def repair_subject(
-        attempts: Iterable[AttemptRecord]) -> Optional[AttemptRecord]:
-    """The last attempt that carried a verdict, walking past machine faults.
-
-    ENVIRONMENTAL and LAUNCHER_TRANSIENT rows are not judgements about the
-    artifact. A repair that wrote nothing (`REPAIR_DIFF_EMPTY_KEY`) is not
-    one either: it produced no new tree. Walking past them is bounded: one
-    pass over the attempt list, newest first, stop at the first row that is
-    not a machine fault and not an empty repair. A SEMANTIC row without a
-    stored output commit still ends the walk, so a red gate still restarts.
-    """
-    for row in sorted(attempts, key=lambda r: r.attempt_no, reverse=True):
-        if row.retry_class in (RetryClass.ENVIRONMENTAL,
-                               RetryClass.LAUNCHER_TRANSIENT):
-            continue
-        if (row.extra or {}).get(REPAIR_DIFF_EMPTY_KEY):
-            continue
-        return row
-    return None
-
-
-def decide_repair(facts: RepairFacts) -> RepairDecision:
-    """Whether the attempt being opened repairs the rejected diff, or restarts.
-
-    Five refusals, then the admission. Each refusal is structural, and the
-    order is the order in which a fact becomes knowable rather than a
-    preference:
-
-    1. **The previous verdict produced nothing worth repairing.** Both halves
-       are read: the subject's `retry_class` must be SEMANTIC *and* it must
-       carry a stored output commit (`REVIEW_OUTPUT_SHA_KEY`). Either alone
-       is the wrong predicate — a red gate is SEMANTIC without having
-       produced a tree, and the commit without the class would admit a row
-       `mark_blocked` wrote. A gate failure leaves nothing to repair: the
-       tree it produced never passed its own gate, so the next attempt
-       restarts from the integration head exactly as it always has.
-
-       An ENVIRONMENTAL or LAUNCHER_TRANSIENT row is not that subject. Those
-       classes are machine faults, and `repair_subject` walks past them to
-       the last attempt that carried a verdict. A lone ENVIRONMENTAL row,
-       or an ENVIRONMENTAL row whose only predecessors also failed the
-       machine, still returns `REPAIR_NO_PRIOR_REJECTION`.
-
-       The predicate used to be `REVIEW_REJECTED_KEY`, which was the same set
-       while a review rejection was the only way an attempt could fail *after*
-       its own gate had gone green. §19 M35 ended that: review no longer fails
-       anything, and §7.4's post-work falsification refusal took its place as
-       the failure that arrives with a proven commit in hand. Keying on the
-       commit rather than on which stage objected is what makes the repair
-       chain outlive the stage it was built for — and it is the honest
-       predicate either way, because the commit is the thing being repaired.
-    2. **The rejected diff is not provable.** No stored output commit, a ref
-       that no longer holds it, or a commit that fails
-       `is_attempt_output_commit` means the subject of the repair cannot be
-       named, and branching from a tree the evidence chain does not name is
-       worse than starting over.
-    3. **The integration head moved.** Evaluated against the head *now* and
-       the subject's recorded head, not against a machine-fault row. §8.1
-       puts attempt worktrees on the integration head, and a repair honours
-       that by branching from a commit that *descends* from the head the
-       rejection was measured against — which is only the current head while
-       no sibling has merged. When one has, the rejected commit descends from
-       a head that is no longer integration's, and branching from it would
-       silently hand the builder a tree missing the sibling's work. The same
-       equality also expires the findings, and it is the expiry
-       `AttemptRecord.guidance_key` already performs, so the two cannot
-       disagree: a base the guidance is invalid at is a base the repair is
-       refused at.
-    4. **The chain reached `REPAIR_CHAIN_LIMIT`.** `chain_length` strictly
-       increases off the immediate predecessor, including an ENVIRONMENTAL
-       predecessor that was itself a repair, so a blip cannot reset the
-       bound. After three consecutive repairs the node is re-derived from
-       the integration head with the findings still in the prompt.
-    5. **The last repair made it worse.** Findings rising across a repair — the
-       repaired rejection raised fewer than the repair did — is the ledger
-       saying the diff in hand is not the thing to keep. Both counts are
-       integers stored on rows the review budget already counts; an unknown
-       count never breaks the chain, because "unknown" is not "rose".
-
-    Nothing here can block a node. Every refusal falls back to the behaviour
-    that existed before this function did, which is the fresh base the
-    scheduler would have used anyway.
-    """
-    latest = facts.prior
-    subject = (repair_subject(facts.attempts)
-               if facts.attempts else latest)
-    if (subject is None
-            or subject.retry_class is not RetryClass.SEMANTIC
-            or not (subject.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)):
-        return RepairDecision(None, REPAIR_NO_PRIOR_REJECTION)
-    rejected_sha = (subject.extra or {}).get(REVIEW_OUTPUT_SHA_KEY)
-    if (not isinstance(rejected_sha, str) or not rejected_sha
-            or not facts.output_proven
-            or facts.rejected_ref_sha != rejected_sha):
-        return RepairDecision(None, REPAIR_OUTPUT_UNPROVEN)
-    if subject.integration_head != facts.integration_head:
-        return RepairDecision(None, REPAIR_HEAD_MOVED)
-    chain_source = latest if latest is not None else subject
-    chain_length = chain_source.repair_chain_length + 1
-    if chain_length > REPAIR_CHAIN_LIMIT:
-        return RepairDecision(None, REPAIR_CHAIN_EXHAUSTED)
-    prior_findings = (subject.extra or {}).get(REVIEW_FINDINGS_COUNT_KEY)
-    if (isinstance(prior_findings, int)
-            and facts.repaired_findings is not None
-            and prior_findings > facts.repaired_findings):
-        return RepairDecision(None, REPAIR_FINDINGS_ROSE)
-    return RepairDecision(
-        RepairBasis(base_sha=rejected_sha,
-                    integration_head=facts.integration_head,
-                    repair_of_attempt=subject.attempt_no,
-                    chain_length=chain_length),
-        REPAIR_ADMITTED)
-
-
-# ── §7.5 the reviewer-side failure: retry the reviewer, not the builder ──────
-
-#: Every reviewer dispatch made against one attempt's committed output, stored
-#: on that attempt's own row. A list rather than a counter, because the count
-#: is not the only thing the ledger owes an operator: which route and model
-#: stalled, on which signal, and after how long is the difference between "the
-#: reviewer is wedged" and "this commit is too large for that context window",
-#: and neither is recoverable from a number.
-#:
-#: It lives on the attempt row rather than in process memory for the reason
-#: `GUIDANCE_KEY` does: the budget below is a `COUNT(*)` over durable rows, and
-#: a resumed scheduler that counted an in-memory list would re-arm the budget
-#: at every process boundary — which is the refund loop §7.5 convicts, arrived
-#: at through a counter that looks local and is not.
-REVIEW_DISPATCH_KEY = "review_dispatches"
-
-
-class ReviewDispatchOutcome(str, Enum):
-    """What a reviewer-side failure earns.
-
-    `REDISPATCH` sends the *reviewer* at the same commit again. `SETTLE` hands
-    the failure back to the ENVIRONMENTAL default, which is what the
-    reviewer-stall arm did unconditionally before this existed — and doing it
-    unconditionally is issue #90: the builder's committed, gate-passing tree
-    was discarded and the node re-derived from base, four times over, for a
-    failure that was never the builder's.
-    """
-
-    REDISPATCH = "REDISPATCH"
-    SETTLE = "SETTLE"
-
-
-#: Why a reviewer-side failure was not re-dispatched. Module constants, never
-#: strings composed at the call site: `_settle_failure` writes the value into
-#: the durable failure detail, and a reason an operator greps for has to be
-#: one of a closed set to be greppable at all. The decision below returns one
-#: of these *beside* its outcome; nothing ever branches on the text.
-#:
-#: `REVIEW_REDISPATCH_EXHAUSTED` is deliberately the wording the stall arm has
-#: always written. A run that exhausts its re-dispatches ends exactly where it
-#: ended before, and an operator's existing query for that reason keeps
-#: finding it.
-REVIEW_OUTPUT_UNPROVEN = "the attempt has no provable output commit to re-review"
-REVIEW_REDISPATCH_EXHAUSTED = "the code reviewer stalled without reporting"
-REVIEW_REDISPATCH_NO_HEADROOM = (
-    "the code reviewer stalled and the attempt window cannot hold another "
-    "review of the same length")
-
-
-@dataclass(frozen=True)
-class ReviewDispatchDecision:
-    """Exactly one outcome, with the reason the ledger records for it."""
-
-    outcome: ReviewDispatchOutcome
-    reason: str
-
-
-@dataclass(frozen=True)
-class ReviewStallFacts:
-    """The typed facts one reviewer-side failure carries (§1.2).
-
-    Every field is either a git object name, a number, or a member of a closed
-    vocabulary the reviewer's own machinery defines. Nothing here is pane text,
-    prompt text, or a free-text envelope field, and nothing here is an agent's
-    claim about its own work — a stalled reviewer produced no claim, which is
-    precisely what makes this a fact about the machine.
-
-    `surviving_sha` is what the attempt's own git ref holds *now*, read back
-    after the stall rather than remembered from before it. `output_sha` is what
-    the harness committed. They are two fields and not one on purpose: equal
-    means the builder's work is still exactly where the evidence chain says it
-    is, and anything else — a moved ref, a missing ref — means the subject of
-    the re-review cannot be proven and the re-dispatch is refused.
-    """
-
-    output_sha: Optional[str]
-    surviving_sha: Optional[str]
-    dispatches_spent: int
-    budget: int
-    #: `finalization_window.FinalizationSignal`'s value — the reviewer window's
-    #: own typed account of how it ended. Carried for the ledger; the decision
-    #: below never branches on it.
-    signal: Optional[str] = None
-    route: Optional[str] = None
-    model: Optional[str] = None
-    session_id: Optional[str] = None
-    elapsed_s: Optional[float] = None
-    #: Seconds left in this attempt's §7.6 window when the stall was observed.
-    #: `None` means the caller could not measure it, which is not the same as
-    #: zero and is treated as "unmeasured" rather than as "none left".
-    window_headroom_s: Optional[float] = None
-
-
-def review_dispatches_spent(attempt: Optional[AttemptRecord]) -> int:
-    """`COUNT(*)` over the typed dispatch rows this attempt already stored.
-
-    Scoped to the attempt rather than to the node, because that is the scope
-    the fact is true within: a dispatch spent re-reviewing attempt a4's commit
-    says nothing about a5's, and counting across attempts would let one
-    attempt's wedged reviewer spend the next attempt's allowance.
-
-    A row written before this key existed carries no list and counts zero,
-    which is correct rather than merely convenient: under that code no
-    dispatch beyond the first was ever made.
-    """
-    if attempt is None:
-        return 0
-    stored = (attempt.extra or {}).get(REVIEW_DISPATCH_KEY)
-    if not isinstance(stored, list):
-        return 0
-    return len(stored)
-
-
-def review_dispatch_row(facts: "ReviewStallFacts") -> Dict[str, Any]:
-    """One dispatch record, as the attempt row stores it.
-
-    `dispatch_no` is derived from the count rather than passed in, so the
-    stored sequence cannot disagree with the budget that counts it.
-    """
     return {
-        "output_sha": facts.output_sha,
-        "surviving_sha": facts.surviving_sha,
-        "dispatch_no": facts.dispatches_spent + 1,
-        "signal": facts.signal,
-        "route": facts.route,
-        "model": facts.model,
-        "session_id": facts.session_id,
-        "elapsed_s": facts.elapsed_s,
+        REPAIR_KEY: {
+            "attempt_no": basis.repair_of_attempt,
+            "integration_head": basis.integration_head,
+            "chain_length": basis.chain_length,
+        }
     }
-
-
-def classify_review_stall(facts: "ReviewStallFacts") -> ReviewDispatchDecision:
-    """§7.5 applied to the actor that actually failed.
-
-    A reviewer that never reported says nothing about the code, which is why
-    the stall arm has always classified ENVIRONMENTAL. What it also says
-    nothing about is the *builder*, and that half was missing: the whole
-    attempt was failed, so a committed tree that had passed its post-node gate
-    and its permission check was discarded and the node re-derived from the
-    integration head. Issue #90 measured the cost — four attempts, four
-    accepted envelopes, four passing gates, zero verdicts, and a node blocked
-    `ENVIRONMENTAL_BUDGET_EXHAUSTED` having never once been reviewed — and the
-    growth it causes: each restart replays the retry guidance ledger, so every
-    cycle produced a larger implementation of the same requirement.
-
-    The retry that matches the failure is another *reviewer* against the same
-    commit. Three facts decide it, all structural:
-
-    1. There is an output commit, and the attempt's own ref still holds it.
-       Without that the subject of the re-review is unproven, and re-reviewing
-       something other than what the evidence chain names is worse than not
-       re-reviewing at all.
-    2. The re-dispatch budget is not spent. It is the ENVIRONMENTAL budget —
-       the class this failure already belonged to — spent on re-dispatching
-       the reviewer rather than on discarding the builder.
-    3. The attempt's §7.6 window can still hold a review of the length the one
-       that just stalled took. Without this the re-dispatch converts a
-       reviewer stall into a `NODE_TIMEOUT` and discards the same commit one
-       horizon later, which is the failure this function exists to stop.
-
-    None of the three reads text. `surviving_sha` is `git rev-parse` over the
-    attempt's own ref, `dispatches_spent` is a count of durable rows, and the
-    headroom is arithmetic over two numbers the attempt row and the config
-    already carry.
-    """
-    if not facts.output_sha or facts.surviving_sha != facts.output_sha:
-        return ReviewDispatchDecision(
-            ReviewDispatchOutcome.SETTLE, REVIEW_OUTPUT_UNPROVEN)
-    if facts.dispatches_spent >= facts.budget:
-        return ReviewDispatchDecision(
-            ReviewDispatchOutcome.SETTLE, REVIEW_REDISPATCH_EXHAUSTED)
-    if (facts.window_headroom_s is not None and facts.elapsed_s is not None
-            and facts.window_headroom_s < facts.elapsed_s):
-        return ReviewDispatchDecision(
-            ReviewDispatchOutcome.SETTLE, REVIEW_REDISPATCH_NO_HEADROOM)
-    return ReviewDispatchDecision(
-        ReviewDispatchOutcome.REDISPATCH, REVIEW_REDISPATCH_EXHAUSTED)
 
 
 # ── guidance, made durable ───────────────────────────────────────
@@ -894,32 +456,40 @@ GUIDANCE_KEY = "guidance"
 def guidance_extra_verification(detail: Optional[dict]) -> Dict[str, Any]:
     """The typed VERIFICATION entry, as the attempt row stores it."""
     guidance = verification_guidance(detail)
-    return {GUIDANCE_KEY: {
-        "surface": "verification",
-        "reason": guidance.reason,
-        "offending_paths": list(guidance.offending_paths),
-        "failed_clause": guidance.failed_clause,
-        "unreferenced_symbols": list(guidance.unreferenced_symbols),
-    }}
+    return {
+        GUIDANCE_KEY: {
+            "surface": "verification",
+            "reason": guidance.reason,
+            "offending_paths": list(guidance.offending_paths),
+            "failed_clause": guidance.failed_clause,
+            "unreferenced_symbols": list(guidance.unreferenced_symbols),
+        }
+    }
 
 
 def guidance_extra_review(review: object) -> Dict[str, Any]:
     """The typed REVIEW entry, as the attempt row stores it."""
     guidance = review_guidance(review)
-    return {GUIDANCE_KEY: {
-        "surface": "review",
-        "subject_digest": guidance.subject_digest,
-        "findings": [
-            {"check_id": finding.check_id, "object_id": finding.object_id,
-             "message": finding.message, "blocking": finding.blocking}
-            for finding in guidance.findings
-        ],
-    }}
+    return {
+        GUIDANCE_KEY: {
+            "surface": "review",
+            "subject_digest": guidance.subject_digest,
+            "findings": [
+                {
+                    "check_id": finding.check_id,
+                    "object_id": finding.object_id,
+                    "message": finding.message,
+                    "blocking": finding.blocking,
+                }
+                for finding in guidance.findings
+            ],
+        }
+    }
 
 
 def guidance_from_attempts(
-        attempts: Iterable[AttemptRecord]
-        ) -> Dict[Tuple[str, str], "GuidanceLedger"]:
+    attempts: Iterable[AttemptRecord],
+) -> Dict[Tuple[str, str], "GuidanceLedger"]:
     """Rebuild every node's ledger from the durable attempt extras.
 
     Keyed by `AttemptRecord.guidance_key` — `(node_id, base_sha)` — because
@@ -931,8 +501,7 @@ def guidance_from_attempts(
     constraints.
     """
     ledgers: Dict[Tuple[str, str], GuidanceLedger] = {}
-    for attempt in sorted(attempts,
-                          key=lambda item: (item.node_id, item.attempt_no)):
+    for attempt in sorted(attempts, key=lambda item: (item.node_id, item.attempt_no)):
         payload = (attempt.extra or {}).get(GUIDANCE_KEY)
         if not isinstance(payload, dict):
             continue
@@ -940,12 +509,16 @@ def guidance_from_attempts(
         ledger = ledgers.get(key, GuidanceLedger())
         surface = payload.get("surface")
         if surface == "verification":
-            ledger = ledger.with_verification(VerificationGuidance(
-                reason=str(payload.get("reason") or ""),
-                offending_paths=tuple(payload.get("offending_paths") or ()),
-                failed_clause=payload.get("failed_clause"),
-                unreferenced_symbols=tuple(
-                    payload.get("unreferenced_symbols") or ())))
+            ledger = ledger.with_verification(
+                VerificationGuidance(
+                    reason=str(payload.get("reason") or ""),
+                    offending_paths=tuple(payload.get("offending_paths") or ()),
+                    failed_clause=payload.get("failed_clause"),
+                    unreferenced_symbols=tuple(
+                        payload.get("unreferenced_symbols") or ()
+                    ),
+                )
+            )
         elif surface == "review":
             findings = tuple(
                 ReviewFinding(
@@ -957,9 +530,12 @@ def guidance_from_attempts(
                 for item in (payload.get("findings") or [])
                 if isinstance(item, dict)
             )
-            ledger = ledger.with_review(ReviewGuidance(
-                subject_digest=str(payload.get("subject_digest") or ""),
-                findings=findings))
+            ledger = ledger.with_review(
+                ReviewGuidance(
+                    subject_digest=str(payload.get("subject_digest") or ""),
+                    findings=findings,
+                )
+            )
         else:
             continue
         ledgers[key] = ledger
@@ -968,7 +544,10 @@ def guidance_from_attempts(
 
 # ── §7.5 launcher budgets — credential is the zero-retry exception ──────────
 
-def launcher_retry_budget(cfg: SchedulerConfig, failure: Optional[LauncherFailure]) -> int:
+
+def launcher_retry_budget(
+    cfg: SchedulerConfig, failure: Optional[LauncherFailure]
+) -> int:
     """LAUNCHER_TRANSIENT's budget, sized from the member (§7.5).
 
     Two members spend nothing. CREDENTIAL's zero is §7.5's own entry, the one
@@ -1031,6 +610,7 @@ def launcher_retry_budget(cfg: SchedulerConfig, failure: Optional[LauncherFailur
 # ledger — the same scoping rule §1.1 item 4 applies to evidence chains, so a
 # new surface extends the structure rather than borrowing another's slot.
 
+
 class AcceptanceSurface(str, Enum):
     """The independent predicates that can reject an attempt and recycle it.
 
@@ -1067,6 +647,7 @@ class ReviewFinding:
     object_id: str
     message: str
     blocking: bool
+    rationale: str = ""
 
 
 @dataclass(frozen=True)
@@ -1101,13 +682,13 @@ class GuidanceLedger:
 
     def with_verification(self, guidance: VerificationGuidance) -> "GuidanceLedger":
         return GuidanceLedger(
-            verification=self.verification + (guidance,),
-            review=self.review)
+            verification=self.verification + (guidance,), review=self.review
+        )
 
     def with_review(self, guidance: ReviewGuidance) -> "GuidanceLedger":
         return GuidanceLedger(
-            verification=self.verification,
-            review=self.review + (guidance,))
+            verification=self.verification, review=self.review + (guidance,)
+        )
 
     @property
     def empty(self) -> bool:
@@ -1131,7 +712,8 @@ def verification_guidance(detail: Optional[dict]) -> VerificationGuidance:
         reason=str(reason),
         offending_paths=tuple(detail.get("offending_paths") or ()),
         failed_clause=detail.get("clause"),
-        unreferenced_symbols=tuple(detail.get("unreferenced_symbols") or ()))
+        unreferenced_symbols=tuple(detail.get("unreferenced_symbols") or ()),
+    )
 
 
 def review_guidance(review: object) -> ReviewGuidance:
@@ -1144,16 +726,72 @@ def review_guidance(review: object) -> ReviewGuidance:
     """
     findings: List[ReviewFinding] = []
     for cell in getattr(review, "findings", ()) or ():
-        findings.append(ReviewFinding(
-            check_id=cell.check_id, object_id=cell.object_id,
-            message=cell.message.strip(), blocking=True))
+        findings.append(
+            ReviewFinding(
+                check_id=cell.check_id,
+                object_id=cell.object_id,
+                message=cell.message.strip(),
+                blocking=True,
+                rationale=str(
+                    getattr(cell, "grade_rationale", "")
+                    or getattr(cell, "rationale", "")
+                ).strip(),
+            )
+        )
     for cell in getattr(review, "advisories", ()) or ():
-        findings.append(ReviewFinding(
-            check_id=cell.check_id, object_id=cell.object_id,
-            message=cell.message.strip(), blocking=False))
+        findings.append(
+            ReviewFinding(
+                check_id=cell.check_id,
+                object_id=cell.object_id,
+                message=cell.message.strip(),
+                blocking=False,
+                rationale=str(
+                    getattr(cell, "grade_rationale", "")
+                    or getattr(cell, "rationale", "")
+                ).strip(),
+            )
+        )
     return ReviewGuidance(
-        subject_digest=getattr(review, "subject_digest", ""),
-        findings=tuple(findings))
+        subject_digest=getattr(review, "subject_digest", ""), findings=tuple(findings)
+    )
+
+
+def guidance_from_lane_history(
+    spends: Iterable[LaneRetrySpend], reviews: Iterable[CandidateReview]
+) -> GuidanceLedger:
+    """Rebuild standing constraints from the persistent correction ledgers.
+
+    ``lane_retry_spend`` is the correction loop's canonical history.  A
+    retained builder can fail verification several times without minting new
+    attempt rows, so ``guidance_from_attempts`` cannot represent that history.
+    Rejected candidate findings already live in ``candidate_reviews`` and are
+    replayed beside the semantic spend details.  Ordering is stable within
+    each acceptance surface; ``render_guidance`` deliberately renders the two
+    surfaces separately.
+    """
+    ledger = GuidanceLedger()
+    for spend in sorted(spends, key=lambda item: item.cycle_seq):
+        if spend.retry_class is LaneRetryClass.SEMANTIC:
+            ledger = ledger.with_verification(verification_guidance(dict(spend.detail)))
+    for review in reviews:
+        if review.verdict is not ReviewVerdict.REJECTED:
+            continue
+        findings = tuple(
+            ReviewFinding(
+                check_id=str(item.get("check_id") or ""),
+                object_id=str(item.get("object_id") or ""),
+                message=str(item.get("message") or ""),
+                blocking=bool(item.get("blocking", True)),
+                rationale=str(
+                    item.get("grade_rationale") or item.get("rationale") or ""
+                ),
+            )
+            for item in review.findings
+        )
+        ledger = ledger.with_review(
+            ReviewGuidance(subject_digest=review.candidate_sha, findings=findings)
+        )
+    return ledger
 
 
 #: Rendering budget for the whole guidance block, in characters. B13's lesson
@@ -1166,14 +804,16 @@ GUIDANCE_CHAR_BUDGET = 12_000
 
 _TRUNCATION_MARKER = (
     "  [guidance truncated to fit the prompt budget; every constraint named "
-    "above still binds in full]")
+    "above still binds in full]"
+)
 
 #: Written in place of the entries an accumulating ledger could not afford.
 #: A surface's history is dropped oldest-first, so what this marker replaces
 #: is always older than what survives it.
 _HISTORY_MARKER = (
     "  [earlier findings from this surface dropped to fit the prompt budget; "
-    "the entries below are the most recent]")
+    "the entries below are the most recent]"
+)
 
 
 #: How many offending paths the retry prompt names individually.
@@ -1204,12 +844,13 @@ def _offending_path_lines(paths: Sequence[str]) -> List[str]:
     """
     total = len(paths)
     shown = list(paths[:OFFENDING_PATH_SAMPLE])
-    lines = ["Paths written outside this node's declared outputs "
-             f"({total} in total):"]
+    lines = [f"Paths written outside this node's declared outputs ({total} in total):"]
     lines.extend("  " + path for path in shown)
     if total > len(shown):
-        lines.append(f"  ... and {total - len(shown)} more, elided here; the "
-                     "full list is recorded in this attempt's failure detail")
+        lines.append(
+            f"  ... and {total - len(shown)} more, elided here; the "
+            "full list is recorded in this attempt's failure detail"
+        )
     return lines
 
 
@@ -1222,35 +863,43 @@ def _unreferenced_symbol_lines(symbols: Sequence[str]) -> List[str]:
     of thirty deletes twenty, ships again, and spends another attempt on the
     ten the prompt elided.
     """
-    lines = [f"Symbols this node defined that nothing references "
-             f"({len(symbols)} in total). Each must be removed, or given a "
-             f"caller that a test exercises:"]
+    lines = [
+        f"Symbols this node defined that nothing references "
+        f"({len(symbols)} in total). Each must be removed, or given a "
+        f"caller that a test exercises:"
+    ]
     lines.extend("  " + symbol for symbol in symbols)
     return lines
 
 
 def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
-    lines = ["Verification (§8.3):",
-             "A prior attempt for this node did not verify."
-             if g.failed_clause is None else
-             "A prior attempt for this node did not verify "
-             f"(clause {g.failed_clause})."]
+    lines = [
+        "Verification (§8.3):",
+        "A prior attempt for this node did not verify."
+        if g.failed_clause is None
+        else "A prior attempt for this node did not verify "
+        f"(clause {g.failed_clause}).",
+    ]
     if g.reason:
         lines.append(g.reason)
     if g.offending_paths:
         lines.extend(_offending_path_lines(g.offending_paths))
     if g.unreferenced_symbols:
         lines.extend(_unreferenced_symbol_lines(g.unreferenced_symbols))
-    lines.append("Declared outputs: "
-                 + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)"))
+    lines.append(
+        "Declared outputs: "
+        + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)")
+    )
     return lines
 
 
 def _review_lines(g: ReviewGuidance) -> List[str]:
-    lines = ["Code review:",
-             "A prior attempt for this node passed its gate but was rejected "
-             "by code review. The gate going green is not the bar; the "
-             "findings below must be resolved and the gate kept green."]
+    lines = [
+        "Code review:",
+        "A prior attempt for this node passed its gate but was rejected "
+        "by code review. The gate going green is not the bar; the "
+        "findings below must be resolved and the gate kept green.",
+    ]
     blocking = [f for f in g.findings if f.blocking]
     advisory = [f for f in g.findings if not f.blocking]
     if blocking:
@@ -1258,11 +907,15 @@ def _review_lines(g: ReviewGuidance) -> List[str]:
         for f in blocking:
             lines.append(f"  [{f.object_id}] {f.check_id}")
             lines.append(f"    {f.message}")
+            if f.rationale:
+                lines.append(f"    Rationale: {f.rationale}")
     if advisory:
         lines.append("Advisory findings — address if you agree:")
         for f in advisory:
             lines.append(f"  [{f.object_id}] {f.check_id}")
             lines.append(f"    {f.message}")
+            if f.rationale:
+                lines.append(f"    Rationale: {f.rationale}")
     return lines
 
 
@@ -1273,6 +926,7 @@ def _fit(lines: List[str], share: int) -> List[str]:
     first line (the surface header) always survives, so a surface is never
     silently absent from the prompt.
     """
+
     def size(ls: List[str]) -> int:
         return sum(len(l) + 1 for l in ls)
 
@@ -1305,6 +959,7 @@ def _fit_surface(blocks: List[List[str]], share: int) -> List[str]:
     when a single entry still overflows does `_fit` truncate within it,
     which is the pre-history behaviour and keeps the surface's header.
     """
+
     def size(lines: List[str]) -> int:
         return sum(len(l) + 1 for l in lines)
 
@@ -1334,8 +989,8 @@ def _fit_surface(blocks: List[List[str]], share: int) -> List[str]:
 #: can read the diff, and because a named commit is checkable — a prompt that
 #: said "your previous work is here" without saying which commit would be a
 #: claim the agent could not verify. Nothing transitions on any of this
-#: (§10.1/§1.2): every lifecycle decision about the repair was already taken by
-#: `decide_repair` over typed rows before this text was rendered.
+#: (§10.1/§1.2): the lifecycle store already proved the candidate, review, and
+#: handoff rows before the scheduler constructed this basis.
 def _repair_lines(basis: "RepairBasis") -> List[str]:
     return [
         "REPAIR, NOT REIMPLEMENTATION.",
@@ -1357,9 +1012,12 @@ def _repair_lines(basis: "RepairBasis") -> List[str]:
     ]
 
 
-def render_guidance(node: object, ledger: Optional[GuidanceLedger],
-                    char_budget: int = GUIDANCE_CHAR_BUDGET,
-                    repair: Optional["RepairBasis"] = None) -> Optional[str]:
+def render_guidance(
+    node: object,
+    ledger: Optional[GuidanceLedger],
+    char_budget: int = GUIDANCE_CHAR_BUDGET,
+    repair: Optional["RepairBasis"] = None,
+) -> Optional[str]:
     """Every surface's standing constraints, rendered for the retry prompt.
 
     This string is the one place the ledger is ever read. It mutates the
@@ -1373,30 +1031,32 @@ def render_guidance(node: object, ledger: Optional[GuidanceLedger],
     and marks that it did, so history is what gets dropped under pressure and
     a whole surface never silently disappears (B13).
 
-    `repair` is the typed basis `decide_repair` admitted, or `None` for the
-    ordinary fresh-base retry. It changes the preamble and nothing else: the
-    findings below are the same findings either way, and the repair preamble
-    is what tells the agent they are about code it is looking at rather than
-    code it is about to write. It renders **before** the budget is divided
-    among the surfaces and is never truncated, because a repair prompt whose
-    repair instruction was elided is an implement prompt.
+    `repair` is the typed basis admitted from the durable candidate and
+    handoff ledgers, or `None` for an ordinary fresh-base retry. It changes
+    the preamble and nothing else: the findings below are the same findings
+    either way, and the repair preamble tells the agent that the code already
+    exists in its retained tree rather than waiting to be implemented.
+    It renders **before** the budget is divided among the surfaces and is never
+    truncated, because a repair prompt whose repair instruction was elided is
+    an implement prompt.
     """
     if ledger is None or ledger.empty:
         return None
     sections: List[List[List[str]]] = []
     if ledger.verification:
-        sections.append([_verification_lines(node, item)
-                         for item in ledger.verification])
+        sections.append(
+            [_verification_lines(node, item) for item in ledger.verification]
+        )
     if ledger.review:
         sections.append([_review_lines(item) for item in ledger.review])
     preamble = [
         "Every constraint below is binding at the same time. Earlier attempts "
         "were rejected for fixing one surface while regressing another; a "
-        "constraint a prior attempt already satisfied still binds."]
+        "constraint a prior attempt already satisfied still binds."
+    ]
     if repair is not None:
         preamble = _repair_lines(repair) + [""] + preamble
-    share = max(0, (char_budget - sum(len(l) + 1 for l in preamble))
-                ) // len(sections)
+    share = max(0, (char_budget - sum(len(l) + 1 for l in preamble))) // len(sections)
     rendered: List[str] = list(preamble)
     for section in sections:
         rendered.append("")
@@ -1406,8 +1066,9 @@ def render_guidance(node: object, ledger: Optional[GuidanceLedger],
 
 # ── §7.5 git results: only the documented not-found exit code is a fact ─────
 
+
 class GitResult(str, Enum):
-    """"No report can ever be semantic" applied to git rather than to agents:
+    """ "No report can ever be semantic" applied to git rather than to agents:
     only git's own documented not-found exit code means the object is absent.
     Every other nonzero exit is ENVIRONMENTAL, never a fact about the
     repository."""
@@ -1483,16 +1144,20 @@ class _OutputComparisonVisitor(ast.NodeVisitor):
             for op in node.ops:
                 if isinstance(op, _STDIO_COMPARISON_OPS):
                     self.violations.append(
-                        (node.lineno, "string/in comparison against process output"))
+                        (node.lineno, "string/in comparison against process output")
+                    )
                     break
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        if (isinstance(node.func, ast.Attribute)
-                and node.func.attr in _STDIO_COMPARISON_METHODS
-                and _looks_like_output(node.func.value)):
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in _STDIO_COMPARISON_METHODS
+            and _looks_like_output(node.func.value)
+        ):
             self.violations.append(
-                (node.lineno, f".{node.func.attr}() against process output"))
+                (node.lineno, f".{node.func.attr}() against process output")
+            )
         self.generic_visit(node)
 
 
@@ -1528,14 +1193,14 @@ def find_output_content_comparisons(source: str) -> List[Tuple[int, str]]:
 
 #: A small, exact violation of the rule above: a classifier reading stderr
 #: text. The detector must be proven to catch this, or it proves nothing.
-PLANTED_OUTPUT_COMPARISON_FIXTURE = '''
+PLANTED_OUTPUT_COMPARISON_FIXTURE = """
 def classify(exc, stderr):
     if "timeout" in stderr:
         return "ENVIRONMENTAL"
     if stderr.startswith("fatal:"):
         return "ENVIRONMENTAL"
     return "SEMANTIC"
-'''
+"""
 
 
 # ── §7.5 AST detector #2: no unclassified git failure is a repository fact ──
@@ -1546,10 +1211,13 @@ _ABSENCE_MARKERS = ("absent", "not_found", "notfound", "missing")
 def _mentions_absence(body: List[ast.stmt]) -> bool:
     for stmt in body:
         for sub in ast.walk(stmt):
-            if isinstance(sub, ast.Name) and any(m in sub.id.lower() for m in _ABSENCE_MARKERS):
+            if isinstance(sub, ast.Name) and any(
+                m in sub.id.lower() for m in _ABSENCE_MARKERS
+            ):
                 return True
             if isinstance(sub, ast.Attribute) and any(
-                    m in sub.attr.lower() for m in _ABSENCE_MARKERS):
+                m in sub.attr.lower() for m in _ABSENCE_MARKERS
+            ):
                 return True
     return False
 
@@ -1557,8 +1225,11 @@ def _mentions_absence(body: List[ast.stmt]) -> bool:
 def _gated_by_equality(test: ast.expr) -> bool:
     """Whether an `if` test is a single `==` comparison — the only shape
     that can legitimately gate a conclusion of absence (§7.5)."""
-    return (isinstance(test, ast.Compare) and len(test.ops) == 1
-           and isinstance(test.ops[0], ast.Eq))
+    return (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+    )
 
 
 class _GitAbsenceVisitor(ast.NodeVisitor):
@@ -1574,8 +1245,11 @@ class _GitAbsenceVisitor(ast.NodeVisitor):
     def visit_If(self, node: ast.If) -> None:
         if _mentions_absence(node.body) and not _gated_by_equality(node.test):
             self.violations.append(
-                (node.lineno,
-                 "absence concluded without an equality-gated not-found check"))
+                (
+                    node.lineno,
+                    "absence concluded without an equality-gated not-found check",
+                )
+            )
         self.generic_visit(node)
 
 
@@ -1589,9 +1263,9 @@ def find_ungated_git_absence(source: str) -> List[Tuple[int, str]]:
 
 
 #: A small, exact violation: treating any nonzero exit as absence.
-PLANTED_GIT_ABSENCE_FIXTURE = '''
+PLANTED_GIT_ABSENCE_FIXTURE = """
 def check(exit_code):
     if exit_code != 0:
         return GitResult.ABSENT
     return GitResult.PRESENT
-'''
+"""

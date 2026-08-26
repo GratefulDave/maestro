@@ -13,6 +13,7 @@ its reason.
 
 Run with: PYTHONPATH=. pytest tests/test_ingress_projection_totality.py -q
 """
+
 from __future__ import annotations
 
 import json
@@ -41,46 +42,58 @@ def _ir() -> dict:
         "plan_id": "phase-1",
         "title": "Phase 1 freeze",
         "plan_kind": "brownfield",
-        "source_artifacts": [{
-            "source_id": "src-readme",
-            "path": "README.md",
-            "sha256": "a" * 64,
-            "required": True,
-        }],
-        "requirements": [{
-            "requirement_id": "req-freeze",
-            "text": "Freeze the writers behind a greeting module.",
-            "surface": [
-                {"path": "src/greeting.py", "mutation": "written"},
-                {"path": "README.md", "mutation": "unmodified"},
-            ],
-            "effects": [],
-        }],
-        "lanes": [{
-            "lane_id": "lane-freeze",
-            "title": "Freeze writers",
-            "execution_context": ".",
-            "requirement_ids": ["req-freeze"],
-            "depends_on": [],
-            "verifier_ids": ["verify-freeze"],
-        }],
-        "verifiers": [{
-            "verifier_id": "verify-freeze",
-            "lane_ids": ["lane-freeze"],
-            "source_ids": ["src-readme"],
-            "command": "python3 -m pytest tests/test_existing.py",
-            "min_executed": 1,
-        }],
-        "extensions": {"maestro": {
-            "repo": "example",
-            "outputs": {"lane-freeze": ["src/greeting.py"]},
-            "prohibited_effects": [],
-            "integration_branch": "main",
-            "integration_gate": {
-                "runner": "pytest", "argv": ["tests"], "cwd": ".",
-                "min_cases": 1,
-            },
-        }},
+        "source_artifacts": [
+            {
+                "source_id": "src-readme",
+                "path": "README.md",
+                "sha256": "a" * 64,
+                "required": True,
+            }
+        ],
+        "requirements": [
+            {
+                "requirement_id": "req-freeze",
+                "text": "Freeze the writers behind a greeting module.",
+                "surface": [
+                    {"path": "src/greeting.py", "mutation": "written"},
+                    {"path": "README.md", "mutation": "unmodified"},
+                ],
+                "effects": [],
+            }
+        ],
+        "lanes": [
+            {
+                "lane_id": "lane-freeze",
+                "title": "Freeze writers",
+                "execution_context": ".",
+                "requirement_ids": ["req-freeze"],
+                "depends_on": [],
+                "verifier_ids": ["verify-freeze"],
+            }
+        ],
+        "verifiers": [
+            {
+                "verifier_id": "verify-freeze",
+                "lane_ids": ["lane-freeze"],
+                "source_ids": ["src-readme"],
+                "command": "python3 -m pytest tests/test_existing.py",
+                "min_executed": 1,
+            }
+        ],
+        "extensions": {
+            "maestro": {
+                "repo": "example",
+                "outputs": {"lane-freeze": ["src/greeting.py"]},
+                "prohibited_effects": [],
+                "integration_branch": "main",
+                "integration_gate": {
+                    "runner": "pytest",
+                    "argv": ["tests"],
+                    "cwd": ".",
+                    "min_cases": 1,
+                },
+            }
+        },
     }
 
 
@@ -110,12 +123,14 @@ class IngressProjectionTotalityTest(IngressFixture):
         node = self.node()
         self.assertEqual(node["node_id"], "lane-freeze")
         self.assertEqual(node["reads"], ["src-readme"])
-        self.assertEqual(node["kind"], pci._EMITTED_NODE_KIND)
+        self.assertEqual(node["kind"], pci._LANE_KIND_TO_NODE_KIND["build"])
 
     def test_a_newly_declared_lane_field_with_no_home_raises(self):
         """The measured case: a field added later is refused, not dropped."""
+
         def mutate(ir: dict) -> None:
             ir["lanes"][0]["field_added_later"] = "unprojected"
+
         with self.assertRaises(pci.IngressProjectionIncomplete) as caught:
             self.project(mutate)
         self.assertIn("field_added_later", str(caught.exception))
@@ -124,6 +139,7 @@ class IngressProjectionTotalityTest(IngressFixture):
     def test_a_newly_declared_requirement_field_with_no_home_raises(self):
         def mutate(ir: dict) -> None:
             ir["requirements"][0]["contract_field_added_later"] = "x"
+
         with self.assertRaises(pci.IngressProjectionIncomplete) as caught:
             self.project(mutate)
         self.assertIn("contract_field_added_later", str(caught.exception))
@@ -132,6 +148,7 @@ class IngressProjectionTotalityTest(IngressFixture):
     def test_a_newly_declared_verifier_field_with_no_home_raises(self):
         def mutate(ir: dict) -> None:
             ir["verifiers"][0]["threshold_added_later"] = 3
+
         with self.assertRaises(pci.IngressProjectionIncomplete) as caught:
             self.project(mutate)
         self.assertIn("threshold_added_later", str(caught.exception))
@@ -140,11 +157,14 @@ class IngressProjectionTotalityTest(IngressFixture):
     def test_a_newly_declared_claim_field_with_no_home_raises(self):
         def mutate(ir: dict) -> None:
             ir["lanes"][0]["claim_ids"] = ["claim-freeze"]
-            ir["claims"] = [{
-                "claim_id": "claim-freeze",
-                "predicate": "exercises",
-                "field_added_later": "unprojected",
-            }]
+            ir["claims"] = [
+                {
+                    "claim_id": "claim-freeze",
+                    "predicate": "exercises",
+                    "field_added_later": "unprojected",
+                }
+            ]
+
         with self.assertRaises(pci.IngressProjectionIncomplete) as caught:
             self.project(mutate)
         self.assertIn("field_added_later", str(caught.exception))
@@ -158,28 +178,30 @@ class IngressProjectionTotalityTest(IngressFixture):
         wrong["reads"] = []
         with self.assertRaises(pci.IngressProjectionIncomplete) as caught:
             pci._assert_ingress_projection_is_total(
-                ir, ir["lanes"][0], ir["verifiers"][0], wrong)
+                ir, ir["lanes"][0], ir["verifiers"][0], wrong
+            )
         self.assertIn("reads", str(caught.exception))
 
     def test_requirement_source_ids_reach_reads(self):
         """Instance 2: a requirement may not name evidence its node drops."""
+
         def mutate(ir: dict) -> None:
-            ir["source_artifacts"].append({
-                "source_id": "src-section-l-audit",
-                "path": "docs/AUDIT.md",
-                "sha256": "b" * 64,
-                "required": True,
-            })
+            ir["source_artifacts"].append(
+                {
+                    "source_id": "src-section-l-audit",
+                    "path": "docs/AUDIT.md",
+                    "sha256": "b" * 64,
+                    "required": True,
+                }
+            )
             ir["requirements"][0]["source_ids"] = ["src-section-l-audit"]
+
         node = self.node(mutate)
-        self.assertEqual(
-            node["reads"], ["src-readme", "src-section-l-audit"])
+        self.assertEqual(node["reads"], ["src-readme", "src-section-l-audit"])
 
     def test_requirement_source_ids_are_not_exempt(self):
-        self.assertNotIn(
-            "source_ids", pci._REQUIREMENT_PROJECTION_EXEMPT)
-        self.assertEqual(
-            pci._REQUIREMENT_PROJECTION["source_ids"], "reads")
+        self.assertNotIn("source_ids", pci._REQUIREMENT_PROJECTION_EXEMPT)
+        self.assertEqual(pci._REQUIREMENT_PROJECTION["source_ids"], "reads")
 
     def test_each_named_absence_keeps_its_exemption_and_reason(self):
         """Issue #96: a test that fails if any of the six loses its reason.
@@ -198,18 +220,24 @@ class IngressProjectionTotalityTest(IngressFixture):
 
     def test_every_exemption_states_a_reason(self):
         tables = (
-            (pci._LANE_PROJECTION, pci._LANE_PROJECTION_EXEMPT,
-             "_LANE_PROJECTION"),
-            (pci._REQUIREMENT_PROJECTION, pci._REQUIREMENT_PROJECTION_EXEMPT,
-             "_REQUIREMENT_PROJECTION"),
-            (pci._VERIFIER_PROJECTION, pci._VERIFIER_PROJECTION_EXEMPT,
-             "_VERIFIER_PROJECTION"),
-            (pci._CLAIM_PROJECTION, pci._CLAIM_PROJECTION_EXEMPT,
-             "_CLAIM_PROJECTION"),
-            (pci._SEAM_PROJECTION, pci._SEAM_PROJECTION_EXEMPT,
-             "_SEAM_PROJECTION"),
-            (pci._FIXTURE_PROJECTION, pci._FIXTURE_PROJECTION_EXEMPT,
-             "_FIXTURE_PROJECTION"),
+            (pci._LANE_PROJECTION, pci._LANE_PROJECTION_EXEMPT, "_LANE_PROJECTION"),
+            (
+                pci._REQUIREMENT_PROJECTION,
+                pci._REQUIREMENT_PROJECTION_EXEMPT,
+                "_REQUIREMENT_PROJECTION",
+            ),
+            (
+                pci._VERIFIER_PROJECTION,
+                pci._VERIFIER_PROJECTION_EXEMPT,
+                "_VERIFIER_PROJECTION",
+            ),
+            (pci._CLAIM_PROJECTION, pci._CLAIM_PROJECTION_EXEMPT, "_CLAIM_PROJECTION"),
+            (pci._SEAM_PROJECTION, pci._SEAM_PROJECTION_EXEMPT, "_SEAM_PROJECTION"),
+            (
+                pci._FIXTURE_PROJECTION,
+                pci._FIXTURE_PROJECTION_EXEMPT,
+                "_FIXTURE_PROJECTION",
+            ),
         )
         for projection, exempt, table in tables:
             pci._assert_table_reasons(projection, exempt, table)
@@ -217,26 +245,34 @@ class IngressProjectionTotalityTest(IngressFixture):
                 if dest is None:
                     self.assertTrue(exempt[name].strip(), table + "." + name)
 
-    def test_the_guard_covers_tests_nodes(self):
-        """PR #124 added TestsNode; it cannot hide from this guard."""
+    def test_the_guard_covers_every_supported_node_kind(self):
+        """Build and tests lanes project; deterministic code remains unbound."""
         self.assertIn(pm.TestsNode, pci._DESTINATION_NODE_TYPES)
         self.assertIn(pm.AgentNode, pci._DESTINATION_NODE_TYPES)
         self.assertIn(pm.CodeNode, pci._DESTINATION_NODE_TYPES)
-        self.assertEqual(pci._EMITTED_NODE_KIND, "agent")
-        self.assertIn("tests", pci._UNEMITTED_NODE_KINDS)
-        self.assertTrue(pci._UNEMITTED_NODE_KINDS["tests"].strip())
+        self.assertEqual(
+            pci._LANE_KIND_TO_NODE_KIND, {"build": "agent", "tests": "tests"}
+        )
+        self.assertNotIn("tests", pci._UNEMITTED_NODE_KINDS)
+        self.assertIn("code", pci._UNEMITTED_NODE_KINDS)
+        self.assertTrue(pci._UNEMITTED_NODE_KINDS["code"].strip())
         self.node()  # exercises the AgentNode/TestsNode field check
 
-    def test_an_emitted_tests_kind_raises_until_the_ir_can_split(self):
+    def test_an_emitted_tests_kind_is_accepted_but_code_still_raises(self):
         ir = _ir()
         draft = pci.project_draft(ir, self.repo)
-        wrong = dict(draft["nodes"][0])
-        wrong["kind"] = "tests"
+        node = dict(draft["nodes"][0])
+        node["kind"] = "tests"
+        pci._assert_ingress_projection_is_total(
+            ir, ir["lanes"][0], ir["verifiers"][0], node
+        )
+
+        node["kind"] = "code"
         with self.assertRaises(pci.IngressProjectionIncomplete) as caught:
             pci._assert_ingress_projection_is_total(
-                ir, ir["lanes"][0], ir["verifiers"][0], wrong)
-        self.assertIn("tests", str(caught.exception))
-        self.assertIn("_UNEMITTED_NODE_KINDS", str(caught.exception))
+                ir, ir["lanes"][0], ir["verifiers"][0], node
+            )
+        self.assertIn("code", str(caught.exception))
 
 
 class RecordedPlanCatalogTest(unittest.TestCase):
@@ -259,9 +295,12 @@ class RecordedPlanCatalogTest(unittest.TestCase):
             for index, item in enumerate(items):
                 extra = sorted(set(item) - set(projection))
                 self.assertEqual(
-                    extra, [],
+                    extra,
+                    [],
                     "{0}[{1}] declares {2} with no catalog entry".format(
-                        collection, index, extra))
+                        collection, index, extra
+                    ),
+                )
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ function node(node_id: string, needs: string[] = []): MaestroNode {
     needs,
     outputs: [],
     state: "PENDING",
+    lane_phase: null,
     attempt_no: 0,
     block_reason: null,
     cancel_cause: null,

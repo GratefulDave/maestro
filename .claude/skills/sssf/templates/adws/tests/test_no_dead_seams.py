@@ -51,6 +51,7 @@ search cannot.
 
 Run:  uv run adw_test.py -k dead_seams
 """
+
 from __future__ import annotations
 
 import ast
@@ -64,7 +65,6 @@ ADWS = Path(__file__).resolve().parent.parent
 #: legal. `DEFERRED:` marks a known defect with an owner and an audit row, not
 #: an accepted state — deleting the line is part of landing the fix.
 ALLOWED: Dict[str, str] = {
-
     # ── §1.2's detectors ────────────────────────────────────────────────────
     # Their job is to convict a planted violation from a test. Production never
     # calls a detector; a detector production called would be a linter.
@@ -78,114 +78,103 @@ ALLOWED: Dict[str, str] = {
     "enforcement.assert_verbs": "detector: proves the CLI exposes the verbs the docs claim",
     "enforcement.assert_workspace_verbs": "detector: the workspace half of the verb-surface proof",
     "maestro.parser_verbs": "detector: enumerates the argparse surface for the verb-surface proof",
-
     # ── the offline golden scenario's fake adapter (§13.1) ──────────────────
     "launcher.complete": "FakeLauncher, the golden scenario's test double",
-
     # ── property tables and derived accessors ───────────────────────────────
     # A named view over state production already maintains, existing so a test
     # can state a property about it. Nothing branches on these in production,
     # so nothing is unreachable behind them.
     "scheduler_types.exits_for": "§11.3 property table: every block_reason "
-                                 "admits an exit, proven from tests",
+    "admits an exit, proven from tests",
     "scheduler_types.pane_limit": "§7.2 identity — concurrency IS the pane "
-                                  "limit; production enforces it through "
-                                  "config.concurrency (scheduler.py:460, :503) "
-                                  "and the test asserts the two agree",
+    "limit; production enforces it through "
+    "config.concurrency (scheduler.py:460, :503) "
+    "and the test asserts the two agree",
     "finalization.graded_cells": "derived view of the matrix, asserted in tests",
-
-
     "finalization_window.opened_at_monotonic": "accessor over the private "
-                                               "_opened_at_monotonic that "
-                                               "production maintains",
+    "_opened_at_monotonic that "
+    "production maintains",
     "participant.active_participant_ids": "accessor over the runner's live "
-                                          "process map, asserted in tests",
-    "scheduler.integration_untested": "derived flag on RunReport, asserted "
-                                      "in tests",
+    "process map, asserted in tests",
+    "scheduler.integration_untested": "derived flag on RunReport, asserted in tests",
     "verification.asserts_repository_wide": "derived predicate over a gate "
-                                            "spec, asserted in tests",
+    "spec, asserted in tests",
     "worktree.is_empty": "derived predicate over InventoryDelta",
-
     # ── DEFERRED — audited, owner assigned, fix not yet landed ──────────────
     # Rows D1-D11 of the dead-seam audit. Each is a real instance of this
     # class; none is accepted as correct.
-
     # D6. Honestly unreachable rather than mistakenly unwired, and the one
     # entry here that is NOT deferred work: §8.3 states herdr's recorded
     # surface exposes no pid and no process group, and §16.3 item 17 makes
     # adopting one conditional on a receipt that does not exist. Deleting the
     # field would delete the seam that receipt is meant to fill.
     "LaunchHandle.process_group": "§8.3 + §16.3 item 17: no group exists to "
-                                  "record for an agent node until the quiesce "
-                                  "receipt lands. Deliberate, not deferred.",
-
+    "record for an agent node until the quiesce "
+    "receipt lands. Deliberate, not deferred.",
     # The sibling field, and a different reason: this one HAS a production
-    # writer -- `HerdrLauncher.launch` sets it once the prompt is submitted --
-    # but sets it through `object.__setattr__`, which this module's own header
-    # lists among the dynamic writers it cannot see. Allowlisting it here says
+    # writer -- `HerdrLauncher.launch` sets it after the agent starts (and,
+    # for direct Claude, after its separate prompt submission) -- but does so
+    # through `object.__setattr__`, which this module's own header lists among
+    # the dynamic writers it cannot see. Allowlisting it here says
     # "the sweep cannot see this write", not "there is no write", and the
     # difference is checked by a reader rather than asserted: the write is
     # driven end to end through the real launch path in
     # `test_agent_liveness_pid.py::LaunchRecordsTheLivenessPidTests`, which
     # fails if `launch` stops populating it or stops calling herdr at all.
     # It is NOT written as a constructor keyword, because the value cannot
-    # exist at construction time -- before the prompt is submitted the pane's
-    # foreground group is still its own shell -- and passing `liveness_pid=None`
-    # there to satisfy this sweep would be exactly the "field written only with
-    # its own default" that the header names as semantic deadness.
+    # exist at construction time -- before the agent starts, the pane's
+    # foreground group is still its own shell -- and passing
+    # `liveness_pid=None` there to satisfy this sweep would be exactly the
+    # "field written only with its own default" that the header names as
+    # semantic deadness.
     "LaunchHandle.liveness_pid": "written by HerdrLauncher.launch via "
-                                 "object.__setattr__, which this sweep "
-                                 "documents as invisible; covered by "
-                                 "test_agent_liveness_pid.py",
-
+    "object.__setattr__, which this sweep "
+    "documents as invisible; covered by "
+    "test_agent_liveness_pid.py",
     # D10. Does not reach the scheduler from maestro.py's SchedulerDeps
     # construction. (D11 stood here too and is fixed: a gate's threshold now
     # travels on `PlanNode.gate_min_cases`, the one integration gate's on
     # `SchedulerDeps.integration_min_cases`, and the per-run scalar this
     # registry named was deleted rather than wired.)
-
     # D3 / D4 / D5. retry_policy.py, under investigation; do not delete.
     "retry_policy.semantic_budget_exhausted": "DEFERRED D3: §7.5's ceiling, "
-                                              "duplicated by the scheduler's "
-                                              "inline check and off by one "
-                                              "from it. Which is correct is "
-                                              "an open ruling.",
+    "duplicated by the scheduler's "
+    "inline check and off by one "
+    "from it. Which is correct is "
+    "an open ruling.",
     "retry_policy.review_budget_exhausted": "DEFERRED D3: same shape as the "
-                                            "semantic ceiling above.",
+    "semantic ceiling above.",
     "retry_policy.semantic_attempts_at_base": "DEFERRED D4: §7.5's "
-                                              "(node_id, base_sha) "
-                                              "prompt-mutation scope. Its "
-                                              "companion predicate is wired "
-                                              "now; this half still is not.",
+    "(node_id, base_sha) "
+    "prompt-mutation scope. Its "
+    "companion predicate is wired "
+    "now; this half still is not.",
     "retry_policy.classify_git_exit": "DEFERRED D9: merge-path git exit "
-                                      "classification, no production caller.",
-
+    "classification, no production caller.",
     # D2 / D7 / D8 / D9. (D1, and the D4, D5, D7 and D9 rows that stood here,
     # were removed when the bidirectional check below convicted them: each had
     # acquired the production caller its entry said it lacked, and the entry
     # had gone on suppressing a check for a defect that no longer existed.)
     "lifecycle.audit_results": "DEFERRED D7: reader over §7.7's results "
-                               "table, which now has a production writer "
-                               "(scheduler._record_result) while this reader "
-                               "still has no production caller. Run status "
-                               "renders from the table; nothing audits it.",
+    "table, which now has a production writer "
+    "(scheduler._record_result) while this reader "
+    "still has no production caller. Run status "
+    "renders from the table; nothing audits it.",
     "scheduler_types.is_retryable": "DEFERRED D8: production decides "
-                                    "retryability from RetryClass, never from "
-                                    "BlockReason.",
-    "worktree.with_state": "DEFERRED D9: superseded NodeRecord constructor.",
+    "retryability from RetryClass, never from "
+    "BlockReason.",
     "scheduler_types.to_record": "DEFERRED D9: superseded PlanNode converter.",
     "route_receipts.load_public_key": "DEFERRED D9: production derives keys via "
-                                      "crypto.seed_to_public_key instead.",
-
+    "crypto.seed_to_public_key instead.",
     # Audited instances of this same class that sit on the deliver, workspace,
     # or diagnostics paths rather than on `run start`. Real, recorded, and
     # deferred to a pass that owns those paths.
     "coordinator_store.audit_transitions": "DEFERRED: workspace-path audit "
-                                           "reader, no production caller",
+    "reader, no production caller",
     "coordinator_store.list_runs": "DEFERRED: workspace-path query, no "
-                                   "production caller",
+    "production caller",
     "lifecycle.audit_transitions": "DEFERRED: diagnostics reader over the "
-                                   "transitions table, no production caller",
+    "transitions table, no production caller",
     # Its reason used to read "finalization-path". That path is gone --
     # `plan finalize` dispatches no reviewer -- and the function did not go
     # with it, because §6.5's fresh-session rule is about any reviewer and the
@@ -193,42 +182,38 @@ ALLOWED: Dict[str, str] = {
     # there, which is the deferred work; what changed is which caller it is
     # waiting for.
     "finalization_window.require_fresh_session_dir": "DEFERRED: the node "
-                                                     "reviewer's launch does "
-                                                     "not call it yet",
+    "reviewer's launch does "
+    "not call it yet",
     "publication.prepare": "DEFERRED: WorkspacePublisher.prepare, publication "
-                           "path, no production caller",
-
+    "path, no production caller",
     # Config keys whose only writer is a test, so the dataclass default is the
     # production value in every run. Not broken branches — constants wearing a
     # config key's clothes — but recorded so that "configurable" is not
     # mistaken for "configured".
     "ValidationConfig.review_payload_budget_bytes": "default is the production "
-                                                    "value; tests vary it to "
-                                                    "exercise the budget",
-
+    "value; tests vary it to "
+    "exercise the budget",
     # The launcher-classification lane's typed failure signal. Its writers land
     # with that lane; `launcher_failure` itself is already wired.
     "FailureSignal.binary_resolved": "DEFERRED: launcher-classification lane",
     "FailureSignal.process_started": "DEFERRED: launcher-classification lane",
     "FailureSignal.code_effect": "DEFERRED: launcher-classification lane",
     "CodeEffect.exit_zero": "DEFERRED: launcher-classification lane",
-
-
     # Constructor slots whose every production call site is `lambda ...: None`.
     # The field check cannot see these: the lambda *is* a writer. Naming them
     # here is the point of #99 — a deliberate or deferred no-op must be stated
     # rather than look wired. The `maestro.py` call site is left for a follow-up
     # because that file is partly owned by a concurrent lane.
     "FinalizationWindow.record_reviewer_session": "DEFERRED #99: production "
-                                                  "constructor in maestro.py:"
-                                                  "_code_review_runner still "
-                                                  "passes lambda _s: None; "
-                                                  "this lane names the seam "
-                                                  "rather than colliding on "
-                                                  "maestro.py",
+    "constructor in maestro.py:"
+    "_code_review_runner still "
+    "passes lambda _s: None; "
+    "this lane names the seam "
+    "rather than colliding on "
+    "maestro.py",
     "RunBackstop.on_stuck": "DEFERRED: production constructor in scheduler.py "
-                            "passes lambda diagnostic: None; watchdog.py is "
-                            "owned by a concurrent lane",
+    "passes lambda diagnostic: None; watchdog.py is "
+    "owned by a concurrent lane",
 }
 
 
@@ -259,8 +244,11 @@ def _has_default_factory(stmt: ast.AnnAssign) -> bool:
 def _is_dataclass(node: ast.ClassDef) -> bool:
     for dec in node.decorator_list:
         target = dec.func if isinstance(dec, ast.Call) else dec
-        name = (target.attr if isinstance(target, ast.Attribute)
-                else getattr(target, "id", ""))
+        name = (
+            target.attr
+            if isinstance(target, ast.Attribute)
+            else getattr(target, "id", "")
+        )
         if name == "dataclass":
             return True
     return False
@@ -271,6 +259,7 @@ def _callee_name(node: ast.Call) -> Optional[str]:
     if isinstance(func, ast.Attribute):
         return func.attr
     return getattr(func, "id", None)
+
 
 def _is_noop_lambda(node: ast.AST) -> bool:
     """`lambda ...: None` — the writer that is not a writer (#99).
@@ -298,9 +287,9 @@ def _noop_lambda_offenders(prod: "_Index") -> List[str]:
                 f"{key} is passed a no-op lambda at every production call "
                 f"site {locs[:3]}; the seam reads as wired and records "
                 "nothing. Wire a real callable, delete the parameter, or "
-                "add it to ALLOWED with the reason the no-op is stated.")
+                "add it to ALLOWED with the reason the no-op is stated."
+            )
     return offenders
-
 
 
 class _Index:
@@ -340,8 +329,10 @@ class _Index:
                     fields = self.fields.setdefault(node.name, {})
                     order: List[str] = []
                     for stmt in node.body:
-                        if not (isinstance(stmt, ast.AnnAssign)
-                                and isinstance(stmt.target, ast.Name)):
+                        if not (
+                            isinstance(stmt, ast.AnnAssign)
+                            and isinstance(stmt.target, ast.Name)
+                        ):
                             continue
                         order.append(stmt.target.id)
                         if _has_default_factory(stmt):
@@ -349,20 +340,24 @@ class _Index:
                         fields[stmt.target.id] = f"{path.name}:{stmt.lineno}"
                     self.field_order[node.name] = order
                 init = next(
-                    (stmt for stmt in node.body
-                     if isinstance(stmt, (ast.FunctionDef,
-                                          ast.AsyncFunctionDef))
-                     and stmt.name == "__init__"),
-                    None)
+                    (
+                        stmt
+                        for stmt in node.body
+                        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and stmt.name == "__init__"
+                    ),
+                    None,
+                )
                 if init is not None:
                     self.constructors[node.name] = [
-                        arg.arg for arg in init.args.args if arg.arg != "self"]
+                        arg.arg for arg in init.args.args if arg.arg != "self"
+                    ]
                 elif node.name in self.field_order:
-                    self.constructors[node.name] = list(
-                        self.field_order[node.name])
+                    self.constructors[node.name] = list(self.field_order[node.name])
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self.callables.setdefault(f"{module}.{node.name}",
-                                          f"{path.name}:{node.lineno}")
+                self.callables.setdefault(
+                    f"{module}.{node.name}", f"{path.name}:{node.lineno}"
+                )
 
     def _record_construction(self, owner: str, call: ast.Call, loc: str) -> None:
         order = self.field_order.get(owner)
@@ -377,18 +372,17 @@ class _Index:
                 # `Cls(**payload)` writes an unknowable set of fields.
                 self.splatted.add(owner)
 
-    def _record_constructor_args(self, owner: str, call: ast.Call,
-                                 loc: str) -> None:
+    def _record_constructor_args(self, owner: str, call: ast.Call, loc: str) -> None:
         params = self.constructors.get(owner)
         if not params:
             return
         for param, arg in zip(params, call.args):
-            self.constructor_args.setdefault((owner, param), []).append(
-                (loc, arg))
+            self.constructor_args.setdefault((owner, param), []).append((loc, arg))
         for kw in call.keywords:
             if kw.arg:
                 self.constructor_args.setdefault((owner, kw.arg), []).append(
-                    (loc, kw.value))
+                    (loc, kw.value)
+                )
 
     def use(self, path: Path, tree: ast.Module) -> None:
         # A classmethod builds its own class as `cls(...)`. Resolve that first,
@@ -399,8 +393,7 @@ class _Index:
                 continue
             loc = f"{path.name}:{{0}}"
             for inner in ast.walk(outer):
-                if not (isinstance(inner, ast.Call)
-                        and _callee_name(inner) == "cls"):
+                if not (isinstance(inner, ast.Call) and _callee_name(inner) == "cls"):
                     continue
                 site = loc.format(inner.lineno)
                 if outer.name in self.field_order:
@@ -411,8 +404,7 @@ class _Index:
         for node in ast.walk(tree):
             loc = f"{path.name}:{getattr(node, 'lineno', 0)}"
             if isinstance(node, ast.Attribute):
-                bucket = (self.writes if isinstance(node.ctx, ast.Store)
-                          else self.reads)
+                bucket = self.writes if isinstance(node.ctx, ast.Store) else self.reads
                 bucket.setdefault(node.attr, set()).add(loc)
                 self.refs.setdefault(node.attr, set()).add(loc)
             elif isinstance(node, ast.Name):
@@ -438,10 +430,10 @@ class _Index:
 
 def _build() -> Tuple[_Index, _Index]:
     prod, test = _Index(), _Index()
-    prod_trees = [(p, ast.parse(p.read_text(), filename=str(p)))
-                  for p in _production_files()]
-    test_trees = [(p, ast.parse(p.read_text(), filename=str(p)))
-                  for p in _test_files()]
+    prod_trees = [
+        (p, ast.parse(p.read_text(), filename=str(p))) for p in _production_files()
+    ]
+    test_trees = [(p, ast.parse(p.read_text(), filename=str(p))) for p in _test_files()]
     for path, tree in prod_trees:
         prod.define(path, tree)
     for path, tree in prod_trees:
@@ -454,14 +446,16 @@ def _build() -> Tuple[_Index, _Index]:
 
 
 class DeadSeamTest(unittest.TestCase):
-
     def test_the_tree_was_actually_found(self) -> None:
         """A mislocated or empty ADWS makes every check below pass vacuously,
         which is the one way this file could lie in the reassuring direction."""
         production = _production_files()
-        self.assertGreater(len(production), 40,
-                           f"only {len(production)} production files under "
-                           f"{ADWS} — the checks below would pass vacuously")
+        self.assertGreater(
+            len(production),
+            40,
+            f"only {len(production)} production files under "
+            f"{ADWS} — the checks below would pass vacuously",
+        )
         self.assertGreater(len(_test_files()), 20, "test files not found")
 
     def test_every_branched_field_has_a_production_writer(self) -> None:
@@ -475,26 +469,30 @@ class DeadSeamTest(unittest.TestCase):
                 if key in ALLOWED:
                     continue
                 if not prod.reads.get(field):
-                    continue      # unread is B15's problem, not this one
+                    continue  # unread is B15's problem, not this one
                 if cls in prod.splatted:
-                    continue      # `Cls(**payload)` writes we cannot see
+                    continue  # `Cls(**payload)` writes we cannot see
                 if prod.scoped_writes.get((cls, field)):
                     continue
                 if prod.writes.get(field):
-                    continue      # written through a callee we could not resolve
-                test_writes = (test.scoped_writes.get((cls, field), set())
-                               | test.writes.get(field, set()))
+                    continue  # written through a callee we could not resolve
+                test_writes = test.scoped_writes.get(
+                    (cls, field), set()
+                ) | test.writes.get(field, set())
                 offenders.append(
                     f"{key} ({where}) is read in production at "
                     f"{sorted(prod.reads[field])[:3]} and written nowhere in "
-                    f"production; {len(test_writes)} test writes")
+                    f"production; {len(test_writes)} test writes"
+                )
         self.assertEqual(
-            [], offenders,
+            [],
+            offenders,
             "a production reader with no production writer: the branch it "
             "guards can never be taken, so the behaviour behind it silently "
             "never happens. Wire a writer, delete the field and its branch "
             "together, or add it to ALLOWED with the reason it has none.\n"
-            + "\n".join(offenders))
+            + "\n".join(offenders),
+        )
 
     def test_every_callable_is_referenced_in_production(self) -> None:
         prod, test = _build()
@@ -507,28 +505,33 @@ class DeadSeamTest(unittest.TestCase):
             if refs:
                 continue
             if not test.refs.get(name):
-                continue      # referenced nowhere at all is a different check
+                continue  # referenced nowhere at all is a different check
             offenders.append(
                 f"{qualified} ({where}) has no production reference; "
-                f"{len(test.refs[name])} test references")
+                f"{len(test.refs[name])} test references"
+            )
         self.assertEqual(
-            [], offenders,
+            [],
+            offenders,
             "a callable exercised only by tests. Either production should call "
             "it, or it is dead and should go with its tests, or it is "
             "deliberately test-only and belongs in ALLOWED with a reason.\n"
-            + "\n".join(offenders))
+            + "\n".join(offenders),
+        )
 
     def test_no_constructor_parameter_is_only_fed_a_noop_lambda(self) -> None:
         """#99: a `lambda ...: None` is not a writer, even though it is a
         keyword argument the field check counts as one."""
         prod, _test = _build()
         self.assertEqual(
-            [], _noop_lambda_offenders(prod),
+            [],
+            _noop_lambda_offenders(prod),
             "a constructor parameter whose every production call site is a "
             "no-op lambda. The field check cannot see this — the lambda is "
             "the writer it counts. Wire a real callable, delete the "
             "parameter, or add it to ALLOWED with the reason the no-op is "
-            "stated.\n" + "\n".join(_noop_lambda_offenders(prod)))
+            "stated.\n" + "\n".join(_noop_lambda_offenders(prod)),
+        )
 
     def test_a_noop_lambda_writer_is_now_convicted_and_was_not(self) -> None:
         """§13.4 / §16.3: the extension convicts a planted slot the field
@@ -537,7 +540,8 @@ class DeadSeamTest(unittest.TestCase):
             "class Window:\n"
             "    def __init__(self, record_reviewer_session):\n"
             "        self._r = record_reviewer_session\n"
-            "Window(record_reviewer_session=lambda _s: None)\n")
+            "Window(record_reviewer_session=lambda _s: None)\n"
+        )
         idx = _Index()
         idx.define(Path("planted.py"), planted)
         idx.use(Path("planted.py"), planted)
@@ -545,12 +549,15 @@ class DeadSeamTest(unittest.TestCase):
         # it is silent — and even if the slot were a field, the lambda
         # would count as a write.
         self.assertNotIn("Window", idx.fields)
-        self.assertTrue(idx.writes.get("record_reviewer_session"),
-                        "the old check's write bucket saw the lambda")
+        self.assertTrue(
+            idx.writes.get("record_reviewer_session"),
+            "the old check's write bucket saw the lambda",
+        )
         offenders = _noop_lambda_offenders(idx)
         self.assertTrue(
             any("Window.record_reviewer_session" in row for row in offenders),
-            "planted no-op lambda was not convicted: " + repr(offenders))
+            "planted no-op lambda was not convicted: " + repr(offenders),
+        )
         # Control: a real callable at the same slot is not a dead seam.
         live = ast.parse(
             "class Window:\n"
@@ -558,12 +565,12 @@ class DeadSeamTest(unittest.TestCase):
             "        self._r = record_reviewer_session\n"
             "def record(session):\n"
             "    persist(session)\n"
-            "Window(record_reviewer_session=record)\n")
+            "Window(record_reviewer_session=record)\n"
+        )
         live_idx = _Index()
         live_idx.define(Path("live.py"), live)
         live_idx.use(Path("live.py"), live)
         self.assertEqual([], _noop_lambda_offenders(live_idx))
-
 
     def test_no_allowlist_entry_has_acquired_a_production_caller(self) -> None:
         """The allowlist read in one direction only, and that is how an entry
@@ -603,36 +610,41 @@ class DeadSeamTest(unittest.TestCase):
             if writes:
                 stale.append(
                     f"{key} is allowlisted as having no production writer, "
-                    f"but production writes it at {sorted(writes)[:3]}")
+                    f"but production writes it at {sorted(writes)[:3]}"
+                )
                 continue
             # A `module.callable` entry: it claims no production caller.
             where = prod.callables.get(key)
             if where is None:
                 continue
-            calls = {call for call in prod.calls.get(name, set())
-                     if call != where}
+            calls = {call for call in prod.calls.get(name, set()) if call != where}
             if calls:
                 stale.append(
                     f"{key} is allowlisted as having no production caller, "
-                    f"but production calls it at {sorted(calls)[:3]}")
+                    f"but production calls it at {sorted(calls)[:3]}"
+                )
         self.assertEqual(
-            [], stale,
+            [],
+            stale,
             "an allowlist entry that is no longer true. The symbol has "
             "acquired a production writer or caller, so the entry now "
             "suppresses a check for a defect that no longer exists — and "
             "anything written from that entry, in an audit row or an "
             "architecture register, went stale with it. Delete the entry.\n"
-            + "\n".join(stale))
+            + "\n".join(stale),
+        )
 
     def test_every_allowlist_entry_carries_a_reason(self) -> None:
         """An entry with an empty or placeholder reason is a suppression
         wearing the allowlist's clothes, which is the failure this file exists
         to prevent one level up."""
-        bad = [key for key, reason in ALLOWED.items()
-               if len(reason.strip()) < 12 or reason.strip().upper() in
-               {"TODO", "FIXME", "N/A", "UNKNOWN"}]
-        self.assertEqual([], bad,
-                         f"allowlist entries with no usable reason: {bad}")
+        bad = [
+            key
+            for key, reason in ALLOWED.items()
+            if len(reason.strip()) < 12
+            or reason.strip().upper() in {"TODO", "FIXME", "N/A", "UNKNOWN"}
+        ]
+        self.assertEqual([], bad, f"allowlist entries with no usable reason: {bad}")
 
 
 if __name__ == "__main__":

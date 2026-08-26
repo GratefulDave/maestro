@@ -96,7 +96,7 @@ code,
 .app-shell {
   display: grid;
   min-height: 100vh;
-  grid-template-columns: 244px minmax(0, 1fr);
+  grid-template-columns: 300px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -177,6 +177,158 @@ code,
 .nav-item-active {
   background: color-mix(in srgb, var(--color-accent) 15%, var(--color-panel));
   color: #cfe1ff;
+}
+
+.run-hierarchy {
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.workspace-nav-link {
+  display: block;
+  overflow: hidden;
+  margin: 0 4px 9px;
+  padding: 8px 7px;
+  color: var(--color-ink);
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-nav-link:hover {
+  color: #cfe1ff;
+}
+
+.lane-nav-list,
+.agent-nav-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lane-nav-list {
+  display: grid;
+  gap: 3px;
+}
+
+.lane-nav-list summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 7px;
+  border-radius: 7px;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.lane-nav-list summary::-webkit-details-marker {
+  display: none;
+}
+
+.lane-nav-list summary:hover {
+  background: var(--color-panel);
+  color: var(--color-ink);
+}
+
+.lane-nav-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hierarchy-state {
+  color: var(--color-faint);
+  font-size: 0.57rem;
+  letter-spacing: 0.04em;
+}
+
+.hierarchy-state-running,
+.hierarchy-state-building,
+.hierarchy-state-candidate_ready,
+.hierarchy-state-reviewing,
+.hierarchy-state-repair_handoff,
+.hierarchy-state-repairing,
+.hierarchy-state-waiting_for_new_candidate {
+  color: var(--color-accent);
+}
+
+.hierarchy-state-blocked,
+.hierarchy-state-cancelled {
+  color: var(--color-err);
+}
+
+.hierarchy-state-merged,
+.hierarchy-state-accepted,
+.hierarchy-state-verified {
+  color: var(--color-ok);
+}
+
+.agent-nav-list {
+  position: relative;
+  display: grid;
+  gap: 1px;
+  margin: 0 0 4px 15px;
+  padding-left: 12px;
+}
+
+.agent-nav-list::before {
+  position: absolute;
+  inset: 0 auto 5px 0;
+  width: 1px;
+  background: var(--color-border);
+  content: "";
+}
+
+.agent-nav-link {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+}
+
+.agent-nav-link:hover,
+.agent-nav-link-active {
+  background: var(--color-panel);
+  color: var(--color-ink);
+}
+
+.agent-nav-link small {
+  overflow: hidden;
+  max-width: 68px;
+  color: var(--color-faint);
+  font-size: 0.55rem;
+  text-overflow: ellipsis;
+}
+
+.agent-role {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-muted);
+}
+
+.agent-role-builder {
+  background: var(--color-accent);
+}
+
+.agent-role-tester {
+  background: var(--color-warn);
+}
+
+.agent-role-reviewer {
+  background: #a77bff;
 }
 
 .app-main {
@@ -717,6 +869,17 @@ code,
 
 .dag-node-running {
   border-color: var(--color-info) !important;
+}
+
+.dag-node-reviewing,
+.dag-node-candidate_ready,
+.dag-node-waiting_for_new_candidate {
+  border-color: var(--color-accent) !important;
+}
+
+.dag-node-repair_handoff,
+.dag-node-repairing {
+  border-color: var(--color-warn) !important;
 }
 
 .dag-node-in_review {

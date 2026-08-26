@@ -1,199 +1,173 @@
-"""Merged nodes that carried rejecting findings, rebuilt from the lifecycle ledger.
+"""Rejected candidate findings rebuilt from the authoritative review ledger.
 
-A run can declare ACCEPTED while every merged lane still holds BLOCKING
-review findings. Those findings already persist in two places:
-
-* ``attempts.extra_json.guidance.findings`` (via ``record_review_advisory``)
-* ``runs/<run_id>/review/<digest>/findings.json`` on disk
-
-After process exit the only reader was the in-process exit JSON. This
-module is the durable reader: it names every MERGED node whose merged
-attempt still carries a ``blocking`` finding, and it decides nothing.
-
-Nothing here fails an attempt, blocks a node, or stops a merge (§1.2,
-§19 M35). A lifecycle transition may depend only on a counted,
-re-derivable fact; a reviewer's prose may advise and may not adjudicate.
-The findings are made visible, not powerful.
+``candidate_reviews`` owns one immutable verdict per candidate SHA. A rejected
+verdict and its findings remain visible after repair; a later PASS authorizes
+only its own descendant candidate. Legacy review guidance on ``attempts`` is
+exposed separately as audit data and never participates in this projection.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from . import retry_policy as rp
-
-
-MERGED_NODE_STATE = "MERGED"
+from . import scheduler_types as st
 
 
 def _name(value: Any) -> Optional[str]:
-    """An enum member, a bare string, or nothing — as the stored string."""
     if value is None:
         return None
     return getattr(value, "value", value)
 
 
-def _extra(attempt: Any) -> Mapping[str, Any]:
-    extra = getattr(attempt, "extra", None)
-    return extra if isinstance(extra, Mapping) else {}
-
-
 @dataclass(frozen=True)
 class LocatedFinding:
-    """One rejecting finding, copied from the attempt row's guidance extra."""
+    """One finding preserved on a rejected candidate review."""
 
     check_id: str
     object_id: str
     message: str
-    blocking: bool = True
+    grade: str
+    scope: str
+    status: str
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "check_id": self.check_id,
             "object_id": self.object_id,
             "message": self.message,
-            "blocking": self.blocking,
+            "grade": self.grade,
+            "scope": self.scope,
+            "status": self.status,
         }
 
 
 @dataclass(frozen=True)
-class MergedNodeFindings:
-    """One MERGED node whose merged attempt still carries rejecting findings."""
+class CandidateFindings:
+    """One immutable rejected candidate and its signed review evidence."""
 
-    node_id: str
-    attempt_no: int
-    subject_digest: str
+    review_node_id: str
+    candidate_sha: str
+    review_digest: str
+    receipt_path: str
     findings: Tuple[LocatedFinding, ...]
 
     def as_dict(self) -> Dict[str, Any]:
         return {
-            "node_id": self.node_id,
-            "attempt_no": self.attempt_no,
-            "subject_digest": self.subject_digest,
+            "review_node_id": self.review_node_id,
+            "candidate_sha": self.candidate_sha,
+            "review_digest": self.review_digest,
+            "receipt_path": self.receipt_path,
             "findings": [finding.as_dict() for finding in self.findings],
         }
 
 
 @dataclass(frozen=True)
 class RunFindings:
-    """Every merged node of one run that carried a rejecting finding."""
+    """Every rejected candidate review retained by one run."""
 
     run_id: str
     declared_outcome: Optional[str]
-    nodes: Tuple[MergedNodeFindings, ...]
+    reviews: Tuple[CandidateFindings, ...]
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "run_id": self.run_id,
             "declared_outcome": self.declared_outcome,
-            "nodes": [node.as_dict() for node in self.nodes],
+            "reviews": [review.as_dict() for review in self.reviews],
         }
 
 
-def blocking_findings_from_extra(
-        extra: Optional[Mapping[str, Any]]) -> Tuple[LocatedFinding, ...]:
-    """The ``blocking`` findings stored on one attempt's guidance extra.
+def _located(raw: Mapping[str, Any]) -> LocatedFinding:
+    return LocatedFinding(
+        check_id=str(raw.get("check_id") or ""),
+        object_id=str(raw.get("object_id") or ""),
+        message=str(raw.get("message") or ""),
+        grade=str(raw.get("grade") or ""),
+        scope=str(raw.get("scope") or ""),
+        status=str(raw.get("status") or ""),
+    )
 
-    Advisories (``blocking`` false or absent) are not rejecting findings and
-    are not returned. A missing or non-review surface is empty, never an
-    error: this is a reader over rows that predate the key.
+
+def legacy_findings_from_extra(
+    extra: Optional[Mapping[str, Any]],
+) -> Tuple[LocatedFinding, ...]:
+    """Review-shaped attempt guidance for audit display only.
+
+    Older ledgers stored review output on ``attempts.extra_json``. Returning it
+    here keeps that historical row inspectable; candidate dispatch, merge,
+    retry, and run-level findings never read this function.
     """
     extra = extra or {}
     guidance = extra.get(rp.GUIDANCE_KEY)
-    if not isinstance(guidance, dict):
-        return ()
-    if guidance.get("surface") != "review":
+    if not isinstance(guidance, dict) or guidance.get("surface") != "review":
         return ()
     raw = guidance.get("findings")
     if not isinstance(raw, list):
         return ()
-    findings: List[LocatedFinding] = []
-    for item in raw:
-        if not isinstance(item, dict):
+    return tuple(_located(item) for item in raw if isinstance(item, dict))
+
+
+def run_findings(
+    run_id: str, reviews: Iterable[Any], *, declared_outcome: Optional[str] = None
+) -> RunFindings:
+    """Return every terminal REJECTED candidate from ``candidate_reviews``."""
+    found = []
+    for review in reviews:
+        if (
+            _name(getattr(review, "state", None))
+            != st.CandidateReviewState.COMPLETED.value
+        ):
             continue
-        if not item.get("blocking"):
+        if _name(getattr(review, "verdict", None)) != st.ReviewVerdict.REJECTED.value:
             continue
-        findings.append(LocatedFinding(
-            check_id=str(item.get("check_id") or ""),
-            object_id=str(item.get("object_id") or ""),
-            message=str(item.get("message") or ""),
-            blocking=True))
-    return tuple(findings)
-
-
-def subject_digest_from_extra(extra: Optional[Mapping[str, Any]]) -> str:
-    extra = extra or {}
-    guidance = extra.get(rp.GUIDANCE_KEY)
-    if isinstance(guidance, dict):
-        digest = guidance.get("subject_digest")
-        if digest:
-            return str(digest)
-    digest = extra.get("review_subject_digest")
-    return str(digest) if digest else ""
-
-
-def _attempts_by_node(attempts: Iterable[Any]) -> Dict[str, Dict[int, Any]]:
-    by_node: Dict[str, Dict[int, Any]] = {}
-    for attempt in attempts:
-        node_id = getattr(attempt, "node_id", None)
-        attempt_no = getattr(attempt, "attempt_no", None)
-        if not node_id or attempt_no is None:
-            continue
-        by_node.setdefault(str(node_id), {})[int(attempt_no)] = attempt
-    return by_node
-
-
-def run_findings(run_id: str, nodes: Iterable[Any], attempts: Iterable[Any],
-                 *, declared_outcome: Optional[str] = None) -> RunFindings:
-    """Every MERGED node whose merged attempt carries a rejecting finding.
-
-    The merged attempt is the one whose ``attempt_no`` matches the node's
-    current ``attempt_no`` — the attempt that actually merged, not an earlier
-    rejection that a later attempt repaired. A skip-merged node with no
-    review extra is absent, which is correct: there is nothing to surface.
-    """
-    by_node = _attempts_by_node(attempts)
-    found: List[MergedNodeFindings] = []
-    for node in nodes:
-        if _name(getattr(node, "state", None)) != MERGED_NODE_STATE:
-            continue
-        node_id = str(node.node_id)
-        attempt_no = int(getattr(node, "attempt_no", 0) or 0)
-        attempt = by_node.get(node_id, {}).get(attempt_no)
-        extra = _extra(attempt)
-        findings = blocking_findings_from_extra(extra)
-        if not findings:
-            continue
-        found.append(MergedNodeFindings(
-            node_id=node_id,
-            attempt_no=attempt_no,
-            subject_digest=subject_digest_from_extra(extra),
-            findings=findings))
-    found.sort(key=lambda item: item.node_id)
+        findings = tuple(
+            _located(item)
+            for item in getattr(review, "findings", ())
+            if isinstance(item, Mapping)
+        )
+        found.append(
+            CandidateFindings(
+                review_node_id=str(review.review_node_id),
+                candidate_sha=str(review.candidate_sha),
+                review_digest=str(review.review_digest or ""),
+                receipt_path=str(review.receipt_path or ""),
+                findings=findings,
+            )
+        )
+    found.sort(key=lambda item: (item.review_node_id, item.candidate_sha))
     return RunFindings(
-        run_id=run_id, declared_outcome=declared_outcome,
-        nodes=tuple(found))
+        run_id=run_id, declared_outcome=declared_outcome, reviews=tuple(found)
+    )
 
 
 def render(profile: RunFindings) -> str:
-    """The operator's view: the verdict, then every rejecting finding beside it."""
+    """Render rejected candidates without implying they were merged."""
     outcome = profile.declared_outcome or "(no declared outcome)"
     lines = ["{}  {}".format(profile.run_id, outcome)]
-    if not profile.nodes:
-        lines.append("  no merged node carried a rejecting finding")
+    if not profile.reviews:
+        lines.append("  no rejected candidate review carries findings")
         return "\n".join(lines)
-    count = len(profile.nodes)
-    lines.append("  {} merged node{} carried rejecting findings".format(
-        count, "" if count == 1 else "s"))
-    for node in profile.nodes:
-        lines.append("  {}  a{}  {} blocking".format(
-            node.node_id, node.attempt_no, len(node.findings)))
-        if node.subject_digest:
-            lines.append("    digest  {}".format(node.subject_digest))
-        for finding in node.findings:
-            lines.append("    {}  {}".format(
-                finding.check_id, finding.object_id))
+    count = len(profile.reviews)
+    lines.append(
+        "  {} rejected candidate review{}".format(count, "" if count == 1 else "s")
+    )
+    for review in profile.reviews:
+        lines.append(
+            "  {}  {}  {} finding{}".format(
+                review.review_node_id,
+                review.candidate_sha,
+                len(review.findings),
+                "" if len(review.findings) == 1 else "s",
+            )
+        )
+        if review.review_digest:
+            lines.append("    digest   {}".format(review.review_digest))
+        if review.receipt_path:
+            lines.append("    receipt  {}".format(review.receipt_path))
+        for finding in review.findings:
+            lines.append("    {}  {}".format(finding.check_id, finding.object_id))
             if finding.message:
                 lines.append("      {}".format(finding.message))
     return "\n".join(lines)

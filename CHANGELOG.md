@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Persistent candidate-review lifecycle replaces inline advisory review.**
+  Every reviewable build now projects one derived `build::review` DAG node.
+  The scheduler publishes immutable candidate SHAs, reviews each SHA exactly
+  once, and requires a matching PASS before merging that exact commit.
+  A rejection atomically records typed findings and one repair handoff, then
+  returns control to the retained builder session and worktree; the retained
+  reviewer waits for the descendant candidate in the same lane tab. Builder,
+  reviewer, and retry generations are durable and stale callbacks are audit
+  evidence only. Herdr now displays one workspace named for the persisted plan,
+  one tab per authored lane, and role/generation pane labels while runtime
+  identity remains in SQLite. Candidate reviews, handoffs, actor sessions,
+  per-class retry spends, and lane phase are queryable through status/history.
+  Terminal cleanup occurs only after merge, block, cancel, or explicit
+  liveness-proven abandonment.
 
 - **Architecture HTML brought level with the working-tree runtime.** Dark tokens
   were already correct. The diagrams were not: PlanV3/`TestsNode` were missing;

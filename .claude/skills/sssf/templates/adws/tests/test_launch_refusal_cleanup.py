@@ -22,6 +22,7 @@ it the first is indistinguishable from "always say False", which is the lie
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -35,8 +36,11 @@ from adw_modules import launcher as lch
 from adw_modules import retry_policy as rp
 from adw_modules import scheduler as sch
 from adw_modules import worktree as worktree_module
-from adw_modules.route_receipts import (AdmittedRouteSet, load_admitted_routes,
-                                        load_public_key)
+from adw_modules.route_receipts import (
+    AdmittedRouteSet,
+    load_admitted_routes,
+    load_public_key,
+)
 
 
 class _AnyRoute(AdmittedRouteSet):
@@ -70,9 +74,12 @@ class FakeHerdr:
         self.get_cwds = [str(worktree)]
         self.start_error = None
         self.prompt_error = None
+        self.prompt_envelope = None
         self.close_error = None
         self.closed = []
         self.revision = 1
+        self.agent_status = "idle"
+        self.advance_revision = True
 
     def __call__(self, *args, env=None, timeout=30.0):
         self.calls.append(list(args))
@@ -84,19 +91,39 @@ class FakeHerdr:
         if head == ("pane", "split"):
             if self.split_pane_id is None:
                 return {"result": {"pane": {}}}
-            return {"result": {"pane": {"pane_id": self.split_pane_id,
-                                        "cwd": str(self.worktree)}}}
+            return {
+                "result": {
+                    "pane": {"pane_id": self.split_pane_id, "cwd": str(self.worktree)}
+                }
+            }
         if head == ("pane", "get"):
-            index = min(len([c for c in self.calls if c[:2] == ["pane", "get"]]),
-                        len(self.get_cwds)) - 1
-            return {"result": {"pane": {"pane_id": self.split_pane_id,
-                                        "cwd": self.get_cwds[index],
-                                        "revision": self.revision}}}
+            index = (
+                min(
+                    len([c for c in self.calls if c[:2] == ["pane", "get"]]),
+                    len(self.get_cwds),
+                )
+                - 1
+            )
+            return {
+                "result": {
+                    "pane": {
+                        "pane_id": self.split_pane_id,
+                        "cwd": self.get_cwds[index],
+                        "revision": self.revision,
+                    }
+                }
+            }
         if head == ("pane", "process-info"):
-            return {"result": {"process_info": {
-                "pane_id": self.split_pane_id,
-                "foreground_processes": [
-                    {"name": "zsh", "argv0": "zsh", "argv": ["zsh"]}]}}}
+            return {
+                "result": {
+                    "process_info": {
+                        "pane_id": self.split_pane_id,
+                        "foreground_processes": [
+                            {"name": "zsh", "argv0": "zsh", "argv": ["zsh"]}
+                        ],
+                    }
+                }
+            }
         if head == ("pane", "close"):
             if self.close_error is not None:
                 raise self.close_error
@@ -105,21 +132,39 @@ class FakeHerdr:
         if head == ("agent", "start"):
             if self.start_error is not None:
                 raise self.start_error
-            return {"result": {"agent": {
-                "name": args[2], "status": "idle",
-                "transcript_path": str(self.transcript)}}}
+            return {
+                "result": {
+                    "agent": {
+                        "name": args[2],
+                        "status": "idle",
+                        "transcript_path": str(self.transcript),
+                    }
+                }
+            }
         if head in (("agent", "prompt"), ("agent", "send-keys")):
             if self.prompt_error is not None:
+                if self.prompt_envelope is not None:
+                    self.prompt_envelope.write_text(
+                        json.dumps({"success": True}), encoding="utf-8"
+                    )
                 raise self.prompt_error
-            self.revision += 1
+            if self.advance_revision:
+                self.revision += 1
             return {"result": {"ok": True}}
         if head == ("agent", "wait"):
             return {"result": {"ok": True, "status": "idle"}}
         if head == ("agent", "get"):
             if self.closed:
                 return {"result": {}}
-            return {"result": {"agent": {"name": args[2], "status": "idle",
-                                         "transcript_path": str(self.transcript)}}}
+            return {
+                "result": {
+                    "agent": {
+                        "name": args[2],
+                        "status": self.agent_status,
+                        "transcript_path": str(self.transcript),
+                    }
+                }
+            }
         return {"result": {}}
 
     def argv_for(self, verb):
@@ -142,7 +187,8 @@ class RefusalCleanupTest(unittest.TestCase):
         key = load_public_key(fixtures / "route_receipts.pub")
         self.admitted_routes = load_admitted_routes(
             {"omp": fixtures / "omp.json", "claude": fixtures / "claude.json"},
-            verify_keys=(key,))
+            verify_keys=(key,),
+        )
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -161,13 +207,16 @@ class RefusalCleanupTest(unittest.TestCase):
             # B13: `omp` publishes a catalog, so a dispatched spec must carry
             # the window `preflight_launch_prompt` measures the prompt against.
             context_window_tokens=400_000,
-            environment=worktree_module.launch_env(self.scratch))
+            environment=worktree_module.launch_env(self.scratch),
+        )
 
     def build(self, admitted=None):
         harness = lch.HerdrLauncher(
-            herdr_path=self.root / "herdr", omp_path=Path("/opt/omp"),
+            herdr_path=self.root / "herdr",
+            omp_path=Path("/opt/omp"),
             claude_path=Path("/opt/claude"),
-            admitted_routes=admitted or self.admitted_routes)
+            admitted_routes=admitted or self.admitted_routes,
+        )
         fake = FakeHerdr(worktree=self.worktree, transcript=self.transcript)
         harness._herdr = fake
         # These cases drive the refusal `agent start` raises, not the window in
@@ -187,7 +236,8 @@ class RefusalCleanupTest(unittest.TestCase):
         return lch.HerdrCallError(
             'LAUNCH_REFUSED:{"error":{"code":"agent_pane_busy",'
             '"message":"agent target pane w13A:pA is not an available shell"}}',
-            "agent_pane_busy")
+            "agent_pane_busy",
+        )
 
     # ── the incident: `agent start` refused after a successful split ────────
 
@@ -204,19 +254,42 @@ class RefusalCleanupTest(unittest.TestCase):
         self.assertFalse(refusal.pane_created)
         self.assertIs(refusal.__cause__, fake.start_error)
 
-    def test_prompt_submission_failure_cancels_the_started_agent(self):
+    def test_prompt_submission_failure_cancels_the_started_claude_agent(self):
         harness, fake = self.build()
         fake.prompt_error = lch.PromptSubmissionUnobservable("no revision")
         with self.assertRaises(lch.LaunchRefused) as caught:
-            harness.launch(self.spec())
+            harness.launch(self.spec(route="claude"))
         refusal = caught.exception
-        self.assertIs(
-            refusal.refusal, lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED)
+        self.assertIs(refusal.refusal, lch.LaunchRefusal.PROMPT_SUBMISSION_REFUSED)
         self.assertFalse(refusal.pane_created)
         self.assertEqual(fake.closed, ["w0:p2"])
         self.assertEqual(harness.reclaim(self.spec().correlation_token), ())
-        self.assertIs(
-            harness.classify(refusal), lch.ErrorClass.TRANSIENT)
+        self.assertIs(harness.classify(refusal), lch.ErrorClass.TRANSIENT)
+
+    def test_completed_claude_agent_outranks_late_submission_refusal(self):
+        harness, fake = self.build()
+        fake.prompt_error = lch.PromptNotSubmitted("static revision")
+        fake.prompt_envelope = self.envelope
+
+        handle = harness.launch(self.spec(route="claude"))
+
+        self.assertEqual(fake.closed, [])
+        self.assertIs(handle.envelope_path, self.envelope)
+        result = harness.poll(handle)
+        self.assertIs(result.state, lch.PollState.EXITED)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.detail, "ENVELOPE_SUCCESS")
+
+    def test_omp_working_status_proves_static_revision_submission(self):
+        harness, fake = self.build()
+        fake.advance_revision = False
+        fake.agent_status = "working"
+
+        handle = harness.launch(self.spec(route="omp"))
+
+        self.assertEqual(fake.closed, [])
+        self.assertEqual(len(fake.argv_for(("agent", "prompt"))), 1)
+        self.assertEqual(handle.agent_name[:8], "maestro-")
 
     def test_the_refusal_stays_a_retryable_launch_failure(self):
         """The end of the causal chain the incident took.
@@ -236,10 +309,8 @@ class RefusalCleanupTest(unittest.TestCase):
         self.assertTrue(sch._launch_left_nothing_to_reap(failed))
         # Sized as contention rather than as a broken launcher, and outside
         # the zero-budget partition so the STARTUP budget is actually spent.
-        self.assertIs(failed.classified_failure,
-                      rp.LauncherFailure.TRANSPORT)
-        self.assertNotIn(failed.classified_failure,
-                         rp.DETERMINISTIC_LAUNCHER_FAILURES)
+        self.assertIs(failed.classified_failure, rp.LauncherFailure.TRANSPORT)
+        self.assertNotIn(failed.classified_failure, rp.DETERMINISTIC_LAUNCHER_FAILURES)
 
     def test_a_busy_pane_is_classified_from_herdrs_typed_code(self):
         """Contention, not a broken launcher: TRANSIENT rather than EXECUTION.
@@ -252,11 +323,11 @@ class RefusalCleanupTest(unittest.TestCase):
         fake.start_error = self.busy_pane()
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(self.spec())
-        self.assertIs(lch.classify_error(caught.exception),
-                      lch.ErrorClass.TRANSIENT)
+        self.assertIs(lch.classify_error(caught.exception), lch.ErrorClass.TRANSIENT)
         self.assertIs(
             lch.classify_error(lch.HerdrCallError("LAUNCH_REFUSED:x", "")),
-            lch.ErrorClass.EXECUTION)
+            lch.ErrorClass.EXECUTION,
+        )
 
     def test_a_close_herdr_refused_reports_a_pane_that_may_survive(self):
         """The fail-closed control on the pair. §8.3 never reports an absence
@@ -278,8 +349,7 @@ class RefusalCleanupTest(unittest.TestCase):
         harness, fake = self.build(admitted=object.__new__(_AnyRoute))
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(replace(self.spec(), route="gemini"))
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.UNSUPPORTED_ROUTE)
+        self.assertIs(caught.exception.refusal, lch.LaunchRefusal.UNSUPPORTED_ROUTE)
         self.assertEqual(fake.calls, [])
         self.assertFalse(caught.exception.pane_created)
 
@@ -287,8 +357,7 @@ class RefusalCleanupTest(unittest.TestCase):
         harness, fake = self.build()
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(replace(self.spec(), profile=None))
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.OMP_PROFILE_REQUIRED)
+        self.assertIs(caught.exception.refusal, lch.LaunchRefusal.OMP_PROFILE_REQUIRED)
         self.assertEqual(fake.calls, [])
         self.assertFalse(caught.exception.pane_created)
 
@@ -297,8 +366,7 @@ class RefusalCleanupTest(unittest.TestCase):
         fake.get_cwds = [str(self.root / "wrong")]
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(self.spec())
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.BINDING_MISMATCH)
+        self.assertIs(caught.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH)
         self.assertEqual(fake.argv_for(("agent", "start")), [])
         self.assertEqual(fake.closed, ["w0:p2"])
         self.assertFalse(caught.exception.pane_created)
@@ -308,8 +376,7 @@ class RefusalCleanupTest(unittest.TestCase):
         fake.get_cwds = [str(self.worktree), str(self.root / "wrong")]
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(self.spec())
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.BINDING_MISMATCH)
+        self.assertIs(caught.exception.refusal, lch.LaunchRefusal.BINDING_MISMATCH)
         # `cancel` reaped it: the pane held a started agent, so the process
         # group goes first and the pane close is proved by `_agent_absent`.
         self.assertEqual(fake.closed, ["w0:p2"])
@@ -362,8 +429,9 @@ class RefusalCleanupTest(unittest.TestCase):
         fake.current_pane_id = None
         with self.assertRaises(lch.LaunchRefused) as caught:
             harness.launch(self.spec())
-        self.assertIs(caught.exception.refusal,
-                      lch.LaunchRefusal.SPLIT_PARENT_UNRESOLVED)
+        self.assertIs(
+            caught.exception.refusal, lch.LaunchRefusal.SPLIT_PARENT_UNRESOLVED
+        )
         # Nothing was split, so there is nothing to reap and the refusal says
         # so — and it is retryable, because herdr may answer the next ask.
         self.assertEqual(fake.argv_for(("pane", "split")), [])
@@ -390,12 +458,17 @@ class RefusalCleanupTest(unittest.TestCase):
 
         def busy(*args, **kwargs):
             calls.append(list(args))
-            return {"result": {"process_info": {
-                "foreground_processes": [
-                    {"name": "python", "argv0": "python", "argv": ["python"]}]}}}
+            return {
+                "result": {
+                    "process_info": {
+                        "foreground_processes": [
+                            {"name": "python", "argv0": "python", "argv": ["python"]}
+                        ]
+                    }
+                }
+            }
 
-        self.assertIsNone(
-            lch._wait_for_available_shell(busy, "w0:p2", timeout_s=0.05))
+        self.assertIsNone(lch._wait_for_available_shell(busy, "w0:p2", timeout_s=0.05))
         self.assertTrue(calls)
 
 

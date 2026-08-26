@@ -42,10 +42,12 @@ from adw_modules import scheduler_types
 def _marker_argv(marker: Path, *, exit_code: int = 0) -> list:
     """A provision command that records the directory it ran in."""
     return [
-        sys.executable, "-c",
+        sys.executable,
+        "-c",
         "import os,sys;open(sys.argv[1],'a').write(os.getcwd()+chr(10));"
         "sys.stderr.write('provision said no');sys.exit(int(sys.argv[2]))",
-        str(marker), str(exit_code),
+        str(marker),
+        str(exit_code),
     ]
 
 
@@ -64,9 +66,14 @@ class ConfigurationCarriesTheProvisionArgvTest(unittest.TestCase):
             binary.chmod(0o755)
             binaries[name] = str(binary)
         execution = {
-            "route": "omp", "model": "execution-model", "effort": "medium",
-            "concurrency": 2, "node_timeout_s": 120, "turn_timeout_s": 30,
-            "final_acceptance_timeout_s": 45, "backstop_t_s": 600,
+            "route": "omp",
+            "model": "execution-model",
+            "effort": "medium",
+            "concurrency": 2,
+            "node_timeout_s": 120,
+            "turn_timeout_s": 30,
+            "final_acceptance_timeout_s": 45,
+            "backstop_t_s": 600,
             "semantic_ceiling": 3,
         }
         if provision is not None:
@@ -83,8 +90,11 @@ class ConfigurationCarriesTheProvisionArgvTest(unittest.TestCase):
             "executables": binaries,
             "route_receipts": {"omp": "route-receipts/omp.json"},
             "reviewer": {
-                "route": "omp", "model": "review-model", "effort": "high",
-                "finalization_timeout_s": 60, "turn_timeout_s": 20,
+                "route": "omp",
+                "model": "review-model",
+                "effort": "high",
+                "finalization_timeout_s": 60,
+                "turn_timeout_s": 20,
                 "poll_interval_s": 1,
             },
             "execution": execution,
@@ -134,16 +144,24 @@ class TheLauncherIsBuiltWithTheProvisionArgvTest(unittest.TestCase):
 
     def _args(self, provision_argv):
         return SimpleNamespace(
-            herdr="/bin/sh", omp="/bin/sh", claude="/bin/sh",
-            agent_route="omp", agent_model="m", agent_effort="high",
-            route_receipt=["omp=/dev/null"], route_verify_key=["ab"],
-            provision_argv=provision_argv)
+            herdr="/bin/sh",
+            omp="/bin/sh",
+            claude="/bin/sh",
+            agent_route="omp",
+            agent_model="m",
+            agent_effort="high",
+            route_receipt=["omp=/dev/null"],
+            route_verify_key=["ab"],
+            provision_argv=provision_argv,
+        )
 
     def _build(self, provision_argv):
         with mock.patch.object(
-                maestro.route_receipts, "load_admitted_routes",
-                return_value=mock.Mock(spec=launcher.AdmittedRouteSet)):
-            return maestro._runtime_launcher(self._args(provision_argv))
+            maestro.route_receipts,
+            "load_admitted_routes",
+            return_value=mock.Mock(spec=launcher.AdmittedRouteSet),
+        ):
+            return maestro._runtime_launcher(self._args(provision_argv), "fixture-plan")
 
     def test_the_configured_argv_reaches_the_adapter(self):
         runtime = self._build(["npm", "ci"])
@@ -167,24 +185,32 @@ class TheProvisionerRunsInTheAttemptWorktreeTest(unittest.TestCase):
         args = SimpleNamespace(provision_argv=list(argv))
         route_runner = (
             launcher.HerdrLauncher(
-                herdr_path=Path("/bin/sh"), omp_path=Path("/bin/sh"),
+                herdr_path=Path("/bin/sh"),
+                omp_path=Path("/bin/sh"),
                 claude_path=Path("/bin/sh"),
                 admitted_routes=mock.Mock(spec=launcher.AdmittedRouteSet),
-                provision_argv=tuple(argv))
-            if agent_nodes else None)
+                provision_argv=tuple(argv),
+            )
+            if agent_nodes
+            else None
+        )
         return maestro._run_provisioner(args, route_runner)
 
     def test_provision_runs_with_the_worktree_as_its_working_directory(self):
         for agent_nodes in (True, False):
-            with self.subTest(agent_nodes=agent_nodes), \
-                    tempfile.TemporaryDirectory() as tmp:
+            with (
+                self.subTest(agent_nodes=agent_nodes),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
                 worktree = Path(tmp).resolve()
                 marker = worktree / "ran.txt"
                 provision = self._provision(
-                    _marker_argv(marker), agent_nodes=agent_nodes)
+                    _marker_argv(marker), agent_nodes=agent_nodes
+                )
                 provision(worktree)
                 self.assertEqual(
-                    marker.read_text(encoding="utf-8").strip(), str(worktree))
+                    marker.read_text(encoding="utf-8").strip(), str(worktree)
+                )
 
     def test_a_failing_provision_refuses_identically_on_both_arms(self):
         messages = {}
@@ -193,15 +219,18 @@ class TheProvisionerRunsInTheAttemptWorktreeTest(unittest.TestCase):
                 worktree = Path(tmp).resolve()
                 provision = self._provision(
                     _marker_argv(worktree / "ran.txt", exit_code=3),
-                    agent_nodes=agent_nodes)
+                    agent_nodes=agent_nodes,
+                )
                 with self.assertRaises(RuntimeError) as caught:
                     provision(worktree)
                 messages[agent_nodes] = str(caught.exception)
-        self.assertTrue(messages[True].startswith("PROVISION_FAILED:"),
-                        messages[True])
-        self.assertEqual(messages[True], messages[False],
-                         "the code-only provisioner has drifted from the "
-                         "adapter's: " + repr(messages))
+        self.assertTrue(messages[True].startswith("PROVISION_FAILED:"), messages[True])
+        self.assertEqual(
+            messages[True],
+            messages[False],
+            "the code-only provisioner has drifted from the "
+            "adapter's: " + repr(messages),
+        )
 
     def test_nothing_configured_supplies_no_provisioner(self):
         """§9.3's stated default. A pytest repository wants exactly this."""
@@ -222,86 +251,113 @@ class TheSchedulerIsGivenTheProvisionStepTest(unittest.TestCase):
             def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                 captured["deps"] = deps
 
+            def project(self):
+                return None
+
             def run(self):
                 return SimpleNamespace(
                     outcome=SimpleNamespace(value="ACCEPTED"),
-                    merged=(), blocked=(), review_findings={})
+                    merged=(),
+                    blocked=(),
+                    review_findings={},
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "run"
             (root / "integration").mkdir(parents=True)
             args = SimpleNamespace(
                 plan_file=str(root / "plan.json"),
-                db=str(Path(tmp) / "state.db"), run_id="run-1",
-                integration_path=str(root / "integration"), repo=str(root),
-                data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+                db=str(Path(tmp) / "state.db"),
+                run_id="run-1",
+                integration_path=str(root / "integration"),
+                repo=str(root),
+                data_dir=str(root / "data"),
+                receipt_dir=str(root / "receipts"),
                 worktrees_root=str(root / "worktrees"),
-                scratch_root=str(root / "scratch"), digest="a" * 64,
-                agent_route="omp", agent_model="model", agent_effort="high",
-                agent_profile="profile", provision_argv=provision_argv)
+                scratch_root=str(root / "scratch"),
+                digest="a" * 64,
+                agent_route="omp",
+                agent_model="model",
+                agent_effort="high",
+                agent_profile="profile",
+                provision_argv=provision_argv,
+            )
             output = io.StringIO()
-            with mock.patch.object(
+            with (
+                mock.patch.object(
                     maestro, "_run_configuration", return_value=mock.Mock()
-            ), mock.patch.object(
-                    maestro, "_load_runnable_plan", return_value=plan
-            ), mock.patch.object(
+                ),
+                mock.patch.object(maestro, "_load_runnable_plan", return_value=plan),
+                mock.patch.object(
                     # Runner resolution probes a real interpreter. This plan is
                     # a stub whose gate never executes, so resolution joins the
                     # seams already substituted here rather than making every
                     # CLI test depend on the machine's PATH.
-                    maestro, "_resolve_run_runners", return_value={}
-            ), mock.patch.object(
+                    maestro,
+                    "_resolve_run_runners",
+                    return_value={},
+                ),
+                mock.patch.object(
                     maestro, "_runtime_launcher", return_value=route_runner
-            ), mock.patch.object(
-                    maestro.lc, "LifecycleStore"
-            ), mock.patch.object(
-                    maestro.scheduler, "Scheduler", CapturingScheduler
-            ), contextlib.redirect_stdout(output):
+                ),
+                mock.patch.object(maestro.lc, "LifecycleStore"),
+                mock.patch.object(maestro.scheduler, "Scheduler", CapturingScheduler),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(args)
         self.assertEqual(code, 0, output.getvalue())
         return captured["deps"]
 
     @staticmethod
     def _plan(*, agent_nodes):
-        node = SimpleNamespace(
-            kind=scheduler_types.NodeKind.AGENT, node_id="agent")
+        node = SimpleNamespace(kind=scheduler_types.NodeKind.AGENT, node_id="agent")
         return SimpleNamespace(
             agent_nodes=(node,) if agent_nodes else (),
             merge_policy=SimpleNamespace(
                 integration_branch="main",
-                integration_gate=SimpleNamespace(
-                    runner="none", argv=(), min_cases=1)),
-            node_by_id=lambda: {
-                "agent": SimpleNamespace(instruction="do the work")},
-            to_plan_nodes=lambda: ())
+                integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1),
+            ),
+            node_by_id=lambda: {"agent": SimpleNamespace(instruction="do the work")},
+            to_plan_nodes=lambda: (),
+        )
 
     def test_an_agent_run_gives_the_scheduler_the_adapters_provision(self):
         route_runner = launcher.HerdrLauncher(
-            herdr_path=Path("/bin/sh"), omp_path=Path("/bin/sh"),
+            herdr_path=Path("/bin/sh"),
+            omp_path=Path("/bin/sh"),
             claude_path=Path("/bin/sh"),
             admitted_routes=mock.Mock(spec=launcher.AdmittedRouteSet),
-            provision_argv=("npm", "ci"))
-        deps = self._drive(self._plan(agent_nodes=True),
-                           provision_argv=["npm", "ci"],
-                           route_runner=route_runner)
+            provision_argv=("npm", "ci"),
+        )
+        deps = self._drive(
+            self._plan(agent_nodes=True),
+            provision_argv=["npm", "ci"],
+            route_runner=route_runner,
+        )
         self.assertIsNotNone(
             deps.provision,
             "SchedulerDeps.provision is None, so §8.3's provision step is "
             "skipped and the baseline is measured against an unprovisioned "
-            "tree")
+            "tree",
+        )
         self.assertEqual(deps.provision, route_runner.provision)
 
     def test_a_code_only_run_still_provisions(self):
-        deps = self._drive(self._plan(agent_nodes=False),
-                           provision_argv=["npm", "ci"], route_runner=None)
+        deps = self._drive(
+            self._plan(agent_nodes=False),
+            provision_argv=["npm", "ci"],
+            route_runner=None,
+        )
         self.assertIsNotNone(
             deps.provision,
             "a plan of code nodes alone has no runner adapter, and its "
-            "worktree still needs provisioning before §8.3's baseline")
+            "worktree still needs provisioning before §8.3's baseline",
+        )
 
     def test_a_run_with_nothing_configured_provisions_nothing(self):
-        deps = self._drive(self._plan(agent_nodes=False),
-                           provision_argv=None, route_runner=None)
+        deps = self._drive(
+            self._plan(agent_nodes=False), provision_argv=None, route_runner=None
+        )
         self.assertIsNone(deps.provision)
 
 

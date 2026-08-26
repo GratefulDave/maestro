@@ -73,50 +73,69 @@ OUTPUT_SHA = "2" * 40
 
 #: One real finding from `lane-p2-s3-inventory`, so the fixtures are the shape
 #: the production reviewer actually produced rather than a placeholder.
-REAL_MESSAGE = ("inventory.py:118 — the HeadObject call is wrapped in a bare "
-                "except that returns None, so a permissions failure is "
-                "indistinguishable from a missing key")
+REAL_MESSAGE = (
+    "inventory.py:118 — the HeadObject call is wrapped in a bare "
+    "except that returns None, so a permissions failure is "
+    "indistinguishable from a missing key"
+)
 
 
 def make_store(tmp: Path) -> fin.ReceiptStore:
     repo = tmp / "repo"
     repo.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(repo)], check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
     data_dir = tmp / "sssf-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     seed = rc.generate_seed()
-    return fin.ReceiptStore(tmp / "receipts", repo_paths=(repo,),
-                            data_dir=data_dir,
-                            verify_keys=[rc.seed_to_public_key(seed)],
-                            signing_seed=seed)
+    return fin.ReceiptStore(
+        tmp / "receipts",
+        repo_paths=(repo,),
+        data_dir=data_dir,
+        verify_keys=[rc.seed_to_public_key(seed)],
+        signing_seed=seed,
+    )
 
 
 def a_node(node_id: str = "build") -> st.PlanNode:
-    return st.PlanNode(node_id=node_id, kind=st.NodeKind.AGENT, depth=0,
-                       outputs=(f"{node_id}.py",),
-                       instruction=f"Implement {node_id} as the plan declares.",
-                       gate_command=("pytest",),
-                       gate_selector=f"tests/{node_id}")
+    return st.PlanNode(
+        node_id=node_id,
+        kind=st.NodeKind.AGENT,
+        depth=0,
+        outputs=(f"{node_id}.py",),
+        instruction=f"Implement {node_id} as the plan declares.",
+        gate_command=("pytest",),
+        gate_selector=f"tests/{node_id}",
+    )
 
 
-def a_handoff(subject_digest: str, matrix: fin.ApplicabilityMatrix,
-              **kw: Any) -> cr.ReviewHandoff:
+def a_handoff(
+    subject_digest: str, matrix: fin.ApplicabilityMatrix, **kw: Any
+) -> cr.ReviewHandoff:
     base: Dict[str, Any] = dict(
-        subject_digest=subject_digest, run_id="run1", node_id="build",
-        node_kind="agent", instruction="Add the inventory materializer.",
-        declared_outputs=["inventory.py"], gate_command=["pytest"],
-        gate_selector="tests/inventory", base_sha=BASE_SHA,
-        output_sha=OUTPUT_SHA, diff="--- a\n+++ b\n",
-        matrix=[{"check_id": c.check_id, "object_id": c.object_id}
-                for c in matrix.cells],
-        pair_count=matrix.pair_count, report_path="/tmp/report.json",
-        rubric=[{"check_id": "c", "question": "is it right?"}])
+        subject_digest=subject_digest,
+        run_id="run1",
+        node_id="build",
+        node_kind="agent",
+        instruction="Add the inventory materializer.",
+        declared_outputs=["inventory.py"],
+        gate_command=["pytest"],
+        gate_selector="tests/inventory",
+        base_sha=BASE_SHA,
+        output_sha=OUTPUT_SHA,
+        diff="--- a\n+++ b\n",
+        matrix=[
+            {"check_id": c.check_id, "object_id": c.object_id} for c in matrix.cells
+        ],
+        pair_count=matrix.pair_count,
+        report_path="/tmp/report.json",
+        rubric=[{"check_id": "c", "question": "is it right?"}],
+    )
     base.update(kw)
     return cr.ReviewHandoff(**base)
 
 
 # ── a scripted reviewer, answering a real matrix ────────────────────────────
+
 
 class ScriptedReviewer:
     """Answers every cell of the matrix it is handed, from a per-check script.
@@ -127,9 +146,13 @@ class ScriptedReviewer:
     run for real against these reports instead of being stepped around.
     """
 
-    def __init__(self, findings: Dict[str, Tuple[str, str, str]],
-                 *, clear_the_known_bad: bool = False,
-                 mutate: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        findings: Dict[str, Tuple[str, str, str]],
+        *,
+        clear_the_known_bad: bool = False,
+        mutate: Optional[Any] = None,
+    ) -> None:
         #: check_id -> (grade, message, rationale[, scope])
         self.findings = findings
         self.clear_the_known_bad = clear_the_known_bad
@@ -141,33 +164,62 @@ class ScriptedReviewer:
         for cell in matrix.cells:
             if cell.canary is fin.CanaryKind.KNOWN_BAD:
                 cells.append(
-                    {"check_id": cell.check_id, "object_id": cell.object_id,
-                     "status": "clear"} if self.clear_the_known_bad else
-                    {"check_id": cell.check_id, "object_id": cell.object_id,
-                     "status": "finding", "message": "the control is bad",
-                     "grade": "note", "scope": "in_scope",
-                     "grade_rationale": "it is a control, by construction"})
+                    {
+                        "check_id": cell.check_id,
+                        "object_id": cell.object_id,
+                        "status": "clear",
+                    }
+                    if self.clear_the_known_bad
+                    else {
+                        "check_id": cell.check_id,
+                        "object_id": cell.object_id,
+                        "status": "finding",
+                        "message": "the control is bad",
+                        "grade": "note",
+                        "scope": "in_scope",
+                        "grade_rationale": "it is a control, by construction",
+                    }
+                )
                 continue
             if cell.canary is fin.CanaryKind.KNOWN_GOOD:
-                cells.append({"check_id": cell.check_id,
-                              "object_id": cell.object_id, "status": "clear"})
+                cells.append(
+                    {
+                        "check_id": cell.check_id,
+                        "object_id": cell.object_id,
+                        "status": "clear",
+                    }
+                )
                 continue
             scripted = self.findings.get(cell.check_id)
             if scripted is None:
-                cells.append({"check_id": cell.check_id,
-                              "object_id": cell.object_id, "status": "clear"})
+                cells.append(
+                    {
+                        "check_id": cell.check_id,
+                        "object_id": cell.object_id,
+                        "status": "clear",
+                    }
+                )
                 continue
             # A script may state the scope as a fourth element; the default
             # is the in-scope finding every case before `FindingScope` meant.
             grade, message, rationale = scripted[:3]
             scope = scripted[3] if len(scripted) > 3 else "in_scope"
-            cells.append({"check_id": cell.check_id,
-                          "object_id": cell.object_id, "status": "finding",
-                          "message": message, "grade": grade,
-                          "grade_rationale": rationale, "scope": scope})
-        report: Dict[str, Any] = {"plan_digest": matrix.plan_digest,
-                                  "pair_count": matrix.pair_count,
-                                  "cells": cells}
+            cells.append(
+                {
+                    "check_id": cell.check_id,
+                    "object_id": cell.object_id,
+                    "status": "finding",
+                    "message": message,
+                    "grade": grade,
+                    "grade_rationale": rationale,
+                    "scope": scope,
+                }
+            )
+        report: Dict[str, Any] = {
+            "plan_digest": matrix.plan_digest,
+            "pair_count": matrix.pair_count,
+            "cells": cells,
+        }
         if self.mutate is not None:
             self.mutate(report)
         self.reports.append(report)
@@ -184,46 +236,68 @@ class FakeWindow:
     def run(self, sleep: Any = None) -> fw.WindowOutcome:
         return fw.WindowOutcome(
             completed=True,
-            session=fw.ReviewerSession(route="omp", model="reviewer-model",
-                                       session_id="w1:p2"),
-            elapsed_s=1.0, report=self.report)
+            session=fw.ReviewerSession(
+                route="omp", model="reviewer-model", session_id="w1:p2"
+            ),
+            elapsed_s=1.0,
+            report=self.report,
+        )
 
 
-def run_review(tmp: Path, reviewer: ScriptedReviewer, *,
-               reject_at: cr.FindingGrade = cr.DEFAULT_REJECT_GRADE,
-               ledger_path: Optional[Path] = None,
-               objects: Optional[Sequence[fin.ReviewObject]] = None,
-               store: Optional[fin.ReceiptStore] = None,
-               digest: str = "a" * 64) -> cr.ReviewOutcome:
+def run_review(
+    tmp: Path,
+    reviewer: ScriptedReviewer,
+    *,
+    reject_at: cr.FindingGrade = cr.DEFAULT_REJECT_GRADE,
+    ledger_path: Optional[Path] = None,
+    objects: Optional[Sequence[fin.ReviewObject]] = None,
+    store: Optional[fin.ReceiptStore] = None,
+    digest: str = "a" * 64,
+) -> cr.ReviewOutcome:
     """One whole node review, through the real driver."""
     store = store if store is not None else make_store(tmp)
-    subjects = (objects if objects is not None
-                else cr.review_objects(("inventory.py",), OUTPUT_SHA))
+    subjects = (
+        objects
+        if objects is not None
+        else cr.review_objects(("inventory.py",), OUTPUT_SHA)
+    )
     matrix = fin.compute_matrix(cr.CODE_RUBRIC, digest, subjects)
     return cr.review_attempt(
         subject_digest=digest,
         handoff=a_handoff(digest, matrix),
-        objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
+        objects=subjects,
+        rubric=cr.CODE_RUBRIC,
+        store=store,
         window_factory=reviewer.window_factory,
         occupancy_reader=lambda _s: 0.1,
-        reject_at=reject_at, ledger_path=ledger_path)
+        reject_at=reject_at,
+        ledger_path=ledger_path,
+    )
 
 
 # ── A9: a sub-threshold finding is recorded, and merges ─────────────────────
 
-class SubThresholdFindingsAreRecordedNotRejectedTest(unittest.TestCase):
 
+class SubThresholdFindingsAreRecordedNotRejectedTest(unittest.TestCase):
     def test_a_warning_on_a_blocking_check_is_accepted(self):
         """The whole defect, inverted. `diff.introduces_no_obvious_defect` is
         BLOCKING and carried a finding in 25 of 27 real reviews; before
         grading, every one of those rejected."""
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE,
-                    "the node's stated work is delivered; this is a "
-                    "pre-existing robustness gap the instruction did not ask "
-                    "about")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "the node's stated work is delivered; this is a "
+                            "pre-existing robustness gap the instruction did not ask "
+                            "about",
+                        )
+                    }
+                ),
+            )
 
         self.assertIs(outcome.verdict, fin.Verdict.PASS)
         self.assertTrue(outcome.passed)
@@ -234,18 +308,35 @@ class SubThresholdFindingsAreRecordedNotRejectedTest(unittest.TestCase):
         was found in it, or this change would hide the 25/27 instead of
         ranking them."""
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected"),
-                "diff.is_coherent_with_its_surroundings": (
-                    "note", "naming drifts from the module", "cosmetic")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        ),
+                        "diff.is_coherent_with_its_surroundings": (
+                            "note",
+                            "naming drifts from the module",
+                            "cosmetic",
+                        ),
+                    }
+                ),
+            )
 
         recorded = {c.check_id: c for c in outcome.advisories}
         self.assertEqual(
-            {"diff.introduces_no_obvious_defect",
-             "diff.is_coherent_with_its_surroundings"}, set(recorded))
-        self.assertEqual(cr.FindingGrade.WARNING,
-                         recorded["diff.introduces_no_obvious_defect"].grade)
+            {
+                "diff.introduces_no_obvious_defect",
+                "diff.is_coherent_with_its_surroundings",
+            },
+            set(recorded),
+        )
+        self.assertEqual(
+            cr.FindingGrade.WARNING, recorded["diff.introduces_no_obvious_defect"].grade
+        )
         # And it reaches the builder, so a merge is not a silent one.
         self.assertIn(REAL_MESSAGE, outcome.findings_text())
 
@@ -253,13 +344,23 @@ class SubThresholdFindingsAreRecordedNotRejectedTest(unittest.TestCase):
         """Where an operator finds what a merged node merged with."""
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "review" / ("a" * 8) / "findings.json"
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
-                ledger_path=ledger)
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        )
+                    }
+                ),
+                ledger_path=ledger,
+            )
             self.assertTrue(outcome.passed)
-            self.assertTrue(ledger.exists(),
-                            "a merged node recorded no advisory ledger")
+            self.assertTrue(
+                ledger.exists(), "a merged node recorded no advisory ledger"
+            )
 
             payload = json.loads(ledger.read_text(encoding="utf-8"))
             self.assertEqual(cr.FINDING_LEDGER_SCHEMA, payload["schema"])
@@ -285,32 +386,43 @@ class SubThresholdFindingsAreRecordedNotRejectedTest(unittest.TestCase):
             root = Path(tmp)
             store = make_store(root)
             ledger = root / "findings.json"
-            reviewer = ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")})
+            reviewer = ScriptedReviewer(
+                {
+                    "diff.introduces_no_obvious_defect": (
+                        "warning",
+                        REAL_MESSAGE,
+                        "delivered work is unaffected",
+                    )
+                }
+            )
             first = run_review(root, reviewer, ledger_path=ledger, store=store)
 
             def must_not_launch(_matrix):
                 raise AssertionError("a byte-identical subject re-reviewed")
 
             matrix = fin.compute_matrix(
-                cr.CODE_RUBRIC, "a" * 64,
-                cr.review_objects(("inventory.py",), OUTPUT_SHA))
+                cr.CODE_RUBRIC,
+                "a" * 64,
+                cr.review_objects(("inventory.py",), OUTPUT_SHA),
+            )
             second = cr.review_attempt(
                 subject_digest="a" * 64,
                 handoff=a_handoff("a" * 64, matrix),
                 objects=cr.review_objects(("inventory.py",), OUTPUT_SHA),
-                rubric=cr.CODE_RUBRIC, store=store,
+                rubric=cr.CODE_RUBRIC,
+                store=store,
                 window_factory=must_not_launch,
                 occupancy_reader=lambda _s: 0.1,
-                ledger_path=ledger)
+                ledger_path=ledger,
+            )
 
         self.assertFalse(first.replayed)
         self.assertTrue(second.replayed)
         self.assertTrue(second.passed)
         self.assertEqual((), second.findings)
-        self.assertEqual([cr.FindingGrade.WARNING],
-                         [c.grade for c in second.advisories])
+        self.assertEqual(
+            [cr.FindingGrade.WARNING], [c.grade for c in second.advisories]
+        )
 
 
 class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
@@ -332,16 +444,22 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
 
     def _replay(self, store, ledger_path):
         """A second review of byte-identical bytes, which must not launch."""
+
         def must_not_launch(_matrix):
             raise AssertionError("a byte-identical subject re-reviewed")
 
         subjects = cr.review_objects(("inventory.py",), OUTPUT_SHA)
         matrix = fin.compute_matrix(cr.CODE_RUBRIC, "a" * 64, subjects)
         return cr.review_attempt(
-            subject_digest="a" * 64, handoff=a_handoff("a" * 64, matrix),
-            objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
-            window_factory=must_not_launch, occupancy_reader=lambda _s: 0.1,
-            ledger_path=ledger_path)
+            subject_digest="a" * 64,
+            handoff=a_handoff("a" * 64, matrix),
+            objects=subjects,
+            rubric=cr.CODE_RUBRIC,
+            store=store,
+            window_factory=must_not_launch,
+            occupancy_reader=lambda _s: 0.1,
+            ledger_path=ledger_path,
+        )
 
     def test_a_replay_with_no_ledger_still_reports_the_real_grades(self):
         """The defect this closes. A WARNING on a BLOCKING check merged; with
@@ -351,10 +469,20 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
             root = Path(tmp)
             store = make_store(root)
             ledger = root / "findings.json"
-            first = run_review(root, ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
-                ledger_path=ledger, store=store)
+            first = run_review(
+                root,
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        )
+                    }
+                ),
+                ledger_path=ledger,
+                store=store,
+            )
             self.assertTrue(first.passed)
             self.assertTrue(ledger.exists())
 
@@ -363,10 +491,12 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
 
         self.assertTrue(replayed.replayed)
         self.assertTrue(replayed.passed)
-        self.assertEqual((), replayed.findings,
-                         "a recorded WARNING replayed as a rejection")
-        self.assertEqual([cr.FindingGrade.WARNING],
-                         [c.grade for c in replayed.advisories])
+        self.assertEqual(
+            (), replayed.findings, "a recorded WARNING replayed as a rejection"
+        )
+        self.assertEqual(
+            [cr.FindingGrade.WARNING], [c.grade for c in replayed.advisories]
+        )
 
     def test_a_replay_with_no_ledger_still_reports_a_rejection(self):
         """The other direction, because a fallback that reported everything as
@@ -375,10 +505,20 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
             root = Path(tmp)
             store = make_store(root)
             ledger = root / "findings.json"
-            first = run_review(root, ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "error", REAL_MESSAGE, "the node's stated work is absent")}),
-                ledger_path=ledger, store=store)
+            first = run_review(
+                root,
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "error",
+                            REAL_MESSAGE,
+                            "the node's stated work is absent",
+                        )
+                    }
+                ),
+                ledger_path=ledger,
+                store=store,
+            )
             self.assertFalse(first.passed)
 
             os.remove(ledger)
@@ -386,8 +526,7 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
 
         self.assertTrue(replayed.replayed)
         self.assertFalse(replayed.passed)
-        self.assertEqual([cr.FindingGrade.ERROR],
-                         [c.grade for c in replayed.findings])
+        self.assertEqual([cr.FindingGrade.ERROR], [c.grade for c in replayed.findings])
         self.assertEqual((), replayed.advisories)
 
     def test_the_grade_is_in_the_receipt_that_was_signed(self):
@@ -396,54 +535,77 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = make_store(root)
-            run_review(root, ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
-                store=store)
+            run_review(
+                root,
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        )
+                    }
+                ),
+                store=store,
+            )
             reloaded = store.load("a" * 64)
 
-        graded = {c.check_id: c.grade for c in reloaded.cells
-                  if c.status is fin.CellStatus.FINDING and c.canary is None}
-        self.assertEqual({"diff.introduces_no_obvious_defect": "warning"},
-                         graded)
+        graded = {
+            c.check_id: c.grade
+            for c in reloaded.cells
+            if c.status is fin.CellStatus.FINDING and c.canary is None
+        }
+        self.assertEqual({"diff.introduces_no_obvious_defect": "warning"}, graded)
 
     def test_an_ungraded_receipt_cell_falls_back_to_its_severity(self):
         """A receipt written before the field existed, and plan finalization's
         cells, genuinely carry no grade. Severity is the honest partition there
         and the old behaviour is kept exactly where it is still the truth."""
         blocking = fin.DerivedCell(
-            check_id="diff.introduces_no_obvious_defect", object_id="o1",
-            status=fin.CellStatus.FINDING, severity=fin.Severity.BLOCKING,
-            message=REAL_MESSAGE, grade=None)
+            check_id="diff.introduces_no_obvious_defect",
+            object_id="o1",
+            status=fin.CellStatus.FINDING,
+            severity=fin.Severity.BLOCKING,
+            message=REAL_MESSAGE,
+            grade=None,
+        )
         advisory = fin.DerivedCell(
-            check_id="diff.is_coherent_with_its_surroundings", object_id="o1",
-            status=fin.CellStatus.FINDING, severity=fin.Severity.ADVISORY,
-            message="naming drifts", grade=None)
-        derived = fin.DerivedVerdict(verdict=fin.Verdict.FAIL,
-                                     cells=(blocking, advisory))
+            check_id="diff.is_coherent_with_its_surroundings",
+            object_id="o1",
+            status=fin.CellStatus.FINDING,
+            severity=fin.Severity.ADVISORY,
+            message="naming drifts",
+            grade=None,
+        )
+        derived = fin.DerivedVerdict(
+            verdict=fin.Verdict.FAIL, cells=(blocking, advisory)
+        )
 
-        rejecting, recorded = cr.receipt_findings(derived,
-                                                  cr.DEFAULT_REJECT_GRADE)
+        rejecting, recorded = cr.receipt_findings(derived, cr.DEFAULT_REJECT_GRADE)
 
-        self.assertEqual(["diff.introduces_no_obvious_defect"],
-                         [c.check_id for c in rejecting])
-        self.assertEqual(["diff.is_coherent_with_its_surroundings"],
-                         [c.check_id for c in recorded])
-        self.assertEqual([None, None],
-                         [c.grade for c in rejecting + recorded])
+        self.assertEqual(
+            ["diff.introduces_no_obvious_defect"], [c.check_id for c in rejecting]
+        )
+        self.assertEqual(
+            ["diff.is_coherent_with_its_surroundings"], [c.check_id for c in recorded]
+        )
+        self.assertEqual([None, None], [c.grade for c in rejecting + recorded])
 
     def test_a_grade_this_version_cannot_name_is_read_as_absent(self):
         """The verdict on the replay path is the receipt's signed one and is
         never re-derived here, so an unrecognised grade may change how a
         finding is presented and must not be able to fail the replay."""
         cell = fin.DerivedCell(
-            check_id="diff.introduces_no_obvious_defect", object_id="o1",
-            status=fin.CellStatus.FINDING, severity=fin.Severity.BLOCKING,
-            message=REAL_MESSAGE, grade="catastrophe")
+            check_id="diff.introduces_no_obvious_defect",
+            object_id="o1",
+            status=fin.CellStatus.FINDING,
+            severity=fin.Severity.BLOCKING,
+            message=REAL_MESSAGE,
+            grade="catastrophe",
+        )
         derived = fin.DerivedVerdict(verdict=fin.Verdict.FAIL, cells=(cell,))
 
-        rejecting, recorded = cr.receipt_findings(derived,
-                                                  cr.DEFAULT_REJECT_GRADE)
+        rejecting, recorded = cr.receipt_findings(derived, cr.DEFAULT_REJECT_GRADE)
 
         self.assertEqual(1, len(rejecting))
         self.assertEqual((), recorded)
@@ -457,19 +619,32 @@ class TheReceiptIsACompleteSourceForItsGradesTest(unittest.TestCase):
             root = Path(tmp)
             store = make_store(root)
             ledger = root / "findings.json"
-            run_review(root, ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
-                ledger_path=ledger, store=store)
+            run_review(
+                root,
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        )
+                    }
+                ),
+                ledger_path=ledger,
+                store=store,
+            )
             with_ledger = self._replay(store, ledger)
             os.remove(ledger)
             without_ledger = self._replay(store, ledger)
 
-        self.assertEqual("delivered work is unaffected",
-                         with_ledger.advisories[0].rationale)
+        self.assertEqual(
+            "delivered work is unaffected", with_ledger.advisories[0].rationale
+        )
         self.assertEqual("", without_ledger.advisories[0].rationale)
-        self.assertEqual([c.grade for c in with_ledger.advisories],
-                         [c.grade for c in without_ledger.advisories])
+        self.assertEqual(
+            [c.grade for c in with_ledger.advisories],
+            [c.grade for c in without_ledger.advisories],
+        )
 
 
 class SubThresholdFindingsStillMergeTest(SchedulerFixture):
@@ -481,15 +656,22 @@ class SubThresholdFindingsStillMergeTest(SchedulerFixture):
         kw.setdefault("review_ceiling", 3)
         return super().config(**kw)
 
-    def _review_stage(self, reviewer: ScriptedReviewer, ledgers: Dict[str, Path],
-                      reject_at: cr.FindingGrade = cr.DEFAULT_REJECT_GRADE):
+    def _review_stage(
+        self,
+        reviewer: ScriptedReviewer,
+        ledgers: Dict[str, Path],
+        reject_at: cr.FindingGrade = cr.DEFAULT_REJECT_GRADE,
+    ):
         store = make_store(self.root / "review-store")
 
-        def review(attempt, node, record, base_sha, output_sha):
+        def review(attempt, node, record, base_sha, output_sha, _resume_existing):
             digest = cr.review_digest(
-                run_id="run1", node_id=node.node_id, base_sha=base_sha,
+                run_id="run1",
+                node_id=node.node_id,
+                base_sha=base_sha,
                 output_sha=output_sha,
-                rubric_version=cr.CODE_RUBRIC.version)
+                rubric_version=cr.CODE_RUBRIC.version,
+            )
             ledger = self.root / "review" / digest / "findings.json"
             ledgers[node.node_id] = ledger
             objects = cr.review_objects((f"{node.node_id}.py",), output_sha)
@@ -497,77 +679,125 @@ class SubThresholdFindingsStillMergeTest(SchedulerFixture):
             return cr.review_attempt(
                 subject_digest=digest,
                 handoff=a_handoff(digest, matrix, node_id=node.node_id),
-                objects=objects, rubric=cr.CODE_RUBRIC, store=store,
+                objects=objects,
+                rubric=cr.CODE_RUBRIC,
+                store=store,
                 window_factory=reviewer.window_factory,
                 occupancy_reader=lambda _s: 0.1,
-                reject_at=reject_at, ledger_path=ledger)
+                reject_at=reject_at,
+                ledger_path=ledger,
+            )
 
         return review
 
     def test_a_node_with_only_sub_threshold_findings_merges(self):
         ledgers: Dict[str, Path] = {}
-        reviewer = ScriptedReviewer({
-            "diff.introduces_no_obvious_defect": (
-                "warning", REAL_MESSAGE, "delivered work is unaffected"),
-            "file.change_is_justified_by_the_instruction": (
-                "note", "build.py: the docstring is longer than it needs to be",
-                "cosmetic")})
+        reviewer = ScriptedReviewer(
+            {
+                "diff.introduces_no_obvious_defect": (
+                    "warning",
+                    REAL_MESSAGE,
+                    "delivered work is unaffected",
+                ),
+                "file.change_is_justified_by_the_instruction": (
+                    "note",
+                    "build.py: the docstring is longer than it needs to be",
+                    "cosmetic",
+                ),
+            }
+        )
         self.written["build"] = {"build.py": "ok\n"}
-        self.schedule([self.agent("build")],
-                      deps=self.deps(
-                          review_attempt=self._review_stage(reviewer, ledgers))
-                      ).run()
+        self.schedule(
+            [self.agent("build")],
+            deps=self.deps(review_attempt=self._review_stage(reviewer, ledgers)),
+        ).run()
 
         self.assertEqual(st.NodeState.MERGED.value, self.states()["build"])
         recorded = cr.read_finding_ledger(ledgers["build"])
         self.assertEqual(
-            {"diff.introduces_no_obvious_defect",
-             "file.change_is_justified_by_the_instruction"},
-            {c.check_id for c in recorded})
-        self.assertTrue(all(not c.rejects(cr.FindingGrade.ERROR)
-                            for c in recorded))
+            {
+                "diff.introduces_no_obvious_defect",
+                "file.change_is_justified_by_the_instruction",
+            },
+            {c.check_id for c in recorded},
+        )
+        self.assertTrue(all(not c.rejects(cr.FindingGrade.ERROR) for c in recorded))
 
     def test_one_error_grade_finding_rejects_the_same_lane(self):
-        """The control for the test above, with one grade changed and nothing
-        else: an ERROR is still a rejection, so grading did not delete the
-        check's teeth. Since §19 M35 a rejection no longer refuses the merge —
-        it is recorded against the attempt and the node merges on its counts —
-        so what this asserts is the recorded verdict, which is the part
-        grading owns."""
+        """An ERROR rejects the immutable candidate and prevents its merge."""
         ledgers: Dict[str, Path] = {}
-        reviewer = ScriptedReviewer({
-            "diff.introduces_no_obvious_defect": (
-                "error", REAL_MESSAGE,
-                "the node's stated work is to materialize the inventory and it "
-                "silently drops objects it cannot head")})
+        closed: List[str] = []
+        reviewer = ScriptedReviewer(
+            {
+                "diff.introduces_no_obvious_defect": (
+                    "error",
+                    REAL_MESSAGE,
+                    "the node's stated work is to materialize the inventory and it "
+                    "silently drops objects it cannot head",
+                )
+            }
+        )
         self.written["build"] = {"build.py": "ok\n"}
-        self.schedule([self.agent("build")],
-                      deps=self.deps(
-                          review_attempt=self._review_stage(reviewer, ledgers))
-                      ).run()
+        report = self.schedule(
+            [self.agent("build")],
+            deps=self.deps(
+                review_attempt=self._review_stage(reviewer, ledgers),
+                close_review=closed.append,
+            ),
+        ).run()
 
-        rows = self.store.attempts_for("run1", "build")
-        self.assertTrue(rows[0].extra[rp.REVIEW_REJECTED_KEY])
-        self.assertEqual(st.NodeState.MERGED.value, self.states()["build"])
-        self.assertIsNone(self.store.get_node("run1", "build").block_reason)
+        reviews = self.store.candidate_reviews("run1", "build::review")
+        self.assertGreaterEqual(len(reviews), 1)
+        self.assertTrue(
+            all(review.verdict is st.ReviewVerdict.REJECTED for review in reviews)
+        )
+        self.assertEqual(
+            len({review.candidate_sha for review in reviews}), len(reviews)
+        )
+        self.assertEqual(report.outcome, st.RunOutcome.BLOCKED)
+        self.assertEqual(st.NodeState.BLOCKED.value, self.states()["build"])
+        node = self.store.get_node("run1", "build")
+        self.assertIs(node.block_reason, st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
+        self.assertEqual(len(self.store.attempts_for("run1", "build")), 1)
+        spends = self.store.lane_retry_spends("run1", "build", limit=100)
+        self.assertEqual(
+            [spend.retry_class for spend in spends],
+            [
+                st.LaneRetryClass.REVIEW_REJECTION,
+                st.LaneRetryClass.REVIEW_REJECTION,
+                st.LaneRetryClass.SEMANTIC,
+                st.LaneRetryClass.SEMANTIC,
+            ],
+        )
+        self.assertEqual(closed, ["build"])
+        self.assertNotIn("build", report.merged)
 
 
 # ── A9: at or above the threshold still rejects ─────────────────────────────
 
-class AtThresholdFindingsRejectTest(unittest.TestCase):
 
+class AtThresholdFindingsRejectTest(unittest.TestCase):
     def test_one_error_grade_finding_rejects(self):
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.gate_is_passed_on_the_merits": (
-                    "error", "inventory.py:41 returns the literal the test "
-                    "asserts", "the behaviour the gate exists to witness is "
-                    "absent")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.gate_is_passed_on_the_merits": (
+                            "error",
+                            "inventory.py:41 returns the literal the test asserts",
+                            "the behaviour the gate exists to witness is absent",
+                        )
+                    }
+                ),
+            )
 
         self.assertIs(outcome.verdict, fin.Verdict.FAIL)
         self.assertFalse(outcome.passed)
-        self.assertEqual(["diff.gate_is_passed_on_the_merits"],
-                         [c.check_id for c in outcome.findings])
+        self.assertEqual(
+            ["diff.gate_is_passed_on_the_merits"],
+            [c.check_id for c in outcome.findings],
+        )
         self.assertIn("must be resolved", outcome.findings_text())
 
     def test_an_advisory_check_never_rejects_however_it_is_graded(self):
@@ -575,46 +805,66 @@ class AtThresholdFindingsRejectTest(unittest.TestCase):
         the rubric in code, so an ADVISORY question cannot be escalated into a
         rejection by grading its finding `error`."""
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.is_coherent_with_its_surroundings": (
-                    "error", "the naming is inconsistent",
-                    "the reviewer would like this to block")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.is_coherent_with_its_surroundings": (
+                            "error",
+                            "the naming is inconsistent",
+                            "the reviewer would like this to block",
+                        )
+                    }
+                ),
+            )
 
         self.assertTrue(outcome.passed)
-        self.assertEqual(["diff.is_coherent_with_its_surroundings"],
-                         [c.check_id for c in outcome.advisories])
+        self.assertEqual(
+            ["diff.is_coherent_with_its_surroundings"],
+            [c.check_id for c in outcome.advisories],
+        )
 
 
 # ── §6.2: the threshold is configuration, and it moves the outcome ──────────
 
-class ThresholdIsConfigurationTest(unittest.TestCase):
 
+class ThresholdIsConfigurationTest(unittest.TestCase):
     #: The same report both times. Only the installation's threshold differs.
-    SCRIPT = {"diff.introduces_no_obvious_defect": (
-        "warning", REAL_MESSAGE, "delivered work is unaffected")}
+    SCRIPT = {
+        "diff.introduces_no_obvious_defect": (
+            "warning",
+            REAL_MESSAGE,
+            "delivered work is unaffected",
+        )
+    }
 
     def test_the_same_report_passes_at_error_and_fails_at_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
-            lenient = run_review(Path(tmp) / "a", ScriptedReviewer(self.SCRIPT),
-                                 reject_at=cr.FindingGrade.ERROR)
+            lenient = run_review(
+                Path(tmp) / "a",
+                ScriptedReviewer(self.SCRIPT),
+                reject_at=cr.FindingGrade.ERROR,
+            )
         with tempfile.TemporaryDirectory() as tmp:
-            strict = run_review(Path(tmp) / "b", ScriptedReviewer(self.SCRIPT),
-                                reject_at=cr.FindingGrade.WARNING)
+            strict = run_review(
+                Path(tmp) / "b",
+                ScriptedReviewer(self.SCRIPT),
+                reject_at=cr.FindingGrade.WARNING,
+            )
 
         self.assertIs(fin.Verdict.PASS, lenient.verdict)
         self.assertIs(fin.Verdict.FAIL, strict.verdict)
-        self.assertEqual(["diff.introduces_no_obvious_defect"],
-                         [c.check_id for c in strict.findings])
+        self.assertEqual(
+            ["diff.introduces_no_obvious_defect"], [c.check_id for c in strict.findings]
+        )
 
     def test_the_threshold_is_read_from_the_installation_config(self):
         """End to end from `maestro.config.yaml`, because a threshold the
         loader does not carry is a threshold no deployment can set."""
         import maestro
 
-        self.assertIs(cr.FindingGrade.WARNING,
-                      maestro._config_reject_grade("warning"))
-        self.assertIs(cr.FindingGrade.NOTE,
-                      maestro._config_reject_grade("  NOTE  "))
+        self.assertIs(cr.FindingGrade.WARNING, maestro._config_reject_grade("warning"))
+        self.assertIs(cr.FindingGrade.NOTE, maestro._config_reject_grade("  NOTE  "))
         with self.assertRaises(maestro._MaestroConfigurationError):
             maestro._config_reject_grade("blocking")
 
@@ -622,16 +872,20 @@ class ThresholdIsConfigurationTest(unittest.TestCase):
         self.assertIs(cr.FindingGrade.ERROR, cr.DEFAULT_REJECT_GRADE)
 
     def test_the_grades_are_ordered_and_nothing_compares_them_by_hand(self):
-        self.assertTrue(cr.grade_at_or_above(cr.FindingGrade.ERROR,
-                                             cr.FindingGrade.WARNING))
-        self.assertFalse(cr.grade_at_or_above(cr.FindingGrade.NOTE,
-                                              cr.FindingGrade.WARNING))
-        self.assertTrue(cr.grade_at_or_above(cr.FindingGrade.WARNING,
-                                             cr.FindingGrade.WARNING))
+        self.assertTrue(
+            cr.grade_at_or_above(cr.FindingGrade.ERROR, cr.FindingGrade.WARNING)
+        )
+        self.assertFalse(
+            cr.grade_at_or_above(cr.FindingGrade.NOTE, cr.FindingGrade.WARNING)
+        )
+        self.assertTrue(
+            cr.grade_at_or_above(cr.FindingGrade.WARNING, cr.FindingGrade.WARNING)
+        )
         self.assertFalse(cr.grade_at_or_above(None, cr.FindingGrade.NOTE))
 
 
 # ── B8: rejecting without a located, justified finding is unrepresentable ───
+
 
 class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
     """The half of B8 that could not be retrofitted in Strav, so it is
@@ -648,31 +902,59 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
             cr.CodeReportCell.model_validate(cell)
 
     def test_a_finding_without_a_grade_does_not_parse(self):
-        self._refused({"check_id": "c", "object_id": "o", "status": "finding",
-                       "message": REAL_MESSAGE})
+        self._refused(
+            {
+                "check_id": "c",
+                "object_id": "o",
+                "status": "finding",
+                "message": REAL_MESSAGE,
+            }
+        )
 
     def test_a_finding_without_a_message_does_not_parse(self):
-        self._refused({"check_id": "c", "object_id": "o", "status": "finding",
-                       "grade": "error", "message": "   ",
-                       "grade_rationale": "it is broken",
-                       "scope": "in_scope"})
+        self._refused(
+            {
+                "check_id": "c",
+                "object_id": "o",
+                "status": "finding",
+                "grade": "error",
+                "message": "   ",
+                "grade_rationale": "it is broken",
+                "scope": "in_scope",
+            }
+        )
 
     def test_a_finding_without_a_reason_for_its_grade_does_not_parse(self):
-        self._refused({"check_id": "c", "object_id": "o", "status": "finding",
-                       "grade": "error", "message": REAL_MESSAGE,
-                       "grade_rationale": "  ", "scope": "in_scope"})
+        self._refused(
+            {
+                "check_id": "c",
+                "object_id": "o",
+                "status": "finding",
+                "grade": "error",
+                "message": REAL_MESSAGE,
+                "grade_rationale": "  ",
+                "scope": "in_scope",
+            }
+        )
 
     def test_a_cleared_cell_carrying_a_grade_does_not_parse(self):
-        self._refused({"check_id": "c", "object_id": "o", "status": "clear",
-                       "grade": "error"})
+        self._refused(
+            {"check_id": "c", "object_id": "o", "status": "clear", "grade": "error"}
+        )
 
     def test_a_graded_finding_parses(self):
         """§13.4's other half: the detector must acquit the real article."""
         parsed = cr.CodeReportCell.model_validate(
-            {"check_id": "c", "object_id": "o", "status": "finding",
-             "grade": "warning", "message": REAL_MESSAGE,
-             "grade_rationale": "delivered work is unaffected",
-             "scope": "in_scope"})
+            {
+                "check_id": "c",
+                "object_id": "o",
+                "status": "finding",
+                "grade": "warning",
+                "message": REAL_MESSAGE,
+                "grade_rationale": "delivered work is unaffected",
+                "scope": "in_scope",
+            }
+        )
         self.assertIs(cr.FindingGrade.WARNING, parsed.grade)
         self.assertIs(cr.FindingScope.IN_SCOPE, parsed.scope)
 
@@ -682,8 +964,7 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
 
         def strip_the_grade(report: Dict[str, Any]) -> None:
             for cell in report["cells"]:
-                if cell["status"] == "finding" and cell["check_id"].startswith(
-                        "diff."):
+                if cell["status"] == "finding" and cell["check_id"].startswith("diff."):
                     cell.pop("grade")
                     cell.pop("grade_rationale")
                     cell.pop("scope")
@@ -691,23 +972,41 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = make_store(Path(tmp))
             with self.assertRaises(pydantic.ValidationError):
-                run_review(Path(tmp), ScriptedReviewer(
-                    {"diff.introduces_no_obvious_defect": (
-                        "error", REAL_MESSAGE, "it is broken")},
-                    mutate=strip_the_grade), store=store)
+                run_review(
+                    Path(tmp),
+                    ScriptedReviewer(
+                        {
+                            "diff.introduces_no_obvious_defect": (
+                                "error",
+                                REAL_MESSAGE,
+                                "it is broken",
+                            )
+                        },
+                        mutate=strip_the_grade,
+                    ),
+                    store=store,
+                )
             self.assertFalse(
                 store.has("a" * 64),
-                "a report that does not parse minted a receipt anyway")
+                "a report that does not parse minted a receipt anyway",
+            )
 
     def test_the_derived_invariant_convicts_a_planted_fail(self):
         """B15: the invariant is an executed object, not only a schema, so a
         rewrite of the schema cannot silently drop it."""
         planted = cr.GradedVerdict(
-            verdict=fin.Verdict.FAIL, reject_at=cr.FindingGrade.ERROR,
-            cells=(cr.GradedCell(
-                check_id="diff.introduces_no_obvious_defect",
-                object_id="diff:abc", status=fin.CellStatus.CLEAR,
-                severity=fin.Severity.BLOCKING, grade=None),))
+            verdict=fin.Verdict.FAIL,
+            reject_at=cr.FindingGrade.ERROR,
+            cells=(
+                cr.GradedCell(
+                    check_id="diff.introduces_no_obvious_defect",
+                    object_id="diff:abc",
+                    status=fin.CellStatus.CLEAR,
+                    severity=fin.Severity.BLOCKING,
+                    grade=None,
+                ),
+            ),
+        )
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(planted)
 
@@ -715,73 +1014,123 @@ class RejectionWithoutALocatedFindingIsImpossibleTest(unittest.TestCase):
         """The shape grading introduces: a FAIL whose only finding is graded
         below the bar that decides rejection."""
         planted = cr.GradedVerdict(
-            verdict=fin.Verdict.FAIL, reject_at=cr.FindingGrade.ERROR,
-            cells=(cr.GradedCell(
-                check_id="diff.introduces_no_obvious_defect",
-                object_id="diff:abc", status=fin.CellStatus.FINDING,
-                severity=fin.Severity.BLOCKING, grade=cr.FindingGrade.WARNING,
-                message=REAL_MESSAGE, rationale="unaffected"),))
+            verdict=fin.Verdict.FAIL,
+            reject_at=cr.FindingGrade.ERROR,
+            cells=(
+                cr.GradedCell(
+                    check_id="diff.introduces_no_obvious_defect",
+                    object_id="diff:abc",
+                    status=fin.CellStatus.FINDING,
+                    severity=fin.Severity.BLOCKING,
+                    grade=cr.FindingGrade.WARNING,
+                    message=REAL_MESSAGE,
+                    rationale="unaffected",
+                ),
+            ),
+        )
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(planted)
 
     def test_the_derived_invariant_convicts_a_pass_that_carries_a_rejection(self):
         """The inverted shape, which is the one that would silently merge."""
         planted = cr.GradedVerdict(
-            verdict=fin.Verdict.PASS, reject_at=cr.FindingGrade.ERROR,
-            cells=(cr.GradedCell(
-                check_id="diff.introduces_no_obvious_defect",
-                object_id="diff:abc", status=fin.CellStatus.FINDING,
-                severity=fin.Severity.BLOCKING, grade=cr.FindingGrade.ERROR,
-                message=REAL_MESSAGE, rationale="the work is not done"),))
+            verdict=fin.Verdict.PASS,
+            reject_at=cr.FindingGrade.ERROR,
+            cells=(
+                cr.GradedCell(
+                    check_id="diff.introduces_no_obvious_defect",
+                    object_id="diff:abc",
+                    status=fin.CellStatus.FINDING,
+                    severity=fin.Severity.BLOCKING,
+                    grade=cr.FindingGrade.ERROR,
+                    message=REAL_MESSAGE,
+                    rationale="the work is not done",
+                ),
+            ),
+        )
         with self.assertRaises(cr.VerdictNotLocated):
             cr.require_located_findings(planted)
 
     def test_the_derived_invariant_acquits_the_real_article(self):
-        cr.require_located_findings(cr.GradedVerdict(
-            verdict=fin.Verdict.FAIL, reject_at=cr.FindingGrade.ERROR,
-            cells=(cr.GradedCell(
-                check_id="diff.introduces_no_obvious_defect",
-                object_id="diff:abc", status=fin.CellStatus.FINDING,
-                severity=fin.Severity.BLOCKING, grade=cr.FindingGrade.ERROR,
-                message=REAL_MESSAGE, rationale="the work is not done"),)))
-        cr.require_located_findings(cr.GradedVerdict(
-            verdict=fin.Verdict.PASS, reject_at=cr.FindingGrade.ERROR,
-            cells=(cr.GradedCell(
-                check_id="diff.introduces_no_obvious_defect",
-                object_id="diff:abc", status=fin.CellStatus.FINDING,
-                severity=fin.Severity.BLOCKING, grade=cr.FindingGrade.WARNING,
-                message=REAL_MESSAGE, rationale="unaffected"),)))
+        cr.require_located_findings(
+            cr.GradedVerdict(
+                verdict=fin.Verdict.FAIL,
+                reject_at=cr.FindingGrade.ERROR,
+                cells=(
+                    cr.GradedCell(
+                        check_id="diff.introduces_no_obvious_defect",
+                        object_id="diff:abc",
+                        status=fin.CellStatus.FINDING,
+                        severity=fin.Severity.BLOCKING,
+                        grade=cr.FindingGrade.ERROR,
+                        message=REAL_MESSAGE,
+                        rationale="the work is not done",
+                    ),
+                ),
+            )
+        )
+        cr.require_located_findings(
+            cr.GradedVerdict(
+                verdict=fin.Verdict.PASS,
+                reject_at=cr.FindingGrade.ERROR,
+                cells=(
+                    cr.GradedCell(
+                        check_id="diff.introduces_no_obvious_defect",
+                        object_id="diff:abc",
+                        status=fin.CellStatus.FINDING,
+                        severity=fin.Severity.BLOCKING,
+                        grade=cr.FindingGrade.WARNING,
+                        message=REAL_MESSAGE,
+                        rationale="unaffected",
+                    ),
+                ),
+            )
+        )
 
 
 # ── §6.5: the reviewer still cannot say what it must not say ───────────────
 
-class TheReviewerStillCannotDeclareAVerdictTest(unittest.TestCase):
 
+class TheReviewerStillCannotDeclareAVerdictTest(unittest.TestCase):
     def test_the_graded_schema_declares_no_verdict_and_no_severity(self):
-        self.assertEqual([], fin.find_forbidden_report_fields(
-            cr.CodeReviewerReport))
+        self.assertEqual([], fin.find_forbidden_report_fields(cr.CodeReviewerReport))
 
     def test_the_graded_schema_accepts_no_unknown_key(self):
-        self.assertEqual([], find_permissive_report_models(
-            cr.CodeReviewerReport))
+        self.assertEqual([], find_permissive_report_models(cr.CodeReviewerReport))
 
     def test_a_smuggled_severity_is_refused_unparsed(self):
         with self.assertRaises(pydantic.ValidationError):
             cr.CodeReportCell.model_validate(
-                {"check_id": "c", "object_id": "o", "status": "clear",
-                 "severity": "BLOCKING"})
+                {
+                    "check_id": "c",
+                    "object_id": "o",
+                    "status": "clear",
+                    "severity": "BLOCKING",
+                }
+            )
 
     def test_severity_is_stamped_from_the_rubric_not_from_the_report(self):
         with tempfile.TemporaryDirectory() as tmp:
-            outcome = run_review(Path(tmp), ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "note", REAL_MESSAGE, "cosmetic")}))
+            outcome = run_review(
+                Path(tmp),
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "note",
+                            REAL_MESSAGE,
+                            "cosmetic",
+                        )
+                    }
+                ),
+            )
             stamped = {c.check_id: c.severity for c in outcome.receipt.cells}
 
-        self.assertIs(fin.Severity.BLOCKING,
-                      stamped["diff.introduces_no_obvious_defect"])
-        self.assertIs(fin.Severity.ADVISORY,
-                      stamped["diff.is_coherent_with_its_surroundings"])
+        self.assertIs(
+            fin.Severity.BLOCKING, stamped["diff.introduces_no_obvious_defect"]
+        )
+        self.assertIs(
+            fin.Severity.ADVISORY, stamped["diff.is_coherent_with_its_surroundings"]
+        )
 
 
 class TheReviewerIsToldHowToGradeTest(unittest.TestCase):
@@ -791,19 +1140,19 @@ class TheReviewerIsToldHowToGradeTest(unittest.TestCase):
 
     def _rendered(self) -> str:
         matrix = fin.compute_matrix(
-            cr.CODE_RUBRIC, "a" * 64,
-            cr.review_objects(("inventory.py",), OUTPUT_SHA))
+            cr.CODE_RUBRIC, "a" * 64, cr.review_objects(("inventory.py",), OUTPUT_SHA)
+        )
         return a_handoff("a" * 64, matrix).render()
 
     def test_the_prompt_names_every_grade_and_the_field_that_carries_it(self):
         text = self._rendered()
-        for expected in ("grade", "grade_rationale", "error", "warning",
-                         "note"):
+        for expected in ("grade", "grade_rationale", "error", "warning", "note"):
             self.assertIn(expected, text)
 
     def test_the_prompt_still_forbids_a_verdict_and_a_severity(self):
-        self.assertIn("Do not write a verdict, a severity, or a score",
-                      self._rendered())
+        self.assertIn(
+            "Do not write a verdict, a severity, or a score", self._rendered()
+        )
 
     def test_the_prompt_shows_a_cleared_cell_without_a_grade(self):
         """The shape that would otherwise refuse a whole honest report: a
@@ -823,13 +1172,18 @@ class TheCanaryStillConvictsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = make_store(Path(tmp))
             with self.assertRaises(fin.ReportRejected) as caught:
-                run_review(Path(tmp), ScriptedReviewer(
-                    {}, clear_the_known_bad=True), store=store)
-            self.assertIs(fin.RejectionReason.CANARY_KNOWN_BAD_CLEARED,
-                          caught.exception.reason)
-            self.assertFalse(store.has("a" * 64),
-                             "a reviewer that cleared the control minted a "
-                             "receipt")
+                run_review(
+                    Path(tmp),
+                    ScriptedReviewer({}, clear_the_known_bad=True),
+                    store=store,
+                )
+            self.assertIs(
+                fin.RejectionReason.CANARY_KNOWN_BAD_CLEARED, caught.exception.reason
+            )
+            self.assertFalse(
+                store.has("a" * 64),
+                "a reviewer that cleared the control minted a receipt",
+            )
 
     def test_the_known_bad_control_never_rejects_the_diff_itself(self):
         """It is answered `finding` by construction, so counting it would fail
@@ -855,41 +1209,54 @@ class GradeSurvivesTheReceipt(unittest.TestCase):
     def _cell(self, grade):
         return fin.DerivedCell(
             check_id="diff.introduces_no_obvious_defect",
-            object_id="diff:abc", status=fin.CellStatus.FINDING,
-            severity=fin.Severity.BLOCKING, message="a located defect",
-            grade=grade)
+            object_id="diff:abc",
+            status=fin.CellStatus.FINDING,
+            severity=fin.Severity.BLOCKING,
+            message="a located defect",
+            grade=grade,
+        )
 
     def test_a_graded_cell_round_trips_through_the_receipt_bytes(self):
         receipt = fin.Receipt(
-            plan_digest="d" * 64, rubric_version="maestro-rubric.v2",
-            verdict=fin.Verdict.FAIL, cells=(self._cell("error"),),
+            plan_digest="d" * 64,
+            rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.FAIL,
+            cells=(self._cell("error"),),
             reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
-            created_at_epoch=1)
+            created_at_epoch=1,
+        )
         restored = fin.Receipt.from_bytes(receipt.to_bytes())
         self.assertEqual(restored.cells[0].grade, "error")
         self.assertEqual(restored.verdict, fin.Verdict.FAIL)
 
     def test_an_ungraded_cell_round_trips_as_none(self):
         receipt = fin.Receipt(
-            plan_digest="e" * 64, rubric_version="maestro-rubric.v2",
-            verdict=fin.Verdict.PASS, cells=(self._cell(None),),
+            plan_digest="e" * 64,
+            rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.PASS,
+            cells=(self._cell(None),),
             reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
-            created_at_epoch=1)
+            created_at_epoch=1,
+        )
         self.assertIsNone(fin.Receipt.from_bytes(receipt.to_bytes()).cells[0].grade)
 
     def test_a_receipt_without_the_grade_field_is_refused(self):
         """The frozen schema requires the key, so an old-shaped cell fails
         closed rather than silently deriving `None` for a grade that existed."""
         receipt = fin.Receipt(
-            plan_digest="f" * 64, rubric_version="maestro-rubric.v2",
-            verdict=fin.Verdict.FAIL, cells=(self._cell("error"),),
+            plan_digest="f" * 64,
+            rubric_version="maestro-rubric.v2",
+            verdict=fin.Verdict.FAIL,
+            cells=(self._cell("error"),),
             reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
-            created_at_epoch=1)
+            created_at_epoch=1,
+        )
         payload = json.loads(receipt.to_bytes())
         del payload["cells"][0]["grade"]
         with self.assertRaises(fin.ReceiptInvalid):
             fin.Receipt.from_bytes(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            )
 
 
 class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
@@ -910,16 +1277,23 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
 
     def _receipt(self, reject_at, *, digest="1"):
         return fin.Receipt(
-            plan_digest=digest * 64, rubric_version="maestro-rubric.v2",
+            plan_digest=digest * 64,
+            rubric_version="maestro-rubric.v2",
             verdict=fin.Verdict.PASS,
-            cells=(fin.DerivedCell(
-                check_id="diff.introduces_no_obvious_defect",
-                object_id="diff:abc", status=fin.CellStatus.FINDING,
-                severity=fin.Severity.BLOCKING, message="a located defect",
-                grade="warning"),),
-            reviewer=fin.ReviewerIdentity(route="omp", model="m",
-                                          session_id="s"),
-            created_at_epoch=1, reject_at=reject_at)
+            cells=(
+                fin.DerivedCell(
+                    check_id="diff.introduces_no_obvious_defect",
+                    object_id="diff:abc",
+                    status=fin.CellStatus.FINDING,
+                    severity=fin.Severity.BLOCKING,
+                    message="a located defect",
+                    grade="warning",
+                ),
+            ),
+            reviewer=fin.ReviewerIdentity(route="omp", model="m", session_id="s"),
+            created_at_epoch=1,
+            reject_at=reject_at,
+        )
 
     def test_the_threshold_round_trips_through_the_receipt_bytes(self):
         restored = fin.Receipt.from_bytes(self._receipt("warning").to_bytes())
@@ -931,25 +1305,35 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
         receipt is written by `maestro._deterministic_receipt` with no cells --
         so `None` still has to be the honest value rather than a default
         standing in for a threshold nobody ran under."""
-        restored = fin.Receipt.from_bytes(
-            self._receipt(None, digest="2").to_bytes())
+        restored = fin.Receipt.from_bytes(self._receipt(None, digest="2").to_bytes())
         self.assertIsNone(restored.reject_at)
 
     def test_a_receipt_without_the_threshold_field_is_refused(self):
         payload = json.loads(self._receipt("error", digest="3").to_bytes())
         del payload["reject_at"]
         with self.assertRaises(fin.ReceiptInvalid):
-            fin.Receipt.from_bytes(json.dumps(
-                payload, sort_keys=True, separators=(",", ":")).encode())
+            fin.Receipt.from_bytes(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            )
 
     def test_a_node_review_records_the_threshold_it_ran_under(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = make_store(root)
-            run_review(root, ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
-                reject_at=cr.FindingGrade.ERROR, store=store)
+            run_review(
+                root,
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        )
+                    }
+                ),
+                reject_at=cr.FindingGrade.ERROR,
+                store=store,
+            )
             self.assertEqual("error", store.load("a" * 64).reject_at)
 
     def test_a_replay_partitions_against_the_recorded_threshold(self):
@@ -961,11 +1345,21 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
             root = Path(tmp)
             store = make_store(root)
             ledger = root / "findings.json"
-            first = run_review(root, ScriptedReviewer({
-                "diff.introduces_no_obvious_defect": (
-                    "warning", REAL_MESSAGE, "delivered work is unaffected")}),
-                reject_at=cr.FindingGrade.ERROR, ledger_path=ledger,
-                store=store)
+            first = run_review(
+                root,
+                ScriptedReviewer(
+                    {
+                        "diff.introduces_no_obvious_defect": (
+                            "warning",
+                            REAL_MESSAGE,
+                            "delivered work is unaffected",
+                        )
+                    }
+                ),
+                reject_at=cr.FindingGrade.ERROR,
+                ledger_path=ledger,
+                store=store,
+            )
             self.assertTrue(first.passed)
 
             def must_not_launch(_matrix):
@@ -974,34 +1368,49 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
             subjects = cr.review_objects(("inventory.py",), OUTPUT_SHA)
             matrix = fin.compute_matrix(cr.CODE_RUBRIC, "a" * 64, subjects)
             tightened = cr.review_attempt(
-                subject_digest="a" * 64, handoff=a_handoff("a" * 64, matrix),
-                objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
+                subject_digest="a" * 64,
+                handoff=a_handoff("a" * 64, matrix),
+                objects=subjects,
+                rubric=cr.CODE_RUBRIC,
+                store=store,
                 window_factory=must_not_launch,
                 occupancy_reader=lambda _s: 0.1,
-                reject_at=cr.FindingGrade.WARNING, ledger_path=ledger)
+                reject_at=cr.FindingGrade.WARNING,
+                ledger_path=ledger,
+            )
             os.remove(ledger)
             no_ledger = cr.review_attempt(
-                subject_digest="a" * 64, handoff=a_handoff("a" * 64, matrix),
-                objects=subjects, rubric=cr.CODE_RUBRIC, store=store,
+                subject_digest="a" * 64,
+                handoff=a_handoff("a" * 64, matrix),
+                objects=subjects,
+                rubric=cr.CODE_RUBRIC,
+                store=store,
                 window_factory=must_not_launch,
                 occupancy_reader=lambda _s: 0.1,
-                reject_at=cr.FindingGrade.WARNING, ledger_path=ledger)
+                reject_at=cr.FindingGrade.WARNING,
+                ledger_path=ledger,
+            )
 
         for outcome in (tightened, no_ledger):
             self.assertTrue(outcome.replayed)
             self.assertTrue(outcome.passed)
-            self.assertEqual((), outcome.findings,
-                             "a merged finding replayed as a rejection under a "
-                             "threshold the review never ran under")
-            self.assertEqual([cr.FindingGrade.WARNING],
-                             [c.grade for c in outcome.advisories])
+            self.assertEqual(
+                (),
+                outcome.findings,
+                "a merged finding replayed as a rejection under a "
+                "threshold the review never ran under",
+            )
+            self.assertEqual(
+                [cr.FindingGrade.WARNING], [c.grade for c in outcome.advisories]
+            )
 
     def test_a_receipt_predating_the_field_falls_back_to_the_configured_one(self):
         """The only number available for a receipt written before the field
         existed, and the old behaviour, kept where it is still the truth."""
         receipt = self._receipt(None, digest="4")
         findings, advisories, unreachable = cr._replayed_findings(
-            receipt, None, cr.FindingGrade.WARNING)
+            receipt, None, cr.FindingGrade.WARNING
+        )
         self.assertEqual(1, len(findings))
         self.assertEqual((), advisories)
         self.assertEqual((), unreachable)
@@ -1009,7 +1418,8 @@ class TheThresholdSurvivesTheReceiptToo(unittest.TestCase):
     def test_a_threshold_this_version_cannot_name_does_not_fail_the_replay(self):
         receipt = self._receipt("catastrophe", digest="5")
         findings, advisories, unreachable = cr._replayed_findings(
-            receipt, None, cr.FindingGrade.ERROR)
+            receipt, None, cr.FindingGrade.ERROR
+        )
         self.assertEqual((), findings)
         self.assertEqual(1, len(advisories))
         self.assertEqual((), unreachable)

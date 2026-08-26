@@ -26,9 +26,11 @@ Unreadable revisions read as *not submitted*. Pressing Enter again on a prompt
 that did go through costs a keystroke; believing an unproven submission costs the
 attempt, and then the node's whole retry budget.
 """
+
 from __future__ import annotations
 
 import sys
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,7 +38,7 @@ from pathlib import Path
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
-from adw_modules import launcher as lch          # noqa: E402
+from adw_modules import launcher as lch  # noqa: E402
 
 
 class FakeHerdr:
@@ -48,8 +50,13 @@ class FakeHerdr:
     `idle`, and which is exactly why the wait alone proves nothing.
     """
 
-    def __init__(self, stalls: int = 0, status_ok: bool = True,
-                 revision: object = 0, agent_status: str = "idle"):
+    def __init__(
+        self,
+        stalls: int = 0,
+        status_ok: bool = True,
+        revision: object = 0,
+        agent_status: str = "idle",
+    ):
         self.stalls = stalls
         self.status_ok = status_ok
         self.revision = revision
@@ -79,15 +86,20 @@ class FakeHerdr:
         return {}
 
     def count(self, *verb):
-        return sum(1 for call in self.calls if call[:len(verb)] == verb)
+        return sum(1 for call in self.calls if call[: len(verb)] == verb)
 
 
 class SubmissionProof(unittest.TestCase):
-
     def test_an_accepted_prompt_needs_no_recovery(self):
         herdr = FakeHerdr()
-        lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                until=("working", "idle"), sleep=lambda _s: None)
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=lambda _s: None,
+        )
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
     def test_a_working_agent_proves_acceptance_when_revision_is_static(self):
@@ -100,9 +112,14 @@ class SubmissionProof(unittest.TestCase):
 
         herdr = StaticWorking(revision=41, agent_status="working")
         lch.submit_agent_prompt(
-            herdr, "w1:p1", "@prompt", "agent",
-            until=("working", "idle"), working_proves=True,
-            sleep=lambda _s: None)
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            working_proves=True,
+            sleep=lambda _s: None,
+        )
         self.assertEqual(herdr.revision, 41)
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
@@ -113,17 +130,46 @@ class SubmissionProof(unittest.TestCase):
         does — so only the revision keeps the loop honest.
         """
         herdr = FakeHerdr(stalls=2)
-        lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                until=("working", "idle"), sleep=lambda _s: None)
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=lambda _s: None,
+        )
         # Enter was actually pressed, which is the whole point.
         self.assertGreaterEqual(herdr.count("agent", "send-keys"), 1)
+
+    def test_recovery_wait_cannot_match_the_still_idle_composer(self):
+        herdr = FakeHerdr(stalls=2)
+
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=lambda _s: None,
+        )
+
+        recovery_waits = [call for call in herdr.calls if call[:2] == ("agent", "wait")]
+        self.assertTrue(recovery_waits)
+        for call in recovery_waits:
+            self.assertIn("working", call)
+            self.assertNotIn("idle", call)
 
     def test_a_composer_that_never_accepts_is_refused_rather_than_reported_ok(self):
         herdr = FakeHerdr(stalls=99)
         with self.assertRaises(lch.PromptNotSubmitted):
-            lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                    until=("working", "idle"),
-                                    sleep=lambda _s: None)
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
         self.assertEqual(herdr.count("agent", "send-keys"), lch.SUBMIT_ATTEMPTS)
 
     def test_a_prompt_the_agent_finished_before_working_was_sampled_still_passes(self):
@@ -133,8 +179,9 @@ class SubmissionProof(unittest.TestCase):
         so the revision moved and the launch is not failed for being fast.
         """
         herdr = FakeHerdr()
-        lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                until=("idle",), sleep=lambda _s: None)
+        lch.submit_agent_prompt(
+            herdr, "w1:p1", "@prompt", "agent", until=("idle",), sleep=lambda _s: None
+        )
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
     def test_a_legible_counter_that_never_moves_is_a_genuine_refusal(self):
@@ -145,12 +192,16 @@ class SubmissionProof(unittest.TestCase):
         """
         herdr = FakeHerdr(stalls=99, revision=41)
         with self.assertRaises(lch.PromptNotSubmitted) as caught:
-            lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                    until=("working", "idle"),
-                                    sleep=lambda _s: None)
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
         self.assertIn("AGENT_PROMPT_UNSUBMITTED", str(caught.exception))
-        self.assertEqual(lch.classify_error(caught.exception),
-                         lch.ErrorClass.EXECUTION)
+        self.assertEqual(lch.classify_error(caught.exception), lch.ErrorClass.EXECUTION)
 
     def test_an_unreadable_revision_is_unproven_rather_than_unsubmitted(self):
         """D9. "I could not read the meter" is not "the meter did not move".
@@ -162,14 +213,18 @@ class SubmissionProof(unittest.TestCase):
         """
         herdr = FakeHerdr(revision=None)
         with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
-            lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                    until=("working", "idle"),
-                                    sleep=lambda _s: None)
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
         self.assertIn("AGENT_PROMPT_UNOBSERVED", str(caught.exception))
         self.assertNotIsInstance(caught.exception, lch.PromptNotSubmitted)
         # Reuses the existing transient class; no new retry class exists.
-        self.assertEqual(lch.classify_error(caught.exception),
-                         lch.ErrorClass.TRANSIENT)
+        self.assertEqual(lch.classify_error(caught.exception), lch.ErrorClass.TRANSIENT)
         # Fails closed all the same: recovery was attempted every round.
         self.assertEqual(herdr.count("agent", "send-keys"), lch.SUBMIT_ATTEMPTS)
 
@@ -180,6 +235,7 @@ class SubmissionProof(unittest.TestCase):
         counter that is legible again afterwards does not retroactively supply
         the missing baseline, so this is still unproven -- but transiently so.
         """
+
         class BlindBaseline(FakeHerdr):
             def __init__(self) -> None:
                 super().__init__(revision=5)
@@ -194,9 +250,14 @@ class SubmissionProof(unittest.TestCase):
 
         herdr = BlindBaseline()
         with self.assertRaises(lch.PromptSubmissionUnobservable):
-            lch.submit_agent_prompt(herdr, "w1:p1", "@prompt", "agent",
-                                    until=("working", "idle"),
-                                    sleep=lambda _s: None)
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
 
     def test_a_counter_that_becomes_unreadable_after_a_good_baseline_is_unproven(self):
         """The mirror case: baseline legible, every later read fails.
@@ -204,6 +265,7 @@ class SubmissionProof(unittest.TestCase):
         There is still no before/after pair, so there is still no fact about
         the prompt -- only one about herdr.
         """
+
         class GoesBlind(FakeHerdr):
             def __init__(self) -> None:
                 super().__init__(stalls=99, revision=5)
@@ -217,9 +279,14 @@ class SubmissionProof(unittest.TestCase):
                 return super().__call__(*argv, **kwargs)
 
         with self.assertRaises(lch.PromptSubmissionUnobservable):
-            lch.submit_agent_prompt(GoesBlind(), "w1:p1", "@prompt", "agent",
-                                    until=("working", "idle"),
-                                    sleep=lambda _s: None)
+            lch.submit_agent_prompt(
+                GoesBlind(),
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
 
     def test_a_non_stall_failure_is_raised_rather_than_retried(self):
         class Broken(FakeHerdr):
@@ -229,30 +296,33 @@ class SubmissionProof(unittest.TestCase):
                 return super().__call__(*argv, **kwargs)
 
         with self.assertRaises(RuntimeError) as caught:
-            lch.submit_agent_prompt(Broken(), "w1:p1", "@prompt", "agent",
-                                    sleep=lambda _s: None)
+            lch.submit_agent_prompt(
+                Broken(), "w1:p1", "@prompt", "agent", sleep=lambda _s: None
+            )
         self.assertIn("pane_not_found", str(caught.exception))
 
 
-class OmpSubmitsPromptAfterReadiness(unittest.TestCase):
-    """OMP starts empty; the complete node prompt follows readiness.
-
-    Startup positional delivery races OMP initialization and can execute only
-    the prompt's leading command. The argv therefore contains configuration
-    only; `HerdrLauncher.launch` owns post-readiness atomic submission.
-    """
+class OmpStartsAtInteractiveComposer(unittest.TestCase):
+    """OMP startup argv never races the immutable prompt against readiness."""
 
     def _spec(self, tmp):
         return lch.LaunchSpec(
-            correlation_token="t", worktree=Path(tmp), prompt_path=Path(tmp) / "p.txt",
-            envelope_path=Path(tmp) / "e.json", route="omp", model="x-ai/grok-4.6",
-            effort="high", profile="grok", session_dir=Path(tmp) / "session")
+            correlation_token="t",
+            worktree=Path(tmp),
+            prompt_path=Path(tmp) / "p.txt",
+            envelope_path=Path(tmp) / "e.json",
+            route="omp",
+            model="x-ai/grok-4.6",
+            effort="high",
+            profile="grok",
+            session_dir=Path(tmp) / "session",
+        )
 
     def test_startup_argv_contains_no_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = self._spec(tmp)
             argv = lch.build_omp_argv(Path("/bin/omp"), spec)
-            self.assertNotIn("@{0}".format(spec.prompt_path.resolve()), argv)
+            self.assertFalse(any(arg.startswith("@") for arg in argv))
             self.assertIn("--profile", argv)
             self.assertEqual(argv[argv.index("--profile") + 1], "grok")
 
@@ -266,20 +336,119 @@ class OmpSubmitsPromptAfterReadiness(unittest.TestCase):
             self.assertFalse(any(arg.startswith("@") for arg in argv))
 
 
-class PaneRevision(unittest.TestCase):
+class PersistentHandleSubmission(unittest.TestCase):
+    """A repair turn reuses a proven actor rather than launching a lookalike."""
 
+    def _runtime(self, herdr, handle):
+        runtime = object.__new__(lch.HerdrLauncher)
+        runtime._handles_lock = threading.RLock()
+        runtime._handles = {handle.correlation_token: handle}
+        runtime._herdr = herdr
+        return runtime
+
+    def test_resubmission_requires_the_registered_pane_actor_and_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "repair.md"
+            prompt.write_text("repair", encoding="utf-8")
+            token = "run-build-a1"
+            name = lch.agent_name_for(token)
+
+            class BoundHerdr(FakeHerdr):
+                def __call__(self, *argv, **kwargs):
+                    if argv[:2] == ("pane", "get"):
+                        self.calls.append(argv)
+                        return {
+                            "result": {
+                                "pane": {
+                                    "pane_id": "w1:p1",
+                                    "cwd": str(root),
+                                    "revision": self.revision,
+                                }
+                            }
+                        }
+                    if argv[:2] == ("agent", "get"):
+                        self.calls.append(argv)
+                        return {
+                            "result": {
+                                "agent": {
+                                    "name": name,
+                                    "pane_id": "w1:p1",
+                                    "status": self.agent_status,
+                                }
+                            }
+                        }
+                    return super().__call__(*argv, **kwargs)
+
+            handle = lch.LaunchHandle(token, "w1:p1", name, root, environment={})
+            herdr = BoundHerdr()
+            runtime = self._runtime(herdr, handle)
+            self.assertIs(runtime.resubmit(handle, prompt), handle)
+            self.assertEqual(herdr.count("agent", "prompt"), 1)
+
+            wrong = lch.LaunchHandle(
+                token, "w1:p1", name, root / "other", environment={}
+            )
+            with self.assertRaises(lch.HandleAdoptionRefused):
+                runtime.resubmit(wrong, prompt)
+
+    def test_completed_turn_waits_for_idle_instead_of_sampling_working(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token = "run-build-a1"
+            handle = lch.LaunchHandle(
+                token,
+                "w1:p1",
+                lch.agent_name_for(token),
+                root,
+                environment={"MAESTRO_TEST_ENV": "retained"},
+            )
+            herdr = FakeHerdr(agent_status="working")
+            runtime = self._runtime(herdr, handle)
+            runtime._verified_handle_binding = lambda _handle: None
+            observed = []
+            call = runtime._herdr
+            runtime._herdr = lambda *args, **kwargs: (
+                observed.append(kwargs.get("env")) or call(*args, **kwargs)
+            )
+
+            runtime.wait_for_idle(handle, timeout_s=7.0)
+
+            waits = [call for call in herdr.calls if call[:2] == ("agent", "wait")]
+            self.assertEqual(len(waits), 1)
+            self.assertEqual(waits[0][2:5], (handle.agent_name, "--until", "idle"))
+            self.assertIn("7000", waits[0])
+            self.assertTrue(observed)
+            self.assertTrue(all(env == handle.environment for env in observed))
+
+    def test_completed_done_turn_is_already_reusable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token = "run-build-a1"
+            handle = lch.LaunchHandle(
+                token, "w1:p1", lch.agent_name_for(token), root, environment={}
+            )
+            herdr = FakeHerdr(agent_status="done")
+            runtime = self._runtime(herdr, handle)
+            runtime._verified_handle_binding = lambda _handle: None
+
+            runtime.wait_for_idle(handle, timeout_s=7.0)
+
+            waits = [call for call in herdr.calls if call[:2] == ("agent", "wait")]
+            self.assertEqual(waits, [])
+
+
+class PaneRevision(unittest.TestCase):
     def test_the_counter_is_read_from_the_typed_payload(self):
-        self.assertEqual(
-            lch.pane_revision(FakeHerdr(revision=7), "w1:p1"), 7)
+        self.assertEqual(lch.pane_revision(FakeHerdr(revision=7), "w1:p1"), 7)
 
     def test_anything_unreadable_is_none_rather_than_a_guess(self):
         def broken(*_argv, **_kwargs):
             raise RuntimeError("herdr down")
+
         self.assertIsNone(lch.pane_revision(broken, "w1:p1"))
-        self.assertIsNone(
-            lch.pane_revision(lambda *a, **k: {"result": {}}, "w1:p1"))
-        self.assertIsNone(
-            lch.pane_revision(FakeHerdr(revision="1"), "w1:p1"))
+        self.assertIsNone(lch.pane_revision(lambda *a, **k: {"result": {}}, "w1:p1"))
+        self.assertIsNone(lch.pane_revision(FakeHerdr(revision="1"), "w1:p1"))
 
 
 if __name__ == "__main__":

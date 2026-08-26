@@ -1,4 +1,5 @@
 import { NodeDagView } from "@/components/NodeDagView";
+import { ReviewLifecycleTable } from "@/components/ReviewLifecycleTable";
 import { RunChrome, loadRunOrBanner } from "@/components/RunFrame";
 import { SourceBanner } from "@/components/SourceBanner";
 import { StatCard } from "@/components/StatCard";
@@ -73,6 +74,7 @@ export default async function RunPage({
           </div>
         </section>
       )}
+      <ReviewLifecycleTable run={run} />
       <NodeDagView nodes={run.nodes} runId={runId} sourceId={sourceId} />
       <section className="panel section-panel">
         <div className="section-heading">

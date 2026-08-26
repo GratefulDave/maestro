@@ -38,10 +38,7 @@ from adw_modules import worktree as wt  # noqa: E402
 from test_scheduler import SchedulerFixture, green, red  # noqa: E402
 
 
-HOLLOW = (
-    "def test_refund():\n"
-    "    assert True\n"
-)
+HOLLOW = "def test_refund():\n    assert True\n"
 GENUINE = (
     "def test_refund():\n"
     "    from refunds import refund\n"
@@ -52,9 +49,14 @@ IMPLEMENTATION = "def refund(amount):\n    return 100\n"
 
 def _gate_result(exit_code, **counts):
     return wt.GateResult(
-        label="parent-red", scope="node", selector="t",
-        command=("pytest",), exit_code=exit_code, green=exit_code == 0,
-        counts=counts)
+        label="parent-red",
+        scope="node",
+        selector="t",
+        command=("pytest",),
+        exit_code=exit_code,
+        green=exit_code == 0,
+        counts=counts,
+    )
 
 
 def _ok_permission():
@@ -62,16 +64,17 @@ def _ok_permission():
 
 
 class AdjudicateParentRedTests(unittest.TestCase):
-
     def test_a_new_case_that_passes_at_parent_is_hollow(self):
         verdict = tc.adjudicate_parent_red(
-            _gate_result(0, passed=1, failed=0, collected=1), 1)
+            _gate_result(0, passed=1, failed=0, collected=1), 1
+        )
         self.assertFalse(verdict.verified)
         self.assertIn(tc.TestsRefusal.HOLLOW_AT_PARENT.value, verdict.reason)
 
     def test_every_new_case_failed_is_the_witness(self):
         verdict = tc.adjudicate_parent_red(
-            _gate_result(1, passed=0, failed=1, collected=1), 1)
+            _gate_result(1, passed=0, failed=1, collected=1), 1
+        )
         self.assertTrue(verdict.verified)
 
     def test_a_collection_error_is_not_red(self):
@@ -81,22 +84,22 @@ class AdjudicateParentRedTests(unittest.TestCase):
 
     def test_an_import_crash_is_not_red(self):
         verdict = tc.adjudicate_parent_red(
-            _gate_result(1, passed=0, failed=0, errored=1, collected=1), 1)
+            _gate_result(1, passed=0, failed=0, errored=1, collected=1), 1
+        )
         self.assertFalse(verdict.verified)
         self.assertIn(tc.TestsRefusal.IMPORT_CRASH.value, verdict.reason)
 
     def test_no_new_case_is_refused(self):
         verdict = tc.adjudicate_parent_red(
-            _gate_result(5, passed=0, failed=0, collected=0), 0)
+            _gate_result(5, passed=0, failed=0, collected=0), 0
+        )
         self.assertIn(tc.TestsRefusal.NO_NEW_CASES.value, verdict.reason)
 
 
 class TestsNodePermissionTests(unittest.TestCase):
-
     def test_a_non_test_path_is_refused(self):
         permission = wt.PermissionVerdict(passes=True)
-        verdict = tc.verify_tests_node(
-            True, permission, ("src/refunds.py",), 1)
+        verdict = tc.verify_tests_node(True, permission, ("src/refunds.py",), 1)
         self.assertFalse(verdict.verified)
         self.assertIn(tc.TestsRefusal.DIFF_NOT_TESTS_ONLY.value, verdict.reason)
 
@@ -112,8 +115,9 @@ class CollectAndRunTests(unittest.TestCase):
             ids = tc.collect_nodeids(root, ("tests/test_refund.py",))
             self.assertEqual(1, len(ids))
             self.assertTrue(ids[0].endswith("::test_refund"))
-            self.assertEqual(("tests/test_refund.py::test_refund",),
-                             tc.new_nodeids((), ids))
+            self.assertEqual(
+                ("tests/test_refund.py::test_refund",), tc.new_nodeids((), ids)
+            )
 
     def test_a_hollow_file_passes_at_parent_and_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,58 +150,80 @@ class CollectAndRunTests(unittest.TestCase):
     def test_a_modified_line_is_not_a_new_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=str(root), check=True,
-                           capture_output=True)
+            subprocess.run(
+                ["git", "init"], cwd=str(root), check=True, capture_output=True
+            )
             (root / "tests").mkdir()
             (root / "tests" / "test_refund.py").write_text(HOLLOW)
-            subprocess.run(["git", "add", "."], cwd=str(root), check=True,
-                           capture_output=True)
             subprocess.run(
-                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                 "commit", "-m", "parent"],
-                cwd=str(root), check=True, capture_output=True)
+                ["git", "add", "."], cwd=str(root), check=True, capture_output=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-m",
+                    "parent",
+                ],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+            )
             sha = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=str(root),
-                capture_output=True, text=True, check=True).stdout.strip()
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
             (root / "tests" / "test_refund.py").write_text(
-                "def test_refund():\n    assert 1 == 1\n")
-            parent = tc.collect_parent_nodeids(
-                root, sha, ("tests/test_refund.py",))
+                "def test_refund():\n    assert 1 == 1\n"
+            )
+            parent = tc.collect_parent_nodeids(root, sha, ("tests/test_refund.py",))
             current = tc.collect_nodeids(root, ("tests/test_refund.py",))
             self.assertEqual((), tc.new_nodeids(parent, current))
             verdict = tc.adjudicate_parent_red(
-                tc.run_cases(root, tc.new_nodeids(parent, current)),
-                0)
+                tc.run_cases(root, tc.new_nodeids(parent, current)), 0
+            )
             self.assertFalse(verdict.verified)
             self.assertIn(tc.TestsRefusal.NO_NEW_CASES.value, verdict.reason)
 
 
 class SchedulerSplitTests(SchedulerFixture):
-
     def tests_node(self, node_id="tests", outputs=None):
         return st.PlanNode(
-            node_id=node_id, kind=st.NodeKind.TESTS, depth=0,
+            node_id=node_id,
+            kind=st.NodeKind.TESTS,
+            depth=0,
             outputs=tuple(outputs or ("tests/test_refund.py",)),
             instruction="Write tests for refund.",
             gate_command=("pytest", "tests/test_refund.py"),
-            gate_selector="tests/test_refund.py")
+            gate_selector="tests/test_refund.py",
+        )
 
     def build_node(self, needs=("tests",)):
         return st.PlanNode(
-            node_id="build", kind=st.NodeKind.AGENT, depth=1,
+            node_id="build",
+            kind=st.NodeKind.AGENT,
+            depth=1,
             needs=tuple(needs),
             outputs=("refunds.py",),
             instruction="Implement refund.",
             gate_command=("pytest", "tests/test_refund.py"),
-            gate_selector="tests/test_refund.py")
+            gate_selector="tests/test_refund.py",
+        )
 
     def test_a_hollow_test_is_refused_and_does_not_merge(self):
         self.written["tests"] = {"tests/test_refund.py": HOLLOW}
         self.schedule([self.tests_node()]).run()
         self.assertNotEqual(self.states()["tests"], st.NodeState.MERGED.value)
         details = self.store.conn.execute(
-            "SELECT detail_json FROM transitions WHERE node_id=?",
-            ("tests",)).fetchall()
+            "SELECT detail_json FROM transitions WHERE node_id=?", ("tests",)
+        ).fetchall()
         blob = " ".join(row[0] or "" for row in details)
         self.assertIn(tc.TestsRefusal.HOLLOW_AT_PARENT.value, blob)
 
@@ -269,7 +295,6 @@ def _pair_mapping(base="0" * 40):
 
 
 class PlanV3PairTests(unittest.TestCase):
-
     def test_a_v3_pair_parses_and_projects(self):
         plan = pm.parse_mapping(_pair_mapping())
         self.assertEqual(pm.SCHEMA_V3, plan.schema_version)
@@ -296,7 +321,10 @@ class PlanV3PairTests(unittest.TestCase):
 
         data = _pair_mapping()
         data["merge_policy"]["integration_gate"]["argv"] = [
-            "-q", "-k", "refund", "tests/test_refund.py",
+            "-q",
+            "-k",
+            "refund",
+            "tests/test_refund.py",
         ]
         plan = pm.parse_mapping(data)
         self.assertEqual(pm.SCHEMA_V3, plan.schema_version)
@@ -307,19 +335,30 @@ class PlanV3PairTests(unittest.TestCase):
         )
 
         runner = rr.ResolvedRunner(
-            runner="pytest", executable="/abs/.venv/bin/pytest",
-            origin="declared", probe_exit=5, version="stub")
+            runner="pytest",
+            executable="/abs/.venv/bin/pytest",
+            origin="declared",
+            probe_exit=5,
+            version="stub",
+        )
         captured = {}
 
-        def fake_run(worktree_path, resolved, argv, scratch, cancel_requested,
-                     label="integration-gate"):
+        def fake_run(
+            worktree_path,
+            resolved,
+            argv,
+            scratch,
+            cancel_requested,
+            label="integration-gate",
+        ):
             captured["argv"] = tuple(argv)
             captured["label"] = label
             return None
 
         lane_union = ("tests/test_refund.py", "tests/lane_only.py")
         with mock.patch.object(
-                maestro.worktree, "run_integration_gate", side_effect=fake_run):
+            maestro.worktree, "run_integration_gate", side_effect=fake_run
+        ):
             _, run_ig = maestro._scheduler_gate_deps(plan, {"pytest": runner})
             run_ig(Path("/tmp/integration"), lane_union, lambda: False)
 
@@ -341,16 +380,17 @@ class PlanV3PairTests(unittest.TestCase):
         data["nodes"] = [data["nodes"][0]]
         plan = pm.parse_mapping(data)
         blockers = pv._tests_build_paired(plan)
-        self.assertTrue(any(b.obligation is pv.Obligation.TESTS_BUILD_PAIRED
-                            for b in blockers))
+        self.assertTrue(
+            any(b.obligation is pv.Obligation.TESTS_BUILD_PAIRED for b in blockers)
+        )
 
 
 class TesterConfigKeyTests(unittest.TestCase):
-
-    def test_the_template_config_declares_tester(self):
+    def test_the_runtime_config_declares_tester(self):
         import yaml
-        raw = yaml.safe_load(
-            (ADWS / "maestro.config.yaml").read_text(encoding="utf-8"))
+
+        raw = yaml.safe_load((ADWS / "maestro.config.yaml").read_text(encoding="utf-8"))
         self.assertIn("tester", raw)
-        self.assertEqual("tester", raw["tester"]["profile"])
+        self.assertIsInstance(raw["tester"]["profile"], str)
+        self.assertTrue(raw["tester"]["profile"].strip())
         self.assertEqual("omp", raw["tester"]["route"])

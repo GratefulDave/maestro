@@ -113,6 +113,10 @@ class HeadMoved(WorktreeError):
     """
 
 
+class InvalidCandidateParent(WorktreeError):
+    """A next-candidate cycle did not name one canonical commit object."""
+
+
 class CompareAndSwapRefused(WorktreeError):
     """The attempt ref moved under the harness, so the swap refused (§8.4).
 
@@ -133,16 +137,21 @@ class StagingMismatch(WorktreeError):
     of passing a tautology. Also fails the attempt ENVIRONMENTAL.
     """
 
+
 class GateCancelled(WorktreeError):
     """A gate stopped without a result after its owned process group quiesced."""
 
 
-
-
 # ── git plumbing ────────────────────────────────────────────────────────────
 
-def _git(cwd: Path, *args: str, env: Optional[Mapping[str, str]] = None,
-         check: bool = True, stdin: Optional[str] = None) -> "subprocess.CompletedProcess":
+
+def _git(
+    cwd: Path,
+    *args: str,
+    env: Optional[Mapping[str, str]] = None,
+    check: bool = True,
+    stdin: Optional[str] = None,
+) -> "subprocess.CompletedProcess":
     """One git invocation. Every git call in this module goes through here.
 
     `env` is merged over the process environment rather than replacing it,
@@ -161,7 +170,8 @@ def _git(cwd: Path, *args: str, env: Optional[Mapping[str, str]] = None,
     )
     if check and result.returncode != 0:
         raise WorktreeError(
-            f"git {' '.join(args)} in {cwd} -> {result.returncode}: {result.stderr.strip()}")
+            f"git {' '.join(args)} in {cwd} -> {result.returncode}: {result.stderr.strip()}"
+        )
     return result
 
 
@@ -177,8 +187,9 @@ def integration_head(repo: Path, branch: str) -> str:
     dependent node never sees its dependency's merged output, so its
     differential gate is red at both ends and `needs` is inert.
     """
-    result = _git(repo, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}",
-                  check=False)
+    result = _git(
+        repo, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False
+    )
     if result.returncode != 0:
         raise WorktreeError(f"integration branch {branch!r} does not resolve in {repo}")
     return result.stdout.strip()
@@ -191,11 +202,16 @@ def resolve_commit(repo: Path, spec: str) -> str:
     object id. Spelling is not identity: `abc1234` and the full SHA are
     the same commit when they resolve to the same object.
     """
-    result = _git(repo, "rev-parse", "--verify", "--quiet",
-                  "{0}^{{commit}}".format(spec), check=False)
+    result = _git(
+        repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "{0}^{{commit}}".format(spec),
+        check=False,
+    )
     if result.returncode != 0:
-        raise WorktreeError(
-            "revision {0!r} does not resolve in {1}".format(spec, repo))
+        raise WorktreeError("revision {0!r} does not resolve in {1}".format(spec, repo))
     return result.stdout.strip()
 
 
@@ -215,8 +231,9 @@ def is_object_digest(value: str) -> bool:
     return _OBJECT_DIGEST.fullmatch(value) is not None
 
 
-def is_valid_output_commit(repo: Path, output_sha: str,
-                           expected_base: Optional[str] = None) -> bool:
+def is_valid_output_commit(
+    repo: Path, output_sha: str, expected_base: Optional[str] = None
+) -> bool:
     """Whether a durable output identity names the recorded commit.
 
     A lifecycle row is authority only after its SHA has the canonical object
@@ -226,17 +243,29 @@ def is_valid_output_commit(repo: Path, output_sha: str,
     if not _OBJECT_DIGEST.fullmatch(output_sha):
         return False
     repo = Path(repo)
-    if _git(repo, "cat-file", "-e", f"{output_sha}^{{commit}}",
-            check=False).returncode != 0:
+    if (
+        _git(repo, "cat-file", "-e", f"{output_sha}^{{commit}}", check=False).returncode
+        != 0
+    ):
         return False
-    return (expected_base is None
-            or _git(repo, "merge-base", "--is-ancestor", expected_base, output_sha,
-                    check=False).returncode == 0)
+    return (
+        expected_base is None
+        or _git(
+            repo, "merge-base", "--is-ancestor", expected_base, output_sha, check=False
+        ).returncode
+        == 0
+    )
 
 
-def is_attempt_output_commit(repo: Path, output_sha: str, *, run_id: str,
-                             node_id: str, attempt_no: int,
-                             expected_base: str) -> bool:
+def is_attempt_output_commit(
+    repo: Path,
+    output_sha: str,
+    *,
+    run_id: str,
+    node_id: str,
+    attempt_no: int,
+    expected_base: str,
+) -> bool:
     """Whether SHA is the exact commit published by this durable attempt ref.
 
     An ancestry predicate alone accepts a later descendant that a forged
@@ -249,13 +278,19 @@ def is_attempt_output_commit(repo: Path, output_sha: str, *, run_id: str,
         return False
     ref = "refs/heads/{}".format(branch_name(run_id, node_id, attempt_no))
     resolved = _git(
-        Path(repo), "rev-parse", "--verify", "--quiet", "{}^{{commit}}".format(ref),
-        check=False)
+        Path(repo),
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "{}^{{commit}}".format(ref),
+        check=False,
+    )
     return resolved.returncode == 0 and resolved.stdout.strip() == output_sha
 
 
-def attempt_ref_commit(repo: Path, run_id: str, node_id: str,
-                       attempt_no: int) -> Optional[str]:
+def attempt_ref_commit(
+    repo: Path, run_id: str, node_id: str, attempt_no: int
+) -> Optional[str]:
     """The commit this attempt's own durable ref holds, or `None` if absent.
 
     The surviving-commit read. `commit_measured_delta` advances
@@ -274,18 +309,26 @@ def attempt_ref_commit(repo: Path, run_id: str, node_id: str,
     """
     ref = "refs/heads/{}".format(branch_name(run_id, node_id, attempt_no))
     resolved = _git(
-        Path(repo), "rev-parse", "--verify", "--quiet", "{}^{{commit}}".format(ref),
-        check=False)
+        Path(repo),
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "{}^{{commit}}".format(ref),
+        check=False,
+    )
     if resolved.returncode == 0:
         return resolved.stdout.strip()
     if resolved.returncode == 1:
         return None
     raise WorktreeError(
         "git rev-parse of {0} exited {1}: {2}".format(
-            ref, resolved.returncode, resolved.stderr.strip()))
+            ref, resolved.returncode, resolved.stderr.strip()
+        )
+    )
 
 
 # ── §8.2 identity ───────────────────────────────────────────────────────────
+
 
 def branch_name(run_id: str, node_id: str, attempt_no: int) -> str:
     """`maestro/{run_id}/{node_id}/a{attempt_no}` — one definition, here (§8.2)."""
@@ -333,20 +376,28 @@ class AttemptWorktree:
 def create_worktree(repo: Path, path: Path, branch: str, base: str) -> Path:
     """`git worktree add -b` — the branch creation *is* the collision guard (§8.2)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    result = _git(repo, "worktree", "add", "-q", "-b", branch, str(path), base,
-                  check=False)
+    result = _git(
+        repo, "worktree", "add", "-q", "-b", branch, str(path), base, check=False
+    )
     if result.returncode != 0:
         message = result.stderr.strip()
         if "already exists" in message:
             raise BranchCollision(
-                f"branch {branch!r} or worktree {path} already exists: {message}")
+                f"branch {branch!r} or worktree {path} already exists: {message}"
+            )
         raise WorktreeError(f"git worktree add failed: {message}")
     return path
 
 
-def create_attempt_worktree(repo: Path, run_id: str, node_id: str, attempt_no: int,
-                            integration_head: str, worktrees_root: Path,
-                            scratch_root: Path) -> AttemptWorktree:
+def create_attempt_worktree(
+    repo: Path,
+    run_id: str,
+    node_id: str,
+    attempt_no: int,
+    integration_head: str,
+    worktrees_root: Path,
+    scratch_root: Path,
+) -> AttemptWorktree:
     """Create the attempt's worktree and branch from the integration head (§8.1).
 
     The scratch directory and the harness-private index are both allocated
@@ -361,16 +412,26 @@ def create_attempt_worktree(repo: Path, run_id: str, node_id: str, attempt_no: i
     branch = branch_name(run_id, node_id, attempt_no)
     create_worktree(repo, path, branch, integration_head)
 
-    scratch = Path(scratch_root).resolve() / worktree_dirname(run_id, node_id, attempt_no)
+    scratch = Path(scratch_root).resolve() / worktree_dirname(
+        run_id, node_id, attempt_no
+    )
     scratch.mkdir(parents=True, exist_ok=True)
-    private_index = worktrees_root / f".index-{worktree_dirname(run_id, node_id, attempt_no)}"
+    private_index = (
+        worktrees_root / f".index-{worktree_dirname(run_id, node_id, attempt_no)}"
+    )
 
     tracked = frozenset(line for line in _out(path, "ls-files").splitlines() if line)
     return AttemptWorktree(
-        repo=repo, path=path.resolve(), branch=branch,
-        base=_out(path, "rev-parse", "HEAD"), scratch=scratch,
-        private_index=private_index, run_id=run_id, node_id=node_id,
-        attempt_no=attempt_no, tracked_at_base=tracked,
+        repo=repo,
+        path=path.resolve(),
+        branch=branch,
+        base=_out(path, "rev-parse", "HEAD"),
+        scratch=scratch,
+        private_index=private_index,
+        run_id=run_id,
+        node_id=node_id,
+        attempt_no=attempt_no,
+        tracked_at_base=tracked,
     )
 
 
@@ -390,7 +451,8 @@ def inventory_at_commit(repo: Path, sha: str) -> Inventory:
     result = _git(Path(repo), "ls-tree", "-r", "-z", sha, check=False)
     if result.returncode != 0:
         raise WorktreeError(
-            f"recorded base {sha} cannot be read as a tree: {result.stderr.strip()}")
+            f"recorded base {sha} cannot be read as a tree: {result.stderr.strip()}"
+        )
     inv: Inventory = {}
     for record in result.stdout.split("\0"):
         if not record:
@@ -409,8 +471,14 @@ def inventory_at_commit(repo: Path, sha: str) -> Inventory:
 
 
 def reopen_attempt_worktree(
-        repo: Path, run_id: str, node_id: str, attempt_no: int, base: str,
-        worktrees_root: Path, scratch_root: Path) -> AttemptWorktree:
+    repo: Path,
+    run_id: str,
+    node_id: str,
+    attempt_no: int,
+    base: str,
+    worktrees_root: Path,
+    scratch_root: Path,
+) -> AttemptWorktree:
     """Rebuild the attempt handle from durable identity. Does not create.
 
     Salvage has to measure in a1's own worktree against a1's own recorded
@@ -436,20 +504,31 @@ def reopen_attempt_worktree(
     if not path.is_dir():
         raise WorktreeError(f"attempt worktree {path} is gone")
     branch = branch_name(run_id, node_id, attempt_no)
-    scratch = Path(scratch_root).resolve() / worktree_dirname(run_id, node_id, attempt_no)
+    scratch = Path(scratch_root).resolve() / worktree_dirname(
+        run_id, node_id, attempt_no
+    )
     scratch.mkdir(parents=True, exist_ok=True)
-    private_index = worktrees_root / f".index-{worktree_dirname(run_id, node_id, attempt_no)}"
+    private_index = (
+        worktrees_root / f".index-{worktree_dirname(run_id, node_id, attempt_no)}"
+    )
     tracked_at_base = frozenset(inventory_at_commit(repo, base))
     return AttemptWorktree(
-        repo=repo, path=path.resolve(), branch=branch, base=base,
-        scratch=scratch, private_index=private_index,
-        run_id=run_id, node_id=node_id, attempt_no=attempt_no,
-        tracked_at_base=tracked_at_base, baseline=None,
+        repo=repo,
+        path=path.resolve(),
+        branch=branch,
+        base=base,
+        scratch=scratch,
+        private_index=private_index,
+        run_id=run_id,
+        node_id=node_id,
+        attempt_no=attempt_no,
+        tracked_at_base=tracked_at_base,
+        baseline=None,
     )
 
 
-
 # ── §8.3 the inventory tuple ────────────────────────────────────────────────
+
 
 def _mode_class(path: Path) -> str:
     """git's committable mode resolution for one path."""
@@ -476,8 +555,14 @@ def _blob_ids(worktree: Path, relpaths: Sequence[str]) -> List[str]:
     inline = [rel for rel in relpaths if "\n" not in rel]
     ids: Dict[str, str] = {}
     if inline:
-        out = _git(worktree, "hash-object", "-t", "blob", "--stdin-paths",
-                   stdin="\n".join(inline) + "\n").stdout.split()
+        out = _git(
+            worktree,
+            "hash-object",
+            "-t",
+            "blob",
+            "--stdin-paths",
+            stdin="\n".join(inline) + "\n",
+        ).stdout.split()
         if len(out) != len(inline):
             raise WorktreeError("git hash-object returned a mismatched number of ids")
         ids.update(zip(inline, out))
@@ -494,8 +579,9 @@ def _symlink_blob_id(worktree: Path, relpath: str) -> str:
     tuple change rather than an invisible one (§8.3).
     """
     target = os.readlink(worktree / relpath)
-    return _git(worktree, "hash-object", "-t", "blob", "--stdin",
-                stdin=target).stdout.strip()
+    return _git(
+        worktree, "hash-object", "-t", "blob", "--stdin", stdin=target
+    ).stdout.strip()
 
 
 def blob_text(worktree: Path, blob: str) -> Optional[str]:
@@ -522,7 +608,8 @@ def blob_text(worktree: Path, blob: str) -> Optional[str]:
     if result.returncode != 0:
         raise WorktreeError(
             f"git cat-file blob {blob} in {worktree} -> {result.returncode}: "
-            f"{result.stderr.strip()}")
+            f"{result.stderr.strip()}"
+        )
     return result.stdout
 
 
@@ -541,8 +628,15 @@ def _committable_paths(worktree: Path) -> List[str]:
     measuring. `--full-name` pins the paths to the tree's top so the caller's
     working directory cannot shift what a relative path means.
     """
-    raw = _git(worktree, "ls-files", "-z", "--full-name",
-               "--cached", "--others", "--exclude-standard").stdout
+    raw = _git(
+        worktree,
+        "ls-files",
+        "-z",
+        "--full-name",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ).stdout
     return [rel for rel in raw.split("\0") if rel]
 
 
@@ -610,7 +704,9 @@ def delta(before: Inventory, after: Inventory) -> InventoryDelta:
     """The measured delta between two inventories — the commit set (§8.3)."""
     return InventoryDelta(
         added=tuple(sorted(k for k in after if k not in before)),
-        changed=tuple(sorted(k for k in after if k in before and after[k] != before[k])),
+        changed=tuple(
+            sorted(k for k in after if k in before and after[k] != before[k])
+        ),
         removed=tuple(sorted(k for k in before if k not in after)),
     )
 
@@ -634,8 +730,9 @@ def take_baseline(attempt: AttemptWorktree) -> Inventory:
     return attempt.baseline
 
 
-def expected_inventory(baseline: Inventory, measured: InventoryDelta,
-                       after: Inventory) -> Inventory:
+def expected_inventory(
+    baseline: Inventory, measured: InventoryDelta, after: Inventory
+) -> Inventory:
     """The baseline unioned with the measured, committed delta (§8.3, item 36).
 
     This is what "clean" means at both cleanliness evaluations. It is built
@@ -647,11 +744,14 @@ def expected_inventory(baseline: Inventory, measured: InventoryDelta,
     expected: Inventory = dict(baseline)
     for rel in measured.added + measured.changed:
         if rel not in after:
-            raise WorktreeError(f"delta names {rel!r} but the after-inventory has no tuple")
+            raise WorktreeError(
+                f"delta names {rel!r} but the after-inventory has no tuple"
+            )
         expected[rel] = after[rel]
     for rel in measured.removed:
         expected.pop(rel, None)
     return expected
+
 
 # ── §8.3 cache redirection ──────────────────────────────────────────────────
 
@@ -674,10 +774,10 @@ def bind_lane_concurrency(concurrency: Optional[int]) -> None:
 
 
 def scratch_env(
-        scratch: Path,
-        *,
-        concurrency: Optional[int] = None,
-        cpu_count: Optional[int] = None,
+    scratch: Path,
+    *,
+    concurrency: Optional[int] = None,
+    cpu_count: Optional[int] = None,
 ) -> Dict[str, str]:
     """Point every cache this harness knows about at the attempt's scratch (§8.3).
 
@@ -721,7 +821,8 @@ def scratch_env(
         addopts = "-o cache_dir={}".format(cache_dir)
     else:
         addopts = "-n {} -o cache_dir={}".format(
-            pytest_worker_cap(lanes, cores), cache_dir)
+            pytest_worker_cap(lanes, cores), cache_dir
+        )
     values = {
         "XDG_CACHE_HOME": str(scratch / "xdg"),
         "TMPDIR": str(scratch / "tmp"),
@@ -734,20 +835,20 @@ def scratch_env(
     unforwarded = sorted(set(values) - set(SCRATCH_ENV_KEYS))
     if unforwarded:
         raise WorktreeError(
-            "SCRATCH_ENV_NOT_FORWARDED_TO_PANE:{}".format(",".join(unforwarded)))
+            "SCRATCH_ENV_NOT_FORWARDED_TO_PANE:{}".format(",".join(unforwarded))
+        )
     unbuilt = sorted(set(SCRATCH_ENV_KEYS) - set(values))
     if unbuilt:
-        raise WorktreeError(
-            "SCRATCH_ENV_NOT_BUILT:{}".format(",".join(unbuilt)))
+        raise WorktreeError("SCRATCH_ENV_NOT_BUILT:{}".format(",".join(unbuilt)))
     return values
 
 
 def launch_env(
-        scratch: Path,
-        base: Optional[Mapping[str, str]] = None,
-        *,
-        concurrency: Optional[int] = None,
-        cpu_count: Optional[int] = None,
+    scratch: Path,
+    base: Optional[Mapping[str, str]] = None,
+    *,
+    concurrency: Optional[int] = None,
+    cpu_count: Optional[int] = None,
 ) -> Dict[str, str]:
     """A complete environment for anything launched inside the bracket.
 
@@ -757,8 +858,7 @@ def launch_env(
     convicts someone.
     """
     env = dict(os.environ if base is None else base)
-    redirected = scratch_env(
-        scratch, concurrency=concurrency, cpu_count=cpu_count)
+    redirected = scratch_env(scratch, concurrency=concurrency, cpu_count=cpu_count)
     for key in ("XDG_CACHE_HOME", "TMPDIR", "PYTHONPYCACHEPREFIX", "npm_config_cache"):
         Path(redirected[key]).mkdir(parents=True, exist_ok=True)
     cache_dir = redirected["PYTEST_ADDOPTS"].split("cache_dir=", 1)[1].split()[0]
@@ -767,8 +867,8 @@ def launch_env(
     return env
 
 
-
 # ── §8.3 the two-conjunct permission check ──────────────────────────────────
+
 
 def _matches_any(relpath: str, declared: Iterable[str]) -> bool:
     """Whether a measured path is covered by one of the node's declared outputs.
@@ -778,8 +878,10 @@ def _matches_any(relpath: str, declared: Iterable[str]) -> bool:
     permissive than a POSIX shell glob; that looseness is bounded by conjunct
     (2) below, which no glob can satisfy away.
     """
-    return any(relpath == pattern or fnmatch.fnmatchcase(relpath, pattern)
-               for pattern in declared)
+    return any(
+        relpath == pattern or fnmatch.fnmatchcase(relpath, pattern)
+        for pattern in declared
+    )
 
 
 @dataclass(frozen=True)
@@ -791,8 +893,9 @@ class PermissionVerdict:
     conjunct2_violations: Tuple[str, ...] = ()
 
 
-def permission_check(attempt: AttemptWorktree, measured: InventoryDelta,
-                     declared: Sequence[str]) -> PermissionVerdict:
+def permission_check(
+    attempt: AttemptWorktree, measured: InventoryDelta, declared: Sequence[str]
+) -> PermissionVerdict:
     """Conjunct (1) subset-of-declared, conjunct (2) provisioned content (§8.3).
 
     Declared outputs are name-shaped and the provisioned base is
@@ -805,7 +908,9 @@ def permission_check(attempt: AttemptWorktree, measured: InventoryDelta,
     violation" from an assumption about plan hygiene into a theorem.
     """
     if attempt.baseline is None:
-        raise WorktreeError("permission_check before take_baseline — the bracket never opened")
+        raise WorktreeError(
+            "permission_check before take_baseline — the bracket never opened"
+        )
 
     c1 = tuple(rel for rel in measured.touched if not _matches_any(rel, declared))
     c2: List[str] = []
@@ -815,12 +920,15 @@ def permission_check(attempt: AttemptWorktree, measured: InventoryDelta,
     for rel in measured.added:
         if rel in attempt.baseline:
             c2.append(f"added but already present in the baseline inventory: {rel}")
-    return PermissionVerdict(passes=not c1 and not c2,
-                             conjunct1_violations=c1,
-                             conjunct2_violations=tuple(c2))
+    return PermissionVerdict(
+        passes=not c1 and not c2,
+        conjunct1_violations=c1,
+        conjunct2_violations=tuple(c2),
+    )
 
 
 # ── a declared output git will not commit ───────────────────────────────────
+
 
 def _disk_digest(worktree: Path, rel: str) -> str:
     """Content identity of one on-disk path, or 'missing' if it cannot be read."""
@@ -856,10 +964,12 @@ def _files_absent_from_inventory(worktree: Path, present: Inventory) -> Tuple[st
     return tuple(found)
 
 
-def existing_ignored_outputs(worktree: Path, declared: Sequence[str],
-                             after: Inventory,
-                             before: Optional[Mapping[str, str]]
-                             ) -> Tuple[str, ...]:
+def existing_ignored_outputs(
+    worktree: Path,
+    declared: Sequence[str],
+    after: Inventory,
+    before: Optional[Mapping[str, str]],
+) -> Tuple[str, ...]:
     """Declared outputs the attempt created or changed that git will not commit.
 
     Inventory's universe is `git ls-files --cached --others --exclude-standard`,
@@ -883,7 +993,8 @@ def existing_ignored_outputs(worktree: Path, declared: Sequence[str],
         raise WorktreeError(
             "existing_ignored_outputs without the ignored-at-base map — the "
             "bracket never opened, and an empty before-side reads a provisioned "
-            "dependency tree as the node's own writes")
+            "dependency tree as the node's own writes"
+        )
     root = Path(worktree)
     prior = dict(before)
     after_ignored = {
@@ -909,12 +1020,16 @@ def outputs_ignored_in_repo(repo: Path, declared: Sequence[str]) -> Tuple[str, .
     concrete = [path for path in declared if not _is_glob(path)]
     if not concrete:
         return ()
-    result = _git(repo, "check-ignore", "--stdin", check=False,
-                  stdin="\n".join(concrete) + "\n")
+    result = _git(
+        repo, "check-ignore", "--stdin", check=False, stdin="\n".join(concrete) + "\n"
+    )
     if result.returncode not in (0, 1):
         raise WorktreeError(
-            f"git check-ignore failed in {repo}: {(result.stderr or result.stdout).strip()}")
-    return tuple(line.replace(os.sep, "/") for line in result.stdout.splitlines() if line)
+            f"git check-ignore failed in {repo}: {(result.stderr or result.stdout).strip()}"
+        )
+    return tuple(
+        line.replace(os.sep, "/") for line in result.stdout.splitlines() if line
+    )
 
 
 def _is_glob(pattern: str) -> bool:
@@ -922,6 +1037,7 @@ def _is_glob(pattern: str) -> bool:
 
 
 # ── §8.4 the scheduler-side commit ──────────────────────────────────────────
+
 
 def _is_inside(child: Path, parent: Path) -> bool:
     return str(child).startswith(str(parent) + os.sep)
@@ -952,16 +1068,64 @@ def advance_attempt_ref(attempt: AttemptWorktree, output_sha: str) -> None:
     commit — which moved the ref out from under the harness — makes this refuse
     rather than build on top of it.
     """
-    result = _git(attempt.repo, "update-ref", attempt.ref, output_sha, attempt.base,
-                  check=False)
+    result = _git(
+        attempt.repo, "update-ref", attempt.ref, output_sha, attempt.base, check=False
+    )
     if result.returncode != 0:
         raise CompareAndSwapRefused(
             f"{attempt.ref} no longer at the recorded base {attempt.base[:10]}: "
-            f"{result.stderr.strip()}")
+            f"{result.stderr.strip()}"
+        )
 
 
-def commit_measured_delta(attempt: AttemptWorktree, measured: InventoryDelta,
-                          after: Inventory, message: str) -> str:
+def prepare_descendant_candidate(attempt: AttemptWorktree, parent: str) -> None:
+    """Open the next measured bracket atop an already-published candidate.
+
+    The attempt branch remains the durable identity through every candidate
+    cycle.  This only moves the mutable measurement base after proving both
+    refs already name the requested immutable parent; it never creates a
+    worktree, branch, scratch directory, or commit.
+    """
+    if not is_object_digest(parent):
+        raise InvalidCandidateParent(
+            f"candidate parent must be an exact 40- or 64-hex digest, got {parent!r}"
+        )
+    resolved = _git(
+        attempt.repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"{parent}^{{commit}}",
+        check=False,
+    )
+    if resolved.returncode != 0 or resolved.stdout.strip() != parent:
+        raise InvalidCandidateParent(
+            f"candidate parent {parent} does not resolve as a commit in {attempt.repo}"
+        )
+
+    head = _out(attempt.path, "rev-parse", "HEAD")
+    if head != parent:
+        raise HeadMoved(
+            f"HEAD is {head[:10]}, not candidate parent {parent[:10]} for the next cycle"
+        )
+    ref_parent = attempt_ref_commit(
+        attempt.repo, attempt.run_id, attempt.node_id, attempt.attempt_no
+    )
+    if ref_parent != parent:
+        raise CompareAndSwapRefused(
+            f"{attempt.ref} is {ref_parent or 'absent'}, not candidate parent {parent[:10]}"
+        )
+
+    tracked_at_parent = frozenset(inventory_at_commit(attempt.repo, parent))
+    attempt.base = parent
+    attempt.tracked_at_base = tracked_at_parent
+    attempt.baseline = None
+    attempt.ignored_at_base = None
+
+
+def commit_measured_delta(
+    attempt: AttemptWorktree, measured: InventoryDelta, after: Inventory, message: str
+) -> str:
     """Commit exactly the measured delta, from a harness-private index (§8.4).
 
     The scheduler commits, never the agent, and it commits from git state the
@@ -983,17 +1147,20 @@ def commit_measured_delta(attempt: AttemptWorktree, measured: InventoryDelta,
     """
     if attempt.baseline is None:
         raise WorktreeError("commit_measured_delta before take_baseline")
-    if _is_inside(attempt.private_index, attempt.path) or \
-            _is_inside(attempt.private_index, attempt.scratch):
+    if _is_inside(attempt.private_index, attempt.path) or _is_inside(
+        attempt.private_index, attempt.scratch
+    ):
         raise WorktreeError(
             f"the private index {attempt.private_index} is inside the worktree or the "
-            "shared scratch, which would make the index itself a delta path (§8.4)")
+            "shared scratch, which would make the index itself a delta path (§8.4)"
+        )
 
     head = _out(attempt.path, "rev-parse", "HEAD")
     if head != attempt.base:
         raise HeadMoved(
             f"HEAD is {head[:10]}, not the attempt's recorded base {attempt.base[:10]} — "
-            "something committed in this worktree that was not the harness")
+            "something committed in this worktree that was not the harness"
+        )
 
     attempt.private_index.parent.mkdir(parents=True, exist_ok=True)
     attempt.private_index.unlink(missing_ok=True)
@@ -1015,14 +1182,25 @@ def commit_measured_delta(attempt: AttemptWorktree, measured: InventoryDelta,
             if staged.get(rel) != after.get(rel):
                 raise StagingMismatch(
                     f"{rel} staged as {staged.get(rel)} but measured as {after.get(rel)} — "
-                    "something wrote to the tree between the after-inventory and staging")
+                    "something wrote to the tree between the after-inventory and staging"
+                )
         for rel in measured.removed:
             if rel in staged:
-                raise StagingMismatch(f"{rel} was measured as deleted but is still staged")
+                raise StagingMismatch(
+                    f"{rel} was measured as deleted but is still staged"
+                )
 
         tree = _out(attempt.path, "write-tree", env=env)
-        output_sha = _out(attempt.path, "commit-tree", tree, "-p", attempt.base,
-                          "-m", message, env=env)
+        output_sha = _out(
+            attempt.path,
+            "commit-tree",
+            tree,
+            "-p",
+            attempt.base,
+            "-m",
+            message,
+            env=env,
+        )
     finally:
         attempt.private_index.unlink(missing_ok=True)
 
@@ -1043,8 +1221,12 @@ def commit_measured_delta(attempt: AttemptWorktree, measured: InventoryDelta,
 
 def _tracked_at(worktree: Path, sha: str, relpath: str) -> bool:
     """Is `relpath` in the tree of `sha`?"""
-    return _git(worktree, "cat-file", "-e", "{0}:{1}".format(sha, relpath),
-                check=False).returncode == 0
+    return (
+        _git(
+            worktree, "cat-file", "-e", "{0}:{1}".format(sha, relpath), check=False
+        ).returncode
+        == 0
+    )
 
 
 def paths_written_since(attempt: AttemptWorktree, base: str) -> Tuple[str, ...]:
@@ -1062,13 +1244,15 @@ def paths_written_since(attempt: AttemptWorktree, base: str) -> Tuple[str, ...]:
     Deletions are excluded. Restoring a file the node deleted cannot make its
     gate go red, so a deleted path is not a subject this question has.
     """
-    listed = _out(attempt.path, "diff", "--name-only", "--diff-filter=ACMR",
-                  base, "HEAD")
+    listed = _out(
+        attempt.path, "diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"
+    )
     return tuple(line for line in listed.splitlines() if line.strip())
 
 
-def revert_paths_to(attempt: AttemptWorktree, base: str,
-                    relpaths: Sequence[str]) -> Tuple[str, ...]:
+def revert_paths_to(
+    attempt: AttemptWorktree, base: str, relpaths: Sequence[str]
+) -> Tuple[str, ...]:
     """Put `relpaths` back to their content at `base`.
 
     Called only after `commit_measured_delta` has sealed the output commit, so
@@ -1097,8 +1281,7 @@ def revert_paths_to(attempt: AttemptWorktree, base: str,
     return tuple(reverted)
 
 
-def restore_paths_from_head(attempt: AttemptWorktree,
-                            relpaths: Sequence[str]) -> None:
+def restore_paths_from_head(attempt: AttemptWorktree, relpaths: Sequence[str]) -> None:
     """Undo `revert_paths_to`, from the attempt's own output commit.
 
     HEAD is the sealed output commit by the time this runs — `commit_measured_
@@ -1117,12 +1300,13 @@ def restore_paths_from_head(attempt: AttemptWorktree,
 
 # ── §8.3 the four checks ────────────────────────────────────────────────────
 
+
 @dataclass(frozen=True)
 class Divergence:
     """One path where the measured tree differs from the expected inventory."""
 
     path: str
-    kind: str                      # "unexpected", "missing", or "changed"
+    kind: str  # "unexpected", "missing", or "changed"
     expected: Optional[InventoryTuple] = None
     actual: Optional[InventoryTuple] = None
 
@@ -1162,8 +1346,9 @@ class CheckResult:
     unprovisioned_worktrees: Tuple[str, ...] = ()
 
 
-def compare_to_expected(worktree: Path, expected: Inventory,
-                        consequence: str) -> CleanlinessVerdict:
+def compare_to_expected(
+    worktree: Path, expected: Inventory, consequence: str
+) -> CleanlinessVerdict:
     """Compare the tree's full measured inventory to the expected one (§8.3).
 
     This is a state comparison, not a `git status` read and not an ignore list.
@@ -1182,30 +1367,47 @@ def compare_to_expected(worktree: Path, expected: Inventory,
             divergences.append(Divergence(rel, "missing", expected[rel], None))
         elif actual[rel] != expected[rel]:
             divergences.append(Divergence(rel, "changed", expected[rel], actual[rel]))
-    return CleanlinessVerdict(clean=not divergences, consequence=consequence,
-                              divergences=tuple(divergences))
+    return CleanlinessVerdict(
+        clean=not divergences, consequence=consequence, divergences=tuple(divergences)
+    )
 
 
 def _git_checks(attempt: AttemptWorktree) -> Tuple[bool, bool, bool, Tuple[str, ...]]:
     """The three git-side checks: branch checked out, HEAD resolves, ancestry."""
     detail: List[str] = []
     branch = _git(attempt.path, "symbolic-ref", "--short", "HEAD", check=False)
-    branch_checked_out = branch.returncode == 0 and branch.stdout.strip() == attempt.branch
+    branch_checked_out = (
+        branch.returncode == 0 and branch.stdout.strip() == attempt.branch
+    )
     if not branch_checked_out:
-        detail.append(f"HEAD is not on {attempt.branch}: {branch.stdout.strip() or 'detached'}")
+        detail.append(
+            f"HEAD is not on {attempt.branch}: {branch.stdout.strip() or 'detached'}"
+        )
 
-    head = _git(attempt.path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
-                check=False)
+    head = _git(
+        attempt.path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False
+    )
     head_resolves = head.returncode == 0
     if not head_resolves:
         detail.append("HEAD does not resolve to a commit")
 
     base_is_ancestor = False
     if head_resolves:
-        base_is_ancestor = _git(attempt.path, "merge-base", "--is-ancestor",
-                                attempt.base, "HEAD", check=False).returncode == 0
+        base_is_ancestor = (
+            _git(
+                attempt.path,
+                "merge-base",
+                "--is-ancestor",
+                attempt.base,
+                "HEAD",
+                check=False,
+            ).returncode
+            == 0
+        )
         if not base_is_ancestor:
-            detail.append(f"the recorded base {attempt.base[:10]} is not an ancestor of HEAD")
+            detail.append(
+                f"the recorded base {attempt.base[:10]} is not an ancestor of HEAD"
+            )
     return branch_checked_out, head_resolves, base_is_ancestor, tuple(detail)
 
 
@@ -1232,10 +1434,10 @@ def _registered_worktrees(repo: Path) -> Tuple[Tuple[Path, Optional[str]], ...]:
     bare = False
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
-            path = Path(line[len("worktree "):])
+            path = Path(line[len("worktree ") :])
             branch, bare = None, False
         elif line.startswith("branch "):
-            branch = line[len("branch "):].strip()
+            branch = line[len("branch ") :].strip()
         elif line.strip() == "bare":
             bare = True
         elif not line.strip() and path is not None:
@@ -1334,8 +1536,9 @@ def check_post_commit(attempt: AttemptWorktree, expected: Inventory) -> CheckRes
     branch_ok, head_ok, ancestor_ok, detail = _git_checks(attempt)
     cleanliness = compare_to_expected(attempt.path, expected, "convict")
     ok = branch_ok and head_ok and ancestor_ok and cleanliness.clean
-    return CheckResult("post-commit", branch_ok, head_ok, ancestor_ok, cleanliness,
-                       ok, ok, detail)
+    return CheckResult(
+        "post-commit", branch_ok, head_ok, ancestor_ok, cleanliness, ok, ok, detail
+    )
 
 
 def check_pre_merge(attempt: AttemptWorktree, expected: Inventory) -> CheckResult:
@@ -1359,9 +1562,17 @@ def check_pre_merge(attempt: AttemptWorktree, expected: Inventory) -> CheckResul
     branch_ok, head_ok, ancestor_ok, detail = _git_checks(attempt)
     cleanliness = compare_to_expected(attempt.path, expected, "report")
     ok = branch_ok and head_ok and ancestor_ok and cleanliness.clean
-    return CheckResult("pre-merge", branch_ok, head_ok, ancestor_ok, cleanliness,
-                       ok, True, detail,
-                       unprovisioned_worktrees(attempt))
+    return CheckResult(
+        "pre-merge",
+        branch_ok,
+        head_ok,
+        ancestor_ok,
+        cleanliness,
+        ok,
+        True,
+        detail,
+        unprovisioned_worktrees(attempt),
+    )
 
 
 # ── gates: node-scoped by default, whole-suite only as integration ──────────
@@ -1375,7 +1586,7 @@ class GateResult:
     what this records is the execution itself — command, scope, exit code."""
 
     label: str
-    scope: str                     # "node" or "integration"
+    scope: str  # "node" or "integration"
     selector: Optional[str]
     command: Tuple[str, ...]
     exit_code: int
@@ -1385,9 +1596,14 @@ class GateResult:
 
 
 def _run_gate(
-        worktree: Path, runner: "rr.ResolvedRunner", argv: Sequence[str],
-        scratch: Path, label: str, scope: str, selector: Optional[str],
-        cancel_requested: Callable[[], bool],
+    worktree: Path,
+    runner: "rr.ResolvedRunner",
+    argv: Sequence[str],
+    scratch: Path,
+    label: str,
+    scope: str,
+    selector: Optional[str],
+    cancel_requested: Callable[[], bool],
 ) -> GateResult:
     """Run one gate through a resolved runner.
 
@@ -1405,27 +1621,43 @@ def _run_gate(
     if not isinstance(runner, rr.ResolvedRunner):
         raise TypeError(
             "a gate runs through a resolved runner, never a bare command; "
-            "obtain one from runner_resolution.resolve")
+            "obtain one from runner_resolution.resolve"
+        )
     command = runner.execute_argv(argv)
     try:
         result = run_harness_process(
-            command, cwd=worktree, env=launch_env(scratch),
-            cancel_requested=cancel_requested)
+            command,
+            cwd=worktree,
+            env=launch_env(scratch),
+            cancel_requested=cancel_requested,
+        )
     except HarnessCancelled as exc:
         raise GateCancelled("gate cancelled before a result was produced") from exc
     output = (result.stdout or "") + (result.stderr or "")
-    counts = {("error" if key.startswith("error") else key): int(value)
-              for value, key in _COUNT.findall(output)}
-    return GateResult(label=label, scope=scope, selector=selector,
-                      command=tuple(command), exit_code=result.returncode,
-                      green=result.returncode == 0, counts=counts,
-                      tail=tuple(output.strip().splitlines()[-5:]))
+    counts = {
+        ("error" if key.startswith("error") else key): int(value)
+        for value, key in _COUNT.findall(output)
+    }
+    return GateResult(
+        label=label,
+        scope=scope,
+        selector=selector,
+        command=tuple(command),
+        exit_code=result.returncode,
+        green=result.returncode == 0,
+        counts=counts,
+        tail=tuple(output.strip().splitlines()[-5:]),
+    )
 
 
-def run_node_gate(attempt: AttemptWorktree, runner: "rr.ResolvedRunner",
-                  argv: Sequence[str], selector: str,
-                  cancel_requested: Callable[[], bool],
-                  label: str = "node-gate") -> GateResult:
+def run_node_gate(
+    attempt: AttemptWorktree,
+    runner: "rr.ResolvedRunner",
+    argv: Sequence[str],
+    selector: str,
+    cancel_requested: Callable[[], bool],
+    label: str = "node-gate",
+) -> GateResult:
     """Run a gate scoped to the node's own declared selector (§7.4, §7.3).
 
     The selector is required, and that is the F3 correction made structural.
@@ -1442,7 +1674,8 @@ def run_node_gate(attempt: AttemptWorktree, runner: "rr.ResolvedRunner",
     if not selector or not str(selector).strip():
         raise ValueError(
             "a node gate needs the node's own selector; whole-suite execution is "
-            "run_integration_gate (§8.8), never an unscoped node gate")
+            "run_integration_gate (§8.8), never an unscoped node gate"
+        )
     # The selector is appended token by token, and only where `argv` does not
     # already carry it. Appended whole, as one argv element, it worked for a
     # single-path selector by accident -- the caller in `maestro` passes the
@@ -1453,15 +1686,25 @@ def run_node_gate(attempt: AttemptWorktree, runner: "rr.ResolvedRunner",
     # validator's `all(path in produced ...)`: a selector is a set of paths,
     # and treating it as one opaque string is only ever right for one path.
     extra = [token for token in str(selector).split() if token not in argv]
-    return _run_gate(attempt.path, runner, list(argv) + extra,
-                     attempt.scratch, label, "node", selector,
-                     cancel_requested)
+    return _run_gate(
+        attempt.path,
+        runner,
+        list(argv) + extra,
+        attempt.scratch,
+        label,
+        "node",
+        selector,
+        cancel_requested,
+    )
 
 
 def run_integration_gate(
-        worktree: Path, runner: "rr.ResolvedRunner", argv: Sequence[str],
-        scratch: Path, cancel_requested: Callable[[], bool],
-        label: str = "integration-gate",
+    worktree: Path,
+    runner: "rr.ResolvedRunner",
+    argv: Sequence[str],
+    scratch: Path,
+    cancel_requested: Callable[[], bool],
+    label: str = "integration-gate",
 ) -> GateResult:
     """Run the final whole-suite gate under the caller's cancellation lease.
 
@@ -1469,11 +1712,19 @@ def run_integration_gate(
     where semantic conflicts between individually-correct nodes become visible.
     """
     return _run_gate(
-        Path(worktree), runner, argv, Path(scratch), label, "integration",
-        None, cancel_requested)
+        Path(worktree),
+        runner,
+        argv,
+        Path(scratch),
+        label,
+        "integration",
+        None,
+        cancel_requested,
+    )
 
 
 # ── §8.5 deterministic merge order ──────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class NodeRecord:
@@ -1504,11 +1755,16 @@ def merge_frontier(nodes: Iterable[NodeRecord]) -> Tuple[str, ...]:
     """
     records = list(nodes)
     merged = {n.node_id for n in records if n.state == "MERGED"}
-    eligible = [n for n in records
-                if n.state != "MERGED"
-                and n.state not in TERMINAL_WITHOUT_MERGE
-                and all(dep in merged for dep in n.needs)]
-    return tuple(n.node_id for n in sorted(eligible, key=lambda n: (n.depth, n.node_id)))
+    eligible = [
+        n
+        for n in records
+        if n.state != "MERGED"
+        and n.state not in TERMINAL_WITHOUT_MERGE
+        and all(dep in merged for dep in n.needs)
+    ]
+    return tuple(
+        n.node_id for n in sorted(eligible, key=lambda n: (n.depth, n.node_id))
+    )
 
 
 def next_merge_candidate(nodes: Iterable[NodeRecord]) -> Optional[NodeRecord]:
@@ -1557,6 +1813,7 @@ def upstream_blocked(nodes: Iterable[NodeRecord]) -> Tuple[str, ...]:
 
 # ── §8.6 ancestry, §8.7 conflict ────────────────────────────────────────────
 
+
 @dataclass(frozen=True)
 class MergeResult:
     """One merge transaction's outcome, guarded by git's exit code alone (§8.6)."""
@@ -1571,8 +1828,9 @@ class MergeResult:
     detail: str = ""
 
 
-def merge_verified_node(integration_path: Path, node_id: str, output_sha: str,
-                        message: Optional[str] = None) -> MergeResult:
+def merge_verified_node(
+    integration_path: Path, node_id: str, output_sha: str, message: Optional[str] = None
+) -> MergeResult:
     """Merge one verified node's output SHA into the integration worktree.
 
     Checked **and merged** on the SHA, never on the branch: a branch is a
@@ -1589,36 +1847,71 @@ def merge_verified_node(integration_path: Path, node_id: str, output_sha: str,
     """
     integration_path = Path(integration_path)
     head_before = _out(integration_path, "rev-parse", "HEAD")
-    merge = _git(integration_path, "merge", "--no-ff", "--no-edit",
-                 "-m", message or f"merge {node_id}", output_sha, check=False)
+    merge = _git(
+        integration_path,
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        "-m",
+        message or f"merge {node_id}",
+        output_sha,
+        check=False,
+    )
 
     if merge.returncode != 0:
-        conflicted = tuple(sorted(
-            line for line in _out(integration_path, "diff", "--name-only",
-                                  "--diff-filter=U").splitlines() if line))
+        conflicted = tuple(
+            sorted(
+                line
+                for line in _out(
+                    integration_path, "diff", "--name-only", "--diff-filter=U"
+                ).splitlines()
+                if line
+            )
+        )
         _git(integration_path, "merge", "--abort", check=False)
         head_after = _out(integration_path, "rev-parse", "HEAD")
         if head_after != head_before:
             raise WorktreeError(
                 f"aborting the merge of {node_id} left the integration head at "
-                f"{head_after[:10]} instead of {head_before[:10]}")
-        return MergeResult(node_id=node_id, output_sha=output_sha,
-                           head_before=head_before, head_after=head_after,
-                           conflicted_paths=conflicted,
-                           detail=merge.stderr.strip() or merge.stdout.strip())
+                f"{head_after[:10]} instead of {head_before[:10]}"
+            )
+        return MergeResult(
+            node_id=node_id,
+            output_sha=output_sha,
+            head_before=head_before,
+            head_after=head_after,
+            conflicted_paths=conflicted,
+            detail=merge.stderr.strip() or merge.stdout.strip(),
+        )
 
-    ancestry = _git(integration_path, "merge-base", "--is-ancestor", output_sha, "HEAD",
-                    check=False).returncode == 0
+    ancestry = (
+        _git(
+            integration_path,
+            "merge-base",
+            "--is-ancestor",
+            output_sha,
+            "HEAD",
+            check=False,
+        ).returncode
+        == 0
+    )
     head_after = _out(integration_path, "rev-parse", "HEAD")
-    return MergeResult(node_id=node_id, output_sha=output_sha, head_before=head_before,
-                       head_after=head_after, merged_sha=head_after if ancestry else None,
-                       ancestry_proven=ancestry)
+    return MergeResult(
+        node_id=node_id,
+        output_sha=output_sha,
+        head_before=head_before,
+        head_after=head_after,
+        merged_sha=head_after if ancestry else None,
+        ancestry_proven=ancestry,
+    )
 
 
 # ── §8.8 acceptance and cleanup ─────────────────────────────────────────────
 
-def final_ancestry_sweep(integration_path: Path,
-                         output_shas: Mapping[str, str]) -> Dict[str, bool]:
+
+def final_ancestry_sweep(
+    integration_path: Path, output_shas: Mapping[str, str]
+) -> Dict[str, bool]:
     """Re-prove every merged node against the **final** head (§8.6).
 
     A run is not accepted otherwise, regardless of green tests: test PASS is
@@ -1626,9 +1919,13 @@ def final_ancestry_sweep(integration_path: Path,
     content is in the final tree is git's own ancestry answer at the end.
     """
     integration_path = Path(integration_path)
-    return {node_id: _git(integration_path, "merge-base", "--is-ancestor", sha, "HEAD",
-                          check=False).returncode == 0
-            for node_id, sha in output_shas.items()}
+    return {
+        node_id: _git(
+            integration_path, "merge-base", "--is-ancestor", sha, "HEAD", check=False
+        ).returncode
+        == 0
+        for node_id, sha in output_shas.items()
+    }
 
 
 def acceptance_specs(nodes: Iterable[NodeRecord]) -> Tuple[str, ...]:
@@ -1645,8 +1942,11 @@ def acceptance_specs(nodes: Iterable[NodeRecord]) -> Tuple[str, ...]:
     return tuple(sorted({spec for node in merged for spec in node.specs}))
 
 
-def remove_attempt_worktree(attempt: AttemptWorktree, ancestry_proven: bool,
-                            integration_path: Optional[Path] = None) -> None:
+def remove_attempt_worktree(
+    attempt: AttemptWorktree,
+    ancestry_proven: bool,
+    integration_path: Optional[Path] = None,
+) -> None:
     """Remove the worktree and its branch, only after ancestry is proven (§8.8).
 
     Deleting an unmerged branch destroys the only copy of the work, so an
@@ -1664,7 +1964,12 @@ def remove_attempt_worktree(attempt: AttemptWorktree, ancestry_proven: bool,
     if not ancestry_proven:
         raise WorktreeError(
             f"refusing to remove {attempt.path}: ancestry is not proven, and deleting "
-            "an unmerged branch destroys the only copy of the work (§8.8)")
+            "an unmerged branch destroys the only copy of the work (§8.8)"
+        )
     _git(attempt.repo, "worktree", "remove", str(attempt.path))
-    _git(Path(integration_path) if integration_path else attempt.repo,
-         "branch", "-d", attempt.branch)
+    _git(
+        Path(integration_path) if integration_path else attempt.repo,
+        "branch",
+        "-d",
+        attempt.branch,
+    )

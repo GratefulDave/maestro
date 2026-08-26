@@ -28,7 +28,8 @@ export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string
   const rollup = useMemo(() => {
     const counts = new Map<string, number>();
     for (const node of nodes) {
-      counts.set(node.state, (counts.get(node.state) ?? 0) + 1);
+      const state = node.lane_phase ?? node.state;
+      counts.set(state, (counts.get(state) ?? 0) + 1);
     }
     const byTone = new Map<string, [string, number][]>();
     for (const [state, count] of counts) {
@@ -63,7 +64,8 @@ export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string
       </p>
       <div className="cockpit-ledger">
         {ordered.map(({ node, rail, offTreeNeeds }) => {
-          const tone = STATUS_TONES[node.state.toLowerCase()] ?? "pending";
+          const state = node.lane_phase ?? node.state;
+          const tone = STATUS_TONES[state.toLowerCase()] ?? "pending";
           const note = node.block_reason ?? node.cancel_cause;
           return (
             <Link
@@ -82,7 +84,7 @@ export function DagCockpit({ nodes, base }: { nodes: MaestroNode[]; base: string
                   ⇠ {need}
                 </span>
               ))}
-              <span className="cockpit-state">{stateLabel(node.state, tone)}</span>
+              <span className="cockpit-state">{stateLabel(state, tone)}</span>
               <span className="cockpit-meta">
                 {node.attempt_no > 1 ? `a${node.attempt_no} ` : ""}
                 {note ? `· ${note}` : ""}

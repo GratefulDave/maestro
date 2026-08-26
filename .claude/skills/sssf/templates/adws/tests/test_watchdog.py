@@ -106,8 +106,8 @@ def write_jsonl(path: Path, lines, trailing_newline: bool = True) -> None:
 
 # ── §7.6 arming: the pre-launch segment has only the wall clock ─────────────
 
-class ArmingTests(unittest.TestCase):
 
+class ArmingTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(0.0)
         self.kill = Recorder()
@@ -159,7 +159,8 @@ class ArmingTests(unittest.TestCase):
         agent launched, and the turn timeout must be measured from launch.
         """
         attempt = make_attempt(
-            started_at=0.0, launched_at=100.0, pid=999999, turn_count=0)
+            started_at=0.0, launched_at=100.0, pid=999999, turn_count=0
+        )
         # A dedicated config: node_timeout_s must be well past 106s (the
         # simulated launch delay plus the turn check below), so only the
         # turn-timeout signal is under test here.
@@ -191,6 +192,7 @@ class ArmingTests(unittest.TestCase):
 
 # ── §7.6 the three signals ───────────────────────────────────────────────────
 
+
 class ProcessAliveSignalTests(unittest.TestCase):
     """Process liveness is the launched process polled directly (§7.6) --
     a real subprocess, never a mock, because this is the signal
@@ -220,8 +222,12 @@ class ProcessAliveSignalTests(unittest.TestCase):
             self.assertFalse(wd.process_is_alive(proc.pid))
 
             attempt = make_attempt(
-                started_at=0.0, launched_at=0.0, pid=proc.pid,
-                attempt_host=lc.scheduler_host(), attempt_start_epoch=1.0)
+                started_at=0.0,
+                launched_at=0.0,
+                pid=proc.pid,
+                attempt_host=lc.scheduler_host(),
+                attempt_start_epoch=1.0,
+            )
             watchdog = self._watchdog([attempt])
             self.clock.set(0.001)  # barely any wall clock elapsed
 
@@ -234,16 +240,29 @@ class ProcessAliveSignalTests(unittest.TestCase):
         finally:
             proc.wait(timeout=10)
 
+    def test_unreaped_zombie_is_not_live_work(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 5.0
+            while wd.process_is_alive(proc.pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(wd.process_is_alive(proc.pid))
+            self.assertIsNone(proc.returncode, "the parent unexpectedly reaped it")
+        finally:
+            proc.wait(timeout=10)
+
     def test_live_process_is_not_stalled(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(5)"])
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
         try:
             self.assertTrue(wd.process_is_alive(proc.pid))
 
             attempt = make_attempt(
-                started_at=0.0, launched_at=0.0, pid=proc.pid,
+                started_at=0.0,
+                launched_at=0.0,
+                pid=proc.pid,
                 attempt_host=lc.scheduler_host(),
-                attempt_start_epoch=wd.process_start_epoch(proc.pid))
+                attempt_start_epoch=wd.process_start_epoch(proc.pid),
+            )
             watchdog = self._watchdog([attempt])
             self.clock.set(0.5)
 
@@ -274,20 +293,18 @@ class ProcessAliveSignalTests(unittest.TestCase):
         lowered = doc.lower()
         self.assertIn("agent", lowered)
         self.assertIn("unreachable", lowered)
-        self.assertTrue(
-            "§9.8" in doc or "16.3" in doc or "process_group" in doc,
-            doc)
+        self.assertTrue("§9.8" in doc or "16.3" in doc or "process_group" in doc, doc)
         for line in doc.splitlines():
             if "authoritative" in line.lower() and "process" in line.lower():
                 self.assertRegex(
-                    line, r"(?i)not authoritative|agent",
+                    line,
+                    r"(?i)not authoritative|agent",
                     "process-alive must not be called authoritative "
-                    "without the agent-node qualification")
-
+                    "without the agent-node qualification",
+                )
 
 
 class TurnCountSignalTests(unittest.TestCase):
-
     def setUp(self):
         self.clock = FakeClock(0.0)
         self.kill = Recorder()
@@ -322,8 +339,11 @@ class TurnCountSignalTests(unittest.TestCase):
         """
         write_jsonl(self.transcript, [])  # nothing written yet
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         watchdog = self._watchdog([attempt], actor_status=lambda _a: "idle")
 
         self.clock.set(11.0)  # > turn_timeout_s since launch
@@ -339,10 +359,12 @@ class TurnCountSignalTests(unittest.TestCase):
         Elapsed silence is not quiescence."""
         write_jsonl(self.transcript, [])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
-        watchdog = self._watchdog(
-            [attempt], actor_status=lambda _a: "working")
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
+        watchdog = self._watchdog([attempt], actor_status=lambda _a: "working")
 
         for _ in range(40):
             self.clock.advance(25.0)
@@ -356,10 +378,12 @@ class TurnCountSignalTests(unittest.TestCase):
         `idle` is a heartbeat, not this."""
         write_jsonl(self.transcript, [])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
-        watchdog = self._watchdog(
-            [attempt], actor_status=lambda _a: "blocked")
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
+        watchdog = self._watchdog([attempt], actor_status=lambda _a: "blocked")
         self.clock.set(500.0)
         watchdog.check_once()
         self.assertEqual(self.fail.calls, [])
@@ -369,11 +393,13 @@ class TurnCountSignalTests(unittest.TestCase):
         timeout, with no declared result: TURN_TIMEOUT."""
         write_jsonl(self.transcript, ['{"n": 1}'])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         status = {"v": "working"}
-        watchdog = self._watchdog(
-            [attempt], actor_status=lambda _a: status["v"])
+        watchdog = self._watchdog([attempt], actor_status=lambda _a: status["v"])
         watchdog.check_once()
         self.clock.set(500.0)
         watchdog.check_once()
@@ -388,11 +414,13 @@ class TurnCountSignalTests(unittest.TestCase):
     def test_an_unreadable_status_does_not_clear_a_live_observation(self):
         write_jsonl(self.transcript, [])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         status = {"v": "working"}
-        watchdog = self._watchdog(
-            [attempt], actor_status=lambda _a: status["v"])
+        watchdog = self._watchdog([attempt], actor_status=lambda _a: status["v"])
         watchdog.check_once()
         status["v"] = None
         self.clock.set(500.0)
@@ -406,12 +434,15 @@ class TurnCountSignalTests(unittest.TestCase):
         file within the turn timeout must not stall."""
         write_jsonl(self.transcript, ['{"role": "assistant", "n": 1}'])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         watchdog = self._watchdog([attempt])
 
         watchdog.check_once()  # observes record 1, arms the heartbeat
-        self.clock.set(9.0)   # still inside the turn timeout, file unchanged
+        self.clock.set(9.0)  # still inside the turn timeout, file unchanged
         watchdog.check_once()
 
         self.assertEqual(self.fail.calls, [])
@@ -419,15 +450,18 @@ class TurnCountSignalTests(unittest.TestCase):
     def test_turn_count_advancing_resets_the_stall_timer(self):
         write_jsonl(self.transcript, ['{"n": 1}'])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         watchdog = self._watchdog([attempt])
 
-        watchdog.check_once()          # record 1 observed at t=0
+        watchdog.check_once()  # record 1 observed at t=0
         self.clock.set(9.0)
         write_jsonl(self.transcript, ['{"n": 1}', '{"n": 2}'])
-        watchdog.check_once()          # record 2 observed at t=9, resets clock
-        self.clock.set(17.0)           # 8s since the reset -- still healthy
+        watchdog.check_once()  # record 2 observed at t=9, resets clock
+        self.clock.set(17.0)  # 8s since the reset -- still healthy
         watchdog.check_once()
 
         self.assertEqual(self.fail.calls, [])
@@ -441,8 +475,11 @@ class TurnCountSignalTests(unittest.TestCase):
         config = make_config(node_timeout_s=20.0, turn_timeout_s=1000.0)
         write_jsonl(self.transcript, ['{"n": 1}'])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         watchdog = self._watchdog([attempt], config=config)
 
         watchdog.check_once()
@@ -472,10 +509,12 @@ class TurnCountSignalTests(unittest.TestCase):
         config = make_config(node_timeout_s=20.0, turn_timeout_s=1000.0)
         write_jsonl(self.transcript, ['{"n": 1}'])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
-        watchdog = self._watchdog(
-            [attempt], preserve=preserve, config=config)
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
+        watchdog = self._watchdog([attempt], preserve=preserve, config=config)
 
         watchdog.check_once()
         self.clock.set(21.0)
@@ -485,13 +524,13 @@ class TurnCountSignalTests(unittest.TestCase):
         self.assertEqual(attempt.extra.get("salvage_output_sha"), "abc123")
         self.assertEqual(len(self.kill.calls), 1)
         self.assertEqual(len(self.fail.calls), 1)
-        self.assertEqual(self.fail.calls[0][0][2],
-                         wd.StallReason.NODE_TIMEOUT.value)
+        self.assertEqual(self.fail.calls[0][0][2], wd.StallReason.NODE_TIMEOUT.value)
         # kill before preserve: the recorder saw kill first.
         self.assertEqual(self.kill.calls[0][0][0].key, attempt.key)
 
 
 # ── §9.7 a declared result outranks both of the watchdog's clocks ───────────
+
 
 class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
     """§9.7 at the two clock signals: an artifact a worker wrote outranks
@@ -529,7 +568,8 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
         self.fail = Recorder()
         self.heartbeat = Recorder()
         self.config = make_config(
-            node_timeout_s=1000.0, turn_timeout_s=10.0, backstop_t_s=5000.0)
+            node_timeout_s=1000.0, turn_timeout_s=10.0, backstop_t_s=5000.0
+        )
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.transcript = Path(self.tmpdir.name) / "session.jsonl"
@@ -550,20 +590,25 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
 
     def _attempt(self):
         return make_attempt(
-            started_at=0.0, launched_at=0.0, pid=None,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=None,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
 
     # ── the turn clock ──────────────────────────────────────────────────────
 
-    def test_result_holding_attempt_flatlined_past_the_turn_timeout_is_not_stalled(self):
+    def test_result_holding_attempt_flatlined_past_the_turn_timeout_is_not_stalled(
+        self,
+    ):
         """The production failure, reduced: the transcript stopped growing
         because the worker quiesced the builder, and the attempt is sitting
         in review with its result already adjudicated."""
         write_jsonl(self.transcript, ['{"n": 1}'])
         watchdog = self._watchdog([self._attempt()], declared=True)
 
-        watchdog.check_once()   # observes record 1, arms the heartbeat
-        self.clock.set(500.0)   # 50x turn_timeout_s, transcript unchanged
+        watchdog.check_once()  # observes record 1, arms the heartbeat
+        self.clock.set(500.0)  # 50x turn_timeout_s, transcript unchanged
         watchdog.check_once()
 
         self.assertEqual(self.kill.calls, [])
@@ -577,8 +622,8 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
         """
         write_jsonl(self.transcript, ['{"n": 1}'])
         watchdog = self._watchdog(
-            [self._attempt()], declared=False,
-            actor_status=lambda _a: "idle")
+            [self._attempt()], declared=False, actor_status=lambda _a: "idle"
+        )
 
         watchdog.check_once()
         self.clock.set(500.0)
@@ -646,8 +691,11 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
         constructed at all (§11.2), so `backstop_t_s > node_timeout_s`
         holds for every config the watchdog can ever be handed."""
         with self.assertRaises(st.LivenessBoundUnsatisfied):
-            make_config(node_timeout_s=100.0, final_acceptance_timeout_s=50.0,
-                        backstop_t_s=100.0)
+            make_config(
+                node_timeout_s=100.0,
+                final_acceptance_timeout_s=50.0,
+                backstop_t_s=100.0,
+            )
         self.assertGreater(self.config.backstop_t_s, self.config.node_timeout_s)
 
     # ── §1.2: the guard is a predicate, not a reader of prose ───────────────
@@ -675,7 +723,7 @@ class DeclaredResultOutranksTheSupervisorTests(unittest.TestCase):
         watchdog._process_alive = lambda pid: True
 
         watchdog.check_once()
-        self.clock.set(5.0)   # inside both clocks
+        self.clock.set(5.0)  # inside both clocks
         watchdog.check_once()
         self.assertEqual(asked, [])
 
@@ -694,8 +742,7 @@ class TranscriptRecordCountingTests(unittest.TestCase):
 
     def test_counts_complete_newline_terminated_records(self):
         write_jsonl(self.transcript, ['{"n": 1}', '{"n": 2}', '{"n": 3}'])
-        self.assertEqual(
-            wd.count_complete_transcript_records(self.transcript), 3)
+        self.assertEqual(wd.count_complete_transcript_records(self.transcript), 3)
 
     def test_partial_trailing_record_is_not_counted(self):
         """A file that grows by a partial record must not increment the
@@ -705,8 +752,7 @@ class TranscriptRecordCountingTests(unittest.TestCase):
         with self.transcript.open("a", encoding="utf-8") as f:
             f.write('{"n": 2, "still_wri')  # no closing brace, no newline
 
-        self.assertEqual(
-            wd.count_complete_transcript_records(self.transcript), 1)
+        self.assertEqual(wd.count_complete_transcript_records(self.transcript), 1)
 
     def test_missing_file_counts_zero(self):
         missing = Path(self.tmpdir.name) / "nope.jsonl"
@@ -715,8 +761,8 @@ class TranscriptRecordCountingTests(unittest.TestCase):
 
 # ── the watchdog is the only heartbeat writer ────────────────────────────────
 
-class HeartbeatOwnershipTests(unittest.TestCase):
 
+class HeartbeatOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(0.0)
         self.kill = Recorder()
@@ -751,28 +797,35 @@ class HeartbeatOwnershipTests(unittest.TestCase):
         class in this file writes a heartbeat."""
         tree = ast.parse(WATCHDOG_SOURCE)
         watchdog_class = next(
-            n for n in tree.body
-            if isinstance(n, ast.ClassDef) and n.name == "Watchdog")
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Watchdog"
+        )
         watchdog_method_nodes = set(ast.walk(watchdog_class))
 
         call_sites = []
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_write_heartbeat"):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_write_heartbeat"
+            ):
                 call_sites.append(node)
 
         self.assertTrue(call_sites, "expected at least one heartbeat write")
         for site in call_sites:
             self.assertIn(
-                site, watchdog_method_nodes,
-                "a heartbeat write occurred outside the Watchdog class")
+                site,
+                watchdog_method_nodes,
+                "a heartbeat write occurred outside the Watchdog class",
+            )
 
     def test_writer_is_invoked_when_a_turn_is_first_observed(self):
         write_jsonl(self.transcript, ['{"n": 1}'])
         attempt = make_attempt(
-            started_at=0.0, launched_at=0.0, pid=1,
-            extra={wd.SESSION_PATH_KEY: str(self.transcript)})
+            started_at=0.0,
+            launched_at=0.0,
+            pid=1,
+            extra={wd.SESSION_PATH_KEY: str(self.transcript)},
+        )
         watchdog = wd.Watchdog(
             config=self.config,
             attempts_provider=lambda: [attempt],
@@ -806,15 +859,16 @@ def reads_pane_status_field(source: str) -> bool:
             key = node.slice
             if isinstance(key, ast.Index):  # py < 3.9 compatibility shim
                 key = key.value
-            if (isinstance(key, ast.Constant)
-                    and isinstance(key.value, str)
-                    and key.value in FORBIDDEN_PANE_FIELDS):
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value in FORBIDDEN_PANE_FIELDS
+            ):
                 return True
     return False
 
 
 class PaneTextIsNeverLifecycleTests(unittest.TestCase):
-
     def test_watchdog_module_never_reads_a_pane_status_field(self):
         """§9.7 -- every signal here is structural: process state, a
         record count, a clock. None of it is pane text."""
@@ -828,14 +882,16 @@ class PaneTextIsNeverLifecycleTests(unittest.TestCase):
             "def poll(pane):\n"
             "    if pane.agent_status == 'idle':\n"
             "        return True\n"
-            "    return False\n")
+            "    return False\n"
+        )
         self.assertTrue(reads_pane_status_field(violation_attribute))
 
         violation_subscript = (
             "def poll(pane):\n"
             "    if pane['agent_status'] == 'working':\n"
             "        return False\n"
-            "    return True\n")
+            "    return True\n"
+        )
         self.assertTrue(reads_pane_status_field(violation_subscript))
 
     def test_detector_does_not_false_positive_on_prose_mentioning_the_words(self):
@@ -845,14 +901,15 @@ class PaneTextIsNeverLifecycleTests(unittest.TestCase):
             '"""Herdr\'s agent_status field (idle/working) is screen-\n'
             'derived and is never used as a liveness signal here."""\n'
             "def f():\n"
-            "    return 1\n")
+            "    return 1\n"
+        )
         self.assertFalse(reads_pane_status_field(prose_only))
 
 
 # ── the module owns no store: no database driver, no embedded query ─────────
 
-class NoStoreOwnershipTests(unittest.TestCase):
 
+class NoStoreOwnershipTests(unittest.TestCase):
     def test_watchdog_module_imports_no_database_driver(self):
         """Neither mechanism owns a store (module docstring). If this
         module ever imports a DB driver, something started querying
@@ -883,8 +940,8 @@ class NoStoreOwnershipTests(unittest.TestCase):
 
 # ── §11.2 the run-level backstop ─────────────────────────────────────────────
 
-class RunBackstopTests(unittest.TestCase):
 
+class RunBackstopTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(0.0)
         self.stuck = Recorder()
@@ -892,8 +949,8 @@ class RunBackstopTests(unittest.TestCase):
         # T=500 > greatest_run_window_s (max(node=100, final=50)=100),
         # satisfying the bound SchedulerConfig already enforces.
         self.config = make_config(
-            node_timeout_s=100.0, final_acceptance_timeout_s=50.0,
-            backstop_t_s=500.0)
+            node_timeout_s=100.0, final_acceptance_timeout_s=50.0, backstop_t_s=500.0
+        )
 
     def _backstop(self, last_transition_at):
         def diagnostic():
@@ -988,18 +1045,22 @@ class RunBackstopTests(unittest.TestCase):
         """
         tree = ast.parse(WATCHDOG_SOURCE)
         backstop_class = next(
-            n for n in tree.body
-            if isinstance(n, ast.ClassDef) and n.name == "RunBackstop")
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "RunBackstop"
+        )
         init = next(
-            n for n in backstop_class.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+            n
+            for n in backstop_class.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
         arg_names = {a.arg for a in init.args.args}
-        for forbidden in ("in_flight", "inflight", "running_count",
-                          "pane_count"):
+        for forbidden in ("in_flight", "inflight", "running_count", "pane_count"):
             self.assertNotIn(forbidden, arg_names)
 
 
 # ── §7.6 the thread wrapper itself, not just check_once() ───────────────────
+
 
 class ThreadWrapperTests(unittest.TestCase):
     """`start()`/`stop()` is the only part of "a single scheduler-owned
@@ -1044,8 +1105,10 @@ class ThreadWrapperTests(unittest.TestCase):
 
         # It actually ran the poll loop on its own, more than once.
         self.assertGreaterEqual(
-            len(poll_times), 4,
-            "watchdog thread did not poll repeatedly within the deadline")
+            len(poll_times),
+            4,
+            "watchdog thread did not poll repeatedly within the deadline",
+        )
         # The raising poll was observed and handled, not swallowed
         # unnoticed -- and the loop kept going past it (poll 3 and 4
         # happened after poll 2 raised).
@@ -1059,8 +1122,7 @@ class ThreadWrapperTests(unittest.TestCase):
         watchdog.stop(timeout=2.0)
         stop_elapsed = time.monotonic() - stop_started
 
-        self.assertLess(
-            stop_elapsed, 1.0, "stop() did not join within the bound")
+        self.assertLess(stop_elapsed, 1.0, "stop() did not join within the bound")
         self.assertIsNone(watchdog._thread)
         self.assertFalse(thread_ref.is_alive())
 
@@ -1072,11 +1134,15 @@ class ProductionWiresTheStatusSeamTests(unittest.TestCase):
 
     def test_watchdog_constructor_names_the_actor_status_seam(self):
         init = next(
-            n for n in ast.parse(WATCHDOG_SOURCE).body
-            if isinstance(n, ast.ClassDef) and n.name == "Watchdog")
+            n
+            for n in ast.parse(WATCHDOG_SOURCE).body
+            if isinstance(n, ast.ClassDef) and n.name == "Watchdog"
+        )
         ctor = next(
-            n for n in init.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+            n
+            for n in init.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
         self.assertIn("actor_status", {a.arg for a in ctor.args.args})
         self.assertIn("preserve_unpublished", {a.arg for a in ctor.args.args})
 
@@ -1105,15 +1171,14 @@ class ProductionWiresTheStatusSeamTests(unittest.TestCase):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if not (isinstance(func, ast.Attribute)
-                    and func.attr == "SchedulerDeps"):
+            if not (isinstance(func, ast.Attribute) and func.attr == "SchedulerDeps"):
                 continue
             names = {kw.arg for kw in node.keywords if kw.arg}
             if "actor_status" in names:
                 found = True
         self.assertTrue(
-            found,
-            "maestro run start must pass actor_status into SchedulerDeps")
+            found, "maestro run start must pass actor_status into SchedulerDeps"
+        )
 
     def test_idle_is_not_a_live_working_status(self):
         """Known trap: idle_notification is a heartbeat, not completion

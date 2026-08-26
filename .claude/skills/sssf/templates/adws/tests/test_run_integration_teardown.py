@@ -28,14 +28,17 @@ BRANCH = "integration/run-1"
 def _git(repo, *arguments):
     return subprocess.run(
         ("git", "-C", str(repo)) + arguments,
-        capture_output=True, text=True, check=False)
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _worktree_paths(repo):
     """Resolved, because git reports the real path behind /var -> /private/var."""
     listed = _git(repo, "worktree", "list", "--porcelain")
     return {
-        Path(line[len("worktree "):].strip()).resolve()
+        Path(line[len("worktree ") :].strip()).resolve()
         for line in listed.stdout.splitlines()
         if line.startswith("worktree ")
     }
@@ -55,9 +58,12 @@ class _RunSeamHarness:
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
         subprocess.run(
             ["git", "config", "user.email", "maestro@example.invalid"],
-            cwd=repo, check=True)
+            cwd=repo,
+            check=True,
+        )
         subprocess.run(
-            ["git", "config", "user.name", "Maestro Test"], cwd=repo, check=True)
+            ["git", "config", "user.name", "Maestro Test"], cwd=repo, check=True
+        )
         (repo / "README.md").write_text("base\n", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
@@ -69,11 +75,17 @@ class _RunSeamHarness:
         # arbitrary keywords, and it is what `_run_start` and `_execute_run`
         # actually declare, so the seam is checked instead of merely duck-typed.
         arguments = argparse.Namespace(
-            plan_file=str(root / "plan.json"), db=str(root / "state.db"),
-            run_id="run-1", integration_path=str(integration), repo=str(repo),
-            data_dir=str(root / "data"), receipt_dir=str(root / "receipts"),
+            plan_file=str(root / "plan.json"),
+            db=str(root / "state.db"),
+            run_id="run-1",
+            integration_path=str(integration),
+            repo=str(repo),
+            data_dir=str(root / "data"),
+            receipt_dir=str(root / "receipts"),
             worktrees_root=str(root / "worktrees"),
-            scratch_root=str(root / "scratch"), digest="a" * 64)
+            scratch_root=str(root / "scratch"),
+            digest="a" * 64,
+        )
         # Bound only by installed repository configuration, so a hand-spelled
         # run genuinely arrives without it -- and must, or the reclaim would be
         # tested against a boundary the real unconfigured path never has.
@@ -86,30 +98,35 @@ class _RunSeamHarness:
             agent_nodes=(),
             merge_policy=SimpleNamespace(
                 integration_branch=BRANCH,
-                integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1)),
-            to_plan_nodes=lambda: ())
+                integration_gate=SimpleNamespace(runner="none", argv=(), min_cases=1),
+            ),
+            to_plan_nodes=lambda: (),
+        )
 
     @contextlib.contextmanager
     def _run_seam(self, scheduler_class):
         gate = SimpleNamespace()
-        with mock.patch.object(
-                maestro, "_run_configuration", return_value=mock.Mock()
-        ), mock.patch.object(
+        with (
+            mock.patch.object(maestro, "_run_configuration", return_value=mock.Mock()),
+            mock.patch.object(
                 maestro, "_load_runnable_plan", return_value=self._plan()
-        ), mock.patch.object(
-                maestro, "_validate_run_paths"
-        ), mock.patch.object(
+            ),
+            mock.patch.object(maestro, "_validate_run_paths"),
+            mock.patch.object(
                 maestro, "_scheduler_gate_deps", return_value=(gate, gate)
-        ), mock.patch.object(
+            ),
+            mock.patch.object(
                 # Runner resolution probes a real interpreter, which is what
                 # these tests are not about. It joins the four seams above for
                 # the same reason they are here: this file asks what a run does
                 # to worktrees, and every other question is stubbed.
-                maestro, "_resolve_run_runners", return_value={}
-        ), mock.patch.object(
-                maestro.lc, "LifecycleStore"
-        ), mock.patch.object(
-                maestro.scheduler, "Scheduler", scheduler_class):
+                maestro,
+                "_resolve_run_runners",
+                return_value={},
+            ),
+            mock.patch.object(maestro.lc, "LifecycleStore"),
+            mock.patch.object(maestro.scheduler, "Scheduler", scheduler_class),
+        ):
             yield
 
     @staticmethod
@@ -118,12 +135,15 @@ class _RunSeamHarness:
             def __init__(self, _run_id, _nodes, _config, deps, **_kwargs):
                 self.deps = deps
 
+            def project(self):
+                return None
+
             def run(self):
                 if side_effect is not None:
                     side_effect(Path(self.deps.integration_path))
                 return SimpleNamespace(
-                    outcome=scheduler_types.RunOutcome.ACCEPTED,
-                    merged=(), blocked=())
+                    outcome=scheduler_types.RunOutcome.ACCEPTED, merged=(), blocked=()
+                )
 
         return AcceptingScheduler
 
@@ -137,21 +157,25 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
             repo = self._repository(root)
             integration = root / "integration"
             output = io.StringIO()
-            with self._run_seam(self._accepting_scheduler()), \
-                    contextlib.redirect_stdout(output):
+            with (
+                self._run_seam(self._accepting_scheduler()),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(self._arguments(root, repo, integration))
 
             self.assertEqual(code, 0, output.getvalue())
-            self.assertEqual(
-                json.loads(output.getvalue())["outcome"], "ACCEPTED")
+            self.assertEqual(json.loads(output.getvalue())["outcome"], "ACCEPTED")
             self.assertFalse(integration.exists())
             self.assertNotIn(integration.resolve(), _worktree_paths(repo))
             self.assertEqual(
-                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0,
-                "the integration branch is the only copy of merged work")
+                _git(repo, "rev-parse", "--verify", BRANCH).returncode,
+                0,
+                "the integration branch is the only copy of merged work",
+            )
 
     def test_gate_artifacts_do_not_strand_the_checkout(self):
         """The integration gate runs in there; its litter is not evidence."""
+
         def litter(integration):
             (integration / "untracked.log").write_text("gate\n", encoding="utf-8")
             (integration / "README.md").write_text("modified\n", encoding="utf-8")
@@ -160,14 +184,15 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
             root = Path(tmp)
             repo = self._repository(root)
             integration = root / "integration"
-            with self._run_seam(self._accepting_scheduler(litter)), \
-                    contextlib.redirect_stdout(io.StringIO()):
+            with (
+                self._run_seam(self._accepting_scheduler(litter)),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 code = maestro._run_start(self._arguments(root, repo, integration))
 
             self.assertEqual(code, 0)
             self.assertFalse(integration.exists())
-            self.assertEqual(
-                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0)
+            self.assertEqual(_git(repo, "rev-parse", "--verify", BRANCH).returncode, 0)
 
     def test_second_run_of_the_same_plan_is_not_refused(self):
         """Each run gets its own `<run_root>/integration`, so run two would
@@ -180,10 +205,11 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
                 integration = root / "runs" / run / "integration"
                 integration.parent.mkdir(parents=True)
                 output = io.StringIO()
-                with self._run_seam(self._accepting_scheduler()), \
-                        contextlib.redirect_stdout(output):
-                    code = maestro._run_start(
-                        self._arguments(root, repo, integration))
+                with (
+                    self._run_seam(self._accepting_scheduler()),
+                    contextlib.redirect_stdout(output),
+                ):
+                    code = maestro._run_start(self._arguments(root, repo, integration))
                 outcomes.append((code, json.loads(output.getvalue())["outcome"]))
 
             self.assertEqual(outcomes, [(0, "ACCEPTED"), (0, "ACCEPTED")])
@@ -196,12 +222,16 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
             occupant = root / "occupant"
             subprocess.run(
                 ["git", "worktree", "add", "-q", str(occupant), BRANCH],
-                cwd=repo, check=True)
+                cwd=repo,
+                check=True,
+            )
             (occupant / "operator-work.txt").write_text("mine\n", encoding="utf-8")
             integration = root / "integration"
             output = io.StringIO()
-            with self._run_seam(self._accepting_scheduler()), \
-                    contextlib.redirect_stdout(output):
+            with (
+                self._run_seam(self._accepting_scheduler()),
+                contextlib.redirect_stdout(output),
+            ):
                 code = maestro._run_start(self._arguments(root, repo, integration))
 
             self.assertEqual(code, 3)
@@ -209,8 +239,8 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
             self.assertEqual(payload["outcome"], "INTEGRATION_BRANCH_CHECKED_OUT")
             self.assertTrue(occupant.is_dir())
             self.assertEqual(
-                (occupant / "operator-work.txt").read_text(encoding="utf-8"),
-                "mine\n")
+                (occupant / "operator-work.txt").read_text(encoding="utf-8"), "mine\n"
+            )
             self.assertIn(occupant.resolve(), _worktree_paths(repo))
             self.assertFalse(integration.exists())
 
@@ -218,6 +248,9 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
         class ExplodingScheduler:
             def __init__(self, _run_id, _nodes, _config, _deps, **_kwargs):
                 pass
+
+            def project(self):
+                return None
 
             def run(self):
                 raise RuntimeError("scheduler exploded")
@@ -229,13 +262,13 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
             with self._run_seam(ExplodingScheduler):
                 with self.assertRaises(RuntimeError) as raised:
                     maestro._execute_run(
-                        self._arguments(root, repo, integration), resuming=False)
+                        self._arguments(root, repo, integration), resuming=False
+                    )
 
             self.assertEqual(str(raised.exception), "scheduler exploded")
             self.assertFalse(integration.exists())
             self.assertNotIn(integration.resolve(), _worktree_paths(repo))
-            self.assertEqual(
-                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0)
+            self.assertEqual(_git(repo, "rev-parse", "--verify", BRANCH).returncode, 0)
 
     def test_a_checkout_this_run_did_not_create_is_left_where_it_is(self):
         """Resume reuses an existing integration worktree; it does not own it."""
@@ -245,9 +278,13 @@ class RunIntegrationTeardownTest(_RunSeamHarness, unittest.TestCase):
             integration = root / "integration"
             subprocess.run(
                 ["git", "worktree", "add", "-q", str(integration), BRANCH],
-                cwd=repo, check=True)
-            with self._run_seam(self._accepting_scheduler()), \
-                    contextlib.redirect_stdout(io.StringIO()):
+                cwd=repo,
+                check=True,
+            )
+            with (
+                self._run_seam(self._accepting_scheduler()),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
                 code = maestro._run_start(self._arguments(root, repo, integration))
 
             self.assertEqual(code, 0)
@@ -289,10 +326,12 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
         with sqlite3.connect(root / "state.db") as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY,"
-                " latest_outcome TEXT)")
+                " latest_outcome TEXT)"
+            )
             connection.execute(
-                "INSERT OR REPLACE INTO runs (run_id, latest_outcome)"
-                " VALUES (?, ?)", (run_id, outcome))
+                "INSERT OR REPLACE INTO runs (run_id, latest_outcome) VALUES (?, ?)",
+                (run_id, outcome),
+            )
 
     def _strand_integration(self, repo, state, run_id="run-0"):
         """What a run that died before its release leaves holding the branch."""
@@ -300,17 +339,22 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
         stranded.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["git", "worktree", "add", "-q", str(stranded), BRANCH],
-            cwd=repo, check=True)
+            cwd=repo,
+            check=True,
+        )
         return stranded
 
     def _start(self, root, repo, state, run_id="run-1"):
         integration = state / "runs" / run_id / "integration"
         integration.parent.mkdir(parents=True, exist_ok=True)
         output = io.StringIO()
-        with self._run_seam(self._accepting_scheduler()), \
-                contextlib.redirect_stdout(output):
+        with (
+            self._run_seam(self._accepting_scheduler()),
+            contextlib.redirect_stdout(output),
+        ):
             code = maestro._run_start(
-                self._arguments(root, repo, integration, repository_state=state))
+                self._arguments(root, repo, integration, repository_state=state)
+            )
         return code, json.loads(output.getvalue()), integration
 
     def test_a_stranded_checkout_in_our_own_run_root_is_reclaimed(self):
@@ -328,11 +372,14 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             self.assertFalse(
                 stranded.exists(),
                 "a previous run's own integration checkout is this system's "
-                "litter, not an operator's work")
+                "litter, not an operator's work",
+            )
             self.assertNotIn(stranded.resolve(), _worktree_paths(repo))
             self.assertEqual(
-                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0,
-                "reclaiming a checkout never takes the branch with it")
+                _git(repo, "rev-parse", "--verify", BRANCH).returncode,
+                0,
+                "reclaiming a checkout never takes the branch with it",
+            )
 
     def test_an_operator_checkout_outside_the_run_root_is_still_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -341,7 +388,9 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             occupant = root / "operator"
             subprocess.run(
                 ["git", "worktree", "add", "-q", str(occupant), BRANCH],
-                cwd=repo, check=True)
+                cwd=repo,
+                check=True,
+            )
             (occupant / "operator-work.txt").write_text("mine\n", encoding="utf-8")
 
             code, payload, integration = self._start(root, repo, state)
@@ -350,8 +399,8 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             self.assertEqual(payload["outcome"], "INTEGRATION_BRANCH_CHECKED_OUT")
             self.assertTrue(occupant.is_dir())
             self.assertEqual(
-                (occupant / "operator-work.txt").read_text(encoding="utf-8"),
-                "mine\n")
+                (occupant / "operator-work.txt").read_text(encoding="utf-8"), "mine\n"
+            )
             self.assertIn(occupant.resolve(), _worktree_paths(repo))
             self.assertFalse(integration.exists())
 
@@ -366,9 +415,19 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             for node in ("node-a", "node-b"):
                 attempt = state / "runs" / "run-0" / "worktrees" / node
                 subprocess.run(
-                    ["git", "worktree", "add", "-q", "-b",
-                     "attempt/" + node + "-1", str(attempt), "main"],
-                    cwd=repo, check=True)
+                    [
+                        "git",
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "attempt/" + node + "-1",
+                        str(attempt),
+                        "main",
+                    ],
+                    cwd=repo,
+                    check=True,
+                )
                 (attempt / "evidence.txt").write_text(node + "\n", encoding="utf-8")
                 retained.append(attempt)
 
@@ -380,14 +439,19 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             for attempt in retained:
                 self.assertTrue(
                     attempt.is_dir(),
-                    "a blocked node's worktree is post-mortem evidence")
+                    "a blocked node's worktree is post-mortem evidence",
+                )
                 self.assertEqual(
                     (attempt / "evidence.txt").read_text(encoding="utf-8"),
-                    attempt.name + "\n")
+                    attempt.name + "\n",
+                )
                 self.assertIn(attempt.resolve(), listed)
                 self.assertEqual(
-                    _git(repo, "rev-parse", "--verify",
-                         "attempt/" + attempt.name + "-1").returncode, 0)
+                    _git(
+                        repo, "rev-parse", "--verify", "attempt/" + attempt.name + "-1"
+                    ).returncode,
+                    0,
+                )
 
     def test_a_blocked_runs_checkout_is_refused_rather_than_reclaimed(self):
         """A run an operator can resume is not this system's litter (§19 M24).
@@ -406,14 +470,13 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             code, payload, integration = self._start(root, repo, state)
 
             self.assertEqual(code, 3, payload)
-            self.assertEqual(payload["outcome"],
-                             "INTEGRATION_WORKTREE_RUN_NOT_OVER")
+            self.assertEqual(payload["outcome"], "INTEGRATION_WORKTREE_RUN_NOT_OVER")
             self.assertIn("run-0", payload["detail"])
             self.assertIn("BLOCKED", payload["detail"])
             self.assertTrue(stranded.is_dir())
             self.assertEqual(
-                (stranded / "merged-work.txt").read_text(encoding="utf-8"),
-                "kept\n")
+                (stranded / "merged-work.txt").read_text(encoding="utf-8"), "kept\n"
+            )
             self.assertIn(stranded.resolve(), _worktree_paths(repo))
             self.assertFalse(integration.exists())
 
@@ -435,8 +498,7 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             code, payload, _ = self._start(root, repo, state)
 
             self.assertEqual(code, 3, payload)
-            self.assertEqual(payload["outcome"],
-                             "INTEGRATION_WORKTREE_RUN_NOT_OVER")
+            self.assertEqual(payload["outcome"], "INTEGRATION_WORKTREE_RUN_NOT_OVER")
             self.assertIn("run-0", payload["detail"])
             self.assertIn("no declared outcome", payload["detail"])
             self.assertTrue(stranded.is_dir())
@@ -457,8 +519,8 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             self._record_run(root, None)
 
             released = maestro._reclaim_stranded_integration_worktree(
-                repo, state / "runs", BRANCH, root / "state.db",
-                discard_live=True)
+                repo, state / "runs", BRANCH, root / "state.db", discard_live=True
+            )
 
             # Resolved, because the path comes back through `git worktree
             # list`, which reports the real path behind /var -> /private/var.
@@ -466,8 +528,10 @@ class RunStartReclaimsItsOwnLeftoverTest(_RunSeamHarness, unittest.TestCase):
             self.assertFalse(stranded.exists())
             self.assertNotIn(stranded.resolve(), _worktree_paths(repo))
             self.assertEqual(
-                _git(repo, "rev-parse", "--verify", BRANCH).returncode, 0,
-                "discarding a checkout never takes the branch with it")
+                _git(repo, "rev-parse", "--verify", BRANCH).returncode,
+                0,
+                "discarding a checkout never takes the branch with it",
+            )
 
 
 if __name__ == "__main__":

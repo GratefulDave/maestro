@@ -43,7 +43,6 @@ sys.path.insert(0, str(ADWS))
 
 import maestro  # noqa: E402
 from adw_modules import lifecycle as lc  # noqa: E402
-from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
 
 
@@ -54,8 +53,24 @@ MERGED = "lane-p2-manifest-import"
 
 
 def make_node(node_id: str, depth: int = 0, needs=()) -> st.PlanNode:
-    return st.PlanNode(node_id=node_id, kind=st.NodeKind.CODE, depth=depth,
-                       needs=tuple(needs), command=("true",))
+    return st.PlanNode(
+        node_id=node_id,
+        kind=st.NodeKind.CODE,
+        depth=depth,
+        needs=tuple(needs),
+        command=("true",),
+    )
+
+
+def make_agent_node(node_id: str) -> st.PlanNode:
+    return st.PlanNode(
+        node_id=node_id,
+        kind=st.NodeKind.AGENT,
+        depth=0,
+        instruction=f"Build {node_id}.",
+        gate_command=("pytest",),
+        gate_selector=f"tests/test_{node_id}.py",
+    )
 
 
 def _init_git_repo(root: Path) -> str:
@@ -64,25 +79,27 @@ def _init_git_repo(root: Path) -> str:
         subprocess.run(["git", "-C", str(root), "config", key, value], check=True)
     (root / "f.txt").write_text("x")
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "init"],
-                   check=True)
-    out = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
-                         check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "init"], check=True)
+    out = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     return out.stdout.strip()
 
 
 def _stamp_dead_scheduler(store: lc.LifecycleStore) -> None:
     store.conn.execute(
         "UPDATE runs SET scheduler_pid=?, scheduler_host=? WHERE run_id=?",
-        (DEAD_PID, lc.scheduler_host(), RUN_ID))
+        (DEAD_PID, lc.scheduler_host(), RUN_ID),
+    )
 
 
-def _blocked_unreviewed(store: lc.LifecycleStore, node_id: str,
-                        base_sha: str) -> None:
+def _blocked_unreviewed(store: lc.LifecycleStore, node_id: str, base_sha: str) -> None:
     """The shape a skip is actually taken against: blocked, never verified."""
     store.start_attempt(RUN_ID, node_id, base_sha=base_sha)
-    store.mark_blocked(RUN_ID, node_id,
-                       st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
+    store.mark_blocked(RUN_ID, node_id, st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
 
 
 class MergeCauseVocabularyTests(unittest.TestCase):
@@ -91,13 +108,14 @@ class MergeCauseVocabularyTests(unittest.TestCase):
     def test_a_scheduler_merge_reads_scheduler(self):
         self.assertEqual(
             st.merge_cause_label(st.NodeState.MERGED, st.MergeCause.SCHEDULER),
-            "SCHEDULER")
+            "SCHEDULER",
+        )
 
     def test_an_operator_accepted_merge_reads_operator_accepted(self):
         self.assertEqual(
-            st.merge_cause_label(st.NodeState.MERGED,
-                                 st.MergeCause.OPERATOR_ACCEPTED),
-            "OPERATOR_ACCEPTED")
+            st.merge_cause_label(st.NodeState.MERGED, st.MergeCause.OPERATOR_ACCEPTED),
+            "OPERATOR_ACCEPTED",
+        )
 
     def test_a_merged_row_with_no_recorded_cause_reads_unrecorded(self):
         """The migration invents no facts. This is the whole property.
@@ -107,20 +125,26 @@ class MergeCauseVocabularyTests(unittest.TestCase):
         them is SCHEDULER — that would have every pre-existing row assert an
         evidence chain nobody checked.
         """
-        self.assertEqual(st.merge_cause_label(st.NodeState.MERGED, None),
-                         st.MERGE_CAUSE_UNRECORDED)
-        self.assertNotEqual(st.merge_cause_label(st.NodeState.MERGED, None),
-                            st.MergeCause.SCHEDULER.value)
+        self.assertEqual(
+            st.merge_cause_label(st.NodeState.MERGED, None), st.MERGE_CAUSE_UNRECORDED
+        )
+        self.assertNotEqual(
+            st.merge_cause_label(st.NodeState.MERGED, None),
+            st.MergeCause.SCHEDULER.value,
+        )
 
     def test_a_node_that_is_not_merged_has_no_provenance(self):
-        for state in (st.NodeState.PENDING, st.NodeState.RUNNING,
-                      st.NodeState.VERIFIED, st.NodeState.BLOCKED,
-                      st.NodeState.CANCELLED):
+        for state in (
+            st.NodeState.PENDING,
+            st.NodeState.RUNNING,
+            st.NodeState.VERIFIED,
+            st.NodeState.BLOCKED,
+            st.NodeState.CANCELLED,
+        ):
             self.assertIsNone(st.merge_cause_label(state, None), state)
 
     def test_operator_accepted_is_the_unevidenced_cause(self):
-        self.assertIn(st.MergeCause.OPERATOR_ACCEPTED,
-                      st.UNEVIDENCED_MERGE_CAUSES)
+        self.assertIn(st.MergeCause.OPERATOR_ACCEPTED, st.UNEVIDENCED_MERGE_CAUSES)
         self.assertNotIn(st.MergeCause.SCHEDULER, st.UNEVIDENCED_MERGE_CAUSES)
 
 
@@ -136,7 +160,9 @@ class MergeCauseIsStoredTests(unittest.TestCase):
             store.mark_merged(RUN_ID, MERGED)
             stored = store.conn.execute(
                 "SELECT state, merge_cause FROM node_lifecycle"
-                " WHERE run_id=? AND node_id=?", (RUN_ID, MERGED)).fetchone()
+                " WHERE run_id=? AND node_id=?",
+                (RUN_ID, MERGED),
+            ).fetchone()
             self.assertEqual(stored[0], st.NodeState.MERGED.value)
             self.assertEqual(stored[1], st.MergeCause.SCHEDULER.value)
             store.close()
@@ -156,8 +182,9 @@ class MergeCauseIsStoredTests(unittest.TestCase):
 
             self.assertIs(row.state, st.NodeState.MERGED)
             stored = store.conn.execute(
-                "SELECT merge_cause FROM node_lifecycle"
-                " WHERE run_id=? AND node_id=?", (RUN_ID, SKIPPED)).fetchone()
+                "SELECT merge_cause FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (RUN_ID, SKIPPED),
+            ).fetchone()
             self.assertEqual(stored[0], st.MergeCause.OPERATOR_ACCEPTED.value)
             store.close()
 
@@ -169,8 +196,7 @@ class MergeCauseIsStoredTests(unittest.TestCase):
             sha = _init_git_repo(repo)
             db = Path(tmp) / "lifecycle.db"
             store = lc.LifecycleStore(db)
-            store.create_run(RUN_ID, "d" * 64,
-                             [make_node(MERGED), make_node(SKIPPED)])
+            store.create_run(RUN_ID, "d" * 64, [make_node(MERGED), make_node(SKIPPED)])
             store.start_attempt(RUN_ID, MERGED, base_sha=sha)
             store.mark_verified(RUN_ID, MERGED, output_sha=sha)
             store.mark_merged(RUN_ID, MERGED)
@@ -187,10 +213,10 @@ class MergeCauseIsStoredTests(unittest.TestCase):
             self.assertIs(by_id[MERGED].state, st.NodeState.MERGED)
             self.assertIs(by_id[SKIPPED].state, st.NodeState.MERGED)
             self.assertEqual(by_id[MERGED].merge_provenance, "SCHEDULER")
-            self.assertEqual(by_id[SKIPPED].merge_provenance,
-                             "OPERATOR_ACCEPTED")
-            self.assertNotEqual(by_id[MERGED].merge_provenance,
-                                by_id[SKIPPED].merge_provenance)
+            self.assertEqual(by_id[SKIPPED].merge_provenance, "OPERATOR_ACCEPTED")
+            self.assertNotEqual(
+                by_id[MERGED].merge_provenance, by_id[SKIPPED].merge_provenance
+            )
 
 
 class LedgerOlderThanTheColumnTests(unittest.TestCase):
@@ -209,8 +235,7 @@ class LedgerOlderThanTheColumnTests(unittest.TestCase):
         store.start_attempt(RUN_ID, MERGED, base_sha="a" * 40)
         store.mark_verified(RUN_ID, MERGED, output_sha="b" * 40)
         store.mark_merged(RUN_ID, MERGED)
-        store.conn.execute(
-            "ALTER TABLE node_lifecycle DROP COLUMN merge_cause")
+        store.conn.execute("ALTER TABLE node_lifecycle DROP COLUMN merge_cause")
         store.conn.commit()
         store.close()
         return db
@@ -243,11 +268,13 @@ class LedgerOlderThanTheColumnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = self._ledger_without_the_column(Path(tmp))
             store = lc.LifecycleStore(db)
-            self.assertIn("merge_cause",
-                          lc._table_columns(store.conn, "node_lifecycle"))
+            self.assertIn(
+                "merge_cause", lc._table_columns(store.conn, "node_lifecycle")
+            )
             stored = store.conn.execute(
-                "SELECT merge_cause FROM node_lifecycle"
-                " WHERE run_id=? AND node_id=?", (RUN_ID, MERGED)).fetchone()
+                "SELECT merge_cause FROM node_lifecycle WHERE run_id=? AND node_id=?",
+                (RUN_ID, MERGED),
+            ).fetchone()
             store.close()
             self.assertIsNone(stored[0])
 
@@ -261,9 +288,12 @@ class SkipRecordsTheEvidenceGapTests(unittest.TestCase):
     """Acceptance item 2 — the absent chain is findable afterwards."""
 
     def _skip_transition(self, store: lc.LifecycleStore, node_id: str):
-        rows = [row for row in store.audit_transitions(RUN_ID)
-                if row.get("node_id") == node_id
-                and row.get("reason") == st.Escape.SKIP.value]
+        rows = [
+            row
+            for row in store.audit_transitions(RUN_ID)
+            if row.get("node_id") == node_id
+            and row.get("reason") == st.Escape.SKIP.value
+        ]
         self.assertEqual(len(rows), 1, rows)
         return rows[0]["detail"][lc.MERGE_EVIDENCE_KEY]
 
@@ -285,25 +315,57 @@ class SkipRecordsTheEvidenceGapTests(unittest.TestCase):
             self.assertEqual(evidence["review_rejections"], 0)
             self.assertEqual(evidence["attempts_recorded"], 1)
             self.assertEqual(
-                evidence["block_reason"],
-                st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED.value)
+                evidence["block_reason"], st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED.value
+            )
             store.close()
 
-    def test_review_rejections_are_counted_from_the_attempt_rows(self):
+    def test_review_rejections_are_counted_from_candidate_reviews(self):
         """A reviewer that looked and rejected is not the same as none."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
             sha = _init_git_repo(repo)
             store = lc.LifecycleStore(Path(tmp) / "lifecycle.db")
-            store.create_run(RUN_ID, "d" * 64, [make_node(SKIPPED)])
-            store.start_attempt(RUN_ID, SKIPPED, base_sha=sha)
-            store.fail_attempt(RUN_ID, SKIPPED, st.RetryClass.SEMANTIC,
-                               attempt_extra={rp.REVIEW_REJECTED_KEY: True})
-            store.start_attempt(RUN_ID, SKIPPED, base_sha=sha)
-            store.mark_blocked(RUN_ID, SKIPPED,
-                               st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                               attempt_extra={rp.REVIEW_REJECTED_KEY: True})
+            store.create_run(RUN_ID, "d" * 64, [make_agent_node(SKIPPED)])
+            store.ensure_derived_review_node(
+                RUN_ID, SKIPPED, depth=1, downstream_needs=()
+            )
+            candidates = ("a" * 40, "b" * 40)
+            for index, candidate_sha in enumerate(candidates, 1):
+                store.start_attempt(RUN_ID, SKIPPED, base_sha=sha)
+                store.publish_candidate(
+                    RUN_ID,
+                    SKIPPED,
+                    candidate_sha=candidate_sha,
+                    parent_candidate_sha=(candidates[index - 2] if index > 1 else None),
+                    builder_generation=index,
+                    ancestry_validator=lambda _parent, _child: True,
+                )
+                store.begin_review(
+                    RUN_ID, f"{SKIPPED}::review", candidate_sha, reviewer_generation=1
+                )
+                store.reject_and_create_handoff(
+                    RUN_ID,
+                    f"{SKIPPED}::review",
+                    candidate_sha,
+                    reviewer_generation=1,
+                    builder_generation=index,
+                    review_digest=f"{index}" * 64,
+                    receipt_path=f"/tmp/review-{index}.json",
+                    findings=(
+                        {
+                            "check_id": "diff.correctness",
+                            "grade": "error",
+                            "message": "candidate rejected",
+                        },
+                    ),
+                )
+                if index == 1:
+                    store.fail_attempt(RUN_ID, SKIPPED, st.RetryClass.SEMANTIC)
+                else:
+                    store.mark_blocked(
+                        RUN_ID, SKIPPED, st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+                    )
             store.declare_outcome(RUN_ID)
             _stamp_dead_scheduler(store)
             store.skip(RUN_ID, SKIPPED, accept_sha=sha, repo_path=repo)
@@ -337,8 +399,9 @@ class SkipRecordsTheEvidenceGapTests(unittest.TestCase):
             evidence = self._skip_transition(store, SKIPPED)
             self.assertTrue(evidence["verified_ever"])
             self.assertEqual(evidence["verified_transitions"], 1)
-            self.assertEqual(evidence["block_reason"],
-                             st.BlockReason.MERGE_CONFLICT.value)
+            self.assertEqual(
+                evidence["block_reason"], st.BlockReason.MERGE_CONFLICT.value
+            )
             store.close()
 
     def test_a_scheduler_merge_writes_no_evidence_record(self):
@@ -363,8 +426,7 @@ class RunStatusReportsTheDifferenceTests(unittest.TestCase):
         sha = _init_git_repo(repo)
         db = tmp / "lifecycle.db"
         store = lc.LifecycleStore(db)
-        store.create_run(RUN_ID, "d" * 64,
-                         [make_node(MERGED), make_node(SKIPPED)])
+        store.create_run(RUN_ID, "d" * 64, [make_node(MERGED), make_node(SKIPPED)])
         store.start_attempt(RUN_ID, MERGED, base_sha=sha)
         store.mark_verified(RUN_ID, MERGED, output_sha=sha)
         store.mark_merged(RUN_ID, MERGED)
@@ -378,7 +440,8 @@ class RunStatusReportsTheDifferenceTests(unittest.TestCase):
         try:
             record = reader.run(RUN_ID)
             return maestro._run_progress(
-                reader, record, SimpleNamespace(plan_digests={}))
+                reader, record, SimpleNamespace(plan_digests={})
+            )
         finally:
             reader.close()
 
@@ -389,13 +452,16 @@ class RunStatusReportsTheDifferenceTests(unittest.TestCase):
             self.assertEqual(by_id[MERGED]["state"], "MERGED")
             self.assertEqual(by_id[SKIPPED]["state"], "MERGED")
             self.assertEqual(by_id[MERGED]["merge_cause"], "SCHEDULER")
-            self.assertEqual(by_id[SKIPPED]["merge_cause"],
-                             "OPERATOR_ACCEPTED")
+            self.assertEqual(by_id[SKIPPED]["merge_cause"], "OPERATOR_ACCEPTED")
             # And the payload survives a round trip through the wire format
             # `run status --json` actually prints.
             self.assertEqual(
-                json.loads(json.dumps(progress, sort_keys=True))["nodes"][0]
-                .get("merge_cause") is not None, True)
+                json.loads(json.dumps(progress, sort_keys=True))["nodes"][0].get(
+                    "merge_cause"
+                )
+                is not None,
+                True,
+            )
 
     def test_the_json_projection_carries_the_evidence_only_where_it_applies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,16 +478,17 @@ class RunStatusReportsTheDifferenceTests(unittest.TestCase):
             self.assertIn("operator-accepted", rendered)
             self.assertIn("OPERATOR-ACCEPTED", rendered)
             self.assertIn("never reached VERIFIED", rendered)
-            self.assertIn("evidence chain not established by this run",
-                          rendered)
+            self.assertIn("evidence chain not established by this run", rendered)
 
     def test_the_human_render_leaves_a_run_merged_node_alone(self):
         """The ordinary case gains no annotation and no new vocabulary."""
         with tempfile.TemporaryDirectory() as tmp:
             rendered = maestro._render_progress(self._progress(Path(tmp)))
-            merged_line = [line for line in rendered.splitlines()
-                           if line.strip().startswith(MERGED)
-                           and "MERGED" in line]
+            merged_line = [
+                line
+                for line in rendered.splitlines()
+                if line.strip().startswith(MERGED) and "MERGED" in line
+            ]
             self.assertTrue(merged_line, rendered)
             self.assertIn("output ", merged_line[0])
             self.assertNotIn("operator-accepted", merged_line[0])
@@ -441,8 +508,13 @@ class RunStatusReportsTheDifferenceTests(unittest.TestCase):
             store.skip(RUN_ID, SKIPPED, accept_sha=sha, repo_path=repo)
             store.close()
 
-            args = SimpleNamespace(db=str(db), run_id=RUN_ID, as_json=True,
-                                   plan_digests={}, repository_state=None)
+            args = SimpleNamespace(
+                db=str(db),
+                run_id=RUN_ID,
+                as_json=True,
+                plan_digests={},
+                repository_state=None,
+            )
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = maestro._run_status(args)
@@ -457,18 +529,20 @@ class UnrecordedRendersAsUnrecordedTests(unittest.TestCase):
     """A pre-existing MERGED row is never displayed as a run merge."""
 
     def test_the_detail_column_says_the_provenance_is_unrecorded(self):
-        self.assertIn("unrecorded",
-                      maestro._merge_cause_prefix(st.MERGE_CAUSE_UNRECORDED))
+        self.assertIn(
+            "unrecorded", maestro._merge_cause_prefix(st.MERGE_CAUSE_UNRECORDED)
+        )
 
     def test_the_detail_column_marks_an_operator_accepted_node(self):
         self.assertIn(
             "operator-accepted",
-            maestro._merge_cause_prefix(st.MergeCause.OPERATOR_ACCEPTED.value))
+            maestro._merge_cause_prefix(st.MergeCause.OPERATOR_ACCEPTED.value),
+        )
 
     def test_a_run_merged_node_keeps_the_wording_it_had(self):
         self.assertEqual(
-            maestro._merge_cause_prefix(st.MergeCause.SCHEDULER.value),
-            "output ")
+            maestro._merge_cause_prefix(st.MergeCause.SCHEDULER.value), "output "
+        )
         self.assertEqual(maestro._merge_cause_prefix(None), "output ")
 
 
