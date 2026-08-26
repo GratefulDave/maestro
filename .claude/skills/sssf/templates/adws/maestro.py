@@ -2081,6 +2081,22 @@ def _code_review_runner(
                         raise scheduler.AttemptOwnershipLost(
                             "reviewer dispatch actor binding changed"
                         )
+                    durable = lifecycle_store.candidate_review(
+                        args.run_id,
+                        "{}::review".format(build_node_id),
+                        output_sha,
+                    )
+                    if (
+                        durable is not None
+                        and durable.reviewer_generation != session.generation
+                    ):
+                        lifecycle_store.recover_review_dispatch(
+                            args.run_id,
+                            "{}::review".format(build_node_id),
+                            output_sha,
+                            expected_reviewer_generation=durable.reviewer_generation,
+                            reviewer_generation=session.generation,
+                        )
                     lifecycle_store.mark_review_dispatched(
                         args.run_id,
                         "{}::review".format(build_node_id),

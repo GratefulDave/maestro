@@ -3293,15 +3293,21 @@ class Scheduler:
             # marker first; replayed DISPATCHED only polls.
             resume_existing_dispatch = not begun.created
             if durable_review.reviewer_generation != reviewer_generation:
-                recovered = self.deps.store.recover_review_dispatch(
-                    self.run_id,
-                    review_node.node_id,
-                    candidate.candidate_sha,
-                    expected_reviewer_generation=durable_review.reviewer_generation,
-                    reviewer_generation=reviewer_generation,
-                )
-                durable_review = recovered.review
-                resume_existing_dispatch = True
+                if reviewer_generation > durable_review.reviewer_generation:
+                    recovered = self.deps.store.recover_review_dispatch(
+                        self.run_id,
+                        review_node.node_id,
+                        candidate.candidate_sha,
+                        expected_reviewer_generation=durable_review.reviewer_generation,
+                        reviewer_generation=reviewer_generation,
+                    )
+                    durable_review = recovered.review
+                    resume_existing_dispatch = True
+                else:
+                    # No active reviewer uses the build-attempt number only as
+                    # an initial floor. Preserve the unfinished review's owner
+                    # until the callback durably installs its replacement.
+                    reviewer_generation = durable_review.reviewer_generation
             review = None
             while durable_review.state in {
                 st.CandidateReviewState.PUBLISHED,
