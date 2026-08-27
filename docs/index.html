@@ -4,47 +4,46 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#090b10">
+  <meta name="theme-color" content="#2d3142">
   <title>Maestro — Software Factory</title>
   <meta name="description" content="Technical documentation for Maestro, a deterministic dependency-DAG software factory.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Geist:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
   <style>
     :root {
       color-scheme: dark;
-      --bg: #090b10;
-      --panel: #10141c;
-      --panel-2: #151b25;
-      --line: #273143;
-      --line-soft: #1b2330;
-      --text: #edf2f7;
-      --muted: #9aa8ba;
-      --faint: #657286;
-      --cyan: #59d7e8;
-      --cyan-soft: rgba(89, 215, 232, .11);
-      --violet: #a990ff;
-      --green: #63d99b;
-      --amber: #f3c76b;
-      --red: #ff7f88;
-      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --paper: #2d3142;
+      --paper-2: #393e53;
+      --ink: #f5f5f5;
+      --muted: #bfc0c0;
+      --soft: #8e98ac;
+      --accent: #f08a59;
+      --accent-tint: rgba(240, 138, 89, 0.10);
+      --link: #6a95d8;
+      --rule: rgba(245, 245, 245, 0.12);
+      --rule-solid: rgba(191, 192, 192, 0.25);
+      --good: #8fbf88;
+      --bad: #d97a7a;
+      --serif: "Instrument Serif", Georgia, serif;
+      --sans: Geist, ui-sans-serif, system-ui, sans-serif;
+      --mono: "Geist Mono", ui-monospace, monospace;
     }
 
     * { box-sizing: border-box; }
-    html { color-scheme: dark; background: var(--bg); scroll-behavior: smooth; scroll-padding-top: 2rem; }
+    html { color-scheme: dark; background: var(--paper); scroll-behavior: smooth; scroll-padding-top: 2rem; }
     body {
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at 73% -10%, rgba(89, 215, 232, .08), transparent 28rem),
-        radial-gradient(circle at 10% 12%, rgba(169, 144, 255, .07), transparent 24rem),
-        var(--bg);
-      color: var(--text);
+      background: var(--paper);
+      color: var(--ink);
       font-family: var(--sans);
       line-height: 1.65;
     }
-    a { color: inherit; }
+    a { color: var(--link); }
     code, pre { font-family: var(--mono); }
-    code { color: #d8e5f3; }
-    ::selection { background: rgba(89, 215, 232, .28); color: white; }
+    code { color: var(--ink); }
+    ::selection { background: var(--accent-tint); color: var(--ink); }
 
     .shell { display: grid; grid-template-columns: 17rem minmax(0, 1fr); min-height: 100vh; }
     .sidebar {
@@ -52,104 +51,100 @@
       top: 0;
       height: 100vh;
       padding: 2rem 1.5rem;
-      border-right: 1px solid var(--line-soft);
-      background: rgba(9, 11, 16, .86);
-      backdrop-filter: blur(18px);
+      border-right: 1px solid var(--rule);
+      background: var(--paper);
     }
-    .brand { display: flex; align-items: center; gap: .8rem; margin-bottom: 2.25rem; text-decoration: none; }
+    .brand { display: flex; align-items: center; gap: .8rem; margin-bottom: 2.25rem; text-decoration: none; color: inherit; }
     .mark {
       display: grid;
       place-items: center;
       width: 2.35rem;
       height: 2.35rem;
-      border: 1px solid #344258;
-      border-radius: .7rem;
-      background: linear-gradient(145deg, #1b2532, #0c1017);
-      color: var(--cyan);
+      border: 1px solid var(--rule-solid);
+      border-radius: 8px;
+      background: var(--paper-2);
+      color: var(--accent);
       font: 700 1.1rem var(--mono);
-      box-shadow: inset 0 1px rgba(255,255,255,.05), 0 8px 24px rgba(0,0,0,.3);
     }
     .brand strong { display: block; letter-spacing: .08em; text-transform: uppercase; }
-    .brand small { display: block; color: var(--faint); font: .67rem var(--mono); letter-spacing: .12em; }
-    .nav-label { margin: 1.4rem 0 .45rem; color: var(--faint); font: 600 .66rem var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+    .brand small { display: block; color: var(--soft); font: .67rem var(--mono); letter-spacing: .12em; }
+    .nav-label { margin: 1.4rem 0 .45rem; color: var(--soft); font: 600 .66rem var(--mono); letter-spacing: .14em; text-transform: uppercase; }
     nav a {
       display: block;
       padding: .46rem .65rem;
-      border-left: 1px solid var(--line);
+      border-left: 1px solid var(--rule);
       color: var(--muted);
       font-size: .84rem;
       text-decoration: none;
-      transition: color .15s, border-color .15s, background .15s;
     }
-    nav a:hover, nav a:focus-visible { border-color: var(--cyan); background: var(--cyan-soft); color: var(--text); outline: none; }
-    .sidebar-foot { position: absolute; bottom: 1.6rem; color: var(--faint); font: .68rem/1.5 var(--mono); }
+    nav a:hover, nav a:focus-visible { border-color: var(--accent); background: var(--accent-tint); color: var(--ink); outline: none; }
+    .sidebar-foot { position: absolute; bottom: 1.6rem; color: var(--soft); font: .68rem/1.5 var(--mono); }
 
     main { width: min(74rem, 100%); padding: 4.5rem clamp(1.5rem, 5vw, 5rem) 7rem; }
-    .eyebrow { color: var(--cyan); font: 600 .72rem var(--mono); letter-spacing: .14em; text-transform: uppercase; }
-    h1 { max-width: 14ch; margin: .75rem 0 1.15rem; font-size: clamp(3rem, 7vw, 6rem); line-height: .96; letter-spacing: -.055em; }
-    h1 span { color: var(--muted); font-weight: 430; }
-    .lede { max-width: 48rem; margin: 0; color: #b7c3d2; font-size: clamp(1.05rem, 2vw, 1.3rem); }
+    .eyebrow { color: var(--accent); font: 600 .72rem var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+    h1 { max-width: 14ch; margin: .75rem 0 1.15rem; font-family: var(--serif); font-weight: 400; font-size: clamp(3rem, 7vw, 6rem); line-height: .96; letter-spacing: -.02em; }
+    h1 span { color: var(--muted); }
+    .lede { max-width: 48rem; margin: 0; color: var(--muted); font-size: clamp(1.05rem, 2vw, 1.3rem); }
     .hero-meta { display: flex; flex-wrap: wrap; gap: .55rem; margin-top: 2rem; }
-    .pill { padding: .34rem .65rem; border: 1px solid var(--line); border-radius: 99px; background: rgba(16,20,28,.72); color: var(--muted); font: .72rem var(--mono); }
-    .pill::before { content: ""; display: inline-block; width: .42rem; height: .42rem; margin-right: .45rem; border-radius: 50%; background: var(--green); box-shadow: 0 0 12px var(--green); }
+    .pill { padding: .34rem .65rem; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2); color: var(--muted); font: .72rem var(--mono); }
 
     section { padding-top: 5.75rem; }
     .section-head { display: grid; grid-template-columns: 4.5rem 1fr; gap: 1rem; align-items: start; margin-bottom: 1.75rem; }
-    .section-no { padding-top: .48rem; color: var(--faint); font: .72rem var(--mono); }
+    .section-no { padding-top: .48rem; color: var(--soft); font: .72rem var(--mono); }
     h2 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.65rem); line-height: 1.1; letter-spacing: -.035em; }
     .section-copy { max-width: 48rem; margin: .7rem 0 0; color: var(--muted); }
 
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .85rem; }
     .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .85rem; }
-    a.card { display: block; text-decoration: none; }
-    .section-copy a { color: var(--cyan); }
-    .card { padding: 1.35rem; border: 1px solid var(--line-soft); border-radius: .8rem; background: linear-gradient(145deg, rgba(21,27,37,.84), rgba(13,17,24,.8)); }
+    a.card { display: block; text-decoration: none; color: inherit; }
+    .section-copy a { color: var(--link); }
+    .card { padding: 1.35rem; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2); }
     .card h3 { margin: 0 0 .45rem; font-size: .95rem; letter-spacing: -.01em; }
     .card p { margin: 0; color: var(--muted); font-size: .87rem; }
-    .card .tag { display: inline-block; margin-bottom: .8rem; color: var(--cyan); font: .66rem var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .card .tag { display: inline-block; margin-bottom: .8rem; color: var(--accent); font: .66rem var(--mono); letter-spacing: .08em; text-transform: uppercase; }
 
-    .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin-top: 1.4rem; border: 1px solid var(--line); border-radius: .85rem; overflow: hidden; }
-    .flow-step { position: relative; min-height: 9rem; padding: 1.1rem; background: var(--panel); border-right: 1px solid var(--line); }
+    .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin-top: 1.4rem; border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+    .flow-step { position: relative; min-height: 9rem; padding: 1.1rem; background: var(--paper-2); border-right: 1px solid var(--rule); }
     .flow-step:last-child { border: 0; }
     .flow-step b { display: block; margin: 1.25rem 0 .35rem; font-size: .84rem; }
     .flow-step small { color: var(--muted); font-size: .72rem; line-height: 1.4; }
-    .flow-step code { color: var(--cyan); font-size: .68rem; }
+    .flow-step code { color: var(--accent); font-size: .68rem; }
 
-    .states { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: 1.25rem; border: 1px solid var(--line-soft); border-radius: .8rem; background: var(--panel); }
-    .state { padding: .42rem .68rem; border: 1px solid var(--line); border-radius: .35rem; font: .72rem var(--mono); }
-    .arrow { color: var(--faint); }
-    .state.run { color: var(--cyan); border-color: rgba(89,215,232,.35); }
-    .state.good { color: var(--green); border-color: rgba(99,217,155,.35); }
-    .state.bad { color: var(--red); border-color: rgba(255,127,136,.35); }
+    .states { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: 1.25rem; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2); }
+    .state { padding: .42rem .68rem; border: 1px solid var(--rule); border-radius: 8px; font: .72rem var(--mono); }
+    .arrow { color: var(--soft); }
+    .state.run { color: var(--accent); border-color: var(--accent); }
+    .state.good { color: var(--good); border-color: var(--good); }
+    .state.bad { color: var(--bad); border-color: var(--bad); }
 
-    .table-wrap { overflow-x: auto; border: 1px solid var(--line-soft); border-radius: .8rem; }
-    table { width: 100%; border-collapse: collapse; background: rgba(16,20,28,.75); font-size: .84rem; }
-    th, td { padding: .85rem 1rem; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; }
-    th { color: var(--faint); font: 600 .66rem var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; background: var(--paper-2); font-size: .84rem; }
+    th, td { padding: .85rem 1rem; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+    th { color: var(--soft); font: 600 .66rem var(--mono); letter-spacing: .09em; text-transform: uppercase; }
     td { color: var(--muted); }
-    td:first-child { color: var(--text); font-family: var(--mono); white-space: nowrap; }
+    td:first-child { color: var(--ink); font-family: var(--mono); white-space: nowrap; }
     tr:last-child td { border-bottom: 0; }
 
-    pre { margin: 0; padding: 1.25rem; overflow-x: auto; border: 1px solid var(--line); border-radius: .8rem; background: #07090d; color: #c9d5e3; font-size: .8rem; line-height: 1.65; }
-    pre .prompt { color: var(--green); }
-    pre .comment { color: var(--faint); }
-    .callout { margin-top: 1rem; padding: 1rem 1.15rem; border-left: 2px solid var(--amber); background: rgba(243,199,107,.06); color: var(--muted); font-size: .87rem; }
-    .callout strong { color: var(--amber); }
+    pre { margin: 0; padding: 1.25rem; overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2); color: var(--ink); font-size: .8rem; line-height: 1.65; }
+    pre .prompt { color: var(--accent); }
+    pre .comment { color: var(--soft); }
+    .callout { margin-top: 1rem; padding: 1rem 1.15rem; border-left: 2px solid var(--accent); background: var(--accent-tint); color: var(--muted); font-size: .87rem; }
+    .callout strong { color: var(--accent); }
 
     .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: .7rem; }
-    .metric { padding: 1.1rem; border-top: 1px solid var(--line); background: rgba(16,20,28,.55); }
-    .metric b { display: block; color: var(--text); font: 1.55rem var(--mono); }
-    .metric span { color: var(--faint); font-size: .74rem; }
-    footer { margin-top: 6rem; padding-top: 1.3rem; border-top: 1px solid var(--line-soft); color: var(--faint); font: .72rem var(--mono); }
+    .metric { padding: 1.1rem; border-top: 1px solid var(--rule); background: var(--paper-2); }
+    .metric b { display: block; color: var(--ink); font: 1.55rem var(--mono); }
+    .metric span { color: var(--soft); font-size: .74rem; }
+    footer { margin-top: 6rem; padding-top: 1.3rem; border-top: 1px solid var(--rule); color: var(--soft); font: .72rem var(--mono); }
 
     @media (max-width: 920px) {
       .shell { display: block; }
-      .sidebar { position: relative; height: auto; padding: 1rem 1.25rem; border-right: 0; border-bottom: 1px solid var(--line-soft); }
+      .sidebar { position: relative; height: auto; padding: 1rem 1.25rem; border-right: 0; border-bottom: 1px solid var(--rule); }
       .brand { margin: 0; }
       .sidebar nav, .sidebar-foot { display: none; }
       main { padding-top: 3rem; }
       .flow { grid-template-columns: 1fr; }
-      .flow-step { min-height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .flow-step { min-height: auto; border-right: 0; border-bottom: 1px solid var(--rule); }
       .flow-step b { margin-top: .7rem; }
       .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
@@ -182,6 +177,7 @@
         <a href="plan-authoring.html">Plan authoring</a>
         <a href="deployment-drift.html">Deployment drift</a>
         <a href="split-test-authoring-from-building.html">Spec / build split</a>
+        <a href="hidden-tests-design.html">Hidden tests</a>
         <p class="nav-label">Operations</p>
         <a href="#launcher">Herdr launcher</a>
         <a href="#workspace">Workspace coordinator</a>
@@ -273,6 +269,9 @@
             <tbody>
               <tr><td>plan_model.py</td><td>Typed plan schema, parser registry, scheduler projection</td><td>Plan shape</td></tr>
               <tr><td>plan_validate.py</td><td>Deterministic obligations, lineage, executable gates</td><td>Authoring eligibility</td></tr>
+              <tr><td>plan_amendment.py</td><td>Adopt corrected plan bytes on an in-flight run when settled evidence stays valid</td><td>In-flight plan identity</td></tr>
+              <tr><td>hidden_vault.py</td><td>Hidden-tests attempts live in a separate bare repo under harness-private state. Schema and vault exist; composed hidden-gate execution is not built, and v5 is not runnable</td><td>Object-graph containment</td></tr>
+              <tr><td>gate_capture.py</td><td>Counted cases must be defined in the accepted test bytes; provenance is independent of visibility</td><td>Gate provenance</td></tr>
               <tr><td>scheduler.py</td><td>Ready set, attempts, retries, verification, merge frontier</td><td>Run coordination</td></tr>
               <tr><td>launcher.py</td><td>Herdr panes, process lifecycle, transcripts, quiescence</td><td>Transport only</td></tr>
               <tr><td>lifecycle.py</td><td>SQLite states, transitions, recovery, operator escapes</td><td>Durable state</td></tr>
@@ -305,32 +304,32 @@
           <span class="state bad">CANCELLED</span>
         </div>
         <div class="grid" style="margin-top:.85rem">
-          <article class="card"><span class="tag">Retry</span><h3>Same-session, bounded</h3><p>Semantic, environmental, and launcher-transient failures follow distinct budgets. Semantic <code>--force</code>/<code>--grant</code> returns PENDING immediately. A review-budget grant stays BLOCKED on that exact attempt.</p></article>
-          <article class="card"><span class="tag">Recovery</span><h3>Restart-safe</h3><p>Only absence-proven <code>run resume</code> returns a review-budget grant to PENDING, same attempt, no replacement worktree. An identity-bound late envelope continues; an absent envelope stays <code>QUIESCENCE_UNPROVEN</code>. Persistent actors adopt only on exact pane, cwd, session, correlation, role, and generation. <code>workspace_not_found</code> is absence for every pane and invalidates cached lane layouts.</p></article>
+          <article class="card"><span class="tag">Retry</span><h3>Same-session, bounded</h3><p>Semantic, environmental, and launcher-transient failures follow distinct budgets. Semantic <code>--force</code>/<code>--grant</code> returns PENDING immediately. A review-budget grant stays BLOCKED on that exact attempt until absence-proven <code>run resume</code>.</p></article>
+          <article class="card"><span class="tag">Recovery</span><h3>Restart-safe</h3><p><code>SEMANTIC_BUDGET_EXHAUSTED</code> bare <code>run resume</code> floors spend (<code>retry_spend_floor</code>, <code>lane_retry_spend_floor</code>) and returns the node to the frontier — a floor, not ceiling removal. Only absence-proven <code>run resume</code> returns a review-budget grant to PENDING, same attempt, no replacement worktree. An identity-bound late envelope continues; an absent envelope stays <code>QUIESCENCE_UNPROVEN</code>. Persistent actors adopt only on exact pane, cwd, session, correlation, role, and generation. <code>workspace_not_found</code> is absence for every pane and invalidates cached lane layouts.</p></article>
         </div>
       </section>
 
       <section id="launcher">
         <div class="section-head">
           <span class="section-no">05 / 08</span>
-          <div><h2>Visible Herdr launcher</h2><p class="section-copy">Every agent node runs in a visible pane. Route selects the CLI; model selects the intelligence behind it. Those axes never collapse. Only omp and Claude routes with valid signed route receipts are admitted.</p></div>
+          <div><h2>Visible Herdr launcher</h2><p class="section-copy">Every agent node runs in a visible pane. Route selects the CLI; model selects the intelligence behind it. Those axes never collapse. Only omp and Claude routes with valid signed route receipts are admitted. The OMP flag is <code>--profile</code>, not <code>--pm-profile</code>.</p></div>
         </div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Operation</th><th>Contract</th></tr></thead>
             <tbody>
-              <tr><td>launch(spec)</td><td>Allocate pane, bind exact worktree cwd, start explicit omp or Claude route, return correlation handle.</td></tr>
+              <tr><td>launch(spec)</td><td>Allocate pane, bind exact worktree cwd, start explicit omp or Claude route, return correlation handle. OMP argv uses <code>--profile</code>.</td></tr>
               <tr><td>poll(handle)</td><td>Report starting, running, exited, or gone. Herdr state is advisory; the last complete structured transcript envelope synthesizes terminal exit truth.</td></tr>
               <tr><td>cancel(handle)</td><td>Close the pane and terminate a harness-owned process group by bounded TERM→KILL ladder; report quiescence or pane failures.</td></tr>
               <tr><td>reclaim(token)</td><td>Recover exact correlation matches only; never infer ownership from nearby panes.</td></tr>
               <tr><td>classify(error)</td><td>Map launch faults into fixed configuration, authentication, transient, protocol, or execution classes.</td></tr>
               <tr><td>provision(worktree)</td><td>Run ecosystem setup after worktree creation and before baseline or pre-gate measurement.</td></tr>
               <tr><td>wait_for_interactive_agent(name)</td><td>Block on <code>herdr agent wait &lt;name&gt; --until idle --timeout</code>, the documented readiness gate for coding agents. No undocumented status field is polled and no per-agent startup banner is scraped from the pane.</td></tr>
-              <tr><td>submit_agent_prompt(target, text)</td><td>Deliver one turn with <code>herdr agent prompt &lt;target&gt; &lt;text&gt; --wait --until &lt;status&gt; --timeout</code>, which submits the text and its Enter atomically and proves the composer accepted them. On <code>agent_prompt_stalled</code> the recovery is a single <code>agent send-keys &lt;target&gt; enter</code> followed by <code>agent wait</code>, never a second prompt.</td></tr>
+              <tr><td>submit_agent_prompt(target, text)</td><td>Production submits with <code>pane send-text</code> then a separate <code>pane send-keys enter</code>. An <code>@</code> completion popup ate atomic Enter. Proof is an actor transcript turn, not the pane revision meter and not <code>agent_status</code>. A repaint is not a submitted turn.</td></tr>
             </tbody>
           </table>
         </div>
-        <div class="callout"><strong>Command boundary.</strong> Coding agents are driven only through the <code>agent</code> commands. The <code>pane</code> commands address ordinary terminals, servers, and shells, so <code>pane run</code> against a pane hosting a coding agent types the prompt as a shell command instead of handing it to the composer. A prompt submitted without <code>--wait</code> reports success even when the text is left sitting unsubmitted, which is indistinguishable from a delivered turn until the turn times out.</div>
+        <div class="callout"><strong>Prompt proof.</strong> Submission is two pane calls, not an atomic Enter. The composer’s <code>@</code> completion popup swallowed Enter when it arrived in the same packet as the text. Treat a transcript turn as proof; treating a meter tick or <code>agent_status</code> as delivery is a fake.</div>
       </section>
 
       <section id="workspace">
@@ -371,6 +370,7 @@
 <span class="prompt">$</span> ./maestro.py run status &lt;run-id&gt;
 <span class="prompt">$</span> ./maestro.py run cancel &lt;run-id&gt;
 <span class="prompt">$</span> ./maestro.py run resume &lt;run-id&gt;
+<span class="prompt">$</span> ./maestro.py run amend &lt;plan&gt; --run &lt;id&gt;
 
 <span class="comment"># explicit operator escapes</span>
 <span class="prompt">$</span> ./maestro.py retry &lt;run-id&gt; &lt;node-id&gt;
@@ -386,7 +386,7 @@
 <span class="prompt">$</span> ./maestro.py workspace resume --manifest-file &lt;workspace.json&gt; --workspace-receipt-dir &lt;dir&gt; --data-dir &lt;dir&gt; --verify-key &lt;hex&gt; --db &lt;db&gt; --state-root &lt;dir&gt; --run-id &lt;id&gt; --max-workers &lt;n&gt; --lease-owner &lt;id&gt; --lease-stale-after-s &lt;seconds&gt; --participant-timeout-s &lt;seconds&gt; --cancellation-timeout-s &lt;seconds&gt; --poll-interval-s &lt;seconds&gt;
 <span class="prompt">$</span> ./maestro.py workspace publish --manifest-dir &lt;dir&gt; --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;
 <span class="prompt">$</span> ./maestro.py workspace rollback --manifest-dir &lt;dir&gt; --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;</pre>
-        <div class="callout"><strong>Bootstrap.</strong> <code>bootstrap</code> provisions key material and admits every configured route before any run may use it. Admission is a real capture, not a version probe: each route answers a marker prompt in a visible pane, answers it again from a resumed session to prove continuity, and is then cancelled to prove the pane closes. Only then is a signed route receipt written. A route whose receipt already verifies is reported as reused.</div>
+        <div class="callout"><strong>Bootstrap.</strong> <code>bootstrap</code> provisions key material and admits every configured route before any run may use it. Admission is a real capture, not a version probe: each route answers a marker prompt in a visible pane, answers it again from a resumed session to prove continuity, and is then cancelled to prove the pane closes. Only then is a signed route receipt written. A route whose receipt already verifies is reported as reused. <code>run amend</code> is its own verb: it adopts corrected plan bytes on an in-flight run; it is not a resume flag.</div>
       </section>
 
       <section id="guarantees">
