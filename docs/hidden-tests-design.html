@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#2d3142">
+  <title>Hidden tests — Maestro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;600;700&family=Geist:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: dark;
+      --paper: #2d3142;
+      --paper-2: #393e53;
+      --ink: #f5f5f5;
+      --muted: #bfc0c0;
+      --soft: #8e98ac;
+      --rule: rgba(245,245,245,0.12);
+      --rule-solid: rgba(191,192,192,0.25);
+      --accent: #f08a59;
+      --accent-tint: rgba(240,138,89,0.10);
+      --link: #6a95d8;
+      --serif: "Instrument Serif", Georgia, serif;
+      --sans: Geist, ui-sans-serif, system-ui, sans-serif;
+      --mono: "Geist Mono", ui-monospace, monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); line-height: 1.65; }
+    a { color: var(--link); }
+    a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    code, pre { font-family: var(--mono); }
+    code { color: var(--ink); }
+    .shell { display: grid; grid-template-columns: 17rem minmax(0,1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; padding: 2rem 1.5rem; border-right: 1px solid var(--rule); background: var(--paper); }
+    .brand { display: flex; align-items: center; gap: .8rem; margin-bottom: 2.25rem; text-decoration: none; color: inherit; }
+    .mark { display: grid; place-items: center; width: 2.35rem; height: 2.35rem; border: 1px solid var(--rule-solid); border-radius: 8px; color: var(--accent); font: 700 1.1rem var(--mono); }
+    .brand small { display: block; color: var(--soft); font: .67rem var(--mono); }
+    .nav-label { margin: 1.4rem 0 .45rem; color: var(--soft); font: 600 .66rem var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+    nav a { display: block; padding: .46rem .65rem; border-left: 1px solid var(--rule); color: var(--muted); font-size: .84rem; text-decoration: none; }
+    nav a:hover, nav a.current { border-color: var(--accent); background: var(--accent-tint); color: var(--ink); }
+    main { width: min(52rem, 100%); padding: 4rem clamp(1.5rem, 5vw, 4rem) 6rem; }
+    .eyebrow { color: var(--accent); font: 600 .72rem var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: .75rem 0 1rem; font-family: var(--serif); font-weight: 400; font-size: clamp(2rem, 4vw, 3rem); letter-spacing: -.02em; line-height: 1.12; color: var(--ink); }
+    h2 { margin: 2.4rem 0 .8rem; font-size: 1.4rem; font-weight: 600; color: var(--ink); }
+    h3 { margin: 1.6rem 0 .6rem; font-size: 1.05rem; font-weight: 600; color: var(--ink); }
+    p, li { color: var(--muted); }
+    strong { color: var(--ink); }
+    pre { padding: 1.15rem; overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2); color: var(--ink); font-size: .8rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; margin: 1rem 0; }
+    table { width: 100%; border-collapse: collapse; font-size: .84rem; }
+    th, td { padding: .8rem 1rem; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+    th { color: var(--soft); font: 600 .66rem var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+    tr:last-child td { border-bottom: 0; }
+    .callout { margin: 1rem 0; padding: 1rem 1.15rem; border-left: 2px solid var(--accent); background: var(--accent-tint); color: var(--muted); border-radius: 0 8px 8px 0; }
+    .lede { font-size: 1.12rem; }
+    .built { color: var(--accent); font-family: var(--mono); font-size: .78rem; font-weight: 600; }
+    .unbuilt { color: var(--soft); font-family: var(--mono); font-size: .78rem; font-weight: 600; }
+    .badge { display: inline-block; margin-left: .5rem; padding: .12rem .4rem; border: 1px solid var(--rule); border-radius: 4px; color: var(--soft); font: 600 .62rem var(--mono); letter-spacing: .08em; text-transform: uppercase; vertical-align: middle; }
+    .badge.shipped { border-color: var(--accent); color: var(--accent); background: var(--accent-tint); }
+    footer { margin-top: 4rem; padding-top: 1.2rem; border-top: 1px solid var(--rule); color: var(--soft); font: .72rem var(--mono); }
+    @media (max-width: 920px) { .shell { display: block; } .sidebar { position: relative; height: auto; } .sidebar nav { display: none; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="index.html"><span class="mark">M</span><span><strong>Maestro</strong><small>software factory</small></span></a>
+      <nav>
+        <p class="nav-label">Diagrams</p>
+        <a href="architecture/index.html">Gallery</a>
+        <p class="nav-label">Authoring</p>
+        <a href="plan-authoring.html">Plan authoring</a>
+        <a href="deployment-drift.html">Deployment drift</a>
+        <a href="split-test-authoring-from-building.html">Spec / build split</a>
+        <a class="current" href="hidden-tests-design.html">Hidden tests</a>
+      </nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Design / 2026-08-27</p>
+      <h1>Hidden tests</h1>
+      <p class="lede">Written after the <code>lane-routing-chemical</code> investigation established that current test visibility is deliberate, not a defect. This page proposes replacing that design. Markdown source: <a href="hidden-tests-design.md">hidden-tests-design.md</a>.</p>
+
+      <h2>Implementation status</h2>
+      <p>Read this table before trusting any section below. The prerequisite is built. <strong>The feature is not.</strong> Sections after the table describe the intended end state. This table is what exists, and nothing else is a claim about code.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Piece</th><th>State</th></tr></thead>
+        <tbody>
+          <tr><td>Read containment — the vault (§0, §9)</td><td class="built">Built. <code>adw_modules/hidden_vault.py</code>; <code>tests/test_hidden_test_containment.py</code>, 12 cases against real git</td></tr>
+          <tr><td><code>test_visibility</code> on a tests node</td><td class="built">Built. <code>maestro-plan.v5</code>; <code>TestsNodeV5</code>, <code>PlanNode.test_visibility</code>; <code>tests/test_test_visibility_schema.py</code></td></tr>
+          <tr><td>Invalid-shape refusals (unknown visibility; hidden on a non-tests kind; hidden without a strength contract)</td><td class="built">Built, in the <code>PlanNode</code> constructor</td></tr>
+          <tr><td>Composed evaluation tree (§1, §2)</td><td class="unbuilt">Not built</td></tr>
+          <tr><td>Absence / provenance / coverage conjuncts (§3)</td><td class="unbuilt">Not built</td></tr>
+          <tr><td>Differential falsification in the composed tree (§4)</td><td class="unbuilt">Not built</td></tr>
+          <tr><td><code>RepairDirective</code> and the sanitised handoff (§5)</td><td class="unbuilt">Not built</td></tr>
+          <tr><td><code>HiddenGateReceipt</code> and the evidence chain (§6)</td><td class="unbuilt">Not built</td></tr>
+          <tr><td>Run-level pin, reveal step, merge path (§7)</td><td class="unbuilt">Not built</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout"><strong>v5 is not runnable.</strong> Because the execution machinery is absent, <code>maestro-plan.v5</code> is excluded from <code>maestro._RUNNABLE_PLAN_SCHEMA_VERSIONS</code>. <code>run start</code> refuses v5 with <code>RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE</code>. A hidden node can never half-execute. v1–v4 still run. Hidden execution machinery is not built. Absolute-path reads of vault objects remain possible: there is no sandbox.</div>
+      <p>The run-level pin (§7.2) is deliberately not built yet. Its absence is safe for one reason only: no run can contain a hidden node, so there is no retroactivity for a pin to prevent. It becomes mandatory in the same change that makes v5 runnable.</p>
+      <p>Until the remaining rows are built, the shipped contract in <code>MAESTRO_architecture.md</code> §7.4 and <code>docs/plan-authoring.md</code> still governs. §7.4 / §19 M41 are therefore not amended: they describe the only behaviour that executes. Merged visibility is current design, not a leak.</p>
+
+      <h2>0. What is being changed<span class="badge shipped">vault + schema built</span></h2>
+      <p>Today a tests node merges into the integration branch, every downstream build lane inherits its files, and the build lane’s own commit must carry them byte-identically (<code>tests_chain.compare_test_bytes</code>, <code>PairingRefusal.BYTES_SUBSTITUTED</code>). The implementation builder can read the tests it is judged by. That is the specification working as written, not a leak.</p>
+      <p>This design withholds the test files from the build phase and executes them out of band.</p>
+      <p>The entire value of the feature depends on a property this design cannot supply on its own: the builder must be unable to <em>read</em> the hidden tests. A linked git worktree shares its parent repository’s object database, so a hidden-tests commit stored as a ref in the run repository is readable from the builder’s worktree with one <code>git cat-file</code>.</p>
+      <p><strong>What exists now:</strong> hidden-test attempts live in a separate bare repo under harness-private state (<code>adw_modules/hidden_vault.py</code>), proven by <code>tests/test_hidden_test_containment.py</code> (<code>cat-file --batch-all-objects</code>). That is the vault. The composed evaluation tree that would fetch those blobs into a gate scratch is not built, so a v5 plan cannot start a run. Absolute-path read of harness state is still possible.</p>
+
+      <h2>1. Core mechanism: the composed evaluation tree<span class="badge">intended</span></h2>
+      <p>Not built. Intended: hidden test bytes never enter the integration branch during the build phase and never enter any builder worktree. Every gate run for a hidden-paired build node would execute in a harness-private scratch tree composed at execution time from two immutable commits — the tree under test, and the hidden test paths from the accepted tests candidate sha.</p>
+      <pre>GIT_INDEX_FILE=&lt;private&gt;  git read-tree &lt;tree-under-test&gt;
+GIT_INDEX_FILE=&lt;private&gt;  git update-index --add --cacheinfo &lt;mode&gt;,&lt;blob&gt;,&lt;hidden path&gt;
+GIT_INDEX_FILE=&lt;private&gt;  git write-tree            -&gt;  composed_tree_sha</pre>
+      <p><code>composed_tree_sha</code> would be the audit anchor: a deterministic function of <code>(tree_under_test_sha, accepted_tests_sha, sorted(hidden_paths))</code>. Adjudicators would recompute it rather than trusting a runner report.</p>
+      <h3>1.1 Why composition rather than “run the tests from somewhere else”</h3>
+      <p>Pointing the runner at test files on another path fails on imports. Composition would put both in one tree so existing runner-resolution assumptions hold. None of this executes today.</p>
+
+      <h2>2. Requirement 1 — falsifiability without the test in the worktree<span class="badge">intended</span></h2>
+      <p>Not built. §7.4 requires the node’s gate to be red before the node’s work and green after, and red for the intended reason. The intended composed bracket:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Clause</th><th>Tree composed from</th><th>Required verdict</th></tr></thead>
+        <tbody>
+          <tr><td>pre-node (chain root)</td><td>chain-root integration head + accepted tests</td><td>RED</td></tr>
+          <tr><td>post-node</td><td>candidate <code>output_sha</code> + accepted tests</td><td>GREEN, <code>passed &gt;= min_cases</code></td></tr>
+          <tr><td>output falsification</td><td>candidate with measured-delta paths reverted to chain-root base, + accepted tests</td><td>RED</td></tr>
+        </tbody>
+      </table></div>
+      <p>Intended new refusal: <code>HIDDEN_GATE_RED_BY_IMPORT</code> — a pre-gate red because the tree fails to import or collect is not a valid red. A hidden test suite would have to import lazily enough to fail by assertion at the pre-gate. This authoring burden is not live: v5 cannot start.</p>
+
+      <h2>3. Requirement 2 — binding the candidate to the accepted test sha<span class="badge">intended</span></h2>
+      <p>Not built. <code>compare_test_bytes</code> asks whether test files in the implementation candidate are the exact bytes the accepted test candidate was reviewed as. Under hidden visibility those files are not in the candidate’s tree, so that question is a category error. Intended replacement: three conjuncts from immutable git objects.</p>
+      <ol>
+        <li><strong>Absence.</strong> For every declared hidden path <code>p</code>, <code>blob_id_at(candidate_sha, p)</code> must be <code>None</code>. Refusal <code>HIDDEN_TEST_PATH_PRESENT</code>.</li>
+        <li><strong>Provenance.</strong> The green post-gate <code>GateResult</code> must carry the <code>composed_tree_sha</code> the adjudicator independently recomputes. Refusal <code>HIDDEN_GATE_TREE_MISMATCH</code>.</li>
+        <li><strong>Coverage.</strong> Existing <code>tests_chain.measure_coverage</code> against the composed post-gate execution. Refusal <code>GATE_NOT_GREEN</code>.</li>
+      </ol>
+      <p><code>compare_test_bytes</code> and <code>PairingRefusal.BYTES_SUBSTITUTED</code> are not deleted. Merged-visibility lanes still use them. The pairing path would branch on visibility; both branches keep a live reader. That branch does not exist yet.</p>
+
+      <h2>4. Requirement 3 — differential falsification outside the candidate tree<span class="badge">intended</span></h2>
+      <p>Not built. Intended: the revert runs in the composed scratch tree. The <code>_gate_names</code> filter becomes vacuous because conjunct 1 refuses any candidate holding a hidden path. The one-path-delta vacuity §7.4 names would become structurally impossible. <code>FALSIFICATION_NO_SUBJECT</code> stays required. None of this is wired.</p>
+
+      <h2>5. Requirement 4 — reviewer-to-builder handoff<span class="badge">intended</span></h2>
+      <p>Not built. Today’s repair handoff is free text. Runner output carries case names, <code>file:line</code>, assertion source and expected literals — the entire hidden-test content. The design forbids any runner output from crossing the boundary.</p>
+      <h3>5.1 The record</h3>
+      <p>A hidden-lane repair prompt would render exactly one typed record:</p>
+      <pre>RepairDirective:
+  refusal        : HiddenRepairCode
+  counts         : {passed, failed, errored, skipped}
+  unmet          : tuple[(requirement_id, aspect)]
+  repair_hint    : Optional[str]             # PLAN-AUTHORED
+  offending_paths: tuple[str]                # candidate paths only</pre>
+      <p><code>HiddenRepairCode</code> ::= <code>GATE_NOT_GREEN</code> | <code>MIN_CASES_UNMET</code> | <code>OBLIGATION_UNMET</code> | <code>IMPORT_FAILED</code> | <code>FALSIFICATION_FAILED</code> | <code>PATH_PERMISSION</code> | <code>HIDDEN_TEST_PATH_PRESENT</code>.</p>
+      <h3>5.2 What is refused from crossing</h3>
+      <p><code>GateResult.tail</code>; per-case counts; case ids; <code>case_selector</code>; <code>expected_failing_selector</code>; <code>expected_reason_pattern</code>; fixture values; any byte of any hidden blob; any path under a declared hidden path. Import-error rule: a traceback crosses only if every frame’s file path lies inside the candidate’s declared outputs; a single hidden-path frame collapses the whole text to <code>IMPORT_FAILED</code>.</p>
+      <h3>5.3 <code>repair_hint</code> — plan-authored, never model-authored</h3>
+      <p>The plan author may declare, per <code>(requirement_id, aspect)</code>, a <code>repair_hint</code> at authoring time. The runtime would emit plan bytes, never model bytes. Nothing mechanical stops a lazy author from pasting an assertion into a hint.</p>
+      <h3>5.4 Tripwire</h3>
+      <p>Before a hidden-lane prompt is written to disk, assembled text would be compared against accepted tests’ blob content: any normalised line of sufficient length in both refuses the launch with <code>HIDDEN_TEST_TEXT_IN_PROMPT</code>. A substring tripwire is a backstop against a coding mistake, not a proof against paraphrase. Not implemented.</p>
+
+      <h2>6. Requirement 5 — evidence chain<span class="badge">intended</span></h2>
+      <p>Not built. A build node whose tests prerequisite is hidden would be a distinct evidence shape — <code>HIDDEN_PAIRED_AGENT</code> — not plain <code>AGENT</code>. Its chain would be: accepted tests candidate; <code>HiddenGateReceipt</code> × 3; the <code>HiddenPairing</code> row; the candidate’s §8.3 measured delta; the build node’s independent review over the candidate diff and declared contract — not the hidden tests. The build node’s reviewer would not receive the hidden tests.</p>
+
+      <h2>7. Requirement 6 — migration and blast radius<span class="badge">intended</span></h2>
+      <h3>7.1 Schema<span class="badge shipped">field exists; v5 unrunnable</span></h3>
+      <p>New field on a tests lane: <code>test_visibility: "merged" | "hidden"</code>, default <code>"merged"</code>. Schema version <code>maestro-plan.v5</code>. Invalid shapes are refused in the constructor. <strong>v5 is excluded from runnable plan schema versions.</strong> v1–v4 still run. Do not imply a v5 plan can start a run.</p>
+      <h3>7.2 The pin</h3>
+      <p>Not built. Intended: <code>runs.pinned_test_visibility</code>, written at <code>create_run</code>, read in <code>Scheduler.__init__</code> before <code>_project_nodes</code>. Hidden visibility changes the dependency shape (a hidden build lane needs its tests node <em>accepted</em>, not <em>merged</em>). Pin before projection, or do not build this. Safe today only because no run can contain a hidden node.</p>
+      <h3>7.3 Hidden requires STRENGTH_V1</h3>
+      <p>Schema already refuses hidden without a strength contract. Runtime admission <code>HIDDEN_REQUIRES_STRENGTH_V1</code> for LEGACY-pinned runs is not a live run path: v5 cannot start.</p>
+      <h3>7.4 The reveal step</h3>
+      <p>Not built. Intended: after the last build lane merges and before the integration gate, every accepted hidden tests candidate merges into the integration branch. A run that never reaches final acceptance would leave hidden tests on refs in the private object store, not on any branch.</p>
+      <h3>7.5 What would have to change</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Surface</th><th>Change</th></tr></thead>
+        <tbody>
+          <tr><td><code>maestro._append_needed_tests</code></td><td>Must not fire for hidden lanes</td></tr>
+          <tr><td><code>maestro._agent_node_prompt</code></td><td>Must not emit the gate command line for a hidden lane</td></tr>
+          <tr><td><code>tests_chain.compare_test_bytes</code></td><td>Merged-only branch; kept with a live reader</td></tr>
+          <tr><td><code>verification._gate_names</code></td><td>Vacuous on the hidden path; retained for merged</td></tr>
+          <tr><td>§8.3 permission check</td><td>Gains the absence conjunct</td></tr>
+          <tr><td>Merge / final acceptance</td><td>Gains the reveal step</td></tr>
+          <tr><td>Object storage</td><td>Vault exists; composition fetch into scratch does not</td></tr>
+        </tbody>
+      </table></div>
+      <h3>7.6 Size</h3>
+      <p>This would touch plan schema, ingress, validation, model, the lifecycle store, scheduler projection, gate execution, three verification adjudicators, <code>retry_policy</code>, prompt assembly, and the merge path. Comparable to or larger than the tests/build split that landed as #124. It is not a small change. Schema + vault are the only pieces that exist.</p>
+
+      <h2>8. Non-goals</h2>
+      <ul>
+        <li>Hiding tests from the tests-node author or the tests-node reviewer. Both must read them.</li>
+        <li>Sandboxing the builder’s filesystem generally (§16.3 item 15 remains open).</li>
+        <li>Preventing a builder from inferring likely tests from a well-written requirement. Hidden tests hide the encoding, never the specification.</li>
+        <li>Reading <code>verifiers[].falsifiability.mutation</code>, which §7.4 already records as reaching no runtime.</li>
+        <li>Any change to code nodes, whose acceptance is their command’s exit code.</li>
+      </ul>
+
+      <h2>9. Residual risk, and the honest verdict against §16.3 item 8</h2>
+      <p>§16.3 item 8: proxy-gaming is mitigated, not solved. Every gate samples a proxy, and an agent optimizing for green looks for the cheapest one.</p>
+      <p><strong>What would be reduced</strong> (if the composed tree shipped): overfitting to literal fixture values and assertion structure, and editing the test file to make it pass.</p>
+      <p><strong>What is not reduced:</strong> writing the shallowest code that satisfies the stated requirement. Item 8’s sentence remains true after this change.</p>
+      <p><strong>A fourth mode, measured 2026-08-27, that this design would not have stopped.</strong> <code>lane-routing-chemical</code> a3 put ~190 lines into production source that manufactured the gate’s own case count at collection time — six mechanism families with fallbacks — after an honest <code>2 passed, min_cases is 5</code> rejection. Hidden tests would not have prevented it: the builder never needed the assertions. The repair is <code>adw_modules/gate_capture.py</code>’s provenance check, independent of visibility, and it landed without any part of hidden-test execution.</p>
+      <p><strong>The verdict.</strong> Hidden tests beat item 8 narrowly, in the specific mode that was actually observed (M41), and only if read containment is real. The vault is built. Even with that, §16.3 item 15’s residual applies: under <code>--dangerously-skip-permissions</code> a builder can read any absolute path, including harness state. Hidden tests would be hidden from a cooperative-but-optimizing builder, not from an adversarial one.</p>
+      <p><strong>Recommendation in the source note:</strong> build read containment first as a standalone prerequisite. That prerequisite now exists. The remaining rows — composed tree, receipts, pin, reveal — are still the feature, and they are not built. If those are not acceptable to build, the status quo plus better plan authoring is cheaper for the same real-world protection the provenance check already supplies.</p>
+
+      <h2>10. Documents this contradicts</h2>
+      <p>The documents win until amended. None of the architecture §7.4 / M41 amendments have shipped, because the behaviour they would describe does not execute.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Document</th><th>Proposed amendment</th></tr></thead>
+        <tbody>
+          <tr><td><code>MAESTRO_architecture.md</code> §7.4</td><td>Gate in worktree for merged; composed harness-private tree for hidden. Add <code>HIDDEN_GATE_RED_BY_IMPORT</code></td></tr>
+          <tr><td>§1.1 item 4</td><td>Add the <code>HIDDEN_PAIRED_AGENT</code> evidence chain</td></tr>
+          <tr><td>§16.3 item 8</td><td>Amend, do not delete: what hidden tests reduce, relocate, and depend on</td></tr>
+          <tr><td>§16.3 item 15</td><td>Add read containment as a named requirement — vault exists; sandbox does not</td></tr>
+          <tr><td>§19 M41</td><td>Byte-identical pairing becomes visibility-scoped</td></tr>
+          <tr><td><code>docs/plan-authoring.md</code></td><td><code>test_visibility</code> is authored in v5, not yet runnable</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2>11. Regressions this design must ship with<span class="badge">intended</span></h2>
+      <p>Each must fail against a runtime that lacks the mechanism. Test 7 (read containment) is the one that decides whether the other seven are worth having — and test 7’s vault half is what exists. The other seven are not live.</p>
+      <ol>
+        <li>A hidden-lane builder prompt, as assembled and written to disk, contains no hidden path, no gate argv naming one, and no line of any hidden blob.</li>
+        <li>The builder’s worktree contains no hidden test file at any point, and a candidate that adds one is refused <code>HIDDEN_TEST_PATH_PRESENT</code>.</li>
+        <li>A repair handoff after a red post-gate carries only <code>RepairDirective</code> fields.</li>
+        <li><code>composed_tree_sha</code> recomputation refuses a mismatched receipt.</li>
+        <li>Resume of an existing merged-visibility run does not rewire any <code>needs_json</code>.</li>
+        <li>A <code>maestro-plan.v4</code> plan still starts and resumes unchanged. (v1–v4 remain runnable today.)</li>
+        <li><strong>Read containment:</strong> a process with the builder’s own cwd and credentials cannot obtain the hidden blob by <code>git cat-file</code>, <code>git show</code>, or object-database traversal from the worktree. Vault tests cover this; composition is absent.</li>
+        <li>The reveal step lands accepted tests on the integration branch before the integration gate.</li>
+      </ol>
+
+      <h2>12. Open questions</h2>
+      <ul>
+        <li><strong>Q1 (blocking in the original note).</strong> Build the separate harness-private object store? The vault is now built. Composition still is not. Without composition the feature does not run.</li>
+        <li><strong>Q2.</strong> Repair oracle granularity: per-<code>(requirement, aspect)</code> unmet flags, or a single pass/fail?</li>
+        <li><strong>Q3.</strong> Adopt plan-authored <code>repair_hint</code>, and who audits hints for leaked assertions?</li>
+        <li><strong>Q4.</strong> Confirm the reveal step: the delivered integration branch should contain its tests.</li>
+        <li><strong>Q5.</strong> Accept the expected increase in repair rounds — a builder repairing against counts rather than assertions will spend more attempts.</li>
+      </ul>
+      <footer>Authority is the status table. Vault and v5 schema exist. Composed tree, receipts, and pin do not. v5 cannot start a run.</footer>
+    </main>
+  </div>
+</body>
+</html>
