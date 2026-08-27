@@ -357,8 +357,18 @@ def capture_route(
     continuation_handle = None
     try:
         first_handle = _start_visible_agent(call, spec, cwd, continuing=False)
-        first_prompt = launcher.prepare_route_prompt_text(
-            spec.route, FIRST_PROMPT.format(marker=marker))
+        # NO team prefix on an admission turn.
+        #
+        # `prepare_route_prompt_text` prepends a standing instruction to spawn
+        # subagents via `/team`. That is right for a lane doing real work and
+        # wrong here: admission asks for one literal word back, and the agent
+        # that receives the team instruction OBEYS it -- observed 2026-08-27,
+        # where the capture pane finished its turn with an empty composer,
+        # `<- 1 agent` in its status bar, and no receipt marker anywhere,
+        # because it had gone off to spawn a teammate as instructed. The
+        # capture then waited out its whole budget for a reply that the agent
+        # was never going to write.
+        first_prompt = FIRST_PROMPT.format(marker=marker)
         first_records = _prompt_turn(
             call, first_handle, first_prompt, timeout_ms, marker,
             working_proves=spec.route == "claude")
@@ -371,8 +381,7 @@ def capture_route(
         continuation_handle = _start_visible_agent(
             call, spec, cwd, continuing=True, session_id=session_id)
         continued_with = "-c" if spec.route == "omp" else "--resume"
-        continuation_prompt = launcher.prepare_route_prompt_text(
-            spec.route, CONTINUATION_PROMPT)
+        continuation_prompt = CONTINUATION_PROMPT
         continuation_records = _prompt_turn(
             call, continuation_handle, continuation_prompt, timeout_ms, marker,
             working_proves=spec.route == "claude")
@@ -517,6 +526,11 @@ def _start_visible_agent(
     transcript = ""
     if isinstance(agent, dict) and agent.get("transcript_path"):
         transcript = str(agent["transcript_path"])
+    if not transcript:
+        waited = launcher.wait_for_agent_transcript(
+            call, name, spec.timeout_s)
+        if waited is not None:
+            transcript = str(waited)
     return {"pane_id": pane_id, "name": name, "transcript": transcript}
 
 
@@ -526,16 +540,106 @@ def _prompt_turn(
         *, working_proves: bool = False,
 ) -> Tuple[dict, ...]:
     timeout_s = max(0.001, int(timeout_ms) / 1000.0)
-    try:
+    # Prove submission from the actor's own transcript, not from the pane.
+    #
+    # Admission passed no `submission_recorded`, so `submit_agent_prompt` fell
+    # back to the pane revision -- and the Claude composer accepts a prompt
+    # WITHOUT advancing it. `working_proves` cannot rescue that, because the
+    # typed status is consulted only when the meter is UNREADABLE, and a
+    # static `1` is perfectly readable. So on 2026-08-27 admission refused
+    # `AGENT_PROMPT_UNSUBMITTED:admit-claude-first-...` four times over while
+    # the pane sat at status `working`, revision 1, visibly running the turn
+    # it had just been told it never received.
+    #
+    # A submitted prompt appends a record to the session JSONL; a composer
+    # that swallowed it appends nothing, and neither does a booting agent.
+    # Snapshot the count before offering and require it to rise -- the same
+    # rising-count discipline the run path uses, and a typed record rather
+    # than a rendering, which is what §1.2 requires of anything a transition
+    # keys on.
+    #
+    # The 2026-08-27 comment that omp's meter "works" (so admission passed
+    # `submission_recorded=None` on purpose) is the same hole: paste-repaint
+    # advances omp's revision identically to a real submit. OMP therefore
+    # takes the rising transcript predicate too. Missing transcript waits,
+    # then fails closed -- never the pane revision.
+    transcript = str(handle.get("transcript") or "")
+    if not transcript:
+        waited = launcher.wait_for_agent_transcript(
+            call, handle["name"], timeout_s)
+        if waited is not None:
+            transcript = str(waited)
+    if not transcript and not working_proves:
+        raise AdmissionError(
+            "AGENT_PROMPT_UNOBSERVED:{0} no transcript".format(handle["name"]))
+    before = len(_transcript_records(transcript)) if transcript else 0
+
+    def _submitted() -> bool:
+        # Either typed fact proves it, and neither alone is enough.
+        #
+        # A record appended to the session JSONL is the strongest signal, but
+        # a transcript that has not appeared yet -- the route herdr reports
+        # late -- cannot supply one, and requiring it there refuses a prompt
+        # that did land. The agent's own typed `working` status covers exactly
+        # that gap.
+        #
+        # `working` is safe HERE and nowhere else: admission has already
+        # waited for the interactive composer before offering, so this is not
+        # the boot-time `working` that fooled the run path on 2026-08-27, and
+        # a wrong answer still cannot admit a route -- the capture goes on to
+        # require the reply marker in the transcript, which no booting agent
+        # writes. It lives inside this predicate, never as a consumed()
+        # shortcut on the no-transcript path.
+        if transcript and len(_transcript_records(transcript)) > before:
+            return True
+        if not working_proves:
+            return False
+        try:
+            payload = call("agent", "get", handle["name"])
+        except Exception:
+            return False
+        agent = _extract(payload, "agent")
+        # `agent_status` is herdr's field name; `status` is always None.
+        return isinstance(agent, dict) and (
+            agent.get("agent_status") or agent.get("status")
+        ) == "working"
+
+    def _offer() -> None:
         # Claude's composer can accept a prompt without advancing the pane
-        # revision. Its typed working state is equivalent consumption proof.
+        # revision. Its typed working state is equivalent consumption proof
+        # only when folded into this predicate, never via the meter.
         launcher.submit_agent_prompt(
             call, handle["pane_id"], prompt, handle["name"],
             timeout_s=timeout_s,
             until=("working", "idle") if working_proves else ("idle",),
-            working_proves=working_proves)
+            working_proves=working_proves,
+            submission_recorded=_submitted)
+
+    try:
+        _offer()
     except RuntimeError as exc:
-        raise AdmissionError(str(exc)) from exc
+        # A DROPPED paste is not a swallowed Enter, and only one of them may
+        # be retried.
+        #
+        # A Claude pane that is still settling can take `pane send-text` and
+        # render nothing: observed 2026-08-27 with the capture pane idle at
+        # revision 1, `0 tokens`, and an EMPTY composer -- no text to press
+        # Enter on, so every recovery round pressed at nothing and the turn
+        # never began.
+        #
+        # Re-offering is normally forbidden, because a second prompt appends
+        # to text still sitting unsent and sends both halves as one garbled
+        # turn (the whole reason the recovery loop presses Enter instead of
+        # re-prompting). That hazard requires text on screen. When the
+        # composer is provably EMPTY there is nothing to append to, so the
+        # re-offer is safe -- and it is the only thing that can recover a
+        # paste the composer never took.
+        if not _composer_is_empty(call, handle["pane_id"], prompt):
+            raise AdmissionError(str(exc)) from exc
+        try:
+            _offer()
+        except RuntimeError as retry_exc:
+            raise AdmissionError(str(retry_exc)) from retry_exc
     deadline = time.monotonic() + timeout_s
     while True:
         records = list(_transcript_records(handle.get("transcript") or ""))
@@ -816,7 +920,7 @@ def _herdr(herdr: Path, *args: str, timeout: Optional[float] = None) -> dict:
         raise AdmissionError("LAUNCH_REFUSED:{}".format(refusal[-400:]),
                              herdr_error_code(refusal))
     try:
-        payload = json.loads(result.stdout or "{}")
+        payload = json.loads(result.stdout.strip() or "{}")
     except json.JSONDecodeError as exc:
         if _is_text_read(args):
             return {"result": {"text": result.stdout or ""}}
@@ -847,6 +951,31 @@ def _extract(payload: Mapping[str, object], key: str) -> object:
             if isinstance(value, dict) and key in value:
                 return value[key]
     return None
+
+
+
+def _composer_is_empty(
+        call: Callable[..., dict], pane_id: str, prompt: str) -> bool:
+    """True only when the pane demonstrably does NOT hold the offered text.
+
+    Read defensively and answer False on any doubt: a wrong True re-sends a
+    prompt on top of one already composed, which is the garbled-turn failure
+    re-offering is otherwise banned to avoid. An unreadable pane is doubt.
+    """
+    probe = prompt.strip().splitlines()[0][:40].strip() if prompt.strip() else ""
+    if not probe:
+        return False
+    try:
+        payload = call("pane", "read", pane_id, "--source", "visible")
+    except Exception:
+        return False
+    text = ""
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if isinstance(result, dict):
+        text = str(result.get("text") or "")
+    if not text:
+        return False
+    return probe not in text
 
 
 def _transcript_records(path: str) -> Tuple[dict, ...]:

@@ -77,6 +77,12 @@ class FakeHerdr:
         self.prompt_envelope = None
         self.close_error = None
         self.closed = []
+        #: Whether a successful `agent prompt` records the turn in the actor's
+        #: own transcript, as a real agent runtime does. Production reads that
+        #: durable record as proof of submission, so a fake that accepts the
+        #: prompt and writes nothing models an agent that never took it.
+        self.records_submission = True
+        self._last_text = ""
         self.revision = 1
         self.agent_status = "idle"
         self.advance_revision = True
@@ -141,7 +147,14 @@ class FakeHerdr:
                     }
                 }
             }
-        if head in (("agent", "prompt"), ("agent", "send-keys")):
+        if head in (
+            ("pane", "send-text"),
+            ("agent", "send-keys"),
+            ("pane", "send-text"),
+            ("pane", "send-keys"),
+        ):
+            if head == ("pane", "send-text"):
+                self._last_text = args[3] if len(args) > 3 else ""
             if self.prompt_error is not None:
                 if self.prompt_envelope is not None:
                     self.prompt_envelope.write_text(
@@ -150,6 +163,17 @@ class FakeHerdr:
                 raise self.prompt_error
             if self.advance_revision:
                 self.revision += 1
+            # The pane's revision advances here whether or not the composer
+            # submitted -- pasting the text is itself a repaint -- so the
+            # transcript record is what separates the two. An accepting agent
+            # writes one; a stalled composer (`prompt_error`) never gets here.
+            if self.records_submission and head[1] == "send-keys" and (
+                len(args) > 3 and args[3] == "enter"
+            ):
+                text = self._last_text
+                if isinstance(text, str) and text.startswith("@"):
+                    with Path(self.transcript).open("a", encoding="utf-8") as sink:
+                        sink.write(json.dumps({"role": "user", "text": text}) + "\n")
             return {"result": {"ok": True}}
         if head == ("agent", "wait"):
             return {"result": {"ok": True, "status": "idle"}}
@@ -160,7 +184,8 @@ class FakeHerdr:
                 "result": {
                     "agent": {
                         "name": args[2],
-                        "status": self.agent_status,
+                        "agent_status": self.agent_status,
+                        "status": None,
                         "transcript_path": str(self.transcript),
                     }
                 }
@@ -280,16 +305,36 @@ class RefusalCleanupTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.detail, "ENVELOPE_SUCCESS")
 
-    def test_omp_working_status_proves_static_revision_submission(self):
+    def test_a_prompt_the_actor_never_recorded_refuses_the_launch(self):
+        """Superseded twice by the same run, 2026-08-27.
+
+        First this asserted that a `working` status carried a launch whose
+        pane revision never moved; that was inverted when a booting agent
+        reported `working` while its composer held an unsubmitted prompt, and
+        the meter took over as the proof.
+
+        The meter then failed the same way, one artifact over. Pasting the
+        prompt is itself a repaint, so the counter advances by `+1` whether
+        the composer submitted the turn or is merely rendering text it is
+        still holding. A grok builder sat at revision 1 holding `@<prompt>`
+        while the launcher, reading 0 -> 1, returned success without pressing
+        Enter; the node blocked `ENVIRONMENTAL_BUDGET_EXHAUSTED` with receipt
+        `NEVER_STARTED`. One Enter afterwards drove that same counter past
+        1000 in four seconds.
+
+        So a static meter is no longer the thing asserted -- it never
+        distinguished the two cases in either direction. What is asserted is
+        the invariant both incidents violated: a launch whose prompt the actor
+        never recorded is refused rather than handed on. The meter is left
+        advancing here precisely to show it no longer carries the decision.
+        """
         harness, fake = self.build()
-        fake.advance_revision = False
+        fake.advance_revision = True
         fake.agent_status = "working"
+        fake.records_submission = False
 
-        handle = harness.launch(self.spec(route="omp"))
-
-        self.assertEqual(fake.closed, [])
-        self.assertEqual(len(fake.argv_for(("agent", "prompt"))), 1)
-        self.assertEqual(handle.agent_name[:8], "maestro-")
+        with self.assertRaises(lch.LaunchRefused):
+            harness.launch(self.spec(route="omp"))
 
     def test_the_refusal_stays_a_retryable_launch_failure(self):
         """The end of the causal chain the incident took.

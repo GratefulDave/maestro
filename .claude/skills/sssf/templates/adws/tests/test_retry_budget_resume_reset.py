@@ -176,10 +176,39 @@ class ResumeRefreshesEveryNodesBudget(unittest.TestCase):
                     st.RetryClass.ENVIRONMENTAL,
                     st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
                 ),
+                # Moved out of `terminal` deliberately, and this is the record
+                # of the policy change rather than a test bent to fit code.
+                # The semantic ceiling used to require an explicit grant on
+                # §7.5's argument that repeated semantic failure indicates a
+                # planning defect; §16.3 item 16 already called that an
+                # assumption, and run-8d1a71f463e4430f92a125a8f8b3731d
+                # transitions 1987/1988 are what it cost — one node over its
+                # ceiling stopping a run until a human typed a grant. It is a
+                # floor and not a ceiling removal, so the same ceiling still
+                # bites after the boundary; `test_resume_refreshes_semantic_
+                # budget.py` proves that half.
+                (
+                    "semantic",
+                    st.RetryClass.SEMANTIC,
+                    st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                ),
+                (
+                    "review",
+                    st.RetryClass.SEMANTIC,
+                    st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
+                ),
             )
             terminal = (
-                ("semantic", st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED),
-                ("review", st.BlockReason.REVIEW_BUDGET_EXHAUSTED),
+                # `review` moved out of here too, one change after `semantic`
+                # did, and for a different reason worth keeping distinct. The
+                # semantic ceiling bounds itself — a gate is green or it is
+                # not. A reviewer's opinion has no fixed point, so refreshing
+                # it needs an explicit bound or it is the unbounded loop §3.6
+                # A9 forbids. It has one: `RESUME_REVIEW_REFRESH_CEILING`, a
+                # per-run allowance, after which a review block stays blocked.
+                # This case sits inside that allowance;
+                # `test_resume_refreshes_review_budget.py` proves the ceiling
+                # bites once it is spent.
                 ("credential", st.BlockReason.CREDENTIAL_REFUSED),
             )
             nodes = [make_node(node_id, 0) for node_id, _, _ in cases]

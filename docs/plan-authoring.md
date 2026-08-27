@@ -295,6 +295,35 @@ review, both bound to one immutable sha. When it does run, its own commit must c
 test files byte-identically, and the accepted contract's coverage obligations must be green against
 it. The merge verifies that exact pair and refuses anything else.
 
+**The build lane can read those tests, and that is the design rather than a leak.** They merged
+before it branched, they are in its worktree, and the rule above requires its own commit to carry
+them. Anyone auditing a builder prompt and finding the test source in it is looking at the contract
+working: the prompt attaches bytes the builder already holds, which saves it the context of going to
+find them.
+
+## `test_visibility` — authored in v5, not yet runnable
+
+A `maestro-plan.v5` tests lane declares `test_visibility`, either `"merged"` or `"hidden"`.
+
+`"merged"` is everything above and is what every v1–v4 plan means. Nothing about those plans
+changes, and they remain runnable — a version this project has dropped before, and #104 is the
+record of what that cost.
+
+`"hidden"` withholds the test files from the builders their cases judge. It is **declarable and not
+yet executable**: `maestro-plan.v5` is deliberately absent from the runtime's runnable set, so a v5
+plan is refused at `run start` with `RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE` until the out-of-band gate
+machinery exists. Authoring one today is therefore a statement of intent, not a runnable plan.
+
+What has landed is the prerequisite the feature turns on. A hidden tests node's attempt runs in a
+separate bare repository — the vault — so its bytes never enter the run repository's object
+database, which is the only place containment can live: a linked worktree shares its parent's
+object database, and on 2026-08-27 a live builder worktree printed the blob of the test file its own
+lane was gated by. A hidden lane must also declare a `test_strength` contract, because that
+contract's coverage obligations are the entire vocabulary a sanitised repair handoff is permitted to
+speak back to a builder that cannot see the cases.
+
+The full design, including what it does not buy, is `docs/hidden-tests-design.md`.
+
 ## What a lane's outputs must cover
 
 A lane's `outputs` are not a summary of what it will touch. They are its entire write permission.

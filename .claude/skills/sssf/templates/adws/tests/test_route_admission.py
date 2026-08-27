@@ -205,7 +205,8 @@ elif argv[:2] == ["agent", "get"]:
         # somebody else's pane is what sends prompt text to the wrong shell.
         reported = os.environ.get("FAKE_AGENT_PANE") or pane_id
         print(json.dumps({"result": {"agent": {
-            "interactive_ready": True, "pane_id": reported}}}))
+            "interactive_ready": True, "pane_id": reported,
+            "agent_status": "idle", "status": None}}}))
 else:
     print(json.dumps({"result": {}}))
 """
@@ -425,45 +426,31 @@ class RouteAdmissionTest(unittest.TestCase):
                         "{!r} does not start with {!r}".format(name, prefix),
                     )
                     self.assertTrue(name[len(prefix) :])
-                # Each start must be followed by the documented readiness gate
-                # before its prompt is submitted to the agent composer.
+                # Paste-then-Enter is the offer. A wait may follow it
+                # (`--until working`) and is not a second prompt.
                 for name in started_names:
                     waits = [
                         index
                         for index, command in enumerate(argv)
                         if command[:3] == ["agent", "wait", name]
                     ]
-                    self.assertEqual(len(waits), 1)
-                    self.assertEqual(argv[waits[0]][:3], ["agent", "wait", name])
-                    self.assertNotIn("--until", argv[waits[0]])
+                    self.assertGreaterEqual(len(waits), 1)
                     self.assertIn("--timeout", argv[waits[0]])
-                    prompts = [
-                        index
-                        for index, command in enumerate(argv)
-                        if command[:3] == ["agent", "prompt", name]
-                    ]
-                    self.assertEqual(len(prompts), 1)
-                    self.assertLess(waits[0], prompts[0])
                 submitted = [
-                    command[3] for command in argv if command[:2] == ["agent", "prompt"]
+                    command[-1] for command in argv if command[:2] == ["pane", "send-text"]
                 ]
                 self.assertEqual(len(submitted), 2)
                 for prompt in submitted:
-                    self.assertEqual(
+                    self.assertFalse(
                         prompt.startswith(launcher.CLAUDE_TEAM_PROMPT_PREFIX),
-                        route == "claude",
                     )
-                # A prompt that submits cleanly needs no key recovery.
-                self.assertFalse(
-                    any(
-                        command[:2]
-                        in (
-                            ["pane", "run"],
-                            ["pane", "send-keys"],
-                            ["agent", "send-keys"],
-                        )
-                        for command in argv
-                    )
+                    self.assertNotIn("/team", prompt)
+                # Paste then Enter is the submission path. A second prompt is not.
+                self.assertFalse(any(command[:2] == ["pane", "run"] for command in argv))
+                self.assertFalse(any(command[:2] == ["agent", "prompt"] for command in argv))
+                self.assertTrue(
+                    any(command[:2] == ["pane", "send-keys"] and command[-1] == "enter"
+                        for command in argv)
                 )
 
     def test_a_stalled_prompt_is_submitted_with_enter_not_prompted_again(self):
@@ -487,12 +474,14 @@ class RouteAdmissionTest(unittest.TestCase):
             for c in argv
             if c[:2] == ["agent", "start"] and c[2].startswith("admit-omp-first-")
         )
-        prompts = [c for c in argv if c[:3] == ["agent", "prompt", first]]
-        self.assertEqual(len(prompts), 1)
-        keys = [c for c in argv if c[:3] == ["agent", "send-keys", first]]
-        self.assertEqual(len(keys), 1)
-        self.assertEqual(keys[0], ["agent", "send-keys", first, "enter"])
-        self.assertLess(argv.index(prompts[0]), argv.index(keys[0]))
+        marker_prompt = ra.FIRST_PROMPT.format(marker="MAESTRO_OMP_RECEIPT_OK")
+        offers = [c for c in argv if c[:2] == ["pane", "send-text"]
+                  and c[-1] == marker_prompt]
+        self.assertEqual(len(offers), 1)
+        self.assertFalse(any(c[:3] == ["agent", "prompt", first] for c in argv))
+        keys = [c for c in argv if c[:2] == ["pane", "send-keys"] and c[-1] == "enter"]
+        self.assertGreaterEqual(len(keys), 1)
+        self.assertLess(argv.index(offers[0]), argv.index(keys[0]))
 
     def _argv_log(self) -> list:
         text = (self.root / "argv.jsonl").read_text(encoding="utf-8")

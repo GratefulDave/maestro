@@ -344,7 +344,11 @@ CREATE TABLE IF NOT EXISTS runs (
   -- The test-acceptance contract this run was created under. See
   -- `_RUNS_ADDED_COLUMNS` for why NULL is the legacy pin and why nothing
   -- rewrites this column after `create_run`.
-  test_strength_contract TEXT
+  test_strength_contract TEXT,
+  -- Resumes that have reopened a review-budget block in this run. NULL is
+  -- zero. See `RESUME_REVIEW_REFRESH_CEILING` for the bound it feeds and
+  -- §3.6 A9 for why an unbounded version of it is forbidden.
+  review_refresh_count INTEGER
 );
 CREATE TABLE IF NOT EXISTS dag_nodes (
   run_id       TEXT NOT NULL REFERENCES runs(run_id),
@@ -592,6 +596,34 @@ CREATE TABLE IF NOT EXISTS lane_retry_spend (
   created_at    TEXT NOT NULL,
   PRIMARY KEY (run_id, build_node_id, cycle_seq)
 );
+-- Every plan this run has executed under, in order, with the bytes.
+--
+-- The bytes are here because the plan is the one artifact a run depends on
+-- that was referenced by content and not *stored* by content. `candidate_sha`,
+-- `output_sha`, `base_sha` and `accepted_test_sha` are git objects;
+-- `review_digest` resolves into the receipt store at `{digest}.json`, which is
+-- why a finalization receipt survives an edit to the plan it finalised.
+-- `runs.plan_digest` alone resolved through a *file path*, and `plan ship`
+-- overwrites that file — so amending a plan destroyed the only handle the run
+-- had to its own plan, and `_resume_run_selection` refused forever.
+--
+-- Storing the bytes is what makes that refusal unnecessary rather than
+-- relaxed: resume resolves the plan from the run's own retained record instead
+-- of searching mutable files, so it still cannot be handed a different plan by
+-- accident. `seq` is the lineage — seq 1 is what `create_run` adopted, and each
+-- amendment appends — so "which nodes merged under which plan" is answerable
+-- from the ledger rather than reconstructed.
+CREATE TABLE IF NOT EXISTS run_plan_versions (
+  run_id      TEXT NOT NULL REFERENCES runs(run_id),
+  seq         INTEGER NOT NULL CHECK (seq > 0),
+  plan_digest TEXT NOT NULL CHECK (
+    length(plan_digest) = 64
+    AND plan_digest NOT GLOB '*[^0-9A-Fa-f]*'),
+  plan_bytes  BLOB NOT NULL,
+  adopted_at  TEXT NOT NULL,
+  PRIMARY KEY (run_id, seq),
+  UNIQUE (run_id, plan_digest)
+);
 CREATE TABLE IF NOT EXISTS actor_sessions (
   run_id            TEXT NOT NULL REFERENCES runs(run_id),
   build_node_id     TEXT NOT NULL,
@@ -706,6 +738,16 @@ _RUNS_ADDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
     # left standing — never silently upgraded, and never retroactively
     # invalidated (see `legacy_test_strength_audit`).
     ("test_strength_contract", "TEXT"),
+    # How many times a resume has reopened a review-budget block in this run.
+    # The bound §3.6 A9 requires, made durable: a reviewer's opinion has no
+    # fixed point, so `reject -> resume -> repair -> reject` would otherwise run
+    # as long as somebody keeps typing `run resume`.
+    #
+    # NULL is zero and is read as zero everywhere: a ledger written before this
+    # column has spent none of its allowance, which is the same thing a fresh
+    # run has. Counted rather than timed, because "how many times has this
+    # loop gone round" is the question A9 actually asks.
+    ("review_refresh_count", "INTEGER"),
 )
 
 #: Columns added to `dag_nodes` after the first ledgers were written.  Derived
@@ -809,14 +851,75 @@ _RAISE_NODE_LANE_RETRY_SPEND_FLOOR = (
     _LANE_RETRY_SPEND_FLOOR_SQL + " WHERE run_id=? AND node_id=?"
 )
 
-#: Resume refreshes infrastructure retry spend, so nodes blocked only because
-#: launcher or environmental faults reached their ceilings return to the
-#: frontier in the same transaction. Semantic and review ceilings are
-#: adjudication bounds; they require an explicit grant and remain blocked.
+#: Resume refreshes every retry ceiling a run needs to continue, so a node
+#: blocked because one of them ran out returns to the frontier in the same
+#: transaction. Launcher and environmental faults are infrastructure; the
+#: semantic ceiling is an adjudication bound, and its inclusion here is a
+#: deliberate policy change rather than a tidy-up.
+#:
+#: It used to be excluded, on §7.5's argument that repeated semantic failure
+#: indicates a planning defect rather than bad luck, so the operator should have
+#: to look before granting more. §16.3 item 16 already recorded that argument as
+#: an assumption rather than a result, and the recovery as a forced retry one
+#: attempt at a time.
+#:
+#: `run-8d1a71f463e4430f92a125a8f8b3731d` is what the exclusion cost, and the
+#: ledger carries the whole sequence:
+#:
+#:   1987  lane-routing-chemical  RUNNING->BLOCKED  SEMANTIC_BUDGET_EXHAUSTED
+#:   1988  (run)                  ->BLOCKED         declare-outcome
+#:
+#: One node over its ceiling stopped a run that still had work left, until a
+#: human typed a grant.
+#:
+#: A note on that citation, because it was briefly removed from this comment as
+#: unverifiable and the removal was wrong: the denial came from querying a
+#: *scratch copy* of the ledger taken earlier for an unrelated migration probe,
+#: and reporting its `max(id)` as the live state. The live file holds 1987 and
+#: 1988 exactly as written above. Reading a snapshot and calling it the ledger
+#: is the same mistake as reading a passing test and calling it the code.
+#:
+#: What keeps this from being an off-switch for §7.5 is that it is a *floor*,
+#: not a ceiling removal. `_RAISE_RUN_RETRY_SPEND_FLOOR` moves where counting
+#: starts; the configured ceiling still applies to everything spent after the
+#: boundary, so a node whose plan is genuinely wrong blocks again on the next
+#: resume rather than looping forever. Nothing is deleted: the attempts, the
+#: spend rows and the transitions are the evidence chain and stay intact.
+#:
+#: `CREDENTIAL_REFUSED` and the other non-budget blocks are deliberately absent.
+#: They are not budgets, no boundary can pay them off, and adding them here
+#: would quietly turn "resume refreshes budgets" into "resume clears blocks".
 _RESUME_REFRESHED_BLOCK_REASONS = (
     st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED,
     st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED,
+    st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
 )
+
+#: How many times one run's review ceiling may be refreshed by a resume.
+#:
+#: `REVIEW_BUDGET_EXHAUSTED` is refreshed like the other classes, but unlike
+#: them it needs a bound, and §3.6 A9 is the reason: *"Never gate progress on a
+#: zero-finding LLM sweep with restart-on-any-finding — it has no bounded
+#: termination. Bound the loop or accept graded findings."*
+#:
+#: The asymmetry is real rather than bureaucratic. A semantic ceiling bounds
+#: itself — the gate either goes green or it does not, and the adjudicator is a
+#: count of executed cases, so a node that cannot pass stops. A reviewer's
+#: opinion has no fixed point, so `reject -> resume -> repair -> reject` runs as
+#: long as an operator keeps typing `run resume`. A9 does not forbid refreshing
+#: this budget; it forbids refreshing it without a bound. This is the bound.
+#:
+#: Small on purpose. A large number would satisfy every test of the mechanism
+#: while leaving the loop unbounded in practice, which is the shape A9 convicts;
+#: `tests/test_resume_refreshes_review_budget.py` asserts the magnitude, not
+#: just the behaviour. Three is enough to carry a lane through a reviewer that
+#: disagreed twice and few enough that a genuinely unconvergeable lane stops
+#: for a human while the run still has budget to finish everything else.
+#:
+#: The count is spent only by a resume that actually reopened something, which
+#: is what lets this bound and idempotence hold at once: resuming twice with no
+#: work in between reopens nothing the second time and therefore costs nothing.
+RESUME_REVIEW_REFRESH_CEILING = 3
 
 #: One node — the escape boundary is a decision about that node alone, which
 #: is what a `run resume` flag cannot express (§11.3).
@@ -1554,6 +1657,12 @@ LATE_ENVELOPE_PHASE_KEY = "late_envelope_phase"
 SEALED_OUTPUT_SHA_KEY = "sealed_output_sha"
 REPAIR_HANDOFF_RECOVERY_KEY = "repair_handoff_recovery"
 REVIEW_BUDGET_RECOVERY_KEY = "review_budget_recovery"
+#: One-shot authority to reopen a `QUIESCENCE_UNPROVEN` block over an
+#: attempt that durably never crossed dispatch. Written by
+#: `_write_resume_transition` against evidence, consumed by
+#: `claim_undispatched_attempt`, and never a default: an attempt row
+#: without it is claimed by nothing.
+UNDISPATCHED_RESUME_KEY = "undispatched_resume"
 
 
 def encode_baseline(baseline: Mapping[str, Sequence[str]]) -> Dict[str, str]:
@@ -5084,6 +5193,289 @@ class LifecycleStore:
         )
 
     @serialized
+    def record_plan_version(
+        self, run_id: str, plan_digest: str, plan_bytes: bytes
+    ) -> int:
+        """Append the plan bytes this run is executing under. Returns its seq.
+
+        Idempotent on the digest: re-recording the version already at the head
+        returns its existing seq rather than appending a duplicate, so a resume
+        that re-asserts what it is already running is free. A digest the run
+        adopted *earlier* and has since amended away is refused, because
+        re-adopting it would make the lineage a set rather than a history and
+        "which nodes merged under which plan" would stop being answerable.
+        """
+        _require_candidate_sha(plan_digest, field_name="plan_digest")
+        if not isinstance(plan_bytes, (bytes, bytearray)) or not plan_bytes:
+            raise LifecycleError(
+                "a plan version needs its bytes; {0} supplied none".format(run_id)
+            )
+        rows = self.conn.execute(
+            "SELECT seq, plan_digest FROM run_plan_versions"
+            " WHERE run_id=? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        if rows and str(rows[-1][1]) == plan_digest:
+            return int(rows[-1][0])
+        for seq, digest in rows:
+            if str(digest) == plan_digest:
+                raise LifecycleError(
+                    "{0} already executed under {1} at version {2} and has "
+                    "amended past it; the lineage is a history, not a set"
+                    .format(run_id, plan_digest[:12], seq)
+                )
+        seq = (int(rows[-1][0]) + 1) if rows else 1
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT INTO run_plan_versions"
+                " (run_id, seq, plan_digest, plan_bytes, adopted_at)"
+                " VALUES (?,?,?,?,?)",
+                (run_id, seq, plan_digest, bytes(plan_bytes), now_iso()),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return seq
+
+    @serialized
+    def plan_versions(self, run_id: str) -> Tuple[Tuple[int, str, str], ...]:
+        """This run's plan lineage as `(seq, digest, adopted_at)`, in order."""
+        return tuple(
+            (int(row[0]), str(row[1]), str(row[2]))
+            for row in self.conn.execute(
+                "SELECT seq, plan_digest, adopted_at FROM run_plan_versions"
+                " WHERE run_id=? ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+        )
+
+    @serialized
+    def current_plan(self, run_id: str) -> Optional[Tuple[str, bytes]]:
+        """The digest and bytes this run is executing under now, or None.
+
+        `None` is a run created before plan bytes were retained. It is not an
+        error and must not be treated as one: such a run resolves its plan the
+        old way, by matching installed files, and keeps whatever behaviour it
+        had. Inventing bytes for it would be the defaulting failure §19.2 names.
+        """
+        row = self.conn.execute(
+            "SELECT plan_digest, plan_bytes FROM run_plan_versions"
+            " WHERE run_id=? ORDER BY seq DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return None if row is None else (str(row[0]), bytes(row[1]))
+
+    #: States whose `dag_nodes` row an amendment may never rewrite. MERGED and
+    #: ACCEPTED carry evidence measured against the spec in that row; RUNNING
+    #: has a live attempt launched against it.
+    _AMENDMENT_FROZEN_STATES = ("MERGED", "ACCEPTED", "RUNNING")
+
+    @serialized
+    def amend_run_plan(
+        self,
+        run_id: str,
+        plan_digest: str,
+        plan_bytes: bytes,
+        updates: Mapping[str, st.PlanNode],
+        additions: Sequence[st.PlanNode] = (),
+        transfers: Sequence[Tuple[str, str, str]] = (),
+    ) -> int:
+        """Adopt an amended plan, rewriting only nodes that may be rewritten.
+
+        **`needs_json` is not in this statement, for an existing node, at all.**
+        That is the whole safety argument and it is structural rather than
+        conventional: §19 M42 is a projection that rewired `needs_json` on a
+        run in flight, reopening dependency decisions for nodes already
+        terminal, and the only existing writer of that column is
+        `ensure_derived_review_node`, which is refused outright on a legacy pin.
+        An amendment cannot reach the column because no amendment statement
+        names it. `plan_amendment.classify` refuses a `needs` change before
+        reaching here; this makes that refusal unnecessary rather than trusted.
+
+        The state guard is in the `WHERE` clause rather than in a Python check
+        above it, so a caller that skipped the classifier still cannot land a
+        write on a settled row — the row simply does not match. A statement that
+        matches nothing is then a refusal rather than a silent no-op, which is
+        what the rowcount assertion buys.
+
+        A new node is an INSERT and may carry `needs`, because nothing was
+        admitted in its absence.
+        """
+        _require_candidate_sha(plan_digest, field_name="plan_digest")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for node_id, node in sorted(updates.items()):
+                changed = self.conn.execute(
+                    "UPDATE dag_nodes SET outputs_json=?, specs_json=?, kind=?"
+                    " WHERE run_id=? AND node_id=? AND EXISTS ("
+                    "  SELECT 1 FROM node_lifecycle nl"
+                    "  WHERE nl.run_id = dag_nodes.run_id"
+                    "    AND nl.node_id = dag_nodes.node_id"
+                    "    AND nl.state NOT IN (?,?,?))",
+                    (
+                        json.dumps(list(node.outputs)),
+                        json.dumps(list(node.specs)),
+                        node.kind.value,
+                        run_id,
+                        node_id,
+                        *self._AMENDMENT_FROZEN_STATES,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise IllegalTransition(
+                        "{0}/{1}: an amendment may not rewrite this node — it "
+                        "is absent, or its state is one of {2} and its spec is "
+                        "the terms its evidence was measured against".format(
+                            run_id, node_id, self._AMENDMENT_FROZEN_STATES
+                        )
+                    )
+            # A settled node releasing a path it has finished writing. This is
+            # the *only* statement in the system that touches a settled row,
+            # and it is written so it can do nothing else: it sets one column,
+            # it removes exactly one value from that column's JSON array, and
+            # it matches only an agent-kind row in a settled state.
+            #
+            # Why a settled row may be touched at all: a node's `outputs` do
+            # two jobs — write permission during the attempt, and an ownership
+            # claim in the plan. For a MERGED node the first is spent (the
+            # delta was measured against the outputs as they stood, and the
+            # receipt records that measurement) and the second is a property of
+            # the graph. Releasing a finished path therefore re-judges nothing,
+            # and `run_plan_versions` keeps the version it merged under so the
+            # evidence stays readable against its own terms.
+            #
+            # Why `kind='agent'` is in the WHERE clause rather than checked
+            # above it: a merged *tests* node's outputs are still read after
+            # the merge — `compare_test_bytes` pairs every later build lane
+            # against `tuple(tests_node.outputs)`, and `_append_needed_tests`
+            # reads them for a dependant's prompt — so for that kind they are
+            # live state rather than a spent permission. The statement cannot
+            # express the unsound case.
+            for path, donor, _recipient in transfers:
+                released = self.conn.execute(
+                    "UPDATE dag_nodes SET outputs_json = ("
+                    "  SELECT json_group_array(value) FROM json_each("
+                    "    dag_nodes.outputs_json) WHERE value <> ?)"
+                    " WHERE run_id=? AND node_id=? AND kind=?"
+                    "   AND EXISTS ("
+                    "     SELECT 1 FROM node_lifecycle nl"
+                    "     WHERE nl.run_id = dag_nodes.run_id"
+                    "       AND nl.node_id = dag_nodes.node_id"
+                    "       AND nl.state IN (?,?))",
+                    (
+                        path,
+                        run_id,
+                        donor,
+                        st.NodeKind.AGENT.value,
+                        st.NodeState.MERGED.value,
+                        st.NodeState.ACCEPTED.value,
+                    ),
+                ).rowcount
+                if released != 1:
+                    raise IllegalTransition(
+                        "{0}/{1}: cannot release {2} — the node is absent, is "
+                        "not an agent node, or is not settled. A merged tests "
+                        "node's outputs are still read after the merge and are "
+                        "not a spent permission".format(run_id, donor, path)
+                    )
+            for node in additions:
+                self.conn.execute(
+                    "INSERT INTO dag_nodes (run_id, node_id, plan_digest, kind,"
+                    " depth, needs_json, outputs_json, specs_json)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        node.node_id,
+                        plan_digest,
+                        node.kind.value,
+                        node.depth,
+                        json.dumps(list(node.needs)),
+                        json.dumps(list(node.outputs)),
+                        json.dumps(list(node.specs)),
+                    ),
+                )
+                self.conn.execute(
+                    "INSERT INTO node_lifecycle (run_id, node_id, state,"
+                    " attempt_no, updated_at) VALUES (?,?,?,0,?)",
+                    (run_id, node.node_id, st.NodeState.PENDING.value, now_iso()),
+                )
+            rows = self.conn.execute(
+                "SELECT seq, plan_digest FROM run_plan_versions"
+                " WHERE run_id=? ORDER BY seq",
+                (run_id,),
+            ).fetchall()
+            if rows and str(rows[-1][1]) == plan_digest:
+                self.conn.commit()
+                return int(rows[-1][0])
+            seq = (int(rows[-1][0]) + 1) if rows else 1
+            self.conn.execute(
+                "INSERT INTO run_plan_versions"
+                " (run_id, seq, plan_digest, plan_bytes, adopted_at)"
+                " VALUES (?,?,?,?,?)",
+                (run_id, seq, plan_digest, bytes(plan_bytes), now_iso()),
+            )
+            self.conn.execute(
+                "UPDATE runs SET plan_digest=?, last_transition_at=?"
+                " WHERE run_id=?",
+                (plan_digest, now_iso(), run_id),
+            )
+            self.conn.execute(
+                "INSERT INTO transitions"
+                " (run_id, node_id, kind, from_state, to_state, reason, actor,"
+                " detail_json, created_at) VALUES (?,?,'run',?,?,?,?,?,?)",
+                (
+                    run_id,
+                    None,
+                    None,
+                    None,
+                    "plan-amended",
+                    "operator",
+                    json.dumps(
+                        {
+                            "plan_digest": plan_digest,
+                            "seq": seq,
+                            "updated": sorted(updates),
+                            "added": sorted(n.node_id for n in additions),
+                            "transfers": [list(t) for t in transfers],
+                        },
+                        sort_keys=True,
+                    ),
+                    now_iso(),
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return seq
+
+    def _review_refresh_count(self, run_id: str) -> int:
+        """Resumes that have reopened a review-budget block in this run.
+
+        Unserialized on purpose: `resume_run` calls it from inside its own
+        transaction, and taking the lock again there would deadlock. The public
+        `review_refresh_count` is the one callers outside a transaction use.
+
+        NULL is zero, for the reason every other added column reads that way: a
+        ledger written before the column recorded no refreshes, which is the
+        same thing a fresh run has, and inventing any other number here would
+        retroactively spend an allowance nobody used.
+        """
+        row = self.conn.execute(
+            "SELECT review_refresh_count FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise LifecycleError("no run row for {0}".format(run_id))
+        return int(row[0] or 0)
+
+    @serialized
+    def review_refresh_count(self, run_id: str) -> int:
+        """How much of this run's §3.6 A9 review allowance has been spent."""
+        return self._review_refresh_count(run_id)
+
+    @serialized
     def retry_spend_floor(self, run_id: str, node_id: str) -> int:
         """The attempt number this node's retry budgets are counted from.
 
@@ -6162,6 +6554,7 @@ class LifecycleStore:
         run_id: str,
         *,
         late_envelope_attempts: Iterable[Tuple[str, int]] = (),
+        undispatched_attempts: Iterable[Tuple[str, int]] = (),
     ) -> None:
         """Atomically claim a dead run and write its resume boundary.
 
@@ -6189,8 +6582,17 @@ class LifecycleStore:
         `late_envelope_attempts` is absence-proven recovery authority supplied
         by the runtime preflight. A successful result row alone is not proof
         that the retained worktree or declaration still exists.
+
+        `undispatched_attempts` is the same shape for the opposite state: a
+        `QUIESCENCE_UNPROVEN` block over a generation that both this ledger
+        and the runtime preflight agree never crossed dispatch. Those return
+        to PENDING carrying a one-shot marker the scheduler consumes by
+        reclaiming that exact attempt. A quiescence block over an attempt that
+        did dispatch, or one either half cannot account for, is untouched here
+        and stays blocked -- which is what it is for.
         """
         proven_late_envelopes = set(late_envelope_attempts)
+        proven_undispatched = set(undispatched_attempts)
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             claim = self.conn.execute(
@@ -6242,6 +6644,15 @@ class LifecycleStore:
             )
             self.conn.execute(_RAISE_RUN_RETRY_SPEND_FLOOR, (run_id,))
             self.conn.execute(_RAISE_RUN_LANE_RETRY_SPEND_FLOOR, (run_id,))
+            # A9's bound, read before the loop and spent after it. `spent` is
+            # set only by a node this resume actually reopened through the
+            # refresh route, so a resume that reopens nothing costs nothing and
+            # repeating it is free.
+            review_refresh_used = self._review_refresh_count(run_id)
+            review_refresh_available = (
+                review_refresh_used < RESUME_REVIEW_REFRESH_CEILING
+            )
+            review_refresh_spent = False
             refreshed_reasons = tuple(
                 reason.value
                 for reason in (
@@ -6282,11 +6693,27 @@ class LifecycleStore:
                     payload = json.loads(attempt[0] or "{}")
                     if not isinstance(payload, dict):
                         payload = {}
-                if review_budget and (
-                    payload.get(REVIEW_BUDGET_RECOVERY_KEY) is not True
-                    or not late_envelope
-                ):
-                    continue
+                if review_budget:
+                    # Two distinct routes out of a review-budget block, and
+                    # they answer different questions.
+                    #
+                    # The recovery route corrects the record: a verdict that
+                    # arrived after the block was written. It is not a fresh
+                    # allowance, so the A9 ceiling does not apply to it and
+                    # never consumes a unit of it.
+                    #
+                    # The refresh route is a fresh allowance, and it is the one
+                    # A9 bounds. It is available only while the run has units
+                    # left; past that the node stays blocked for an operator to
+                    # look at, which is the termination A9 asks for.
+                    recovery = (
+                        payload.get(REVIEW_BUDGET_RECOVERY_KEY) is True
+                        and late_envelope
+                    )
+                    if not recovery:
+                        if not review_refresh_available:
+                            continue
+                        review_refresh_spent = True
                 phase = (
                     self._late_envelope_resume_phase(
                         run_id, str(node_id), payload
@@ -6338,6 +6765,80 @@ class LifecycleStore:
                         now,
                     ),
                 )
+            if review_refresh_spent:
+                # One unit per resume, not per node: the allowance is the
+                # operator's decision to go round again, and a run that reopens
+                # four review-blocked lanes in one resume made that decision
+                # once. Written in the same transaction as the reopens it paid
+                # for, so a crash between the two cannot hand out a free round.
+                self.conn.execute(
+                    "UPDATE runs SET review_refresh_count=? WHERE run_id=?",
+                    (review_refresh_used + 1, run_id),
+                )
+            for node_id, attempt_no in sorted(proven_undispatched):
+                attempt = self.conn.execute(
+                    "SELECT extra_json FROM attempts"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (run_id, node_id, attempt_no),
+                ).fetchone()
+                if attempt is None:
+                    raise UnknownNode(
+                        f"{run_id}/{node_id}#{attempt_no}: attempt row is absent"
+                    )
+                payload = json.loads(attempt[0] or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload[UNDISPATCHED_RESUME_KEY] = True
+                self.conn.execute(
+                    "UPDATE attempts SET extra_json=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        json.dumps(payload, sort_keys=True),
+                        run_id,
+                        node_id,
+                        attempt_no,
+                    ),
+                )
+                # Guarded on the exact state *and* the exact block reason, so
+                # a node that moved between the eligibility read and this
+                # write is left alone rather than reopened on a stale premise.
+                reopened = self.conn.execute(
+                    "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
+                    " pending_cause=?, updated_at=?"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?"
+                    "   AND state=? AND block_reason=?",
+                    (
+                        st.NodeState.PENDING.value,
+                        st.PendingCause.OPERATOR_RESUME.value,
+                        now,
+                        run_id,
+                        node_id,
+                        attempt_no,
+                        st.NodeState.BLOCKED.value,
+                        st.BlockReason.QUIESCENCE_UNPROVEN.value,
+                    ),
+                )
+                if reopened.rowcount != 1:
+                    raise LifecycleError(
+                        f"{run_id}/{node_id}#{attempt_no}: no QUIESCENCE_UNPROVEN "
+                        "block on that generation to reopen"
+                    )
+                self.conn.execute(
+                    "INSERT INTO transitions"
+                    " (run_id, node_id, kind, from_state, to_state, reason,"
+                    " actor, detail_json, created_at)"
+                    " VALUES (?,?,'node',?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        node_id,
+                        st.NodeState.BLOCKED.value,
+                        st.NodeState.PENDING.value,
+                        "resume:undispatched-quiescence",
+                        "operator",
+                        json.dumps({"attempt_no": attempt_no}, sort_keys=True),
+                        now,
+                    ),
+                )
             self.conn.execute(
                 "INSERT INTO transitions (run_id, node_id, kind, from_state, to_state,"
                 " reason, actor, detail_json, created_at)"
@@ -6362,6 +6863,182 @@ class LifecycleStore:
             ),
         ).fetchall()
         return tuple((str(row[0]), int(row[1])) for row in rows)
+
+    @serialized
+    def undispatched_quiescence_attempts(
+        self, run_id: str
+    ) -> Tuple[Tuple[str, int], ...]:
+        """Quiescence blocks whose attempt provably never crossed dispatch.
+
+        A `QUIESCENCE_UNPROVEN` block says "this attempt's owned execution
+        could not be shown absent". That is an adjudication about a writer,
+        and where a writer could exist it stays. But the runtime's quiescer
+        answers the same way about an attempt that never created anything at
+        all -- it resolves a handle from a map only a successful launch
+        populates -- and that answer is a statement about the map, not about
+        the world. This is the durable half of telling the two apart, and it
+        is a conjunction of absences rather than one flag, because any single
+        one of them could be absent for an unrelated reason:
+
+        * the attempt row was never launched -- no `launched_at`, no pid, no
+          host, no process start epoch, no turn, and no transcript path. The
+          launcher writes all of those in one `mark_launched`, so their joint
+          absence is the launch not having happened rather than a field
+          having been missed;
+        * no actor session was ever bound for that generation, and none is
+          ACTIVE for the node at all -- a pane bound to this node is a writer
+          whatever the attempt row says;
+        * the attempt produced nothing durable: no result row, no lane
+          candidate at or beyond that generation, no repair handoff, and no
+          orphan (an orphan row *is* a recorded abandoned pid);
+        * it is the node's newest attempt. Reopening a superseded generation
+          would relaunch work a later one already replaced.
+
+        The filesystem half -- no submitted prompt, no envelope, no session
+        directory, and a worktree still identical to its recorded baseline --
+        belongs to the runtime preflight, which owns those paths. Both halves
+        must agree before `resume_run` is given any authority here, and an
+        attempt that fails either one stays blocked.
+        """
+        rows = self.conn.execute(
+            "SELECT nl.node_id, nl.attempt_no, a.extra_json"
+            " FROM node_lifecycle nl"
+            " JOIN attempts a ON a.run_id=nl.run_id AND a.node_id=nl.node_id"
+            "  AND a.attempt_no=nl.attempt_no"
+            " WHERE nl.run_id=? AND nl.state=? AND nl.block_reason=?"
+            "   AND a.launched_at IS NULL AND a.pid IS NULL"
+            "   AND a.attempt_host IS NULL AND a.attempt_start_epoch IS NULL"
+            "   AND a.turn_count=0"
+            "   AND a.attempt_no=(SELECT MAX(m.attempt_no) FROM attempts m"
+            "                      WHERE m.run_id=nl.run_id AND m.node_id=nl.node_id)"
+            "   AND NOT EXISTS (SELECT 1 FROM actor_sessions s"
+            "                    WHERE s.run_id=nl.run_id"
+            "                      AND s.build_node_id=nl.node_id"
+            "                      AND (s.generation>=nl.attempt_no OR s.state=?))"
+            "   AND NOT EXISTS (SELECT 1 FROM results r"
+            "                    WHERE r.run_id=nl.run_id AND r.node_id=nl.node_id"
+            "                      AND r.attempt_no=nl.attempt_no)"
+            "   AND NOT EXISTS (SELECT 1 FROM lane_candidates c"
+            "                    WHERE c.run_id=nl.run_id"
+            "                      AND c.build_node_id=nl.node_id"
+            "                      AND c.builder_generation>=nl.attempt_no)"
+            "   AND NOT EXISTS (SELECT 1 FROM repair_handoffs h"
+            "                    WHERE h.run_id=nl.run_id"
+            "                      AND h.build_node_id=nl.node_id"
+            "                      AND h.builder_generation>=nl.attempt_no)"
+            "   AND NOT EXISTS (SELECT 1 FROM orphans o"
+            "                    WHERE o.run_id=nl.run_id AND o.node_id=nl.node_id"
+            "                      AND o.attempt_no=nl.attempt_no)"
+            " ORDER BY nl.node_id",
+            (
+                run_id,
+                st.NodeState.BLOCKED.value,
+                st.BlockReason.QUIESCENCE_UNPROVEN.value,
+                st.ActorSessionState.ACTIVE.value,
+            ),
+        ).fetchall()
+        eligible = []
+        for node_id, attempt_no, extra_json in rows:
+            payload = json.loads(extra_json or "{}")
+            if not isinstance(payload, dict):
+                continue
+            # A transcript path is written by the same call that sets
+            # `launched_at`, and a sealed output by a measurement that only a
+            # dispatched attempt reaches. Either one present means the SQL
+            # above is reading a row it does not understand, so it declines.
+            if payload.get(wd.SESSION_PATH_KEY) is not None:
+                continue
+            if payload.get(SEALED_OUTPUT_SHA_KEY) is not None:
+                continue
+            eligible.append((str(node_id), int(attempt_no)))
+        return tuple(eligible)
+
+    @serialized
+    def claim_undispatched_attempt(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> int:
+        """Take back the *same* generation a stale quiescence block held.
+
+        The counterpart of `claim_late_envelope_attempt`, for the opposite
+        state: that one adopts an attempt whose work is complete and must not
+        be relaunched, this one reopens an attempt whose work never started
+        and therefore must be. Both consume a one-shot marker written against
+        evidence at the resume boundary; neither invents authority of its own,
+        and an attempt row that does not carry the marker is refused here
+        rather than reopened on the caller's say-so.
+
+        The recorded measurement baseline goes with the claim. §8.3's bracket
+        opens on the *provisioned* tree, and this attempt is about to be
+        provisioned again before it is measured; a before-side taken by a
+        bracket that never closed is not the before-side of the one about to
+        open. Keeping it would either bind the new measurement to a stale
+        tree or -- when provision moves at all -- collide with
+        `record_baseline`'s refusal to rewrite what an attempt started from.
+        The row is dropped in the same transaction that reopens the attempt,
+        so no reader ever sees the attempt RUNNING with a foreign baseline.
+
+        No attempt number is allocated: `start_attempt` mints generations and
+        this deliberately does not, which is what makes the recovery
+        same-attempt rather than a fresh try wearing a recovery's name.
+        """
+        state_row = self.conn.execute(
+            "SELECT state, extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no),
+        ).fetchone()
+        if state_row is None:
+            raise UnknownNode(f"{run_id}/{node_id}#{attempt_no}: attempt row is absent")
+        payload = json.loads(state_row[1] or "{}")
+        if (
+            not isinstance(payload, dict)
+            or payload.pop(UNDISPATCHED_RESUME_KEY, None) is not True
+        ):
+            raise LifecycleError(
+                f"{run_id}/{node_id}#{attempt_no}: no undispatched-resume "
+                "authority on the attempt row; a quiescence block is reopened "
+                "against evidence recorded at the resume boundary, never on "
+                "request"
+            )
+        payload.pop(ATTEMPT_BASELINE_DIGEST_KEY, None)
+        encoded = json.dumps(payload, sort_keys=True)
+
+        def extra(lifecycle: st.NodeLifecycle):
+            return [
+                (
+                    "UPDATE attempts SET state=?, retry_class=NULL, started_at=?,"
+                    " extra_json=? WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (
+                        st.NodeState.RUNNING.value,
+                        time.time(),
+                        encoded,
+                        run_id,
+                        node_id,
+                        attempt_no,
+                    ),
+                ),
+                (
+                    "DELETE FROM attempt_baselines"
+                    " WHERE run_id=? AND node_id=? AND attempt_no=?",
+                    (run_id, node_id, attempt_no),
+                ),
+            ]
+
+        lifecycle = self._transition_node(
+            run_id,
+            node_id,
+            st.NodeState.RUNNING,
+            actor="scheduler",
+            reason="attempt-start",
+            require_state=(st.NodeState.PENDING,),
+            detail={"repair": "undispatched-quiescence"},
+            extra_writes=extra,
+        )
+        if lifecycle.attempt_no != attempt_no:
+            raise LifecycleError(
+                f"{run_id}/{node_id}: lifecycle points at attempt "
+                f"{lifecycle.attempt_no}, not the {attempt_no} being reclaimed"
+            )
+        return attempt_no
 
     @serialized
     def retry_budget_blocked_attempts(self, run_id: str) -> Tuple[Tuple[str, int], ...]:
@@ -6766,6 +7443,7 @@ class LifecycleStore:
         run_id: str,
         *,
         late_envelope_attempts: Sequence[Tuple[str, int]] = (),
+        undispatched_attempts: Sequence[Tuple[str, int]] = (),
     ) -> Tuple[str, ...]:
         """Legal against BLOCKED, STUCK, NULL, and a run the operator stopped
         with `run cancel`; refused against ACCEPTED and against a run given up
@@ -6825,6 +7503,23 @@ class LifecycleStore:
         facts, and guessing that an unrecorded cancellation was merely a pause
         is the guess that reopens an adjudicated run."""
         requested_recoveries = set(late_envelope_attempts)
+        requested_undispatched = set(undispatched_attempts)
+        # Re-derived here rather than trusted from the caller. The runtime
+        # preflight owns the filesystem half of the proof and this owns the
+        # durable half; a generation the ledger does not itself find eligible
+        # is refused however convincing the caller's evidence was.
+        unknown_undispatched = requested_undispatched - set(
+            self.undispatched_quiescence_attempts(run_id)
+        )
+        if unknown_undispatched:
+            named = ", ".join(
+                "{0}#{1}".format(node_id, attempt_no)
+                for node_id, attempt_no in sorted(unknown_undispatched)
+            )
+            raise LifecycleError(
+                f"{run_id}: {named} is not a quiescence block this ledger can "
+                "show never crossed dispatch; resume left the run unchanged"
+            )
         recoverable_attempts = set(self.running_attempts(run_id))
         recoverable_attempts.update(self.retry_budget_blocked_attempts(run_id))
         unknown_recoveries = requested_recoveries - recoverable_attempts
@@ -6869,7 +7564,9 @@ class LifecycleStore:
                 f"reopenable; this one {why}"
             )
         self._write_resume_transition(
-            run_id, late_envelope_attempts=requested_recoveries
+            run_id,
+            late_envelope_attempts=requested_recoveries,
+            undispatched_attempts=requested_undispatched,
         )
         # Before the inherited attempts, and deliberately: these nodes hold no
         # attempt this process could inherit -- `cancel_run` closed every one
@@ -7816,6 +8513,29 @@ class LifecycleReader:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+
+    def current_plan(self, run_id: str) -> Optional[Tuple[str, bytes]]:
+        """The digest and bytes this run executes under, or None.
+
+        The read half of `LifecycleStore.current_plan`, here because resume
+        resolves the plan before any writer handle exists and §10.6 keeps the
+        query in this module rather than in the CLI.
+
+        `None` is a run created before plan bytes were retained. Resume then
+        falls back to matching installed files, which is exactly what it did
+        before — absence is a legacy run, never an error.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT plan_digest, plan_bytes FROM run_plan_versions"
+                " WHERE run_id=? ORDER BY seq DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # A ledger written before the table existed. Same answer as a run
+            # that never recorded one: fall back, do not fail.
+            return None
+        return None if row is None else (str(row[0]), bytes(row[1]))
 
     @classmethod
     def open(cls, db_path) -> "LifecycleReader":

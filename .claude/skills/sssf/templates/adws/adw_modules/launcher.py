@@ -294,8 +294,25 @@ AGENT_NOT_FOUND = "agent_not_found"
 #: `worktree.scratch_env`, because this module is where they cross the herdr
 #: boundary. A variable absent from this tuple never reaches the agent's shell
 #: however carefully it was computed.
+#: `XDG_CACHE_HOME` is deliberately **not** among these, and its absence is a
+#: fix rather than an omission. It was redirected here until 2026-08-27, when
+#: `run-8d1a71f463e4430f92a125a8f8b3731d` spent twelve launcher attempts on a
+#: tester lane whose agent came up `no-model`. A pane is forked by the herdr
+#: server and builds its environment from a *login shell*, and a login shell
+#: reads credentials through this variable -- on the machine that recorded the
+#: incident, `~/.zshrc` sources `${XDG_CACHE_HOME:-$HOME/.cache}/keychain-
+#: secrets.zsh`, which is what exports the provider API keys. Pointing it at a
+#: fresh per-attempt scratch does not redirect a byproduct; it removes the
+#: shell's own bootstrap, and the agent launches with no usable credentials and
+#: a composer that will not accept a prompt.
+#:
+#: That is the asymmetry that makes this variable different from the six that
+#: remain. `TMPDIR`, `PYTHONPYCACHEPREFIX`, `npm_config_cache`, the pytest
+#: cache, `RUFF_CACHE_DIR` and `COVERAGE_FILE` name places a tool *writes*, so
+#: redirecting them moves output. `XDG_CACHE_HOME` also names a place tools
+#: *read*, and redirecting it hides input. §8.3's fence is about what lands in
+#: the measured worktree, and nothing under `~/.cache` was ever inside one.
 SCRATCH_ENV_KEYS: Tuple[str, ...] = (
-    "XDG_CACHE_HOME",
     "TMPDIR",
     "PYTHONPYCACHEPREFIX",
     "PYTEST_ADDOPTS",
@@ -495,8 +512,24 @@ AGENT_QUIESCENT_STATUS = "idle"
 AGENT_QUIESCENCE_CONFIRM_S = 60.0
 
 
+#: NEVER let this begin with `/`. A leading slash opens Claude Code's
+#: slash-command menu, and the Enter that follows is consumed ACCEPTING A
+#: COMPLETION rather than sending the message -- observed 2026-08-27, where
+#: `/team ...` was rewritten to `/oh-my-claudecode:team` and actually invoked
+#: the OMC team skill, so the admission turn ran a slash command instead of
+#: answering, spawned a teammate pane, and never wrote the reply marker the
+#: capture waits for. The instruction reads identically with the verb named
+#: mid-sentence, and nothing then triggers the menu.
+#: How long to let a pasted prompt settle in the composer before pressing a
+#: key at it. `pane send-text` returns when herdr has written the bytes, not
+#: when the agent has taken them, so a key sent immediately after can land on
+#: a composer that is still rendering and be swallowed.
+PASTE_SETTLE_S = 2.0
+
+
 CLAUDE_TEAM_PROMPT_PREFIX = (
-    "/team spawn subagents for tasks. If you get impatient do not duplicate "
+    "Use `/team` to spawn subagents for tasks. If you get impatient do not "
+    "duplicate "
     "the work yourself. Poll them. Make sure they use SendMessage to respond "
     "back to you. Operating rule: a teammate is idle only when it sent you a "
     "real SendMessage result, or `herdr agent list` no longer reports it as "
@@ -1106,11 +1139,11 @@ SUBMIT_ATTEMPTS = 4
 def pane_revision(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int]:
     """The pane's monotonic revision counter, or None when it cannot be read.
 
-    A typed integer the terminal maintains, not pane text: §1.2 permits reading
-    it, and it is the one signal that separates an agent that consumed a prompt
-    from one whose composer is still holding it. `agent_status` cannot — a pane
-    that never accepted the prompt and a pane whose short turn already finished
-    both report `idle`.
+    Diagnostic only. §1.2 permits reading this typed integer, but it cannot
+    prove a prompt was submitted: pasting the text is itself a repaint, so the
+    counter advances whether the composer accepted the turn or is still holding
+    it. `agent_status` cannot either — a pane that never accepted the prompt
+    and a pane whose short turn already finished both report `idle`.
     """
     try:
         payload = herdr_call("pane", "get", pane_id, timeout=15.0)
@@ -1134,6 +1167,7 @@ def submit_agent_prompt(
     attempts: int = SUBMIT_ATTEMPTS,
     working_proves: bool = False,
     sleep: Callable[[float], None] = time.sleep,
+    submission_recorded: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Submit one atomic prompt and prove the agent actually accepted it.
 
@@ -1167,9 +1201,9 @@ def submit_agent_prompt(
     until_argv: List[str] = []
     for status in until:
         until_argv.extend(["--until", status])
-    # What the pane had consumed before the prompt was offered. A revision
-    # advance proves consumption; a typed `working` agent status is independent
-    # positive proof for routes whose pane revision remains static.
+    # Diagnostic meter only. A revision advance does not prove consumption:
+    # paste itself repaints. Readings distinguish Unobservable from
+    # NotSubmitted after recovery is spent. `working` is not proof here either.
     baseline = pane_revision(herdr_call, pane_id)
     # Every legible reading taken *after* the prompt was offered. Emptiness is
     # the structural fact D9 turns on: it says the meter was never readable,
@@ -1178,37 +1212,85 @@ def submit_agent_prompt(
     # Recovery must not wait on `idle`: the unsubmitted composer is already
     # idle, so Herdr would return immediately and all Enter attempts would be
     # spent back-to-back before the composer had another chance to become
-    # interactive. A fast accepted turn is still proven by the revision read
-    # after this wait. Direct sessions may additionally prove `working`.
+    # interactive. A fast accepted turn is proven by a rising transcript
+    # record, never by this wait returning.
     recovery_until = tuple(status for status in until if status != "idle")
     if not recovery_until:
         recovery_until = ("working",)
-
-    def consumed() -> bool:
-        """Whether the pane or agent proves it accepted the offered prompt.
+    def consumed(revision_only: bool = False) -> bool:
+        """Whether the actor proves it accepted the offered prompt.
 
         `idle` is worthless: a composer holding an unsubmitted `@<path>` also
-        reports idle. A pane revision advance proves consumption for fast turns.
-        A typed `working` agent status proves the same fact for direct Claude
-        sessions whose revision may remain static after accepting the prompt.
-        Missing, malformed, or any other status remains unproven.
+        reports idle. A pane revision advance is a repaint, not a turn — never
+        positive proof. Missing, malformed, or any other live signal remains
+        unproven unless an explicit predicate or the Claude working fallback
+        says otherwise.
+
+        Positive proof is `submission_recorded` when the caller supplied one
+        and it returns true. Typed `working` remains a fallback for Claude
+        (admission folds it into that predicate; the no-transcript path here
+        consults it only when the meter is unreadable). `revision_only`
+        drops the status half at the stalled-offer read, before Enter.
         """
         current = pane_revision(herdr_call, pane_id)
         if current is not None:
             readings.append(current)
-        if baseline is not None and current is not None and current > baseline:
-            return True
-        if working_proves and agent_name:
+        # The durable transcript record is the ONLY positive proof whenever the
+        # caller can supply one, and the pane revision is then diagnostic.
+        #
+        # A revision cannot carry this proof at all. Pasting the prompt
+        # repaints the pane, so the counter advances by the same +1 whether the
+        # composer accepted the turn or is merely rendering text it is still
+        # holding. On 2026-08-27 a grok builder sat at revision 1 with
+        # `@<prompt>` unsubmitted in its composer while this function, reading
+        # 0 -> 1, returned success without pressing a single Enter; the node
+        # blocked `ENVIRONMENTAL_BUDGET_EXHAUSTED` with receipt `NEVER_STARTED`.
+        # One Enter afterwards started the turn and drove that same counter past
+        # 1000 within four seconds. The counter is a repaint meter, not a turn
+        # meter, and no threshold over it separates the two cases.
+        if submission_recorded is not None:
+            try:
+                return bool(submission_recorded())
+            except Exception:
+                return False
+        # The 2026-08-27 meter fallback (`current > baseline`) is the defect
+        # this function used to return True through. It does not return here.
+        #
+        # `working` was trusted beside a legible counter the same day, when a
+        # reviewer on the `claude` route sat at revision 1 holding
+        # `@<prompt>.md` in its composer while the launcher returned a handle
+        # and the finalization window waited forty minutes for a report no
+        # actor was writing. So where the counter can be read, working does
+        # not outrank it. Claude's composer can accept a prompt without
+        # moving the meter at all: typed working remains the fallback when
+        # the meter is unreadable, and herdr's field is `agent_status`
+        # (`status` is always None).
+        meter_unreadable = baseline is None or current is None
+        if not revision_only and working_proves and agent_name and meter_unreadable:
             try:
                 payload = herdr_call("agent", "get", agent_name)
             except Exception:
                 return False
             agent = _extract(payload, "agent")
-            if isinstance(agent, dict) and agent.get("status") == "working":
+            if isinstance(agent, dict) and (
+                agent.get("agent_status") or agent.get("status")
+            ) == "working":
                 return True
         return False
 
     def wait_for(budget_s: float) -> bool:
+        """Give the composer a budget, then read the meter — always read it.
+
+        The wait is a *delay*, never the observation. Returning on its failure
+        without reading is what made D9's distinction unreachable on the only
+        path that needs it: `agent wait --until working` raises whenever the
+        agent does not reach `working` inside the budget, which is precisely
+        the stalled-composer case *and* the fast-turn case, so every round
+        pressed Enter and looked at nothing. `readings` then stayed empty and
+        the caller reported "the meter could not be read" about a meter it had
+        never read after offering the prompt — deterministically, on every
+        attempt, until the node's whole launcher budget was gone.
+        """
         recovery_argv: List[str] = []
         for status in recovery_until:
             recovery_argv.extend(["--until", status])
@@ -1223,43 +1305,143 @@ def submit_agent_prompt(
         try:
             herdr_call(*argv, timeout=budget_s + 5.0)
         except Exception:
-            return False
+            pass
         return consumed()
 
-    argv = [
-        "agent",
-        "prompt",
-        target,
-        text,
-        "--wait",
-        *until_argv,
-        "--timeout",
-        str(int(total_s * 1000)),
-    ]
+    # Deliver the text and the Enter as two separate calls, never as
+    # `agent prompt`'s atomic text-plus-Enter.
+    #
+    # `agent prompt` submits the encoded Enter in the same breath as the text,
+    # and `@` opens the composer's file-path completion popup in both omp and
+    # Claude Code. While that popup is open it consumes Enter to accept a
+    # completion rather than to send the message, so the Enter is eaten and the
+    # prompt sits composed and unsent -- the 2026-08-27 stall, where a grok
+    # builder held `@<prompt>` for an hour and one Enter typed by hand started
+    # the turn at once.
+    #
+    # Measured against a live omp pane: `pane send-text` followed by a separate
+    # `pane send-keys enter` submits reliably, because the popup has settled
+    # before the Enter arrives. The same probe showed the pane revision sitting
+    # at 1 while the agent was demonstrably `Working`, which is why submission
+    # is proven from the transcript and never from the meter.
+    stalled = False
     try:
-        herdr_call(*argv, timeout=total_s + 5.0)
-        if consumed():
-            return
+        herdr_call("pane", "send-text", pane_id, text, timeout=total_s + 5.0)
     except Exception as exc:
+        # Only a stall falls through. Anything else -- a refused pane, a dead
+        # socket, a configuration error -- is a real failure about the launch
+        # and must propagate rather than be retried as if the composer had
+        # merely swallowed the text; retrying those burns the attempt budget
+        # against a condition no Enter can fix.
         if "agent_prompt_stalled" not in str(exc):
             raise
+        stalled = True
+    # Close the completion popup BEFORE offering the Enter.
+    #
+    # `@` opens omp's file-path completion popup and the popup keeps focus
+    # after the path is fully typed -- measured 2026-08-27 against a live omp
+    # composer, which rendered `hosts` / `hosts.equiv` under `@/etc/hosts` and
+    # then consumed the next Enter to accept a completion rather than to
+    # submit. The text stayed on screen, the pane revision did not move, and
+    # the turn never started: exactly run-faa4dc49's
+    # lane-routing-chemical-tests, whose composer held the prompt for minutes.
+    #
+    # The same probe showed `esc` closes the popup and leaves the composed
+    # text intact, after which a single Enter submits. So press it first and
+    # unconditionally: with no popup open `esc` is inert against a composer
+    # that is not mid-turn, and pressing it costs one keystroke against a
+    # failure that costs the whole attempt.
+    #
+    # Sending two Enters instead would also submit, but only by accident of
+    # the popup eating the first: against a route with no popup the second
+    # Enter lands on an empty composer as a stray blank turn.
+    #
+    # LET THE PASTE LAND FIRST. `send-text` returns when herdr has written the
+    # bytes to the terminal, NOT when the composer has taken them, and these
+    # three calls otherwise fire within milliseconds of each other. A Claude
+    # pane that has not committed the paste yet swallows the Enter and holds
+    # the text: measured 2026-08-27, where the identical sequence with ~2s
+    # between steps submitted on the first Enter (`status done`, revision
+    # 1 -> 2) while the back-to-back version left the same prompt composed and
+    # unsent, `0 tokens`, through every retry round. The wait is the fix; the
+    # keys were always right.
+    sleep(PASTE_SETTLE_S)
+    try:
+        herdr_call("pane", "send-keys", pane_id, "esc", timeout=30.0)
+    except Exception:
+        # A refused `esc` is not a failed submission. Fall through to the
+        # Enter, which is the thing that actually decides.
+        pass
+    sleep(PASTE_SETTLE_S)
+    try:
+        herdr_call("pane", "send-keys", pane_id, "enter", timeout=30.0)
+    except Exception:
+        stalled = True
+    # Read the meter whether or not the offer stalled. A stall is herdr saying
+    # it did not *observe* a lifecycle change inside its five-second floor,
+    # which is not a statement that the composer refused the text: an agent
+    # that accepts and finishes within that window stalls the wait and
+    # advances the revision all the same. Reading only on the success branch
+    # spent a recovery round on a prompt that had already landed — and, with
+    # the round's own read skipped too, left the whole call with no reading at
+    # all to reason from.
+    if consumed(revision_only=stalled):
+        return
 
     rounds = max(1, attempts)
     # Kept above herdr's own five-second lifecycle-observation floor, or the
     # verify degrades into a plain timeout that proves nothing.
     per_round = max(5.1, total_s / rounds)
     for round_no in range(rounds):
+        # Verify BEFORE pressing, never after.
+        #
+        # The loop pressed first and looked afterwards, which means every
+        # round typed a key into a pane that may already have been working:
+        # the transcript record this function proves submission from is
+        # written as the turn starts, so an agent that accepted the prompt on
+        # the previous key is still indistinguishable from a stalled one until
+        # someone waits and reads. Waiting first makes the extra Enter land
+        # only on a composer that has demonstrably done nothing, and a prompt
+        # that did go through costs zero further keystrokes.
+        if wait_for(per_round):
+            return
         try:
+            # NO `esc` here, ever. In omp `esc` is the interrupt key -- the
+            # composer renders `Working... <esc>` while a turn runs -- so an
+            # `esc` pressed after the prompt landed kills the turn it was
+            # meant to rescue. Pressing it every recovery round is what made
+            # run-c672e173's attempts 1 and 2 run nine turns each and then
+            # die `ENVIRONMENTAL` with the agent stopped mid-work.
+            #
+            # `esc` closes the completion popup exactly once, before the first
+            # Enter, at a moment when no turn can be running because nothing
+            # has been submitted yet. After that the only safe key is Enter.
             herdr_call("agent", "send-keys", target, "enter", timeout=30.0)
         except Exception:
             # A send-keys that fails on one round is not fatal: the pane may be
             # mid-repaint. Fall through to the verify, which is the thing that
             # actually decides.
             pass
-        if wait_for(per_round):
+        if consumed():
             return
         if round_no + 1 < rounds:
             sleep(0.5)
+    if submission_recorded is not None:
+        # The agent runtime writes the transcript record as the turn starts,
+        # which can trail the last Enter by a moment. Give it a bounded grace
+        # rather than reaping a pane that has in fact begun work.
+        grace_deadline = time.monotonic() + TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
+        while True:
+            if consumed():
+                return
+            if time.monotonic() >= grace_deadline:
+                break
+            sleep(0.1)
+        raise PromptNotSubmitted(
+            "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(
+                target, rounds
+            )
+        )
     if baseline is None or not readings:
         # Never a legible before/after pair, so there is no fact about the
         # prompt here at all -- only a fact about herdr. Transient by
@@ -1278,14 +1460,51 @@ def submit_agent_prompt(
 TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = 10.0
 
 
+def prompt_submission_marks(
+    handle: LaunchHandle, prompt_path: Path, *, chunk_size: int = 64 * 1024
+) -> int:
+    """How many times the actor transcript names this exact prompt submission.
+
+    A count rather than a boolean because one actor session is re-prompted
+    across a correction cycle, and a repair or re-review legitimately reuses
+    the same prompt path.  Presence would then be satisfied by the *previous*
+    turn's record the instant a new prompt was offered -- the same stale-proof
+    failure the pane revision has, one artifact over.  Callers snapshot the
+    count before offering and require it to rise.
+    """
+    transcript = handle.transcript_path
+    if transcript is None:
+        return 0
+    marker = ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
+    if chunk_size < len(marker):
+        chunk_size = len(marker)
+    total = 0
+    overlap = b""
+    try:
+        with Path(transcript).open("rb") as source:
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    return total
+                window = overlap + chunk
+                total += window.count(marker)
+                overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
+    except OSError:
+        return total
+
+
 def prompt_submission_recorded(
     handle: LaunchHandle, prompt_path: Path, *, chunk_size: int = 64 * 1024
 ) -> bool:
     """Whether the actor transcript durably names this exact prompt submission.
 
-    Herdr's revision advance proves a live submission to the caller, but that
-    proof disappears if the scheduler dies before its next SQLite write.  The
-    transcript's user-message record survives that gap.  Match the absolute
+    This is the authoritative proof of submission.  Herdr's revision advance
+    cannot serve as one -- the paste itself repaints the pane, so the counter
+    moves identically for a submitted turn and for a composer still holding the
+    text -- and any live signal would in any case disappear if the scheduler
+    died before its next SQLite write.  The transcript's user-message record
+    is written by the agent runtime only when a turn actually starts, and it
+    survives that gap.  Match the absolute
     ``@<path>`` bootstrap rather than pane text or a candidate label, and scan
     in bounded chunks so a long-lived reviewer session is not copied into
     memory merely to recover its latest dispatch.
@@ -1309,6 +1528,23 @@ def prompt_submission_recorded(
                 overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
     except OSError:
         return False
+
+
+def _rising_submission_record(
+    handle: LaunchHandle, prompt_path: Path
+) -> Callable[[], bool]:
+    """A predicate that turns true when THIS offer is recorded.
+
+    Snapshots the transcript's existing marker count now, so a reused prompt
+    path from a previous turn on the same actor cannot stand in as proof.
+    Missing transcript cannot prove a turn: the predicate stays false rather
+    than handing the caller a live-signal fallback. Paste-repaint moves the
+    pane revision whether the composer submitted or not (2026-08-27).
+    """
+    if handle.transcript_path is None:
+        return lambda: False
+    before = prompt_submission_marks(handle, prompt_path)
+    return lambda: prompt_submission_marks(handle, prompt_path) > before
 
 
 def wait_for_prompt_submission_record(
@@ -1683,7 +1919,15 @@ class HerdrLauncher:
                 "LAUNCH_REFUSED:{}".format(refusal[-400:]), herdr_error_code(refusal)
             )
         try:
-            payload = json.loads(result.stdout)
+            # A herdr verb that succeeds with nothing to say prints nothing at
+            # all: `pane send-text`, `pane send-keys`, and `agent send-keys`
+            # all exit 0 with empty stdout. Decoding that as JSON raises, so
+            # before this the two-call submission path -- the fix for the
+            # composer eating an atomic Enter -- refused every prompt with
+            # PROTOCOL_INVALID_JSON, retried as LAUNCHER_TRANSIENT, and burned
+            # the launcher budget without a single agent ever starting a turn.
+            # An exit-0 with no payload is a success carrying no payload.
+            payload = json.loads(result.stdout.strip() or "{}")
         except json.JSONDecodeError as exc:
             if _is_text_read(args):
                 return {"result": {"text": result.stdout or ""}}
@@ -2289,17 +2533,23 @@ class HerdrLauncher:
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 name,
             )
-            bootstrap = "@{0}".format(spec.prompt_path.resolve())
+            # The trailing space is load-bearing, not cosmetic. `@` opens the
+            # composer's file-path completion popup in both omp and Claude
+            # Code, and while that popup is open it consumes Enter to accept a
+            # completion instead of submitting the message -- so the Enter
+            # `agent prompt` sends atomically with the text is swallowed and
+            # the prompt sits on screen, composed and unsent. A space
+            # terminates the path token, which closes the popup, so the Enter
+            # reaches the composer. This is the 2026-08-27 stall: a grok
+            # builder held `@<prompt>` at revision 1 for an hour, and a single
+            # Enter typed by hand afterwards started the turn immediately.
+            bootstrap = "@{0} ".format(spec.prompt_path.resolve())
 
-            submit_agent_prompt(
-                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
-                pane_id,
-                bootstrap,
-                name,
-                timeout_s=60.0,
-                until=("working", "idle"),
-                working_proves=True,
-            )
+            # The rising transcript record is the only positive proof. Obtain
+            # it before offering so `_rising_submission_record` is a real
+            # predicate, not None. Submitting first left the 2026-08-27 grok
+            # builder at revision 1 with `@prompt` unsubmitted while
+            # `consumed()` returned True on the meter fallback.
             if transcript is None:
                 transcript = wait_for_agent_transcript(
                     lambda *args, **kwargs: self._herdr(
@@ -2316,6 +2566,22 @@ class HerdrLauncher:
                         self._tailers[spec.correlation_token] = TranscriptTailer(
                             transcript
                         )
+            if handle.transcript_path is None:
+                raise PromptSubmissionUnobservable(
+                    "AGENT_PROMPT_UNOBSERVED:{0} no transcript".format(name)
+                )
+            submit_agent_prompt(
+                lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
+                pane_id,
+                bootstrap,
+                name,
+                timeout_s=60.0,
+                until=("working", "idle"),
+                working_proves=True,
+                submission_recorded=_rising_submission_record(
+                    handle, spec.prompt_path
+                ),
+            )
 
             # The pane's foreground group is meaningful only after submission.
             liveness_pid = pane_liveness_pid(
@@ -2435,16 +2701,23 @@ class HerdrLauncher:
             ),
             handle.agent_name,
         )
+        if handle.transcript_path is None:
+            raise PromptSubmissionUnobservable(
+                "AGENT_PROMPT_UNOBSERVED:{0} no transcript".format(handle.agent_name)
+            )
         submit_agent_prompt(
             lambda *args, **kwargs: self._herdr(
                 *args, env=handle.environment, **kwargs
             ),
             handle.pane_id,
-            "@{}".format(prompt.resolve()),
+            # Trailing space closes the `@` completion popup so the Enter is
+            # not consumed by it -- see the bootstrap in `launch`.
+            "@{} ".format(prompt.resolve()),
             handle.agent_name,
             timeout_s=timeout_s,
             until=("working", "idle"),
             working_proves=True,
+            submission_recorded=_rising_submission_record(handle, prompt),
         )
         # A new prompt is a new turn. Any confirmation window still open from
         # the previous one measures a pane that has since been handed work,

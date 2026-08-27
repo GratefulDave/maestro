@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import code_review as cr
+from . import gate_capture
 from . import launcher as lch
 from . import lifecycle as lc
 from . import plan_model as pm
@@ -352,6 +353,20 @@ class SchedulerDeps:
     recover_node: Optional[
         Callable[[wt.AttemptWorktree, st.AttemptRecord], Optional[NodeExecution]]
     ] = None
+
+    #: The canonical bytes of the plan this run executes, retained on the run.
+    #:
+    #: The plan was the one artifact a run depended on that was referenced by
+    #: content and not *stored* by content — git holds every sha, the receipt
+    #: store holds every review digest, and `runs.plan_digest` resolved through
+    #: a file path that `plan ship` overwrites. Amending a plan therefore
+    #: destroyed the run's only handle on it and `_resolve_resume_target`
+    #: refused forever.
+    #:
+    #: `None` leaves the old behaviour untouched, which is what keeps every
+    #: caller that does not supply bytes — the offline suite included — working
+    #: exactly as before.
+    plan_bytes: Optional[bytes] = None
 
     #: §10.2's threshold for the ONE integration gate this run ends with
     #: (§8.8), taken from `merge_policy.integration_gate.min_cases`.
@@ -1119,6 +1134,19 @@ class Scheduler:
                     "resuming this one under different rules.".format(
                         self.run_id, pinned.value,
                         self.plan_test_strength_contract.value))
+        # Retain the plan bytes on the run, for a fresh run and a resumed one
+        # alike. Idempotent on the digest, so a resume re-asserting what it
+        # already runs costs nothing.
+        #
+        # The resumed case is not incidental: a run created before retention
+        # existed has no stored bytes, and this is where it acquires them —
+        # from the installed file that still matches its digest. That is the
+        # only window in which a legacy run becomes amendable, and it closes
+        # the moment somebody ships over that file.
+        if self.deps.plan_bytes is not None:
+            self.deps.store.record_plan_version(
+                self.run_id, self.plan_digest, self.deps.plan_bytes
+            )
         # This is intentionally also called for a new run.  It either inserts
         # the derived review plus rewired direct downstream edges, or validates
         # the exact durable row a prior scheduler process left behind.
@@ -2095,6 +2123,19 @@ class Scheduler:
             if existing.extra.get(lc.LATE_ENVELOPE_RECOVERY_KEY) is True:
                 self._recover_attempt_body(node, context, existing)
                 return
+        #: A `QUIESCENCE_UNPROVEN` block the resume boundary proved was written
+        #: over an attempt that never crossed dispatch. Both halves of that
+        #: proof are already durable by the time this reads the marker -- the
+        #: ledger's (`undispatched_quiescence_attempts`) and the runtime's, over
+        #: the paths only it can see -- so what is left here is not a decision
+        #: but its consequence: this generation is redispatched rather than
+        #: replaced. `_recover_attempt_body` is the wrong neighbour to reuse for
+        #: it; that one continues a builder that already produced something,
+        #: and this attempt produced nothing, which is precisely why it may run.
+        undispatched = (
+            existing is not None
+            and existing.extra.get(lc.UNDISPATCHED_RESUME_KEY) is True
+        )
 
         # A process failure may end the persistent scheduler while an immutable
         # candidate and rejected-review handoff remain inside this attempt.
@@ -2121,28 +2162,41 @@ class Scheduler:
             )
             self._recover_attempt_body(node, context, recovered, already_claimed=True)
             return
-        head = (
-            basis.integration_head
-            if basis is not None
-            else wt.integration_head(self.deps.repo, self.deps.integration_branch)
-        )
-        base = basis.base_sha if basis is not None else head
+        if undispatched and existing is not None:
+            # Its own recorded base, never the current integration head. The
+            # attempt is being continued, and an attempt's base is the one
+            # §7.6 opened its window on; re-deriving it here would silently
+            # rebase the same generation onto whatever merged since.
+            head = existing.integration_head
+            base = existing.base_sha
+            attempt_no = store.claim_undispatched_attempt(
+                self.run_id, node.node_id, existing.attempt_no
+            )
+        else:
+            head = (
+                basis.integration_head
+                if basis is not None
+                else wt.integration_head(self.deps.repo, self.deps.integration_branch)
+            )
+            base = basis.base_sha if basis is not None else head
 
-        # §7.6 — the window opens BEFORE the worktree exists, so a hung
-        # `git worktree add` is inside it rather than outside.
-        attempt_no = store.start_attempt(
-            self.run_id,
-            node.node_id,
-            base,
-            attempt_extra=(rp.repair_extra(basis) if basis is not None else None),
-            detail={
-                "repair": (
-                    "durable-rejected-candidate"
-                    if basis is not None
-                    else "fresh-attempt"
-                )
-            },
-        )
+            # §7.6 — the window opens BEFORE the worktree exists, so a hung
+            # `git worktree add` is inside it rather than outside.
+            attempt_no = store.start_attempt(
+                self.run_id,
+                node.node_id,
+                base,
+                attempt_extra=(
+                    rp.repair_extra(basis) if basis is not None else None
+                ),
+                detail={
+                    "repair": (
+                        "durable-rejected-candidate"
+                        if basis is not None
+                        else "fresh-attempt"
+                    )
+                },
+            )
         with self._lock:
             # Recorded against the durable row as soon as it exists, and
             # before anything can observe the attempt RUNNING: leased by this
@@ -2164,14 +2218,36 @@ class Scheduler:
                 record,
             )
 
-        attempt = wt.create_attempt_worktree(
-            self.deps.repo,
-            self.run_id,
-            node.node_id,
-            attempt_no,
-            base,
-            Path(self.deps.worktrees_root),
-            Path(self.deps.scratch_root),
+        # The same generation keeps the same checkout when §8.8's cleanup has
+        # not already taken it. Reopening is not an optimisation: the branch
+        # `create_attempt_worktree` would cut already exists under that name,
+        # and its collision guard is the branch creation itself.
+        attempt = (
+            wt.reopen_attempt_worktree(
+                self.deps.repo,
+                self.run_id,
+                node.node_id,
+                attempt_no,
+                base,
+                Path(self.deps.worktrees_root),
+                Path(self.deps.scratch_root),
+            )
+            if undispatched
+            and wt.attempt_worktree_exists(
+                Path(self.deps.worktrees_root),
+                self.run_id,
+                node.node_id,
+                attempt_no,
+            )
+            else wt.create_attempt_worktree(
+                self.deps.repo,
+                self.run_id,
+                node.node_id,
+                attempt_no,
+                base,
+                Path(self.deps.worktrees_root),
+                Path(self.deps.scratch_root),
+            )
         )
         with self._lock:
             self._attempt_worktrees[node.node_id] = attempt
@@ -3014,6 +3090,58 @@ class Scheduler:
                     tc.PairingRefusal.UNREADABLE, str(exc),
                     retry_class=st.RetryClass.ENVIRONMENTAL)
             collected = runner.collect(attempt.path, declared)
+            # Every counted case must be one the *accepted* test bytes define.
+            # The candidate's own tree is not consulted for this: the forgery
+            # this refuses runs at collection time and leaves the test file
+            # byte-identical, so `compare_test_bytes` above passes truthfully
+            # and the counting rule counts five cases that really did run --
+            # three of them written by the code being gated (§16.3 item 8,
+            # measured on `lane-routing-chemical` a3). Reading the accepted
+            # blob from git and comparing names here is the one place the
+            # process that would have to lie is not the process running the
+            # tests.
+            for declared_path in declared:
+                accepted_bytes = tc._blob_at(
+                    Path(attempt.repo), accepted.candidate_sha, declared_path)
+                if accepted_bytes is None:
+                    continue
+                try:
+                    strays = gate_capture.unexpected_cases(
+                        accepted_bytes.decode("utf-8", "replace"), collected)
+                except gate_capture.GateCaptureRefusal as exc:
+                    return self._pairing_refused(
+                        tc.PairingRefusal.UNREADABLE, str(exc),
+                        retry_class=st.RetryClass.ENVIRONMENTAL)
+                if strays:
+                    return self._pairing_refused(
+                        tc.PairingRefusal.GATE_NOT_GREEN,
+                        "{0}: {1} counted case(s) the accepted test candidate "
+                        "{2} does not define: {3}".format(
+                            gate_capture.CASE_NOT_IN_ACCEPTED_TESTS,
+                            len(strays), accepted.candidate_sha[:12],
+                            ", ".join(strays)))
+                # The root cause, refused before the builder is blamed for it.
+                # A build lane carries the accepted test bytes verbatim, so the
+                # collectable case count is fixed before it starts; a gate
+                # demanding more than the reviewed tests define is unsatisfiable
+                # by construction and every honest attempt fails it forever.
+                # That is the condition that produced the forgery above, not a
+                # separate problem: `lane-routing-chemical` was told to reach 5
+                # against a test candidate defining 2.
+                shortfall = gate_capture.unsatisfiable_min_cases(
+                    accepted_bytes.decode("utf-8", "replace"),
+                    node.gate_min_cases)
+                if shortfall:
+                    return self._pairing_refused(
+                        tc.PairingRefusal.GATE_NOT_GREEN,
+                        "{0}: {1} demands min_cases={2} but the accepted test "
+                        "candidate {3} defines {4} case(s) and this node may "
+                        "not change them -- no honest attempt can pass".format(
+                            gate_capture.MIN_CASES_UNSATISFIABLE,
+                            node.node_id, node.gate_min_cases,
+                            accepted.candidate_sha[:12],
+                            node.gate_min_cases - shortfall),
+                        retry_class=st.RetryClass.ENVIRONMENTAL)
             positive = runner.run(attempt.path, collected)
             coverage = tc.measure_coverage(
                 strength.coverage, positive, tc.PASSED)
@@ -3092,7 +3220,8 @@ class Scheduler:
             uncontracted = tc.GateStrengthEvidence(
                 tests_node_id=node.node_id, candidate_sha=output_sha,
                 runner=runner_name, selector=selector,
-                contract_declared=False)
+                contract_declared=False,
+                gate_min_cases=node.gate_min_cases)
             self._record_strength_evidence(
                 node, output_sha, runner_name, selector, uncontracted)
             return tc.verify_test_strength(uncontracted)
@@ -3161,6 +3290,7 @@ class Scheduler:
             new_nodeids=tuple(new),
             coverage=coverage,
             falsifiability=falsifiability,
+            gate_min_cases=node.gate_min_cases,
         )
         self._record_strength_evidence(
             node, output_sha, runner_name, selector, evidence)
@@ -3496,18 +3626,29 @@ class Scheduler:
             ceiling = rp.launcher_retry_budget(self.config, launcher_failure)
         else:
             ceiling = self.config.environmental_retries
-        budget_spends = (
-            self.deps.store.current_lane_retry_spends(
-                self.run_id, node.node_id, limit=10_000
-            )
-            if retry_class
-            in (
-                st.LaneRetryClass.ENVIRONMENTAL,
-                st.LaneRetryClass.LAUNCHER_TRANSIENT,
-            )
-            else self.deps.store.lane_retry_spends(
-                self.run_id, node.node_id, limit=10_000
-            )
+        # Every refreshable class reads the **floored** view, and there is no
+        # longer an exception to it.
+        #
+        # This used to be a conditional: environmental and launcher spends were
+        # counted from `lane_retry_spend_floor`, and SEMANTIC, REVIEW_REJECTION
+        # and TEST_REVIEW_REJECTION were counted from the beginning of the
+        # lane's life. That was coherent while a resume refreshed only the two
+        # infrastructure classes -- an unfloored read of a budget no boundary
+        # ever moved is just a total. It stopped being coherent the moment
+        # `_RESUME_REFRESHED_BLOCK_REASONS` grew the semantic ceiling and the
+        # bounded review ceiling: `resume_run` raised the floor, this read
+        # ignored it, and the lane re-blocked on its next spend against every
+        # cycle the boundary had already forgiven.
+        #
+        # It shipped inert for exactly that reason, and the shape of the miss is
+        # worth keeping: the *attempt* budget (`attempts_spent`, floored on
+        # `node_lifecycle.retry_spend_floor`) did honour the boundary, so tests
+        # written against that accounting passed while this one stayed broken.
+        # Two budgets, one boundary, and only one of them was reading it.
+        # Production receipt: floor raised to 12 at 06:43:15,
+        # `blocked:SEMANTIC_BUDGET_EXHAUSTED` at 06:43:28.
+        budget_spends = self.deps.store.current_lane_retry_spends(
+            self.run_id, node.node_id, limit=10_000
         )
         spent = sum(item.retry_class is retry_class for item in budget_spends)
         if retry_class in (

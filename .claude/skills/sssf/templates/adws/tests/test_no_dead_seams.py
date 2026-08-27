@@ -65,6 +65,63 @@ ADWS = Path(__file__).resolve().parent.parent
 #: legal. `DEFERRED:` marks a known defect with an owner and an audit row, not
 #: an accepted state — deleting the line is part of landing the fix.
 ALLOWED: Dict[str, str] = {
+    # ── the hidden-tests containment prerequisite ───────────────────────────
+    # DEFERRED, and deferred with a named successor rather than suppressed:
+    # these are the landed half of `test_visibility: hidden`. The half that
+    # calls them -- the composed evaluation tree, the absence/provenance/
+    # coverage conjuncts, the sanitised repair handoff -- is not built, so
+    # `maestro-plan.v5` is deliberately absent from
+    # `maestro._RUNNABLE_PLAN_SCHEMA_VERSIONS` and no run can reach a hidden
+    # node. Containment was landed first because `docs/hidden-tests-design.md`
+    # §9's verdict is that the feature is not worth building until it is
+    # proven, and proving it is regression 7. Delete these five lines in the
+    # change that makes v5 runnable; a caller arrives with it.
+    "hidden_vault.attempt_repository": "DEFERRED: hidden-tests step 2 is the caller; v5 is unrunnable until then",
+    "hidden_vault.blob_id_in": "DEFERRED: hidden-tests step 2 is the caller; v5 is unrunnable until then",
+    "hidden_vault.object_is_absent": "DEFERRED: containment assertion; hidden-tests step 2 is the caller",
+    "hidden_vault.unreachable_from": "DEFERRED: containment assertion; hidden-tests step 2 is the caller",
+    # Pre-existing, and surfaced rather than introduced by the v5 tests: the
+    # registry accessor had no test reference before, so nothing was looking.
+    # Production dispatches through `_PARSERS` directly.
+    "plan_model.registered_versions": "accessor over the parser registry; production dispatches through _PARSERS",
+    # ── gate capture (§16.3 item 8, measured on lane-routing-chemical a3) ────
+    # `unexpected_cases` IS wired -- the pairing check calls it, which is what
+    # closes the class. These two are not, and each says why.
+    #
+    # DEFERRED: `scan_delta` is the early-refusal sweep over a candidate's
+    # non-test source. It is defence in depth rather than the repair, and
+    # `tests/test_gate_capture.py::ThePatternSweepIsNotSufficient` asserts its
+    # insufficiency on purpose, so wiring it is a separate decision about how
+    # loudly to refuse rather than about whether the hole is closed. Its caller
+    # belongs at the §8.3 permission chokepoint where a delta's paths and bytes
+    # are already in hand.
+    "gate_capture.scan_delta": "DEFERRED: early-refusal sweep; the provenance check is the repair and is wired",
+    # ── plan amendment: the store half, landed ahead of its wiring ───────────
+    # DEFERRED with a named successor. These are the durable half of amending a
+    # run's plan without discarding merged work: retained plan bytes, the
+    # lineage, and the guarded `dag_nodes` writer. The caller is the maestro
+    # side — `record_plan_version` at `run start`, `current_plan` in
+    # `_resume_run_selection`, and a `run amend` verb running
+    # `plan_amendment.classify` before `amend_run_plan`.
+    #
+    # They are landed first and unwired on purpose: the `dag_nodes` write is
+    # §19 M42's shape and was the part worth proving before anything could
+    # reach it. Nothing behaves differently while these have no caller, which
+    # is what makes the half-landing safe rather than the half-built path the
+    # brief warned against. Delete these four lines with the wiring.
+    # `record_plan_version`, `current_plan` and `amend_run_plan` were listed
+    # here while the store half was landed ahead of its wiring. All three now
+    # have production callers -- `Scheduler.project`, `_resolve_resume_target`
+    # and `_run_amend` -- and this check convicted the stale entries the moment
+    # they did, which is the allowlist working rather than a nuisance.
+    #
+    # `plan_versions` is the lineage reader and genuinely has no consumer yet.
+    # DEFERRED with a named successor: an operator surface that prints which
+    # plan versions a run has executed under, beside the nodes that merged in
+    # each. Delete this line with that reader; do not delete the method, since
+    # the rows it reads are written and an audit needs a way to see them.
+    "lifecycle.plan_versions": "DEFERRED: lineage reader; its operator surface (`run status` plan history) is not built",
+    "lifecycle.review_refresh_count": "operator accessor over the §3.6 A9 allowance; the resume transaction uses the unserialized _review_refresh_count",
     # ── §1.2's detectors ────────────────────────────────────────────────────
     # Their job is to convict a planted violation from a test. Production never
     # calls a detector; a detector production called would be a linter.

@@ -44,6 +44,7 @@ from adw_modules import participant
 from adw_modules import plan_author
 from adw_modules import plan_contract_ingress
 from adw_modules import runner_resolution
+from adw_modules import plan_amendment
 from adw_modules import plan_digest
 from adw_modules import plan_model
 from adw_modules import plan_validate as pv
@@ -198,6 +199,58 @@ def _construct_unique_mapping(loader, node, deep=False):
 _StrictYamlLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
 )
+
+
+
+def _omp_profile_default_model(route: str, profile: Optional[str]) -> str:
+    """The model an `omp --profile <name>` launch will actually run.
+
+    omp keeps it in the profile's own config as `defaultModel`, which is the
+    single source of truth for that launch -- nothing on the command line can
+    override it, because `build_omp_argv` passes no model at all. Reading it
+    here lets a lane be declared the way it is actually run, as a profile and
+    nothing more.
+    """
+    if route != "omp" or not profile:
+        raise _MaestroConfigurationError(
+            "tester.model is required unless the lane is route omp with a profile"
+        )
+    config = (
+        Path.home() / ".omp" / "profiles" / profile / "agent" / "config.yml"
+    )
+    try:
+        raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+    except OSError as exc:
+        raise _MaestroConfigurationError(
+            "tester.profile {!r} has no readable omp config at {}".format(
+                profile, config
+            )
+        ) from exc
+    found = _find_default_model(raw)
+    if not found:
+        raise _MaestroConfigurationError(
+            "omp profile {!r} declares no defaultModel in {}; give the lane an "
+            "explicit model:".format(profile, config)
+        )
+    return found
+
+
+def _find_default_model(node: object) -> str:
+    """`defaultModel` wherever the profile nests it."""
+    if isinstance(node, dict):
+        value = node.get("defaultModel")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        for child in node.values():
+            found = _find_default_model(child)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = _find_default_model(child)
+            if found:
+                return found
+    return ""
 
 
 def _config_mapping(value, label, required, optional=()):
@@ -913,21 +966,44 @@ def _load_maestro_layout(repo: Path, config_path: Path) -> Dict[str, Any]:
 
     tester = None
     if "tester" in root:
+        # `model` and `effort` are OPTIONAL on an omp lane that names a
+        # profile, because omp does not accept either one.
+        # `launcher.build_omp_argv` sends `--profile` and `--session-dir` and
+        # nothing else: the profile owns the model, and demanding a `model:`
+        # key here made the config state a fact the launcher never uses --
+        # then refused the run when that unused string failed to resolve
+        # (run-6357251adc7d41dc9b2a72645f778c9c, seven attempts, zero turns,
+        # on `deepseek/deepseek-v4-flash:auto`).
+        #
+        # The string is still needed for ONE thing: B13 reads the model's
+        # context window to prove the handoff fits. So when the config omits
+        # it, take it from the profile's own `defaultModel` -- the same model
+        # omp will actually run -- rather than making the operator restate it.
         tester_raw = _config_mapping(
             root["tester"],
             "tester",
-            ("route", "model", "effort"),
-            ("profile", "vendor"),
+            ("route",),
+            ("model", "effort", "profile", "vendor"),
         )
+        tester_profile = (
+            _config_string(tester_raw["profile"], "tester.profile")
+            if "profile" in tester_raw
+            else None
+        )
+        tester_route = _config_string(tester_raw["route"], "tester.route")
+        if "model" in tester_raw:
+            tester_model = _config_string(tester_raw["model"], "tester.model")
+        else:
+            tester_model = _omp_profile_default_model(tester_route, tester_profile)
         tester = {
-            "route": _config_string(tester_raw["route"], "tester.route"),
-            "model": _config_string(tester_raw["model"], "tester.model"),
-            "effort": _config_string(tester_raw["effort"], "tester.effort"),
-            "profile": (
-                _config_string(tester_raw["profile"], "tester.profile")
-                if "profile" in tester_raw
-                else None
+            "route": tester_route,
+            "model": tester_model,
+            "effort": (
+                _config_string(tester_raw["effort"], "tester.effort")
+                if "effort" in tester_raw
+                else ""
             ),
+            "profile": tester_profile,
             "vendor": (
                 _config_string(tester_raw["vendor"], "tester.vendor")
                 if "vendor" in tester_raw
@@ -1576,6 +1652,24 @@ def _select_run(
     return records[0]
 
 
+def _retained_plan_path(config: Dict[str, Any], run_id: str, digest: str) -> Path:
+    """Where a run's own retained plan bytes are materialised for execution.
+
+    Under the run's state directory rather than beside the installed plans:
+    these bytes belong to one run and must not be mistaken for, or overwritten
+    by, anything `plan ship` manages. Named by digest so a run that has amended
+    its plan keeps every version it executed under on disk beside the ledger
+    rows that record them.
+
+    The file is a *rendering* of the durable record, never the record itself —
+    `run_plan_versions` holds the bytes, and this is recreated from them
+    whenever it is missing or does not hash to the digest it claims.
+    """
+    return (
+        Path(config["data_dir"]) / "runs" / run_id / "plans" / "{0}.json".format(digest)
+    )
+
+
 def _resolve_resume_target(
     args: argparse.Namespace, config: Dict[str, Any]
 ) -> Tuple[str, Path]:
@@ -1592,8 +1686,25 @@ def _resolve_resume_target(
     reader = _open_reader(config["database"])
     try:
         record = _select_run(reader, args)
+        retained = reader.current_plan(record.run_id)
     finally:
         reader.close()
+    if retained is not None:
+        # The run kept its own plan bytes, so nothing on disk needs to match.
+        # This does not relax the rule below — it removes the reason for it.
+        # The refusal exists so a resume cannot silently run *different* bytes;
+        # reading the run's own retained record satisfies that more directly
+        # than searching for a file that happens to hash the same, and it holds
+        # after `plan ship` has overwritten the file the run started from.
+        digest, stored = retained
+        materialised = _retained_plan_path(config, record.run_id, digest)
+        materialised.parent.mkdir(parents=True, exist_ok=True)
+        if (
+            not materialised.is_file()
+            or plan_digest.digest_of(materialised.read_bytes()) != digest
+        ):
+            materialised.write_bytes(stored)
+        return record.run_id, materialised
     for name, digest in args.plan_digests.items():
         if digest == record.plan_digest:
             return record.run_id, _named_plan_file(config, name)
@@ -3667,6 +3778,11 @@ def _load_runnable_plan(args: argparse.Namespace) -> plan_model.Plan:
                 args.digest, receipt.verdict.value
             ),
         )
+    # The exact bytes this run executes, carried forward to be retained on the
+    # run itself. Taken here rather than re-read later because these are the
+    # bytes that were validated as canonical and whose digest the PASS receipt
+    # above covers -- a second read could pick up a file edited in between.
+    args.plan_bytes = stored
     return plan_model.parse_bytes(stored)
 
 
@@ -4218,6 +4334,87 @@ def _route_context_window(route: str, model_spec: str) -> Optional[int]:
             )
         ) from exc
     return agent_pi.context_window(provider, model_id)
+
+
+#: Paths inside an attempt's scratch that only a dispatched attempt creates.
+#: The prompt is written immediately before the launch and the envelope is the
+#: agent's own declaration, so either one present means the handoff was made.
+_DISPATCH_RESIDUE_FILES: Tuple[str, ...] = (
+    "agent-prompt.txt",
+    "agent-envelope.json",
+    "repair-prompt.md",
+    "repair-acknowledgement.json",
+)
+
+
+def _undispatched_attempt_residue(
+    args: argparse.Namespace, store: Any, node_id: str, attempt_no: int
+) -> Tuple[str, ...]:
+    """Everything the runtime can find that a never-dispatched attempt cannot have.
+
+    The ledger's half of this proof is `undispatched_quiescence_attempts`, and
+    it is a statement about rows. This is the half over the paths the runtime
+    owns and the ledger cannot see, and it is deliberately a *finder* rather
+    than a predicate: an attempt that fails it stays blocked and the operator
+    is told which artefact refused it, instead of being told "ineligible".
+
+    Empty means proven clean. Anything else means the attempt is not provably
+    undispatched, whatever the rows say, and it keeps its block.
+    """
+    residue: List[str] = []
+    scratch = Path(args.scratch_root) / worktree.worktree_dirname(
+        args.run_id, node_id, attempt_no
+    )
+    for name in _DISPATCH_RESIDUE_FILES:
+        if (scratch / name).exists():
+            residue.append(name)
+    session_dir = scratch / "session"
+    if session_dir.is_dir() and any(session_dir.iterdir()):
+        # A route writes its transcript here, and it does so on launch. A
+        # directory that exists but is empty is the launch environment's own
+        # skeleton, which `worktree.launch_env` makes before any dispatch.
+        residue.append("session/")
+    if not worktree.attempt_worktree_exists(
+        Path(args.worktrees_root), args.run_id, node_id, attempt_no
+    ):
+        # §8.8's cleanup already took it. Nothing to measure and nothing that
+        # could hold output; the durable half already showed none was recorded.
+        return tuple(residue)
+    try:
+        record = store.get_attempt(args.run_id, node_id, attempt_no)
+        reopened = worktree.reopen_attempt_worktree(
+            Path(args.repo),
+            args.run_id,
+            node_id,
+            attempt_no,
+            record.base_sha,
+            Path(args.worktrees_root),
+            Path(args.scratch_root),
+        )
+        identity = worktree.check_at_create(reopened)
+        if not identity.ok:
+            residue.append("worktree identity: " + "; ".join(identity.detail))
+            return tuple(residue)
+        baseline = store.attempt_baseline(args.run_id, node_id, attempt_no)
+    except lc.BaselineUnrecorded:
+        # The bracket never opened, so there is no before-side to measure this
+        # checkout against, and a bare `git status` cannot tell a provisioned
+        # path from a produced one. Unmeasurable is not clean.
+        residue.append("worktree present with no recorded baseline")
+        return tuple(residue)
+    except (lc.LifecycleError, worktree.WorktreeError) as exc:
+        residue.append("{0}: {1}".format(type(exc).__name__, exc))
+        return tuple(residue)
+    # The bracket's own comparison, against the bracket's own before-side.
+    # A provisioned path the baseline already measured is not output; a path
+    # whose tuple diverges is, whatever it is called (§8.3).
+    verdict = worktree.compare_to_expected(reopened.path, baseline, "report")
+    if not verdict.clean:
+        residue.extend(
+            "worktree {0}: {1}".format(divergence.kind, divergence.path)
+            for divergence in verdict.divergences[:5]
+        )
+    return tuple(residue)
 
 
 def _clear_stale_reviewer_report(report_path: Path) -> None:
@@ -5120,6 +5317,32 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         progress.__enter__()
         handles = {}
         proven_absent = set()
+        #: `(node_id, attempt_no)` for every attempt this process has leased
+        #: and for which it has **not yet entered** the one call that can
+        #: create a pane or a process. The front-side twin of `proven_absent`,
+        #: and the same kind of fact: positive knowledge recorded by the frame
+        #: that holds it, never a default inferred from a missing handle.
+        #:
+        #: `handles` is populated only after a launch has succeeded, so every
+        #: failure raised inside `run_node` before that call arrives at
+        #: `quiesce_attempt` with no handle. Without this set the quiescer
+        #: could only answer `PROCESS_GROUP_UNTRACKED` -- "absence unproven" --
+        #: about a process group that was never created, and the scheduler
+        #: turns that answer into a terminal `QUIESCENCE_UNPROVEN` that buries
+        #: the failure which actually happened. That is not hypothetical: it
+        #: blocked `lane-routing-chemical-tests` in
+        #: run-8d1a71f463e4430f92a125a8f8b3731d over a B13 refusal
+        #: (`HandoffTooLarge`, an unresolvable lane model) raised two
+        #: statements before the launch.
+        #:
+        #: `scheduler._launch_left_nothing_to_reap` covers one exception type
+        #: -- a typed `LaunchFailed` that reports `pane_created` false -- and
+        #: deliberately no others (§16.3 item 45). This covers the other half
+        #: of the same shape structurally: every pre-dispatch exit, of every
+        #: exception type, for every node kind. A key is discarded at the
+        #: launch call and never after it, so a launch that creates something
+        #: and then fails is outside the exemption and still owes the proof.
+        undispatched = set()
         handles_lock = RLock()
         # The integration checkout this invocation added, and nothing else. The
         # refusal below returns while another worktree still holds the branch, and
@@ -5129,6 +5352,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         try:
             late_envelope_recovery = []
             proven_late_envelope_recovery = []
+            undispatched_resume = []
             if resuming:
                 # A completed interactive declaration belongs to its original
                 # generation. Validate every durable input, then either prove
@@ -5136,9 +5360,29 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # completed builder must advance to review without relaunching
                 # the build; an unknown actor identity still leaves the run
                 # unchanged.
+                durable_undispatched = set(
+                    store.undispatched_quiescence_attempts(args.run_id)
+                )
                 for node_id, attempt_no in store.quiescence_blocked_attempts(
                     args.run_id
                 ):
+                    if (node_id, attempt_no) in durable_undispatched:
+                        # Asked before any liveness probe, because a probe over
+                        # a correlation token no launch ever created answers
+                        # about nothing -- which is the same mistake, one layer
+                        # up, as the quiescer that wrote this block.
+                        residue = _undispatched_attempt_residue(
+                            args, store, node_id, attempt_no
+                        )
+                        if residue:
+                            run_console.print(
+                                "[yellow]{0} attempt {1} stays blocked: {2}[/yellow]".format(
+                                    node_id, attempt_no, "; ".join(residue)
+                                )
+                            )
+                            continue
+                        undispatched_resume.append((node_id, attempt_no))
+                        continue
                     if node_id not in interactive_node_ids:
                         continue
                     token = "{}-{}-{}".format(args.run_id, node_id, attempt_no)
@@ -5353,6 +5597,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 store.resume_run(
                     args.run_id,
                     late_envelope_attempts=proven_late_envelope_recovery,
+                    undispatched_attempts=undispatched_resume,
                 )
                 for node_id, attempt_no in late_envelope_recovery:
                     store.prepare_late_envelope_recovery(
@@ -5428,10 +5673,20 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 attempt, node, record, retry_prompt, on_launch, cancel_requested
             ):
                 key = (node.node_id, record.attempt_no)
+                with handles_lock:
+                    # Before the first statement that can raise, so no
+                    # pre-dispatch failure can outrun the fact that this frame
+                    # has created nothing yet.
+                    undispatched.add(key)
                 launch_environment = worktree.launch_env(
                     attempt.scratch, concurrency=getattr(args, "concurrency", None)
                 )
                 if node.kind is scheduler_types.NodeKind.CODE:
+                    with handles_lock:
+                        # The chokepoint for a code node. Cleared before the
+                        # call, never after: a `Popen` that starts a process
+                        # and then raises has left a group to reap.
+                        undispatched.discard(key)
                     process = subprocess.Popen(
                         node.command,
                         cwd=attempt.path,
@@ -5483,37 +5738,45 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # goal, so it is strictly larger. Same chokepoint as before.
                 _preflight_prompt(prompt_text, lane_route, lane_model)
                 prompt.write_text(prompt_text, encoding="utf-8")
-                handle = _typed_launch_pane(
-                    route_runner,
-                    launcher.LaunchSpec(
-                        correlation_token="{}-{}-{}".format(
-                            args.run_id, node.node_id, record.attempt_no
-                        ),
-                        worktree=attempt.path,
-                        prompt_path=prompt,
-                        envelope_path=envelope,
-                        route=lane_route,
-                        model=lane_model,
-                        effort=lane_effort,
-                        profile=lane_profile,
-                        session_dir=attempt.scratch / "session",
-                        context_window_tokens=_route_context_window(
-                            lane_route, lane_model
-                        ),
-                        workspace_label=workspace_label,
-                        lane_key=lane_placement[node.node_id],
-                        lane_label=lane_placement[node.node_id],
-                        pane_role=(
-                            "tester"
-                            if node.kind is scheduler_types.NodeKind.TESTS
-                            else "builder"
-                        ),
-                        attempt_no=record.attempt_no,
-                        pane_group_size=3,
-                        restrict_tools=getattr(args, "restrict_actor_tools", False),
-                        environment=launch_environment,
+                # Bound to a name rather than passed inline so the chokepoint
+                # is one statement. `_route_context_window` resolves a lane
+                # model through its route's catalog and raises when it does not
+                # resolve, and as an inline argument that raise happened
+                # *between* the mark being cleared and the launch being
+                # entered -- inside the window the mark exists to describe, and
+                # therefore invisible to it.
+                spec = launcher.LaunchSpec(
+                    correlation_token="{}-{}-{}".format(
+                        args.run_id, node.node_id, record.attempt_no
                     ),
+                    worktree=attempt.path,
+                    prompt_path=prompt,
+                    envelope_path=envelope,
+                    route=lane_route,
+                    model=lane_model,
+                    effort=lane_effort,
+                    profile=lane_profile,
+                    session_dir=attempt.scratch / "session",
+                    context_window_tokens=_route_context_window(
+                        lane_route, lane_model
+                    ),
+                    workspace_label=workspace_label,
+                    lane_key=lane_placement[node.node_id],
+                    lane_label=lane_placement[node.node_id],
+                    pane_role=(
+                        "tester"
+                        if node.kind is scheduler_types.NodeKind.TESTS
+                        else "builder"
+                    ),
+                    attempt_no=record.attempt_no,
+                    pane_group_size=3,
+                    restrict_tools=getattr(args, "restrict_actor_tools", False),
+                    environment=launch_environment,
                 )
+                with handles_lock:
+                    # The one call that can open a pane for this attempt.
+                    undispatched.discard(key)
+                handle = _typed_launch_pane(route_runner, spec)
                 with handles_lock:
                     handles[key] = handle
                     proven_absent.discard(key)
@@ -5572,6 +5835,17 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     handle = handles.get(key)
                     if handle is None:
                         if phase == "pre-baseline":
+                            return
+                        if key in undispatched:
+                            # Absent by construction, for any phase: this
+                            # process leased the attempt and has not entered
+                            # the call that could have created anything for
+                            # it. Answering `PROCESS_GROUP_UNTRACKED` here
+                            # reports "absence unproven" about a group that
+                            # provably does not exist, and the scheduler
+                            # blocks the node terminally on that answer --
+                            # destroying the pre-dispatch failure that caused
+                            # the quiesce in the first place.
                             return
                         raise RuntimeError(
                             "PROCESS_GROUP_UNTRACKED:{}:{}#{}".format(
@@ -5964,6 +6238,16 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 recover_node=_late_agent_execution,
                 run_gate=run_gate,
                 run_integration_gate=run_integration_gate,
+                # The bytes this run executes, retained on the run itself so a
+                # later `plan ship` over the installed file cannot leave it
+                # unresumable. Read from the plan file the run is actually
+                # about to execute, which is the same bytes `_load_runnable_
+                # plan` validated and whose digest the receipt covers.
+                # `None` when the plan did not come through
+                # `_load_runnable_plan` -- an offline harness or a test double
+                # constructing deps directly -- and retention is then skipped,
+                # which is the same no-op a run predating the table sees.
+                plan_bytes=getattr(args, "plan_bytes", None),
                 # The revert target for a `controlled_mutation` negative
                 # control. Carried from the plan the run is executing, so a
                 # control reverts to the state the plan declared as its
@@ -7380,6 +7664,124 @@ def _run_cancel(args: argparse.Namespace) -> int:
         return 0
     finally:
         store.close()
+
+
+def _run_amend(args: argparse.Namespace) -> int:
+    """Adopt corrected plan bytes on a run in flight, keeping its merged work.
+
+    The verb exists because a plan defect found mid-run used to cost every
+    merged node: the run's plan was identified by the digest of a *file*, so
+    `plan ship` correcting it made the run unresumable, and the only escape was
+    abandoning it. `run_plan_versions` retains the bytes; this decides whether
+    the new ones may be adopted over them.
+
+    Amendment is its own verb rather than a flag on `resume`, and that is what
+    keeps `resume` a bare single command. An operator amending a plan is making
+    a decision about already-accepted work and should have to say so; an
+    operator resuming is not, and should not have to acknowledge anything. The
+    typed `plan-amended` transition is the record of the first, so §1.2 holds
+    without a re-approval dance.
+    """
+    amended = _load_runnable_plan(args)
+    reader = _open_reader(args.db)
+    try:
+        record = _select_run(reader, args)
+        retained = reader.current_plan(record.run_id)
+        states = {row.node_id: row.state for row in reader.nodes(record.run_id)}
+    finally:
+        reader.close()
+
+    if retained is None:
+        return _refusal(
+            "RUN_PLAN_NOT_RETAINED",
+            "{0} was created before its plan bytes were retained, so there is "
+            "nothing to amend from. Resume it once against the plan file it "
+            "still matches and the bytes are captured, or start a fresh run."
+            .format(record.run_id),
+        )
+    current_digest, current_bytes = retained
+    if current_digest == args.digest:
+        return _refusal(
+            "RUN_PLAN_UNCHANGED",
+            "{0} already executes {1}".format(record.run_id, args.digest[:12]),
+        )
+
+    current = plan_model.parse_bytes(current_bytes)
+    code, payload = _adjudicate_amendment(
+        args.db,
+        record.run_id,
+        states,
+        current.to_plan_nodes(),
+        amended.to_plan_nodes(),
+        args.digest,
+        args.plan_bytes,
+        current_merge_policy=current.merge_policy,
+        amended_merge_policy=amended.merge_policy,
+        current_schema=current.schema_version,
+        amended_schema=amended.schema_version,
+    )
+    print(json.dumps(payload, sort_keys=True))
+    return code
+
+
+def _adjudicate_amendment(
+    db_path,
+    run_id: str,
+    states,
+    current_nodes,
+    amended_nodes,
+    digest: str,
+    plan_bytes: bytes,
+    *,
+    current_merge_policy=None,
+    amended_merge_policy=None,
+    current_schema=None,
+    amended_schema=None,
+):
+    """Decide and apply an amendment, returning `(exit_code, payload)`.
+
+    Split from `_run_amend` so the decision is reachable without plan files,
+    receipts and a configured installation — the shell above it binds those and
+    does nothing else. That split is not tidiness: the first version of this
+    verb read `args.database`, a name nothing binds, and would have raised
+    `AttributeError` on its first real invocation. Nothing exercised it,
+    because exercising it meant standing up the whole plan apparatus. A verb
+    whose body cannot be reached by a test is a verb nobody has run.
+    """
+    verdict = plan_amendment.classify(
+        current_nodes,
+        amended_nodes,
+        states,
+        current_merge_policy=current_merge_policy,
+        amended_merge_policy=amended_merge_policy,
+        current_schema=current_schema,
+        amended_schema=amended_schema,
+    )
+    if not verdict.amendable:
+        return 3, {
+            "outcome": "RUN_PLAN_AMENDMENT_REFUSED",
+            "run_id": run_id,
+            **verdict.as_mapping(),
+        }
+
+    amended_by_id = {node.node_id: node for node in amended_nodes}
+    updates = {node_id: amended_by_id[node_id] for node_id in verdict.changed}
+    additions = [amended_by_id[node_id] for node_id in verdict.added]
+    store = lc.LifecycleStore(Path(db_path))
+    try:
+        seq = store.amend_run_plan(
+            run_id, digest, plan_bytes, updates, additions,
+            transfers=verdict.transfers,
+        )
+    finally:
+        store.close()
+    return 0, {
+        "outcome": "RUN_PLAN_AMENDED",
+        "run_id": run_id,
+        "plan_digest": digest,
+        "version": seq,
+        **verdict.as_mapping(),
+    }
 
 
 def _run_resume(args: argparse.Namespace) -> int:
@@ -9538,6 +9940,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_db(cancel)
     cancel.set_defaults(handler=_run_cancel)
+    # Amendment takes the *amended* plan by name in the positional, so the
+    # ordinary plan-resolution path binds it, and names the run it applies to
+    # with a flag. Resume is the mirror image and deliberately stays bare.
+    amend = run_sub.add_parser("amend")
+    _add_run_execution_options(amend)
+    amend.add_argument("plan_name")
+    amend.add_argument("--run", dest="selector", metavar="PLAN_OR_RUN_ID",
+                       required=True)
+    amend.set_defaults(handler=_run_amend)
     resume = run_sub.add_parser("resume")
     resume.add_argument("selector", metavar="PLAN_OR_RUN_ID")
     resume.add_argument("--digest")

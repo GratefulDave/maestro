@@ -336,6 +336,13 @@ def _refused(code: TestsRefusal, detail: str, *,
 # did, and this module counts them.
 
 
+#: `GateStrengthEvidence.gate_min_cases` when the caller stated no threshold.
+#: Zero rather than `None` so the field stays an `int` and lands in the ledger
+#: row as a number a query can filter on: `gate_min_cases = 0` is the durable,
+#: greppable evidence that a call site never passed the node's threshold.
+UNSTATED_GATE_FLOOR = 0
+
+
 class StrengthRefusal(str, Enum):
     """Typed reasons a test candidate fails its declared strength contract.
 
@@ -358,6 +365,12 @@ class StrengthRefusal(str, Enum):
     CONTROL_NOT_ISOLATED = "TEST_STRENGTH_CONTROL_NOT_ISOLATED"
     CONTROL_UNEXECUTABLE = "TEST_STRENGTH_CONTROL_UNEXECUTABLE"
     RUNNER_UNSUPPORTED = "TEST_STRENGTH_RUNNER_UNSUPPORTED"
+    #: The candidate discriminates and still cannot supply the threshold its
+    #: paired builder will be judged on. Not a statement about the tests —
+    #: they may be excellent — but about the pair: accepting these bytes
+    #: freezes the collectable count below `min_cases`, and every builder
+    #: dispatched afterwards faces a gate no correct attempt can pass.
+    GATE_FLOOR_UNREACHABLE = "TEST_STRENGTH_GATE_FLOOR_UNREACHABLE"
 
 
 #: The four statuses a single executed case can land in. `errored` is kept
@@ -1118,6 +1131,49 @@ class GateStrengthEvidence:
     coverage: CoverageMeasurement = field(default_factory=CoverageMeasurement)
     falsifiability: FalsifiabilityResult = field(
         default_factory=FalsifiabilityResult)
+    #: The threshold the paired builder will be judged on, from the node's own
+    #: `gate_min_cases`. Compared against the count these bytes actually
+    #: collect, which is the whole point: accepting this candidate **freezes**
+    #: that count, because `compare_test_bytes` makes the builder carry these
+    #: bytes verbatim. A gate above it is unsatisfiable by construction from
+    #: this moment on, and every builder dispatched against it afterwards is
+    #: dispatched against a gate no correct attempt can pass.
+    #:
+    #: `run-8d1a71f463e4430f92a125a8f8b3731d` is the recorded cost: a merged
+    #: two-case file under a five-case gate, four builders, all four forging
+    #: the gate rather than failing.
+    #:
+    #: `UNSTATED` is the default so that adding this field could not, by
+    #: itself, break a construction that predates it. It is deliberately not
+    #: a silent pass: it lands in `as_mapping()` and therefore in the ledger
+    #: row, where a `gate_min_cases` of zero is visible evidence that a caller
+    #: never stated the threshold, and
+    #: `tests/test_gate_floor_supplied.py` fails if either scheduler call site
+    #: stops passing it. §3.6 B8 is why that guard exists: a field added later
+    #: is optional forever unless something refuses the absence.
+    gate_min_cases: int = UNSTATED_GATE_FLOOR
+
+    @property
+    def collected_case_count(self) -> int:
+        """Distinct cases these bytes collect — the frozen supply.
+
+        Distinct, because a node id is unique per run under both supported
+        runners, so a repeat can only be a measurement artefact and counting
+        it twice would report supply that does not exist.
+        """
+        return len(set(self.executed_nodeids))
+
+    @property
+    def gate_floor_reachable(self) -> bool:
+        """Whether the frozen supply reaches the threshold, or is unasked.
+
+        An `UNSTATED` threshold answers True. That is the compatibility arm
+        and not a judgment: nothing was compared, so nothing was refused, and
+        the zero in the ledger row is what says so.
+        """
+        if self.gate_min_cases <= UNSTATED_GATE_FLOOR:
+            return True
+        return self.collected_case_count >= self.gate_min_cases
 
     @property
     def refusal(self) -> Optional[str]:
@@ -1136,6 +1192,12 @@ class GateStrengthEvidence:
             return named
         if not self.falsifiability.proven:
             return StrengthRefusal.CONTROL_UNEXECUTABLE.value
+        # Last, and deliberately so. This candidate's tests are strong by
+        # every measure above; what is wrong is the *pair*. Reporting it
+        # ahead of a coverage or control refusal would bury the more
+        # actionable defect under one about a sibling's threshold.
+        if not self.gate_floor_reachable:
+            return StrengthRefusal.GATE_FLOOR_UNREACHABLE.value
         return None
 
     @property
@@ -1153,6 +1215,9 @@ class GateStrengthEvidence:
             "new_nodeids": list(self.new_nodeids),
             "coverage": self.coverage.as_mapping(),
             "falsifiability": self.falsifiability.as_mapping(),
+            "gate_min_cases": self.gate_min_cases,
+            "collected_case_count": self.collected_case_count,
+            "gate_floor_reachable": self.gate_floor_reachable,
             "refusal": self.refusal,
             "strong": self.strong,
         }
@@ -1184,6 +1249,18 @@ def verify_test_strength(evidence: GateStrengthEvidence
             StrengthRefusal.CONTROL_UNEXECUTABLE.value,
             "the declared negative control was not executed, so nothing "
             "proves these cases can fail")
+    if not evidence.gate_floor_reachable:
+        return _strength_refused(
+            StrengthRefusal.GATE_FLOOR_UNREACHABLE.value,
+            "these bytes collect {0} case(s) and the gate this pair is judged "
+            "on declares min_cases={1}. Accepting them freezes the count at "
+            "{0}, because the build node must carry them verbatim, so no "
+            "correct implementation could pass that gate. Add {2} more "
+            "case(s) to {3}, or re-ship the plan with a lower min_cases; do "
+            "not accept and let a builder discover it".format(
+                evidence.collected_case_count, evidence.gate_min_cases,
+                evidence.gate_min_cases - evidence.collected_case_count,
+                evidence.tests_node_id))
     return vf.VerificationVerdict(verified=True)
 
 

@@ -112,6 +112,20 @@ SCHEMA_V3 = "maestro-plan.v3"
 #: contract, and the remedy is to re-ship the plan, never to edit it.
 SCHEMA_V4 = "maestro-plan.v4"
 
+#: `maestro-plan.v5` — a tests node declares whether its files reach the
+#: builders its cases judge (`test_visibility`).
+#:
+#: A new version rather than an optional field on `TestsNodeV4`, for the reason
+#: v4 itself gives: an optional visibility is a visibility nothing declared, and
+#: "merged" would then be indistinguishable from "the author never decided".
+#:
+#: **v4 stays registered and stays runnable, and that is a requirement rather
+#: than a courtesy.** Dropping a shipped version is what made deployments' plans
+#: unrunnable with `RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE` (#104), repairable only
+#: by re-shipping from the IR and not repairable at all mid-run. A v4 plan
+#: projects to `VISIBILITY_MERGED` and behaves exactly as it did.
+SCHEMA_V5 = "maestro-plan.v5"
+
 #: The closed set of gate runners. §6.2 deleted the plain-argv arm for agent
 #: nodes: an exit-code-only gate cannot satisfy the counting rule.
 RUNNERS = ("pytest", "vitest")
@@ -690,10 +704,27 @@ class TestsNodeV4(TestsNode):
     test_strength: TestStrength
 
 
+class TestsNodeV5(TestsNodeV4):
+    """A tests node that declares whether builders may read it.
+
+    Subclasses `TestsNodeV4` for the reason that one subclasses `TestsNode`:
+    v5's obligations *are* v4's obligations plus one required field. Required,
+    not defaulted — a defaulted visibility could not tell an author who chose
+    `merged` apart from an author who had never heard of the choice, and that
+    distinction is the only thing the version string is here to record.
+    """
+
+    model_config = _STRICT
+
+    test_visibility: Literal["merged", "hidden"]
+
+
 Node = Annotated[Union[AgentNode, CodeNode], Field(discriminator="kind")]
 V3Node = Annotated[Union[AgentNode, CodeNode, TestsNode],
                    Field(discriminator="kind")]
 V4Node = Annotated[Union[AgentNode, CodeNode, TestsNodeV4],
+                   Field(discriminator="kind")]
+V5Node = Annotated[Union[AgentNode, CodeNode, TestsNodeV5],
                    Field(discriminator="kind")]
 
 
@@ -846,6 +877,11 @@ class Plan(BaseModel):
                     # contract would be indistinguishable downstream from an
                     # authored one, which is §19 M26's shape.
                     test_strength=getattr(node, "test_strength", None),
+                    # Carried the same way and defaulted the same way: a v3 or
+                    # v4 node declares no visibility, and `merged` is what it
+                    # has always meant rather than a decision invented here.
+                    test_visibility=getattr(
+                        node, "test_visibility", st.VISIBILITY_MERGED),
                     effects=tuple(node.effects), **common)
             else:
                 result = st.PlanNode(
@@ -919,6 +955,23 @@ class PlanV4(Plan):
 
     schema_version: Literal["maestro-plan.v4"]
     nodes: Tuple[V4Node, ...]  # type: ignore[assignment]
+
+
+class PlanV5(Plan):
+    """`maestro-plan.v5`. Its `tests` nodes declare a visibility.
+
+    v4 stays frozen and, unlike a version this project has dropped before,
+    stays *runnable*: its `nodes` union carries `TestsNodeV4`, which forbids
+    extras, so a v5 tests node cannot parse as a v4 one and a v4 plan cannot
+    acquire a visibility by being re-read under this class. A v4 run therefore
+    keeps behaving exactly as it did, which is what stops this change from
+    doing to shipped plans what #104 did.
+    """
+
+    model_config = _STRICT
+
+    schema_version: Literal["maestro-plan.v5"]
+    nodes: Tuple[V5Node, ...]  # type: ignore[assignment]
 
 
 # ── the projection is total, or it raises (§6.2, §3.6 B15) ─────────────────
@@ -1075,6 +1128,7 @@ register_parser(SCHEMA_V1, Plan)
 register_parser(SCHEMA_V2, PlanV2)
 register_parser(SCHEMA_V3, PlanV3)
 register_parser(SCHEMA_V4, PlanV4)
+register_parser(SCHEMA_V5, PlanV5)
 
 
 def _pointer(loc: Sequence[Any]) -> str:

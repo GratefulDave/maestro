@@ -1047,7 +1047,7 @@ class AuthorTurnEnvironmentTest(unittest.TestCase):
                 self.assertTrue(Path(path).is_relative_to(session_root), key)
                 self.assertFalse(Path(path).is_relative_to(repo), key)
             self.assertEqual(
-                Path(pane_env["XDG_CACHE_HOME"]).parent,
+                Path(pane_env["TMPDIR"]).parent,
                 spec.session_dir.with_name(spec.session_dir.name + ".scratch"))
 
 

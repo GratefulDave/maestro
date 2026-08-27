@@ -259,7 +259,6 @@ class CacheRedirection(WorktreeTestCase):
         attempt = _attempt(self.repo, self.root)
         env = wt.scratch_env(attempt.scratch)
         for key in (
-            "XDG_CACHE_HOME",
             "TMPDIR",
             "PYTHONPYCACHEPREFIX",
             "PYTEST_ADDOPTS",
@@ -288,7 +287,7 @@ class CacheRedirection(WorktreeTestCase):
         attempt = _attempt(self.repo, self.root)
         script = (
             "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
-            "('XDG_CACHE_HOME', 'TMPDIR', 'PYTHONPYCACHEPREFIX', 'PYTEST_ADDOPTS')}))"
+            "('TMPDIR', 'PYTHONPYCACHEPREFIX', 'PYTEST_ADDOPTS')}))"
         )
         gate = wt.run_node_gate(
             attempt,
@@ -318,7 +317,9 @@ class CacheRedirection(WorktreeTestCase):
         script = (
             "import os, pathlib\n"
             "pathlib.Path(os.environ['TMPDIR'], 'gate-temp').write_text('t')\n"
-            "pathlib.Path(os.environ['XDG_CACHE_HOME'], 'gate-cache').write_text('c')\n"
+            "cache = pathlib.Path(os.environ['RUFF_CACHE_DIR'])\n"
+            "cache.mkdir(parents=True, exist_ok=True)\n"
+            "(cache / 'gate-cache').write_text('c')\n"
         )
         baseline = wt.take_baseline(attempt)
         gate = wt.run_node_gate(
@@ -333,7 +334,7 @@ class CacheRedirection(WorktreeTestCase):
             wt.delta(baseline, wt.inventory(attempt.path)), wt.InventoryDelta()
         )
         self.assertTrue((attempt.scratch / "tmp" / "gate-temp").is_file())
-        self.assertTrue((attempt.scratch / "xdg" / "gate-cache").is_file())
+        self.assertTrue((attempt.scratch / "ruff" / "gate-cache").is_file())
 
     def test_a_byproduct_with_nowhere_to_redirect_still_convicts(self):
         """§8.3's preference order, third arm: redirect; failing that, suppress;
@@ -1167,6 +1168,116 @@ class MergeAndAcceptance(WorktreeTestCase):
         self.assertFalse(attempt.path.exists())
         self.assertNotIn(
             attempt.branch, _git(self.repo, "branch", "--list", attempt.branch)
+        )
+
+
+# ── the environment contract, pinned in both directions ─────────────────────
+
+
+class ScratchEnvironmentContract(WorktreeTestCase):
+    """Which variables §8.3 redirects, and the one it must not.
+
+    Recorded failure, 2026-08-27, run-8d1a71f463e4430f92a125a8f8b3731d.
+    `XDG_CACHE_HOME` was redirected into a fresh per-attempt scratch like the
+    others. A pane is forked by the herdr server and builds its environment
+    from a *login shell*, and the login shell on the machine that recorded the
+    incident reads its credentials through that variable --
+    `${XDG_CACHE_HOME:-$HOME/.cache}/keychain-secrets.zsh` is what exports the
+    provider API keys. Redirected, that path did not exist, no keys were
+    exported, and every tester attempt launched an agent reporting `no-model`
+    whose composer would not accept a prompt. Twelve launcher attempts,
+    identical message, seventy-five seconds each.
+
+    The distinction the six survivors share and this one never had: they name
+    places a tool *writes*, so redirecting them moves output out of the
+    measured worktree. `XDG_CACHE_HOME` also names a place tools *read*, so
+    redirecting it hides input -- and nothing under `~/.cache` was ever inside
+    a worktree, so the fence never covered it in the first place.
+
+    Both directions are pinned below, because the failure is silent in both:
+    a variable that reappears here relaunches the incident, and a variable
+    that quietly leaves stops redirecting a byproduct nobody will notice until
+    it convicts a node.
+    """
+
+    #: The six, named here rather than imported, so a change to the production
+    #: tuple has to be restated deliberately in a test that says why.
+    REDIRECTED = (
+        "TMPDIR",
+        "PYTHONPYCACHEPREFIX",
+        "PYTEST_ADDOPTS",
+        "COVERAGE_FILE",
+        "RUFF_CACHE_DIR",
+        "npm_config_cache",
+    )
+
+    def test_the_redirected_set_is_exactly_these_six(self):
+        attempt = _attempt(self.repo, self.root)
+        self.assertEqual(set(wt.scratch_env(attempt.scratch)), set(self.REDIRECTED))
+        self.assertEqual(set(launcher.SCRATCH_ENV_KEYS), set(self.REDIRECTED))
+
+    def test_xdg_cache_home_is_redirected_by_neither_surface(self):
+        """The incident, as a standing assertion. Adding it back to either
+        set alone would also trip the equality check below, but adding it to
+        both would not -- so it is named."""
+        attempt = _attempt(self.repo, self.root)
+        self.assertNotIn("XDG_CACHE_HOME", wt.scratch_env(attempt.scratch))
+        self.assertNotIn("XDG_CACHE_HOME", launcher.SCRATCH_ENV_KEYS)
+
+    def test_the_two_surfaces_stay_the_same_set(self):
+        """A variable redirected for the gates and not the pane is honoured by
+        one and ignored by the other -- the asymmetry that convicted a node on
+        2026-08-17. This is why the removal had to happen on both sides."""
+        attempt = _attempt(self.repo, self.root)
+        self.assertEqual(
+            set(wt.scratch_env(attempt.scratch)), set(launcher.SCRATCH_ENV_KEYS)
+        )
+
+    def test_the_pane_carries_no_xdg_flag(self):
+        """What actually crosses the socket. The pane's whole environment
+        contribution from this harness is these flags, so an `--env
+        XDG_CACHE_HOME=` here is the credential bootstrap being overwritten."""
+        attempt = _attempt(self.repo, self.root)
+        flags = launcher.pane_env_flags(wt.launch_env(attempt.scratch))
+        self.assertFalse(
+            [flag for flag in flags if flag.startswith("XDG_CACHE_HOME=")], flags
+        )
+        assigned = {flag.split("=", 1)[0] for flag in flags if flag != "--env"}
+        self.assertEqual(assigned, set(self.REDIRECTED))
+
+    def test_an_operator_xdg_cache_home_survives_untouched(self):
+        """The positive form: the pane inherits the shell's own value, which
+        is the one its credential bootstrap is keyed on."""
+        attempt = _attempt(self.repo, self.root)
+        env = wt.launch_env(
+            attempt.scratch, base={"XDG_CACHE_HOME": "/operator/cache"}
+        )
+        self.assertEqual(env["XDG_CACHE_HOME"], "/operator/cache")
+
+    def test_every_surviving_redirection_still_points_inside_the_scratch(self):
+        """The fence still holds over what it covers; only its reach changed."""
+        attempt = _attempt(self.repo, self.root)
+        env = wt.scratch_env(attempt.scratch)
+        for key, value in env.items():
+            target = (
+                value.split("cache_dir=", 1)[1].split()[0]
+                if key == "PYTEST_ADDOPTS"
+                else value
+            )
+            self.assertTrue(
+                Path(target).is_relative_to(attempt.scratch), "{}={}".format(key, value)
+            )
+
+    def test_the_pane_flags_still_fail_closed_on_a_missing_redirection(self):
+        """Narrowing the set must not narrow the refusal: an incomplete
+        redirection is still refused before herdr is called at all."""
+        attempt = _attempt(self.repo, self.root)
+        env = dict(wt.launch_env(attempt.scratch))
+        env.pop("TMPDIR")
+        with self.assertRaises(launcher.LaunchRefused) as caught:
+            launcher.pane_env_flags(env)
+        self.assertIs(
+            caught.exception.refusal, launcher.LaunchRefusal.SCRATCH_REDIRECT_MISSING
         )
 
 

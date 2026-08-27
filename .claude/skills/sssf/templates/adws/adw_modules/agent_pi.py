@@ -93,6 +93,27 @@ def resolve_model(pattern: str) -> tuple[str, str]:
     ``openai-codex/gpt-5.6-terra`` without re-registering built-in models.
     """
     listed = [(provider, model_id) for provider, model_id, _ in catalog()]
+    # omp routing suffixes are not catalog entries.
+    #
+    # A profile picks its own model and may append a routing alias:
+    # `~/.omp/profiles/deepseek/agent/config.yml` sets
+    # `defaultModel: deepseek/deepseek-v4-flash:auto`, and `:auto` asks omp to
+    # pick a route at call time. The catalog enumerates the model
+    # (`deepseek/deepseek-v4-flash`) and some concrete aliases (`:free`), but
+    # never `:auto`, so resolving the profile's own string raised
+    # `model pattern ... not found in `omp models`` -- which B13 reports as
+    # HandoffTooLarge, because a model whose window cannot be read cannot be
+    # shown to fit one. run-6357251adc7d41dc9b2a72645f778c9c spent all seven
+    # attempts there at zero turns, having launched no agent at all.
+    #
+    # The suffix selects a route, not a context window, so the window to
+    # measure against is the base model's. Strip it and resolve the base.
+    if ":" in pattern:
+        base, _, suffix = pattern.rpartition(":")
+        if base and (base, suffix) not in (
+            (provider, model_id.split("/", 1)[-1]) for provider, model_id in listed
+        ) and not any(model_id.endswith(":" + suffix) for _, model_id in listed):
+            pattern = base
     if "/" in pattern:
         provider, model_id = pattern.split("/", 1)
         if (provider, model_id) in listed:

@@ -696,11 +696,23 @@ class ReviewKindTests(unittest.TestCase):
 
 
 class CeilingProbe:
-    """A `Scheduler` reduced to the durable same-session budget seam."""
+    """A `Scheduler` reduced to the durable same-session budget seam.
 
-    def __init__(self, cfg, attempts=(), granted=0, lane_spends=()):
+    `floor` models `lane_retry_spend_floor`: the cycle count a boundary has
+    already forgiven, so `current_lane_retry_spends` is the tail past it. It is
+    modelled rather than aliased to the full list on purpose — this fake is the
+    reason a real defect survived. `_lane_retry` read the *unfloored* spends for
+    SEMANTIC and both review classes, so a resumed lane re-blocked against
+    cycles the boundary had forgiven, and every test here passed throughout
+    because a stub that returns one list for both readers cannot tell the two
+    apart. The executed proof over a real `LifecycleStore` lives in
+    `tests/test_resume_refreshes_semantic_budget.py::TheLaneBudgetActuallyHonoursTheFloor`.
+    """
+
+    def __init__(self, cfg, attempts=(), granted=0, lane_spends=(), floor=0):
         self.run_id = "run1"
         self.config = cfg
+        self.floor = floor
         self.lane_spends = list(lane_spends)
 
         def spend_lane_retry(_run_id, _node_id, retry_class, **_kwargs):
@@ -715,6 +727,9 @@ class CeilingProbe:
                 ),
                 lane_retry_spends=lambda run_id, node_id, limit: tuple(
                     self.lane_spends
+                ),
+                current_lane_retry_spends=lambda run_id, node_id, limit: tuple(
+                    self.lane_spends[self.floor :]
                 ),
                 spend_lane_retry=spend_lane_retry,
             )

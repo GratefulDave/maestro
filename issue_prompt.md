@@ -8,8 +8,8 @@ Two actors do the work, in separate Herdr panes bound to the same worktree:
 
 | Actor | Launch | Role |
 | --- | --- | --- |
-| **builder** | `omp --pm-profile grok` | Resolves issues. Never reviews its own output. |
-| **reviewer** | `omp --pm-profile openai-performance` | Reviews the merged surface. Never edits code. |
+| **builder** | `omp --profile grok` | Resolves issues. Never reviews its own output. |
+| **reviewer** | `omp --profile openai-performance` | Reviews the merged surface. Never edits code. |
 
 The loop is: builder fixes → writes a typed report → reviewer reads the diff and the report
 → writes a typed verdict → builder reads the verdict and fixes what FAILed → repeat.
@@ -83,14 +83,14 @@ Builder:
 ```
 herdr pane split --cwd "$WT" --direction right --no-focus
 # note the pane id it returns, then:
-herdr pane run <builder_pane> omp --pm-profile grok --session-dir "$WT/.sweep/builder-session" @"$WT/.sweep/builder-prompt.md"
+herdr pane run <builder_pane> omp --profile grok --session-dir "$WT/.sweep/builder-session" @"$WT/.sweep/builder-prompt.md"
 ```
 
 Reviewer:
 
 ```
 herdr pane split --cwd "$WT" --direction down --no-focus
-herdr pane run <reviewer_pane> omp --pm-profile openai-performance --session-dir "$WT/.sweep/reviewer-session" @"$WT/.sweep/reviewer-prompt.md"
+herdr pane run <reviewer_pane> omp --profile openai-performance --session-dir "$WT/.sweep/reviewer-session" @"$WT/.sweep/reviewer-prompt.md"
 ```
 
 The trailing `@<path>` is omp's `MESSAGES` positional and is how the prompt is delivered.

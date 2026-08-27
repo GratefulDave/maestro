@@ -1272,6 +1272,11 @@ class OperatorCliTest(unittest.TestCase):
             store.quiescence_blocked_attempts.return_value = (("code", 1),)
             store.running_attempts.return_value = ()
             store.retry_budget_blocked_attempts.return_value = ()
+            # The ledger cannot show this generation never crossed dispatch,
+            # so no same-attempt recovery authority is derived for it and the
+            # block is carried into `resume_run` untouched. Empty here is the
+            # assertion, not the stub: the call below names it.
+            store.undispatched_quiescence_attempts.return_value = ()
             store.resume_run.side_effect = ResumeReached
             output = io.StringIO()
             with (
@@ -1293,7 +1298,9 @@ class OperatorCliTest(unittest.TestCase):
         self.assertEqual(
             json.loads(output.getvalue())["outcome"], "RUN_EXECUTION_FAILED"
         )
-        store.resume_run.assert_called_once_with("run-1", late_envelope_attempts=[])
+        store.resume_run.assert_called_once_with(
+            "run-1", late_envelope_attempts=[], undispatched_attempts=[]
+        )
         store.retry.assert_not_called()
         runtime_launcher.assert_not_called()
 
