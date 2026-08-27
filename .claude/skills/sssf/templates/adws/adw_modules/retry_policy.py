@@ -882,6 +882,7 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     ]
     if g.reason:
         lines.append(g.reason)
+        lines.extend(_remediation_lines(g.reason))
     if g.offending_paths:
         lines.extend(_offending_path_lines(g.offending_paths))
     if g.unreferenced_symbols:
@@ -891,6 +892,53 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
         + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)")
     )
     return lines
+
+
+
+#: Refusal codes whose remedy is not derivable from the refusal text.
+#:
+#: A typed verdict says WHAT was wrong and is deliberately silent on what to
+#: do instead -- correctly, because a refusal is evidence and a remedy is
+#: advice. But nothing else in the retry loop supplies the advice: the
+#: guidance is assembled from ledger items by string concatenation, and a
+#: reviewer never sees a candidate that died in verification. So a node that
+#: cannot infer the remedy from the verdict re-reads the same words and
+#: re-makes the same mistake until its budget is gone -- observed 2026-08-27
+#: on `lane-routing-chemical-tests`, where attempts a2 and a3 produced
+#: BYTE-IDENTICAL refusals and a4 was dispatched with the same prompt again.
+#:
+#: These lines are deterministic text keyed on the typed code, not a model's
+#: opinion, so nothing here can decide a transition (§1.2).
+
+
+def _remediation_lines(reason: str) -> List[str]:
+    """Advice for the refusals whose remedy the verdict does not imply."""
+    if "TEST_STRENGTH_CONTROL_WRONG_REASON" not in reason:
+        return []
+    lowered = reason.lower()
+    if not any(
+        crash in lowered
+        for crash in ("modulenotfounderror", "importerror", "attributeerror")
+    ):
+        return []
+    return [
+        "How to reconcile this: the cases DO fail at the parent, but they "
+        "fail by crashing on a missing import rather than by asserting. An "
+        "import of a module the parent does not have raises before any "
+        "assertion runs, so the failure cannot carry the declared reason.",
+        "Catch the import inside the case body and assert on the result, so "
+        "the case is still red at the parent and red FOR THE DECLARED "
+        "REASON. Keep the import inside the body -- at module scope it makes "
+        "the file uncollectable, which is not a satisfying red:",
+        "    def test_<name>():",
+        "        try:",
+        "            from <module> import <symbol>",
+        "        except ModuleNotFoundError:",
+        "            <symbol> = None",
+        "        assert <symbol> is not None, \"<text matching the declared "
+        "reason>\"",
+        "        # ... then the real behavioural assertions",
+    ]
 
 
 def _review_lines(g: ReviewGuidance) -> List[str]:

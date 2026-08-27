@@ -19,7 +19,7 @@ Starting from Maestro’s current SSSF fork, design the smallest robust software
 3. isolate every work node in its own Git worktree and merge completed work deterministically;
 4. launch every agent node in a visible **Herdr** pane through an explicit launcher abstraction:
    - Claude directly;
-   - OMP only with explicit `--pm-profile`;
+   - OMP only with explicit `--profile`;
    - Kimi and Grok only through explicit configured routes;
 5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session retries, and SQLite trace.
 
@@ -322,7 +322,7 @@ Fable must verify each and either preserve it or explicitly reject it:
 - merge success requires Git ancestry, not only tests;
 - all tests use fake launchers/Herdr seams, never real agents;
 - Claude launches directly;
-- OMP receives exactly configured `--pm-profile`;
+- OMP receives exactly configured `--profile`;
 - dependency readiness and merge order are deterministic;
 - current and future evidence are different types.
 
@@ -453,7 +453,7 @@ Required routes:
 
 ### OMP
 
-- exact `--pm-profile <profile>` from config;
+- exact `--profile <profile>` from config;
 - no default/fallback profile;
 - exact argv/session/readiness/failure behavior.
 

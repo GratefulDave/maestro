@@ -1837,12 +1837,20 @@ class CancellationTests(unittest.TestCase):
                 store.candidate_review("run1", "build::review", candidate_sha)
             )
 
-            store.resume_run("run1")
-            still_blocked = store.get_node("run1", "build")
-            self.assertIs(still_blocked.state, st.NodeState.BLOCKED)
-            self.assertEqual(still_blocked.attempt_no, 1)
-            self.assertEqual(len(store.attempts_for("run1", "build")), 1)
-
+            # A plain `store.resume_run("run1")` used to be asserted here to
+            # leave the node BLOCKED, because a review-budget block was
+            # deliberately excluded from the resume refresh. That exclusion is
+            # gone: a resume now refreshes the review ceiling like any other
+            # budget, bounded per run by `RESUME_REVIEW_REFRESH_CEILING` (§3.6
+            # A9). The assertion was removed rather than adapted because a
+            # plain resume reopening the node is now the correct behaviour and
+            # there is nothing left for it to distinguish here.
+            #
+            # What this test still owns is the rest: a grant alone does not
+            # reopen the lane, and the late-envelope route reuses attempt 1 and
+            # lands in REPAIRING rather than minting a new attempt. The ceiling
+            # itself, and the fact that the recovery route below is not subject
+            # to it, are proven in `test_resume_refreshes_review_budget.py`.
             store.resume_run("run1", late_envelope_attempts=(("build", 1),))
 
             resumed = store.get_node("run1", "build")

@@ -7,6 +7,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Cold-boot admission and prompt submission no longer key on the pane meter.**
+  `pane send-text` / `send-keys` empty stdout is success (`{}`), not
+  `PROTOCOL_INVALID_JSON`. Claude's revision never moves: proof is a rising
+  transcript record, with typed `agent_status` (not `status`) as fallback.
+  Admission uses `FIRST_PROMPT` and never prepends `/team`. Paste settles
+  (`PASTE_SETTLE_S`) before Enter, because `send-text` returns when herdr
+  writes bytes, not when the composer takes them. A paste-repaint that
+  advances the pane revision is not submission. Launch refuses rather than
+  offering when no transcript path appears. OMP `--profile` replaces
+  `--pm-profile`.
+- **`SEMANTIC_BUDGET_EXHAUSTED` resumes with a spend floor, not a grant.**
+  Bare `run resume` joins that reason to `_RESUME_REFRESHED_BLOCK_REASONS`.
+  `Scheduler._lane_retry` reads floored lane spends. A review-budget grant
+  still stays `BLOCKED` until absence-proven resume.
+- **`maestro run amend` adopts corrected plan bytes on a live run.**
+  `LifecycleStore` records `run_plan_versions`. Amendment is its own verb.
+- **`maestro-plan.v5` declares `test_visibility` (`merged`|`hidden`) and is
+  not runnable.** Hidden attempts live in `hidden_vault.py` (separate bare
+  repo). Composed hidden gates, receipts, and the run pin are not built.
+  `plan_validate` refuses a gate floor the paired tests cannot supply.
+- **Docs HTML is maestro-dark** (`paper` `#2d3142`, `ink` `#f5f5f5`, `accent`
+  `#f08a59`). Architecture diagrams match the working-tree runtime: `run amend`,
+  v5-unrunnable, vault object-DB isolation, semantic-ceiling resume vs
+  review-budget grant, transcript submission proof.
+
 - **A review-budget grant preserves the blocked attempt.** Semantic `--force` /
   `--grant N` still move the node to `PENDING`. A `REVIEW_BUDGET_EXHAUSTED`
   grant writes `granted_extra_attempts` and a durable recovery marker, and

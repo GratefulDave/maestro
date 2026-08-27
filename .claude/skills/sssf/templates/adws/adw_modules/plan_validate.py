@@ -35,6 +35,14 @@ and §6.4 fixes both:
   nothing to do. Every other gate is checked for the collection count as
   stated. Both arms require a selector to exist at all.
 
+  The produced arm's exemption is exactly right and exactly incomplete, and
+  `GATE_FLOOR_SUPPLIED` is the half it cannot reach. "How many cases exist at
+  base" is necessarily zero for a path the plan is about to create; "how many
+  cases does this plan **guarantee** will exist" is a different quantity, and
+  where the selector's whole supply comes from tests nodes it is decidable
+  from the authored bytes. `run-8d1a71f463e4430f92a125a8f8b3731d` is what the
+  gap costs — see `_gate_floor_supplied`.
+
 Two more obligations are gate *scope* rather than gate executability, and
 they were checks a prose reviewer used to be asked (§3.6 B12's rubric,
 `gate.selector_is_scoped_to_this_node` and
@@ -102,6 +110,17 @@ class Obligation(str, Enum):
     node, and without this check a tests node with no dependent, or a build
     node that still owns the test files, would parse.
 
+    `GATE_FLOOR_SUPPLIED` is the seventeenth, and the one the produced arm of
+    `GATE_EXECUTABLE` structurally cannot ask. That arm exempts a selector the
+    plan is about to create, because a collection count at base would
+    necessarily be zero. The question it leaves unasked is not how many cases
+    exist now but how many this plan *guarantees* will exist, against the
+    threshold a sibling is judged on — and where the selector's whole supply
+    comes from tests nodes, that lower bound is decidable here. It is the
+    tests node's own declared `min_cases`, which its acceptance enforces; it
+    is emphatically not derived from its coverage obligations, which declare
+    aspects rather than counts. See `_tests_supply_floor`.
+
     `TEST_STRENGTH_COHERENT` is the sixteenth. `maestro-plan.v4`'s
     `TestStrength` model already refuses a contract that is internally
     malformed; this refuses one that is well-formed and still unexecutable
@@ -126,6 +145,7 @@ class Obligation(str, Enum):
     INTEGRATION_GATE_COVERS_LANES = "INTEGRATION_GATE_COVERS_LANES"
     TESTS_BUILD_PAIRED = "TESTS_BUILD_PAIRED"
     TEST_STRENGTH_COHERENT = "TEST_STRENGTH_COHERENT"
+    GATE_FLOOR_SUPPLIED = "GATE_FLOOR_SUPPLIED"
 
 
 #: Named as a tuple as well as an enum so the count is checkable rather than
@@ -147,6 +167,7 @@ OBLIGATIONS: Tuple[Obligation, ...] = (
     Obligation.INTEGRATION_GATE_COVERS_LANES,
     Obligation.TESTS_BUILD_PAIRED,
     Obligation.TEST_STRENGTH_COHERENT,
+    Obligation.GATE_FLOOR_SUPPLIED,
 )
 
 
@@ -980,6 +1001,196 @@ def _test_strength_coherent(plan: "pm.Plan") -> List[Blocker]:
     return blockers
 
 
+def _tests_supply_floor(node: Any) -> Tuple[int, str]:
+    """How many executed cases this tests node's *acceptance* guarantees.
+
+    A lower bound and never an estimate, because the refusal it feeds must be
+    true. Every clause below is something the runtime *refuses* on, never the
+    tester's word about its own work (§1.2).
+
+    **The bound is the tests node's own `gate.min_cases`, not its coverage
+    obligations.** That is a correction, and the reasoning it replaces is
+    worth keeping because the wrong version reads plausibly.
+
+    Coverage obligations declare **aspects**; a gate declares a **count**.
+    Deriving a count from the obligations made one field carry two logical
+    facts — the RC1 shape — and it forced an author who wanted seven aspects
+    and nine cases to write a single obligation demanding nine cases against
+    one selector, which asserts something they do not mean. A true number
+    written as a false statement reads fine in a diff and lies in the ledger.
+
+    The obligations also cannot bear the weight, and the plan that exposed
+    this proves it rather than arguing it. `fdadb-v2-wp6-geo-layer` declares
+    seven obligations whose selectors are English phrases — `at most five FAQ
+    pairs`, `omits a question whose data is absent`. A vitest case named
+    `returns at most five FAQ pairs and omits a question whose data is
+    absent` contains both and discharges two obligations with one case. A
+    `case_selector` is a substring of the case node id, so distinct selectors
+    never imply distinct cases: their sum is unsound and their count is
+    unsound, which is why the superseded version took their maximum and why
+    even that was answering the wrong question.
+
+    What the node's own `gate.min_cases` has that the obligations do not:
+
+    * it is already the author's statement of how many cases the tester will
+      write, in the field that exists for counts;
+    * it is already rendered to that node's reviewer as its acceptance
+      contract — `code_review.py` emits "it must collect at least N passing
+      case(s)" into the tests node's handoff — so until the clause below
+      existed it was a promise with a reader and no enforcer (§3.6 B15);
+    * `tc.GateStrengthEvidence.gate_floor_reachable` now enforces it, at
+      tests-node acceptance, against the candidate's own collected count.
+
+    That last clause is what makes this sound, and the two arms compose into
+    a proof rather than two overlapping heuristics: this obligation proves
+    `build.min_cases <= tests.min_cases` before the run, acceptance proves
+    `collected >= tests.min_cases` before the builder is dispatched, and
+    therefore `collected >= build.min_cases` at every moment a builder is
+    working.
+
+    A coverage obligation still raises the bound when it demands more than
+    the gate, because `tc.measure_coverage` requires that many *selected and
+    executed* cases and a selected case is a collected one. So the floor is
+    the maximum of the two enforced quantities — never their sum, for the
+    reason above.
+
+    An **uncontracted** node's floor is one. `tc.verify_tests_node` refuses a
+    candidate whose `new_case_count` is below one (`NO_NEW_CASES`), and that
+    is the whole of the guarantee: a LEGACY-pinned run never calls
+    `_prove_test_strength`, so nothing enforces its declared `min_cases`.
+    Answering zero was considered and refused — it would block every v3 plan
+    including the ones that are fine, and the rollout invariant keeps v3
+    runnable.
+
+    Returns the bound and the clause that establishes it, so the blocker can
+    say why rather than emit a bare number.
+    """
+    strength = getattr(node, "test_strength", None)
+    declared = int(getattr(node.gate, "min_cases", 1))
+    if strength is None:
+        return 1, ("{0} declares no test-strength contract, so its own "
+                   "min_cases of {1} is enforced by nothing — a LEGACY-pinned "
+                   "run never measures test strength — and the only guarantee "
+                   "left is the runtime's: a tests candidate with no new "
+                   "collected case is refused NO_NEW_CASES, which is one "
+                   "case".format(node.node_id, declared))
+    obligated = max(int(item.min_cases) for item in strength.coverage)
+    floor = max(1, declared, obligated)
+    why = ("{0} is held to {1} collected case(s) by its own gate, which its "
+           "acceptance enforces against the candidate's measured count"
+           .format(node.node_id, declared))
+    if obligated > declared:
+        why += ("; its largest coverage obligation demands {0}, which is "
+                "higher and is enforced the same way".format(obligated))
+    return floor, why
+
+
+def _gate_floor_supplied(plan: "pm.Plan") -> List[Blocker]:
+    """A gate's `min_cases` must be supplied by what the plan guarantees.
+
+    §7.4: "a plan declaring 70 is asserting that the node's own selector
+    reaches 70 passing cases". Where a node writes the tests its own gate
+    counts, that assertion is about a supply the node itself controls and
+    there is nothing to refuse. Where the selector's cases are written by a
+    **tests node** and read by a paired builder, the two are different actors
+    and the builder cannot close the gap: `tc.compare_test_bytes` requires it
+    to carry the accepted test bytes verbatim, so the collectable count over
+    that selector is fixed the moment the tests node is accepted.
+
+    `run-8d1a71f463e4430f92a125a8f8b3731d` is what that costs.
+    `lane-routing-chemical`'s tests node merged a file defining two test
+    functions; the paired build lane declared `min_executed: 5` over the same
+    selector. Four builders were dispatched against a gate that was
+    unsatisfiable by construction, and all four forged it rather than fail —
+    two forgery sites escalating to fourteen, including monkeypatching
+    pytest's import machinery. Every step was individually correct. Nobody
+    compared two against five.
+
+    Scope, stated as what it declines to claim:
+
+    * only gates whose selector paths are **all** produced by the plan, which
+      is exactly `_gate_executable`'s exempt arm. A selector reaching an
+      existing path is collected at base there, and this must not answer the
+      same question twice;
+    * only gates whose selector paths are **all** tests-node outputs. One
+      path the pair does not own means a supply this plan does not fix, no
+      lower bound is derivable, and a refusal would not be honest;
+    * a **lower** bound only. Nothing stops a tester writing more cases than
+      it is held to, so a gate above the floor is refused as *not
+      guaranteed*, which is what the message says. The ceiling question is
+      undecidable here and is not asked.
+
+    **What this deliberately no longer catches (2026-08-27).** Since the
+    floor became the tests node's own `gate.min_cases`, a *symmetric* pair —
+    tests and builder declaring the same number, which is the common shape
+    and the one both shipped plans use — can never fail here: the comparison
+    is a number against itself. That earliness is not lost, it moves:
+    `tc.GateStrengthEvidence.gate_floor_reachable` refuses the same defect at
+    tests-node acceptance, against the measured count instead of a derived
+    bound, and still before any builder is dispatched. This obligation now
+    catches the *asymmetric* declaration; acceptance catches the *unmet* one.
+    Stated plainly because a rule whose weakening is documented is worth more
+    than one whose strength is overstated.
+
+    Two tests nodes supplying one selector sum, because they write different
+    files and a case node id carries its file — distinct files cannot produce
+    one case node id, which is the property the within-node maximum lacks.
+    """
+    tests_by_path: Dict[str, Any] = {}
+    for node in plan.nodes:
+        if not isinstance(node, pm.TestsNode):
+            continue
+        for path in node.outputs:
+            tests_by_path[_norm(path)] = node
+    if not tests_by_path:
+        return []
+    produced = {_norm(path) for path in plan.declared_outputs()}
+    blockers: List[Blocker] = []
+
+    def check(gate: "pm.Gate", pointer: str, label: str) -> None:
+        paths = [_norm(path) for path in pm.selector_paths(gate)]
+        if not paths or any(path not in produced for path in paths):
+            return
+        suppliers: List[Any] = []
+        for path in paths:
+            supplier = tests_by_path.get(path)
+            if supplier is None:
+                return
+            if all(supplier.node_id != seen.node_id for seen in suppliers):
+                suppliers.append(supplier)
+        floor = 0
+        reasons: List[str] = []
+        for supplier in suppliers:
+            bound, reason = _tests_supply_floor(supplier)
+            floor += bound
+            reasons.append(reason)
+        if floor >= gate.min_cases:
+            return
+        blockers.append(Blocker(
+            Obligation.GATE_FLOOR_SUPPLIED, pointer + "/min_cases",
+            "{0}'s gate declares min_cases={1} over a selector whose cases "
+            "are written entirely by {2}, and this plan guarantees only {3} "
+            "of them. The build node cannot close the gap — it must carry "
+            "the accepted test bytes verbatim — so the gate is not "
+            "guaranteed satisfiable by any correct attempt. Raise the "
+            "min_cases of {2} — that is the count its own acceptance holds it "
+            "to — or lower min_cases here so the two agree. Do NOT collapse "
+            "coverage obligations into one demanding {1} cases: an obligation "
+            "declares a behavioural aspect, not a case budget, and one "
+            "selector asserted to match {1} cases says something the author "
+            "does not mean. Why {3}: {4}".format(
+                label, gate.min_cases,
+                ", ".join(node.node_id for node in suppliers),
+                floor, "; ".join(reasons))))
+
+    for index, node in enumerate(plan.nodes):
+        if isinstance(node, (pm.AgentNode, pm.TestsNode)):
+            check(node.gate, "/nodes/{0}/gate".format(index), node.node_id)
+    check(plan.merge_policy.integration_gate,
+          "/merge_policy/integration_gate", "the integration gate")
+    return blockers
+
+
 def validate_plan(stored: bytes, repo: Union[str, Path], *,
                   receipts: ReceiptIndex, collector: GateCollector,
                   config: Optional[ValidationConfig] = None) -> ValidationResult:
@@ -1049,6 +1260,7 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
     blockers.extend(_integration_gate_covers_lanes(plan))
     blockers.extend(_tests_build_paired(plan))
     blockers.extend(_test_strength_coherent(plan))
+    blockers.extend(_gate_floor_supplied(plan))
 
     if blockers:
         return ValidationResult(Outcome.AUTHORING_BLOCKED, None, tuple(blockers))

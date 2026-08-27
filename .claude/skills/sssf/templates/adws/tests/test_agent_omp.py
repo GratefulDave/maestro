@@ -41,6 +41,14 @@ CATALOG = {
          "selector": "openai-codex/gpt-5.6-terra", "contextWindow": 272000},
         {"provider": "openrouter", "id": "openai/gpt-5.6-luna",
          "selector": "openrouter/openai/gpt-5.6-luna", "contextWindow": 1050000},
+        # A profile-selected model and one CONCRETE routing alias of it. omp
+        # enumerates `:free` and never `:auto`, which is the asymmetry the
+        # suffix rule turns on.
+        {"provider": "deepseek", "id": "deepseek-v4-flash",
+         "selector": "deepseek/deepseek-v4-flash", "contextWindow": 1000000},
+        {"provider": "openrouter", "id": "deepseek/deepseek-v4-flash:free",
+         "selector": "openrouter/deepseek/deepseek-v4-flash:free",
+         "contextWindow": 164000},
     ]
 }
 
@@ -113,6 +121,39 @@ class OmpRouteTest(unittest.TestCase):
     def test_resolve_model_accepts_an_exact_selector(self):
         self.assertEqual(agent_pi.resolve_model("openai-codex/gpt-5.6-luna"),
                          ("openai-codex", "gpt-5.6-luna"))
+
+    def test_an_auto_routing_suffix_resolves_to_the_base_model(self):
+        """Recorded failure, run-6357251adc7d41dc9b2a72645f778c9c.
+
+        The omp route launches `omp --profile <name>` and passes NO model --
+        the profile picks one, and may append a routing alias:
+        `deepseek/deepseek-v4-flash:auto`. omp resolves that at call time; the
+        catalog never lists it. Refusing it made B13 report HandoffTooLarge --
+        a model whose window cannot be read cannot be shown to fit one -- and
+        all seven attempts died at zero turns having launched no agent.
+
+        `:auto` selects a route, not a window, so the base model's window is
+        the right ceiling to measure the handoff against.
+        """
+        self.assertEqual(
+            agent_pi.resolve_model("deepseek/deepseek-v4-flash:auto"),
+            ("deepseek", "deepseek-v4-flash"),
+        )
+        self.assertEqual(
+            agent_pi.context_window("deepseek", "deepseek-v4-flash"), 1000000
+        )
+
+    def test_a_listed_alias_is_never_stripped_to_its_base(self):
+        """`:free` IS a catalog entry, with its own much smaller window.
+
+        Stripping every suffix would silently measure a 164K alias against a
+        1M ceiling, which is the overflowing-reviewer failure B13 exists to
+        prevent -- so the rule strips only what the catalog does not list.
+        """
+        self.assertEqual(
+            agent_pi.resolve_model("deepseek/deepseek-v4-flash:free"),
+            ("openrouter", "deepseek/deepseek-v4-flash:free"),
+        )
 
     def test_unknown_model_names_the_omp_subcommand_in_its_error(self):
         with self.assertRaises(ValueError) as caught:

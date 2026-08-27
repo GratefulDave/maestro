@@ -64,6 +64,24 @@ def bump():
     nxt = revision() + 1
     open(REV, "w").write(str(nxt))
 
+def record_submission():
+    # Write the turn into the actor transcript, as a real runtime does.
+    # Submission is proven from this durable record, never from the pane
+    # revision: pasting the prompt is itself a repaint, so the counter moves
+    # identically whether the composer submitted or is still holding the
+    # text. FAKE_NEVER_SUBMITS models a composer that never accepts.
+    if os.environ.get("FAKE_NEVER_SUBMITS"):
+        return
+    transcript = os.environ.get("FAKE_TRANSCRIPT")
+    if not transcript:
+        return
+    path = os.path.join(ROOT, "last_prompt")
+    text = open(path).read() if os.path.exists(path) else ""
+    if not text.startswith("@"):
+        return
+    with open(transcript, "a") as sink:
+        sink.write(json.dumps({"role": "user", "text": text}) + chr(10))
+
 if argv[:2] == ["pane", "current"]:
     # A real herdr session always answers this: `route_admission` refuses
     # admission outright with HERDR_SESSION_REQUIRED when it cannot, so no
@@ -106,19 +124,44 @@ elif argv[:2] == ["agent", "start"]:
     print(json.dumps({"result": {"agent": agent}}))
 elif argv[:2] == ["agent", "wait"]:
     print(json.dumps({"result": {"ok": True, "status": "idle"}}))
-elif argv[:2] == ["agent", "prompt"]:
+elif argv[:2] == ["pane", "send-text"]:
+    # Production submits as text-then-Enter, never `agent prompt`: that verb
+    # sends its Enter atomically with the text, and `@` opens the composer's
+    # path-completion popup, which eats it.
     stalls = os.path.join(ROOT, "stalls")
     seen = int(open(stalls).read()) if os.path.exists(stalls) else 0
+    open(os.path.join(ROOT, "last_prompt"), "w").write(argv[3] if len(argv) > 3 else "")
     if seen < int(os.environ.get("FAKE_PROMPT_STALLS", "0")):
-        # The composer took the text and never submitted it: no lifecycle
-        # change, and -- the part that matters -- no revision movement.
         open(stalls, "w").write(str(seen + 1))
         sys.stderr.write(json.dumps({"error": {"code": "agent_prompt_stalled"}}))
         sys.exit(1)
     bump()
     print(json.dumps({"result": {"ok": True}}))
+elif argv[:2] == ["pane", "send-keys"]:
+    bump()
+    record_submission()
+    print(json.dumps({"result": {"ok": True}}))
+elif argv[:2] == ["pane", "send-text"]:
+    stalls = os.path.join(ROOT, "stalls")
+    seen = int(open(stalls).read()) if os.path.exists(stalls) else 0
+    open(os.path.join(ROOT, "last_prompt"), "w").write(argv[3] if len(argv) > 3 else "")
+    if seen < int(os.environ.get("FAKE_PROMPT_STALLS", "0")):
+        # The composer took the text and never submitted it: no lifecycle
+        # change, no revision movement, and -- the part that decides it --
+        # no record of the turn in the actor's own transcript.
+        open(stalls, "w").write(str(seen + 1))
+        sys.stderr.write(json.dumps({"error": {"code": "agent_prompt_stalled"}}))
+        sys.exit(1)
+    bump()
+    record_submission()
+    print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["agent", "send-keys"]:
     bump()
+    # Enter on a composer holding the text submits it, which is what makes
+    # the recovery loop worth running. A fake that bumps the revision and
+    # writes nothing models a pane that repainted and stayed stalled -- the
+    # 2026-08-27 production failure, not a successful recovery.
+    record_submission()
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["agent", "read"]:
     name = argv[2]
@@ -308,6 +351,26 @@ class LauncherContractTest(unittest.TestCase):
             "never start its work yourself", launcher_module.CLAUDE_TEAM_PROMPT_PREFIX
         )
 
+    def test_the_claude_prefix_never_begins_with_a_slash(self):
+        """A leading `/` opens Claude Code's slash-command menu.
+
+        The Enter that follows is then consumed ACCEPTING A COMPLETION, not
+        sending the message. Observed 2026-08-27 during route admission:
+        `/team ...` was rewritten to `/oh-my-claudecode:team` and invoked the
+        OMC team skill, so the turn ran a command, spawned a teammate pane,
+        and never wrote the reply marker the capture waits for --
+        `AGENT_PROMPT_UNSUBMITTED:admit-claude-first-...`.
+
+        Asserted on the first character rather than on the absence of `/team`,
+        because the hazard is the position, not the word.
+        """
+        self.assertFalse(launcher_module.CLAUDE_TEAM_PROMPT_PREFIX.startswith("/"))
+        # The instruction still has to NAME the verb, or the prefix has been
+        # emptied of the thing it exists to say.
+        self.assertIn("/team", launcher_module.CLAUDE_TEAM_PROMPT_PREFIX)
+        prompt = launcher_module.prepare_route_prompt_text("claude", "do the work")
+        self.assertFalse(prompt.startswith("/"))
+
     def test_omp_prompt_does_not_get_the_claude_team_prefix(self):
         launcher_module.prepare_route_prompt(self.spec("omp"))
         self.assertEqual(self.prompt.read_text(), "do the work")
@@ -332,6 +395,46 @@ class LauncherContractTest(unittest.TestCase):
         # Every other command still has to speak JSON.
         with self.assertRaisesRegex(RuntimeError, "PROTOCOL_INVALID_JSON"):
             harness._herdr("pane", "list")
+
+    def test_silent_success_is_a_success_not_a_protocol_violation(self):
+        """A herdr verb with nothing to report prints nothing and exits 0.
+
+        `pane send-text`, `pane send-keys`, and `agent send-keys` are all
+        silent on success. Decoding empty stdout as JSON raises, and on
+        2026-08-27 that turned every prompt submission into
+        PROMPT_SUBMISSION_REFUSED -> LAUNCHER_TRANSIENT: run
+        run-1e8ee5e5742c4777bf65393c02b41624 retried
+        lane-routing-chemical-tests to LAUNCHER_BUDGET_EXHAUSTED without one
+        agent ever starting a turn. The two-call submission path is the only
+        caller of these verbs, so nothing else could have caught it.
+        """
+        for body in ("", "\n", "   \n\n"):
+            script = self.root / "silent-herdr"
+            script.write_text("#!/bin/sh\nprintf '%s' '{}'\n".format(body))
+            script.chmod(0o755)
+            harness = HerdrLauncher(
+                herdr_path=script,
+                omp_path=Path("/opt/omp"),
+                claude_path=Path("/opt/claude"),
+                admitted_routes=self.admitted_routes,
+            )
+            self.assertEqual(harness._herdr("pane", "send-text", "w1:p2", "hi"), {})
+            self.assertEqual(harness._herdr("pane", "send-keys", "w1:p2", "enter"), {})
+            self.assertEqual(harness._herdr("agent", "send-keys", "n", "enter"), {})
+
+    def test_non_empty_garbage_is_still_a_protocol_violation(self):
+        """Silence is a success carrying no payload. Noise is not."""
+        script = self.root / "noisy-herdr"
+        script.write_text("#!/bin/sh\nprintf '%s\\n' 'not json'\n")
+        script.chmod(0o755)
+        harness = HerdrLauncher(
+            herdr_path=script,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
+        with self.assertRaisesRegex(RuntimeError, "PROTOCOL_INVALID_JSON"):
+            harness._herdr("pane", "send-text", "w1:p2", "hi")
 
     def test_launch_refuses_unadmitted_route_before_creating_pane(self):
         fixtures = Path(__file__).parent / "fixtures" / "step8"
@@ -563,17 +666,24 @@ class LauncherContractTest(unittest.TestCase):
         self.assertIn("--timeout", wait)
         route_argv = start[start.index("--") + 1 :]
         self.assertFalse(any(arg.startswith("@") for arg in route_argv))
-        prompts = [call for call in calls if call[:2] == ["agent", "prompt"]]
+        prompts = [call for call in calls if call[:2] == ["pane", "send-text"]]
         self.assertEqual(len(prompts), 1)
-        self.assertEqual(prompts[0][3], "@{0}".format(self.prompt.resolve()))
+        self.assertEqual(prompts[0][3], "@{0} ".format(self.prompt.resolve()))
         self.assertLess(wait_indexes[0], calls.index(prompts[0]))
-        self.assertFalse(
-            any(
-                call[:2]
-                in (["pane", "run"], ["pane", "send-keys"], ["agent", "send-keys"])
-                for call in calls
-            )
-        )
+        # `pane run` types into a shell rather than handing text to a coding
+        # agent's composer, so it stays refused. `pane send-keys` does NOT:
+        # it is now how the Enter is delivered, deliberately as its own call.
+        #
+        # Two keys, in this order, never one. `@` opens the composer's
+        # path-completion popup and the popup does NOT settle on its own --
+        # this test asserted that it did until run-faa4dc49 falsified it, with
+        # a lane holding its prompt unsubmitted while Enter after Enter was
+        # eaten to accept a completion. `esc` closes the popup and leaves the
+        # text, so the Enter that follows is the one that submits.
+        self.assertFalse(any(call[:2] == ["pane", "run"] for call in calls))
+        keys = [call for call in calls if call[:2] == ["pane", "send-keys"]]
+        self.assertEqual([call[3] for call in keys], ["esc", "enter"])
+        self.assertLess(calls.index(prompts[0]), calls.index(keys[0]))
 
     def test_launch_waits_for_a_transcript_path_that_arrives_after_start(self):
         # `agent start` returns once herdr holds the process, which for the omp
@@ -602,8 +712,9 @@ class LauncherContractTest(unittest.TestCase):
 
     def test_launch_bounds_the_wait_when_no_transcript_ever_arrives(self):
         # The bounded half: when the path genuinely never appears the wait
-        # terminates and the handle carries None, so the caller's
-        # SESSION_PATH_MISSING is still reachable rather than traded for a hang.
+        # terminates. Offering without a transcript would fall back to the
+        # pane meter, so launch refuses rather than hanging or shipping an
+        # unproven submit.
         os.environ["FAKE_START_WITHOUT_SESSION"] = "1"
         os.environ["FAKE_SESSION_NEVER"] = "1"
         harness = HerdrLauncher(
@@ -614,9 +725,14 @@ class LauncherContractTest(unittest.TestCase):
         )
         with mock.patch.object(launcher, "TRANSCRIPT_PATH_TIMEOUT_S", 0.05):
             started = time.monotonic()
-            handle = harness.launch(self.spec())
+            with self.assertRaises(launcher_module.LaunchRefused) as caught:
+                harness.launch(self.spec())
             elapsed = time.monotonic() - started
-        self.assertIsNone(handle.transcript_path)
+        self.assertIs(
+            caught.exception.refusal,
+            launcher_module.LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
+        )
+        self.assertIn("no transcript", str(caught.exception))
         self.assertNotIn("run1-node_a-1", harness._tailers)
         self.assertLess(elapsed, 30.0)
 
@@ -819,24 +935,28 @@ class LauncherContractTest(unittest.TestCase):
             json.loads(line)["argv"]
             for line in (self.root / "argv.jsonl").read_text().splitlines()
         ]
-        prompt_calls = [call for call in calls if call[:2] == ["agent", "prompt"]]
+        prompt_calls = [call for call in calls if call[:2] == ["pane", "send-text"]]
         self.assertEqual(len(prompt_calls), 1)
         bootstrap = prompt_calls[0][3]
-        self.assertEqual(bootstrap, "@{0}".format(self.prompt.resolve()))
+        # The trailing space is part of the contract, not slack. `@` opens the
+        # composer's path-completion popup, and while it is open Enter accepts
+        # a completion instead of sending the message; a space terminates the
+        # path token so the Enter reaches the composer.
+        self.assertEqual(bootstrap, "@{0} ".format(self.prompt.resolve()))
         self.assertNotIn(prompt_bytes, json.dumps(calls))
         wait_index = next(
             index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
         )
         prompt_index = next(
-            index for index, call in enumerate(calls) if call[:2] == ["agent", "prompt"]
+            index for index, call in enumerate(calls) if call[:2] == ["pane", "send-text"]
         )
         transcript_index = next(
             index
             for index, call in enumerate(calls)
-            if index > prompt_index and call[:2] == ["agent", "get"]
+            if call[:2] == ["agent", "get"] and index < prompt_index
         )
         self.assertLess(wait_index, prompt_index)
-        self.assertLess(prompt_index, transcript_index)
+        self.assertLess(transcript_index, prompt_index)
 
     def test_every_claude_launch_including_retry_gets_one_ready_prompt(self):
         for attempt in (1, 2):
@@ -861,7 +981,7 @@ class LauncherContractTest(unittest.TestCase):
             index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
         ]
         prompts = [
-            index for index, call in enumerate(calls) if call[:2] == ["agent", "prompt"]
+            index for index, call in enumerate(calls) if call[:2] == ["pane", "send-text"]
         ]
         self.assertEqual(len(starts), 2)
         self.assertEqual(len(waits), 2)
@@ -892,7 +1012,7 @@ class LauncherContractTest(unittest.TestCase):
             index for index, call in enumerate(calls) if call[:2] == ["agent", "wait"]
         ]
         prompts = [
-            index for index, call in enumerate(calls) if call[:2] == ["agent", "prompt"]
+            index for index, call in enumerate(calls) if call[:2] == ["pane", "send-text"]
         ]
         self.assertEqual(len(starts), 2)
         self.assertEqual(len(waits), 2)
@@ -919,24 +1039,39 @@ class LauncherContractTest(unittest.TestCase):
         runtime.launch(self.spec("claude"))
         calls = self.recorded_calls()
         self.assertEqual(
-            len([call for call in calls if call[:2] == ["agent", "prompt"]]), 1
+            len([call for call in calls if call[:2] == ["pane", "send-text"]]), 1
         )
         # Enter was pressed on what the composer was already holding, and the
         # prompt was never re-issued -- a second `agent prompt` would append to
         # the unsubmitted line and send both as one garbled turn.
-        send_keys = [call for call in calls if call[:2] == ["agent", "send-keys"]]
-        self.assertEqual(len(send_keys), 1)
-        self.assertEqual(send_keys[0][3], "enter")
+        send_keys = [call for call in calls if call[:2] == ["pane", "send-keys"]]
+        # `esc` closes the `@`-completion popup that would otherwise eat the
+        # Enter; the Enter that follows is the one that submits (run-faa4dc49).
+        self.assertEqual([call[3] for call in send_keys], ["esc", "enter"])
 
-    def test_a_pane_that_never_advances_its_revision_refuses_the_launch(self):
-        """The blindness this suite carried until 2026-08-18.
+    def test_a_prompt_the_actor_never_recorded_refuses_the_launch(self):
+        """The blindness this suite carried, in both of its forms.
 
-        With no `revision` key at all the launcher can never prove submission,
-        so the launch must refuse rather than hand back a handle for an agent
-        that was never given any work.
+        Until 2026-08-18 an unsubmitted prompt was believed submitted because
+        the pane reported `idle`. The meter replaced the status word, and this
+        test then asserted that an unreadable meter refuses.
+
+        On 2026-08-27 the meter failed the same way, one artifact over: a grok
+        builder sat at revision 1 holding `@<prompt>` while the launcher, read-
+        ing 0 -> 1, returned success without pressing Enter. Pasting the prompt
+        is itself a repaint, so the counter advances identically whether the
+        composer took the turn or is merely rendering text it still holds.
+
+        So the meter is no longer what refuses, and its absence is no longer a
+        refusal: an actor whose transcript records the turn has submitted it
+        whatever the pane reports. What refuses is the fact both incidents
+        actually shared -- no durable record of the turn in the actor's own
+        transcript. The pane here is kept meterless deliberately, to show the
+        refusal no longer depends on reading one.
         """
         os.environ["FAKE_PANE_WITHOUT_REVISION"] = "1"
         os.environ["FAKE_AGENT_STATUS"] = "idle"
+        os.environ["FAKE_NEVER_SUBMITS"] = "1"
         runtime = HerdrLauncher(
             herdr_path=self.herdr,
             omp_path=Path("/opt/omp"),
@@ -949,7 +1084,7 @@ class LauncherContractTest(unittest.TestCase):
             caught.exception.refusal, launcher.LaunchRefusal.PROMPT_SUBMISSION_REFUSED
         )
         self.assertIsInstance(
-            caught.exception.__cause__, launcher.PromptSubmissionUnobservable
+            caught.exception.__cause__, launcher.PromptNotSubmitted
         )
 
     def test_reclaim_matches_exact_token_only(self):

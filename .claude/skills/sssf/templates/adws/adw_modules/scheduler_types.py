@@ -720,6 +720,28 @@ class NodeKind(str, Enum):
     TESTS = "tests"
 
 
+#: Whether a tests node's files reach the builders that its cases judge.
+#:
+#: "merged" is every plan authored before this existed and is what §7.4's
+#: in-worktree gate and `tests_chain.compare_test_bytes` assume: the tests node
+#: merges into the integration branch, the build lane inherits the files, and
+#: its own commit must carry them byte-identically.
+#:
+#: "hidden" withholds them. The bytes live in a vault outside the run
+#: repository (`hidden_vault`), because a linked worktree shares its parent's
+#: object database and withholding a *path* while leaving the *object* in reach
+#: is not containment — measured 2026-08-27, one `git cat-file` printed the
+#: assertions from a builder's own worktree.
+#:
+#: These live here rather than in `plan_model` because `plan_model` imports this
+#: module and both ends need the vocabulary; one representation of the fact
+#: rather than two reconciled by convention (§4 RC1).
+TestVisibility = str
+VISIBILITY_MERGED: TestVisibility = "merged"
+VISIBILITY_HIDDEN: TestVisibility = "hidden"
+TEST_VISIBILITIES = (VISIBILITY_MERGED, VISIBILITY_HIDDEN)
+
+
 @dataclass(frozen=True)
 class PlanNode:
     """A plan node, consumed directly — no second authored type, no converter.
@@ -819,6 +841,14 @@ class PlanNode:
     #: verbatim so `_assert_projection_is_total` compares it by value.
     test_strength: Optional[Any] = None
 
+    #: `VISIBILITY_MERGED` is the v4-and-earlier shape and the default forever,
+    #: exactly as `test_strength=None` is the v3 shape: a plan authored before
+    #: visibility existed declared nothing, and the projection must not invent
+    #: a decision its author never made. A v5 tests node declares one, which is
+    #: what makes "this author chose" a recoverable fact rather than a guess
+    #: (§3.6 B8 — a field added later is optional forever).
+    test_visibility: TestVisibility = VISIBILITY_MERGED
+
     def __post_init__(self) -> None:
         if not str(self.node_id).strip():
             raise ValueError("a node needs a non-empty id; identity is not optional")
@@ -831,6 +861,37 @@ class PlanNode:
             raise ValueError(
                 f"{self.node_id}: a test-strength contract belongs to a tests "
                 "node; on any other kind it is a field nothing reads (§12.3)"
+            )
+
+        if self.test_visibility not in TEST_VISIBILITIES:
+            raise ValueError(
+                f"{self.node_id}: test_visibility {self.test_visibility!r} is "
+                f"not one of {TEST_VISIBILITIES}; an unrecognised visibility "
+                "would read as 'not hidden' everywhere downstream, which is "
+                "the fail-open direction"
+            )
+
+        if (
+            self.test_visibility == VISIBILITY_HIDDEN
+            and self.kind is not NodeKind.TESTS
+        ):
+            raise ValueError(
+                f"{self.node_id}: only a tests node has visibility; on any "
+                "other kind it is a field nothing reads (§3.6 B15)"
+            )
+
+        # Hidden visibility is measured through the accepted contract's
+        # coverage obligations -- they are the entire vocabulary the sanitised
+        # repair handoff is allowed to use. A hidden tests node without one
+        # would leave the builder with counts and no way to name what is unmet.
+        if (
+            self.test_visibility == VISIBILITY_HIDDEN
+            and self.test_strength is None
+        ):
+            raise ValueError(
+                f"{self.node_id}: a hidden tests node needs a test-strength "
+                "contract; its coverage obligations are the only vocabulary a "
+                "sanitised repair handoff may speak"
             )
 
         if self.kind is NodeKind.REVIEW:

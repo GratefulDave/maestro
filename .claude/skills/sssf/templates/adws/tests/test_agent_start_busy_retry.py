@@ -92,6 +92,57 @@ class _Clock:
         self.now += seconds
 
 
+class NotReadyIsNotReOfferableTests(unittest.TestCase):
+    """`agent_not_ready` looks like the busy race and must not be treated as one.
+
+    Measured 2026-08-27 while proving the reviewer submission path. `agent
+    start` answered
+
+        agent_not_ready: agent <name> is blocked during startup and is not
+        ready for prompts
+
+    and adding that code to the survivable set made the next offer collide:
+
+        agent_name_taken: agent name <name> is already used; candidates:
+        ... status=Blocked
+
+    The first start had **registered the agent**. So unlike `agent_pane_busy`,
+    where nothing was created and a fresh offer is the remedy, this names an
+    agent that exists and has not finished booting — and the remedy is to wait
+    for readiness, which `wait_for_interactive_agent` already does. Re-offering
+    start can only ever collide with the agent the previous offer made.
+
+    Pinned rather than left to review because the two codes read alike in a log
+    and the wrong repair is the obvious one.
+    """
+
+    def test_the_survivable_set_covers_the_busy_race_and_not_the_boot_race(self):
+        self.assertEqual(lch.TRANSIENT_HERDR_ERROR_CODES, frozenset({"agent_pane_busy"}))
+
+    def test_a_booting_agent_is_never_re_offered(self):
+        clock = _Clock()
+        calls = []
+
+        def start():
+            calls.append(len(calls))
+            raise lch.HerdrCallError(
+                'LAUNCH_REFUSED:{"error":{"code":"agent_not_ready","message":'
+                '"agent maestro-965660608410e5ce is blocked during startup and '
+                'is not ready for prompts"},"id":"cli:agent:start"}',
+                "agent_not_ready",
+            )
+
+        with self.assertRaises(lch.HerdrCallError) as caught:
+            lch._start_agent_when_free(
+                start, window_s=10.0, poll_s=0.5,
+                sleep=clock.sleep, monotonic=clock.monotonic)
+
+        self.assertEqual(caught.exception.code, "agent_not_ready")
+        # One offer, and no second one to collide `agent_name_taken` with.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(clock.slept, [])
+
+
 class ReOfferTests(unittest.TestCase):
     """`_start_agent_when_free` in isolation, on a driven clock."""
 

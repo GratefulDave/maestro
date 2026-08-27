@@ -29,6 +29,7 @@ attempt, and then the node's whole retry budget.
 
 from __future__ import annotations
 
+import inspect
 import sys
 import threading
 import tempfile
@@ -42,12 +43,14 @@ from adw_modules import launcher as lch  # noqa: E402
 
 
 class FakeHerdr:
-    """A pane whose revision only advances when the prompt is truly accepted.
+    """A pane whose revision advances when the composer repaints.
 
-    `stalls` is how many `agent prompt` / `send-keys` rounds are swallowed
-    before the composer starts accepting. `status_ok` mimics herdr answering
-    the lifecycle wait successfully — which the stalled pane does, reporting
-    `idle`, and which is exactly why the wait alone proves nothing.
+    Pasting the prompt is a repaint, so `send-text` may tick the counter
+    without the turn having started. Tests must not treat that tick as
+    submission. `stalls` is how many `send-text` / `send-keys` rounds are
+    swallowed before the composer starts accepting. `status_ok` mimics herdr
+    answering the lifecycle wait successfully — which the stalled pane does,
+    reporting `idle`, and which is exactly why the wait alone proves nothing.
     """
 
     def __init__(
@@ -69,11 +72,14 @@ class FakeHerdr:
         if verb == ("pane", "get"):
             return {"result": {"pane": {"revision": self.revision}}}
         if verb == ("agent", "get"):
-            return {"result": {"agent": {"status": self.agent_status}}}
-        if verb in (("agent", "prompt"), ("agent", "send-keys")):
+            # herdr's field is `agent_status`; `status` is always None.
+            return {"result": {"agent": {
+                "agent_status": self.agent_status, "status": None,
+            }}}
+        if verb in (("pane", "send-text"), ("agent", "send-keys")):
             if self.stalls > 0:
                 self.stalls -= 1
-                if verb == ("agent", "prompt"):
+                if verb == ("pane", "send-text"):
                     raise RuntimeError("agent_prompt_stalled")
                 return {}
             if isinstance(self.revision, int):
@@ -89,7 +95,133 @@ class FakeHerdr:
         return sum(1 for call in self.calls if call[: len(verb)] == verb)
 
 
+
+def _recorded_after_pane_enter(herdr: FakeHerdr):
+    """True once the offer's Enter has been issued. Not a meter. Not paste."""
+
+    def recorded() -> bool:
+        return any(
+            call[:2] == ("pane", "send-keys")
+            and len(call) > 3
+            and call[3] == "enter"
+            for call in herdr.calls
+        )
+
+    return recorded
+
+
+def _recorded_after_agent_enters(herdr: FakeHerdr, n: int):
+    """True after `n` recovery Enters. Send-text repaint never counts."""
+
+    def recorded() -> bool:
+        return herdr.count("agent", "send-keys") >= n
+
+    return recorded
+
 class SubmissionProof(unittest.TestCase):
+    def test_the_completion_popup_is_dismissed_before_the_enter(self):
+        """Recorded failure, 2026-08-27, run-faa4dc49ac954899a7445d9b447c0443.
+
+        `lane-routing-chemical-tests` held
+        `@/Users/.../agent-prompt.txt` in its omp composer, unsubmitted, at
+        pane revision 2, while the launcher pressed Enter. Measured directly
+        against a live omp composer that same day: typing `@/etc/hosts` leaves
+        the file-completion popup open (the pane renders `hosts` and
+        `hosts.equiv` beneath the composer), the next Enter is consumed to
+        accept a completion rather than to submit, and only a *second* Enter
+        starts the turn. `esc` closes the popup and leaves the composed text
+        intact, after which one Enter submits.
+
+        So the Enter must never be the first key after the text. Asserted as
+        an order over the argv the function actually issues, because a count
+        of Enters is exactly what a popup-eaten Enter satisfies.
+        """
+        herdr = FakeHerdr()
+        try:
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        except lch.PromptNotSubmitted:
+            pass
+        keys = [
+            call for call in herdr.calls
+            if call[:2] in (("pane", "send-text"), ("pane", "send-keys"))
+        ]
+        verbs = [(call[1], call[3] if len(call) > 3 else "") for call in keys]
+        self.assertEqual(verbs[0][0], "send-text")
+        self.assertEqual(verbs[1], ("send-keys", "esc"))
+        self.assertEqual(verbs[2], ("send-keys", "enter"))
+
+    def test_paste_settle_sleeps_between_send_text_and_enter(self):
+        """send-text returns when herdr writes bytes, not when the composer
+        takes them. PASTE_SETTLE_S must land between those two calls."""
+        slept = []
+        herdr = FakeHerdr()
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=slept.append,
+            submission_recorded=_recorded_after_pane_enter(herdr),
+        )
+        keys = [
+            call for call in herdr.calls
+            if call[:2] in (("pane", "send-text"), ("pane", "send-keys"))
+        ]
+        text_i = next(
+            i for i, call in enumerate(keys) if call[:2] == ("pane", "send-text")
+        )
+        enter_i = next(
+            i for i, call in enumerate(keys)
+            if call[:2] == ("pane", "send-keys") and call[3] == "enter"
+        )
+        self.assertLess(text_i, enter_i)
+        self.assertGreaterEqual(slept.count(lch.PASTE_SETTLE_S), 1)
+
+    def test_esc_is_pressed_once_and_never_after_the_prompt_lands(self):
+        """`esc` is omp's INTERRUPT key, not just a popup dismissal.
+
+        The composer renders `Working... <esc>` while a turn runs. Pressing
+        `esc` on every recovery round therefore killed the turn it was meant
+        to rescue: run-c672e173f33044489d37f12527c5b251 attempts 1 and 2 each
+        ran nine turns and then died `ENVIRONMENTAL` with the agent stopped
+        mid-work, which is a strictly worse failure than the unsubmitted
+        prompt the key was added to fix.
+
+        One `esc`, before the first Enter, when nothing can be running yet.
+        """
+        herdr = FakeHerdr(stalls=99, revision=0)
+        with self.assertRaises(lch.PromptNotSubmitted):
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                attempts=4,
+                sleep=lambda _s: None,
+            )
+        escapes = [
+            call for call in herdr.calls
+            if call[:2] in (("pane", "send-keys"), ("agent", "send-keys"))
+            and len(call) > 3 and call[3] == "esc"
+        ]
+        self.assertEqual(len(escapes), 1)
+        enters = [
+            call for call in herdr.calls
+            if call[:2] in (("pane", "send-keys"), ("agent", "send-keys"))
+            and len(call) > 3 and call[3] == "enter"
+        ]
+        self.assertGreater(len(enters), 1)
+        self.assertLess(herdr.calls.index(escapes[0]), herdr.calls.index(enters[0]))
+
     def test_an_accepted_prompt_needs_no_recovery(self):
         herdr = FakeHerdr()
         lch.submit_agent_prompt(
@@ -99,18 +231,77 @@ class SubmissionProof(unittest.TestCase):
             "agent",
             until=("working", "idle"),
             sleep=lambda _s: None,
+            submission_recorded=_recorded_after_pane_enter(herdr),
         )
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
-    def test_a_working_agent_proves_acceptance_when_revision_is_static(self):
+    def test_a_send_text_repaint_without_a_record_is_not_submitted(self):
+        """Meter fallback guard. FakeHerdr ticks revision on paste; that is
+        not proof. If `current > baseline` starts returning True again, this
+        assertion fails because the call would succeed with zero recovery."""
+        herdr = FakeHerdr()
+        with self.assertRaises(lch.PromptNotSubmitted):
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+
+    def test_a_working_agent_does_not_outrank_a_legible_static_meter(self):
+        """Recorded failure, 2026-08-27, run-8d1a71f463e4430f92a125a8f8b3731d.
+
+        This test asserted the opposite until production falsified it. A
+        reviewer on the `claude` route sat at revision 1 holding
+        `@<prompt>.md` in its composer while `working` was believed, the
+        launcher returned a handle, and the finalization window waited forty
+        minutes for a report no actor was writing. The node blocked
+        `ENVIRONMENTAL_BUDGET_EXHAUSTED` with receipt `NEVER_STARTED` and the
+        operator found the prompt still on screen.
+
+        Claude Code reports `working` while it *boots*. The status therefore
+        cannot separate "took the prompt" from "starting up" — exactly the
+        blindness `idle` had in the original incident, one word over. A
+        legible counter can, so where it can be read it decides, and Enter is
+        pressed on a composer the status was vouching for.
+        """
+
         class StaticWorking(FakeHerdr):
             def __call__(self, *argv, **kwargs):
-                if argv[:2] == ("agent", "prompt"):
+                if argv[:2] == ("pane", "send-text"):
                     self.calls.append(argv)
                     return {}
                 return super().__call__(*argv, **kwargs)
 
-        herdr = StaticWorking(revision=41, agent_status="working")
+        herdr = StaticWorking(stalls=99, revision=41, agent_status="working")
+        with self.assertRaises(lch.PromptNotSubmitted):
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                working_proves=True,
+                sleep=lambda _s: None,
+            )
+        self.assertEqual(herdr.revision, 41)
+        self.assertEqual(herdr.count("agent", "send-keys"), lch.SUBMIT_ATTEMPTS)
+
+    def test_a_working_agent_still_proves_it_when_the_meter_is_unreadable(self):
+        """Typed working remains the fallback when the meter cannot be read.
+        herdr's field is `agent_status`; a fake that only set `status` would
+        not convict a regression that forgot that field."""
+
+        class UnreadableWorking(FakeHerdr):
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("pane", "send-text"):
+                    self.calls.append(argv)
+                    return {}
+                return super().__call__(*argv, **kwargs)
+
+        herdr = UnreadableWorking(revision=None, agent_status="working")
         lch.submit_agent_prompt(
             herdr,
             "w1:p1",
@@ -120,7 +311,6 @@ class SubmissionProof(unittest.TestCase):
             working_proves=True,
             sleep=lambda _s: None,
         )
-        self.assertEqual(herdr.revision, 41)
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
     def test_a_swallowed_prompt_is_not_believed_because_the_pane_says_idle(self):
@@ -137,6 +327,7 @@ class SubmissionProof(unittest.TestCase):
             "agent",
             until=("working", "idle"),
             sleep=lambda _s: None,
+            submission_recorded=_recorded_after_agent_enters(herdr, 2),
         )
         # Enter was actually pressed, which is the whole point.
         self.assertGreaterEqual(herdr.count("agent", "send-keys"), 1)
@@ -151,6 +342,7 @@ class SubmissionProof(unittest.TestCase):
             "agent",
             until=("working", "idle"),
             sleep=lambda _s: None,
+            submission_recorded=_recorded_after_agent_enters(herdr, 2),
         )
 
         recovery_waits = [call for call in herdr.calls if call[:2] == ("agent", "wait")]
@@ -175,12 +367,18 @@ class SubmissionProof(unittest.TestCase):
     def test_a_prompt_the_agent_finished_before_working_was_sampled_still_passes(self):
         """Why `idle` cannot simply be dropped from the wait.
 
-        The task is done and the pane is idle again — but it consumed a turn,
-        so the revision moved and the launch is not failed for being fast.
+        The task is done and the pane is idle again — but it consumed a turn.
+        Proof is the rising record (here: the offer Enter), not the meter.
         """
         herdr = FakeHerdr()
         lch.submit_agent_prompt(
-            herdr, "w1:p1", "@prompt", "agent", until=("idle",), sleep=lambda _s: None
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("idle",),
+            sleep=lambda _s: None,
+            submission_recorded=_recorded_after_pane_enter(herdr),
         )
         self.assertEqual(herdr.count("agent", "send-keys"), 0)
 
@@ -291,7 +489,7 @@ class SubmissionProof(unittest.TestCase):
     def test_a_non_stall_failure_is_raised_rather_than_retried(self):
         class Broken(FakeHerdr):
             def __call__(self, *argv, **kwargs):
-                if argv[:2] == ("agent", "prompt"):
+                if argv[:2] == ("pane", "send-text"):
                     raise RuntimeError("pane_not_found")
                 return super().__call__(*argv, **kwargs)
 
@@ -400,8 +598,11 @@ class PersistentHandleSubmission(unittest.TestCase):
             root = Path(tmp)
             prompt = root / "repair.md"
             prompt.write_text("repair", encoding="utf-8")
+            transcript = root / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
             token = "run-build-a1"
             name = lch.agent_name_for(token)
+            marker = "@" + str(prompt.resolve())
 
             class BoundHerdr(FakeHerdr):
                 def __call__(self, *argv, **kwargs):
@@ -423,20 +624,44 @@ class PersistentHandleSubmission(unittest.TestCase):
                                 "agent": {
                                     "name": name,
                                     "pane_id": "w1:p1",
-                                    "status": self.agent_status,
+                                    "agent_status": self.agent_status,
+                                    "status": None,
                                 }
                             }
                         }
+                    if (
+                        argv[:2] == ("pane", "send-keys")
+                        and len(argv) > 3
+                        and argv[3] == "enter"
+                    ):
+                        self.calls.append(argv)
+                        with transcript.open("a", encoding="utf-8") as sink:
+                            sink.write(
+                                '{"role":"user","text":"%s"}\n' % marker
+                            )
+                        return {}
                     return super().__call__(*argv, **kwargs)
 
-            handle = lch.LaunchHandle(token, "w1:p1", name, root, environment={})
+            handle = lch.LaunchHandle(
+                token,
+                "w1:p1",
+                name,
+                root,
+                environment={},
+                transcript_path=transcript,
+            )
             herdr = BoundHerdr()
             runtime = self._runtime(herdr, handle)
             self.assertIs(runtime.resubmit(handle, prompt), handle)
-            self.assertEqual(herdr.count("agent", "prompt"), 1)
+            self.assertEqual(herdr.count("pane", "send-text"), 1)
 
             wrong = lch.LaunchHandle(
-                token, "w1:p1", name, root / "other", environment={}
+                token,
+                "w1:p1",
+                name,
+                root / "other",
+                environment={},
+                transcript_path=transcript,
             )
             with self.assertRaises(lch.HandleAdoptionRefused):
                 runtime.resubmit(wrong, prompt)
@@ -511,3 +736,357 @@ class PaneRevision(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitFailureIsNotUnobservability(unittest.TestCase):
+    """The wait is a delay. Reading the meter is the observation.
+
+    Recorded failure, 2026-08-27, run-8d1a71f463e4430f92a125a8f8b3731d.
+    `lane-routing-chemical-tests` spent twelve launcher attempts on an
+    identical `AGENT_PROMPT_UNOBSERVED:... after 4 submit attempts`, each
+    lasting the full sixty-second budget, against panes whose `revision` field
+    every other reader could see perfectly well.
+
+    `consumed()` was reachable through exactly two doors and the stall locks
+    both: it ran after `agent prompt --wait` *returned*, which a stalled offer
+    does not, and inside `wait_for` after `agent wait` *returned*, which it
+    does not either — herdr raises when the agent has not reached `working`
+    inside the budget, and a composer holding an unsubmitted `@<path>` never
+    does. So the loop pressed Enter four times and never once looked at the
+    meter, `readings` stayed empty, and the caller reported "the counter could
+    not be read" about a counter it had not read since baseline.
+
+    That inverts the distinction `PromptSubmissionUnobservable` exists to
+    make. D9 separates "the meter did not move" from "I could not read the
+    meter"; this manufactured the second from a failure of the *wait*, which
+    is a statement about neither. And because `agent wait --until working`
+    fails identically for a fast turn, a prompt that had already landed was
+    reported unobservable too — the launch was refused over work that was
+    already under way.
+
+    Every case below fails a `wait` and asserts on what is concluded from it.
+    The existing `FakeHerdr` has always been able to fail one (`status_ok`);
+    nothing had ever combined that with a stall, which is why the whole family
+    was invisible.
+    """
+
+    def test_a_failing_wait_never_reports_a_legible_meter_as_unreadable(self):
+        """The incident. Wait failure is not Unobservable when the meter was
+        readable. Proof is a rising record (recovery Enter), not the paste."""
+        herdr = FakeHerdr(stalls=1, status_ok=False)
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=lambda _s: None,
+            submission_recorded=_recorded_after_agent_enters(herdr, 1),
+        )
+        self.assertEqual(herdr.count("agent", "send-keys"), 1)
+        # Baseline plus at least one reading taken after the prompt was
+        # offered. One `pane get` in the whole call is the defect's signature.
+        self.assertGreater(herdr.count("pane", "get"), 1)
+
+    def test_a_prompt_that_landed_despite_a_stalled_offer_needs_no_enter(self):
+        """A send-text repaint plus stall is NOT submitted.
+
+        herdr's stall means it did not *observe* a lifecycle change. The paste
+        still repaints, so the revision ticks — and that used to return
+        success with zero recovery Enter. Recovery Enter or a transcript rise
+        is required; without either, fail closed.
+        """
+
+        class StalledButAccepted(FakeHerdr):
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("pane", "send-text"):
+                    self.calls.append(argv)
+                    self.revision += 1
+                    raise RuntimeError("agent_prompt_stalled")
+                return super().__call__(*argv, **kwargs)
+
+        herdr = StalledButAccepted(status_ok=False)
+        with self.assertRaises(lch.PromptNotSubmitted):
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        self.assertGreaterEqual(herdr.count("agent", "send-keys"), 1)
+        self.assertEqual(herdr.count("pane", "send-text"), 1)
+
+    def test_a_wedged_composer_is_unsubmitted_rather_than_unobservable(self):
+        """The half a careless repair gets wrong. The meter was legible every
+        round and did not move: that is a fact about the composer, and it must
+        keep its terminal EXECUTION verdict rather than being laundered into a
+        transient one."""
+        herdr = FakeHerdr(stalls=99, status_ok=False, revision=41)
+        with self.assertRaises(lch.PromptNotSubmitted) as caught:
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        self.assertIn("AGENT_PROMPT_UNSUBMITTED", str(caught.exception))
+        self.assertEqual(lch.classify_error(caught.exception), lch.ErrorClass.EXECUTION)
+        self.assertEqual(herdr.count("agent", "send-keys"), lch.SUBMIT_ATTEMPTS)
+
+    def test_a_genuinely_unreadable_meter_is_still_unobservable(self):
+        """D9's own case, with the wait failing too. The class survives; only
+        its false positives are gone."""
+        herdr = FakeHerdr(stalls=99, status_ok=False, revision=None)
+        with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        self.assertIn("AGENT_PROMPT_UNOBSERVED", str(caught.exception))
+        self.assertEqual(lch.classify_error(caught.exception), lch.ErrorClass.TRANSIENT)
+
+    def test_the_prompt_is_offered_exactly_once_however_the_wait_ends(self):
+        """A second `agent prompt` would append its text to the unsubmitted
+        line and send both as one garbled turn. Recovery presses Enter on what
+        is already on screen and never re-offers."""
+        for label, herdr in (
+            ("lands on enter", FakeHerdr(stalls=1, status_ok=False)),
+            ("wedged", FakeHerdr(stalls=99, status_ok=False, revision=41)),
+            ("unreadable", FakeHerdr(stalls=99, status_ok=False, revision=None)),
+        ):
+            with self.subTest(case=label):
+                try:
+                    lch.submit_agent_prompt(
+                        herdr,
+                        "w1:p1",
+                        "@prompt",
+                        "agent",
+                        until=("working", "idle"),
+                        sleep=lambda _s: None,
+                    )
+                except (lch.PromptNotSubmitted, lch.PromptSubmissionUnobservable):
+                    pass
+                self.assertEqual(herdr.count("pane", "send-text"), 1)
+
+    def test_observation_stops_at_the_first_proof(self):
+        """Observed exactly once, then nothing further is spent: no extra
+        Enter, no extra wait, no extra round. Proof is the record, not the
+        revision tick from paste."""
+        herdr = FakeHerdr(stalls=1, status_ok=False)
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=lambda _s: None,
+            submission_recorded=_recorded_after_agent_enters(herdr, 1),
+        )
+        self.assertEqual(herdr.count("agent", "send-keys"), 1)
+        self.assertEqual(herdr.count("agent", "wait"), 1)
+
+    def test_a_failure_that_is_not_a_stall_still_propagates(self):
+        """The offer's other failures are not submission facts and are not
+        swallowed into the recovery loop."""
+
+        class Broken(FakeHerdr):
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("pane", "send-text"):
+                    self.calls.append(argv)
+                    raise RuntimeError("LAUNCH_REFUSED:agent_not_found")
+                return super().__call__(*argv, **kwargs)
+
+        herdr = Broken(status_ok=False)
+        with self.assertRaises(RuntimeError) as caught:
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        self.assertIn("agent_not_found", str(caught.exception))
+        self.assertEqual(herdr.count("agent", "send-keys"), 0)
+
+
+class PasteRepaintIsNotSubmissionTests(unittest.TestCase):
+    """§7.6 — the pane revision cannot prove submission, because the paste moves it.
+
+    Recorded failure, 2026-08-27, run-8d1a71f463e4430f92a125a8f8b3731d. A grok
+    builder pane sat at revision **1** holding `@<prompt>` in its composer,
+    unsubmitted, while the console showed the lane RUNNING/BUILDING and the
+    scheduler waited on a turn no actor had started. The node had already
+    blocked once as `ENVIRONMENTAL_BUDGET_EXHAUSTED` with receipt
+    `NEVER_STARTED` on the same mechanism.
+
+    The revision was not stuck. It was *correct*: `pane get` counts repaints,
+    and pasting the prompt into a composer is a repaint. Baseline 0 on an empty
+    booted composer, paste, read 1 -- `current > baseline` -- and
+    `submit_agent_prompt` returned success without pressing Enter even once.
+    One Enter pressed by hand afterwards started the turn and drove that same
+    counter past 1000 in four seconds.
+
+    So the counter separates nothing, and no threshold over it can: a stalled
+    pane and a submitted one both show `+1` immediately after the paste. This
+    is the same shape as the `idle` failure this file opens with and the
+    `working` failure that replaced it -- a signal that moves for both
+    outcomes. The proof has to be an artifact only an accepted turn produces,
+    and the agent runtime's own transcript record is one.
+    """
+
+    def setUp(self):
+        self._grace = lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
+        lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = 0.05
+
+    def tearDown(self):
+        lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = self._grace
+
+    class RepaintingPane:
+        """A pane whose revision ticks once for the paste and never again.
+
+        This is the production observation, not a contrivance: a composer that
+        swallowed the text renders it, and renders nothing further.
+        """
+
+        def __init__(self, transcript: Path, marker: str, submit_on_enter: bool):
+            self.transcript = transcript
+            self.marker = marker
+            self.submit_on_enter = submit_on_enter
+            self.revision = 0
+            self.enters = 0
+
+        def __call__(self, *argv, **kwargs):
+            head = tuple(argv[:2])
+            if head == ("pane", "send-text"):
+                self.revision += 1  # the paste repaints the pane
+                return {"result": {"type": "ok"}}
+            if head == ("agent", "send-keys"):
+                self.enters += 1
+                if self.submit_on_enter:
+                    with self.transcript.open("a", encoding="utf-8") as sink:
+                        sink.write('{"role":"user","text":"%s"}\n' % self.marker)
+                return {"result": {"type": "ok"}}
+            if head == ("pane", "get"):
+                return {"result": {"pane": {"revision": self.revision}}}
+            if head == ("agent", "get"):
+                return {"result": {"agent": {
+                    "agent_status": "working", "status": None,
+                }}}
+            if head == ("agent", "wait"):
+                return {"result": {"type": "ok"}}
+            return {"result": {"type": "ok"}}
+
+    def _handle(self, transcript: Path) -> lch.LaunchHandle:
+        return lch.LaunchHandle("tok", "w1:p1", "maestro-test", transcript.parent,
+                                transcript_path=transcript)
+
+    def test_a_repaint_tick_is_refused_when_the_transcript_never_records_the_turn(self):
+        with tempfile.TemporaryDirectory() as root:
+            prompt = Path(root) / "prompt.md"
+            prompt.write_text("do the work", encoding="utf-8")
+            transcript = Path(root) / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            handle = self._handle(transcript)
+            herdr = self.RepaintingPane(
+                transcript, "@" + str(prompt.resolve()), submit_on_enter=False
+            )
+            with self.assertRaises(lch.PromptNotSubmitted):
+                lch.submit_agent_prompt(
+                    herdr,
+                    "w1:p1",
+                    "@" + str(prompt.resolve()),
+                    "maestro-test",
+                    timeout_s=6.0,
+                    until=("working", "idle"),
+                    working_proves=True,
+                    sleep=lambda _: None,
+                    submission_recorded=lch._rising_submission_record(handle, prompt),
+                )
+            # The revision did advance, and it proved nothing.
+            self.assertEqual(herdr.revision, 1)
+
+    def test_the_recovery_enter_runs_instead_of_being_skipped_by_the_repaint(self):
+        with tempfile.TemporaryDirectory() as root:
+            prompt = Path(root) / "prompt.md"
+            prompt.write_text("do the work", encoding="utf-8")
+            transcript = Path(root) / "session.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            handle = self._handle(transcript)
+            herdr = self.RepaintingPane(
+                transcript, "@" + str(prompt.resolve()), submit_on_enter=True
+            )
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@" + str(prompt.resolve()),
+                "maestro-test",
+                timeout_s=6.0,
+                until=("working", "idle"),
+                working_proves=True,
+                sleep=lambda _: None,
+                submission_recorded=lch._rising_submission_record(handle, prompt),
+            )
+            self.assertGreaterEqual(herdr.enters, 1)
+
+    def test_a_previous_turns_record_for_the_same_prompt_path_is_not_this_turns_proof(self):
+        """One actor is re-prompted across a correction cycle, reusing the path."""
+        with tempfile.TemporaryDirectory() as root:
+            prompt = Path(root) / "prompt.md"
+            prompt.write_text("do the work", encoding="utf-8")
+            transcript = Path(root) / "session.jsonl"
+            marker = "@" + str(prompt.resolve())
+            transcript.write_text(
+                '{"role":"user","text":"%s"}\n' % marker, encoding="utf-8"
+            )
+            handle = self._handle(transcript)
+            herdr = self.RepaintingPane(transcript, marker, submit_on_enter=False)
+            with self.assertRaises(lch.PromptNotSubmitted):
+                lch.submit_agent_prompt(
+                    herdr,
+                    "w1:p1",
+                    marker,
+                    "maestro-test",
+                    timeout_s=6.0,
+                    until=("working", "idle"),
+                    working_proves=True,
+                    sleep=lambda _: None,
+                    submission_recorded=lch._rising_submission_record(handle, prompt),
+                )
+
+
+class ColdBootAdmissionFacts(unittest.TestCase):
+    """Regression locks for the 2026-08-27 cold-boot admission facts."""
+
+    def test_admission_prompt_is_the_literal_marker_not_the_team_prefix(self):
+        from adw_modules import route_admission as ra
+
+        source = inspect.getsource(ra.capture_route)
+        self.assertIn("FIRST_PROMPT.format", source)
+        self.assertNotIn("prepare_route_prompt_text(", source)
+        self.assertNotIn("/team", ra.FIRST_PROMPT)
+        prompt_turn = inspect.getsource(ra._prompt_turn)
+        self.assertNotIn("prepare_route_prompt_text(", prompt_turn)
+
+    def test_admission_herdr_treats_empty_stdout_as_success(self):
+        from adw_modules import route_admission as ra
+
+        source = inspect.getsource(ra._herdr)
+        self.assertIn('or "{}"', source)
+
+    def test_claude_admission_keeps_typed_working_as_fallback(self):
+        from adw_modules import route_admission as ra
+
+        source = inspect.getsource(ra._prompt_turn)
+        self.assertIn("working_proves", source)
+        self.assertIn('agent.get("agent_status")', source)
+        self.assertIn("submission_recorded=_submitted", source)
+        self.assertNotIn("submission_recorded = _submitted if working_proves else None", source)

@@ -504,6 +504,24 @@ def inventory_at_commit(repo: Path, sha: str) -> Inventory:
     return inv
 
 
+def attempt_worktree_exists(
+    worktrees_root: Path, run_id: str, node_id: str, attempt_no: int
+) -> bool:
+    """Whether this exact generation's checkout is still on disk.
+
+    `reopen_attempt_worktree` refuses a missing one and `create_attempt_worktree`
+    refuses an existing one, so the caller that may meet either -- a same-attempt
+    recovery, whose checkout §8.8's cleanup may or may not have removed -- has to
+    ask before it chooses. Asked of the path the two of them compute the same way,
+    rather than of git's worktree list: an entry git still administers for a
+    directory that is gone is not a checkout anything can reopen.
+    """
+    path = Path(worktrees_root).resolve() / worktree_dirname(
+        run_id, node_id, attempt_no
+    )
+    return path.is_dir()
+
+
 def reopen_attempt_worktree(
     repo: Path,
     run_id: str,
@@ -858,7 +876,12 @@ def scratch_env(
             pytest_worker_cap(lanes, cores), cache_dir
         )
     values = {
-        "XDG_CACHE_HOME": str(scratch / "xdg"),
+        # `XDG_CACHE_HOME` was here until 2026-08-27. It names a directory
+        # tools read as well as write, and a pane's login shell reads its
+        # credentials through it, so redirecting it removed the shell's own
+        # secret bootstrap and launched agents with no usable model. See
+        # `launcher.SCRATCH_ENV_KEYS`, which this set is asserted equal to
+        # below -- the two move together or not at all.
         "TMPDIR": str(scratch / "tmp"),
         "PYTHONPYCACHEPREFIX": str(scratch / "pycache"),
         "PYTEST_ADDOPTS": addopts,
@@ -893,7 +916,7 @@ def launch_env(
     """
     env = dict(os.environ if base is None else base)
     redirected = scratch_env(scratch, concurrency=concurrency, cpu_count=cpu_count)
-    for key in ("XDG_CACHE_HOME", "TMPDIR", "PYTHONPYCACHEPREFIX", "npm_config_cache"):
+    for key in ("TMPDIR", "PYTHONPYCACHEPREFIX", "npm_config_cache"):
         Path(redirected[key]).mkdir(parents=True, exist_ok=True)
     cache_dir = redirected["PYTEST_ADDOPTS"].split("cache_dir=", 1)[1].split()[0]
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
