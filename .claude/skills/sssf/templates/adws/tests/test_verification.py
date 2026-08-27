@@ -229,7 +229,6 @@ class AgentNodeVerificationTests(unittest.TestCase):
         repository still passes as a whole; that claim is made once, by the
         integration gate at the final head."""
         self.assertIn("integration gate", vf.verify_agent_node.__doc__)
-        self.assertFalse(self.ok().asserts_repository_wide)
 
 
 # ── §7.3 the code-node predicate ────────────────────────────────────────────

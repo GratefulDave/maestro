@@ -32,8 +32,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from . import worktree as wt
-
 
 # ── §7.3 states, and the two kinds of terminal ──────────────────────────────
 
@@ -102,9 +100,6 @@ ABSOLUTELY_TERMINAL: Tuple[NodeState, ...] = (
     NodeState.ACCEPTED,
     NodeState.CANCELLED,
 )
-
-#: Operator action may unblock these; they are stopped, not immutable.
-OPERATOR_TERMINAL: Tuple[NodeState, ...] = (NodeState.BLOCKED,)
 
 #: States that stop a node without merging source output. Shared with the
 #: merge frontier so cascade semantics cannot drift from lifecycle semantics.
@@ -384,12 +379,6 @@ class MergeCause(str, Enum):
     OPERATOR_ACCEPTED = "OPERATOR_ACCEPTED"
 
 
-#: The merge causes that carry no evidence chain of their own (§1.1 item 4),
-#: so an audit looking for merges whose evidence must be established some
-#: other way reads this list rather than naming the member. Data rather than
-#: a branch, exactly as `REOPENABLE_CANCEL_CAUSES` is.
-UNEVIDENCED_MERGE_CAUSES: Tuple[MergeCause, ...] = (MergeCause.OPERATOR_ACCEPTED,)
-
 #: What a reader says about a `MERGED` node whose cause was never recorded:
 #: a row written before the column existed. It is deliberately **not** a
 #: `MergeCause` member, because it is the absence of the fact rather than a
@@ -573,14 +562,8 @@ class BlockReason(str, Enum):
 #: answer (§7.5). Without a dedicated reason each of these falls to the
 #: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
 #: then blocks with an infra-flavoured reason for what is a fact about content.
-#: Named as a set rather than behind a predicate. An `is_retryable(reason)`
-#: helper stood here and had no production caller for as long as it existed:
-#: production decides retryability from the `RetryClass` at classification
-#: time — `classify` returns a `block_reason` for exactly these and a
-#: `retry_class` for everything else, so by the time a `BlockReason` exists
-#: the decision is already made and asking it again is a second representation
-#: of one fact (RC1). The tuple stays because §7.5's membership rule is a
-#: statement worth naming and testing; the predicate over it does not.
+#: Named as a set rather than behind a predicate. The tuple stays because
+#: §7.5's membership rule is a statement worth naming and testing.
 NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.GATE_NOT_FALSIFIABLE,
     BlockReason.CODE_NODE_NO_EFFECT,
@@ -1051,21 +1034,6 @@ class PlanNode:
                     "for (§7.3); a threshold here is a number nothing reads"
                 )
 
-    def to_record(self, state: NodeState) -> "wt.NodeRecord":
-        """Project onto the merge protocol's record (§7.1, §8.5).
-
-        A projection, not a conversion: every field is copied unchanged, so
-        re-projecting at the same digest and diffing the rows makes a bug in
-        this function observable rather than silent.
-        """
-        return wt.NodeRecord(
-            node_id=self.node_id,
-            depth=self.depth,
-            needs=tuple(self.needs),
-            state=NodeState(state).value,
-            specs=tuple(self.specs),
-        )
-
 
 # ── §11.2 configuration, and the bound preflight enforces ───────────────────
 
@@ -1159,11 +1127,6 @@ class SchedulerConfig:
         window has no run row, so it is not one of them."""
         return max(self.node_timeout_s, self.final_acceptance_timeout_s)
 
-    @property
-    def pane_limit(self) -> int:
-        """§7.2 — the concurrency limit is also the pane limit, because one
-        in-flight node holds at most one launch."""
-        return self.concurrency
 
     def retry_budget(self, retry_class: RetryClass) -> int:
         """The non-semantic budgets. SEMANTIC is absent deliberately: its

@@ -529,13 +529,10 @@ class ReviewProjectionTests(SchedulerFixture):
         )
         self.assertNotIn("code::review", scheduler.nodes)
         tests_review = scheduler.nodes["tests::review"]
-        self.assertIs(tests_review.kind, st.NodeKind.REVIEW)
         self.assertEqual(tests_review.review_of, "tests")
         build_review = scheduler.nodes["build::review"]
-        self.assertIs(build_review.kind, st.NodeKind.REVIEW)
         self.assertEqual(build_review.review_of, "build")
         self.assertEqual(build_review.needs, ("build",))
-        self.assertEqual(build_review.outputs, ())
         self.assertEqual(build_review.depth, scheduler.nodes["build"].depth + 1)
 
     def test_downstream_projection_passes_through_review_edge(self):

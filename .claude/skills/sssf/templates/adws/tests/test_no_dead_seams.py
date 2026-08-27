@@ -165,19 +165,12 @@ ALLOWED: Dict[str, str] = {
     # so nothing is unreachable behind them.
     "scheduler_types.exits_for": "§11.3 property table: every block_reason "
     "admits an exit, proven from tests",
-    "scheduler_types.pane_limit": "§7.2 identity — concurrency IS the pane "
-    "limit; production enforces it through "
-    "config.concurrency (scheduler.py:460, :503) "
-    "and the test asserts the two agree",
-    "finalization.graded_cells": "derived view of the matrix, asserted in tests",
     "finalization_window.opened_at_monotonic": "accessor over the private "
     "_opened_at_monotonic that "
     "production maintains",
     "participant.active_participant_ids": "accessor over the runner's live "
     "process map, asserted in tests",
     "scheduler.integration_untested": "derived flag on RunReport, asserted in tests",
-    "verification.asserts_repository_wide": "derived predicate over a gate "
-    "spec, asserted in tests",
     "worktree.is_empty": "derived predicate over InventoryDelta",
     # ── DEFERRED — audited, owner assigned, fix not yet landed ──────────────
     # Rows D1-D11 of the dead-seam audit. Each is a real instance of this
@@ -216,18 +209,6 @@ ALLOWED: Dict[str, str] = {
     # `SchedulerDeps.integration_min_cases`, and the per-run scalar this
     # registry named was deleted rather than wired.)
     # D3 / D4 / D5. retry_policy.py, under investigation; do not delete.
-    "retry_policy.semantic_budget_exhausted": "DEFERRED D3: §7.5's ceiling, "
-    "duplicated by the scheduler's "
-    "inline check and off by one "
-    "from it. Which is correct is "
-    "an open ruling.",
-    "retry_policy.review_budget_exhausted": "DEFERRED D3: same shape as the "
-    "semantic ceiling above.",
-    "retry_policy.semantic_attempts_at_base": "DEFERRED D4: §7.5's "
-    "(node_id, base_sha) "
-    "prompt-mutation scope. Its "
-    "companion predicate is wired "
-    "now; this half still is not.",
     "retry_policy.classify_git_exit": "DEFERRED D9: merge-path git exit "
     "classification, no production caller.",
     # D2 / D7 / D8 / D9. (D1, and the D4, D5, D7 and D9 rows that stood here,
@@ -239,10 +220,6 @@ ALLOWED: Dict[str, str] = {
     "(scheduler._record_result) while this reader "
     "still has no production caller. Run status "
     "renders from the table; nothing audits it.",
-    "scheduler_types.is_retryable": "DEFERRED D8: production decides "
-    "retryability from RetryClass, never from "
-    "BlockReason.",
-    "scheduler_types.to_record": "DEFERRED D9: superseded PlanNode converter.",
     "route_receipts.load_public_key": "DEFERRED D9: production derives keys via "
     "crypto.seed_to_public_key instead.",
     # Audited instances of this same class that sit on the deliver, workspace,
@@ -276,8 +253,6 @@ ALLOWED: Dict[str, str] = {
     # with that lane; `launcher_failure` itself is already wired.
     "FailureSignal.binary_resolved": "DEFERRED: launcher-classification lane",
     "FailureSignal.process_started": "DEFERRED: launcher-classification lane",
-    "FailureSignal.code_effect": "DEFERRED: launcher-classification lane",
-    "CodeEffect.exit_zero": "DEFERRED: launcher-classification lane",
     # Constructor slots whose every production call site is `lambda ...: None`.
     # The field check cannot see these: the lambda *is* a writer. Naming them
     # here is the point of #99 — a deliberate or deferred no-op must be stated

@@ -276,7 +276,6 @@ class ReviewerSession:
     pid: Optional[int] = None
     launched_at: Optional[float] = None
     opened_at_epoch: float = 0.0
-    turn_count: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -541,7 +540,6 @@ class FinalizationWindow:
         elif record_count > self._turn_observed_count:
             self._turn_observed_count = record_count
             self._turn_observed_at = self._time_source()
-        session.turn_count = self._turn_observed_count
 
         now = self._time_source()
         status: Optional[str] = None

@@ -1393,7 +1393,7 @@ class ReviewObjectTests(unittest.TestCase):
         matrix = fin.compute_matrix(
             cr.CODE_RUBRIC, "c" * 64, cr.review_objects(("a.py",), OUTPUT_SHA)
         )
-        graded = {(c.check_id, c.object_id) for c in matrix.graded_cells}
+        graded = {(c.check_id, c.object_id) for c in matrix.cells if not c.is_canary}
         self.assertIn(
             ("diff.implements_the_stated_instruction", f"diff:{OUTPUT_SHA}"), graded
         )
@@ -1427,7 +1427,7 @@ class ReviewObjectTests(unittest.TestCase):
             "c" * 64,
             (fin.ReviewObject(object_id="diff:abc", kind=fin.ObjectKind.DIFF),),
         )
-        self.assertEqual(matrix.graded_cells, ())
+        self.assertFalse(any(not c.is_canary for c in matrix.cells))
 
 
 # ── §8.3: the reviewer's pane carries the redirection too ───────────────────

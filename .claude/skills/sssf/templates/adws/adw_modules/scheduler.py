@@ -514,8 +514,6 @@ class _DerivedReviewNode:
     review_of: str
     depth: int
     needs: Tuple[str, ...]
-    kind: st.NodeKind = st.NodeKind.REVIEW
-    outputs: Tuple[str, ...] = ()
     specs: Tuple[str, ...] = ()
 
 

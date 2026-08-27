@@ -55,7 +55,6 @@ from .scheduler_types import (
     ReviewVerdict,
     SchedulerConfig,
 )
-from .worktree import PermissionVerdict
 
 
 # ── §7.5 structural inputs — every field a fact, never process output text ──
@@ -81,14 +80,6 @@ class GateOutcome:
     pre_gate_failed: bool
     post_gate_passed: bool
 
-
-@dataclass(frozen=True)
-class CodeEffect:
-    """§7.3's code-node clause: exit code and whether the diff is empty."""
-
-    exit_zero: bool
-    diff_empty: bool
-    expects_changes: bool
 
 
 class LauncherFailure(str, Enum):
@@ -154,8 +145,6 @@ class FailureSignal:
     process_started: bool = True
     report: Optional[ReportOutcome] = None
     gate: Optional[GateOutcome] = None
-    permission: Optional[PermissionVerdict] = None
-    code_effect: Optional[CodeEffect] = None
     launcher_failure: Optional[LauncherFailure] = None
 
 
@@ -198,32 +187,17 @@ class Classification:
 def classify(signal: FailureSignal) -> Classification:
     """Structural, never lexical (§7.5). Evaluated in the order §7.3 and §7.4
     define the underlying predicates: the gate's own falsifiability first
-    (§7.4), then the permission check that is measured before anything else
-    is even committed (§8.3), then the code node's declared expectation
-    (§7.3), then content-level failure (SEMANTIC), then launch failure
+    (§7.4), then content-level failure (SEMANTIC), then launch failure
     (LAUNCHER_TRANSIENT), and only once nothing structural matched, the
     fail-closed ENVIRONMENTAL default.
     """
-    # ── the three failures that fit no retry class at all (§7.3, §7.5) ──────
+    # ── the failure that fits no retry class at all (§7.4, §7.5) ──────
     if (
         signal.node_kind is NodeKind.AGENT
         and signal.gate is not None
         and not signal.gate.pre_gate_failed
     ):
         return Classification(block_reason=BlockReason.GATE_NOT_FALSIFIABLE)
-
-    if signal.permission is not None and not signal.permission.passes:
-        if signal.node_kind is NodeKind.CODE:
-            return Classification(block_reason=BlockReason.PERMISSION_SCOPE_VIOLATION)
-        # An agent node's clause-4 failure is deliberately not in this
-        # family: an agent is not deterministic, and a retry prompt naming
-        # the offending paths is genuinely new instructions (§7.5).
-        return Classification(retry_class=RetryClass.SEMANTIC)
-
-    if signal.node_kind is NodeKind.CODE and signal.code_effect is not None:
-        ce = signal.code_effect
-        if ce.exit_zero and ce.expects_changes and ce.diff_empty:
-            return Classification(block_reason=BlockReason.CODE_NODE_NO_EFFECT)
 
     # ── SEMANTIC: a parseable failing report, or a failed post-node gate ────
     if signal.report is not None and signal.report.parsed and signal.report.failed:
@@ -277,24 +251,6 @@ def classify_with_containment(
 
 
 # ── §7.5 the semantic budget, both halves ────────────────────────────────────
-
-
-def semantic_attempts_at_base(
-    attempts: Iterable[AttemptRecord], node_id: str, base_sha: str
-) -> int:
-    """The `(node_id, base_sha)` prompt-mutation scope (§7.5).
-
-    A new base is genuinely new evidence, so this re-arms with no counter to
-    clear and no reset event to fire — it is a `COUNT(*)` over the attempt
-    rows that already exist, derived from a stored fact rather than a flag.
-    """
-    return sum(
-        1
-        for a in attempts
-        if a.node_id == node_id
-        and a.base_sha == base_sha
-        and a.retry_class is RetryClass.SEMANTIC
-    )
 
 
 def semantic_attempts_total(attempts: Iterable[AttemptRecord], node_id: str) -> int:
@@ -469,26 +425,6 @@ def guidance_extra_verification(detail: Optional[dict]) -> Dict[str, Any]:
     }
 
 
-def guidance_extra_review(review: object) -> Dict[str, Any]:
-    """The typed REVIEW entry, as the attempt row stores it."""
-    guidance = review_guidance(review)
-    return {
-        GUIDANCE_KEY: {
-            "surface": "review",
-            "subject_digest": guidance.subject_digest,
-            "findings": [
-                {
-                    "check_id": finding.check_id,
-                    "object_id": finding.object_id,
-                    "message": finding.message,
-                    "blocking": finding.blocking,
-                }
-                for finding in guidance.findings
-            ],
-        }
-    }
-
-
 def _verification_from_payload(payload: Mapping[str, Any]) -> VerificationGuidance:
     """One durable VERIFICATION entry, rebuilt from its stored payload.
 
@@ -618,24 +554,6 @@ def launcher_retry_budget(
 #   newest review, and rendering truncates deterministically to a character
 #   budget without ever dropping a surface. Attempt counts stay bounded by the
 #   untouched semantic and review ceilings; the ledger adds no loop.
-#
-# A new acceptance surface later means a new enum member and a new slot on the
-# ledger — the same scoping rule §1.1 item 4 applies to evidence chains, so a
-# new surface extends the structure rather than borrowing another's slot.
-
-
-class AcceptanceSurface(str, Enum):
-    """The independent predicates that can reject an attempt and recycle it.
-
-    One member per surface that mutates the retry prompt. `VERIFICATION` is
-    the §8.3 predicate (clauses 1–4, including the pre-commit permission
-    check); `REVIEW` is the cross-vendor reviewer. Launcher and environmental
-    failures never mutate the prompt (§7.5), so they have no member here.
-    """
-
-    VERIFICATION = "verification"
-    REVIEW = "review"
-
 
 @dataclass(frozen=True)
 class VerificationGuidance:

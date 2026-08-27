@@ -67,8 +67,6 @@ class StatesTests(unittest.TestCase):
             set(st.ABSOLUTELY_TERMINAL),
             {st.NodeState.MERGED, st.NodeState.ACCEPTED, st.NodeState.CANCELLED},
         )
-        self.assertEqual(set(st.OPERATOR_TERMINAL), {st.NodeState.BLOCKED})
-        self.assertFalse(set(st.ABSOLUTELY_TERMINAL) & set(st.OPERATOR_TERMINAL))
 
     def test_terminal_without_merge_matches_the_merge_protocol(self):
         """One representation of the cascade set, shared with §8.5's frontier.
@@ -143,12 +141,6 @@ class RetryClassTests(unittest.TestCase):
                 st.BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
             },
         )
-        # The `is_retryable(reason)` predicate that stood here was deleted: it
-        # had no production caller, because `classify` already decides
-        # retryability from the RetryClass at classification time and a
-        # BlockReason only exists once that decision has been made. What the
-        # membership means operationally is asserted where it is observable —
-        # `test_non_retryable_reasons_do_not_offer_retry` below.
 
 
 # ── §11.3 every stored block reason has a real exit ─────────────────────────
@@ -251,7 +243,7 @@ class BlockReasonExitTests(unittest.TestCase):
 
         `_EXITS` is the module's only enum-keyed *table* — a structure whose
         contract is that it answers for every member — which is why a member
-        can go missing from it. The other seven module-level constants derived
+        can go missing from it. The other five module-level constants derived
         from an enum are deliberately partial: each names the subset of its
         enum for which some property holds, so a member's absence is the
         answer `no`, not a gap. What they can still get wrong is holding a
@@ -260,13 +252,11 @@ class BlockReasonExitTests(unittest.TestCase):
         subsets = {
             "LANE_PHASE_TERMINAL": (st.LANE_PHASE_TERMINAL, st.LanePhase),
             "ABSOLUTELY_TERMINAL": (st.ABSOLUTELY_TERMINAL, st.NodeState),
-            "OPERATOR_TERMINAL": (st.OPERATOR_TERMINAL, st.NodeState),
             "TERMINAL_WITHOUT_MERGE": (st.TERMINAL_WITHOUT_MERGE, st.NodeState),
             "REOPENABLE_CANCEL_CAUSES": (
                 st.REOPENABLE_CANCEL_CAUSES,
                 st.CancelCause,
             ),
-            "UNEVIDENCED_MERGE_CAUSES": (st.UNEVIDENCED_MERGE_CAUSES, st.MergeCause),
             "NON_RETRYABLE": (st.NON_RETRYABLE, st.BlockReason),
         }
         for name, (members, enum) in subsets.items():
@@ -360,23 +350,6 @@ class PlanNodeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.agent(needs=("n1",))
 
-    def test_projects_to_the_merge_protocol_record(self):
-        """§7.1 — one authored node type, projected, never converted."""
-        node = self.agent(depth=2, needs=("a", "b"), specs=("tests/test_n1.py",))
-        record = node.to_record(st.NodeState.VERIFIED)
-        self.assertIsInstance(record, wt.NodeRecord)
-        self.assertEqual(record.node_id, "n1")
-        self.assertEqual(record.depth, 2)
-        self.assertEqual(record.needs, ("a", "b"))
-        self.assertEqual(record.state, "VERIFIED")
-        self.assertEqual(record.specs, ("tests/test_n1.py",))
-
-    def test_projection_is_reprojectable_and_stable(self):
-        """§7.1 — re-project at the same digest and diff the rows."""
-        node = self.agent()
-        self.assertEqual(
-            node.to_record(st.NodeState.PENDING), node.to_record(st.NodeState.PENDING)
-        )
 
 
 # ── §11.2 the liveness bound preflight enforces ─────────────────────────────
@@ -442,10 +415,6 @@ class SchedulerConfigTests(unittest.TestCase):
         semantic failure, which is a different design, not a configuration."""
         with self.assertRaises(ValueError):
             self.cfg(semantic_ceiling=0)
-
-    def test_concurrency_is_also_the_pane_limit(self):
-        """§7.2 — one in-flight node holds at most one launch."""
-        self.assertEqual(self.cfg(concurrency=6).pane_limit, 6)
 
 
 # ── §7.7 results adjudication vocabulary ────────────────────────────────────

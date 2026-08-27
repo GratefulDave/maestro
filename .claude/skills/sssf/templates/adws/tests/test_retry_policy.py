@@ -12,8 +12,6 @@ The tests below are the agreement, executed:
   §7.5   only git's documented not-found exit code means "object absent"
   §7.5   an unclassified exception defaults ENVIRONMENTAL, fail-closed
   §7.5   no infra fault decrements the semantic budget
-  §7.3   three failures classify to no retry class at all, not ENVIRONMENTAL
-  §7.5   an agent node's clause-4 failure is SEMANTIC, a code node's is not
   §7.5   the semantic budget: prompt-mutation scope vs. the cumulative ceiling
   §7.5   `retry --force` grants exactly one attempt beyond the ceiling
 
@@ -33,7 +31,6 @@ sys.path.insert(0, str(ADWS))
 from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
-from adw_modules import worktree as wt  # noqa: E402
 
 
 def make_cfg(**overrides):
@@ -58,14 +55,6 @@ class CeilingProbe:
     """A `Scheduler` reduced to what `_semantic_ceiling_reached` reads.
 
     §7.5's cumulative ceiling has exactly one enforcer, and it is that method.
-    A pure `retry_policy.semantic_budget_exhausted` stated the same rule from
-    the outside, had no production caller, and disagreed with the enforcer by
-    one: it counted only the attempt rows that already existed, while the
-    scheduler also counts the attempt failing right now, whose row is written
-    by the very call the decision gates. Testing the unused copy proved
-    nothing about a run, so it was deleted and these tests were re-pointed
-    here — the production method is invoked unbound against this object, so
-    what executes is the rule the scheduler executes.
 
     It reads three things: `run_id`, `config`, and `deps.store.attempts_for`.
     """
@@ -135,24 +124,6 @@ class ClassifyTests(unittest.TestCase):
         self.assertIsNone(result.retry_class)
         self.assertIn(result.block_reason, st.NON_RETRYABLE)
 
-    def test_code_node_no_effect(self):
-        """§7.3 — exit zero, empty diff, expects_changes True: not ENVIRONMENTAL,
-        not SEMANTIC, and not silently VERIFIED. Dedicated, non-retryable."""
-        signal = rp.FailureSignal(
-            node_kind=st.NodeKind.CODE,
-            code_effect=rp.CodeEffect(exit_zero=True, diff_empty=True, expects_changes=True))
-        result = rp.classify(signal)
-        self.assertEqual(result.block_reason, st.BlockReason.CODE_NODE_NO_EFFECT)
-        self.assertIn(result.block_reason, st.NON_RETRYABLE)
-
-    def test_idempotent_node_with_default_expectation_is_not_no_effect(self):
-        """§7.3 — expects_changes defaults false; an empty diff there is the
-        assertive node's normal result, not a violation."""
-        signal = rp.FailureSignal(
-            node_kind=st.NodeKind.CODE,
-            code_effect=rp.CodeEffect(exit_zero=True, diff_empty=True, expects_changes=False))
-        result = rp.classify(signal)
-        self.assertNotEqual(result.block_reason, st.BlockReason.CODE_NODE_NO_EFFECT)
 
     def test_launcher_transient_from_pane_allocation(self):
         signal = rp.FailureSignal(node_kind=st.NodeKind.AGENT,
@@ -182,39 +153,6 @@ class ClassifyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rp.Classification()
 
-
-# ── §7.5 the clause-4 asymmetry — the subtlest rule ──────────────────────────
-
-class ClauseFourAsymmetryTests(unittest.TestCase):
-    """A code node's undeclared write blocks PERMISSION_SCOPE_VIOLATION with
-    zero retries. An agent node's undeclared write classifies SEMANTIC, never
-    ENVIRONMENTAL — because an agent is not deterministic and a retry prompt
-    naming the offending paths is genuinely new instructions (§7.5)."""
-
-    def failing_verdict(self):
-        return wt.PermissionVerdict(passes=False, conjunct1_violations=("scratch/junk",))
-
-    def test_code_node_clause_four_failure_is_permission_scope_violation(self):
-        signal = rp.FailureSignal(node_kind=st.NodeKind.CODE, permission=self.failing_verdict())
-        result = rp.classify(signal)
-        self.assertEqual(result.block_reason, st.BlockReason.PERMISSION_SCOPE_VIOLATION)
-        self.assertIsNone(result.retry_class)
-        self.assertIn(result.block_reason, st.NON_RETRYABLE)
-
-    def test_agent_node_clause_four_failure_is_semantic(self):
-        signal = rp.FailureSignal(node_kind=st.NodeKind.AGENT, permission=self.failing_verdict())
-        result = rp.classify(signal)
-        self.assertEqual(result.retry_class, st.RetryClass.SEMANTIC)
-        self.assertIsNone(result.block_reason)
-        self.assertTrue(st.mutates_prompt(result.retry_class))
-
-    def test_passing_verdict_triggers_neither(self):
-        passing = wt.PermissionVerdict(passes=True)
-        for kind in (st.NodeKind.AGENT, st.NodeKind.CODE):
-            signal = rp.FailureSignal(node_kind=kind, permission=passing)
-            result = rp.classify(signal)
-            self.assertNotEqual(result.block_reason, st.BlockReason.PERMISSION_SCOPE_VIOLATION)
-            self.assertNotEqual(result.retry_class, st.RetryClass.SEMANTIC)
 
 
 # ── §7.5 containment: an unclassified failure is still classified ───────────
@@ -279,18 +217,6 @@ class NoInfraBudgetDecrementTests(unittest.TestCase):
 
 class SemanticBudgetTests(unittest.TestCase):
 
-    def test_prompt_mutation_scope_is_per_node_and_base(self):
-        """(node_id, base_sha) re-arms with no counter to clear: it is a
-        COUNT(*) over the stored rows, derived from a stored fact."""
-        attempts = [
-            make_attempt("n1", "b1", 1, st.RetryClass.SEMANTIC),
-            make_attempt("n1", "b2", 2, st.RetryClass.SEMANTIC),
-            make_attempt("n1", "b2", 3, st.RetryClass.SEMANTIC),
-        ]
-        self.assertEqual(rp.semantic_attempts_at_base(attempts, "n1", "b1"), 1)
-        self.assertEqual(rp.semantic_attempts_at_base(attempts, "n1", "b2"), 2)
-        self.assertEqual(rp.semantic_attempts_at_base(attempts, "n1", "b3"), 0)
-
     def test_the_ceiling_stops_the_refund_loop(self):
         """Without the cumulative ceiling, every unrelated merge mints a new
         base_sha and re-arms the per-base scope, so total spend scales with
@@ -301,9 +227,6 @@ class SemanticBudgetTests(unittest.TestCase):
         for i in range(10):
             base = f"base{i}"
             attempts.append(make_attempt("n1", base, i, st.RetryClass.SEMANTIC))
-            # per-base scope alone always reports exactly 1 failure — looks
-            # "re-armed" on every single merge, forever.
-            self.assertEqual(rp.semantic_attempts_at_base(attempts, "n1", base), 1)
 
         self.assertEqual(rp.semantic_attempts_total(attempts, "n1"), 10)
         self.assertTrue(ceiling_reached(cfg, "n1", attempts))
