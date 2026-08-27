@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <title>Maestro plan flow · Deterministic PASS receipt</title>
+  <title>Plan ship · validate and finalize</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;   /* deep warm charcoal */
-      --color-ink:     #f5f5f5;   /* warm off-white */
-      --color-muted:   #bfc0c0;   /* silver */
-      --color-accent:  #f08a59;   /* accent */
+      --color-paper:   #2d3142;
+      --color-ink:     #f5f5f5;
+      --color-muted:   #bfc0c0;
+      --color-accent:  #f08a59;
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -59,11 +59,11 @@
 <body>
   <div class="frame">
     <p class="eyebrow">Flowchart · Maestro</p>
-    <h1>Maestro plan flow · Deterministic PASS receipt</h1>
+    <h1>Plan ship · validate and finalize</h1>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="31-flow-plan-title 31-flow-plan-desc">
-      <title id="31-flow-plan-title">Maestro plan flow · Deterministic PASS receipt</title>
-      <desc id="31-flow-plan-desc">Flowchart of Maestro plan verbs: gate and review operate on a Plan IR already on disk, then ship composes author, validate, and finalize. Contract admission runs inside project_draft during author/ship and refuses a claim no declared fixture can witness with CLAIM_UNWITNESSABLE; an ineligible plan stops at AUTHORING_BLOCKED with no receipt; validate runs 15 obligations including TESTS_BUILD_PAIRED; finalize dispatches no reviewer, writing the signed PASS receipt on deterministic validation alone under rubric maestro-deterministic.v1.</desc>
+      <title id="31-flow-plan-title">Plan ship · validate and finalize</title>
+      <desc id="31-flow-plan-desc">Plan ship composes author, validate, and finalize. Authoring may declare maestro-plan.v5, including test_visibility, but run start refuses v5 with RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE. gate_floor_supplied refuses a tests lane whose gate min_cases exceeds what paired tests can supply. Contract admission refuses CLAIM_UNWITNESSABLE. Ineligible plans stop at AUTHORING_BLOCKED with no receipt. Finalize writes the signed PASS receipt on deterministic validation alone. maestro run amend is a run verb, not plan ship.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -72,11 +72,10 @@
 
       <rect width="100%" height="100%" fill="#2d3142"/>
 
-      <!-- plan ship groups author + validate + finalize -->
       <rect x="440" y="168" width="240" height="360" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,4"/>
       <text x="452" y="184" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">PLAN SHIP</text>
 
-      <!-- Arrows (drawn first, behind nodes) -->
+      <!-- Arrows -->
       <line x1="560" y1="88" x2="560" y2="112" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <line x1="560" y1="160" x2="560" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <line x1="560" y1="248" x2="560" y2="272" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
@@ -84,8 +83,7 @@
       <line x1="560" y1="344" x2="560" y2="368" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <line x1="660" y1="404" x2="800" y2="404" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <line x1="560" y1="440" x2="560" y2="464" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="560" y1="520" x2="560" y2="552" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
-
+      <line x1="560" y1="520" x2="560" y2="552" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- Arrow labels -->
       <rect x="700" y="288" width="60" height="12" rx="2" fill="#2d3142"/>
       <text x="730" y="298" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REFUSED</text>
@@ -115,51 +113,54 @@
       <rect x="470" y="200" width="180" height="48" rx="6" fill="#2d3142"/>
       <rect x="470" y="200" width="180" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="560" y="220" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">author</text>
-      <text x="560" y="234" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">from-plan-contract</text>
+      <text x="560" y="234" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">v5 declarable · not runnable</text>
 
-      <!-- admission over the contract IR -->
+      <!-- admission -->
       <polygon points="560,272 660,308 560,344 460,308" fill="#2d3142"/>
       <polygon points="560,272 660,308 560,344 460,308" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="560" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">admit?</text>
       <text x="560" y="320" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">inside project_draft</text>
 
       <!-- ADMISSION_REFUSED -->
-      <rect x="800" y="284" width="240" height="48" rx="24" fill="#2d3142"/>
-      <rect x="800" y="284" width="240" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <rect x="800" y="284" width="240" height="48" rx="20" fill="#2d3142"/>
+      <rect x="800" y="284" width="240" height="48" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
       <text x="920" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ADMISSION_REFUSED</text>
       <text x="920" y="318" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CLAIM_UNWITNESSABLE</text>
 
-      <!-- validate / eligible? -->
+      <!-- validate / gate_floor_supplied -->
       <polygon points="560,368 660,404 560,440 460,404" fill="#2d3142"/>
       <polygon points="560,368 660,404 560,440 460,404" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="560" y="400" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">validate</text>
-      <text x="560" y="416" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">15 obligations</text>
+      <text x="560" y="416" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">gate_floor_supplied</text>
 
       <!-- AUTHORING_BLOCKED -->
-      <rect x="800" y="380" width="240" height="48" rx="24" fill="#2d3142"/>
-      <rect x="800" y="380" width="240" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <rect x="800" y="380" width="240" height="48" rx="20" fill="#2d3142"/>
+      <rect x="800" y="380" width="240" height="48" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
       <text x="920" y="400" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AUTHORING_BLOCKED</text>
-      <text x="920" y="414" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">typed blockers · no receipt</text>
+      <text x="920" y="414" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">min_cases &gt; supply · no receipt</text>
 
       <!-- finalize (focal) -->
       <rect x="470" y="464" width="180" height="56" rx="6" fill="#2d3142"/>
-      <rect x="470" y="464" width="180" height="56" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="470" y="464" width="180" height="56" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="560" y="488" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">finalize</text>
       <text x="560" y="504" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">no reviewer dispatched</text>
 
       <!-- PASS signed receipt (focal) -->
-      <rect x="470" y="552" width="180" height="48" rx="24" fill="#2d3142"/>
-      <rect x="470" y="552" width="180" height="48" rx="24" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="470" y="552" width="180" height="48" rx="20" fill="#2d3142"/>
+      <rect x="470" y="552" width="180" height="48" rx="20" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="560" y="572" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PASS</text>
-      <text x="560" y="586" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">maestro-deterministic.v1</text>
+      <text x="560" y="586" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">v5 run start UNRUNNABLE</text>
 
-      <!-- Callout -->
       <text x="40" y="484" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif">No reviewer is asked what the bytes already say.</text>
       <path d="M 312,478 Q 390,470 464,484" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
       <circle cx="468" cy="484" r="2" fill="#f5f5f5"/>
 
+      <text x="40" y="220" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif">run amend is a run verb, not plan ship.</text>
+      <path d="M 280,224 Q 360,224 464,224" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="468" cy="224" r="2" fill="#f5f5f5"/>
+
       <!-- Legend -->
-      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(245,245,245,0.12)" stroke-width="0.8"/>
       <text x="40" y="656" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND · SHAPE CARRIES TYPE</text>
 
       <rect x="40" y="672" width="24" height="12" rx="6" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
@@ -171,11 +172,11 @@
       <polygon points="392,678 404,672 416,678 404,684" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="428" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision (diamond)</text>
 
-      <rect x="600" y="672" width="24" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="600" y="672" width="24" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="632" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Deterministic receipt</text>
 
       <rect x="800" y="672" width="24" height="12" rx="2" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
-      <text x="832" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">ship composes author + validate + finalize</text>
+      <text x="832" y="682" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">ship = author + validate + finalize</text>
     </svg>
   </div>
 </body>

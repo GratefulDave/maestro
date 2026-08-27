@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="34-flow-repair-chain-title 34-flow-repair-chain-desc">
       <title id="34-flow-repair-chain-title">Repair chain · Witness inherited from the root</title>
-      <desc id="34-flow-repair-chain-desc">Flowchart of a repair chain: the chain root opens at the integration head with a FAILED pre-node gate — the falsifiability witness — then a SEMANTIC failure with a proven output commit lets decide_repair admit a RepairBasis. Review rejection is not the repair trigger and is not a merge claim. The repair attempt bases on the prior output commit rather than the integration head, so pre_gate_not_falsifiable is asked with repairing=True and is inherited from the chain root. Five refusals — no SEMANTIC row with a stored output SHA, an unproven output, a moved integration head, REPAIR_CHAIN_LIMIT exceeded, or findings that rose — restart the node at the integration head instead.</desc>
+      <desc id="34-flow-repair-chain-desc">Repair opens on a SEMANTIC failure with a proven output SHA — not on review REJECTED. The chain root's FAILED pre-node gate is the falsifiability witness; a later repair attempt bases on that output commit and inherits the witness (pre_gate_not_falsifiable with repairing=True). Five refusals — no SEMANTIC row with a stored output SHA, an unproven output, a moved integration head, REPAIR_CHAIN_LIMIT exceeded, or findings that rose — restart the node at the integration head instead.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -97,11 +97,11 @@
       <text x="440" y="76" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt a1 · chain root</text>
       <text x="440" y="92" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">base = head · pre RED, post GREEN</text>
 
-      <!-- SEMANTIC with stored output SHA (review is not the repair trigger) -->
+      <!-- SEMANTIC with stored output SHA (review REJECTED is not the repair trigger) -->
       <rect x="300" y="136" width="280" height="48" rx="6" fill="#2d3142"/>
       <rect x="300" y="136" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="440" y="156" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SEMANTIC · output SHA</text>
-      <text x="440" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SEMANTIC+SHA opens repair</text>
+      <text x="440" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">not review REJECTED</text>
 
       <!-- decide_repair admits? (focal) -->
       <polygon points="440,216 560,264 440,312 320,264" fill="#2d3142"/>
@@ -124,8 +124,8 @@
       <!-- clause 2: witness inherited -->
       <rect x="300" y="424" width="280" height="48" rx="6" fill="#2d3142"/>
       <rect x="300" y="424" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="440" y="444" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">clause 2: witness inherited</text>
-      <text x="440" y="460" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">not GATE_NOT_FALSIFIABLE</text>
+      <text x="440" y="444" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">witness from chain root</text>
+      <text x="440" y="460" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">falsifiability inherited</text>
 
       <!-- Callout -->
       <text x="1240" y="360" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">Three repairs, then re-derived from the head.</text>
