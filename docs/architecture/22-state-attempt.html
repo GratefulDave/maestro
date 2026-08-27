@@ -10,13 +10,17 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;   /* deep warm charcoal */
-      --color-ink:     #f5f5f5;   /* warm off-white */
-      --color-muted:   #bfc0c0;   /* silver */
-      --color-accent:  #f08a59;   /* accent */
-      --font-sans:     'Geist', system-ui, sans-serif;
-      --font-serif:    'Instrument Serif', serif;
-      --font-mono:     'Geist Mono', ui-monospace, monospace;
+      --color-paper:       #2d3142;
+      --color-ink:         #f5f5f5;
+      --color-muted:       #bfc0c0;
+      --color-soft:        #8e98ac;
+      --color-rule:        rgba(245,245,245,0.12);
+      --color-accent:      #f08a59;
+      --color-accent-tint: rgba(240,138,89,0.10);
+      --color-link:        #6a95d8;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace;
     }
 
     html { color-scheme: dark; background: var(--color-paper); }
@@ -50,20 +54,112 @@
       letter-spacing: -0.02em;
       line-height: 1.15;
       color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .subtitle {
+      font-family: var(--font-sans);
+      font-size: 1rem;
+      line-height: 1.55;
+      color: var(--color-muted);
+      max-width: 68ch;
       margin-bottom: 1.5rem;
     }
 
     svg { width: 100%; min-width: 900px; display: block; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .card {
+      background: #393e53;
+      border-radius: 6px;
+      border: 1px solid var(--color-rule);
+      padding: 1.25rem;
+    }
+
+    .card .eyebrow { margin-bottom: 0.75rem; }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 0.875rem;
+      padding-bottom: 0.875rem;
+      border-bottom: 1px solid rgba(245,245,245,0.08);
+    }
+
+    .card-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .card-dot.ink   { background: var(--color-ink); }
+    .card-dot.muted { background: var(--color-muted); }
+    .card-dot.coral { background: var(--color-accent); }
+
+    .card h3 {
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--color-ink);
+      letter-spacing: -0.005em;
+    }
+
+    .card ul {
+      list-style: none;
+      color: var(--color-muted);
+      font-size: 0.8125rem;
+      line-height: 1.55;
+    }
+
+    .card li {
+      margin-bottom: 0.3rem;
+      padding-left: 0.875rem;
+      position: relative;
+    }
+
+    .card li::before {
+      content: '—';
+      position: absolute;
+      left: 0;
+      color: rgba(245,245,245,0.25);
+      font-size: 0.75rem;
+    }
+
+    .footer {
+      margin-top: 2rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid rgba(245,245,245,0.10);
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      color: var(--color-soft);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    @media (max-width: 800px) {
+      .cards { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <div class="frame">
     <p class="eyebrow">State machine · Maestro</p>
     <h1>Attempt settle · Only SEMANTIC mutates_prompt</h1>
+    <p class="subtitle">Classify a live attempt. Resume is a different machine: identity-bound late envelope, undispatched claim of the same generation, or stay QUIESCENCE_UNPROVEN. Prompt proof is a transcript turn.</p>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="22-state-attempt-title 22-state-attempt-desc">
       <title id="22-state-attempt-title">Attempt settle · Only SEMANTIC mutates_prompt</title>
-      <desc id="22-state-attempt-desc">One live AttemptRecord starts RUNNING under idx_one_live_attempt_per_node; _settle_failure classifies SEMANTIC, ENVIRONMENTAL, or LAUNCHER_TRANSIENT, while _release_unclassified_attempt leaves retry_class NULL; CLOSED_ATTEMPT_STATE CANCELLED releases the index; only SEMANTIC mutates_prompt; CREDENTIAL and DETERMINISTIC_REFUSAL spend launcher_retry_budget 0. Resume: an identity-bound late envelope continues; an absent envelope stays QUIESCENCE_UNPROVEN; a persistent actor adopts only on exact pane, cwd, session, correlation, role, and generation; workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
+      <desc id="22-state-attempt-desc">One live AttemptRecord starts RUNNING under idx_one_live_attempt_per_node; _settle_failure classifies SEMANTIC, ENVIRONMENTAL, or LAUNCHER_TRANSIENT, while _release_unclassified_attempt leaves retry_class NULL; CLOSED_ATTEMPT_STATE CANCELLED releases the index; only SEMANTIC mutates_prompt; CREDENTIAL and DETERMINISTIC_REFUSAL spend launcher_retry_budget 0. Resume: an identity-bound late envelope continues; an absent envelope stays QUIESCENCE_UNPROVEN; undispatched_quiescence_attempts plus claim_undispatched_attempt reclaim the same generation that never crossed dispatch; prompt proof is the actor transcript turn, not pane revision meter, not agent_status; a persistent actor adopts only on exact pane, cwd, session, correlation, role, and generation; workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -140,7 +236,7 @@
 
       <!-- SEMANTIC (focal) -->
       <rect x="640" y="64" width="280" height="80" rx="8" fill="#2d3142"/>
-      <rect x="640" y="64" width="280" height="80" rx="8" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="640" y="64" width="280" height="80" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <rect x="648" y="70" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
       <text x="668" y="80" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLASS</text>
       <text x="780" y="112" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SEMANTIC</text>
@@ -190,7 +286,7 @@
       <rect x="160" y="668" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="184" y="678" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">LIVE RUNNING</text>
 
-      <rect x="360" y="668" width="16" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="360" y="668" width="16" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="384" y="678" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">SEMANTIC CLASS</text>
 
       <rect x="560" y="668" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
@@ -201,8 +297,39 @@
 
       <circle cx="920" cy="674" r="4" fill="#f5f5f5"/>
       <text x="932" y="678" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">START / END</text>
-      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">resume: identity-bound late envelope continues · absent envelope QUIESCENCE_UNPROVEN · adopt only exact pane/cwd/session/correlation/role/generation · workspace_not_found is absence</text>
+      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">prompt proof = transcript turn · not pane revision · not agent_status · workspace_not_found is absence</text>
     </svg>
+
+    <div class="cards">
+      <div class="card">
+        <p class="eyebrow">QUIESCENCE_UNPROVEN</p>
+        <div class="card-header">
+          <span class="card-dot coral"></span>
+          <h3>Stay blocked, or reclaim the same generation</h3>
+        </div>
+        <ul>
+          <li><strong>Absent envelope</strong> — stays QUIESCENCE_UNPROVEN until an explicit retry. Bare resume neither grants budget nor relaunches completed work.</li>
+          <li><strong>Undispatched claim</strong> — <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">undispatched_quiescence_attempts</code> names a generation that never crossed dispatch; <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">claim_undispatched_attempt</code> reopens that same attempt_no, allocating nothing.</li>
+          <li><strong>Late envelope</strong> — identity-bound success continues the attempt. Adopt only on exact pane, cwd, session, correlation, role, and generation.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="eyebrow">PROOF · ABSENCE</p>
+        <div class="card-header">
+          <span class="card-dot ink"></span>
+          <h3>Transcript turn, not the pane meter</h3>
+        </div>
+        <ul>
+          <li><strong>Prompt proof</strong> — the actor transcript turn. A pane revision advance is a repaint; <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">agent_status</code> is not proof. Production: <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">pane send-text</code> then a separate <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">pane send-keys enter</code>.</li>
+          <li><strong>workspace_not_found</strong> — absence for every pane in that workspace. Cached lane layouts are invalid; they are dropped together, not reused.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span>Maestro · lifecycle.claim_undispatched_attempt · launcher.submit_agent_prompt</span>
+      <span>SEMANTIC mutates_prompt · transcript turn</span>
+    </div>
   </div>
 </body>
 </html>

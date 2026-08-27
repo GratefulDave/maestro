@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="02-layers-title 02-layers-desc">
       <title id="02-layers-title">Maestro layers · The signed receipt is the gate</title>
-      <desc id="02-layers-desc">Layer stack from the visualizer’s read-only MaestroDb poll and maestro.py, through the maestro-plan.v2/v3 signed Receipt (on-disk filename remains maestro-plan.v1), WorkspaceCoordinator, Scheduler and LifecycleStore, down to AttemptWorktree isolation and a Herdr pane. L3 is a sibling path of L2 under maestro.py, not a parent of the scheduler.</desc>
+      <desc id="02-layers-desc">Layer stack from the visualizer’s read-only MaestroDb poll and maestro.py, through the signed Receipt gate (on-disk filename remains maestro-plan.v1; v1–v4 run, v5 is schema-only and not startable), WorkspaceCoordinator, Scheduler and LifecycleStore, down to AttemptWorktree isolation and a Herdr pane. L3 is a sibling path of L2 under maestro.py, not a parent of the scheduler. No live hidden composed-tree or hidden-gate layer.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -94,14 +94,14 @@
       <line x1="160" y1="288" x2="1240" y2="288" stroke="rgba(245,245,245,0.12)" stroke-width="1"/>
       <text x="180" y="260" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">L5</text>
       <text x="320" y="260" fill="#f5f5f5" font-size="16" font-weight="600" font-family="'Geist', sans-serif">Operator CLI</text>
-      <text x="1220" y="260" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.08em">maestro.py</text>
+      <text x="1220" y="260" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.08em">maestro.py · start · amend</text>
 
-      <!-- L4 — Plan identity (FOCAL): schema v2/v3 + signed Receipt; file name maestro-plan.v1 -->
+      <!-- L4 — Plan identity (FOCAL): signed Receipt is the gate; v1–v4 runnable; v5 unrunnable -->
       <rect x="160" y="288" width="1080" height="64" fill="rgba(240,138,89,0.08)"/>
       <rect x="160" y="288" width="1080" height="64" fill="none" stroke="#f08a59" stroke-width="1"/>
       <text x="180" y="324" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em" font-weight="600">L4</text>
       <text x="320" y="324" fill="#f5f5f5" font-size="16" font-weight="600" font-family="'Geist', sans-serif">Plan identity</text>
-      <text x="1220" y="324" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.08em">v2|v3 schema · file maestro-plan.v1 · Receipt</text>
+      <text x="1220" y="324" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.08em">v1–v4 run · v5 unrunnable · Receipt</text>
 
       <!-- L3 — Workspace coordinator -->
       <rect x="160" y="352" width="1080" height="64" fill="#393e53"/>
@@ -125,7 +125,7 @@
 
       <!-- Caption -->
       <text x="160" y="584" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">FOCAL LAYER</text>
-      <text x="280" y="584" fill="#bfc0c0" font-size="12" font-family="'Instrument Serif', serif" font-style="italic">A signed Receipt is one verdict about one plan_digest. Filename maestro-plan.v1. MaestroDb polls; it does not write.</text>
+      <text x="280" y="584" fill="#bfc0c0" font-size="12" font-family="'Instrument Serif', serif" font-style="italic">A signed Receipt is the gate — one verdict about one plan_digest. Filename maestro-plan.v1. v5 cannot start a run. No hidden composed-tree layer.</text>
 
       <!-- Legend -->
       <line x1="40" y1="652" x2="1240" y2="652" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>

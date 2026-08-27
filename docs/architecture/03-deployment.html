@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="03-deployment-title 03-deployment-desc">
       <title id="03-deployment-title">Maestro local deployment</title>
-      <desc id="03-deployment-desc">Deployment diagram placing adws and maestro.config.yaml in the git repository, lifecycle.sqlite3 receipts keys and run worktrees at repository_state/runs/&lt;run_id&gt;/worktrees in repository_state outside the repo, Herdr visible panes on the host, and an optional visualizer on bun:4600. Derived build::review lives in the ledger. workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
+      <desc id="03-deployment-desc">Deployment diagram placing adws and maestro.config.yaml in the git repository; lifecycle.sqlite3 plus receipts and keys in repository_state; a hidden-tests bare repo under harness-private state, never in the run object DB; run worktrees linked to the run repo at repository_state/runs/&lt;run_id&gt;/worktrees; Herdr visible panes on the host; and an optional visualizer on bun:4600. Derived build::review lives in the ledger. workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -87,7 +87,7 @@
 
       <!-- Network paths (behind nodes) -->
       <line x1="356" y1="136" x2="444" y2="136" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
-      <path d="M 256,240 V 324 Q 256,332 264,332 H 444" fill="none" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <path d="M 256,240 V 328 Q 256,336 264,336 H 444" fill="none" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
       <path d="M 164,240 V 408 Q 164,416 172,416 H 564 Q 572,416 572,424 V 432" fill="none" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
       <path d="M 1070,240 V 408 Q 1070,416 1062,416 H 716 Q 708,416 708,424 V 432" fill="none" stroke="#f08a59" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
       <path d="M 924,504 H 888 Q 880,504 880,496 V 424 a 8,8 0 0,1 0,-16 V 208 Q 880,200 872,200 H 836" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
@@ -96,8 +96,8 @@
       <rect x="372" y="116" width="56" height="12" rx="2" fill="#2d3142"/>
       <text x="400" y="125" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LEDGER</text>
 
-      <rect x="316" y="312" width="68" height="12" rx="2" fill="#2d3142"/>
-      <text x="350" y="321" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RECEIPTS</text>
+      <rect x="308" y="316" width="76" height="12" rx="2" fill="#2d3142"/>
+      <text x="346" y="325" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BARE REPO</text>
 
       <rect x="52" y="360" width="104" height="12" rx="2" fill="#2d3142"/>
       <text x="104" y="369" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GIT WORKTREE</text>
@@ -119,37 +119,40 @@
       <text x="80" y="216" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">maestro.config.yaml</text>
       <text x="340" y="216" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
 
-      <!-- Node: lifecycle (focal) -->
-      <rect x="444" y="80" width="392" height="160" rx="6" fill="#2d3142"/>
-      <rect x="444" y="80" width="392" height="160" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <!-- Node: lifecycle (focal) — object DB; receipts/keys are files beside it, not vault -->
+      <rect x="444" y="80" width="392" height="176" rx="6" fill="#2d3142"/>
+      <rect x="444" y="80" width="392" height="176" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
       <rect x="452" y="88" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
       <text x="472" y="97" fill="#f08a59" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
       <text x="640" y="120" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">lifecycle</text>
       <text x="640" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CandidateReview · ActorSession</text>
-      <rect x="452" y="200" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="216" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">SCHEMA</text>
-      <text x="820" y="216" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">sqlite3</text>
+      <rect x="452" y="152" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <text x="460" y="168" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">SCHEMA</text>
+      <text x="820" y="168" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">sqlite3</text>
+      <rect x="452" y="184" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <text x="460" y="200" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">route-receipts</text>
+      <text x="820" y="200" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
+      <rect x="452" y="216" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <text x="460" y="232" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">keys</text>
+      <text x="820" y="232" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">signing.pub</text>
 
-      <!-- Node: receipts / keys -->
-      <rect x="444" y="264" width="392" height="136" rx="6" fill="#2d3142"/>
-      <rect x="444" y="264" width="392" height="136" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <rect x="452" y="272" width="40" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
-      <text x="472" y="281" fill="#bfc0c0" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
-      <text x="640" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">receipts</text>
-      <rect x="452" y="316" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="332" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">route-receipts</text>
-      <text x="820" y="332" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
-      <rect x="452" y="348" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="364" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">keys</text>
-      <text x="820" y="364" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">signing.pub</text>
-
+      <!-- Node: hidden vault — separate bare repo; never in the run object DB -->
+      <rect x="444" y="272" width="392" height="128" rx="6" fill="#2d3142"/>
+      <rect x="444" y="272" width="392" height="128" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <rect x="452" y="280" width="40" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
+      <text x="472" y="289" fill="#bfc0c0" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BARE</text>
+      <text x="640" y="312" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">hidden vault</text>
+      <text x="640" y="328" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">harness-private · not object DB</text>
+      <rect x="452" y="352" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
+      <text x="460" y="368" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">hidden-tests</text>
+      <text x="820" y="368" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">git-bare</text>
       <!-- Node: worktrees -->
       <rect x="444" y="432" width="392" height="148" rx="6" fill="#2d3142"/>
       <rect x="444" y="432" width="392" height="148" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <rect x="452" y="440" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
       <text x="468" y="449" fill="#f5f5f5" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
       <text x="640" y="472" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">worktrees</text>
-      <text x="640" y="488" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">runs/&lt;run_id&gt;/worktrees</text>
+      <text x="640" y="488" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">linked to run repo</text>
       <rect x="452" y="520" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
       <text x="460" y="536" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">checkouts</text>
       <text x="820" y="536" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">git</text>
@@ -198,7 +201,7 @@
 
       <line x1="920" y1="676" x2="948" y2="676" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
       <text x="956" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Optional poll</text>
-      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">derived build::review in the ledger · workspace_not_found is absence and invalidates cached lane layouts</text>
+      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">hidden vault is a bare repo under harness-private state, never in the run object DB · worktrees linked to the run repo · derived build::review in the ledger · workspace_not_found is absence</text>
     </svg>
   </div>
 </body>

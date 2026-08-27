@@ -10,13 +10,17 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;
-      --color-ink:     #f5f5f5;
-      --color-muted:   #bfc0c0;
-      --color-accent:  #f08a59;
-      --font-sans:     'Geist', system-ui, sans-serif;
-      --font-serif:    'Instrument Serif', serif;
-      --font-mono:     'Geist Mono', ui-monospace, monospace;
+      --color-paper:       #2d3142;
+      --color-ink:         #f5f5f5;
+      --color-muted:       #bfc0c0;
+      --color-soft:        #8e98ac;
+      --color-rule:        rgba(245,245,245,0.12);
+      --color-accent:      #f08a59;
+      --color-accent-tint: rgba(240,138,89,0.10);
+      --color-link:        #6a95d8;
+      --font-sans:         'Geist', system-ui, sans-serif;
+      --font-serif:        'Instrument Serif', serif;
+      --font-mono:         'Geist Mono', ui-monospace, monospace;
     }
 
     html { color-scheme: dark; background: var(--color-paper); }
@@ -50,20 +54,112 @@
       letter-spacing: -0.02em;
       line-height: 1.15;
       color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .subtitle {
+      font-family: var(--font-sans);
+      font-size: 1rem;
+      line-height: 1.55;
+      color: var(--color-muted);
+      max-width: 64ch;
       margin-bottom: 1.5rem;
     }
 
     svg { width: 100%; min-width: 900px; display: block; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .card {
+      background: #393e53;
+      border-radius: 6px;
+      border: 1px solid var(--color-rule);
+      padding: 1.25rem;
+    }
+
+    .card .eyebrow { margin-bottom: 0.75rem; }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 0.875rem;
+      padding-bottom: 0.875rem;
+      border-bottom: 1px solid rgba(245,245,245,0.08);
+    }
+
+    .card-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .card-dot.ink   { background: var(--color-ink); }
+    .card-dot.muted { background: var(--color-muted); }
+    .card-dot.coral { background: var(--color-accent); }
+
+    .card h3 {
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--color-ink);
+      letter-spacing: -0.005em;
+    }
+
+    .card ul {
+      list-style: none;
+      color: var(--color-muted);
+      font-size: 0.8125rem;
+      line-height: 1.55;
+    }
+
+    .card li {
+      margin-bottom: 0.3rem;
+      padding-left: 0.875rem;
+      position: relative;
+    }
+
+    .card li::before {
+      content: '—';
+      position: absolute;
+      left: 0;
+      color: rgba(245,245,245,0.25);
+      font-size: 0.75rem;
+    }
+
+    .footer {
+      margin-top: 2rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid rgba(245,245,245,0.10);
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      color: var(--color-soft);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    @media (max-width: 800px) {
+      .cards { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <div class="frame">
     <p class="eyebrow">State machine · Maestro</p>
     <h1>The six NodeStates</h1>
+    <p class="subtitle">Same six states. Two BLOCKED exits that look alike are not: a review-budget grant stays put; a semantic-budget resume floors spend and returns the node to PENDING.</p>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="20-state-node-title 20-state-node-desc">
       <title id="20-state-node-title">NodeState lifecycle</title>
-      <desc id="20-state-node-desc">Maestro NodeState machine: PENDING to RUNNING to VERIFIED to MERGED on the scheduler path, fail_attempt RUNNING back to PENDING, RUNNING or VERIFIED to BLOCKED, operator retry back to PENDING, skip --accept-sha to MERGED, and abandon to CANCELLED. A review-budget grant is not a BLOCKED-to-PENDING escape; only absence-proven run resume returns that same attempt to PENDING. run cancel maps any non-absolute terminal to CANCELLED; resume reopens RUN_CANCEL to PENDING.</desc>
+      <desc id="20-state-node-desc">Maestro NodeState machine: PENDING to RUNNING to VERIFIED to MERGED on the scheduler path, fail_attempt RUNNING back to PENDING, RUNNING or VERIFIED to BLOCKED, operator retry back to PENDING, skip --accept-sha to MERGED, and abandon to CANCELLED. A review-budget grant is not a BLOCKED-to-PENDING escape; the attempt stays BLOCKED until absence-proven run resume. SEMANTIC_BUDGET_EXHAUSTED is returned to PENDING by bare run resume, which floors retry spend rather than granting ceiling. run cancel maps any non-absolute terminal to CANCELLED; resume reopens RUN_CANCEL to PENDING.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -91,7 +187,7 @@
       <!-- VERIFIED → BLOCKED  mark_blocked at merge-time -->
       <path d="M 728,240 V 400 H 600"
             fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <!-- BLOCKED → PENDING  retry actor=operator Escape.RETRY -->
+      <!-- BLOCKED → PENDING  retry actor=operator Escape.RETRY · semantic resume floor -->
       <path d="M 464,360 V 308 Q 464,300 456,300 H 320 Q 312,300 312,292 V 240"
             fill="none" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
       <!-- BLOCKED → MERGED  skip --accept-sha actor=operator MergeCause.OPERATOR_ACCEPTED -->
@@ -121,8 +217,8 @@
       <rect x="640" y="320" width="72" height="12" rx="2" fill="#2d3142"/>
       <text x="676" y="330" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED TOO</text>
 
-      <rect x="368" y="280" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="388" y="290" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RETRY</text>
+      <rect x="332" y="280" width="88" height="12" rx="2" fill="#2d3142"/>
+      <text x="376" y="290" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RESUME/RETRY</text>
 
       <rect x="724" y="380" width="80" height="12" rx="2" fill="#2d3142"/>
       <text x="764" y="390" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SKIP --ACCEPT</text>
@@ -147,7 +243,7 @@
 
       <!-- RUNNING (focal) -->
       <rect x="440" y="160" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="440" y="160" width="160" height="80" rx="8" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="440" y="160" width="160" height="80" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <rect x="448" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
       <text x="468" y="177" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
       <text x="520" y="204" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">RUNNING</text>
@@ -169,11 +265,11 @@
       <text x="936" y="204" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
       <text x="936" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SCHEDULER</text>
 
-      <!-- BLOCKED -->
+      <!-- BLOCKED (focal — two resume stories) -->
       <rect x="440" y="360" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="440" y="360" width="160" height="80" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <rect x="448" y="368" width="52" height="12" rx="2" fill="transparent" stroke="rgba(142,152,172,0.50)" stroke-width="0.8"/>
-      <text x="474" y="377" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OP.TERM</text>
+      <rect x="440" y="360" width="160" height="80" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="448" y="368" width="52" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
+      <text x="474" y="377" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OP.TERM</text>
       <text x="520" y="404" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
       <text x="520" y="420" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">mark_blocked</text>
 
@@ -201,17 +297,46 @@
       <line x1="320" y1="672" x2="352" y2="672" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4"/>
       <text x="360" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">operator escape</text>
 
-      <rect x="528" y="664" width="16" height="16" rx="4" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="552" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">RUNNING focal</text>
+      <rect x="528" y="664" width="16" height="16" rx="4" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <text x="552" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">RUNNING · BLOCKED</text>
 
-      <rect x="704" y="664" width="16" height="16" rx="4" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <text x="728" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">OPERATOR_TERMINAL</text>
-
-      <circle cx="920" cy="672" r="8" fill="none" stroke="#f5f5f5" stroke-width="1"/>
-      <circle cx="920" cy="672" r="5" fill="#f5f5f5"/>
-      <text x="936" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ABSOLUTELY_TERMINAL</text>
-      <text x="40" y="708" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">review-budget grant is not BLOCKED→PENDING · absence-proven resume recovers that attempt · cancel_run → CANCELLED · resume reopens RUN_CANCEL to PENDING</text>
+      <circle cx="760" cy="672" r="8" fill="none" stroke="#f5f5f5" stroke-width="1"/>
+      <circle cx="760" cy="672" r="5" fill="#f5f5f5"/>
+      <text x="776" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ABSOLUTELY_TERMINAL</text>
+      <text x="40" y="708" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">review-budget grant stays BLOCKED · SEMANTIC_BUDGET_EXHAUSTED: bare resume floors spend → PENDING · cancel_run → CANCELLED</text>
     </svg>
+
+    <div class="cards">
+      <div class="card">
+        <p class="eyebrow">REVIEW_BUDGET_EXHAUSTED</p>
+        <div class="card-header">
+          <span class="card-dot muted"></span>
+          <h3>Grant is not BLOCKED → PENDING</h3>
+        </div>
+        <ul>
+          <li><strong>Grant</strong> — <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">retry --force/--grant</code> leaves the rejected candidate, handoff, worktree, and actor generation on this attempt. State stays BLOCKED.</li>
+          <li><strong>Resume after grant</strong> — only absence-proven <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">run resume</code> may return that same attempt to the frontier.</li>
+          <li>A grant is not a ceiling removal and not a new attempt number.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="eyebrow">SEMANTIC_BUDGET_EXHAUSTED</p>
+        <div class="card-header">
+          <span class="card-dot coral"></span>
+          <h3>Bare resume floors spend → PENDING</h3>
+        </div>
+        <ul>
+          <li>Joins <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">_RESUME_REFRESHED_BLOCK_REASONS</code>.</li>
+          <li>Bare <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">run resume</code> raises <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">retry_spend_floor</code> / <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">lane_retry_spend_floor</code> and returns the node to PENDING.</li>
+          <li>Floor, not grant, not ceiling removal. Scheduler retry reads floored lane spends.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span>Maestro · scheduler_types.NodeState · lifecycle.retry / resume_run</span>
+      <span>six states · grant ≠ semantic floor</span>
+    </div>
   </div>
 </body>
 </html>

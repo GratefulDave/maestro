@@ -83,11 +83,11 @@
   <div class="frame">
     <p class="eyebrow">Data flow · Diagram Design</p>
     <h1>What may cause a lifecycle transition</h1>
-    <p class="lede">Typed records and signed receipts only. Never pane text, prompt text, free-text envelope fields, or an agent’s claim. The visualizer is read-only and is omitted.</p>
+    <p class="lede">Typed records and signed receipts only. Never pane text, prompt text, free-text envelope fields, or an agent’s claim. Prompt submission proof is the actor transcript turn, not pane revision or agent_status. The visualizer is read-only and is omitted.</p>
 
     <svg viewBox="0 0 728 436" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="04-data-flow-receipts-title 04-data-flow-receipts-desc">
       <title id="04-data-flow-receipts-title">What may cause a lifecycle transition</title>
-      <desc id="04-data-flow-receipts-desc">Operator CLI and plan IR bind a signed receipt; the scheduler hands typed records and a signed merge receipt to SQLite lifecycle, which is the only store that may write a transition. Pane text, prompts, free-text envelope fields, agent claims, and the read-only visualizer cannot.</desc>
+      <desc id="04-data-flow-receipts-desc">Operator CLI and plan IR bind a signed receipt; the scheduler hands typed records and a signed merge receipt to SQLite lifecycle, which is the only store that may write a transition. Pane text, prompts, free-text envelope fields, agent claims, pane revision, and agent_status cannot. Prompt submission proof is the actor transcript turn.</desc>
       <defs>
         <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
           <circle cx="11" cy="11" r="0.8" fill="rgba(245,245,245,0.10)"/>

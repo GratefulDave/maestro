@@ -16,7 +16,7 @@
       --color-soft:        #8e98ac;
       --color-rule:        rgba(245,245,245,0.12);
       --color-accent:      #f08a59;
-      --color-accent-tint: rgba(240,138,89,0.08);
+      --color-accent-tint: rgba(240,138,89,0.10);
       --color-link:        #6a95d8;
       --font-sans:         'Geist', system-ui, sans-serif;
       --font-serif:        'Instrument Serif', serif;
@@ -155,11 +155,11 @@
   <div class="frame">
     <p class="eyebrow">State machine · lifecycle.derive_run_state</p>
     <h1>Derived run state</h1>
-    <p class="subtitle">What the run is, from node rows, cancel_requested, and scheduler_liveness. RunOutcome is a different vocabulary, written once when a live scheduler declares.</p>
+    <p class="subtitle">What the run is, from node rows, cancel_requested, and scheduler_liveness. First match in code order wins — not a sequential PENDING→RUNNING machine. RunOutcome is a different vocabulary, written once when a live scheduler declares.</p>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="21-state-run-title 21-state-run-desc">
       <title id="21-state-run-title">Derived run state</title>
-      <desc id="21-state-run-desc">Predicate stack of derive_run_state, in code order: EMPTY, then settled ABSOLUTELY_TERMINAL (MERGED / CANCELLED / QUIESCENT), then ABANDONED, then CANCELLING, then RUNNING, then BLOCKED, then PENDING, then QUIESCENT. Not a sequential PENDING→RUNNING machine. scheduler_liveness None is unknown, never dead.</desc>
+      <desc id="21-state-run-desc">Predicate stack of derive_run_state, in code order, first match returns: EMPTY, then settled ABSOLUTELY_TERMINAL (MERGED / CANCELLED / QUIESCENT), then ABANDONED, then CANCELLING, then RUNNING, then BLOCKED, then PENDING, then QUIESCENT fallthrough. Not a sequential PENDING→RUNNING machine. scheduler_liveness None is unknown, never dead.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -174,74 +174,92 @@
       <circle cx="56" cy="56" r="6" fill="#f5f5f5"/>
 
       <!-- 1 EMPTY -->
-      <rect x="80" y="48" width="520" height="44" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="80" y="48" width="520" height="44" rx="8" fill="#2d3142"/>
+      <rect x="80" y="48" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="96" y="76" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">1</text>
-      <text x="120" y="76" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">no nodes?</text>
-      <rect x="720" y="48" width="200" height="44" rx="20" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <text x="120" y="76" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">no nodes?</text>
+      <rect x="720" y="48" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="48" width="200" height="44" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
       <text x="820" y="76" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">EMPTY</text>
       <line x1="600" y1="70" x2="720" y2="70" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 2 settled -->
-      <rect x="80" y="108" width="520" height="88" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="80" y="108" width="520" height="88" rx="8" fill="#2d3142"/>
+      <rect x="80" y="108" width="520" height="88" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="96" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">2</text>
-      <text x="120" y="136" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">all ABSOLUTELY_TERMINAL?</text>
+      <text x="120" y="136" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">all ABSOLUTELY_TERMINAL?</text>
       <text x="120" y="156" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">all MERGED ∧ ¬cancel → MERGED</text>
       <text x="120" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">cancel_requested ∨ outcome CANCELLED → CANCELLED</text>
       <text x="120" y="188" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">else settled mix → QUIESCENT</text>
-      <rect x="720" y="108" width="200" height="28" rx="12" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="820" y="128" fill="#f5f5f5" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
-      <rect x="940" y="108" width="140" height="28" rx="12" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="1010" y="128" fill="#f5f5f5" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLED</text>
-      <rect x="720" y="148" width="200" height="28" rx="12" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="820" y="168" fill="#f5f5f5" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
+      <rect x="720" y="108" width="200" height="28" rx="8" fill="#2d3142"/>
+      <rect x="720" y="108" width="200" height="28" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <text x="820" y="128" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
+      <rect x="940" y="108" width="140" height="28" rx="8" fill="#2d3142"/>
+      <rect x="940" y="108" width="140" height="28" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <text x="1010" y="128" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLED</text>
+      <rect x="720" y="148" width="200" height="28" rx="8" fill="#2d3142"/>
+      <rect x="720" y="148" width="200" height="28" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <text x="820" y="168" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
       <line x1="600" y1="152" x2="720" y2="152" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 3 ABANDONED (focal) -->
-      <rect x="80" y="212" width="520" height="52" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="80" y="212" width="520" height="52" rx="8" fill="#2d3142"/>
+      <rect x="80" y="212" width="520" height="52" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="96" y="236" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace">3</text>
-      <text x="120" y="236" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">pid dead ∧ (RUNNING ∨ no outcome)?</text>
+      <text x="120" y="236" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">pid dead ∧ (RUNNING ∨ no outcome)?</text>
       <text x="120" y="252" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">dead + RUNNING abandons even with an outcome</text>
-      <rect x="720" y="216" width="200" height="44" rx="20" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="720" y="216" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="216" width="200" height="44" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="820" y="244" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ABANDONED</text>
       <line x1="600" y1="238" x2="720" y2="238" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
 
       <!-- 4 CANCELLING -->
-      <rect x="80" y="280" width="520" height="44" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="80" y="280" width="520" height="44" rx="8" fill="#2d3142"/>
+      <rect x="80" y="280" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="96" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">4</text>
-      <text x="120" y="308" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">cancel_requested?</text>
-      <rect x="720" y="280" width="200" height="44" rx="20" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="120" y="308" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">cancel_requested?</text>
+      <rect x="720" y="280" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="280" width="200" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="820" y="308" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLING</text>
       <line x1="600" y1="302" x2="720" y2="302" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 5 RUNNING -->
-      <rect x="80" y="340" width="520" height="44" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="80" y="340" width="520" height="44" rx="8" fill="#2d3142"/>
+      <rect x="80" y="340" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="96" y="368" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">5</text>
-      <text x="120" y="368" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">any node RUNNING?</text>
-      <rect x="720" y="340" width="200" height="44" rx="20" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="120" y="368" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">any node RUNNING?</text>
+      <rect x="720" y="340" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="340" width="200" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="820" y="368" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">RUNNING</text>
       <line x1="600" y1="362" x2="720" y2="362" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 6 BLOCKED -->
-      <rect x="80" y="400" width="520" height="44" rx="6" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <rect x="80" y="400" width="520" height="44" rx="8" fill="#2d3142"/>
+      <rect x="80" y="400" width="520" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
       <text x="96" y="428" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">6</text>
-      <text x="120" y="428" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">any node BLOCKED?</text>
-      <rect x="720" y="400" width="200" height="44" rx="20" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <text x="120" y="428" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">any node BLOCKED?</text>
+      <rect x="720" y="400" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="400" width="200" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
       <text x="820" y="428" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
       <line x1="600" y1="422" x2="720" y2="422" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 7 PENDING -->
-      <rect x="80" y="460" width="520" height="44" rx="6" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <rect x="80" y="460" width="520" height="44" rx="8" fill="#2d3142"/>
+      <rect x="80" y="460" width="520" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
       <text x="96" y="488" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">7</text>
-      <text x="120" y="488" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">any node PENDING?</text>
-      <rect x="720" y="460" width="200" height="44" rx="20" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <text x="120" y="488" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">any node PENDING?</text>
+      <rect x="720" y="460" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="460" width="200" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
       <text x="820" y="488" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PENDING</text>
       <line x1="600" y1="482" x2="720" y2="482" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 8 QUIESCENT fallthrough -->
-      <rect x="80" y="520" width="520" height="44" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="80" y="520" width="520" height="44" rx="8" fill="#2d3142"/>
+      <rect x="80" y="520" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="96" y="548" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">8</text>
-      <text x="120" y="548" fill="#f5f5f5" font-size="13" font-family="'Geist', sans-serif">else fallthrough</text>
-      <rect x="720" y="520" width="200" height="44" rx="20" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <text x="120" y="548" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">else fallthrough</text>
+      <rect x="720" y="520" width="200" height="44" rx="8" fill="#2d3142"/>
+      <rect x="720" y="520" width="200" height="44" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
       <text x="820" y="548" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
       <line x1="600" y1="542" x2="720" y2="542" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
@@ -258,10 +276,10 @@
       <rect x="520" y="604" width="16" height="12" rx="2" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
       <text x="544" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">PENDING · BLOCKED</text>
 
-      <rect x="720" y="604" width="16" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="720" y="604" width="16" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="744" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ABANDONED</text>
 
-      <text x="40" y="644" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">scheduler_liveness None is unknown, never dead · not a PENDING→RUNNING sequential machine</text>
+      <text x="40" y="644" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">first match wins · scheduler_liveness None is unknown, never dead · not PENDING then RUNNING</text>
     </svg>
 
     <div class="cards">
@@ -282,19 +300,20 @@
         <p class="eyebrow">LIFECYCLE.DERIVE_RUN_STATE</p>
         <div class="card-header">
           <span class="card-dot coral"></span>
-          <h3>ABANDONED is not CANCELLED</h3>
+          <h3>First match, not a walk</h3>
         </div>
         <ul>
+          <li><strong>Order</strong> — EMPTY, settled terminal, ABANDONED, CANCELLING, RUNNING, BLOCKED, PENDING, QUIESCENT. The first true predicate returns. PENDING is not a prelude to RUNNING.</li>
           <li><strong>ABANDONED</strong> — scheduler_liveness is False and (a node is RUNNING, or latest_outcome is None). No scheduler, nothing will declare.</li>
           <li><strong>CANCELLED</strong> — cancellation finished: every node absolutely terminal, and cancel_requested or latest_outcome is CANCELLED.</li>
-          <li><strong>QUIESCENT</strong> — settled without that cancel signal: all-terminal mix that is not MERGED, or the fallthrough with no live work.</li>
+          <li><strong>QUIESCENT</strong> — settled without that cancel signal, or the fallthrough with no live work.</li>
         </ul>
       </div>
     </div>
 
     <div class="footer">
       <span>Maestro · lifecycle.py · scheduler_types.py</span>
-      <span>derive_run_state · total_run_outcome</span>
+      <span>derive_run_state · first match · not sequential</span>
     </div>
   </div>
 </body>

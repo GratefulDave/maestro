@@ -257,7 +257,7 @@
                 <span class="card-dot coral" aria-hidden="true"></span>
                 <h3>System architecture</h3>
               </div>
-              <p>How an operator command becomes a run — scheduler sequences, HerdrLauncher is transport only.</p>
+              <p>How an operator command becomes a run — scheduler sequences; HerdrLauncher is transport; prompt proof is the actor transcript turn.</p>
             </a>
           </li>
           <li>
@@ -277,7 +277,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Deployment</h3>
               </div>
-              <p>Where adws, lifecycle SQLite, worktrees, Herdr panes, and the visualizer live on the host.</p>
+              <p>Where adws, lifecycle SQLite, worktrees, the hidden-tests vault (separate object DB), Herdr panes, and the visualizer live on the host.</p>
             </a>
           </li>
           <li>
@@ -303,7 +303,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Plan model classes</h3>
               </div>
-              <p>Plan, PlanV2, PlanV3, AgentNode, TestsNode, CodeNode, and MergePolicy’s integration gate.</p>
+              <p>Plan through PlanV5: test_visibility is authored on v5, not runnable; TestsNode, CodeNode, MergePolicy’s integration gate.</p>
             </a>
           </li>
           <li>
@@ -313,7 +313,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Scheduler lifecycle classes</h3>
               </div>
-              <p>LifecycleStore owns AttemptRecord, CandidateReview, ActorSession, handoff, and granted_extra_attempts.</p>
+              <p>LifecycleStore owns AttemptRecord, plan_versions for run amend, CandidateReview, ActorSession, and granted_extra_attempts.</p>
             </a>
           </li>
           <li>
@@ -405,7 +405,7 @@
                 <span class="card-dot soft" aria-hidden="true"></span>
                 <h3>Operator escape flowchart</h3>
               </div>
-              <p>SEMANTIC --force/--grant goes PENDING; review-budget grant stays BLOCKED until absence-proven resume.</p>
+              <p>SEMANTIC_BUDGET_EXHAUSTED: bare resume floors spend and returns to frontier. Review-budget grant stays BLOCKED until absence-proven resume.</p>
             </a>
           </li>
           <li>
@@ -457,7 +457,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Runtime module tree</h3>
               </div>
-              <p>maestro.py clusters: Plan, Run (incl. finalization review kernel), Workspace, ADW leftover.</p>
+              <p>Plan (hidden_vault, gate_capture), Run (plan_amendment, finalization kernel, launcher as transport). v5 unrunnable; no composed hidden gate.</p>
             </a>
           </li>
           <li>
@@ -467,7 +467,7 @@
                 <span class="card-dot muted" aria-hidden="true"></span>
                 <h3>Verb groups (plan/run/workspace)</h3>
               </div>
-              <p>plan / run / workspace subverbs listed; run start is the focal command.</p>
+              <p>Run group includes amend (own verb, not a resume flag) and test-strength; run start is focal.</p>
             </a>
           </li>
           <li>
@@ -477,7 +477,7 @@
                 <span class="card-dot link" aria-hidden="true"></span>
                 <h3>All operator root verbs</h3>
               </div>
-              <p>All nine root verbs from maestro.py — the full operator CLI surface.</p>
+              <p>Nine root verbs; run amend is a run subverb, not a tenth root.</p>
             </a>
           </li>
         </ul>
