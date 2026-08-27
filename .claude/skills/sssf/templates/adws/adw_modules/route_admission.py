@@ -390,10 +390,11 @@ def capture_route(
         if continuation["text"] != first_turn["text"]:
             raise AdmissionError("ROUTE_CONTINUITY_UNPROVEN")
         _stop_agent(call, continuation_handle)
-        gone = _agent_gone(call, continuation_handle["name"])
+        gone, denial = _agent_gone(call, continuation_handle["name"])
         continuation_handle = None
         if not gone:
-            raise AdmissionError("ROUTE_CANCELLATION_UNPROVEN")
+            raise AdmissionError(
+                "ROUTE_CANCELLATION_UNPROVEN:{0}".format(denial))
     finally:
         if first_handle is not None:
             _best_effort_close(call, first_handle)
@@ -594,10 +595,12 @@ def _prompt_turn(
             return True
         if not working_proves:
             return False
-        try:
-            payload = call("agent", "get", handle["name"])
-        except Exception:
-            return False
+        # A failed `agent get` propagates on purpose: `submit_agent_prompt`
+        # absorbs a raising proof predicate into its typed failure record, so
+        # the eventual refusal names the dead probe instead of silently
+        # reading it as "not submitted". Swallowing it here would discard
+        # exactly the evidence that record exists to keep.
+        payload = call("agent", "get", handle["name"])
         agent = _extract(payload, "agent")
         # `agent_status` is herdr's field name; `status` is always None.
         return isinstance(agent, dict) and (
@@ -641,6 +644,13 @@ def _prompt_turn(
         except RuntimeError as retry_exc:
             raise AdmissionError(str(retry_exc)) from retry_exc
     deadline = time.monotonic() + timeout_s
+    # Every pane read that failed while polling for the reply marker, by
+    # source. The read is a probe retried to the deadline, so each individual
+    # failure is survivable — but if the deadline arrives with every read
+    # dead, "no reply marker" was never observed, only asserted, and the
+    # refusal must say which observations actually failed. Diagnostic only;
+    # nothing branches on it (§1.2).
+    read_denials: Dict[str, str] = {}
     while True:
         records = list(_transcript_records(handle.get("transcript") or ""))
         if not _reply_marker_present(records, marker, prompt):
@@ -649,8 +659,10 @@ def _prompt_turn(
                     read = call(
                         "pane", "read", handle["pane_id"],
                         "--source", source, "--lines", "120")
-                except AdmissionError:
+                except AdmissionError as exc:
+                    read_denials[source] = exc.code or type(exc).__name__
                     continue
+                read_denials.pop(source, None)
                 records.extend(_embedded_records(read))
                 text = _pane_text(read)
                 if text:
@@ -661,7 +673,12 @@ def _prompt_turn(
             return tuple(records)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise AdmissionError("ROUTE_RECEIPT_INCOMPLETE")
+            suffix = ""
+            if read_denials:
+                suffix = ":pane_unread[{0}]".format(",".join(
+                    "{0}={1}".format(source, denial)
+                    for source, denial in sorted(read_denials.items())))
+            raise AdmissionError("ROUTE_RECEIPT_INCOMPLETE" + suffix)
         time.sleep(min(0.05, remaining))
 
 
@@ -868,6 +885,16 @@ def _optional_int(value: object) -> Optional[int]:
         return None
 
 
+#: Herdr's typed `error.code` values that positively assert the asked-about
+#: pane no longer exists. Any other failure of the absence probe is a missing
+#: observation — a timeout, a dead socket, a mid-restart server — and a
+#: missing observation must never be read as proof of absence.
+PANE_ABSENT_CODES = ("pane_not_found", "workspace_not_found")
+
+#: Herdr's typed refusal when it holds no record of the requested agent.
+AGENT_ABSENT_CODES = ("agent_not_found",)
+
+
 def _stop_agent(call: Callable[..., dict], handle: Mapping[str, str]) -> None:
     """Close the pane and prove it is gone.
 
@@ -878,29 +905,60 @@ def _stop_agent(call: Callable[..., dict], handle: Mapping[str, str]) -> None:
     try:
         call("pane", "close", handle["pane_id"])
     except AdmissionError:
+        # Deliberate: close's reply is not the evidence. The absence probe
+        # below is, and it fails closed.
         pass
-    if not _pane_gone(call, handle["pane_id"]):
-        raise AdmissionError("ROUTE_CANCELLATION_UNPROVEN")
+    gone, denial = _pane_gone(call, handle["pane_id"])
+    if not gone:
+        raise AdmissionError(
+            "ROUTE_CANCELLATION_UNPROVEN:{0}:{1}".format(
+                handle["pane_id"], denial))
 
 
-def _pane_gone(call: Callable[..., dict], pane_id: str) -> bool:
+def _pane_gone(call: Callable[..., dict], pane_id: str) -> Tuple[bool, str]:
+    """(gone, denial): absence proven, or the observation that failed to prove it.
+
+    Only Herdr's own typed absence codes prove the pane gone. This used to
+    read *any* failed `pane get` as absence, so a transport failure while
+    herdr was unreachable counted as a proven cancellation — the failed
+    observation was indistinguishable from the negative evidence it was
+    supposed to produce. `denial` is diagnostic only: it names why absence is
+    unproven; nothing branches on it (§1.2).
+    """
     try:
         payload = call("pane", "get", pane_id)
-    except AdmissionError:
-        return True
-    return not isinstance(_extract(payload, "pane"), dict)
+    except AdmissionError as exc:
+        if exc.code in PANE_ABSENT_CODES:
+            return True, ""
+        return False, "pane_unreadable:{0}".format(
+            exc.code or type(exc).__name__)
+    if isinstance(_extract(payload, "pane"), dict):
+        return False, "pane_still_present"
+    return True, ""
 
 
-def _agent_gone(call: Callable[..., dict], name: str) -> bool:
+def _agent_gone(call: Callable[..., dict], name: str) -> Tuple[bool, str]:
+    """(gone, denial) — same contract and same reasoning as `_pane_gone`."""
     try:
         payload = call("agent", "get", name)
-    except AdmissionError:
-        return True
+    except AdmissionError as exc:
+        if exc.code in AGENT_ABSENT_CODES:
+            return True, ""
+        return False, "agent_unreadable:{0}".format(
+            exc.code or type(exc).__name__)
     agent = _extract(payload, "agent")
-    return not isinstance(agent, dict)
+    if isinstance(agent, dict):
+        return False, "agent_still_present"
+    return True, ""
 
 
 def _best_effort_close(call: Callable[..., dict], handle: Mapping[str, str]) -> None:
+    """Deliberate swallow: cleanup on an already-refusing path.
+
+    Every caller is inside a `finally` or after a raise is committed; the
+    refusal already in flight is the evidence, and a close failure here must
+    not replace it. Callers that need cancellation *proven* use `_stop_agent`.
+    """
     try:
         if handle.get("pane_id"):
             call("pane", "close", handle["pane_id"])
@@ -1029,6 +1087,13 @@ def _session_from_text(records: Sequence[Mapping[str, object]]) -> str:
 
 
 def _session_from_agent(call: Callable[..., dict], name: str) -> str:
+    """The agent's typed session value, or `""` when none is observable.
+
+    Deliberate swallow: this is a fallback probe (the transcript parse is the
+    primary source), the empty string is its typed "nothing observable"
+    answer, and the claude path fails closed behind it — a receipt without a
+    session refuses `ROUTE_RECEIPT_INCOMPLETE` rather than admitting.
+    """
     try:
         payload = call("agent", "get", name)
     except AdmissionError:

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from . import handoff_budget as hb
 from . import permissions
@@ -1101,13 +1101,82 @@ def _agent_transcript_path(
     return candidate if candidate.is_file() else None
 
 
+@dataclass(frozen=True)
+class SubmitCallFailure:
+    """One herdr call the submission path absorbed instead of raising.
+
+    The recovery loop deliberately survives individual call failures — a pane
+    mid-repaint refuses a key it would take a moment later — but surviving a
+    failure and discarding it are different acts. On 2026-08-27 every
+    `agent send-keys` in the recovery loop failed on the herdr agent-registry
+    lookup for a just-registered admission agent, each failure was swallowed,
+    and the loop refused `AGENT_PROMPT_UNSUBMITTED` — a statement about the
+    composer that was actually a statement about a name lookup, and nothing in
+    the refusal could say so.
+
+    Typed record, diagnostic only: it travels on the refusal so the caller can
+    report *which* call failed and how, and per §1.2 nothing keys a lifecycle
+    transition on it. `code` is Herdr's own `error.code` when the failure
+    carried one, else ``""``.
+    """
+
+    phase: str
+    argv: Tuple[str, ...]
+    error: str
+    code: str
+
+
+def _swallowed_code(exc: BaseException) -> str:
+    """Herdr's typed `error.code` for an absorbed failure, or `""`.
+
+    Reads the `.code` field both `HerdrCallError` and route admission's
+    `AdmissionError` carry, then falls back to walking the `from` chain.
+    """
+    code = getattr(exc, "code", "")
+    if isinstance(code, str) and code:
+        return code
+    return _herdr_error_code_of(exc)
+
+
+def _swallowed_summary(failures: Sequence["SubmitCallFailure"]) -> str:
+    """Compact operator-facing rendering of the absorbed failures.
+
+    Appended to refusal messages so the report survives the `str(exc)`
+    restatements between here and the attempt record. Callers must not branch
+    on it (§7.5); the typed tuple on the refusal is the record.
+    """
+    if not failures:
+        return ""
+    order: List[str] = []
+    counts: Dict[str, int] = {}
+    for failure in failures:
+        key = "{0}:{1}".format(failure.phase, failure.code or failure.error)
+        if key not in counts:
+            order.append(key)
+            counts[key] = 0
+        counts[key] += 1
+    return " swallowed=[{0}]".format(
+        ", ".join("{0}x{1}".format(key, counts[key]) for key in order)
+    )
+
+
 class PromptNotSubmitted(RuntimeError):
     """The composer holds the prompt text and will not submit it.
 
     Raised only after every recovery attempt has been spent *and* the pane's
     revision counter was legible throughout, so it means the pane is genuinely
-    wedged rather than merely slow or merely unreadable.
+    wedged rather than merely slow or merely unreadable. `failures` carries
+    every absorbed call failure (`SubmitCallFailure`) observed along the way —
+    evidence for the report, never an input to a transition (§1.2).
     """
+
+    def __init__(
+        self,
+        message: str,
+        failures: Sequence[SubmitCallFailure] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failures: Tuple[SubmitCallFailure, ...] = tuple(failures)
 
 
 class PromptSubmissionUnobservable(RuntimeError):
@@ -1125,7 +1194,23 @@ class PromptSubmissionUnobservable(RuntimeError):
 
     `classify_error` maps this to the existing `TRANSIENT` class -- no new
     retry class -- so the scheduler retries the launch instead of burning it.
+
+    The same distinction covers the other two observation channels. A call
+    that never *delivered* a single Enter (`AGENT_PROMPT_UNDELIVERED`) has no
+    fact about the composer either — it pressed nothing, so "the composer will
+    not submit" was never established — and a `submission_recorded` predicate
+    that raised on every consultation observed nothing about the transcript.
+    Both are statements about herdr or the proof channel, both fail closed,
+    and both carry their absorbed failures in `failures`.
     """
+
+    def __init__(
+        self,
+        message: str,
+        failures: Sequence[SubmitCallFailure] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failures: Tuple[SubmitCallFailure, ...] = tuple(failures)
 
 
 #: How many times to press Enter on an unsubmitted composer before giving up.
@@ -1136,7 +1221,11 @@ class PromptSubmissionUnobservable(RuntimeError):
 SUBMIT_ATTEMPTS = 4
 
 
-def pane_revision(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int]:
+def pane_revision(
+    herdr_call: Callable[..., dict],
+    pane_id: str,
+    on_error: Optional[Callable[[BaseException], None]] = None,
+) -> Optional[int]:
     """The pane's monotonic revision counter, or None when it cannot be read.
 
     Diagnostic only. §1.2 permits reading this typed integer, but it cannot
@@ -1144,10 +1233,16 @@ def pane_revision(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int
     counter advances whether the composer accepted the turn or is still holding
     it. `agent_status` cannot either — a pane that never accepted the prompt
     and a pane whose short turn already finished both report `idle`.
+
+    ``None`` is the typed answer for "unreadable" (D9); `on_error` receives
+    the failure that produced it, so an eventual `AGENT_PROMPT_UNOBSERVED`
+    refusal can say *why* the meter was unreadable instead of only that it was.
     """
     try:
         payload = herdr_call("pane", "get", pane_id, timeout=15.0)
-    except Exception:
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         return None
     pane = (payload or {}).get("result", {}).get("pane")
     if not isinstance(pane, dict):
@@ -1201,10 +1296,39 @@ def submit_agent_prompt(
     until_argv: List[str] = []
     for status in until:
         until_argv.extend(["--until", status])
+    # Every call failure this function survives is recorded here rather than
+    # discarded. Surviving a failure is deliberate — the pane may be
+    # mid-repaint — but a discarded failure made the 2026-08-27 refusal claim
+    # the composer was wedged when in fact every recovery Enter had died on an
+    # agent-registry lookup and nothing had been pressed at all. The record
+    # travels on the refusal; nothing branches on it (§1.2).
+    failures: List[SubmitCallFailure] = []
+    # How many Enter keypresses herdr actually accepted. Zero at refusal time
+    # means "the composer will not submit" was never tested, only asserted.
+    enters_delivered = 0
+    # Whether `submission_recorded` ever answered without raising. A predicate
+    # that raised on every consultation observed nothing about the transcript,
+    # which is D9's distinction applied to the proof channel.
+    proof_observed = False
+
+    def absorb(phase: str, argv: Tuple[str, ...], exc: BaseException) -> None:
+        failures.append(
+            SubmitCallFailure(
+                phase=phase,
+                argv=argv,
+                error=type(exc).__name__,
+                code=_swallowed_code(exc),
+            )
+        )
+
     # Diagnostic meter only. A revision advance does not prove consumption:
     # paste itself repaints. Readings distinguish Unobservable from
     # NotSubmitted after recovery is spent. `working` is not proof here either.
-    baseline = pane_revision(herdr_call, pane_id)
+    baseline = pane_revision(
+        herdr_call,
+        pane_id,
+        on_error=lambda exc: absorb("meter-read", ("pane", "get", pane_id), exc),
+    )
     # Every legible reading taken *after* the prompt was offered. Emptiness is
     # the structural fact D9 turns on: it says the meter was never readable,
     # which is not the same claim as "the meter did not move".
@@ -1232,7 +1356,14 @@ def submit_agent_prompt(
         consults it only when the meter is unreadable). `revision_only`
         drops the status half at the stalled-offer read, before Enter.
         """
-        current = pane_revision(herdr_call, pane_id)
+        nonlocal proof_observed
+        current = pane_revision(
+            herdr_call,
+            pane_id,
+            on_error=lambda exc: absorb(
+                "meter-read", ("pane", "get", pane_id), exc
+            ),
+        )
         if current is not None:
             readings.append(current)
         # The durable transcript record is the ONLY positive proof whenever the
@@ -1250,9 +1381,15 @@ def submit_agent_prompt(
         # meter, and no threshold over it separates the two cases.
         if submission_recorded is not None:
             try:
-                return bool(submission_recorded())
-            except Exception:
+                answer = bool(submission_recorded())
+            except Exception as exc:
+                # Fail closed, but keep the failure: a proof probe that dies
+                # is a missing observation about the transcript, not a False
+                # about the prompt, and the refusal must be able to say so.
+                absorb("proof-probe", (), exc)
                 return False
+            proof_observed = True
+            return answer
         # The 2026-08-27 meter fallback (`current > baseline`) is the defect
         # this function used to return True through. It does not return here.
         #
@@ -1269,7 +1406,8 @@ def submit_agent_prompt(
         if not revision_only and working_proves and agent_name and meter_unreadable:
             try:
                 payload = herdr_call("agent", "get", agent_name)
-            except Exception:
+            except Exception as exc:
+                absorb("status-probe", ("agent", "get", agent_name), exc)
                 return False
             agent = _extract(payload, "agent")
             if isinstance(agent, dict) and (
@@ -1304,8 +1442,13 @@ def submit_agent_prompt(
         ]
         try:
             herdr_call(*argv, timeout=budget_s + 5.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Expected for both the stalled composer and the fast turn — the
+            # wait raising is not the observation, `consumed()` below is. It
+            # is still recorded: a wait that dies on a name lookup instead of
+            # a timeout burns its round in milliseconds, and only the record
+            # makes that visible in the refusal.
+            absorb("recovery-wait", tuple(argv), exc)
         return consumed()
 
     # Deliver the text and the Enter as two separate calls, never as
@@ -1368,14 +1511,16 @@ def submit_agent_prompt(
     sleep(PASTE_SETTLE_S)
     try:
         herdr_call("pane", "send-keys", pane_id, "esc", timeout=30.0)
-    except Exception:
-        # A refused `esc` is not a failed submission. Fall through to the
-        # Enter, which is the thing that actually decides.
-        pass
+    except Exception as exc:
+        # A refused `esc` is not a failed submission. Record it and fall
+        # through to the Enter, which is the thing that actually decides.
+        absorb("popup-esc", ("pane", "send-keys", pane_id, "esc"), exc)
     sleep(PASTE_SETTLE_S)
     try:
         herdr_call("pane", "send-keys", pane_id, "enter", timeout=30.0)
-    except Exception:
+        enters_delivered += 1
+    except Exception as exc:
+        absorb("offer-enter", ("pane", "send-keys", pane_id, "enter"), exc)
         stalled = True
     # Read the meter whether or not the offer stalled. A stall is herdr saying
     # it did not *observe* a lifecycle change inside its five-second floor,
@@ -1417,15 +1562,40 @@ def submit_agent_prompt(
             # Enter, at a moment when no turn can be running because nothing
             # has been submitted yet. After that the only safe key is Enter.
             herdr_call("agent", "send-keys", target, "enter", timeout=30.0)
-        except Exception:
-            # A send-keys that fails on one round is not fatal: the pane may be
-            # mid-repaint. Fall through to the verify, which is the thing that
-            # actually decides.
-            pass
+            enters_delivered += 1
+        except Exception as exc:
+            # A send-keys that fails on one round is not fatal: the pane may
+            # be mid-repaint. But the failure is evidence, not noise — on
+            # 2026-08-27 `agent send-keys` failed the herdr agent-registry
+            # lookup for a just-registered admission agent on EVERY round,
+            # each failure was discarded, and the refusal then claimed the
+            # composer had swallowed four Enters that were never delivered.
+            absorb(
+                "recovery-enter", ("agent", "send-keys", target, "enter"), exc
+            )
+            # `agent_not_found` is Herdr's typed statement that the
+            # agent-scope verb cannot resolve this target at all, so pressing
+            # it again through the registry can never deliver. `pane
+            # send-keys <pane_id>` is the scope measured to deliver on both
+            # routes, and the pane id is ground truth this function was
+            # handed. Keyed on the typed code, never on message prose (§1.2),
+            # and only when an agent name was in play — with no name, target
+            # IS the pane id and the fallback would repeat the same call.
+            if agent_name and _swallowed_code(exc) == AGENT_NOT_FOUND:
+                try:
+                    herdr_call("pane", "send-keys", pane_id, "enter", timeout=30.0)
+                    enters_delivered += 1
+                except Exception as pane_exc:
+                    absorb(
+                        "recovery-enter-pane",
+                        ("pane", "send-keys", pane_id, "enter"),
+                        pane_exc,
+                    )
         if consumed():
             return
         if round_no + 1 < rounds:
             sleep(0.5)
+    summary = _swallowed_summary(failures)
     if submission_recorded is not None:
         # The agent runtime writes the transcript record as the turn starts,
         # which can trail the last Enter by a moment. Give it a bounded grace
@@ -1437,10 +1607,41 @@ def submit_agent_prompt(
             if time.monotonic() >= grace_deadline:
                 break
             sleep(0.1)
-        raise PromptNotSubmitted(
-            "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(
-                target, rounds
+        summary = _swallowed_summary(failures)
+        if enters_delivered == 0:
+            raise PromptSubmissionUnobservable(
+                "AGENT_PROMPT_UNDELIVERED:{0} after {1} submit attempts{2}".format(
+                    target, rounds, summary
+                ),
+                failures,
             )
+        if not proof_observed:
+            # Every consultation of the proof predicate raised, so nothing
+            # was ever observed about the transcript. Claiming UNSUBMITTED
+            # here would assert a fact about the composer that only the dead
+            # proof channel could have established.
+            raise PromptSubmissionUnobservable(
+                "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts{2}".format(
+                    target, rounds, summary
+                ),
+                failures,
+            )
+        raise PromptNotSubmitted(
+            "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts{2}".format(
+                target, rounds, summary
+            ),
+            failures,
+        )
+    if enters_delivered == 0:
+        # Herdr accepted no Enter at all, so no key ever reached the composer
+        # and "it will not submit" was never tested. The recorded failures say
+        # which deliveries died and how; the refusal must not launder them
+        # into a claim about the composer.
+        raise PromptSubmissionUnobservable(
+            "AGENT_PROMPT_UNDELIVERED:{0} after {1} submit attempts{2}".format(
+                target, rounds, summary
+            ),
+            failures,
         )
     if baseline is None or not readings:
         # Never a legible before/after pair, so there is no fact about the
@@ -1448,12 +1649,16 @@ def submit_agent_prompt(
         # construction, and the pane is left for the caller to reap exactly as
         # the wedged case is.
         raise PromptSubmissionUnobservable(
-            "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts".format(
-                target, rounds
-            )
+            "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts{2}".format(
+                target, rounds, summary
+            ),
+            failures,
         )
     raise PromptNotSubmitted(
-        "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts".format(target, rounds)
+        "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts{2}".format(
+            target, rounds, summary
+        ),
+        failures,
     )
 
 
@@ -1461,7 +1666,11 @@ TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = 10.0
 
 
 def prompt_submission_marks(
-    handle: LaunchHandle, prompt_path: Path, *, chunk_size: int = 64 * 1024
+    handle: LaunchHandle,
+    prompt_path: Path,
+    *,
+    chunk_size: int = 64 * 1024,
+    on_error: Optional[Callable[[BaseException], None]] = None,
 ) -> int:
     """How many times the actor transcript names this exact prompt submission.
 
@@ -1489,7 +1698,13 @@ def prompt_submission_marks(
                 window = overlap + chunk
                 total += window.count(marker)
                 overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
-    except OSError:
+    except OSError as exc:
+        # The count so far is a floor, not the count. Callers comparing counts
+        # must know the scan aborted — see `_rising_submission_record`, where
+        # a silently partial baseline let a previous turn's record stand in as
+        # the current offer's proof.
+        if on_error is not None:
+            on_error(exc)
         return total
 
 
@@ -1540,11 +1755,51 @@ def _rising_submission_record(
     Missing transcript cannot prove a turn: the predicate stays false rather
     than handing the caller a live-signal fallback. Paste-repaint moves the
     pane revision whether the composer submitted or not (2026-08-27).
+
+    Only a *clean* scan may serve as the baseline. `prompt_submission_marks`
+    returns the count-so-far when its read aborts, and a baseline that
+    under-counts an already-marked transcript would turn a previous turn's
+    record into this offer's proof — the exact stale-proof failure the
+    snapshot exists to prevent, re-entered through a discarded read error. An
+    aborted baseline is instead established by the first clean consultation
+    (which answers False), and an aborted consultation raises so the caller
+    records the dead probe instead of reading it as "not recorded".
     """
     if handle.transcript_path is None:
         return lambda: False
-    before = prompt_submission_marks(handle, prompt_path)
-    return lambda: prompt_submission_marks(handle, prompt_path) > before
+
+    def clean_marks() -> int:
+        aborted: List[BaseException] = []
+        count = prompt_submission_marks(
+            handle, prompt_path, on_error=aborted.append
+        )
+        if aborted:
+            # A transcript that does not exist yet has an EXACT count of
+            # zero — nothing was partially read, because nothing was opened.
+            # Deferring the baseline here made the first genuine record
+            # establish the baseline instead of proving the offer, which
+            # spent an extra recovery round (and an extra Enter) on every
+            # launch whose transcript had not been created yet.
+            if isinstance(aborted[0], FileNotFoundError):
+                return 0
+            raise aborted[0]
+        return count
+
+    baseline: List[Optional[int]] = [None]
+    try:
+        baseline[0] = clean_marks()
+    except OSError:
+        # No clean baseline yet; the first clean consultation supplies one.
+        pass
+
+    def recorded() -> bool:
+        count = clean_marks()
+        if baseline[0] is None:
+            baseline[0] = count
+            return False
+        return count > baseline[0]
+
+    return recorded
 
 
 def wait_for_prompt_submission_record(
@@ -1585,12 +1840,30 @@ def wait_for_interactive_agent(
         status = agent.get("agent_status") or agent.get("status")
         return status in ("idle", "done")
 
+    # The last probe failure `ready()` absorbed, as `TypeName/typed-code`.
+    # A probe raising is a missing observation, not a "no" — but discarding it
+    # left the timeout refusal claiming "never became ready" about an agent
+    # record that was never read. Diagnostic only; nothing branches on it.
+    probe_denial: List[str] = []
+
     def ready() -> bool:
         try:
             payload = herdr_call("agent", "get", name)
-        except RuntimeError:
+        except RuntimeError as exc:
+            del probe_denial[:]
+            probe_denial.append(
+                "{0}/{1}".format(
+                    type(exc).__name__, _swallowed_code(exc) or "no-code"
+                )
+            )
             return False
         return settled(payload)
+
+    def refusal() -> RuntimeError:
+        suffix = " probe={0}".format(probe_denial[0]) if probe_denial else ""
+        return RuntimeError(
+            "AGENT_INTERACTIVE_READY_TIMEOUT:{0}{1}".format(name, suffix)
+        )
 
     if ready():
         return
@@ -1607,10 +1880,10 @@ def wait_for_interactive_agent(
     except RuntimeError as exc:
         if ready():
             return
-        raise RuntimeError("AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name)) from exc
+        raise refusal() from exc
     if settled(outcome) or ready():
         return
-    raise RuntimeError("AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(name))
+    raise refusal()
 
 
 #: How long `launch` waits for Herdr to report the agent's transcript.

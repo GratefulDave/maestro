@@ -463,6 +463,8 @@ def guidance_extra_verification(detail: Optional[dict]) -> Dict[str, Any]:
             "offending_paths": list(guidance.offending_paths),
             "failed_clause": guidance.failed_clause,
             "unreferenced_symbols": list(guidance.unreferenced_symbols),
+            "refusal_code": guidance.refusal_code,
+            "remedy": guidance.remedy,
         }
     }
 
@@ -487,6 +489,26 @@ def guidance_extra_review(review: object) -> Dict[str, Any]:
     }
 
 
+def _verification_from_payload(payload: Mapping[str, Any]) -> VerificationGuidance:
+    """One durable VERIFICATION entry, rebuilt from its stored payload.
+
+    The single parser for the `GUIDANCE_KEY` verification shape: ledger
+    reconstruction and refusal-repetition both read the same rows, and two
+    parsers would be the two representations §4 convicts — an entry that
+    compared unequal to itself across the two readers would make repetition
+    undetectable by construction.
+    """
+    code = payload.get("refusal_code")
+    return VerificationGuidance(
+        reason=str(payload.get("reason") or ""),
+        offending_paths=tuple(payload.get("offending_paths") or ()),
+        failed_clause=payload.get("failed_clause"),
+        unreferenced_symbols=tuple(payload.get("unreferenced_symbols") or ()),
+        refusal_code=str(code) if code else None,
+        remedy=str(payload.get("remedy") or ""),
+    )
+
+
 def guidance_from_attempts(
     attempts: Iterable[AttemptRecord],
 ) -> Dict[Tuple[str, str], "GuidanceLedger"]:
@@ -509,16 +531,7 @@ def guidance_from_attempts(
         ledger = ledgers.get(key, GuidanceLedger())
         surface = payload.get("surface")
         if surface == "verification":
-            ledger = ledger.with_verification(
-                VerificationGuidance(
-                    reason=str(payload.get("reason") or ""),
-                    offending_paths=tuple(payload.get("offending_paths") or ()),
-                    failed_clause=payload.get("failed_clause"),
-                    unreferenced_symbols=tuple(
-                        payload.get("unreferenced_symbols") or ()
-                    ),
-                )
-            )
+            ledger = ledger.with_verification(_verification_from_payload(payload))
         elif surface == "review":
             findings = tuple(
                 ReviewFinding(
@@ -637,6 +650,28 @@ class VerificationGuidance:
     #: where the attempt wrote, the other names what it must delete — and a
     #: prompt that conflated them would ask for the wrong edit.
     unreferenced_symbols: Tuple[str, ...] = ()
+    #: The typed refusal code the verification surface stamped, or `None` for
+    #: a refusal that carries no identity — a bare red gate, an exit code.
+    #: This is the field `refusal_repetition` keys on, and its absence is what
+    #: keeps that check away from coarse refusals: "gate exited 1" is true of
+    #: every failing pytest run, so two of them in a row prove nothing about
+    #: whether the attempts were the same work, while two byte-identical
+    #: `TESTS_NO_NEW_CASES` records are a deterministic adjudicator saying the
+    #: same thing about the same shape of diff. Only a surface that *declares*
+    #: its refusal deterministic — by stamping the code — opts in.
+    refusal_code: Optional[str] = None
+    #: What would satisfy the refusing check — the verdict's other half,
+    #: declared beside the typed code at the surface that raised it
+    #: (`tests_chain`'s refusal enums; the scheduler's pairing sites) and
+    #: carried here so `_verification_lines` can render it beside the reason.
+    #: Deterministic text keyed on the code, never derived from the reason's
+    #: prose afterwards: the string-sniffing predecessor of this field covered
+    #: one verdict of 24, which is how `lane-wp6-tests` was refused twice,
+    #: byte-identically, with nothing it could act on. Empty only for
+    #: verdicts with no typed refusal identity. A pure function of the
+    #: refusal site, so it never makes two otherwise-identical entries
+    #: unequal for the dedup/repetition reads above.
+    remedy: str = ""
 
 
 @dataclass(frozen=True)
@@ -658,6 +693,24 @@ class ReviewGuidance:
     findings: Tuple[ReviewFinding, ...] = ()
 
 
+def _dedupe_keep_newest(entries: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Drop exact-duplicate entries, keeping each entry's *newest* occurrence.
+
+    Newest rather than oldest because `_fit_surface` drops from the front
+    under prompt pressure and relies on "newest always last to go": a
+    recurring finding is the one the next attempt must fix, so its surviving
+    copy has to sit where the truncation reaches it last.
+    """
+    seen: set = set()
+    kept: List[Any] = []
+    for entry in reversed(entries):
+        if entry in seen:
+            continue
+        seen.add(entry)
+        kept.append(entry)
+    return tuple(reversed(kept))
+
+
 @dataclass(frozen=True)
 class GuidanceLedger:
     """Every typed entry per acceptance surface, for one node, in order.
@@ -675,10 +728,29 @@ class GuidanceLedger:
     was satisfied. History is kept and `render_guidance` bounds it; the
     truncation there is deterministic and visible, which an overwrite was
     not.
+
+    **A ledger never holds two equal entries.** Enforced structurally here
+    rather than at any call site, because the duplicates arrived through two
+    independent doors and a fix at one would have left the other open: the
+    same failure is durably recorded both as an attempt-row guidance extra
+    and as a lane retry spend, so `_refresh_lane_guidance`'s legacy+persistent
+    concatenation carried every constraint twice; and an identically-refused
+    reattempt appended an identical entry on top of that. Observed 2026-08-27:
+    a `lane-wp6-tests` retry prompt carried the same `TESTS_NO_NEW_CASES`
+    verdict three times. An identical entry adds nothing a builder can act on
+    and spends prompt budget that `_fit_surface` then recovers by dropping
+    findings that *do* differ. The newest occurrence is the one kept, so a
+    recurring finding still renders in its true (latest) position.
     """
 
     verification: Tuple[VerificationGuidance, ...] = ()
     review: Tuple[ReviewGuidance, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "verification", _dedupe_keep_newest(tuple(self.verification))
+        )
+        object.__setattr__(self, "review", _dedupe_keep_newest(tuple(self.review)))
 
     def with_verification(self, guidance: VerificationGuidance) -> "GuidanceLedger":
         return GuidanceLedger(
@@ -708,11 +780,14 @@ def verification_guidance(detail: Optional[dict]) -> VerificationGuidance:
     """
     detail = detail or {}
     reason = detail.get("verdict") or detail.get("reason") or ""
+    code = detail.get("refusal_code")
     return VerificationGuidance(
         reason=str(reason),
         offending_paths=tuple(detail.get("offending_paths") or ()),
         failed_clause=detail.get("clause"),
         unreferenced_symbols=tuple(detail.get("unreferenced_symbols") or ()),
+        refusal_code=str(code) if code else None,
+        remedy=str(detail.get("remedy") or ""),
     )
 
 
@@ -794,6 +869,139 @@ def guidance_from_lane_history(
     return ledger
 
 
+# ── §7.5 refusal repetition — the correction loop's convergence floor ───────
+#
+# The retry loop's premise is that a SEMANTIC retry is "genuinely new
+# instructions" (§7.5). That premise fails when the refusal itself stops
+# changing: a deterministic verification surface that produces a byte-identical
+# typed refusal for a second consecutive attempt is reporting that the loop is
+# not converging — the guidance did not change (the ledger dedupes an identical
+# entry), so the next prompt would not change, so the next attempt reproduces
+# the refusal until the budget is gone. Observed 2026-08-27 twice:
+# `lane-routing-chemical-tests` produced byte-identical
+# TEST_STRENGTH_CONTROL_WRONG_REASON refusals across attempts, and
+# `lane-wp6-tests` produced byte-identical TESTS_NO_NEW_CASES refusals on its
+# 2nd and 8th attempts — nine attempts, zero convergence, budget spent
+# discovering a fact two rows already proved.
+#
+# The comparison is over the typed refusal record only — the same durable
+# fields §1.1 item 4 already requires (`_failure_detail`'s clause, code, paths,
+# symbols, and the verification predicate's own deterministic reason), rebuilt
+# through the single parser the guidance ledger uses. No pane text, no prompt
+# text, no envelope field, and no agent claim participates (§1.2): every field
+# compared is computed by the harness's own deterministic adjudicators.
+# Identity requires a stamped `refusal_code`; a refusal without one — a bare
+# red gate, an exit code — supports no identity claim and never repeats here,
+# because "gate exited 1" is true of every failing run and two of them prove
+# nothing about whether the work was the same. Fail-open to the ordinary
+# budgets, fail-closed only on positive typed evidence.
+
+
+#: How many consecutive identical refusals stop a node. Two, because the
+#: invariant is exactly "a node is not re-dispatched when the refusal it just
+#: produced is identical to the refusal its previous attempt produced": the
+#: first occurrence is information, the second is proof of non-convergence,
+#: and a third dispatch is an operator's decision (`maestro retry --force`
+#: after changing the inputs, or as an explicit override). Not configurable —
+#: a knob here would be a budget in disguise, and the budgets are elsewhere.
+IDENTICAL_REFUSAL_LIMIT = 2
+
+
+def refusal_repetition(
+    history: Sequence[VerificationGuidance], current: VerificationGuidance
+) -> int:
+    """How many consecutive times `current` has now been produced, including
+    itself — 1 means "first occurrence", 2 means the previous content-level
+    refusal was identical and re-dispatch against unchanged inputs is proven
+    pointless.
+
+    `history` is this node's prior SEMANTIC refusals in production order,
+    already scoped by the caller to the window inside which "unchanged inputs"
+    holds — the guidance key for fresh attempts, the floored lane spends for a
+    retained builder. Infra failures never appear in it: an ENVIRONMENTAL or
+    LAUNCHER_TRANSIENT attempt between two identical refusals is noise about
+    the machine, not evidence about the content, and must not break the run
+    (the observed `lane-wp6-tests` chain had five infra rows between its two
+    identical refusals).
+
+    A `current` with no `refusal_code` returns 1 unconditionally: no identity
+    claim without a surface that declared its refusal deterministic.
+    """
+    if not current.refusal_code:
+        return 1
+    count = 1
+    for previous in reversed(tuple(history)):
+        if previous != current:
+            break
+        count += 1
+    return count
+
+
+def verification_refusals_from_attempts(
+    attempts: Iterable[AttemptRecord],
+    guidance_key: Tuple[str, str],
+    floor: int = 0,
+) -> Tuple[VerificationGuidance, ...]:
+    """This node's durable SEMANTIC refusals at one guidance key, in order.
+
+    The fresh-attempt half of `refusal_repetition`'s history: rows are the
+    attempt-extra guidance entries `_settle_failure` writes, scoped to
+    `(node_id, integration_head)` because a refusal about a tree says nothing
+    about a different tree — an upstream merge changes the inputs, which is
+    exactly what ends the repetition claim. Rows at or below `floor` are
+    excluded for the same reason the budgets exclude them (§11.3): an
+    operator boundary is a typed declaration that prior evidence is forgiven.
+    """
+    entries: List[Tuple[int, VerificationGuidance]] = []
+    for attempt in attempts:
+        if attempt.attempt_no <= floor or attempt.guidance_key != guidance_key:
+            continue
+        payload = (attempt.extra or {}).get(GUIDANCE_KEY)
+        if not isinstance(payload, dict) or payload.get("surface") != "verification":
+            continue
+        entries.append((attempt.attempt_no, _verification_from_payload(payload)))
+    return tuple(entry for _, entry in sorted(entries, key=lambda item: item[0]))
+
+
+def verification_refusals_from_spends(
+    spends: Iterable[LaneRetrySpend],
+) -> Tuple[VerificationGuidance, ...]:
+    """A retained lane's durable SEMANTIC refusals, in spend order.
+
+    The retained-builder half of the history: `lane_retry_spend` details are
+    the same `_failure_detail` record the attempt extras carry, so both halves
+    rebuild through the same constructors and compare equal when the stored
+    facts are equal. Callers pass the *floored* spend view, which is how an
+    operator boundary forgives here too.
+    """
+    return tuple(
+        verification_guidance(dict(spend.detail))
+        for spend in sorted(spends, key=lambda item: item.cycle_seq)
+        if spend.retry_class is LaneRetryClass.SEMANTIC
+    )
+
+
+def repeated_refusal_detail(
+    detail: Optional[Mapping[str, Any]],
+    current: VerificationGuidance,
+    repeats: int,
+) -> Dict[str, Any]:
+    """The block payload for `SEMANTIC_REFUSAL_REPEATED`, quoting the refusal.
+
+    Fail closed and be explicit: an operator told a node stopped must be able
+    to read, from this one record, which typed refusal repeated, its full
+    deterministic text, and how many consecutive attempts produced it — the
+    inputs to their actual decision, which is "change the plan or the tree"
+    versus "grant an attempt anyway" (`maestro retry --force`).
+    """
+    return dict(
+        detail or {},
+        refusal_code=current.refusal_code,
+        repeated_refusal=current.reason,
+        identical_refusals=repeats,
+    )
+
+
 #: Rendering budget for the whole guidance block, in characters. B13's lesson
 #: applies to the builder as much as the reviewer: a prompt that outgrows the
 #: agent's context produces an attempt about a different task. The budget is
@@ -872,6 +1080,25 @@ def _unreferenced_symbol_lines(symbols: Sequence[str]) -> List[str]:
     return lines
 
 
+def _remedy_lines(remedy: str) -> List[str]:
+    """The verdict's other half, rendered right under the reason it repairs.
+
+    The remedy arrives on the guidance as declared, deterministic text keyed
+    on the typed refusal code at the site that raised it (`tests_chain`'s
+    refusal enums; the scheduler's pairing sites) — never re-derived here by
+    inspecting the reason's prose. The string-sniffing predecessor of this
+    renderer covered one verdict of 24, and every other refusal reached its
+    agent as an observation with no exit: `lane-wp6-tests` was refused
+    `TESTS_NO_NEW_CASES` twice, byte-identically, with nothing it could act
+    on. One line per remedy line so `_fit` can trim from the end while the
+    header and the first sentences survive; nothing transitions on any of
+    this (§1.2).
+    """
+    lines = ["To satisfy this check:"]
+    lines.extend("  " + line for line in remedy.splitlines())
+    return lines
+
+
 def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     lines = [
         "Verification (§8.3):",
@@ -882,7 +1109,8 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
     ]
     if g.reason:
         lines.append(g.reason)
-        lines.extend(_remediation_lines(g.reason))
+    if g.remedy:
+        lines.extend(_remedy_lines(g.remedy))
     if g.offending_paths:
         lines.extend(_offending_path_lines(g.offending_paths))
     if g.unreferenced_symbols:
@@ -892,53 +1120,6 @@ def _verification_lines(node: object, g: VerificationGuidance) -> List[str]:
         + (", ".join(getattr(node, "outputs", ()) or ()) or "(none)")
     )
     return lines
-
-
-
-#: Refusal codes whose remedy is not derivable from the refusal text.
-#:
-#: A typed verdict says WHAT was wrong and is deliberately silent on what to
-#: do instead -- correctly, because a refusal is evidence and a remedy is
-#: advice. But nothing else in the retry loop supplies the advice: the
-#: guidance is assembled from ledger items by string concatenation, and a
-#: reviewer never sees a candidate that died in verification. So a node that
-#: cannot infer the remedy from the verdict re-reads the same words and
-#: re-makes the same mistake until its budget is gone -- observed 2026-08-27
-#: on `lane-routing-chemical-tests`, where attempts a2 and a3 produced
-#: BYTE-IDENTICAL refusals and a4 was dispatched with the same prompt again.
-#:
-#: These lines are deterministic text keyed on the typed code, not a model's
-#: opinion, so nothing here can decide a transition (§1.2).
-
-
-def _remediation_lines(reason: str) -> List[str]:
-    """Advice for the refusals whose remedy the verdict does not imply."""
-    if "TEST_STRENGTH_CONTROL_WRONG_REASON" not in reason:
-        return []
-    lowered = reason.lower()
-    if not any(
-        crash in lowered
-        for crash in ("modulenotfounderror", "importerror", "attributeerror")
-    ):
-        return []
-    return [
-        "How to reconcile this: the cases DO fail at the parent, but they "
-        "fail by crashing on a missing import rather than by asserting. An "
-        "import of a module the parent does not have raises before any "
-        "assertion runs, so the failure cannot carry the declared reason.",
-        "Catch the import inside the case body and assert on the result, so "
-        "the case is still red at the parent and red FOR THE DECLARED "
-        "REASON. Keep the import inside the body -- at module scope it makes "
-        "the file uncollectable, which is not a satisfying red:",
-        "    def test_<name>():",
-        "        try:",
-        "            from <module> import <symbol>",
-        "        except ModuleNotFoundError:",
-        "            <symbol> = None",
-        "        assert <symbol> is not None, \"<text matching the declared "
-        "reason>\"",
-        "        # ... then the real behavioural assertions",
-    ]
 
 
 def _review_lines(g: ReviewGuidance) -> List[str]:

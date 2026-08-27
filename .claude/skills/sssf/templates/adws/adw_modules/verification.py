@@ -244,6 +244,27 @@ class VerificationVerdict:
     #: cause `offending_paths` is: the retry prompt has to name every one of
     #: them, and a prose sentence a later reader has to re-parse is not a list.
     unreferenced_symbols: Tuple[str, ...] = ()
+    #: The typed member of the refusing surface's own vocabulary — a
+    #: `TestsRefusal` or `StrengthRefusal` value — or `None` where the refusal
+    #: has no identity beyond its exit code. `reason` already *starts* with
+    #: this string, but a prefix of prose is not a typed fact (§7.5 forbids
+    #: exactly that read), so the code travels as its own field. It is what
+    #: lets `retry_policy.refusal_repetition` distinguish a deterministic
+    #: adjudicator repeating itself from a red gate that is red twice.
+    refusal_code: Optional[str] = None
+    #: What would satisfy the refusing check, declared by the surface that
+    #: refused — the other half of a verdict. `reason` observes what was
+    #: measured wrong; without this field, whether the refused agent can act
+    #: on that observation is accidental, and the observed cost was a tester
+    #: spending three attempts grepping the harness for the gate
+    #: implementation instead of changing its cases
+    #: (run-d3bd665ce838456f989a15143f196710). Deterministic text keyed on
+    #: the typed refusal code — never a model's opinion — rendered into the
+    #: retry prompt beside the verdict and read nowhere else; nothing
+    #: transitions on it (§1.2). Every typed refusal code must supply one at
+    #: construction (`tests/test_refusal_remedies.py` enumerates them); empty
+    #: only for verdicts whose refusal has no typed identity.
+    remedy: str = ""
 
     @property
     def asserts_repository_wide(self) -> bool:

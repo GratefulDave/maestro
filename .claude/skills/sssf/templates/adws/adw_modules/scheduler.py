@@ -2998,6 +2998,8 @@ class Scheduler:
                 failed_clause=3,
                 reason="{0}: {1}".format(tc.TestsRefusal.COLLECTION_FAILED.value, exc),
                 retry_class=st.RetryClass.ENVIRONMENTAL,
+                refusal_code=tc.TestsRefusal.COLLECTION_FAILED.value,
+                remedy=tc.TestsRefusal.COLLECTION_FAILED.remedy,
             )
         new = tc.new_nodeids(parent, current)
         parent_run = tc.run_cases(attempt.path, new)
@@ -3119,7 +3121,15 @@ class Scheduler:
                         "{2} does not define: {3}".format(
                             gate_capture.CASE_NOT_IN_ACCEPTED_TESTS,
                             len(strays), accepted.candidate_sha[:12],
-                            ", ".join(strays)))
+                            ", ".join(strays)),
+                        remedy=(
+                            "Remove whatever defines or generates the stray "
+                            "cases named above — conftest hooks, "
+                            "parametrization, or collection-time code in "
+                            "this diff. Only cases the accepted test bytes "
+                            "define may count toward the gate; the count "
+                            "must be reached by making those cases pass, "
+                            "never by adding cases of your own."))
                 # The root cause, refused before the builder is blamed for it.
                 # A build lane carries the accepted test bytes verbatim, so the
                 # collectable case count is fixed before it starts; a gate
@@ -3141,7 +3151,15 @@ class Scheduler:
                             node.node_id, node.gate_min_cases,
                             accepted.candidate_sha[:12],
                             node.gate_min_cases - shortfall),
-                        retry_class=st.RetryClass.ENVIRONMENTAL)
+                        retry_class=st.RetryClass.ENVIRONMENTAL,
+                        remedy=(
+                            "No edit of this diff can satisfy the gate: the "
+                            "accepted tests define fewer cases than the "
+                            "gate's min_cases and this node may not change "
+                            "them. An operator must re-ship the plan with "
+                            "min_cases at or below the defined case count, "
+                            "or re-run the tests lane so a candidate "
+                            "defining enough cases is accepted."))
             positive = runner.run(attempt.path, collected)
             coverage = tc.measure_coverage(
                 strength.coverage, positive, tc.PASSED)
@@ -3167,12 +3185,19 @@ class Scheduler:
         code: "tc.PairingRefusal",
         detail: str,
         retry_class: st.RetryClass = st.RetryClass.SEMANTIC,
+        remedy: Optional[str] = None,
     ) -> "vf.VerificationVerdict":
+        # `remedy` overrides the member's default only where one code covers
+        # several measured sub-causes (GATE_NOT_GREEN); the override is still
+        # deterministic text declared at the raising site, never inferred
+        # from the verdict afterwards.
         return vf.VerificationVerdict(
             verified=False,
             failed_clause=3,
             reason="{0}: {1}".format(code.value, detail),
             retry_class=retry_class,
+            refusal_code=code.value,
+            remedy=code.remedy if remedy is None else remedy,
         )
 
     def _prove_test_strength(
@@ -3230,7 +3255,9 @@ class Scheduler:
         except tc.RunnerUnsupported as exc:
             return vf.VerificationVerdict(
                 verified=False, failed_clause=3, reason=str(exc),
-                retry_class=st.RetryClass.ENVIRONMENTAL)
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+                refusal_code=tc.StrengthRefusal.RUNNER_UNSUPPORTED.value,
+                remedy=tc.StrengthRefusal.RUNNER_UNSUPPORTED.remedy)
         try:
             current = runner.collect(attempt.path, test_paths)
             parent = tc.collect_parent_nodeids(
@@ -3240,7 +3267,9 @@ class Scheduler:
                 verified=False, failed_clause=3,
                 reason="{0}: {1}".format(
                     tc.TestsRefusal.COLLECTION_FAILED.value, exc),
-                retry_class=st.RetryClass.ENVIRONMENTAL)
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+                refusal_code=tc.TestsRefusal.COLLECTION_FAILED.value,
+                remedy=tc.TestsRefusal.COLLECTION_FAILED.remedy)
         new = tc.new_nodeids(parent, current)
         coverage_run = runner.run(attempt.path, current)
         coverage = tc.measure_coverage(
@@ -3762,20 +3791,35 @@ class Scheduler:
         subject_sha = basis.base_sha if basis is not None else attempt.base
         detail = _failure_detail(classification, verdict)
         detail["candidate_sha"] = subject_sha
+        # Read before this failure's spend is written, so the history is the
+        # prior refusals (§7.5 refusal repetition).
+        current = rp.verification_guidance(detail)
+        repeats = self._lane_refusal_repeats(node.node_id, current)
         allowed = self._lane_retry(
             node, retry_class, candidate_sha=subject_sha, detail=detail
         )
         guidance = self._refresh_lane_guidance(node.node_id, record)
-        if not allowed:
+        if not allowed or repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
             self._close_persistent_reviewer(node.node_id, record)
             self._settle_context(context)
             self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
-            if retry_class is st.LaneRetryClass.SEMANTIC:
-                detail = self._lane_semantic_budget_detail(detail, node.node_id)
+            if repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
+                # Identical typed refusal to the previous SEMANTIC failure of
+                # this retained lane: re-prompting the same builder with a
+                # ledger that deduplicates the identical entry is a prompt
+                # that does not change, so the repair reproduces the refusal
+                # until the budget is gone. Named ahead of the budget reason
+                # because it is the truer cause (§7.5).
+                reason = st.BlockReason.SEMANTIC_REFUSAL_REPEATED
+                detail = rp.repeated_refusal_detail(detail, current, repeats)
+            else:
+                reason = _budget_reason(classification.retry_class)
+                if retry_class is st.LaneRetryClass.SEMANTIC:
+                    detail = self._lane_semantic_budget_detail(detail, node.node_id)
             self.deps.store.mark_blocked(
                 self.run_id,
                 node.node_id,
-                _budget_reason(classification.retry_class),
+                reason,
                 detail=detail,
                 retry_class=classification.retry_class,
             )
@@ -3855,20 +3899,33 @@ class Scheduler:
         retry_class = st.LaneRetryClass(classification.retry_class.value)
         detail = _failure_detail(classification, verdict)
         detail["candidate_sha"] = previous_sha
+        # Read before this failure's spend is written, so the history is the
+        # prior refusals (§7.5 refusal repetition).
+        current = rp.verification_guidance(detail)
+        repeats = self._lane_refusal_repeats(node.node_id, current)
         allowed = self._lane_retry(
             node, retry_class, candidate_sha=previous_sha, detail=detail
         )
         guidance = self._refresh_lane_guidance(node.node_id, record)
-        if not allowed:
+        if not allowed or repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
             self._close_persistent_reviewer(node.node_id, record)
             self._settle_context(context)
             self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
-            if retry_class is st.LaneRetryClass.SEMANTIC:
-                detail = self._lane_semantic_budget_detail(detail, node.node_id)
+            if repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
+                # Identical typed refusal to the previous SEMANTIC failure of
+                # this retained lane — see `_continue_after_precandidate_
+                # failure`; the repair prompt would not change, so the loop
+                # cannot converge (§7.5).
+                reason = st.BlockReason.SEMANTIC_REFUSAL_REPEATED
+                detail = rp.repeated_refusal_detail(detail, current, repeats)
+            else:
+                reason = _budget_reason(classification.retry_class)
+                if retry_class is st.LaneRetryClass.SEMANTIC:
+                    detail = self._lane_semantic_budget_detail(detail, node.node_id)
             self.deps.store.mark_blocked(
                 self.run_id,
                 node.node_id,
-                _budget_reason(classification.retry_class),
+                reason,
                 detail=detail,
                 retry_class=classification.retry_class,
             )
@@ -4481,10 +4538,16 @@ class Scheduler:
                 )
                 candidate_sha = candidates[-1].candidate_sha if candidates else None
                 extra = None
+                current = None
+                repeats = 1
                 if st.mutates_prompt(retry_class):
                     extra = dict(rp.guidance_extra_verification(detail))
                     if extra_facts:
                         extra.update(extra_facts)
+                    # Read before `_lane_retry` writes this failure's spend,
+                    # so the history compared against is the prior refusals.
+                    current = rp.verification_guidance(detail)
+                    repeats = self._lane_refusal_repeats(node.node_id, current)
                 allowed = self._lane_retry(
                     node,
                     lane_retry_class,
@@ -4493,6 +4556,29 @@ class Scheduler:
                     launcher_failure=classification.launcher_failure,
                 )
                 self._refresh_lane_guidance(node.node_id, record)
+                if repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
+                    # The refusal this attempt just produced is identical, as
+                    # a typed record, to the one its previous SEMANTIC attempt
+                    # produced. The spend above already recorded it; what
+                    # stops here is the re-dispatch, because the inputs are
+                    # proven unchanged — a deduped ledger renders the same
+                    # prompt — and re-running them reproduces the refusal
+                    # until the budget is gone (§7.5). Checked ahead of the
+                    # budget block below because it is the truer cause: a
+                    # budget reason tells the operator to grant attempts that
+                    # this record proves would refuse identically again.
+                    self._mark_lane_blocked(
+                        node, record, allow_watchdog_fence=allow_watchdog_fence
+                    )
+                    store.mark_blocked(
+                        self.run_id,
+                        node.node_id,
+                        st.BlockReason.SEMANTIC_REFUSAL_REPEATED,
+                        detail=rp.repeated_refusal_detail(detail, current, repeats),
+                        retry_class=retry_class,
+                        attempt_extra=extra,
+                    )
+                    return
                 if not allowed:
                     self._mark_lane_blocked(
                         node, record, allow_watchdog_fence=allow_watchdog_fence
@@ -4532,10 +4618,33 @@ class Scheduler:
                 extra = dict(rp.guidance_extra_verification(detail))
                 if extra_facts:
                     extra.update(extra_facts)
+                current = rp.verification_guidance(detail)
+                # Read before this failure's own guidance extra lands on its
+                # attempt row below, so the history is the prior refusals.
+                repeats = self._attempt_refusal_repeats(record, current)
                 self._guidance[record.guidance_key] = self._guidance.get(
                     record.guidance_key, rp.GuidanceLedger()
-                ).with_verification(rp.verification_guidance(detail))
+                ).with_verification(current)
                 lifecycle = store.get_node(self.run_id, node.node_id)
+                if repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
+                    # Identical typed refusal to the previous SEMANTIC attempt
+                    # at this guidance key: the inputs are proven unchanged
+                    # (the deduped ledger renders the same prompt), so a
+                    # re-dispatch reproduces the refusal until the budget is
+                    # gone (§7.5). The blocking attempt persists its guidance
+                    # the same way the ceiling block below does.
+                    self._mark_lane_blocked(
+                        node, record, allow_watchdog_fence=allow_watchdog_fence
+                    )
+                    store.mark_blocked(
+                        self.run_id,
+                        node.node_id,
+                        st.BlockReason.SEMANTIC_REFUSAL_REPEATED,
+                        detail=rp.repeated_refusal_detail(detail, current, repeats),
+                        retry_class=retry_class,
+                        attempt_extra=extra,
+                    )
+                    return
                 if self._semantic_ceiling_reached(
                     node.node_id, lifecycle.granted_extra_attempts
                 ):
@@ -4636,6 +4745,44 @@ class Scheduler:
             granted_extra_attempts=granted,
             semantic_grant_required=max(1, required),
         )
+
+    def _lane_refusal_repeats(
+        self, node_id: str, current: rp.VerificationGuidance
+    ) -> int:
+        """§7.5 refusal repetition over a retained lane's floored spends.
+
+        Called *before* the current failure's spend is written, so the
+        history is exactly the prior refusals. The floored view is the same
+        one the budgets read: an operator boundary (`retry`, `run resume`)
+        forgives the identity chain along with the spend, so a granted
+        attempt is compared against nothing and always runs.
+        """
+        history = rp.verification_refusals_from_spends(
+            self.deps.store.current_lane_retry_spends(
+                self.run_id, node_id, limit=10_000
+            )
+        )
+        return rp.refusal_repetition(history, current)
+
+    def _attempt_refusal_repeats(
+        self, record: st.AttemptRecord, current: rp.VerificationGuidance
+    ) -> int:
+        """§7.5 refusal repetition over durable fresh-attempt guidance rows.
+
+        Scoped by `record.guidance_key` — a refusal is evidence about a tree,
+        and an upstream merge that moves the integration head is a genuine
+        change of inputs that ends the repetition claim. Floored on the same
+        operator boundary the attempt budgets honour (§11.3). The current
+        failure's own guidance extra is not yet written when this runs, so
+        the history is exactly the prior refusals.
+        """
+        store = self.deps.store
+        history = rp.verification_refusals_from_attempts(
+            store.attempts_for(self.run_id, record.node_id),
+            record.guidance_key,
+            floor=store.retry_spend_floor(self.run_id, record.node_id),
+        )
+        return rp.refusal_repetition(history, current)
 
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """Enforce the cumulative semantic ceiling across every attempt base.
@@ -5239,6 +5386,19 @@ def _failure_detail(
         detail["clause"] = verdict.failed_clause
         if verdict.reason:
             detail["verdict"] = verdict.reason
+        if verdict.refusal_code:
+            # The refusing surface's own typed vocabulary member. `verdict`
+            # above starts with the same string, but a prose prefix is not a
+            # typed fact: this field is what lets `refusal_repetition` claim
+            # two refusals are the same adjudication without reading prose.
+            detail["refusal_code"] = verdict.refusal_code
+        if verdict.remedy:
+            # The other half of the verdict: what would satisfy the refusing
+            # check, declared by the surface that refused (deterministic text
+            # keyed on the typed code, §1.2). Durable here so a resumed run's
+            # retry prompt can still say it, and so a blocked node's last
+            # verdict is actionable from the ledger alone.
+            detail["remedy"] = verdict.remedy
         if verdict.unreferenced_symbols:
             # What the attempt must delete, located, and durable for the same
             # reason the offending paths are: a node that exhausts its semantic

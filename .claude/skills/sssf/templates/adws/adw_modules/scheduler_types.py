@@ -554,6 +554,18 @@ class BlockReason(str, Enum):
     #: unchanged base emits the same symbols, so the repair is the command or
     #: the plan, never another attempt.
     PRODUCED_SYMBOL_UNREFERENCED = "PRODUCED_SYMBOL_UNREFERENCED"
+    #: The same content-level refusal, byte-identical as a typed record, was
+    #: produced by two consecutive SEMANTIC attempts (§7.5). Re-dispatch
+    #: against inputs the loop has just proven unchanged reproduces the same
+    #: refusal until the budget is gone — observed as nine attempts on one
+    #: node spending an entire ceiling on two facts. The block's detail names
+    #: the repeated `refusal_code`, quotes the refusal, and counts the
+    #: identical occurrences; the escape is an operator changing the inputs
+    #: or granting an attempt (`maestro retry --force`). Not in
+    #: `NON_RETRYABLE`: the actor is an agent, so a retry *could* differ —
+    #: the point is that this one demonstrably did not, twice, and a third
+    #: dispatch is an operator's call rather than the scheduler's.
+    SEMANTIC_REFUSAL_REPEATED = "SEMANTIC_REFUSAL_REPEATED"
 
 
 #: The failures that fit no retry class, because re-running a

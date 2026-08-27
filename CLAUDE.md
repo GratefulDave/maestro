@@ -104,14 +104,33 @@ each still under a commit named "Mirror the ADW runtime from maestro into this
 deployment". Tracking is not levelness. The 2026-08-20 reading that recorded
 those copies as level is superseded by the 2026-08-22 check below.
 
-Re-derived 2026-08-22 with `runtime_sync.py check`, which is the tool to use —
-not `diff -rq`, which reports a filename without saying which side is ahead:
+Re-derived **2026-08-27** with `runtime_sync.py check`, which is the tool to use —
+not `diff -rq`, which reports a filename without saying which side is ahead.
+This reading supersedes the 2026-08-22 one; the counts moved because two test
+files were added that day, which is exactly why a count dates a snapshot rather
+than describing an invariant:
 
 | comparison | result |
 | --- | --- |
-| template ↔ the-library | level over 214 files |
-| template ↔ `lexgenius/adws/` | **not level**: 10 files present only in the template, 46 content diffs, `maestro.config.yaml` held out. The deployment's `adws/` tree is otherwise clean. |
-| template ↔ `lexgenius-pipeline/adws/` | **not level**: the same 10-absent / 46-diff shape, `maestro.config.yaml` held out. That tree is also dirty under `adws/` (modified `scheduler_types.py`, `maestro.config.yaml`, `tests/test_scheduler_types.py`; untracked `reachability.py` and its test), so the check is a reading of a dirty deployment, not only of its last mirror commit. |
+| template ↔ the-library | level over **231** files |
+| template ↔ `lexgenius-pipeline/adws/` | level over **230** files |
+| template ↔ `lexgenius/adws/` | level except **three deployment-owned docs where lexgenius is AHEAD** — `tests/AGENTS.md` (+15 lines), `tests/fixtures/AGENTS.md` (+7), `tests/fixtures/step8/AGENTS.md` (+9). They are pinned, deliberately, and must stay pinned: a mirror that discards them is destroying the deployment's own documentation. |
+| template ↔ `lexgenius-pipeline-epa-national-corpus/adws/` | **not level**: `tests/test_refusal_remedies.py` and `tests/test_repeated_refusal.py` absent, and 6 modules behind — `launcher.py` (+273 lines), `retry_policy.py` (+181), `scheduler.py` (+160), `route_admission.py` (+65), `scheduler_types.py` (+12), `code_review.py` (+2). |
+| template ↔ `.worktrees/fdadb/integration/adws/` | **not level**: identical shape to EPA. |
+
+Both live deployments are deliberately behind as of this reading. The template
+gained the repeated-refusal block (§19.6 M49) and the refusal-remedy obligation
+(M50) that day, and mirroring those changes **how a run terminates** — a node
+that refuses identically twice now blocks rather than retrying. That is a
+decision about a running factory, not a housekeeping sync, and it was left to
+the operator rather than taken by the agent that made the change.
+
+`--overwrite-ahead` deserves its own warning here, because it was nearly used
+on the `lexgenius` docs above. The flag discards destination files that look
+*ahead* of the source — which is indistinguishable from someone's uncommitted
+work, or from a deployment that legitimately owns a richer file. Run `check`
+first, read which side is ahead, and treat an ahead file as a stop-and-report
+condition. A refusal from the tool is the tool working.
 
 The 2026-08-20 episode that brought all three level is history, not the current
 state. Issue #71's per-file question was answered in that episode — the

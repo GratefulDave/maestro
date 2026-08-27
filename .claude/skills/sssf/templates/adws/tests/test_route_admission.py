@@ -84,7 +84,10 @@ elif argv[:2] == ["pane", "split"]:
 elif argv[:2] == ["pane", "get"]:
     closed_path = os.path.join(root, "closed")
     if os.path.exists(closed_path) and argv[2] in open(closed_path, encoding="utf-8").read().split():
-        sys.stderr.write("pane_not_found\n")
+        # Real herdr refuses with a typed error envelope, and `_pane_gone`
+        # accepts only the typed code as proof of absence. A fake that wrote
+        # bare prose here could not express the one field production reads.
+        sys.stderr.write(json.dumps({"error": {"code": "pane_not_found"}}))
         sys.exit(1)
     claimed = os.environ.get("FAKE_PANE_CWD", cwd)
     pane = {"pane_id": "w1:p2", "cwd": claimed}
@@ -926,6 +929,62 @@ class BootstrapCliTest(unittest.TestCase):
             self.assertEqual(code, 3)
             self.assertEqual(payload["outcome"], "ROUTE_ADMISSION_FAILED")
             self.assertEqual(payload["detail"], "ROUTE_MODEL_UNCONFIGURED:claude")
+
+
+class CancellationEvidenceTest(unittest.TestCase):
+    """A failed absence probe is a missing observation, never absence.
+
+    `_pane_gone` used to read ANY failed `pane get` as "gone", so herdr being
+    unreachable during the probe counted as a proven cancellation. The failure
+    on a path whose purpose is to produce evidence was caught and converted
+    into the very evidence it failed to produce.
+    """
+
+    def test_unreadable_pane_is_not_proof_of_cancellation(self):
+        def call(*argv, timeout=None):
+            if argv[:2] == ("pane", "close"):
+                return {"result": {"ok": True}}
+            if argv[:2] == ("pane", "get"):
+                raise ra.AdmissionError("LAUNCH_REFUSED:herdr timed out")
+            return {"result": {}}
+
+        with self.assertRaisesRegex(
+            ra.AdmissionError, "ROUTE_CANCELLATION_UNPROVEN"
+        ) as caught:
+            ra._stop_agent(call, {"pane_id": "w1:p2", "name": "admit-omp"})
+        # The refusal names the observation that failed, not just the
+        # conclusion it blocked.
+        self.assertIn("pane_unreadable", str(caught.exception))
+
+    def test_typed_absence_still_proves_cancellation(self):
+        def call(*argv, timeout=None):
+            if argv[:2] == ("pane", "close"):
+                return {"result": {"ok": True}}
+            if argv[:2] == ("pane", "get"):
+                raise ra.AdmissionError(
+                    "LAUNCH_REFUSED:pane_not_found", "pane_not_found")
+            return {"result": {}}
+
+        ra._stop_agent(call, {"pane_id": "w1:p2", "name": "admit-omp"})
+
+    def test_unreadable_agent_is_not_proof_of_absence(self):
+        def call(*argv, timeout=None):
+            raise ra.AdmissionError("LAUNCH_REFUSED:socket closed")
+
+        gone, denial = ra._agent_gone(call, "admit-omp")
+        self.assertFalse(gone)
+        self.assertIn("agent_unreadable", denial)
+        gone, denial = ra._pane_gone(call, "w1:p2")
+        self.assertFalse(gone)
+
+    def test_typed_agent_absence_is_still_absence(self):
+        def call(*argv, timeout=None):
+            raise ra.AdmissionError(
+                "LAUNCH_REFUSED:agent_not_found", "agent_not_found")
+
+        gone, denial = ra._agent_gone(call, "admit-omp")
+        self.assertTrue(gone)
+        self.assertEqual(denial, "")
 
 
 @contextlib.contextmanager

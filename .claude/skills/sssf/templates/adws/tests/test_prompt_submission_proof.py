@@ -1090,3 +1090,231 @@ class ColdBootAdmissionFacts(unittest.TestCase):
         self.assertIn('agent.get("agent_status")', source)
         self.assertIn("submission_recorded=_submitted", source)
         self.assertNotIn("submission_recorded = _submitted if working_proves else None", source)
+
+
+def _recorded_after_pane_enters(herdr: FakeHerdr, n: int):
+    """True after `n` pane-scope Enters were issued. Not a meter."""
+
+    def recorded() -> bool:
+        return sum(
+            1 for call in herdr.calls
+            if call[:2] == ("pane", "send-keys")
+            and len(call) > 3
+            and call[3] == "enter"
+        ) >= n
+
+    return recorded
+
+
+class SwallowedFailuresAreEvidence(unittest.TestCase):
+    """A discarded failure on the submission path is a fabricated conclusion.
+
+    Measured instance, 2026-08-27: every `agent send-keys` in the recovery
+    loop died on herdr's agent-registry lookup for a just-registered admission
+    agent — `agent_not_found`, typed — and every failure was swallowed by
+    `except Exception: pass`. The loop "pressed Enter four times" having
+    pressed nothing, waited out its whole budget, and refused
+    `AGENT_PROMPT_UNSUBMITTED`: a statement about the composer that was
+    actually a statement about a name lookup. `pane send-keys <pane_id>` was
+    the scope proven to deliver on both routes the whole time, and that
+    difference was invisible precisely because the failure was discarded.
+    """
+
+    def test_a_registry_miss_falls_back_to_the_pane_scope_and_submits(self):
+        """The incident, rescued: `agent_not_found` is herdr's typed statement
+        that the agent-scope verb cannot resolve the target, so the recovery
+        presses the pane id — ground truth this function was handed."""
+
+        class RegistryMiss(FakeHerdr):
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("agent", "send-keys"):
+                    self.calls.append(argv)
+                    raise lch.HerdrCallError(
+                        "LAUNCH_REFUSED:agent not found", lch.AGENT_NOT_FOUND
+                    )
+                return super().__call__(*argv, **kwargs)
+
+        herdr = RegistryMiss()
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            until=("working", "idle"),
+            sleep=lambda _s: None,
+            submission_recorded=_recorded_after_pane_enters(herdr, 2),
+        )
+        # One agent-scope attempt, then the pane-scope fallback delivered:
+        # the offer's Enter plus the recovery round's fallback Enter.
+        self.assertEqual(herdr.count("agent", "send-keys"), 1)
+        self.assertTrue(_recorded_after_pane_enters(herdr, 2)())
+
+    def test_zero_delivered_enters_never_claims_the_composer_refused(self):
+        """When herdr accepted no Enter at all, `AGENT_PROMPT_UNSUBMITTED`
+        asserts a fact about the composer the code never established. The
+        refusal is UNDELIVERED, transient, and names the calls that died."""
+
+        class NoKeyDelivered(FakeHerdr):
+            def __call__(self, *argv, **kwargs):
+                if (
+                    argv[:2] in (("agent", "send-keys"), ("pane", "send-keys"))
+                    and len(argv) > 3
+                    and argv[3] == "enter"
+                ):
+                    self.calls.append(argv)
+                    raise lch.HerdrCallError(
+                        "LAUNCH_REFUSED:agent not found", lch.AGENT_NOT_FOUND
+                    )
+                return super().__call__(*argv, **kwargs)
+
+        herdr = NoKeyDelivered()
+        with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        message = str(caught.exception)
+        self.assertIn("AGENT_PROMPT_UNDELIVERED", message)
+        self.assertIn("agent_not_found", message)
+        phases = {failure.phase for failure in caught.exception.failures}
+        self.assertIn("offer-enter", phases)
+        self.assertIn("recovery-enter", phases)
+        self.assertIn("recovery-enter-pane", phases)
+        self.assertIn(
+            lch.AGENT_NOT_FOUND,
+            {failure.code for failure in caught.exception.failures},
+        )
+        self.assertEqual(
+            lch.classify_error(caught.exception), lch.ErrorClass.TRANSIENT
+        )
+
+    def test_a_dead_proof_channel_is_unobservable_not_unsubmitted(self):
+        """A `submission_recorded` that raises on every consultation observed
+        nothing about the transcript; the old code silently read each raise as
+        False and refused UNSUBMITTED with no trace of the dead probe."""
+
+        def broken_probe() -> bool:
+            raise OSError("transcript unreadable")
+
+        herdr = FakeHerdr(status_ok=False)
+        grace = lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
+        lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = 0.0
+        try:
+            with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
+                lch.submit_agent_prompt(
+                    herdr,
+                    "w1:p1",
+                    "@prompt",
+                    "agent",
+                    until=("working", "idle"),
+                    sleep=lambda _s: None,
+                    submission_recorded=broken_probe,
+                )
+        finally:
+            lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S = grace
+        self.assertIn("AGENT_PROMPT_UNOBSERVED", str(caught.exception))
+        phases = {failure.phase for failure in caught.exception.failures}
+        self.assertIn("proof-probe", phases)
+        self.assertIn(
+            "OSError",
+            {failure.error for failure in caught.exception.failures},
+        )
+
+    def test_meter_read_failures_ride_the_unobservable_refusal(self):
+        """D9's unobservable case now says WHY the meter was unreadable."""
+
+        class GoesBlind(FakeHerdr):
+            def __init__(self) -> None:
+                super().__init__(stalls=99, status_ok=False, revision=5)
+                self.reads = 0
+
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] == ("pane", "get"):
+                    self.reads += 1
+                    if self.reads > 1:
+                        raise RuntimeError("herdr timeout")
+                return super().__call__(*argv, **kwargs)
+
+        with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
+            lch.submit_agent_prompt(
+                GoesBlind(),
+                "w1:p1",
+                "@prompt",
+                "agent",
+                until=("working", "idle"),
+                sleep=lambda _s: None,
+            )
+        self.assertIn("swallowed=[", str(caught.exception))
+        phases = {failure.phase for failure in caught.exception.failures}
+        self.assertIn("meter-read", phases)
+
+    def test_an_aborted_baseline_cannot_promote_a_previous_turns_record(self):
+        """`prompt_submission_marks` returns its count-so-far when the read
+        aborts. Snapshotting that partial count as the baseline let a
+        transcript that already contained the marker prove a submission that
+        never happened: 0-from-a-failed-read < 1-from-the-old-turn."""
+        import os as _os
+        import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = Path(tmp) / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            transcript = Path(tmp) / "transcript.jsonl"
+            marker = "@" + str(prompt.resolve())
+            # The transcript EXISTS and already carries a PREVIOUS turn's
+            # record — the reuse case the baseline snapshot exists for.
+            transcript.write_text(marker + "\n", encoding="utf-8")
+            handle = types.SimpleNamespace(transcript_path=transcript)
+            # The baseline scan aborts mid-observation: the file is present
+            # but unreadable, so the count-so-far (0) is partial, not zero.
+            _os.chmod(transcript, 0)
+            try:
+                recorded = lch._rising_submission_record(handle, prompt)
+            finally:
+                _os.chmod(transcript, 0o600)
+            # The old turn's record must not count as this offer's proof.
+            self.assertFalse(recorded())
+            # Only a rise observed between clean reads is this offer's proof.
+            with transcript.open("a", encoding="utf-8") as sink:
+                sink.write(marker + "\n")
+            self.assertTrue(recorded())
+
+    def test_a_transcript_not_yet_created_baselines_at_exactly_zero(self):
+        """A missing file is not a partial read: its zero is exact, and the
+        first record written after the offer proves it on the first clean
+        consultation — no recovery round, no extra Enter."""
+        import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = Path(tmp) / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
+            transcript = Path(tmp) / "transcript.jsonl"
+            handle = types.SimpleNamespace(transcript_path=transcript)
+            recorded = lch._rising_submission_record(handle, prompt)
+            self.assertFalse(recorded())
+            transcript.write_text(
+                "@" + str(prompt.resolve()) + "\n", encoding="utf-8"
+            )
+            self.assertTrue(recorded())
+
+    def test_interactive_ready_timeout_names_the_dead_probe(self):
+        """`wait_for_interactive_agent` polled a probe whose every failure was
+        discarded, then reported "never became ready" about an agent record it
+        had never read."""
+
+        def call(*argv, **kwargs):
+            if argv[:2] == ("agent", "get"):
+                raise lch.HerdrCallError(
+                    "LAUNCH_REFUSED:down", lch.AGENT_NOT_FOUND
+                )
+            raise RuntimeError("timeout")
+
+        with self.assertRaises(RuntimeError) as caught:
+            lch.wait_for_interactive_agent(call, "agent-x", timeout_s=0.001)
+        message = str(caught.exception)
+        self.assertIn("AGENT_INTERACTIVE_READY_TIMEOUT:agent-x", message)
+        self.assertIn("probe=HerdrCallError/agent_not_found", message)
