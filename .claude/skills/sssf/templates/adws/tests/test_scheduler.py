@@ -60,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import maestro  # noqa: E402
 from adw_modules import lifecycle as lc  # noqa: E402
+from adw_modules import plan_model as pm  # noqa: E402
 from adw_modules import retry_policy as rp  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules import scheduler_types as st  # noqa: E402
@@ -318,6 +319,53 @@ class SchedulerFixture(unittest.TestCase):
             gate_selector=f"tests/{node_id}",
         )
 
+    def authored_tests_node(
+        self, node_id, depth=0, needs=(), outputs=None, contracted=True
+    ):
+        """A tests node, contracted by default.
+
+        `contracted` is not decoration: it decides the run's pinned contract,
+        and the contract decides whether the node owns a derived review at
+        all. An uncontracted tests node runs under `LEGACY`, where acceptance
+        is "new cases, red at the parent" and there is no reviewer in the
+        rules -- asking one to judge coverage obligations that were never
+        declared is a reviewer judging against a placeholder.
+        """
+        return st.PlanNode(
+            node_id=node_id,
+            kind=st.NodeKind.TESTS,
+            depth=depth,
+            needs=tuple(needs),
+            outputs=tuple(
+                outputs if outputs is not None else (f"tests/test_{node_id}.py",)
+            ),
+            instruction=f"Write the {node_id} tests.",
+            gate_command=("gate",),
+            gate_selector=f"tests/{node_id}",
+            test_strength=pm.TestStrength(
+                coverage=(
+                    pm.CoverageObligation(
+                        requirement_id="R1",
+                        aspect="positive",
+                        case_selector=f"test_{node_id}_pays",
+                        min_cases=1,
+                    ),
+                    pm.CoverageObligation(
+                        requirement_id="R1",
+                        aspect="negative",
+                        case_selector=f"test_{node_id}_rejects",
+                        min_cases=1,
+                    ),
+                ),
+                falsifiability=pm.Falsifiability(
+                    strategy="baseline_absent",
+                    mutation=None,
+                    expected_failing_selector=f"test_{node_id}",
+                    expected_reason_pattern=r"(AssertionError|ImportError)",
+                ),
+            ) if contracted else None,
+        )
+
     def code(self, node_id, depth=0, needs=(), outputs=(), expects_changes=False):
         return st.PlanNode(
             node_id=node_id,
@@ -422,19 +470,7 @@ class ReviewProjectionTests(SchedulerFixture):
             st.PlanNode(node_id="build::review", kind=st.NodeKind.REVIEW, depth=1)
 
     def test_authored_tests_node_is_preserved_unchanged(self):
-        tests = self.agent("tests", outputs=("tests/test_build.py",))
-        # The authored kind is the only difference relevant to projection.
-        tests = st.PlanNode(
-            node_id=tests.node_id,
-            kind=st.NodeKind.TESTS,
-            depth=tests.depth,
-            needs=tests.needs,
-            outputs=tests.outputs,
-            specs=tests.specs,
-            instruction=tests.instruction,
-            gate_command=tests.gate_command,
-            gate_selector=tests.gate_selector,
-        )
+        tests = self.authored_tests_node("tests", outputs=("tests/test_build.py",))
         build = self.agent("build", depth=1, needs=("tests",))
 
         scheduler = self.schedule([tests, build], deps=self.review_deps())
@@ -452,18 +488,41 @@ class ReviewProjectionTests(SchedulerFixture):
         # and rewrites nothing.
         self.assertEqual(scheduler.nodes["build"].needs, ("tests::review",))
 
+    def test_an_uncontracted_tests_node_owns_no_review_and_moves_nothing(self):
+        """The other side of the same rule, and the rollout invariant.
+
+        A tests node declaring no strength contract pins the run `LEGACY`,
+        where acceptance is "new cases, red at the parent" and no reviewer
+        exists in the rules. Deriving one anyway would push the build lane
+        behind a review that will never be dispatched, which is what the
+        pre-resume audit of `run-8d1a71f463e4430f92a125a8f8b3731d`
+        prevented (§19 M42).
+        """
+        tests = self.authored_tests_node("tests", contracted=False)
+        build = self.agent("build", depth=1, needs=("tests",))
+
+        scheduler = self.schedule([tests, build], deps=self.review_deps())
+
+        self.assertIs(
+            st.TestStrengthContract.LEGACY, scheduler.test_strength_contract
+        )
+        self.assertNotIn("tests::review", scheduler.nodes)
+        self.assertEqual(scheduler.nodes["build"].needs, ("tests",))
+        self.assertEqual(scheduler.nodes["build"].depth, 1)
+        # The agent lane keeps its reviewer either way.
+        self.assertIn("build::review", scheduler.nodes)
+
     def test_projects_one_stable_review_per_reviewable_build(self):
-        template = self.agent("tests", outputs=("tests/test_build.py",))
-        tests = replace(template, kind=st.NodeKind.TESTS)
+        tests = self.authored_tests_node("tests", outputs=("tests/test_build.py",))
         build = self.agent("build", depth=1, needs=("tests",))
         code = self.code("code", depth=0)
 
         scheduler = self.schedule([tests, build, code], deps=self.review_deps())
 
         reviews = scheduler._derived_review_nodes()
-        # One per *reviewable* node, and a tests node is one. A code node is
-        # not: its acceptance is its command's exit code (§6.2), so there is
-        # no diff a reviewer would be asked about.
+        # One per *reviewable* node, and a contracted tests node is one. A
+        # code node is not: its acceptance is its command's exit code (§6.2),
+        # so there is no diff a reviewer would be asked about.
         self.assertEqual(
             {review.node_id for review in reviews},
             {"build::review", "tests::review"},

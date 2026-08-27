@@ -623,6 +623,35 @@ class Scheduler:
             for record in records
         )
 
+    def _out_of_contract_review_owner(self, node_id: str) -> Optional[str]:
+        """The tests node owning a review row this run's contract excludes.
+
+        A ledger is not repaired by a code change. A legacy-pinned run that
+        was resumed by the runtime this fixes carries the damage durably: a
+        `<tests>::review` row it will never dispatch, and a dependant whose
+        `needs_json` was rewired to point at it. Not deriving the node any
+        more leaves that row orphaned, and an orphan is worse than the bug --
+        `_dependency_satisfied` would answer "not merged" about a review that
+        never merges, and `_is_candidate_accepted` would refuse the whole run
+        for a row in neither terminal state.
+
+        So the exclusion has to be stated once and honoured everywhere: in a
+        run whose contract has no test reviewer, a review row over a tests
+        node is not part of the run, and the dependency it was spliced into is
+        satisfied by the tests node itself -- exactly the edge the plan
+        authored (§19 M42).
+
+        Deliberately not a database repair. Rewriting `needs_json` under a
+        legacy run would be the migration the rollout invariant reserves for
+        an operator who asked for one; declining to *require* a node is not.
+        """
+        if self._tests_nodes_are_reviewable():
+            return None
+        if node_id in self.nodes or not node_id.endswith("::review"):
+            return None
+        owner = node_id[: -len("::review")]
+        return owner if self._is_tests_node(owner) else None
+
     def _dependency_satisfied(self, node_id: str) -> bool:
         node = self.nodes.get(node_id)
         if self._is_derived_review(node):
@@ -632,6 +661,9 @@ class Scheduler:
             ):
                 return False
             return self._test_prerequisite_satisfied(node.review_of)
+        owner = self._out_of_contract_review_owner(node_id)
+        if owner is not None:
+            return _is_merged(self.deps.store, self.run_id, owner)
         if self._is_tests_node(node_id):
             return _is_merged(
                 self.deps.store, self.run_id, node_id
@@ -670,6 +702,46 @@ class Scheduler:
             for block in self.deps.store.legacy_test_strength_blocks(self.run_id)
         )
 
+    def _governing_test_strength_contract(self) -> st.TestStrengthContract:
+        """The contract this run's nodes are judged under, pin first.
+
+        An existing run answers with its pin, unconditionally and without
+        consulting the plan. A run that does not exist yet has no pin to
+        honour and answers with what its plan implies -- which is the value
+        `project()` is about to write as the pin.
+
+        The two disagree only when a plan was re-shipped, or a newer runtime
+        derives a different contract from the same authored nodes, under a run
+        that already exists. `project()` refuses that resume outright; this
+        method makes the refusal reachable, because until it happens the
+        scheduler must behave as the run was created, not as the plan now
+        reads.
+        """
+        pinned = self.deps.store.pinned_test_strength_contract(self.run_id)
+        if pinned is None:
+            return self.plan_test_strength_contract
+        return pinned
+
+    def _tests_nodes_are_reviewable(self) -> bool:
+        """Whether *this run* derives review edges over its tests nodes.
+
+        Only a `STRENGTH_V1` run does. The rollout invariant is that a
+        legacy-pinned run keeps the node set, depths and dependency edges it
+        was authored and admitted with: its tests nodes were accepted on their
+        case count, its dependants were admitted on that acceptance, and there
+        is no verdict a review opened now could reach that would not be a
+        retroactive reclassification of an already-terminal row.
+
+        Deriving one anyway is not a harmless extra node. It inserts a
+        `PENDING` review into the run's frontier, rewires every direct
+        dependant of the tests node to need the review instead, and lengthens
+        every path below it. The pre-resume audit of
+        `run-8d1a71f463e4430f92a125a8f8b3731d` found that the old projection
+        would do exactly that to its 13 legacy tests nodes; the live ledger
+        remained unmodified because resume was withheld (§19 M42).
+        """
+        return self.test_strength_contract is st.TestStrengthContract.STRENGTH_V1
+
     def _project_nodes(
         self, authored_nodes: Mapping[str, st.PlanNode]
     ) -> Dict[str, Any]:
@@ -687,10 +759,18 @@ class Scheduler:
         # `lane-acquisition-manifest-tests` reached MERGED on four non-skipped
         # cases, and the four implementation candidates it existed to gate
         # were each independently rejected. The tests were never judged.
+        #
+        # Scoped to the run's *pinned* contract, because a legacy run's tests
+        # nodes were admitted under rules that had no reviewer in them at all.
+        reviewable_kinds = (
+            (st.NodeKind.AGENT, st.NodeKind.TESTS)
+            if self._tests_nodes_are_reviewable()
+            else (st.NodeKind.AGENT,)
+        )
         reviewable = {
             node_id
             for node_id, node in authored_nodes.items()
-            if node.kind in (st.NodeKind.AGENT, st.NodeKind.TESTS)
+            if node.kind in reviewable_kinds
         }
         review_ids = {node_id: self._review_id(node_id) for node_id in reviewable}
         collisions = set(authored_nodes).intersection(review_ids.values())
@@ -782,16 +862,27 @@ class Scheduler:
         self.authored_nodes: Dict[str, st.PlanNode] = {
             node.node_id: node for node in nodes
         }
-        self.nodes: Dict[str, Any] = self._project_nodes(self.authored_nodes)
-        #: Which test-acceptance rules this run's nodes are judged under.
+        #: What the plan in front of this process implies, and the value
+        #: pinned into `runs.test_strength_contract` when this process is the
+        #: one creating the run.
+        self.plan_test_strength_contract = derive_test_strength_contract(nodes)
+        #: Which test-acceptance rules this run's nodes are actually judged
+        #: under.
         #:
-        #: Derived from the plan rather than read from the ledger, so there is
-        #: one authority for "what does accepting a test candidate require"
-        #: and it is the artifact the run is executing. The ledger's
-        #: `runs.test_strength_contract` is the durable *pin* of the same
-        #: fact, written once at `create_run` and compared against this at
-        #: resume; a mismatch is refused there rather than reconciled here.
-        self.test_strength_contract = derive_test_strength_contract(nodes)
+        #: The durable pin whenever the run already exists, and only the
+        #: plan's implication when it does not. A plan is mutable -- it can be
+        #: re-shipped from its IR, and a newer runtime can derive a different
+        #: contract from the same authored nodes -- while the pin is written
+        #: once, at `create_run`, and is the fact under which this run's
+        #: already-terminal nodes were decided. Reading the plan here is what
+        #: let a legacy-pinned run be *projected* under `STRENGTH_V1` rules
+        #: before `project()` ever got the chance to refuse the mismatch, and
+        #: projection is not a read: it derives review nodes and rewires the
+        #: authored dependency edges of everything downstream of them.
+        self.test_strength_contract = self._governing_test_strength_contract()
+        # Projected *after* the governing contract is known, because the
+        # contract decides whether tests nodes own derived review edges at all.
+        self.nodes: Dict[str, Any] = self._project_nodes(self.authored_nodes)
         self.plan_digest = plan_digest
         self.plan_name = plan_name
         # Defaults to `time.time` so it matches `started_at` and
@@ -998,7 +1089,7 @@ class Scheduler:
                 self.plan_digest,
                 list(self.authored_nodes.values()),
                 plan_name=self.plan_name,
-                test_strength_contract=self.test_strength_contract,
+                test_strength_contract=self.plan_test_strength_contract,
             )
         except lc.RunAlreadyExists:
             # An existing run keeps the contract it was created under. The pin
@@ -1013,17 +1104,21 @@ class Scheduler:
             # every run created before the column reads `LEGACY`, so comparing
             # the two unconditionally refuses the resume of every run that
             # already exists, for a contract that governs nothing in it.
+            #
+            # Compared against what the *plan* implies. `self.test_strength_
+            # contract` is already the pin on this path -- comparing it here
+            # would compare the pin to itself and never refuse anything.
             pinned = self.deps.store.test_strength_contract(self.run_id)
             governs = any(node.kind is st.NodeKind.TESTS
                           for node in self.authored_nodes.values())
-            if governs and pinned is not self.test_strength_contract:
+            if governs and pinned is not self.plan_test_strength_contract:
                 raise TestStrengthContractMismatch(
                     "{0} was created under the {1} test-acceptance contract "
                     "and this plan implies {2}; a run is pinned to the "
                     "contract it started with. Start a new run rather than "
                     "resuming this one under different rules.".format(
                         self.run_id, pinned.value,
-                        self.test_strength_contract.value))
+                        self.plan_test_strength_contract.value))
         # This is intentionally also called for a new run.  It either inserts
         # the derived review plus rewired direct downstream edges, or validates
         # the exact durable row a prior scheduler process left behind.
@@ -4695,6 +4790,12 @@ class Scheduler:
                 state == st.NodeState.ACCEPTED.value
                 and self._is_derived_review(self.nodes.get(node_id))
             )
+            # A review row this run's contract excludes holds nothing back.
+            # It is a ledger artefact of a runtime that projected it under
+            # rules this run was never created with, and asking a legacy run
+            # to reach a terminal state on it would strand the run forever on
+            # a node nothing will ever dispatch (§19 M42).
+            or self._out_of_contract_review_owner(node_id) is not None
             for node_id, state in states.items()
         )
 
