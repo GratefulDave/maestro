@@ -273,6 +273,13 @@ class ResumeRefreshesEveryNodesBudget(unittest.TestCase):
             store.create_run("run1", "d", [make_node("a", 0)])
             _spend(store, "a", st.RetryClass.ENVIRONMENTAL, 2)
             store.start_attempt("run1", "a", base_sha="s1")
+            # The resume charges an inherited attempt only when it recorded
+            # evidence of a failure; with no turn, result or sealed output it
+            # is released UNCLASSIFIED and there is no charge for the floor to
+            # spare. A pane alone is not evidence — a recorded turn is.
+            store.record_heartbeat(
+                store.get_attempt("run1", "a", 3), turn_count=1, observed_at=1.0
+            )
 
             store.resume_run("run1")
 

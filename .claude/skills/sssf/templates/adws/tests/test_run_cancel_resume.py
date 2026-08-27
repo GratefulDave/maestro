@@ -371,6 +371,13 @@ class InheritedRunningAttemptTests(unittest.TestCase):
             store = new_store(Path(tmp))
             store.create_run("run1", "d", [make_node("a", 0)])
             store.start_attempt("run1", "a", base_sha="s1")  # scheduler died here
+            # An agent that took a turn: the charged closure. An attempt that
+            # recorded no turn, result or sealed output is released
+            # UNCLASSIFIED instead, because nothing it did was observed and a
+            # retry class would be a verdict about nothing (§7.5).
+            store.record_heartbeat(
+                store.get_attempt("run1", "a", 1), turn_count=1, observed_at=1.0
+            )
             store.declare_outcome("run1")  # BLOCKED, nothing can progress
 
             reclaimed = store.resume_run("run1")

@@ -37,21 +37,93 @@ from . import scheduler_types as st
 from . import verification as vf
 from . import worktree as wt
 
-class TestsRefusal(str, Enum):
+class _RemediedRefusal(str, Enum):
+    """A refusal code that cannot exist without stating its remedy.
+
+    A verdict is two halves: what was measured wrong, and what would satisfy
+    the measure. The first half was always typed; the second used to be
+    whatever the detail string happened to imply, and on
+    `run-d3bd665ce838456f989a15143f196710` it implied nothing — the tester
+    received the same `TEST_STRENGTH_CONTROL_WRONG_REASON` verdict three
+    times, byte-identical, and spent its turns grepping the harness for the
+    gate implementation instead of changing its cases. This is B15 one level
+    up: a verdict with no remedy is a field with no reader on the only side
+    that can act.
+
+    So the remedy is a **required constructor argument of the code itself**.
+    A member declared as a bare string does not import — `__new__` has no
+    default for `remedy`, and the TypeError is a build failure, which is the
+    same enforcement posture B8 gives located findings ("a field added later
+    is optional forever"). `tests/test_refusal_remedies.py` enumerates every
+    member as the executable statement of the obligation.
+
+    The remedy is deterministic text keyed on the typed code — never a
+    model's opinion — and nothing transitions on it (§1.2): it is rendered
+    into the retry prompt beside the verdict and read nowhere else.
+    """
+
+    remedy: str
+
+    def __new__(cls, value: str, remedy: str) -> "_RemediedRefusal":
+        member = str.__new__(cls, value)
+        member._value_ = value
+        member.remedy = remedy
+        return member
+
+
+class TestsRefusal(_RemediedRefusal):
     """Named, typed reasons a tests node's evidence chain refuses an attempt.
 
     These are not BlockReason members: a tests agent can rewrite the files,
     so the failures are SEMANTIC (or ENVIRONMENTAL when the runner produced
     no report). The name is the thing a test asserts and a retry prompt
-    carries, not a terminal vocabulary entry.
+    carries, not a terminal vocabulary entry. Each member's second element is
+    the remedy the retry prompt renders beside the verdict — what would
+    satisfy the clause, stated by the module that measures it.
     """
 
-    DIFF_NOT_TESTS_ONLY = "TESTS_DIFF_NOT_TESTS_ONLY"
-    NO_NEW_CASES = "TESTS_NO_NEW_CASES"
-    HOLLOW_AT_PARENT = "TESTS_HOLLOW_AT_PARENT"
-    COLLECTION_FAILED = "TESTS_COLLECTION_FAILED"
-    IMPORT_CRASH = "TESTS_IMPORT_CRASH"
-    NOT_RED_AT_PARENT = "TESTS_NOT_RED_AT_PARENT"
+    DIFF_NOT_TESTS_ONLY = (
+        "TESTS_DIFF_NOT_TESTS_ONLY",
+        "Confine the diff to test files: revert or delete every non-test "
+        "path it touches, and put any fixture or helper the cases need "
+        "inside the test files themselves. This node's acceptance reads "
+        "test paths only; source edits belong to the paired implementation "
+        "node and can never satisfy this one.")
+    NO_NEW_CASES = (
+        "TESTS_NO_NEW_CASES",
+        "Write at least one genuinely new test case — a function the runner "
+        "collects as a nodeid that did not exist at the parent commit. "
+        "Editing an existing case's body, adding a helper, or adding an "
+        "assertion to an old case creates no new case. Check before "
+        "finishing with `--collect-only -q -o addopts=` that the new "
+        "nodeids appear.")
+    HOLLOW_AT_PARENT = (
+        "TESTS_HOLLOW_AT_PARENT",
+        "Strengthen every new case that passed at the parent commit so it "
+        "asserts on behaviour the parent does not have. A case that is "
+        "green before the implementation exists proves nothing and will "
+        "never gate anything; each new case must FAIL when run against the "
+        "parent tree.")
+    COLLECTION_FAILED = (
+        "TESTS_COLLECTION_FAILED",
+        "This names the harness, not your tests: the runner produced no "
+        "parseable report at the parent tree, so nothing about the cases "
+        "was judged. The retry re-runs collection unchanged. If it recurs, "
+        "the runner or its environment needs an operator's attention — "
+        "different test content cannot satisfy this check.")
+    IMPORT_CRASH = (
+        "TESTS_IMPORT_CRASH",
+        "Make every new case collectable and runnable at the parent tree: "
+        "move imports of modules the parent does not have from module scope "
+        "into the test body, catch the ImportError there, and turn it into "
+        "a failing assertion. A case must fail by asserting; an import or "
+        "collection crash is a broken tree, not a red case.")
+    NOT_RED_AT_PARENT = (
+        "TESTS_NOT_RED_AT_PARENT",
+        "Run the new cases against the parent tree and strengthen each one "
+        "that does not fail there, so every new case asserts on behaviour "
+        "the parent lacks. Acceptance requires every new case red at the "
+        "parent — failed by assertion, not passed, skipped, or errored.")
 
 
 class TestsGitReadFailed(RuntimeError):
@@ -312,11 +384,18 @@ def _refused(code: TestsRefusal, detail: str, *,
              failed_clause: int = 3,
              retry_class: Optional[st.RetryClass] = st.RetryClass.SEMANTIC,
              offending_paths: Tuple[str, ...] = ()) -> vf.VerificationVerdict:
+    # `refusal_code` is the same member the reason's prefix spells, carried as
+    # a typed field because these refusals are deterministic adjudications:
+    # two byte-identical records mean the loop reproduced the same fact, and
+    # `retry_policy.refusal_repetition` may only conclude that from a typed
+    # code, never from a prose prefix (§7.5).
     return vf.VerificationVerdict(
         verified=False, failed_clause=failed_clause,
         reason="{0}: {1}".format(code.value, detail),
         retry_class=retry_class,
-        offending_paths=offending_paths)
+        offending_paths=offending_paths,
+        refusal_code=code.value,
+        remedy=code.remedy)
 
 
 # ── the executable test-strength contract (§TS) ─────────────────────────────
@@ -343,34 +422,144 @@ def _refused(code: TestsRefusal, detail: str, *,
 UNSTATED_GATE_FLOOR = 0
 
 
-class StrengthRefusal(str, Enum):
+class StrengthRefusal(_RemediedRefusal):
     """Typed reasons a test candidate fails its declared strength contract.
 
     Separate from `TestsRefusal` because they refuse different things. A
     `TestsRefusal` says the candidate is not a tests-node diff at all — it
     wrote source, or it added no case. A `StrengthRefusal` says the candidate
-    *is* a tests diff and does not discriminate.
+    *is* a tests diff and does not discriminate. Each member's second element
+    is the remedy the retry prompt renders beside the verdict; the coverage
+    members are worded to hold under both measurement standards, because
+    `measure_coverage` raises them at test acceptance (EXECUTED, the tester's
+    diff is judged) and again at implementation acceptance (PASSED, the
+    builder's diff is judged) and the counting rule is the same both times.
     """
 
-    CONTRACT_ABSENT = "TEST_STRENGTH_CONTRACT_ABSENT"
-    REQUIREMENT_UNCOVERED = "TEST_STRENGTH_REQUIREMENT_UNCOVERED"
-    OBLIGATION_UNMET = "TEST_STRENGTH_OBLIGATION_UNMET"
-    OBLIGATION_ONLY_SKIPPED = "TEST_STRENGTH_OBLIGATION_ONLY_SKIPPED"
-    POSITIVE_GATE_NOT_GREEN = "TEST_STRENGTH_POSITIVE_GATE_NOT_GREEN"
-    CONTROL_NOT_SELECTED = "TEST_STRENGTH_CONTROL_SELECTED_NO_CASE"
-    CONTROL_NOT_RED = "TEST_STRENGTH_CONTROL_NOT_RED"
-    CONTROL_WRONG_REASON = "TEST_STRENGTH_CONTROL_WRONG_REASON"
-    CONTROL_COLLECTION_FAILED = "TEST_STRENGTH_CONTROL_COLLECTION_FAILED"
-    CONTROL_IMPORT_CRASH = "TEST_STRENGTH_CONTROL_IMPORT_CRASH"
-    CONTROL_NOT_ISOLATED = "TEST_STRENGTH_CONTROL_NOT_ISOLATED"
-    CONTROL_UNEXECUTABLE = "TEST_STRENGTH_CONTROL_UNEXECUTABLE"
-    RUNNER_UNSUPPORTED = "TEST_STRENGTH_RUNNER_UNSUPPORTED"
+    CONTRACT_ABSENT = (
+        "TEST_STRENGTH_CONTRACT_ABSENT",
+        "No test edit can satisfy this check: the node declares no "
+        "test-strength contract, and a candidate accepted without one is "
+        "accepted on its case count, which does not discriminate. The plan "
+        "must be re-shipped with a `test_strength` block for this node — "
+        "coverage obligations mapping case selectors to requirements, plus "
+        "an executable falsifiability control. That is an operator's edit, "
+        "not this lane's.")
+    REQUIREMENT_UNCOVERED = (
+        "TEST_STRENGTH_REQUIREMENT_UNCOVERED",
+        "Write cases whose nodeids the obligation's declared case_selector "
+        "actually selects — name new tests so the selector quoted in the "
+        "verdict matches them. The counter matches collected nodeids against "
+        "that selector verbatim; a case that covers the requirement under a "
+        "name the selector does not match counts for nothing.")
+    OBLIGATION_UNMET = (
+        "TEST_STRENGTH_OBLIGATION_UNMET",
+        "Bring the obligation's selected-case count up to its min_cases, "
+        "counted from cases that run to a verdict — passed or failed — in "
+        "one suite run. Add cases the declared selector matches, and fix "
+        "any selected case that errors or fails to collect: a crash reaches "
+        "no verdict and never counts.")
+    OBLIGATION_ONLY_SKIPPED = (
+        "TEST_STRENGTH_OBLIGATION_ONLY_SKIPPED",
+        "Make the selected cases execute: remove the skip/skipif/xfail "
+        "marks, or make their conditions false in this environment, so "
+        "every case the obligation selects runs to a verdict. A skipped "
+        "case is not executed behavioural evidence and can never satisfy "
+        "an obligation, whatever it would assert if it ran.")
+    POSITIVE_GATE_NOT_GREEN = (
+        "TEST_STRENGTH_POSITIVE_GATE_NOT_GREEN",
+        "Change the implementation until every case the obligation selects "
+        "passes against this candidate — run the selector locally, read "
+        "each failure, and fix the code it names. Do not edit the test "
+        "files: they are the accepted, reviewed bytes this node is gated "
+        "by, and a diff that touches them is refused before it is judged.")
+    CONTROL_NOT_SELECTED = (
+        "TEST_STRENGTH_CONTROL_SELECTED_NO_CASE",
+        "Make the contract's expected_failing_selector select at least one "
+        "case this candidate collects: write cases whose nodeids match the "
+        "selector quoted in the verdict. A control that selects nothing is "
+        "unfalsifiable rather than falsified, and no run of it can prove "
+        "the cases discriminate.")
+    CONTROL_NOT_RED = (
+        "TEST_STRENGTH_CONTROL_NOT_RED",
+        "Strengthen every selected case the verdict names as surviving so "
+        "it fails when the code under test is absent or reverted: assert on "
+        "behaviour the control removes, not on facts that hold either way. "
+        "The control passes only when every selected case goes red under "
+        "the declared defect.")
+    CONTROL_WRONG_REASON = (
+        "TEST_STRENGTH_CONTROL_WRONG_REASON",
+        "The selected cases must fail with text the declared "
+        "expected_reason_pattern matches. If the observed reasons are "
+        "crashes — ModuleNotFoundError, ImportError, AttributeError — the "
+        "cases DO fail at the parent, but a missing import raises before "
+        "any assertion runs, so the failure cannot carry the declared "
+        "reason. Import the absent module inside the test body, catch the "
+        "ImportError there, and assert on the result with a message the "
+        "pattern matches — keep the import inside the body, because at "
+        "module scope it makes the file uncollectable, which is not a "
+        "satisfying red:\n"
+        "    def test_<name>():\n"
+        "        try:\n"
+        "            from <module> import <symbol>\n"
+        "        except ModuleNotFoundError:\n"
+        "            <symbol> = None\n"
+        "        assert <symbol> is not None, \"<text matching the "
+        "declared reason>\"\n"
+        "        # ... then the real behavioural assertions\n"
+        "If the cases already fail by asserting but with other text, align "
+        "the assertion messages with the declared pattern.")
+    CONTROL_COLLECTION_FAILED = (
+        "TEST_STRENGTH_CONTROL_COLLECTION_FAILED",
+        "This names the harness, not the tests: the negative control run "
+        "produced no parseable report, so nothing was proven either way "
+        "about the cases. The retry re-executes the control unchanged; if "
+        "it recurs, the runner or its environment needs an operator's "
+        "attention — different test content cannot satisfy this check.")
+    CONTROL_IMPORT_CRASH = (
+        "TEST_STRENGTH_CONTROL_IMPORT_CRASH",
+        "Make the selected cases survive collection in the control tree, "
+        "where the code under test is absent or reverted: move imports of "
+        "that code from module scope into the test body and turn the "
+        "ImportError into a failing assertion. A case must go red by "
+        "asserting; one that errors before reaching an assertion proves "
+        "nothing.")
+    CONTROL_NOT_ISOLATED = (
+        "TEST_STRENGTH_CONTROL_NOT_ISOLATED",
+        "Make the cases side-effect free with respect to the worktree: "
+        "create files only under the runner's temp locations (tmp_path, "
+        "tempfile) outside the repository, and remove anything a test "
+        "writes inside it, so `git status --porcelain` reads identically "
+        "before and after the control. A control that dirties the attempt "
+        "worktree is refused whatever it proved.")
+    CONTROL_UNEXECUTABLE = (
+        "TEST_STRENGTH_CONTROL_UNEXECUTABLE",
+        "No declared control could be run, so nothing proves these cases "
+        "can fail — a contract or environment fact, not a test fact. The "
+        "plan must declare an executable falsifiability strategy for this "
+        "node (`baseline_absent`, or `controlled_mutation` with revert "
+        "paths and a plan base commit), or an operator must fix the fault "
+        "named in the verdict. Rewriting the tests cannot satisfy this "
+        "check.")
+    RUNNER_UNSUPPORTED = (
+        "TEST_STRENGTH_RUNNER_UNSUPPORTED",
+        "This factory can only count cases for the runners it names — the "
+        "gate must declare one of them (pytest or vitest). A plan/config "
+        "fact: re-ship the plan with a supported `gate` runner; no edit to "
+        "the tests can satisfy it.")
     #: The candidate discriminates and still cannot supply the threshold its
     #: paired builder will be judged on. Not a statement about the tests —
     #: they may be excellent — but about the pair: accepting these bytes
     #: freezes the collectable count below `min_cases`, and every builder
     #: dispatched afterwards faces a gate no correct attempt can pass.
-    GATE_FLOOR_UNREACHABLE = "TEST_STRENGTH_GATE_FLOOR_UNREACHABLE"
+    GATE_FLOOR_UNREACHABLE = (
+        "TEST_STRENGTH_GATE_FLOOR_UNREACHABLE",
+        "Add enough collected cases to these files to reach the gate's "
+        "declared min_cases, or have the plan re-shipped with a lower "
+        "min_cases. The count is taken by collection over these exact "
+        "bytes, and the paired builder must carry them verbatim, so the "
+        "floor must be reachable now — a builder can never add cases "
+        "later.")
 
 
 #: The four statuses a single executed case can land in. `errored` is kept
@@ -1268,10 +1457,23 @@ def _strength_refused(code: str, detail: str) -> vf.VerificationVerdict:
     retry_class = (st.RetryClass.ENVIRONMENTAL
                    if code in _ENVIRONMENTAL_REFUSALS
                    else st.RetryClass.SEMANTIC)
+    # Typed for the same reason `_refused` stamps its member: strength
+    # refusals are measured, so an identical repeat is a convergence fact
+    # `refusal_repetition` is allowed to act on. An ENVIRONMENTAL strength
+    # refusal still carries its code, but never reaches the repetition check —
+    # only SEMANTIC rows enter its history (§7.5).
+    #
+    # `code` arrives as the durable string (`CoverageMeasurement.refusal` and
+    # `FalsifiabilityResult.refusal` store values, not members); resolving it
+    # back through the enum is what makes an unknown code a loud ValueError
+    # here rather than a verdict that silently ships without its remedy.
+    member = StrengthRefusal(code)
     return vf.VerificationVerdict(
         verified=False, failed_clause=3,
         reason="{0}: {1}".format(code, detail),
-        retry_class=retry_class)
+        retry_class=retry_class,
+        refusal_code=member.value,
+        remedy=member.remedy)
 
 
 def blob_id_at(tree: Path, commit: str, path: str) -> Optional[str]:
@@ -1307,13 +1509,46 @@ def blob_id_at(tree: Path, commit: str, path: str) -> Optional[str]:
     return object_id.decode("ascii", "replace")
 
 
-class PairingRefusal(str, Enum):
-    """Why an implementation candidate is not bound to accepted test bytes."""
+class PairingRefusal(_RemediedRefusal):
+    """Why an implementation candidate is not bound to accepted test bytes.
 
-    NO_ACCEPTED_CANDIDATE = "TEST_PAIRING_NO_ACCEPTED_CANDIDATE"
-    BYTES_SUBSTITUTED = "TEST_PAIRING_TEST_BYTES_SUBSTITUTED"
-    GATE_NOT_GREEN = "TEST_PAIRING_ACCEPTED_TESTS_NOT_GREEN"
-    UNREADABLE = "TEST_PAIRING_TEST_TREE_UNREADABLE"
+    The audience for these remedies is the *builder*, not the tester: a
+    pairing refusal lands on the implementation lane's retry prompt. Where
+    one code covers several measured sub-causes (`GATE_NOT_GREEN` has
+    three), the member carries the remedy for the ordinary one and the
+    raising site overrides with the specific one — the override is still
+    deterministic text declared at a raise site, never inferred later.
+    """
+
+    NO_ACCEPTED_CANDIDATE = (
+        "TEST_PAIRING_NO_ACCEPTED_CANDIDATE",
+        "Nothing in this diff can satisfy the check yet: the tests node "
+        "this lane is gated by has no accepted test candidate, so there is "
+        "nothing to be gated against. The pairing is re-checked once a test "
+        "candidate is accepted; if none ever is, the tests lane — not this "
+        "one — is where the work is.")
+    BYTES_SUBSTITUTED = (
+        "TEST_PAIRING_TEST_BYTES_SUBSTITUTED",
+        "Restore every differing path the verdict names to the accepted "
+        "test candidate's exact bytes. This node may not edit, delete, "
+        "regenerate, or reformat reviewed test files — the acceptance those "
+        "tests carry is an acceptance of those bytes. Make the "
+        "implementation satisfy the tests as reviewed, never the tests fit "
+        "the implementation.")
+    GATE_NOT_GREEN = (
+        "TEST_PAIRING_ACCEPTED_TESTS_NOT_GREEN",
+        "Make every case the accepted test candidate's obligations select "
+        "pass against this candidate: run the accepted selector locally, "
+        "read each failure, and change the implementation until the "
+        "selected cases are green — without touching the test files, which "
+        "must stay byte-identical to the accepted candidate.")
+    UNREADABLE = (
+        "TEST_PAIRING_TEST_TREE_UNREADABLE",
+        "This names the machine, not the diff: a git read or "
+        "case-collection step failed while checking the pairing, so "
+        "nothing about the implementation was judged. The retry re-runs "
+        "the check unchanged; if it recurs, an operator must inspect the "
+        "repository or runner fault named in the verdict.")
 
 
 def compare_test_bytes(tree: Path, accepted_sha: str, candidate_sha: str,

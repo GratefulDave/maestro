@@ -2188,7 +2188,18 @@ def _code_review_runner(
             # its reviewer is still writing.  Only the common poller's
             # completeness contract may adopt a persisted report.
             persisted_report = _poll_reviewer_report(report_path)
-            dispatch_is_proven = resume_existing_dispatch
+            # What the ledger says about this exact (node, output_sha) review,
+            # and it is the only thing consulted. `DISPATCHED` means an offer
+            # was issued to a reviewer; `PUBLISHED` means one was not. Named
+            # `recorded` rather than `proven` on purpose -- the edge is written
+            # when the prompt is offered, not when the actor is observed to
+            # have taken it, and calling that "proven" is the precise mistake
+            # §16.3 item 136 is about.
+            dispatch_is_recorded = resume_existing_dispatch
+            # Resuming a row the ledger left PUBLISHED. Its one reader is the
+            # stale-report decision below: a report on disk under this digest
+            # may belong to an earlier generation, and only the poller's
+            # completeness contract may adopt one.
             recovering_unproven_dispatch = False
             if lifecycle_store is not None:
                 durable_review = lifecycle_store.candidate_review(
@@ -2197,7 +2208,7 @@ def _code_review_runner(
                     output_sha,
                 )
                 if durable_review is not None:
-                    dispatch_is_proven = (
+                    dispatch_is_recorded = (
                         durable_review.state
                         is scheduler_types.CandidateReviewState.DISPATCHED
                     )
@@ -2206,13 +2217,34 @@ def _code_review_runner(
                         and durable_review.state
                         is scheduler_types.CandidateReviewState.PUBLISHED
                     )
-            if not dispatch_is_proven and not recovering_unproven_dispatch:
+            if not dispatch_is_recorded and not recovering_unproven_dispatch:
                 _clear_stale_reviewer_report(report_path)
                 persisted_report = None
             submitted = False
 
             def mark_dispatched(handle) -> None:
-                nonlocal dispatch_is_proven, recovering_unproven_dispatch
+                """Record that this generation was offered the review prompt.
+
+                **Its precondition is an offer, not a proof, and that is
+                deliberate.** `submit_agent_prompt` no longer refuses a lane
+                prompt it could not prove was taken: turn length is unbounded
+                (§7.6 measured omp's transcript at TURN granularity and says a
+                turn doing real work runs far longer), so the end of any window
+                over "has the actor recorded this yet" is a fact about the
+                window. A reviewer turn runs 46-461s (§3.6) -- exactly as
+                unbounded as a build turn -- so the reviewer path is uniform
+                with the lane path rather than special.
+
+                What follows is that this edge is written on the offer, and a
+                failed offer is caught later by the finalization window
+                observing a reviewer that never reports. That ordering is now
+                load-bearing: it is what lets `PUBLISHED` mean "never offered"
+                and `DISPATCHED` mean "do not offer again", which is what
+                removed the duplicate-review window this path used to carry.
+                Do not "tighten" it by moving the write back behind a proof --
+                there is no bounded proof to move it behind.
+                """
+                nonlocal dispatch_is_recorded, recovering_unproven_dispatch
                 if lifecycle_store is not None:
                     # Direct callback consumers (including offline contract
                     # tests) may use actor-session persistence without the
@@ -2226,7 +2258,7 @@ def _code_review_runner(
                         )
                         is None
                     ):
-                        dispatch_is_proven = True
+                        dispatch_is_recorded = True
                         recovering_unproven_dispatch = False
                         return
                     session = active_session(build_node_id)
@@ -2259,39 +2291,60 @@ def _code_review_runner(
                         output_sha,
                         reviewer_generation=session.generation,
                     )
-                dispatch_is_proven = True
+                dispatch_is_recorded = True
                 recovering_unproven_dispatch = False
-
-            def recover_transcript_dispatch(handle) -> bool:
-                if dispatch_is_proven:
-                    return True
-                recorded = launcher.prompt_submission_recorded(handle, prompt_path)
-                if not recorded and recovering_unproven_dispatch:
-                    recorded = launcher.wait_for_prompt_submission_record(
-                        handle, prompt_path
-                    )
-                if not recorded:
-                    return False
-                mark_dispatched(handle)
-                return True
 
             def launch_reviewer():
                 nonlocal submitted
                 handle = handles.get(build_node_id)
                 if handle is not None:
-                    # PUBLISHED can be the crash gap after Herdr consumed the
-                    # prompt but before SQLite advanced to DISPATCHED. The
-                    # exact @<digest/prompt.md> transcript record closes that
-                    # gap without a duplicate turn.
-                    recover_transcript_dispatch(handle)
-                    if not dispatch_is_proven and not submitted:
+                    if not dispatch_is_recorded and not submitted:
+                        # LEDGER FIRST, THEN THE PROMPT. Do not reorder these.
+                        #
+                        # `CandidateReviewState` is a two-phase log: PUBLISHED
+                        # is written *before* prompt submission and DISPATCHED
+                        # after it, so a crash between them used to leave
+                        # PUBLISHED meaning either "never offered" or "offered,
+                        # and the process died before it could say so". The
+                        # ledger could not tell those apart, and what stood in
+                        # for it was a 10s look for the prompt's record in the
+                        # actor's transcript, with the expiry read as "never
+                        # offered" and answered with a second prompt.
+                        #
+                        # That is the same defect as §16.3 item 136, one
+                        # consequence milder: the transcript is written at TURN
+                        # granularity, turn length is unbounded, and no window
+                        # over it can be sized correctly. A reviewer turn runs
+                        # 46-461s (§3.6), so the 10s window expired on working
+                        # reviewers and bought a duplicate review.
+                        #
+                        # Writing the edge first removes the ambiguity instead
+                        # of guessing at it. PUBLISHED now means the offer was
+                        # never begun, which is the only case that may be
+                        # offered; DISPATCHED means an offer was issued, and an
+                        # issued offer is never repeated. Nothing here consults
+                        # an artifact the actor writes, so nothing here can be
+                        # wrong about how long the actor takes to write it.
+                        #
+                        # The residual is a crash between this write and the
+                        # prompt landing: the reviewer never receives it, and
+                        # the finalization window adjudicates the silence. That
+                        # is the same trade already accepted for recording
+                        # dispatch on the offer rather than on proof, and it is
+                        # the safe direction -- a review that does not happen
+                        # is detectable, a duplicated review turn overwrites
+                        # the report of the one that did.
+                        #
+                        # `mark_dispatched` also re-verifies the actor binding,
+                        # so running it first means ownership is proven before
+                        # any text is typed into the pane.
+                        mark_dispatched(handle)
                         runner.resubmit(
                             handle,
                             prompt_path,
                             route=args.reviewer_route,
                             expected_token=handle.correlation_token,
                         )
-                        mark_dispatched(handle)
                         submitted = True
                 else:
                     session = active_session(build_node_id)
@@ -2435,17 +2488,19 @@ def _code_review_runner(
                                 tab_id=handle.tab_id,
                             )
                     if adopted_existing:
-                        recover_transcript_dispatch(handle)
-                        if not dispatch_is_proven:
+                        if not dispatch_is_recorded:
+                            # Ledger first, then the prompt -- see the branch
+                            # above for why this order is the fix rather than
+                            # an accident of it.
+                            mark_dispatched(handle)
                             runner.resubmit(
                                 handle,
                                 prompt_path,
                                 route=args.reviewer_route,
                                 expected_token=handle.correlation_token,
                             )
-                            mark_dispatched(handle)
                             submitted = True
-                    if not dispatch_is_proven and submitted:
+                    if not dispatch_is_recorded and submitted:
                         mark_dispatched(handle)
                     handles[build_node_id] = handle
                 return finalization_window.ReviewerSession(
@@ -5738,6 +5793,43 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # goal, so it is strictly larger. Same chokepoint as before.
                 _preflight_prompt(prompt_text, lane_route, lane_model)
                 prompt.write_text(prompt_text, encoding="utf-8")
+                # When the launcher first held this attempt's durable identity,
+                # so the `mark_launched` after `launch` returns re-asserts that
+                # instant instead of overwriting it with the later one. Same
+                # attempt, one launch, one launched_at.
+                identity_at: List[float] = []
+
+                def record_launch_identity(handle: Any) -> None:
+                    """Write pane identity the moment the launcher holds it.
+
+                    Runs inside `launch`, before the prompt-submission proof.
+                    Until this existed the row stayed blank for the 30s-2min a
+                    real pane was already open, so §7.6's process-alive and
+                    turn-count signals were disarmed over exactly the window
+                    where a launch goes wrong, and a refusal in the submission
+                    path orphaned a pane no durable record named.
+
+                    `pid` is `None` on purpose: the pane's foreground group is
+                    only meaningful after submission, and `attempt_liveness`
+                    reads a missing pid as *unknown* rather than as dead
+                    (§1.2), so arming early cannot manufacture a PROCESS_DEAD.
+                    The call after `launch` returns fills the pid in.
+                    """
+                    identity_at.append(time.time())
+                    store.mark_launched(
+                        args.run_id,
+                        node.node_id,
+                        record.attempt_no,
+                        None,
+                        launched_at=identity_at[0],
+                        extra=_launch_attempt_extra(
+                            str(handle.transcript_path),
+                            vendor=lane_vendor,
+                            model=lane_model,
+                            route=lane_route,
+                        ),
+                    )
+
                 # Bound to a name rather than passed inline so the chokepoint
                 # is one statement. `_route_context_window` resolves a lane
                 # model through its route's catalog and raises when it does not
@@ -5772,6 +5864,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     pane_group_size=3,
                     restrict_tools=getattr(args, "restrict_actor_tools", False),
                     environment=launch_environment,
+                    on_identity=record_launch_identity,
                 )
                 with handles_lock:
                     # The one call that can open a pane for this attempt.
@@ -5810,6 +5903,11 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     node.node_id,
                     record.attempt_no,
                     liveness_pid,
+                    # Re-asserted, not recomputed: `record_launch_identity`
+                    # already wrote this row when the pane became real, and
+                    # `launched_at` names that instant rather than whenever
+                    # the submission path happened to finish.
+                    launched_at=identity_at[0] if identity_at else None,
                     extra=_launch_attempt_extra(
                         str(handle.transcript_path),
                         vendor=lane_vendor,
@@ -5817,7 +5915,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                         route=lane_route,
                     ),
                 )
-                on_launch(liveness_pid)
+                on_launch(liveness_pid, identity_at[0] if identity_at else None)
                 return _poll_agent_execution(
                     route_runner,
                     handle,

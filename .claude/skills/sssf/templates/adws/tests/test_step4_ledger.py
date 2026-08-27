@@ -552,6 +552,11 @@ class OneQueryPathTests(LedgerFixture):
                 "transitions",
                 "results",
                 "orphans",
+                # The plan lineage §10.6 reads back: `record_plan_version`
+                # writes it from `scheduler.py`, `current_plan` and
+                # `amend_run_plan` read it from `maestro.py`. Live run state,
+                # not a dashboard.
+                "run_plan_versions",
                 "actor_sessions",
                 "lane_candidates",
                 "candidate_reviews",

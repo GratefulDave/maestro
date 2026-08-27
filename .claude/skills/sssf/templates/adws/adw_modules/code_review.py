@@ -1299,7 +1299,9 @@ class ReviewHandoff(BaseModel):
             "Every `finding` carries four things, and a finding missing any of "
             "them makes the whole report unparseable:",
             "",
-            "  message          what is wrong and exactly where",
+            "  message          what is wrong, exactly where, and what "
+            "change would resolve it — the builder acts on this text and "
+            "sees nothing else about your reasoning",
             "  grade            error | warning | note",
             "  grade_rationale  one sentence: the consequence that puts it at "
             "that grade",

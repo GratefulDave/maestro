@@ -49,6 +49,28 @@ prompt and the adjudicator read a default of 1. Attributing every write to the
 class the callee resolves to is the whole reason this check sees what a text
 search cannot.
 
+**And which class the callee resolves to is a question, not a given.** Two
+production modules may define a dataclass by the same name. Keying field order
+on the bare name alone lets whichever definition is parsed last silently
+replace the other's, and then every construction of *either* class is zipped
+against the wrong field order. That degrades in both directions at once:
+`deliver.Finding(source, code, pointer, message)` read as unwritten in `source`
+and `pointer`, because `plan_amendment.Finding`'s three-field order had
+displaced it and the fourth argument fell off the end of the zip -- while
+`plan_amendment.Finding.node_id` simultaneously read as *written* by sixteen
+call sites, seven of which were `deliver.py`'s and wrote no such field. The
+loud half was a false positive; the quiet half is a false negative, and it is
+the half that would have hidden the next real seam. Resolution is therefore
+module-local first -- which is what Python itself does with a bare name -- and
+a name that genuinely collides must be declared in `SHARED_DATACLASS_NAMES`
+with the reason, so the ambiguity is written down rather than rediscovered.
+
+The residual, stated: `scoped_writes` stays keyed on the *bare* class name,
+because `ALLOWED` and the converse check below are written that way. Two
+same-named classes that also share a *field* name would still cross-attribute
+that one field. `SHARED_DATACLASS_NAMES` carries the reason each collision is
+tolerated, and that reason is where a shared field name has to be argued.
+
 Run:  uv run adw_test.py -k dead_seams
 """
 
@@ -57,7 +79,7 @@ from __future__ import annotations
 import ast
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 ADWS = Path(__file__).resolve().parent.parent
 
@@ -273,6 +295,24 @@ ALLOWED: Dict[str, str] = {
     "owned by a concurrent lane",
 }
 
+#: Production dataclass names defined in more than one module, each with the
+#: reason the collision is tolerated. A shared name is not itself a defect --
+#: two unrelated domains may each have earned the word -- but it is the one
+#: input that makes every other check in this file approximate rather than
+#: exact, so it is declared rather than discovered. An entry must say what the
+#: two field lists are and why cross-attribution between them is harmless.
+SHARED_DATACLASS_NAMES: Dict[str, str] = {
+    "Finding": (
+        "deliver.Finding (source, code, pointer, message) is a reason a work "
+        "package did not ship; plan_amendment.Finding (code, node_id, detail) "
+        "is a reason an amendment is refused. Unrelated domains, and each is "
+        "constructed only within its own module, so module-local resolution "
+        "is exact for both. The residual is the bare-name key on "
+        "scoped_writes: the two share the field name `code`, and both write "
+        "it at every construction, so neither can mask the other there."
+    ),
+}
+
 
 def _production_files() -> List[Path]:
     out: List[Path] = []
@@ -354,7 +394,18 @@ class _Index:
 
     def __init__(self) -> None:
         self.fields: Dict[str, Dict[str, str]] = {}
-        self.field_order: Dict[str, List[str]] = {}
+        #: Field order and `__init__` parameters, keyed by (defining module,
+        #: class) rather than by class name alone. Two production modules
+        #: define a dataclass named `Finding`; on a bare-name key the second
+        #: one parsed replaced the first, and from then on every construction
+        #: of either class was zipped against the other's field order. The
+        #: module is what disambiguates, because it is what Python itself
+        #: uses to resolve a bare `Finding(...)`.
+        self.module_field_order: Dict[Tuple[str, str], List[str]] = {}
+        self.module_constructors: Dict[Tuple[str, str], List[str]] = {}
+        #: Bare class name -> every module that defines a class by it. Used to
+        #: resolve a name that is *imported* rather than module-local.
+        self.definitions: Dict[str, List[str]] = {}
         self.callables: Dict[str, str] = {}
         self.reads: Dict[str, Set[str]] = {}
         self.writes: Dict[str, Set[str]] = {}
@@ -395,7 +446,8 @@ class _Index:
                         if _has_default_factory(stmt):
                             continue
                         fields[stmt.target.id] = f"{path.name}:{stmt.lineno}"
-                    self.field_order[node.name] = order
+                    self.module_field_order[(module, node.name)] = order
+                self.definitions.setdefault(node.name, []).append(module)
                 init = next(
                     (
                         stmt
@@ -406,20 +458,44 @@ class _Index:
                     None,
                 )
                 if init is not None:
-                    self.constructors[node.name] = [
-                        arg.arg for arg in init.args.args if arg.arg != "self"
-                    ]
-                elif node.name in self.field_order:
-                    self.constructors[node.name] = list(self.field_order[node.name])
+                    params = [arg.arg for arg in init.args.args if arg.arg != "self"]
+                else:
+                    params = list(
+                        self.module_field_order.get((module, node.name), ())
+                    )
+                if init is not None or params:
+                    self.constructors[node.name] = params
+                    self.module_constructors[(module, node.name)] = params
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.callables.setdefault(
                     f"{module}.{node.name}", f"{path.name}:{node.lineno}"
                 )
 
-    def _record_construction(self, owner: str, call: ast.Call, loc: str) -> None:
-        order = self.field_order.get(owner)
-        if order is None:
-            return
+    def _shapes_for(
+        self, module: str, name: str, table: Dict[Tuple[str, str], List[str]]
+    ) -> List[List[str]]:
+        """Which class does a bare `Name(...)` call in `module` construct?
+
+        Module-local definition first, which is Python's own answer and is
+        exact. Otherwise the name was imported, and the shape is whichever
+        module defines it -- unambiguous unless the name collides, in which
+        case every candidate is returned and the write is attributed to all of
+        them. That over-attributes rather than under-attributes, so a genuine
+        seam behind a collided name reads as written; `SHARED_DATACLASS_NAMES`
+        is the reader that makes that possibility visible instead of silent.
+        """
+        local = table.get((module, name))
+        if local is not None:
+            return [local]
+        return [
+            table[(mod, name)]
+            for mod in self.definitions.get(name, ())
+            if (mod, name) in table
+        ]
+
+    def _record_construction(
+        self, owner: str, call: ast.Call, loc: str, order: Sequence[str]
+    ) -> None:
         for field, _arg in zip(order, call.args):
             self.scoped_writes.setdefault((owner, field), set()).add(loc)
         for kw in call.keywords:
@@ -429,10 +505,9 @@ class _Index:
                 # `Cls(**payload)` writes an unknowable set of fields.
                 self.splatted.add(owner)
 
-    def _record_constructor_args(self, owner: str, call: ast.Call, loc: str) -> None:
-        params = self.constructors.get(owner)
-        if not params:
-            return
+    def _record_constructor_args(
+        self, owner: str, call: ast.Call, loc: str, params: Sequence[str]
+    ) -> None:
         for param, arg in zip(params, call.args):
             self.constructor_args.setdefault((owner, param), []).append((loc, arg))
         for kw in call.keywords:
@@ -442,6 +517,7 @@ class _Index:
                 )
 
     def use(self, path: Path, tree: ast.Module) -> None:
+        module = path.stem
         # A classmethod builds its own class as `cls(...)`. Resolve that first,
         # or every field a `parse`/`from_row` constructor writes reads as
         # unwritten — which is most of GateCounts.
@@ -453,10 +529,14 @@ class _Index:
                 if not (isinstance(inner, ast.Call) and _callee_name(inner) == "cls"):
                     continue
                 site = loc.format(inner.lineno)
-                if outer.name in self.field_order:
-                    self._record_construction(outer.name, inner, site)
-                if outer.name in self.constructors:
-                    self._record_constructor_args(outer.name, inner, site)
+                for order in self._shapes_for(
+                    module, outer.name, self.module_field_order
+                ):
+                    self._record_construction(outer.name, inner, site, order)
+                for params in self._shapes_for(
+                    module, outer.name, self.module_constructors
+                ):
+                    self._record_constructor_args(outer.name, inner, site, params)
 
         for node in ast.walk(tree):
             loc = f"{path.name}:{getattr(node, 'lineno', 0)}"
@@ -470,19 +550,28 @@ class _Index:
                 name = _callee_name(node)
                 if name:
                     self.calls.setdefault(name, set()).add(loc)
-                if name in self.field_order:
-                    # Attribute the write to *that class's* field, never to
-                    # every field of that name anywhere: `min_cases=` on a plan
-                    # gate is not a write of `SchedulerDeps.min_cases`, and
-                    # treating it as one is exactly how an unwired field hides
-                    # behind a namesake in another class.
-                    self._record_construction(name or "", node, loc)
-                else:
+                # Attribute the write to *that class's* field, never to
+                # every field of that name anywhere: `min_cases=` on a plan
+                # gate is not a write of `SchedulerDeps.min_cases`, and
+                # treating it as one is exactly how an unwired field hides
+                # behind a namesake in another class. `_shapes_for` carries
+                # that same argument one level up, to the class name itself.
+                orders = (
+                    self._shapes_for(module, name, self.module_field_order)
+                    if name
+                    else []
+                )
+                for order in orders:
+                    self._record_construction(name or "", node, loc, order)
+                if not orders:
                     for kw in node.keywords:
                         if kw.arg:
                             self.writes.setdefault(kw.arg, set()).add(loc)
-                if name in self.constructors:
-                    self._record_constructor_args(name or "", node, loc)
+                if name:
+                    for params in self._shapes_for(
+                        module, name, self.module_constructors
+                    ):
+                        self._record_constructor_args(name, node, loc, params)
 
 
 def _build() -> Tuple[_Index, _Index]:
@@ -495,8 +584,12 @@ def _build() -> Tuple[_Index, _Index]:
         prod.define(path, tree)
     for path, tree in prod_trees:
         prod.use(path, tree)
-    # Tests reuse production definitions; only their usages differ.
-    test.fields, test.field_order = prod.fields, prod.field_order
+    # Tests reuse production definitions; only their usages differ. The
+    # module-scoped tables travel with them, or a test-module call site would
+    # resolve nothing and every field would read as unwritten by tests.
+    test.fields = prod.fields
+    test.module_field_order = prod.module_field_order
+    test.definitions = prod.definitions
     for path, tree in test_trees:
         test.use(path, tree)
     return prod, test
@@ -629,6 +722,64 @@ class DeadSeamTest(unittest.TestCase):
         live_idx.use(Path("live.py"), live)
         self.assertEqual([], _noop_lambda_offenders(live_idx))
 
+    def test_a_same_named_dataclass_no_longer_steals_the_other_field_order(
+        self,
+    ) -> None:
+        """The collision that hid two real writers and invented seven fake ones.
+
+        `deliver.Finding(source, code, pointer, message)` and
+        `plan_amendment.Finding(code, node_id, detail)` are both production
+        dataclasses. On a bare-name key the second parsed replaced the first,
+        so every construction in either module was zipped against the other's
+        order. Both directions are asserted here, because only one of them
+        fails loudly:
+
+        * `w`/`x`/`y`/`z` read as **unwritten** although their own module
+          writes all four positionally -- the false positive, which is what
+          finally sent someone to look.
+        * `p`/`q` read as **written** by a module that has never heard of
+          them -- the false negative, which is the half that would have
+          acquitted a genuine seam in silence.
+        """
+        alpha = ast.parse(
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Thing:\n"
+            "    w: int\n"
+            "    x: int\n"
+            "    y: int\n"
+            "    z: int\n"
+            "def build():\n"
+            "    return Thing(1, 2, 3, 4)\n"
+        )
+        beta = ast.parse(
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Thing:\n"
+            "    p: int\n"
+            "    q: int\n"
+        )
+        idx = _Index()
+        # Parse order is the one that used to decide the winner: `beta` is
+        # sorted after `alpha`, so beta's two-field order was the survivor.
+        idx.define(Path("alpha.py"), alpha)
+        idx.define(Path("beta.py"), beta)
+        idx.use(Path("alpha.py"), alpha)
+        idx.use(Path("beta.py"), beta)
+
+        for field in ("w", "x", "y", "z"):
+            self.assertTrue(
+                idx.scoped_writes.get(("Thing", field)),
+                f"alpha.Thing.{field} is written positionally by alpha and "
+                "reads as unwritten: the other module's field order won",
+            )
+        for field in ("p", "q"):
+            self.assertFalse(
+                idx.scoped_writes.get(("Thing", field)),
+                f"beta.Thing.{field} reads as written, but only alpha "
+                "constructs anything and alpha has no such field",
+            )
+
     def test_no_allowlist_entry_has_acquired_a_production_caller(self) -> None:
         """The allowlist read in one direction only, and that is how an entry
         outlives the defect it names.
@@ -690,6 +841,68 @@ class DeadSeamTest(unittest.TestCase):
             "architecture register, went stale with it. Delete the entry.\n"
             + "\n".join(stale),
         )
+
+    def test_no_shared_dataclass_name_is_undeclared_and_none_is_stale(
+        self,
+    ) -> None:
+        """A class name defined in two modules is what makes this file guess.
+
+        Every check here keys `scoped_writes` on the bare class name, so two
+        production dataclasses sharing one name is the single input that turns
+        an exact attribution into an approximate one. Module-local resolution
+        handles the construction sites; what it cannot handle is the *field*
+        names, and it cannot handle a name imported into a third module where
+        both definitions are candidates. So a collision is legal and declared,
+        never legal and silent.
+
+        Asserted in both directions, because an entry that outlives its
+        collision is the same staleness the allowlist check above convicts: a
+        reason still on the page for a condition that no longer holds.
+        """
+        prod, _test = _build()
+        by_name: Dict[str, List[str]] = {}
+        for module, cls in sorted(prod.module_field_order):
+            by_name.setdefault(cls, []).append(module)
+        colliding = {
+            cls: mods for cls, mods in by_name.items() if len(set(mods)) > 1
+        }
+
+        undeclared = [
+            f"{cls} is defined as a dataclass in {sorted(set(mods))}; every "
+            "write to either is attributed to the same bare-name key"
+            for cls, mods in sorted(colliding.items())
+            if cls not in SHARED_DATACLASS_NAMES
+        ]
+        self.assertEqual(
+            [],
+            undeclared,
+            "a production dataclass name defined in more than one module, "
+            "with no declaration. Rename one, or add it to "
+            "SHARED_DATACLASS_NAMES with the two field lists and the reason "
+            "cross-attribution between them is harmless.\n"
+            + "\n".join(undeclared),
+        )
+
+        stale = [
+            f"{cls} is declared in SHARED_DATACLASS_NAMES but is defined in "
+            f"{sorted(set(by_name.get(cls, [])))}"
+            for cls in sorted(SHARED_DATACLASS_NAMES)
+            if cls not in colliding
+        ]
+        self.assertEqual(
+            [],
+            stale,
+            "a SHARED_DATACLASS_NAMES entry whose collision is gone. The "
+            "reason it carries is now describing code that does not exist; "
+            "delete the entry.\n" + "\n".join(stale),
+        )
+
+        thin = [
+            cls
+            for cls, reason in SHARED_DATACLASS_NAMES.items()
+            if len(reason.strip()) < 12
+        ]
+        self.assertEqual([], thin, f"declarations with no usable reason: {thin}")
 
     def test_every_allowlist_entry_carries_a_reason(self) -> None:
         """An entry with an empty or placeholder reason is a suppression

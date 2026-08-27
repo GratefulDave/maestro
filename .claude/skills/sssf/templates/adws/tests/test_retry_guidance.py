@@ -84,69 +84,6 @@ class _Node:
         self.outputs = tuple(outputs)
 
 
-class WrongReasonRemediationTests(unittest.TestCase):
-    """A verdict that cannot be acted on spends attempts without converging.
-
-    Recorded 2026-08-27, run-d3bd665ce838456f989a15143f196710,
-    `lane-routing-chemical-tests`: attempts a2 and a3 produced BYTE-IDENTICAL
-    `TEST_STRENGTH_CONTROL_WRONG_REASON` refusals and a4 was dispatched with
-    the same prompt again. The tester spent its turn grepping the harness for
-    the gate implementation instead of writing cases, because nothing in the
-    loop ever says what to do differently: guidance is assembled from ledger
-    items by concatenation, and a reviewer never sees a candidate that died in
-    verification.
-
-    The remedy is deterministic text keyed on the typed code -- not a model's
-    opinion -- so it decides no transition (§1.2).
-    """
-
-    REASON = (
-        "TEST_STRENGTH_CONTROL_WRONG_REASON: every selected case failed, but "
-        "none for the declared reason 'AssertionError|feeds_mart'; observed: "
-        "ModuleNotFoundError: No module named 'pkg.mod'"
-    )
-
-    def test_an_import_crash_verdict_carries_the_way_out(self):
-        lines = rp._remediation_lines(self.REASON)
-        self.assertTrue(lines)
-        joined = "\n".join(lines)
-        # It must name the actual mechanism, not merely repeat the verdict.
-        self.assertIn("raises before any assertion runs", joined)
-        self.assertIn("except ModuleNotFoundError", joined)
-        # And it must not undo the constraint that put the import in the body.
-        self.assertIn("inside the body", joined)
-        self.assertIn("uncollectable", joined)
-
-    def test_the_remedy_reaches_the_rendered_guidance(self):
-        """B15: text with no reader is not a fix. Assert it is rendered."""
-        rendered = "\n".join(
-            rp._verification_lines(
-                _Node(("tests/test_x.py",)),
-                rp.VerificationGuidance(reason=self.REASON, failed_clause=3),
-            )
-        )
-        self.assertIn("How to reconcile this", rendered)
-        self.assertIn(self.REASON, rendered)
-
-    def test_a_wrong_reason_that_is_not_an_import_crash_gets_no_advice(self):
-        """The advice is about import crashes; a plain wrong reason is not one."""
-        self.assertEqual(
-            rp._remediation_lines(
-                "TEST_STRENGTH_CONTROL_WRONG_REASON: ... observed: "
-                "AssertionError: some other message"
-            ),
-            [],
-        )
-
-    def test_unrelated_refusals_are_untouched(self):
-        for reason in (
-            "TEST_STRENGTH_CONTROL_NOT_RED: a case passed at the parent",
-            "clause 4",
-            "",
-        ):
-            self.assertEqual(rp._remediation_lines(reason), [])
-
-
 class LedgerSemanticsTests(unittest.TestCase):
     """Accumulation across surfaces, and history within one."""
 

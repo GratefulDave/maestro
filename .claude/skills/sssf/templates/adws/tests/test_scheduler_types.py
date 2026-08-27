@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from enum import Enum
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -187,6 +188,102 @@ class BlockReasonExitTests(unittest.TestCase):
                 offered = set(st.exits_for(reason))
                 self.assertNotIn(st.Escape.RETRY, offered)
                 self.assertNotIn(st.Escape.RETRY_FORCE, offered)
+
+    def test_every_block_reason_is_mapped(self):
+        """The completeness the other tests in this class assume.
+
+        `test_every_reason_admits_a_legal_exit` proves the *value* is
+        non-empty, which it can only do once the lookup has already succeeded;
+        a member absent from `_EXITS` fails it with a lookup error rather than
+        with the fact. `SEMANTIC_REFUSAL_REPEATED` shipped in the enum with no
+        entry and nothing in production noticed, because nothing in production
+        reads this table at all — the map is asserted about here and consulted
+        nowhere else, so the suite is the only thing standing between an added
+        member and a blocked node that declares no way out.
+
+        Set equality, in both directions on purpose: a missing key is the
+        defect that happened, and a stale key is the same defect run backwards
+        — an escape declared for a reason nothing can store any more.
+        """
+        self.assertEqual(
+            set(st._EXITS),
+            set(st.BlockReason),
+            "every stored block reason declares its exits, and only stored "
+            "reasons appear in the table",
+        )
+
+    def test_repeated_semantic_refusal_does_not_offer_plain_retry(self):
+        """The escape the block exists to withhold.
+
+        The reason fires when two consecutive attempts produced the identical
+        content-level refusal, and K is not exhausted when it does — so plain
+        `retry` is admitted on budget and re-dispatches the identical node
+        against the identical input, which is the loop this member was added
+        to cut. `retry --force` is the same dispatch with an operator's
+        signature on it, so it stays.
+        """
+        offered = set(st.exits_for(st.BlockReason.SEMANTIC_REFUSAL_REPEATED))
+        self.assertNotIn(st.Escape.RETRY, offered)
+        self.assertIn(st.Escape.RETRY_FORCE, offered)
+        self.assertTrue(offered - {st.Escape.ABANDON}, "a kill is not a repair")
+
+    def test_an_unmapped_reason_reads_as_a_build_defect(self):
+        """The failure an added-and-unmapped member gets from now on.
+
+        A bare `KeyError` at a dict subscript reprs the member and says
+        nothing about what to do; the point of the reason existing at all is
+        that a blocked operator is told their way out.
+        """
+
+        class Unmapped(str, Enum):
+            NOT_IN_THE_TABLE = "NOT_IN_THE_TABLE"
+
+        with self.assertRaises(st.UnmappedBlockReason) as caught:
+            st.exits_for(Unmapped.NOT_IN_THE_TABLE)
+        message = str(caught.exception)
+        self.assertIn("NOT_IN_THE_TABLE", message)
+        self.assertIn("_EXITS", message)
+        self.assertIn("no entry", message)
+        self.assertIsInstance(caught.exception, LookupError)
+
+    def test_the_enum_derived_tuples_are_subsets_and_not_tables(self):
+        """The sibling shapes, and why only one of them owes completeness.
+
+        `_EXITS` is the module's only enum-keyed *table* — a structure whose
+        contract is that it answers for every member — which is why a member
+        can go missing from it. The other seven module-level constants derived
+        from an enum are deliberately partial: each names the subset of its
+        enum for which some property holds, so a member's absence is the
+        answer `no`, not a gap. What they can still get wrong is holding a
+        value from the wrong enum, which is what this checks.
+        """
+        subsets = {
+            "LANE_PHASE_TERMINAL": (st.LANE_PHASE_TERMINAL, st.LanePhase),
+            "ABSOLUTELY_TERMINAL": (st.ABSOLUTELY_TERMINAL, st.NodeState),
+            "OPERATOR_TERMINAL": (st.OPERATOR_TERMINAL, st.NodeState),
+            "TERMINAL_WITHOUT_MERGE": (st.TERMINAL_WITHOUT_MERGE, st.NodeState),
+            "REOPENABLE_CANCEL_CAUSES": (
+                st.REOPENABLE_CANCEL_CAUSES,
+                st.CancelCause,
+            ),
+            "UNEVIDENCED_MERGE_CAUSES": (st.UNEVIDENCED_MERGE_CAUSES, st.MergeCause),
+            "NON_RETRYABLE": (st.NON_RETRYABLE, st.BlockReason),
+        }
+        for name, (members, enum) in subsets.items():
+            with self.subTest(constant=name):
+                self.assertTrue(members, f"{name} is empty")
+                for member in members:
+                    self.assertIsInstance(member, enum)
+                self.assertEqual(
+                    len(set(members)), len(members), f"{name} repeats a member"
+                )
+                self.assertLess(
+                    len(set(members)),
+                    len(set(enum)),
+                    f"{name} covers its whole enum; if that is now the "
+                    "contract it is a table and owes the completeness test "
+                    "above, not this one",
+                )
 
 
 # ── §7.3 / §7.4 the node model the scheduler consumes directly ──────────────
