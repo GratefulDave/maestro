@@ -2346,11 +2346,28 @@ class Scheduler:
         )
         self._require_running(record)
 
-        def on_launch(pid: Optional[int] = None) -> None:
-            """Arm liveness only while this exact generation still owns RUNNING."""
+        def on_launch(
+            pid: Optional[int] = None, launched_at: Optional[float] = None
+        ) -> None:
+            """Arm liveness only while this exact generation still owns RUNNING.
+
+            `launched_at` is passed by a runner that already armed the attempt
+            earlier in its own launch — the agent runner writes pane identity
+            the instant herdr reports the session path, well before the prompt
+            proof finishes. Re-asserting the row here must not move the instant
+            the attempt became live forward to whenever the launch happened to
+            return; one launch has one `launched_at`. `None` means this call is
+            the first, and `mark_launched` stamps the current time.
+
+            It is passed rather than made write-once in the store: a resumed
+            generation relaunches under the same attempt row and must be able
+            to re-arm, so the row cannot refuse a second `launched_at`.
+            """
             with self._lock:
                 self._require_running(record)
-                store.mark_launched(self.run_id, node.node_id, attempt_no, pid)
+                store.mark_launched(
+                    self.run_id, node.node_id, attempt_no, pid, launched_at
+                )
 
         self._require_running(record)
         with self._lock:

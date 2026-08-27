@@ -138,6 +138,12 @@ elif argv[:2] == ["pane", "send-text"]:
     bump()
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["pane", "send-keys"]:
+    # A pane herdr will not take a key for at all. Nothing reaches the
+    # composer, so nothing is ever learned about the composer -- which is a
+    # different fact from "it refused the text", and refuses differently.
+    if os.environ.get("FAKE_KEYS_REFUSED"):
+        sys.stderr.write(json.dumps({"error": {"code": "pane_not_found"}}))
+        sys.exit(1)
     bump()
     record_submission()
     print(json.dumps({"result": {"ok": True}}))
@@ -156,6 +162,9 @@ elif argv[:2] == ["pane", "send-text"]:
     record_submission()
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["agent", "send-keys"]:
+    if os.environ.get("FAKE_KEYS_REFUSED"):
+        sys.stderr.write(json.dumps({"error": {"code": "agent_not_found"}}))
+        sys.exit(1)
     bump()
     # Enter on a composer holding the text submits it, which is what makes
     # the recovery loop worth running. A fake that bumps the revision and
@@ -685,6 +694,53 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual([call[3] for call in keys], ["esc", "enter"])
         self.assertLess(calls.index(prompts[0]), calls.index(keys[0]))
 
+    def test_launch_identity_is_written_before_the_submission_proof(self):
+        """A real pane existed for minutes while its attempt row said NULL.
+
+        `store.mark_launched` was reachable only after `launch` returned, and
+        `launch` does not return until the prompt-submission proof is done --
+        30s to 2 minutes later. For that whole window `launched_at`, `pid` and
+        `session_path` were NULL on the attempt row, which means
+        `AttemptRecord.armed` was False and §7.6's process-alive and turn-count
+        signals were disarmed over exactly the stretch where a launch goes
+        wrong. A refusal inside the submission path then left a pane behind
+        that no durable record named.
+
+        None of that identity depends on the composer accepting a keystroke.
+        The pane is bound to the worktree, the actor owns the pane, and herdr
+        has reported the session path, all before a single Enter is pressed --
+        so the write happens there, and the proof happens after it.
+        """
+        seen = []
+        runtime = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
+
+        def record(handle):
+            seen.append((handle, len(self.recorded_calls())))
+
+        handle = runtime.launch(replace(self.spec(), on_identity=record))
+
+        self.assertEqual(len(seen), 1)
+        identified, calls_at_write = seen[0]
+        self.assertIs(identified, handle)
+        # The identity is complete at the moment it is written.
+        self.assertEqual(identified.pane_id, "w1:p2")
+        self.assertEqual(identified.transcript_path, self.transcript)
+        self.assertTrue(identified.agent_name)
+        # And it is written before the prompt is offered, not after.
+        calls = self.recorded_calls()
+        offered = [
+            index for index, call in enumerate(calls)
+            if call[:2] in (["pane", "send-text"], ["pane", "send-keys"],
+                            ["agent", "send-keys"])
+        ]
+        self.assertTrue(offered)
+        self.assertLessEqual(calls_at_write, offered[0])
+
     def test_launch_waits_for_a_transcript_path_that_arrives_after_start(self):
         # `agent start` returns once herdr holds the process, which for the omp
         # route is before the coder has opened its JSONL session -- so herdr
@@ -1049,29 +1105,73 @@ class LauncherContractTest(unittest.TestCase):
         # Enter; the Enter that follows is the one that submits (run-faa4dc49).
         self.assertEqual([call[3] for call in send_keys], ["esc", "enter"])
 
-    def test_a_prompt_the_actor_never_recorded_refuses_the_launch(self):
-        """The blindness this suite carried, in both of its forms.
+    def test_a_prompt_the_actor_has_not_recorded_yet_does_not_refuse(self):
+        """A bounded look at an unbounded quantity is not a verdict.
 
-        Until 2026-08-18 an unsubmitted prompt was believed submitted because
-        the pane reported `idle`. The meter replaced the status word, and this
-        test then asserted that an unreadable meter refuses.
+        The history this test carries is three-deep. Until 2026-08-18 an
+        unsubmitted prompt was believed submitted because the pane reported
+        `idle`. The meter replaced the status word, and this test then asserted
+        that an unreadable meter refuses. On 2026-08-27 the meter failed the
+        same way one artifact over -- a grok builder at revision 1 holding
+        `@<prompt>` while the launcher, reading 0 -> 1, returned success
+        without pressing Enter -- so proof moved to the actor's own transcript,
+        and the absence of a record became the refusal.
 
-        On 2026-08-27 the meter failed the same way, one artifact over: a grok
-        builder sat at revision 1 holding `@<prompt>` while the launcher, read-
-        ing 0 -> 1, returned success without pressing Enter. Pasting the prompt
-        is itself a repaint, so the counter advances identically whether the
-        composer took the turn or is merely rendering text it still holds.
+        That last step is the one being undone here, and only that one. The
+        transcript is written at TURN granularity: §7.6 measured 57.7s in one
+        case and states that a turn doing real work runs far longer, which
+        makes "has the record appeared yet" an unbounded quantity. The
+        launcher looked at it for roughly 40s and called the answer
+        `AGENT_PROMPT_UNSUBMITTED`. On run-8a200af7f9044ce7a11a51b6908f37e3
+        lane-wp6-tests a4 the transcript hit disk carrying the marker at
+        11:44:22 and the refusal was recorded at 11:44:22.707; the paste had
+        worked, and the refusal cancelled the handle.
 
-        So the meter is no longer what refuses, and its absence is no longer a
-        refusal: an actor whose transcript records the turn has submitted it
-        whatever the pane reports. What refuses is the fact both incidents
-        actually shared -- no durable record of the turn in the actor's own
-        transcript. The pane here is kept meterless deliberately, to show the
-        refusal no longer depends on reading one.
+        No larger window fixes that, so the lane path stopped issuing the
+        verdict. It presses its Enters, writes the launch identity, and returns
+        the handle; the node's liveness and quiescence machinery adjudicates
+        from there, because it is the only reader whose evidence keeps
+        arriving. `FAKE_NEVER_SUBMITS` is the composer that genuinely never
+        accepts, and even against that the launcher's honest answer is
+        "offered, unproven" -- indistinguishable, at this remove, from an actor
+        three minutes into a real turn.
         """
         os.environ["FAKE_PANE_WITHOUT_REVISION"] = "1"
         os.environ["FAKE_AGENT_STATUS"] = "idle"
         os.environ["FAKE_NEVER_SUBMITS"] = "1"
+        runtime = HerdrLauncher(
+            herdr_path=self.herdr,
+            omp_path=Path("/opt/omp"),
+            claude_path=Path("/opt/claude"),
+            admitted_routes=self.admitted_routes,
+        )
+
+        handle = runtime.launch(self.spec("claude"))
+
+        self.assertEqual(handle.pane_id, "w1:p2")
+        calls = self.recorded_calls()
+        # It did every deliverable thing before declining to conclude.
+        self.assertEqual(
+            len([call for call in calls if call[:2] == ["pane", "send-text"]]), 1
+        )
+        enters = [
+            call for call in calls
+            if call[:2] in (["pane", "send-keys"], ["agent", "send-keys"])
+            and call[3] == "enter"
+        ]
+        self.assertGreaterEqual(len(enters), launcher.SUBMIT_ATTEMPTS)
+        # And it did not cancel the pane it had just opened.
+        self.assertFalse([call for call in calls if call[:2] == ["pane", "close"]])
+
+    def test_an_undelivered_enter_still_refuses_the_launch(self):
+        """Suppressing the verdict about the composer suppresses only that.
+
+        `AGENT_PROMPT_UNDELIVERED` is D9's distinction, not this one: herdr
+        accepted no Enter at all, so no key ever reached the composer and "it
+        will not submit" was never tested. That is a statement about herdr, it
+        classifies TRANSIENT, and it still fails closed on the lane path.
+        """
+        os.environ["FAKE_KEYS_REFUSED"] = "1"
         runtime = HerdrLauncher(
             herdr_path=self.herdr,
             omp_path=Path("/opt/omp"),
@@ -1084,8 +1184,9 @@ class LauncherContractTest(unittest.TestCase):
             caught.exception.refusal, launcher.LaunchRefusal.PROMPT_SUBMISSION_REFUSED
         )
         self.assertIsInstance(
-            caught.exception.__cause__, launcher.PromptNotSubmitted
+            caught.exception.__cause__, launcher.PromptSubmissionUnobservable
         )
+        self.assertIn("AGENT_PROMPT_UNDELIVERED", str(caught.exception))
 
     def test_reclaim_matches_exact_token_only(self):
         launcher = FakeLauncher()

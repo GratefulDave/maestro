@@ -611,10 +611,34 @@ def _prompt_turn(
         # Claude's composer can accept a prompt without advancing the pane
         # revision. Its typed working state is equivalent consumption proof
         # only when folded into this predicate, never via the meter.
+        #
+        # ADMISSION KEEPS ITS BOUNDED WAIT, AND THAT IS NOT THE 2026-08-27
+        # DEFECT REPEATING. DO NOT "UNIFY" THIS WITH THE LANE PATH.
+        #
+        # The lane path stopped convicting at the end of a window because the
+        # quantity it was looking at -- how long an agent's turn runs before
+        # its transcript records anything -- is unbounded (§7.6: a turn doing
+        # real work runs far longer than the 57.7s measured there). No window
+        # over an unbounded quantity can be sized correctly, so the refusal at
+        # the end of one was a statement about Maestro's clock.
+        #
+        # This turn is not that quantity. The prompt here is literally "Reply
+        # with exactly <marker> and nothing else": one short sentence, one
+        # short answer, no tools, no files, no work. Its length is bounded BY
+        # CONSTRUCTION, which is what makes a window over it a legitimate
+        # measurement rather than an invented one.
+        #
+        # And the consequence differs. A lane attempt that is offered but
+        # unproven is adjudicated downstream by liveness and quiescence, so
+        # returning "unproven" costs nothing and loses nothing. Admission has
+        # no downstream: its output is a SIGNED ROUTE RECEIPT, and a receipt
+        # signed over an unproven route is exactly the thing §1.2 forbids --
+        # a durable typed artifact asserting something nobody observed. It
+        # must fail closed here or not at all, so `refuse_unproven` keeps its
+        # default.
         launcher.submit_agent_prompt(
             call, handle["pane_id"], prompt, handle["name"],
             timeout_s=timeout_s,
-            until=("working", "idle") if working_proves else ("idle",),
             working_proves=working_proves,
             submission_recorded=_submitted)
 

@@ -305,8 +305,8 @@ class RefusalCleanupTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.detail, "ENVELOPE_SUCCESS")
 
-    def test_a_prompt_the_actor_never_recorded_refuses_the_launch(self):
-        """Superseded twice by the same run, 2026-08-27.
+    def test_a_prompt_the_actor_has_not_recorded_yet_keeps_its_pane(self):
+        """Superseded three times by the same run, 2026-08-27.
 
         First this asserted that a `working` status carried a launch whose
         pane revision never moved; that was inverted when a booting agent
@@ -320,21 +320,32 @@ class RefusalCleanupTest(unittest.TestCase):
         while the launcher, reading 0 -> 1, returned success without pressing
         Enter; the node blocked `ENVIRONMENTAL_BUDGET_EXHAUSTED` with receipt
         `NEVER_STARTED`. One Enter afterwards drove that same counter past
-        1000 in four seconds.
+        1000 in four seconds. Proof moved to the actor's own transcript, and
+        the absence of a record became the refusal.
 
-        So a static meter is no longer the thing asserted -- it never
-        distinguished the two cases in either direction. What is asserted is
-        the invariant both incidents violated: a launch whose prompt the actor
-        never recorded is refused rather than handed on. The meter is left
-        advancing here precisely to show it no longer carries the decision.
+        That third step is what is undone here, and only it. The transcript is
+        written at TURN granularity — §7.6 measured 57.7s and says a turn doing
+        real work runs far longer — so "has the record appeared yet" is an
+        unbounded quantity, and a refusal issued at the end of a ~40s look at
+        it is a statement about the clock. On
+        run-8a200af7f9044ce7a11a51b6908f37e3, lane-wp6-tests a4's transcript
+        hit disk carrying the marker at 11:44:22 and the refusal was recorded
+        at 11:44:22.707. The refusal then cancelled the handle, which is what
+        this test now asserts must not happen: the pane stays, the handle is
+        returned, and the node's liveness and quiescence machinery adjudicates
+        an actor whose evidence keeps arriving.
         """
         harness, fake = self.build()
         fake.advance_revision = True
         fake.agent_status = "working"
         fake.records_submission = False
 
-        with self.assertRaises(lch.LaunchRefused):
-            harness.launch(self.spec(route="omp"))
+        handle = harness.launch(self.spec(route="omp"))
+
+        self.assertEqual(fake.closed, [])
+        self.assertEqual(
+            harness.reclaim(self.spec().correlation_token), (handle,)
+        )
 
     def test_the_refusal_stays_a_retryable_launch_failure(self):
         """The end of the causal chain the incident took.

@@ -482,6 +482,24 @@ class LaunchSpec:
     #: `--disallowedTools`. Maestro does not editorialise about tools unless
     #: asked.
     restrict_tools: bool = False
+    #: Called once with the `LaunchHandle` the instant the launcher holds this
+    #: attempt's durable identity — pane, actor name, and the session path
+    #: herdr reports as `agent_session` — and BEFORE the prompt-submission
+    #: proof runs.
+    #:
+    #: `store.mark_launched` used to be reachable only after `launch` returned,
+    #: which is 30s to 2 minutes after a real pane exists and a real actor owns
+    #: it. For that whole window the attempt row said `launched_at`, `pid` and
+    #: `session_path` were NULL: the watchdog's §7.6 signals stayed disarmed
+    #: because `AttemptRecord.armed` is `launched_at is not None`, the console
+    #: showed an attempt with no session to open, and a refusal inside the
+    #: submission path left behind a pane that no durable record named.
+    #:
+    #: The identity is available long before the proof is, so it is written
+    #: long before the proof is. Left `None` the launcher writes nothing, which
+    #: is correct for the launchers that have no ledger (route admission, the
+    #: plan author, the smoke tool).
+    on_identity: Optional[Callable[["LaunchHandle"], None]] = None
 
 
 #: Direct Claude sessions must delegate substantial work rather than silently
@@ -510,6 +528,17 @@ AGENT_QUIESCENT_STATUS = "idle"
 #: same test: two numbers for one clock is how a raised default comes to look
 #: like it did nothing.
 AGENT_QUIESCENCE_CONFIRM_S = 60.0
+
+
+#: The statuses the recovery wait treats as "this round is over": the actor is
+#: demonstrably alive (`working`), demonstrably settled after a turn (`done`),
+#: or stopped at something it needs (`blocked`). Herdr 0.8.2's `agent wait
+#: --until` accepts idle, working, blocked, done, unknown; the two omitted here
+#: are omitted deliberately. `idle` is the state of a composer holding an
+#: unsubmitted prompt, so waiting on it returns instantly and spends every
+#: recovery Enter back-to-back. `unknown` describes an actor nobody can
+#: describe, which is not a liveness signal.
+RECOVERY_LIVENESS_STATUSES: Tuple[str, ...] = ("working", "done", "blocked")
 
 
 #: NEVER let this begin with `/`. A leading slash opens Claude Code's
@@ -1258,25 +1287,29 @@ def submit_agent_prompt(
     agent_name: Optional[str] = None,
     *,
     timeout_s: float = 30.0,
-    until: Sequence[str] = ("idle",),
     attempts: int = SUBMIT_ATTEMPTS,
     working_proves: bool = False,
     sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    refuse_unproven: bool = True,
     submission_recorded: Optional[Callable[[], bool]] = None,
 ) -> None:
-    """Submit one atomic prompt and prove the agent actually accepted it.
+    """Offer one prompt to an agent composer and press it until it takes.
 
-    `herdr agent prompt` is the documented path for coding agents: it honours
-    live bracketed-paste mode and submits the text plus an encoded Enter
-    atomically. `pane run` is documented for ordinary terminals, servers, and
-    shells, so pointing it at a pane hosting a coding agent types the prompt as
-    a shell command instead of handing it to the agent composer.
+    **`herdr agent prompt` is not used here, and reviving it reinstates a
+    known production stall.** That verb submits an encoded Enter atomically
+    with the text, and `@` opens the composer's file-path completion popup in
+    both omp and Claude Code -- while that popup is open the Enter is consumed
+    ACCEPTING A COMPLETION rather than sending the message. Measured against a
+    live omp composer on 2026-08-27, and observed in production the same day
+    with a grok builder holding `@<prompt>` unsubmitted for an hour until an
+    Enter typed by hand started the turn. The sequence that ships instead is
+    three separate calls -- `pane send-text`, `pane send-keys esc`, `pane
+    send-keys enter` -- with a settle between them; see the offer below.
 
-    `--wait` is what makes the submission provable. Herdr requires an observed
-    lifecycle change within five seconds and returns `agent_prompt_stalled`
-    otherwise. Without it a prompt delivered to a composer that is not accepting
-    input yet reports success while the text simply sits on screen unsubmitted,
-    which is indistinguishable from a delivered prompt until the turn times out.
+    `pane run` is documented for ordinary terminals, servers, and shells, so
+    pointing it at a pane hosting a coding agent types the prompt as a shell
+    command instead of handing it to the agent composer. It stays refused.
 
     **Why this is a loop and not a fallback.** Against omp the stall happens
     roughly half the time: the composer takes the `@<path>` text and never
@@ -1290,12 +1323,42 @@ def submit_agent_prompt(
     The recovery presses Enter on what is already on screen and never re-issues
     `agent prompt`: a second prompt would append its text to the unsubmitted
     line and send both as one garbled turn.
+
+    **`refuse_unproven` decides whether the end of the budget is a verdict.**
+    A bounded look at an unbounded quantity must not produce a terminal
+    refusal. Turn length is unbounded -- §7.6 measured omp writing its
+    transcript at TURN granularity, 57.7s in the measured case, and states
+    plainly that a turn doing real work runs far longer -- so no window over
+    "has the transcript recorded this submission yet" can ever be sized
+    correctly, and `AGENT_PROMPT_UNSUBMITTED` at the end of one is a statement
+    about Maestro's clock wearing the costume of a statement about the
+    composer. On 2026-08-27, run-8a200af7f9044ce7a11a51b6908f37e3's
+    lane-wp6-tests attempt a4 had its transcript hit disk carrying the marker
+    at 11:44:22 and was refused at 11:44:22.707; the paste had worked, and the
+    refusal cancelled the handle.
+
+    So the *lane* path passes `refuse_unproven=False`: the Enters are pressed,
+    the launch identity is written, and the function returns "offered,
+    unproven" rather than convicting. Adjudication then belongs to the node's
+    liveness and quiescence machinery, which is already wall-clock-free and
+    already arms only after `working` or `blocked` is observed (B14). Route
+    admission keeps the default `True` -- see its call site for why its turn is
+    bounded by construction.
+
+    Nothing about `refuse_unproven` weakens the two refusals that are *not*
+    claims about turn length: `AGENT_PROMPT_UNDELIVERED` (herdr accepted no
+    Enter at all, so nothing was ever pressed) and `AGENT_PROMPT_UNOBSERVED`
+    (every consultation of the proof channel raised) are statements about
+    herdr, they fail closed on both paths, and both still raise.
+
+    `monotonic` is injected for the same reason `sleep` is. The grace deadline
+    below reads a clock, and a fake that cannot move that clock cannot express
+    "the transcript flushes one turn later" without literally waiting a turn --
+    which made the whole failure above untestable (§16.3 item 62: a fake that
+    cannot express the failure is not coverage).
     """
     target = agent_name or pane_id
     total_s = max(5.1, max(0.001, timeout_s))
-    until_argv: List[str] = []
-    for status in until:
-        until_argv.extend(["--until", status])
     # Every call failure this function survives is recorded here rather than
     # discarded. Surviving a failure is deliberate — the pane may be
     # mid-repaint — but a discarded failure made the 2026-08-27 refusal claim
@@ -1333,14 +1396,16 @@ def submit_agent_prompt(
     # the structural fact D9 turns on: it says the meter was never readable,
     # which is not the same claim as "the meter did not move".
     readings: List[int] = []
-    # Recovery must not wait on `idle`: the unsubmitted composer is already
-    # idle, so Herdr would return immediately and all Enter attempts would be
-    # spent back-to-back before the composer had another chance to become
-    # interactive. A fast accepted turn is proven by a rising transcript
-    # record, never by this wait returning.
-    recovery_until = tuple(status for status in until if status != "idle")
-    if not recovery_until:
-        recovery_until = ("working",)
+    # The recovery wait ends the round the moment the actor is demonstrably
+    # alive OR demonstrably settled; see `RECOVERY_LIVENESS_STATUSES` for why
+    # `idle` and `unknown` are not in that set. It was `("working",)` alone
+    # until 2026-08-27, which made the wait raise on two entirely different
+    # facts -- a composer that never took the prompt, and a turn that had
+    # already finished (`done`) or stopped at a permission prompt (`blocked`)
+    # before the wait was even issued. A fast accepted turn is still proven by
+    # a rising transcript record, never by this wait returning.
+    recovery_until = RECOVERY_LIVENESS_STATUSES
+
     def consumed(revision_only: bool = False) -> bool:
         """Whether the actor proves it accepted the offered prompt.
 
@@ -1440,6 +1505,7 @@ def submit_agent_prompt(
             "--timeout",
             str(int(budget_s * 1000)),
         ]
+        started = monotonic()
         try:
             herdr_call(*argv, timeout=budget_s + 5.0)
         except Exception as exc:
@@ -1449,7 +1515,29 @@ def submit_agent_prompt(
             # a timeout burns its round in milliseconds, and only the record
             # makes that visible in the refusal.
             absorb("recovery-wait", tuple(argv), exc)
-        return consumed()
+        if consumed():
+            return True
+        # The round has a floor, and the wait is not it.
+        #
+        # An Enter is only worth pressing at a composer that has had a moment
+        # to do something with the last one. Until 2026-08-27 that moment was a
+        # side effect of `--until working` always timing out, so widening the
+        # state set — the fix directly above — would have collapsed every round
+        # into a back-to-back keystroke for any actor herdr reports `done` or
+        # `blocked`, which is the 2026-08-18 shape all over again.
+        #
+        # The floor is `PASTE_SETTLE_S`, not the round budget, because it is
+        # the same measured quantity: how long the composer needs to take what
+        # was sent it before the next key can land. A wait that blocked for its
+        # whole budget has already spent far more than that and sleeps nothing
+        # here. Spacing is bounded by construction — a gap between two key
+        # presses — which is what separates it from turn length and keeps this
+        # from being another invented clock.
+        remaining = min(budget_s, PASTE_SETTLE_S) - (monotonic() - started)
+        if remaining > 0:
+            sleep(remaining)
+            return consumed()
+        return False
 
     # Deliver the text and the Enter as two separate calls, never as
     # `agent prompt`'s atomic text-plus-Enter.
@@ -1600,13 +1688,19 @@ def submit_agent_prompt(
         # The agent runtime writes the transcript record as the turn starts,
         # which can trail the last Enter by a moment. Give it a bounded grace
         # rather than reaping a pane that has in fact begun work.
-        grace_deadline = time.monotonic() + TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
-        while True:
-            if consumed():
-                return
-            if time.monotonic() >= grace_deadline:
-                break
-            sleep(0.1)
+        #
+        # Only worth spending when a refusal is on the table. The grace is the
+        # last stretch of the window this function used to convict at the end
+        # of, and where it no longer convicts, waiting it out delays the handoff
+        # to the node's own machinery without changing a single answer.
+        if refuse_unproven:
+            grace_deadline = monotonic() + TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S
+            while True:
+                if consumed():
+                    return
+                if monotonic() >= grace_deadline:
+                    break
+                sleep(0.1)
         summary = _swallowed_summary(failures)
         if enters_delivered == 0:
             raise PromptSubmissionUnobservable(
@@ -1626,6 +1720,15 @@ def submit_agent_prompt(
                 ),
                 failures,
             )
+        if not refuse_unproven:
+            # Offered, unproven — and on this path that is the whole truthful
+            # answer. Enters were delivered and the proof channel answered; it
+            # answered "no record yet", which after a bounded look at an
+            # unbounded quantity is a statement about the length of the look.
+            # The node's liveness and quiescence machinery adjudicates from
+            # here (B14), and it is the only reader that can, because it is
+            # the only one whose evidence keeps arriving.
+            return
         raise PromptNotSubmitted(
             "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts{2}".format(
                 target, rounds, summary
@@ -1654,6 +1757,11 @@ def submit_agent_prompt(
             ),
             failures,
         )
+    if not refuse_unproven:
+        # Same reasoning as the transcript branch above, over a weaker meter:
+        # a legible revision that did not move is not proof the composer
+        # refused the text, because pasting repaints and a turn need not.
+        return
     raise PromptNotSubmitted(
         "AGENT_PROMPT_UNSUBMITTED:{0} after {1} submit attempts{2}".format(
             target, rounds, summary
@@ -1800,24 +1908,6 @@ def _rising_submission_record(
         return count > baseline[0]
 
     return recorded
-
-
-def wait_for_prompt_submission_record(
-    handle: LaunchHandle,
-    prompt_path: Path,
-    timeout_s: float = TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S,
-    *,
-    sleep: Callable[[float], None] = time.sleep,
-) -> bool:
-    """Wait boundedly for the durable transcript half of submission proof."""
-    deadline = time.monotonic() + max(0.0, timeout_s)
-    while True:
-        if prompt_submission_recorded(handle, prompt_path):
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        sleep(min(0.1, remaining))
 
 
 def wait_for_interactive_agent(
@@ -2843,14 +2933,27 @@ class HerdrLauncher:
                 raise PromptSubmissionUnobservable(
                     "AGENT_PROMPT_UNOBSERVED:{0} no transcript".format(name)
                 )
+            # Durable identity now, proof later. Everything this call needs is
+            # already established — the pane is bound to the worktree, the
+            # actor owns the pane, and herdr has reported its session path —
+            # and none of it depends on the composer accepting a keystroke. A
+            # failure here is deliberately NOT absorbed: it means the ledger
+            # would not record a pane that demonstrably exists, which is the
+            # orphan this callback was added to prevent.
+            if spec.on_identity is not None:
+                spec.on_identity(handle)
             submit_agent_prompt(
                 lambda *args, **kwargs: self._herdr(*args, env=environment, **kwargs),
                 pane_id,
                 bootstrap,
                 name,
                 timeout_s=60.0,
-                until=("working", "idle"),
                 working_proves=True,
+                # The lane path never convicts here. Turn length is unbounded
+                # (§7.6), so the end of this function's budget is a fact about
+                # the budget; the node's liveness and quiescence machinery is
+                # what adjudicates a lane attempt.
+                refuse_unproven=False,
                 submission_recorded=_rising_submission_record(
                     handle, spec.prompt_path
                 ),
@@ -2988,8 +3091,10 @@ class HerdrLauncher:
             "@{} ".format(prompt.resolve()),
             handle.agent_name,
             timeout_s=timeout_s,
-            until=("working", "idle"),
             working_proves=True,
+            # A correction cycle is the same lane path as the first launch and
+            # gets the same answer: offered, unproven, adjudicated downstream.
+            refuse_unproven=False,
             submission_recorded=_rising_submission_record(handle, prompt),
         )
         # A new prompt is a new turn. Any confirmation window still open from

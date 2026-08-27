@@ -1081,7 +1081,7 @@ class OperatorCliTest(unittest.TestCase):
                 def run(self):
                     try:
                         self.deps.run_node(
-                            attempt, node, record, "", lambda _pid: None, lambda: True
+                            attempt, node, record, "", lambda _pid, _at=None: None, lambda: True
                         )
                     except launcher.HarnessQuiescenceError:
                         self.deps.quiesce_attempt(record, "retry")
@@ -1179,7 +1179,7 @@ class OperatorCliTest(unittest.TestCase):
                 def run(self):
                     try:
                         self.deps.run_node(
-                            attempt, node, record, "", lambda _pid: None, lambda: True
+                            attempt, node, record, "", lambda _pid, _at=None: None, lambda: True
                         )
                     except RuntimeError:
                         self.deps.quiesce_attempt(record, "retry")
@@ -1647,7 +1647,7 @@ class OperatorCliTest(unittest.TestCase):
 
                 def run(self):
                     self.deps.run_node(
-                        attempt, code_node, record, "", lambda _pid: None, lambda: False
+                        attempt, code_node, record, "", lambda _pid, _at=None: None, lambda: False
                     )
                     agent_record = SimpleNamespace(node_id="agent", attempt_no=1)
                     self.deps.run_node(
@@ -1655,7 +1655,7 @@ class OperatorCliTest(unittest.TestCase):
                         agent_node,
                         agent_record,
                         "",
-                        lambda _pid: None,
+                        lambda _pid, _at=None: None,
                         lambda: False,
                     )
                     return SimpleNamespace(

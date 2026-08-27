@@ -259,7 +259,6 @@ def main() -> int:
             "@{0} ".format(prompt_path.resolve()),
             name,
             timeout_s=args.timeout_s,
-            until=("working", "idle"),
             working_proves=True,
             submission_recorded=lch._rising_submission_record(handle, prompt_path),
         )
@@ -285,7 +284,7 @@ def main() -> int:
                     "prompt_offers": offers,
                     "transcript": str(transcript),
                     "recorded": lch.prompt_submission_recorded(handle, prompt_path),
-                    "enter_presses": herdr.count("agent", "send-keys"),
+                    "enter_presses": enters,
                     "elapsed_s": round(elapsed, 2),
                     "failures": failures,
                 },
@@ -300,9 +299,15 @@ def main() -> int:
                     "profile": args.profile,
                     "outcome": "SMOKE_FAILED",
                     "error": "{0}: {1}".format(type(exc).__name__, exc),
-                    "prompt_offers": herdr.count("agent", "prompt"),
+                    # `agent prompt` is not issued by the runtime, so counting
+                    # it always reported 0 and said nothing. The text offer is
+                    # `pane send-text`, and Enter arrives on either scope.
+                    "prompt_offers": herdr.count("pane", "send-text"),
                     "pane_reads": herdr.count("pane", "get"),
-                    "enter_presses": herdr.count("agent", "send-keys"),
+                    "enter_presses": (
+                        herdr.count("pane", "send-keys")
+                        + herdr.count("agent", "send-keys")
+                    ),
                 },
                 sort_keys=True,
             )

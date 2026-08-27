@@ -622,6 +622,22 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
         Escape.SKIP,
         Escape.ABANDON,
     ),
+    # The one reason whose repair is deliberately *not* plain retry even
+    # though its actor is an agent. K is not exhausted here — the block fired
+    # because two consecutive attempts produced the byte-identical refusal —
+    # so a plain `retry` would be admitted on budget and would re-dispatch the
+    # identical node against the identical input, which is precisely the
+    # non-convergence this reason was added to stop. `retry --force` is the
+    # same verb carrying the operator's signature: a third dispatch becomes a
+    # decision somebody made once, rather than one the scheduler keeps making.
+    # The repair the block's detail actually points at is upstream of all
+    # three — change the inputs the refusal named — and that arrives as a new
+    # plan or a new base, not as an escape.
+    BlockReason.SEMANTIC_REFUSAL_REPEATED: (
+        Escape.RETRY_FORCE,
+        Escape.SKIP,
+        Escape.ABANDON,
+    ),
     # Infra faults: a healthier machine genuinely can produce a different
     # answer, so plain retry is the repair.
     BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED: (
@@ -649,9 +665,40 @@ _EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
 }
 
 
+class UnmappedBlockReason(LookupError):
+    """A stored block reason with no declared escape (§11.3).
+
+    Deliberately not a bare `KeyError`. A `KeyError` raised at a dict
+    subscript reads as a lookup that happened to miss, and reprs its argument
+    instead of saying anything; this is a build defect — a member was added to
+    `BlockReason` and `_EXITS` was not extended, so the runtime is carrying a
+    reason it can offer an operator no way out of. `LookupError` keeps it
+    catchable as the lookup failure it technically is while letting the
+    message name what has to change.
+
+    Raised at the point of use rather than asserted at import: an import-time
+    completeness check would make a missing entry brick every consumer of this
+    module, including the operator verbs someone would reach for to diagnose
+    it. Completeness is proved in the suite instead
+    (`test_every_block_reason_is_mapped`), which is where a defect of this
+    shape should be found — this exception is the backstop for when it was
+    not.
+    """
+
+
 def exits_for(reason: BlockReason) -> Tuple[Escape, ...]:
     """The legal transitions out of a stored block reason (§11.3)."""
-    return _EXITS[reason]
+    try:
+        return _EXITS[reason]
+    except KeyError:
+        raise UnmappedBlockReason(
+            f"{reason.value} is a stored block reason with no entry in _EXITS: "
+            "a node blocked with it is a dead end that declares no escape. "
+            "Every BlockReason member needs its exits and the comment saying "
+            "why those and not others (§11.3); "
+            "tests/test_scheduler_types.py::BlockReasonExitTests"
+            "::test_every_block_reason_is_mapped is what fails when it does not."
+        ) from None
 
 
 # ── §7.7 results ────────────────────────────────────────────────────────────

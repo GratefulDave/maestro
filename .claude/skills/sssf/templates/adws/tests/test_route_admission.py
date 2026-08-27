@@ -68,6 +68,61 @@ def pane_of(name):
             if start[2] == name and "--pane" in start:
                 return start[start.index("--pane") + 1]
     return "w1:p2"
+
+def name_of(pane):
+    starts_path = os.path.join(root, "starts.jsonl")
+    if os.path.exists(starts_path):
+        for line in reversed(open(starts_path, encoding="utf-8").read().splitlines()):
+            start = json.loads(line)["argv"]
+            if "--pane" in start and start[start.index("--pane") + 1] == pane:
+                return start[2]
+    return ""
+
+def record_turn(name):
+    # The durable half of submission proof: a submitted prompt appends a
+    # record to the session JSONL. A composer that swallowed the text appends
+    # nothing, which is the only difference between the two panes.
+    route = "claude" if "claude" in name else "omp"
+    marker = "MAESTRO_CLAUDE_RECEIPT_OK" if route == "claude" else "MAESTRO_OMP_RECEIPT_OK"
+    record = {
+        "event_type": "result" if route == "claude" else "message_end",
+        "subtype": "success",
+        "role": "assistant",
+        "stop_reason": "stop",
+        "is_error": False,
+        "text": marker,
+        "exit_code": 0,
+        "model": os.environ.get("FAKE_REPORTED_MODEL", "reported-model"),
+        "session_id": "11111111-1111-4111-8111-111111111111",
+    }
+    with open(os.path.join(root, name + ".jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+def submit(name):
+    # One accepted Enter: the turn starts, and its record lands now or trails.
+    open(os.path.join(root, name + ".entered"), "w").close()
+    bump(pane_of(name))
+    if os.environ.get("FAKE_OMIT_MARKER"):
+        return
+    delay = int(os.environ.get("FAKE_DELAY_MARKER", "0"))
+    if delay:
+        # The transcript is written at TURN granularity, so it can trail the
+        # Enter that started the turn. Count the observations it trails by.
+        open(os.path.join(root, name + ".pending"), "w").write(str(delay))
+        return
+    record_turn(name)
+
+def tick_pending(pane):
+    name = name_of(pane)
+    path = os.path.join(root, name + ".pending") if name else ""
+    if not path or not os.path.exists(path):
+        return
+    left = int(open(path).read()) - 1
+    if left > 0:
+        open(path, "w").write(str(left))
+        return
+    os.remove(path)
+    record_turn(name)
 if argv[:2] == ["pane", "current"]:
     print(json.dumps({"result": {"pane": {"pane_id": "w1:p1", "cwd": cwd}}}))
 elif argv[:2] == ["pane", "split"]:
@@ -89,6 +144,7 @@ elif argv[:2] == ["pane", "get"]:
         # bare prose here could not express the one field production reads.
         sys.stderr.write(json.dumps({"error": {"code": "pane_not_found"}}))
         sys.exit(1)
+    tick_pending(argv[2])
     claimed = os.environ.get("FAKE_PANE_CWD", cwd)
     pane = {"pane_id": "w1:p2", "cwd": claimed}
     if not os.environ.get("FAKE_PANE_WITHOUT_REVISION"):
@@ -130,43 +186,29 @@ elif argv[:2] == ["agent", "start"]:
         "transcript_path": os.path.join(root, argv[2] + ".jsonl")}}}))
 elif argv[:2] == ["agent", "wait"]:
     print(json.dumps({"result": {"ok": True, "status": "idle"}}))
-elif argv[:2] in (["agent", "prompt"], ["agent", "send-keys"]):
-    name = argv[2]
-    submitting = argv[:2] == ["agent", "send-keys"]
-    if not submitting:
-        prompt_text = argv[3] if len(argv) > 3 else ""
-        open(os.path.join(root, name + ".prompt"), "w", encoding="utf-8").write(prompt_text)
+elif argv[:2] == ["agent", "send-keys"]:
+    # The recovery scope. `agent prompt` is deliberately absent from this fake:
+    # it is absent from the runtime, because `@` opens the composer's
+    # file-completion popup and that popup eats the Enter `agent prompt` sends
+    # atomically with the text.
+    submit(argv[2])
+    print(json.dumps({"result": {"ok": True}}))
+elif argv[:2] == ["pane", "send-text"]:
+    # The text lands in the composer. It is NOT submitted by this call, which
+    # is the whole reason a separate Enter exists.
+    name = name_of(argv[2])
+    if name:
+        open(os.path.join(root, name + ".prompt"), "w", encoding="utf-8").write(
+            argv[3] if len(argv) > 3 else "")
         stall_path = os.path.join(root, "stalled_prompts")
         stalled = int(open(stall_path).read()) if os.path.exists(stall_path) else 0
         if stalled < int(os.environ.get("FAKE_STALL_PROMPTS", "0")):
-            # The composer accepted the text but never submitted it: the prompt
-            # is left sitting on screen and no lifecycle change is observed.
+            # The composer never took the text: nothing on screen to press
+            # Enter at, and no lifecycle change observed.
             open(stall_path, "w").write(str(stalled + 1))
+            os.remove(os.path.join(root, name + ".prompt"))
             sys.stderr.write(json.dumps({"error": {"code": "agent_prompt_stalled"}}))
             sys.exit(1)
-    open(os.path.join(root, name + ".entered"), "w").close()
-    # The pane consumed something: either the atomic `agent prompt` submission
-    # or the Enter that rescued a composer holding the text. A stalled prompt
-    # exits above without ever reaching here, so it never advances the counter.
-    bump(pane_of(name))
-    if os.environ.get("FAKE_OMIT_MARKER") or os.environ.get("FAKE_DELAY_MARKER"):
-        print(json.dumps({"result": {"ok": True}}))
-        raise SystemExit(0)
-    route = "claude" if "claude" in name else "omp"
-    marker = "MAESTRO_CLAUDE_RECEIPT_OK" if route == "claude" else "MAESTRO_OMP_RECEIPT_OK"
-    record = {
-        "event_type": "result" if route == "claude" else "message_end",
-        "subtype": "success",
-        "role": "assistant",
-        "stop_reason": "stop",
-        "is_error": False,
-        "text": marker,
-        "exit_code": 0,
-        "model": os.environ.get("FAKE_REPORTED_MODEL", "reported-model"),
-        "session_id": "11111111-1111-4111-8111-111111111111",
-    }
-    with open(os.path.join(root, name + ".jsonl"), "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record) + "\n")
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["pane", "read"]:
     pane_id = argv[2]
@@ -187,6 +229,13 @@ elif argv[:2] == ["pane", "read"]:
         print(json.dumps({"result": {}}))
 elif argv[:2] == ["pane", "send-keys"]:
     open(os.path.join(root, "launched"), "a").write(argv[2] + "\n")
+    # `esc` dismisses the completion popup and submits nothing. Only Enter
+    # submits, and only at a pane whose composer is holding text.
+    key = argv[3] if len(argv) > 3 else ""
+    name = name_of(argv[2])
+    if key == "enter" and name and os.path.exists(
+            os.path.join(root, name + ".prompt")):
+        submit(name)
     print(json.dumps({"result": {"ok": True}}))
 elif argv[:2] == ["pane", "close"]:
     if os.environ.get("FAKE_CLOSE_FAIL"):
@@ -429,16 +478,25 @@ class RouteAdmissionTest(unittest.TestCase):
                         "{!r} does not start with {!r}".format(name, prefix),
                     )
                     self.assertTrue(name[len(prefix) :])
-                # Paste-then-Enter is the offer. A wait may follow it
-                # (`--until working`) and is not a second prompt.
+                # Paste-then-Enter is the offer. Any `agent wait` is a
+                # recovery round, not a second prompt — and it is not
+                # guaranteed: this fake's Enter submits on the first press, so
+                # the loop is never entered. Assert the shape of the waits that
+                # DO happen rather than that any happens; the earlier
+                # `assertGreaterEqual(len(waits), 1)` was asserting that
+                # recovery is always needed, which is the opposite of what a
+                # working first Enter looks like.
                 for name in started_names:
                     waits = [
-                        index
-                        for index, command in enumerate(argv)
+                        command
+                        for command in argv
                         if command[:3] == ["agent", "wait", name]
                     ]
-                    self.assertGreaterEqual(len(waits), 1)
-                    self.assertIn("--timeout", argv[waits[0]])
+                    for wait in waits:
+                        # Admission's turn is bounded by construction — one
+                        # sentence in, one marker out — so its wait keeps a
+                        # deadline. The lane path's does not; do not unify.
+                        self.assertIn("--timeout", wait)
                 submitted = [
                     command[-1] for command in argv if command[:2] == ["pane", "send-text"]
                 ]
@@ -648,11 +706,28 @@ class RouteAdmissionTest(unittest.TestCase):
         self.assertEqual((self.root / "busy_starts").read_text(), "1")
 
     def test_delayed_transcript_uses_official_prompt_wait(self):
-        os.environ["FAKE_DELAY_MARKER"] = "1"
+        """A transcript that flushes late is not an unsubmitted prompt.
+
+        The premise is unchanged and is the whole point: the record proving
+        submission is written at TURN granularity, so it trails the Enter that
+        started the turn, and reading its momentary absence as "the composer
+        refused the text" refuses a prompt that landed perfectly.
+
+        What changed is the sequence being asserted. This test used to require
+        two `agent prompt --wait --until idle` calls, and `agent prompt` no
+        longer exists anywhere in the runtime — it was replaced deliberately,
+        because it submits its encoded Enter atomically with the text and `@`
+        opens the composer's file-completion popup, which eats exactly that
+        Enter. The measured replacement is three separate calls: `pane
+        send-text` puts the text in the composer, `pane send-keys esc` closes
+        the popup, and `pane send-keys enter` submits. DO NOT REVIVE
+        `agent prompt` to make an argv assertion shorter.
+        """
+        os.environ["FAKE_DELAY_MARKER"] = "3"
         receipt = ra.capture_route(self.spec("omp"))
         self.assertEqual(receipt["first_turn"]["text"], "MAESTRO_OMP_RECEIPT_OK")
         self.assertEqual(receipt["continuation_turn"]["text"], "MAESTRO_OMP_RECEIPT_OK")
-        prompt_argvs = [
+        argv = [
             entry["argv"]
             for entry in (
                 json.loads(line)
@@ -660,15 +735,30 @@ class RouteAdmissionTest(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             )
-            if entry["argv"][:2] == ["agent", "prompt"]
         ]
-        self.assertEqual(len(prompt_argvs), 2)
-        for argv in prompt_argvs:
-            # `--wait` is what proves the composer accepted the prompt: without
-            # it Herdr reports success even when the text is left unsubmitted.
-            self.assertIn("--wait", argv)
-            self.assertEqual(argv[argv.index("--until") + 1], "idle")
-            self.assertGreater(int(argv[argv.index("--timeout") + 1]), 5000)
+        self.assertEqual(
+            [call for call in argv if call[:2] == ["agent", "prompt"]],
+            [],
+            "`agent prompt` submits its Enter into the completion popup",
+        )
+        keys = [
+            (call[1], call[3] if len(call) > 3 else "")
+            for call in argv
+            if call[:2] in (["pane", "send-text"], ["pane", "send-keys"])
+        ]
+        # Two turns, each offered as text, then popup dismissal, then Enter.
+        self.assertEqual(
+            keys,
+            [
+                ("send-text", ra.FIRST_PROMPT.format(
+                    marker="MAESTRO_OMP_RECEIPT_OK")),
+                ("send-keys", "esc"),
+                ("send-keys", "enter"),
+                ("send-text", ra.CONTINUATION_PROMPT),
+                ("send-keys", "esc"),
+                ("send-keys", "enter"),
+            ],
+        )
 
     def test_signed_capture_admits_and_is_not_a_copied_fixture(self):
         seed = receipt_crypto.generate_seed()

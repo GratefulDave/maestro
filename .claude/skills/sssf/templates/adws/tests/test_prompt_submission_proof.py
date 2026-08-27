@@ -143,7 +143,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         except lch.PromptNotSubmitted:
@@ -167,7 +166,6 @@ class SubmissionProof(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=slept.append,
             submission_recorded=_recorded_after_pane_enter(herdr),
         )
@@ -204,7 +202,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 attempts=4,
                 sleep=lambda _s: None,
             )
@@ -229,7 +226,6 @@ class SubmissionProof(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_pane_enter(herdr),
         )
@@ -246,7 +242,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
 
@@ -282,7 +277,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 working_proves=True,
                 sleep=lambda _s: None,
             )
@@ -307,7 +301,6 @@ class SubmissionProof(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             working_proves=True,
             sleep=lambda _s: None,
         )
@@ -325,7 +318,6 @@ class SubmissionProof(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_agent_enters(herdr, 2),
         )
@@ -340,7 +332,6 @@ class SubmissionProof(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_agent_enters(herdr, 2),
         )
@@ -359,7 +350,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertEqual(herdr.count("agent", "send-keys"), lch.SUBMIT_ATTEMPTS)
@@ -376,7 +366,6 @@ class SubmissionProof(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("idle",),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_pane_enter(herdr),
         )
@@ -395,7 +384,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertIn("AGENT_PROMPT_UNSUBMITTED", str(caught.exception))
@@ -416,7 +404,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertIn("AGENT_PROMPT_UNOBSERVED", str(caught.exception))
@@ -453,7 +440,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
 
@@ -482,7 +468,6 @@ class SubmissionProof(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
 
@@ -779,7 +764,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_agent_enters(herdr, 1),
         )
@@ -812,7 +796,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertGreaterEqual(herdr.count("agent", "send-keys"), 1)
@@ -830,7 +813,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertIn("AGENT_PROMPT_UNSUBMITTED", str(caught.exception))
@@ -847,7 +829,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertIn("AGENT_PROMPT_UNOBSERVED", str(caught.exception))
@@ -869,7 +850,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
                         "w1:p1",
                         "@prompt",
                         "agent",
-                        until=("working", "idle"),
                         sleep=lambda _s: None,
                     )
                 except (lch.PromptNotSubmitted, lch.PromptSubmissionUnobservable):
@@ -886,7 +866,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_agent_enters(herdr, 1),
         )
@@ -911,7 +890,6 @@ class WaitFailureIsNotUnobservability(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertIn("agent_not_found", str(caught.exception))
@@ -1006,7 +984,6 @@ class PasteRepaintIsNotSubmissionTests(unittest.TestCase):
                     "@" + str(prompt.resolve()),
                     "maestro-test",
                     timeout_s=6.0,
-                    until=("working", "idle"),
                     working_proves=True,
                     sleep=lambda _: None,
                     submission_recorded=lch._rising_submission_record(handle, prompt),
@@ -1030,7 +1007,6 @@ class PasteRepaintIsNotSubmissionTests(unittest.TestCase):
                 "@" + str(prompt.resolve()),
                 "maestro-test",
                 timeout_s=6.0,
-                until=("working", "idle"),
                 working_proves=True,
                 sleep=lambda _: None,
                 submission_recorded=lch._rising_submission_record(handle, prompt),
@@ -1056,7 +1032,6 @@ class PasteRepaintIsNotSubmissionTests(unittest.TestCase):
                     marker,
                     "maestro-test",
                     timeout_s=6.0,
-                    until=("working", "idle"),
                     working_proves=True,
                     sleep=lambda _: None,
                     submission_recorded=lch._rising_submission_record(handle, prompt),
@@ -1140,7 +1115,6 @@ class SwallowedFailuresAreEvidence(unittest.TestCase):
             "w1:p1",
             "@prompt",
             "agent",
-            until=("working", "idle"),
             sleep=lambda _s: None,
             submission_recorded=_recorded_after_pane_enters(herdr, 2),
         )
@@ -1174,7 +1148,6 @@ class SwallowedFailuresAreEvidence(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         message = str(caught.exception)
@@ -1210,7 +1183,6 @@ class SwallowedFailuresAreEvidence(unittest.TestCase):
                     "w1:p1",
                     "@prompt",
                     "agent",
-                    until=("working", "idle"),
                     sleep=lambda _s: None,
                     submission_recorded=broken_probe,
                 )
@@ -1245,7 +1217,6 @@ class SwallowedFailuresAreEvidence(unittest.TestCase):
                 "w1:p1",
                 "@prompt",
                 "agent",
-                until=("working", "idle"),
                 sleep=lambda _s: None,
             )
         self.assertIn("swallowed=[", str(caught.exception))
@@ -1318,3 +1289,202 @@ class SwallowedFailuresAreEvidence(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("AGENT_INTERACTIVE_READY_TIMEOUT:agent-x", message)
         self.assertIn("probe=HerdrCallError/agent_not_found", message)
+
+
+class VirtualClock:
+    """A monotonic clock the test moves, so a turn can take three minutes.
+
+    §16.3 item 62 — a fake that cannot express the failure is not coverage.
+    Before this seam existed `submit_agent_prompt` read `time.monotonic()`
+    directly for its grace deadline, so "the transcript flushes one turn after
+    the prompt landed" could only be written by literally waiting a turn. The
+    defect it hides is therefore the one no test could state.
+
+    Time advances only where the function under test would really have spent
+    it: an injected `sleep`, and the herdr wait that blocks for its budget.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, float(seconds))
+
+
+class BlockingWaitHerdr(FakeHerdr):
+    """`agent wait --timeout N` consumes N milliseconds, as herdr's does."""
+
+    def __init__(self, clock: VirtualClock, **kwargs):
+        super().__init__(**kwargs)
+        self.clock = clock
+
+    def __call__(self, *argv, **kwargs):
+        if argv[:2] == ("agent", "wait") and "--timeout" in argv:
+            self.clock.sleep(int(argv[argv.index("--timeout") + 1]) / 1000.0)
+        return super().__call__(*argv, **kwargs)
+
+
+#: Longer than any window this function could have invented, and shorter than
+#: plenty of real turns. §7.6 measured omp writing its transcript at TURN
+#: granularity — 57.7s in the measured case — and records that a turn doing
+#: real work runs far longer.
+TURN_LENGTH_S = 180.0
+
+
+class ABoundedLookIsNotAVerdict(unittest.TestCase):
+    """Recorded failure, 2026-08-27, run-8a200af7f9044ce7a11a51b6908f37e3.
+
+    `lane-wp6-tests` attempt a4: the actor's transcript hit disk carrying the
+    submission marker at 11:44:22 UTC, and `AGENT_PROMPT_UNSUBMITTED` was
+    recorded at 11:44:22.707 — after roughly four rounds of >=5.1s plus a 10s
+    grace. The paste had worked. The refusal cancelled the handle and spent the
+    attempt.
+
+    No larger number fixes this, which is why the number is not what changed.
+    Turn length is unbounded, so every window over "has the transcript recorded
+    the submission yet" is wrong for some turn, and the end of one is a fact
+    about Maestro's clock wearing the costume of a fact about the composer.
+    """
+
+    def _submit(self, clock, herdr, **kwargs):
+        lch.submit_agent_prompt(
+            herdr,
+            "w1:p1",
+            "@prompt",
+            "agent",
+            timeout_s=60.0,
+            working_proves=True,
+            sleep=clock.sleep,
+            monotonic=clock,
+            submission_recorded=lambda: clock.now >= TURN_LENGTH_S,
+            **kwargs,
+        )
+
+    def test_a_turn_longer_than_the_window_is_not_refused_on_the_lane_path(self):
+        clock = VirtualClock()
+        herdr = BlockingWaitHerdr(clock)
+
+        self._submit(clock, herdr, refuse_unproven=False)
+
+        # It really did the work it can do: text, popup dismissal, Enter.
+        self.assertGreaterEqual(
+            sum(
+                1 for call in herdr.calls
+                if call[:2] == ("pane", "send-keys") and call[3] == "enter"
+            ),
+            1,
+        )
+        # And it gave up looking long before the turn would have been recorded,
+        # which is exactly why it must not have convicted.
+        self.assertLess(clock.now, TURN_LENGTH_S)
+
+    def test_the_same_composer_is_still_refused_where_a_receipt_is_at_stake(self):
+        """Route admission's turn is bounded by construction, so it convicts.
+
+        Its prompt is one sentence asking for one marker back, and its output
+        is a SIGNED receipt. "Offered, unproven" is not a thing a receipt can
+        say, so admission keeps the terminal verdict the lane path gave up.
+        """
+        clock = VirtualClock()
+        herdr = BlockingWaitHerdr(clock)
+
+        with self.assertRaises(lch.PromptNotSubmitted):
+            self._submit(clock, herdr, refuse_unproven=True)
+
+    def test_undelivered_and_unobserved_still_refuse_on_the_lane_path(self):
+        """Suppressing the verdict about the composer suppresses only that.
+
+        `AGENT_PROMPT_UNDELIVERED` is a statement about herdr — not one Enter
+        was accepted, so "the composer will not submit" was never tested. It
+        fails closed on every path, and it is D9's distinction, not this one.
+        """
+        clock = VirtualClock()
+
+        class DeafHerdr(BlockingWaitHerdr):
+            def __call__(self, *argv, **kwargs):
+                if argv[:2] in (("pane", "send-keys"), ("agent", "send-keys")):
+                    self.calls.append(argv)
+                    raise lch.HerdrCallError("LAUNCH_REFUSED:no", "pane_not_found")
+                return super().__call__(*argv, **kwargs)
+
+        with self.assertRaises(lch.PromptSubmissionUnobservable) as caught:
+            self._submit(clock, DeafHerdr(clock), refuse_unproven=False)
+        self.assertIn("AGENT_PROMPT_UNDELIVERED", str(caught.exception))
+
+    def test_the_grace_window_is_not_spent_where_it_cannot_change_an_answer(self):
+        """The grace is the tail of the window this function convicted at.
+
+        Where it no longer convicts, waiting it out only delays the handoff to
+        the node's own machinery. Measured on the virtual clock so the saving
+        is a fact rather than a claim.
+        """
+        lane, admission = VirtualClock(), VirtualClock()
+        self._submit(lane, BlockingWaitHerdr(lane), refuse_unproven=False)
+        with self.assertRaises(lch.PromptNotSubmitted):
+            self._submit(
+                admission, BlockingWaitHerdr(admission), refuse_unproven=True
+            )
+        # The grace polls every 0.1s, so it overshoots by at most one tick.
+        saved = admission.now - lane.now
+        self.assertGreaterEqual(saved, lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S)
+        self.assertLess(saved, lch.TRANSCRIPT_SUBMISSION_OBSERVE_TIMEOUT_S + 0.5)
+
+
+class TheRecoveryWaitEndsOnAnyLivenessOrSettledState(unittest.TestCase):
+    """`--until working` alone raised on two unrelated facts.
+
+    A composer that never took the prompt and a turn that had already finished
+    both fail that wait, and so does an actor stopped at a permission prompt.
+    Herdr 0.8.2's `agent wait --until` accepts idle, working, blocked, done and
+    unknown; the round is over as soon as the actor is alive or settled.
+    """
+
+    def test_the_wait_names_working_done_and_blocked_and_never_idle(self):
+        herdr = FakeHerdr(stalls=99)
+        with self.assertRaises(lch.PromptNotSubmitted):
+            lch.submit_agent_prompt(
+                herdr, "w1:p1", "@prompt", "agent", sleep=lambda _s: None
+            )
+        waits = [call for call in herdr.calls if call[:2] == ("agent", "wait")]
+        self.assertTrue(waits)
+        for call in waits:
+            for status in ("working", "done", "blocked"):
+                self.assertIn(status, call)
+            # `idle` is the state of a composer holding an unsubmitted prompt,
+            # so waiting on it would return instantly and spend every recovery
+            # Enter back-to-back — the 2026-08-18 shape.
+            self.assertNotIn("idle", call)
+            self.assertNotIn("unknown", call)
+
+    def test_a_wait_that_answers_instantly_still_spaces_the_keystrokes(self):
+        """Widening the state set must not collapse the round.
+
+        An actor herdr reports `done` satisfies the wait at once, and without a
+        floor under the round every remaining Enter would be pressed in the
+        same millisecond — which is the failure the old `--until working` was
+        accidentally preventing by always timing out.
+        """
+        clock = VirtualClock()
+        # This herdr answers the wait immediately: it never advances the clock.
+        herdr = FakeHerdr(stalls=99, agent_status="done")
+
+        with self.assertRaises(lch.PromptNotSubmitted):
+            lch.submit_agent_prompt(
+                herdr,
+                "w1:p1",
+                "@prompt",
+                "agent",
+                timeout_s=60.0,
+                sleep=clock.sleep,
+                monotonic=clock,
+            )
+
+        # Two paste settles at the offer, then one settle's worth of spacing
+        # under every recovery round — none of which the instant wait supplied.
+        rounds = lch.SUBMIT_ATTEMPTS
+        self.assertGreaterEqual(
+            clock.now, lch.PASTE_SETTLE_S * (2 + rounds)
+        )

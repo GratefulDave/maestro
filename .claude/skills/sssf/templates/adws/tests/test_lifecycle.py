@@ -323,6 +323,13 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
         reached MERGED with no independent reader, because there was nothing
         for one to be recorded against. A code node still cannot own one; its
         acceptance is its command's exit code (§6.2).
+
+        The run is pinned `STRENGTH_V1` because that is the contract under
+        which a tests node is reviewable at all. Written before §19 M42, this
+        left the pin unset, which reads as LEGACY — and under LEGACY the same
+        call is refused on purpose, which is asserted by
+        `test_a_legacy_pinned_run_refuses_a_tests_owner_for_a_derived_review`
+        rather than by weakening anything here.
         """
         with self.assertRaises(ValueError):
             st.PlanNode(node_id="authored-review", kind=st.NodeKind.REVIEW, depth=0)
@@ -342,7 +349,12 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))
-            store.create_run("run1", "d", [tests, code])
+            store.create_run(
+                "run1",
+                "d",
+                [tests, code],
+                test_strength_contract=st.TestStrengthContract.STRENGTH_V1,
+            )
             row = store.conn.execute(
                 "SELECT kind, review_of FROM dag_nodes WHERE run_id=? AND node_id=?",
                 ("run1", "tests"),
@@ -360,6 +372,51 @@ class PersistentReviewLifecycleTests(unittest.TestCase):
                 store.ensure_derived_review_node(
                     "run1", "code", depth=1, downstream_needs=()
                 )
+
+    def test_a_legacy_pinned_run_refuses_a_tests_owner_for_a_derived_review(self):
+        """§19 M42 — the pin decides, not what this runtime can now do.
+
+        A tests node in a legacy-pinned run was admitted on its case count
+        under rules that had no reviewer in them. Projecting a review for it
+        now would not merely add a row: it rewires every direct dependant's
+        `needs_json` to the review and lifts the depth of everything below,
+        reopening dependency decisions of nodes that may already be terminal.
+        The scheduler stopped asking; this refusal is what stops a future
+        caller reintroducing it by another route.
+
+        The same fixture as the test above, differing only in the pin — which
+        is the whole claim.
+        """
+        tests = st.PlanNode(
+            node_id="tests",
+            kind=st.NodeKind.TESTS,
+            depth=0,
+            gate_command=("true",),
+            gate_selector="tests/test_example.py",
+            instruction="add a focused test",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            self.addCleanup(store.close)
+            # No `test_strength_contract`: the legacy pin, recorded explicitly.
+            store.create_run("run1", "d", [tests])
+            self.assertIs(
+                store.test_strength_contract("run1"),
+                st.TestStrengthContract.LEGACY,
+            )
+
+            with self.assertRaises(lc.LifecycleError) as caught:
+                store.ensure_derived_review_node(
+                    "run1", "tests", depth=1, downstream_needs=()
+                )
+            self.assertIn("cannot own a derived review node", str(caught.exception))
+            # And the refusal left no half-written row behind.
+            self.assertIsNone(
+                store.conn.execute(
+                    "SELECT 1 FROM dag_nodes WHERE run_id=? AND node_id=?",
+                    ("run1", "tests::review"),
+                ).fetchone()
+            )
 
     def test_derived_review_rejects_generic_verified_and_merged_transitions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1485,6 +1542,12 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
             store.start_attempt(
                 "run1", "a", base_sha="s1"
             )  # left RUNNING — a crashed scheduler
+            # A recorded turn, so this exercises the charged closure. Without
+            # evidence the attempt is released UNCLASSIFIED and the reason
+            # below is `resume:no-evidence-recorded` rather than `retry:`.
+            store.record_heartbeat(
+                store.get_attempt("run1", "a", 1), turn_count=1, observed_at=1.0
+            )
             reclaimed = store.resume_run("run1")
             self.assertEqual(reclaimed, ("a",))
             self.assertEqual(store.get_node("run1", "a").state, st.NodeState.PENDING)
@@ -1569,9 +1632,70 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
             self.assertIsNone(attempt.attempt_start_epoch)
             self.assertEqual(attempt.turn_count, 0)
 
-    def test_resume_still_charges_an_inherited_attempt_that_declared_nothing(self):
-        """The inverse: a genuinely in-flight attempt is ENVIRONMENTAL, as
-        it always was. Only a typed, adjudicated result row spares it."""
+    def test_resume_still_charges_an_attempt_that_took_a_turn_and_then_died(self):
+        """The inverse, and the backstop this change must not remove: an agent
+        that took a turn and then died is a fact about the environment, so it
+        is charged ENVIRONMENTAL exactly as it always was. The budget still
+        protects against a genuinely broken environment."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.mark_launched("run1", "a", 1, pid=None)
+            store.record_heartbeat(
+                store.get_attempt("run1", "a", 1), turn_count=1, observed_at=1.0
+            )
+
+            store.resume_run("run1")
+
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 1
+            )
+            self.assertIs(
+                store.get_attempt("run1", "a", 1).retry_class,
+                st.RetryClass.ENVIRONMENTAL,
+            )
+
+    def test_resume_releases_an_attempt_that_never_acquired_launch_identity(self):
+        """§7.5, §16.3 item 136 — an operator's restart is not a fact about
+        the environment.
+
+        `mark_launched` never fired for this attempt, so it has no
+        `launched_at`, no pid, no host and no start epoch — and therefore no
+        turn, no result and no sealed output either. Missing identity is not
+        the predicate any more, but it is still sufficient for it: an attempt
+        that never launched cannot have recorded evidence. Charging it
+        ENVIRONMENTAL records a judgement about a failure nobody saw, and
+        spends a budget on it. The row is still closed — that part is not
+        optional — but UNCLASSIFIED.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            self.assertIsNone(store.get_attempt("run1", "a", 1).launched_at)
+
+            reclaimed = store.resume_run("run1")
+
+            self.assertEqual(reclaimed, ("a",))
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.PENDING)
+            # The charge that must not happen.
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 0
+            )
+            attempt = store.get_attempt("run1", "a", 1)
+            self.assertIsNone(attempt.retry_class)
+            # ...and the closure that must still happen (§10.3, §7.6, §7.7).
+            self.assertEqual(attempt.state, lc.CLOSED_ATTEMPT_STATE)
+            # The pane is still recorded before the row is closed (§7.8).
+            self.assertEqual(len(store.audit_orphans("run1")), 1)
+            # And the node is genuinely re-launchable.
+            self.assertEqual(store.start_attempt("run1", "a", base_sha="s2"), 2)
+
+    def test_the_release_is_a_typed_transition_naming_why_it_cost_nothing(self):
+        """§1.2 — the durable record says which costless closure this was, so
+        the reason an attempt carries no class is readable from the ledger
+        rather than inferred from an absent column."""
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))
             store.create_run("run1", "d", [make_node("a", 0)])
@@ -1579,9 +1703,132 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
 
             store.resume_run("run1")
 
+            reasons = [
+                row[0]
+                for row in store.conn.execute(
+                    "SELECT reason FROM transitions"
+                    " WHERE run_id=? AND node_id=? ORDER BY id",
+                    ("run1", "a"),
+                ).fetchall()
+            ]
+            self.assertIn("resume:no-evidence-recorded", reasons)
+            self.assertEqual([r for r in reasons if r.startswith("retry:")], [])
+
+    def test_repeated_restarts_cannot_exhaust_a_budget_they_did_not_spend(self):
+        """The incident, in miniature: `lane-wp6-tests` in
+        `run-8a200af7f9044ce7a11a51b6908f37e3` reached 2 of 2 environmental
+        spend where half the spend was the operator restarting the scheduler.
+        Three restarts over an attempt that never launched must leave the
+        budget untouched, not exhaust it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            for base in ("s1", "s2", "s3"):
+                store.start_attempt("run1", "a", base_sha=base)
+                store.resume_run("run1")
+
             self.assertEqual(
-                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 1
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 0
             )
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.PENDING)
+
+    def test_charging_and_releasing_are_told_apart_by_recorded_evidence_alone(self):
+        """The discriminator, stated as one comparison: two runs identical in
+        every respect — both launched, both with a pane and a transcript path —
+        except that one attempt took a turn. Only that one is charged.
+
+        Launch identity is held constant precisely because it is no longer the
+        discriminating fact. Were it still the predicate, both columns would
+        read 1 and this comparison could not tell them apart at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spent = {}
+            for name, took_turn in (("took-a-turn", True), ("no-evidence", False)):
+                root = Path(tmp) / name
+                root.mkdir()
+                store = new_store(root)
+                self.addCleanup(store.close)
+                store.create_run("run1", "d", [make_node("a", 0)])
+                store.start_attempt("run1", "a", base_sha="s1")
+                store.mark_launched(
+                    "run1",
+                    "a",
+                    1,
+                    pid=None,
+                    extra={wd.SESSION_PATH_KEY: "/tmp/session.jsonl"},
+                )
+                if took_turn:
+                    store.record_heartbeat(
+                        store.get_attempt("run1", "a", 1),
+                        turn_count=1,
+                        observed_at=1.0,
+                    )
+                store.resume_run("run1")
+                spent[name] = store.attempts_spent(
+                    "run1", "a", st.RetryClass.ENVIRONMENTAL
+                )
+            self.assertEqual(spent, {"took-a-turn": 1, "no-evidence": 0})
+
+    def test_a_pane_and_a_transcript_path_are_not_evidence_of_a_failure(self):
+        """The a1/a6/a7 shape from `run-8a200af7f9044ce7a11a51b6908f37e3`, and
+        the reason this predicate is not keyed on launch identity.
+
+        The agent runner writes `launched_at` and the transcript path the
+        instant herdr reports the pane — 30s to 2min before the prompt is even
+        submitted — so an attempt the operator's restart killed in that window
+        has full launch identity and has still done nothing. `pid` is None
+        because the pane's foreground group is only meaningful after
+        submission. There is no turn, no result, no sealed output: nothing to
+        base a verdict on, and so no charge.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            store.mark_launched(
+                "run1",
+                "a",
+                1,
+                pid=None,
+                extra={wd.SESSION_PATH_KEY: "/tmp/session.jsonl"},
+            )
+            armed = store.get_attempt("run1", "a", 1)
+            # The fixture is the point: identity present, evidence absent.
+            self.assertIsNotNone(armed.launched_at)
+            self.assertEqual(armed.extra[wd.SESSION_PATH_KEY], "/tmp/session.jsonl")
+            self.assertEqual(armed.turn_count, 0)
+
+            store.resume_run("run1")
+
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 0
+            )
+            attempt = store.get_attempt("run1", "a", 1)
+            self.assertIsNone(attempt.retry_class)
+            self.assertEqual(attempt.state, lc.CLOSED_ATTEMPT_STATE)
+
+    def test_three_restarts_over_a_paned_attempt_cannot_exhaust_the_budget(self):
+        """The incident's arithmetic, on the shape it actually had. Attempts
+        a1, a6 and a7 each held a pane and each was killed by a restart; they
+        drove `lane-wp6-tests` to 2 of 2 environmental spend. Keyed on
+        evidence, the three cost nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            store.create_run("run1", "d", [make_node("a", 0)])
+            for attempt_no, base in enumerate(("s1", "s2", "s3"), start=1):
+                store.start_attempt("run1", "a", base_sha=base)
+                store.mark_launched(
+                    "run1",
+                    "a",
+                    attempt_no,
+                    pid=None,
+                    extra={wd.SESSION_PATH_KEY: "/tmp/session.jsonl"},
+                )
+                store.resume_run("run1")
+
+            self.assertEqual(
+                store.attempts_spent("run1", "a", st.RetryClass.ENVIRONMENTAL), 0
+            )
+            self.assertEqual(store.get_node("run1", "a").state, st.NodeState.PENDING)
 
     def test_resume_charges_an_inherited_attempt_whose_result_was_superseded(self):
         """Only ACCEPTED spares the attempt. A SUPERSEDED row names an

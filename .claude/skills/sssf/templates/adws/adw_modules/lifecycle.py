@@ -6882,9 +6882,15 @@ class LifecycleStore:
 
         * the attempt row was never launched -- no `launched_at`, no pid, no
           host, no process start epoch, no turn, and no transcript path. The
-          launcher writes all of those in one `mark_launched`, so their joint
-          absence is the launch not having happened rather than a field
-          having been missed;
+          launcher now writes those across **two** `mark_launched` calls, not
+          one: the agent runner writes `launched_at` and the transcript path
+          the instant herdr reports the pane, and the call after `launch`
+          returns fills in the pid, and with it the host and process start
+          epoch. So a row carrying `launched_at` and a transcript path but no
+          pid is not a field having been missed -- it is the normal state of an
+          attempt mid-launch, and the conjunction below correctly declines to
+          call it undispatched. What the conjunction still means is that *no*
+          part of either call landed, which is the launch not having happened;
         * no actor session was ever bound for that generation, and none is
           ACTIVE for the node at all -- a pane bound to this node is a writer
           whatever the attempt row says;
@@ -7463,12 +7469,21 @@ class LifecycleStore:
         This is artifact precedence at the resume boundary: completed work is
         not discarded because the supervisor died before observing it.
 
-        A generation with an ACCEPTED result row but without that full recovery
-        proof is closed UNCLASSIFIED rather than charged ENVIRONMENTAL.
-        `attempts_spent` counts only classified rows, so the infrastructure
-        failure costs no budget, but the work is not adopted on a partial
-        evidence chain. Everything else is charged ENVIRONMENTAL exactly as
-        before.
+        An inherited generation that recorded no evidence about a failure is
+        closed UNCLASSIFIED rather than charged ENVIRONMENTAL — no turn, no
+        result, no sealed output, per `_attempt_recorded_evidence`, which is
+        also where the reasoning for that set lives. `attempts_spent` counts
+        only classified rows, so the closure costs no budget. This is not a
+        softening of the retry classes: an attempt that took a turn and then
+        died is charged ENVIRONMENTAL exactly as before, and its retry against
+        identical inputs is still the right behaviour. It is the removal of a
+        charge for a fact nobody recorded. Without it, `lane-wp6-tests` in
+        `run-8a200af7f9044ce7a11a51b6908f37e3` reached 2 of 2 environmental
+        spend across attempts a1, a6 and a7 — each with an empty `detail_json`
+        — where half the spend was the operator's own restart, and §7.5 says
+        no infra fault may produce a budget decrement. Deliberately **not**
+        keyed on launch identity: those attempts had panes and transcript
+        paths, and keying on either would charge them again.
 
         Each one's pane is recorded in `orphans` before its attempt row is
         closed — the pid lives on that row, so reading it afterwards would read
@@ -7606,13 +7621,112 @@ class LifecycleStore:
                 # Re-enter completion through the same late-envelope path so
                 # candidate/review/handoff ledgers decide the persisted phase.
                 self._release_late_envelope_attempt(run_id, node_id, node.attempt_no)
+            elif inherited is not None and not self._attempt_recorded_evidence(
+                run_id, node_id, inherited.attempt_no
+            ):
+                # The attempt recorded nothing that could be evidence about a
+                # failure, so ENVIRONMENTAL would be a verdict on a fact nobody
+                # observed, spending budget on an attempt the operator's own
+                # restart ended (§7.5, §16.3 item 136). Close it costless.
+                self._release_unclassified_attempt(
+                    run_id, node_id, reason="resume:no-evidence-recorded"
+                )
             else:
                 self.fail_attempt(run_id, node_id, st.RetryClass.ENVIRONMENTAL)
             reclaimed.append(node_id)
         return tuple(reclaimed)
 
+    def _attempt_recorded_evidence(
+        self, run_id: str, node_id: str, attempt_no: int
+    ) -> bool:
+        """Did this attempt record anything that could be evidence about a
+        failure? (§7.5)
+
+        The distinction this draws is between what an attempt *produced* and
+        what the launcher *recorded about its pane*, and it is the whole
+        predicate. A retry class is a verdict — ENVIRONMENTAL says the world
+        broke, LAUNCHER_TRANSIENT says the launcher did — and a verdict needs
+        something to be a verdict about. An attempt that opened a pane and was
+        then killed by an operator restarting the scheduler produced nothing:
+        charging it spends a budget on a failure nobody observed, and §7.5
+        forbids exactly that.
+
+        Evidence, all three of which are things the attempt *did*:
+
+        * `turn_count > 0` — the watchdog counted a completed turn in the
+          transcript. `record_heartbeat` is its only writer, so this is the
+          heartbeat signal and the turn signal at once. An agent that took a
+          turn and then died is a fact about the environment, and the budget
+          must still protect against a genuinely broken one.
+        * a `results` row for this exact generation, whatever its
+          adjudication. ACCEPTED is handled before this is ever consulted;
+          SUPERSEDED still means the attempt declared an outcome.
+        * `SEALED_OUTPUT_SHA_KEY` in the attempt's `extra_json` — an output
+          measurement only a dispatched attempt reaches.
+
+        **Not** evidence, and this is the part that had to change: `launched_at`,
+        `pid`, `attempt_host`, `attempt_start_epoch`, and the transcript path
+        under `wd.SESSION_PATH_KEY`. All five are written by `mark_launched`,
+        which the agent runner now calls the instant herdr reports the pane —
+        30s to 2min before the prompt-submission proof. They are launch
+        identity. Keying on any of them re-charges the attempts this predicate
+        exists to spare: `lane-wp6-tests` in
+        `run-8a200af7f9044ce7a11a51b6908f37e3` had a pane and a transcript path
+        for a1, a6 and a7, and had taken no turn and declared nothing.
+
+        `undispatched_quiescence_attempts` reads the transcript path the
+        opposite way, and both are right: it asks whether the attempt crossed
+        *dispatch*, for which an open pane is the answer. This asks whether the
+        attempt produced grounds for a *verdict*, for which it is not.
+
+        **Before adding a signal to the evidence set, check which of those two
+        questions it answers.** The transcript path is the trap, and it has
+        been walked into twice: it is written by `mark_launched`, it is already
+        read as evidence three hundred lines above, and adding it here is the
+        single most natural-looking change anyone will propose to this
+        function. It would silently restore the charge this predicate exists to
+        remove. The test that would catch it is
+        `test_a_pane_and_a_transcript_path_are_not_evidence_of_a_failure`; the
+        rule it enforces is that a signal belongs here only if the *attempt*
+        wrote it, never if the *launcher* did.
+
+        This fix has cancelled itself twice already for that reason. It was
+        first keyed on `launched_at IS NULL`, which was correct until the agent
+        runner began writing launch identity at pane start rather than after
+        the submission proof — at which point the very attempts it was written
+        for had identity and were charged again. Keying on the transcript path
+        would reproduce that a third time.
+
+        An absent attempt row returns True. Missing evidence is not evidence of
+        absence, and the charge is what this branch did before the predicate
+        existed.
+        """
+        row = self.conn.execute(
+            "SELECT turn_count, extra_json FROM attempts"
+            " WHERE run_id=? AND node_id=? AND attempt_no=?",
+            (run_id, node_id, attempt_no),
+        ).fetchone()
+        if row is None:
+            return True
+        if (row[0] or 0) > 0:
+            return True
+        try:
+            payload = json.loads(row[1] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get(SEALED_OUTPUT_SHA_KEY) is not None:
+            return True
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM results"
+                " WHERE run_id=? AND node_id=? AND attempt_no=? LIMIT 1",
+                (run_id, node_id, attempt_no),
+            ).fetchone()
+            is not None
+        )
+
     def _release_unclassified_attempt(
-        self, run_id: str, node_id: str
+        self, run_id: str, node_id: str, *, reason: str
     ) -> st.NodeLifecycle:
         """RUNNING -> PENDING with the attempt row closed but UNCLASSIFIED.
 
@@ -7623,6 +7737,16 @@ class LifecycleStore:
         with §10.3's partial unique index, keeps §7.6's watchdog polling an
         attempt nobody is running, and makes §7.7 adjudicate a late arrival
         ACCEPTED rather than SUPERSEDED.
+
+        `reason` names which of the resume's costless closures this is, and it
+        is required rather than defaulted because the transition row is the
+        only durable record of *why* an attempt was released without a class.
+        `resume:no-evidence-recorded` is the case `_attempt_recorded_evidence`
+        decides: the attempt took no turn, declared no result, and sealed no
+        output, so a retry class would be a verdict about a failure nobody
+        observed. §7.5 forbids an infra fault from decrementing a budget, and
+        an attempt the operator ended by restarting the scheduler is a weaker
+        fact still.
         """
 
         def extra(lifecycle: st.NodeLifecycle):
@@ -7639,7 +7763,7 @@ class LifecycleStore:
             node_id,
             st.NodeState.PENDING,
             actor="scheduler",
-            reason="resume:result-declared",
+            reason=reason,
             pending_cause=st.PendingCause.SCHEDULER,
             require_state=(st.NodeState.RUNNING,),
             extra_writes=extra,
