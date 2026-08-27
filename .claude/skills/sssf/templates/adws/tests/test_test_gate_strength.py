@@ -1051,7 +1051,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
             capture_output=True, text=True, check=True,
         ).stdout.strip()
 
-    def tests_node(self, contract=None):
+    def authored_tests_node(self, contract=None):
         return st.PlanNode(
             node_id="tests",
             kind=st.NodeKind.TESTS,
@@ -1102,7 +1102,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
             return _Passing(candidate_sha)
 
         self.schedule(
-            [self.tests_node()], deps=self.strength_deps(review_attempt=review)
+            [self.authored_tests_node()], deps=self.strength_deps(review_attempt=review)
         ).run()
         self.assertNotEqual(st.NodeState.MERGED.value, self.states()["tests"])
         self.assertNotIn("tests", reviewed)
@@ -1122,7 +1122,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
             return _Passing(candidate_sha)
 
         self.schedule(
-            [self.tests_node()], deps=self.strength_deps(review_attempt=review)
+            [self.authored_tests_node()], deps=self.strength_deps(review_attempt=review)
         ).run()
         self.assertEqual(st.NodeState.MERGED.value, self.states()["tests"])
         recorded = self.evidence()
@@ -1137,7 +1137,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         decides, and a rejected candidate is not an accepted one."""
         self.written["tests"] = {"tests/test_refund.py": GENUINE}
         self.schedule(
-            [self.tests_node()],
+            [self.authored_tests_node()],
             config=self.config(review_ceiling=1, test_review_ceiling=1),
             deps=self.strength_deps(
                 review_attempt=lambda *a: RejectingReview(a[4])
@@ -1150,7 +1150,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         """Requirement: the test-review budget is distinct from every other."""
         self.written["tests"] = {"tests/test_refund.py": GENUINE}
         self.schedule(
-            [self.tests_node()],
+            [self.authored_tests_node()],
             config=self.config(review_ceiling=1, test_review_ceiling=1),
             deps=self.strength_deps(
                 review_attempt=lambda *a: RejectingReview(a[4])
@@ -1171,7 +1171,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         self.gate_script[("build", "post")] = [green()]
         self.gate_script[("build", "falsify")] = [red()]
         self.schedule(
-            [self.tests_node(), self.build_node()], deps=self.strength_deps()
+            [self.authored_tests_node(), self.build_node()], deps=self.strength_deps()
         ).run()
         states = self.states()
         self.assertEqual(st.NodeState.MERGED.value, states["tests"])
@@ -1193,7 +1193,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         self.gate_script[("build", "post")] = [green()]
         self.gate_script[("build", "falsify")] = [red()]
         self.schedule(
-            [self.tests_node(), self.build_node()], deps=self.strength_deps()
+            [self.authored_tests_node(), self.build_node()], deps=self.strength_deps()
         ).run()
         self.assertEqual(st.NodeState.MERGED.value, self.states()["tests"])
         self.assertNotEqual(st.NodeState.MERGED.value, self.states()["build"])
@@ -1208,7 +1208,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         self.gate_script[("build", "post")] = [green()]
         self.gate_script[("build", "falsify")] = [red()]
         self.schedule(
-            [self.tests_node(), self.build_node()], deps=self.strength_deps()
+            [self.authored_tests_node(), self.build_node()], deps=self.strength_deps()
         ).run()
         self.assertNotEqual(st.NodeState.MERGED.value, self.states()["build"])
         blob = self._transition_detail("build")
@@ -1224,7 +1224,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
             return _Passing(candidate_sha)
 
         self.schedule(
-            [self.tests_node()], deps=self.strength_deps(review_attempt=review)
+            [self.authored_tests_node()], deps=self.strength_deps(review_attempt=review)
         ).run()
         first = len(dispatches)
         self.assertEqual(1, first)
@@ -1232,7 +1232,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         # the reviewer is not asked again and no fresh attempt is created to
         # escape recovery.
         self.schedule(
-            [self.tests_node()], deps=self.strength_deps(review_attempt=review)
+            [self.authored_tests_node()], deps=self.strength_deps(review_attempt=review)
         ).run()
         self.assertEqual(first, len(dispatches))
 
@@ -1240,7 +1240,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         """Requirement 9's ledger half: the same immutable bytes carry one
         measurement, so a stale callback cannot install a second answer."""
         self.written["tests"] = {"tests/test_refund.py": GENUINE}
-        self.schedule([self.tests_node()], deps=self.strength_deps()).run()
+        self.schedule([self.authored_tests_node()], deps=self.strength_deps()).run()
         recorded = self.evidence()
         # One row per immutable candidate, not per measurement attempt.
         self.assertEqual(
@@ -1258,7 +1258,7 @@ class GateStrengthEndToEnd(SchedulerFixture):
         """The rollout invariant, over the scheduler. A plan whose tests node
         declares no contract runs under LEGACY: the strength gate does not
         fire, and the node merges exactly as it did before."""
-        legacy = replace(self.tests_node(), test_strength=None)
+        legacy = replace(self.authored_tests_node(), test_strength=None)
         self.written["tests"] = {"tests/test_refund.py": WEAK}
         scheduler = self.schedule([legacy], deps=self.strength_deps())
         self.assertIs(
@@ -1279,6 +1279,263 @@ class GateStrengthEndToEnd(SchedulerFixture):
             record.node_id: record.state
             for record in self.store.node_records("run1")
         }
+
+
+class LegacyResumeDerivesNoTestReview(GateStrengthEndToEnd):
+    """Requirement 11's other half: the *graph* of a legacy run is preserved.
+
+    Classifying a legacy tests node rather than migrating it is worthless if
+    resuming the run projects a review edge over it anyway. The projection is
+    not a read -- it inserts a PENDING review into the frontier, rewires every
+    direct dependant to need the review instead of the tests node, and lifts
+    the depth of everything below. Doing that to an already-terminal node
+    reopens a dependency decision the rollout invariant froze.
+
+    `run-8d1a71f463e4430f92a125a8f8b3731d` is the measured case: its pin and
+    authored tests remain LEGACY, while the old projection would have added
+    `lane-acquisition-manifest-tests::review` and moved
+    `lane-acquisition-manifest` behind it. The pre-resume audit stopped before
+    the live ledger was changed (§19 M42).
+    """
+
+    def legacy_pair(self):
+        return [replace(self.authored_tests_node(), test_strength=None), self.build_node()]
+
+    def pin(self, contract, nodes):
+        self.store.create_run(
+            "run1", "digest-run1", list(nodes), test_strength_contract=contract
+        )
+
+    def projected(self, scheduler):
+        return {
+            node_id: (node.depth, tuple(node.needs))
+            for node_id, node in scheduler.nodes.items()
+        }
+
+    def test_a_legacy_pinned_run_projects_no_review_over_its_tests_node(self):
+        nodes = self.legacy_pair()
+        self.pin(st.TestStrengthContract.LEGACY, nodes)
+        scheduler = self.schedule(nodes, deps=self.strength_deps())
+
+        projected = self.projected(scheduler)
+        # The authored set, plus the build lane's review and nothing else.
+        self.assertEqual({"tests", "build", "build::review"}, set(projected))
+        self.assertNotIn("tests::review", projected)
+
+    def test_a_legacy_pinned_run_preserves_authored_depth_and_dependencies(self):
+        nodes = self.legacy_pair()
+        self.pin(st.TestStrengthContract.LEGACY, nodes)
+        scheduler = self.schedule(nodes, deps=self.strength_deps())
+
+        projected = self.projected(scheduler)
+        self.assertEqual((0, ()), projected["tests"])
+        # Still needs the tests node itself, at its authored depth. Under a
+        # derived review this reads (2, ("tests::review",)).
+        self.assertEqual((1, ("tests",)), projected["build"])
+
+    def test_a_legacy_pinned_run_writes_no_review_row_and_rewires_nothing(self):
+        nodes = self.legacy_pair()
+        self.pin(st.TestStrengthContract.LEGACY, nodes)
+        scheduler = self.schedule(nodes, deps=self.strength_deps())
+
+        scheduler.project()
+
+        rows = {
+            record.node_id: tuple(record.needs)
+            for record in self.store.node_records("run1")
+        }
+        self.assertEqual({"tests", "build", "build::review"}, set(rows))
+        self.assertEqual(("tests",), rows["build"])
+
+    def test_a_legacy_pinned_run_dispatches_no_test_review(self):
+        nodes = self.legacy_pair()
+        self.pin(st.TestStrengthContract.LEGACY, nodes)
+        self.written["tests"] = {"tests/test_refund.py": WEAK}
+        self.written["build"] = {"refunds.py": "REFUNDS\n"}
+        reviewed = []
+
+        def review(attempt, node, record, base_sha, candidate_sha, _resume):
+            reviewed.append(node.node_id)
+            return _Passing(candidate_sha)
+
+        self.schedule(nodes, deps=self.strength_deps(review_attempt=review)).run()
+
+        self.assertNotIn("tests", reviewed)
+        self.assertIn("build", reviewed)
+        self.assertEqual(st.NodeState.MERGED.value, self.states()["tests"])
+        # The legacy gate is untouched: no strength evidence was measured.
+        self.assertEqual((), self.evidence())
+
+    def test_a_strength_v1_run_still_derives_and_dispatches_the_test_review(self):
+        nodes = [self.authored_tests_node(), self.build_node()]
+        self.pin(st.TestStrengthContract.STRENGTH_V1, nodes)
+        scheduler = self.schedule(nodes, deps=self.strength_deps())
+
+        projected = self.projected(scheduler)
+        self.assertIn("tests::review", projected)
+        self.assertEqual((2, ("tests::review",)), projected["build"])
+
+    def test_the_pin_decides_the_projection_not_the_plan_in_front_of_it(self):
+        """A re-shipped plan cannot contract a run that was created legacy.
+
+        The refusal already existed in `project()`; what it could not do was
+        arrive before the graph had been rebuilt under the new plan's rules.
+        """
+        self.pin(st.TestStrengthContract.LEGACY, self.legacy_pair())
+        contracted = [self.authored_tests_node(), self.build_node()]
+
+        scheduler = self.schedule(contracted, deps=self.strength_deps())
+
+        self.assertIs(
+            st.TestStrengthContract.STRENGTH_V1,
+            scheduler.plan_test_strength_contract,
+        )
+        self.assertIs(
+            st.TestStrengthContract.LEGACY, scheduler.test_strength_contract
+        )
+        self.assertNotIn("tests::review", scheduler.nodes)
+        with self.assertRaises(sch.TestStrengthContractMismatch):
+            scheduler.project()
+
+    def test_a_fresh_run_has_no_pin_and_answers_from_its_plan(self):
+        self.assertIsNone(self.store.pinned_test_strength_contract("run1"))
+        scheduler = self.schedule(
+            [self.authored_tests_node(), self.build_node()], deps=self.strength_deps()
+        )
+        self.assertIs(
+            st.TestStrengthContract.STRENGTH_V1, scheduler.test_strength_contract
+        )
+        self.assertIn("tests::review", scheduler.nodes)
+
+    def test_the_store_refuses_a_test_review_row_in_a_legacy_pinned_run(self):
+        """Defence in depth: the invariant does not depend on one caller."""
+        nodes = self.legacy_pair()
+        self.pin(st.TestStrengthContract.LEGACY, nodes)
+
+        with self.assertRaises(lc.LifecycleError) as caught:
+            self.store.ensure_derived_review_node(
+                "run1", "tests", depth=1, downstream_needs=("build",)
+            )
+        self.assertIn("test-acceptance contract", str(caught.exception))
+        # And an agent lane in the same run is still projectable.
+        self.store.ensure_derived_review_node("run1", "build", depth=2)
+
+    # ── a ledger a previous runtime already damaged ──────────────────────────
+
+    def contaminated_legacy_run(self):
+        """The durable state a resume between M41 and M42 would have left.
+
+        Projected while the pin said `STRENGTH_V1` — which is the only way to
+        get these rows past the store's new refusal — and then re-pinned
+        `LEGACY`, because what the old runtime actually did was derive the
+        review for a run whose pin already said legacy. The rows are what
+        matter: a `tests::review` nobody will dispatch, and a `build` whose
+        `needs_json` was rewired to point at it.
+        """
+        nodes = self.legacy_pair()
+        self.store.create_run(
+            "run1", "digest-run1", list(nodes),
+            test_strength_contract=st.TestStrengthContract.STRENGTH_V1,
+        )
+        self.store.ensure_derived_review_node(
+            "run1", "tests", depth=1, downstream_needs=("build",)
+        )
+        # `build::review` is left for the scheduler to project, because that
+        # row is not the damage and its depth is still whatever the legacy
+        # projection computes.
+        self.store.conn.execute(
+            "UPDATE runs SET test_strength_contract=? WHERE run_id=?",
+            (st.TestStrengthContract.LEGACY.value, "run1"),
+        )
+        rows = {
+            record.node_id: tuple(record.needs)
+            for record in self.store.node_records("run1")
+        }
+        # The damage this fixture exists to model, asserted rather than assumed.
+        self.assertIn("tests::review", rows)
+        self.assertEqual(("tests::review",), rows["build"])
+        return nodes
+
+    def test_an_orphaned_test_review_no_longer_blocks_its_dependant(self):
+        nodes = self.contaminated_legacy_run()
+        scheduler = self.schedule(nodes, deps=self.strength_deps())
+
+        self.assertNotIn("tests::review", scheduler.nodes)
+        # Unsatisfied while the tests node is unmerged...
+        self.assertFalse(scheduler._dependency_satisfied("tests::review"))
+        self.store.conn.execute(
+            "UPDATE node_lifecycle SET state=? WHERE run_id=? AND node_id=?",
+            (st.NodeState.MERGED.value, "run1", "tests"),
+        )
+        # ...and satisfied by the tests node itself, which is the edge the
+        # plan authored before anything rewired it.
+        self.assertTrue(scheduler._dependency_satisfied("tests::review"))
+
+    def test_an_orphan_over_an_unverified_tests_node_is_refused_not_rescued(self):
+        """The exact boundary of what declining to require a row can do.
+
+        `_out_of_contract_review_owner` unblocks a *dependant*. It cannot
+        unblock the reviewed node itself, because §7.3's VERIFIED predicate
+        lives in the store and keys on the review row's existence: once a
+        `tests::review` row is in the ledger, `mark_verified` demands an
+        ACCEPTED PASS bound to that exact candidate, and no scheduler-side
+        decision reaches it.
+
+        That is the right failure. A tests node still mid-flight under a
+        contaminated ledger is a ledger that needs an explicit migration, and
+        this asserts it says so loudly rather than merging on a rule nobody
+        applied. The damage this whole change exists to prevent happens after
+        a tests node is already MERGED, where no VERIFIED transition remains
+        to be refused — which is why the dependant is the half that matters
+        and the half the previous test covers.
+        """
+        nodes = self.contaminated_legacy_run()
+        self.written["tests"] = {"tests/test_refund.py": WEAK}
+        reviewed = []
+
+        def review(attempt, node, record, base_sha, candidate_sha, _resume):
+            reviewed.append(node.node_id)
+            return _Passing(candidate_sha)
+
+        report = self.schedule(
+            nodes, deps=self.strength_deps(review_attempt=review)
+        ).run()
+
+        self.assertIs(st.RunOutcome.BLOCKED, report.outcome)
+        self.assertEqual(
+            {"tests"}, {node_id for node_id, _ in report.blocked}
+        )
+        # Never silently merged, and never reviewed under a contract that has
+        # no test reviewer in it.
+        self.assertNotIn("tests", reviewed)
+        self.assertNotEqual(st.NodeState.MERGED.value, self.states()["tests"])
+        self.assertIn(
+            "VERIFIED requires ACCEPTED PASS",
+            self._transition_detail("tests"),
+        )
+        # The orphan is left exactly where it was. Declining to require a row
+        # is not the same as migrating it, and a legacy run's ledger is not
+        # rewritten without an operator asking.
+        self.assertEqual(
+            st.NodeState.PENDING.value, self.states()["tests::review"]
+        )
+
+    def test_a_strength_v1_run_still_requires_its_test_review(self):
+        """The exclusion is scoped to the contract, not to review rows."""
+        nodes = [self.authored_tests_node(), self.build_node()]
+        self.pin(st.TestStrengthContract.STRENGTH_V1, nodes)
+        self.store.ensure_derived_review_node(
+            "run1", "tests", depth=1, downstream_needs=("build",)
+        )
+        scheduler = self.schedule(nodes, deps=self.strength_deps())
+
+        self.assertIsNone(scheduler._out_of_contract_review_owner("tests::review"))
+        self.store.conn.execute(
+            "UPDATE node_lifecycle SET state=? WHERE run_id=? AND node_id=?",
+            (st.NodeState.MERGED.value, "run1", "tests"),
+        )
+        # Merging the tests node is not enough: the review edge is real here.
+        self.assertFalse(scheduler._dependency_satisfied("tests::review"))
 
 
 class _Passing:

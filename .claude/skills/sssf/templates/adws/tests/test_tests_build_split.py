@@ -194,7 +194,7 @@ class CollectAndRunTests(unittest.TestCase):
 
 
 class SchedulerSplitTests(SchedulerFixture):
-    def tests_node(self, node_id="tests", outputs=None):
+    def authored_tests_node(self, node_id="tests", outputs=None):
         return st.PlanNode(
             node_id=node_id,
             kind=st.NodeKind.TESTS,
@@ -219,7 +219,7 @@ class SchedulerSplitTests(SchedulerFixture):
 
     def test_a_hollow_test_is_refused_and_does_not_merge(self):
         self.written["tests"] = {"tests/test_refund.py": HOLLOW}
-        self.schedule([self.tests_node()]).run()
+        self.schedule([self.authored_tests_node()]).run()
         self.assertNotEqual(self.states()["tests"], st.NodeState.MERGED.value)
         details = self.store.conn.execute(
             "SELECT detail_json FROM transitions WHERE node_id=?", ("tests",)
@@ -233,7 +233,7 @@ class SchedulerSplitTests(SchedulerFixture):
         self.gate_script[("build", "pre")] = [red()]
         self.gate_script[("build", "post")] = [green()]
         self.gate_script[("build", "falsify")] = [red()]
-        self.schedule([self.tests_node(), self.build_node()]).run()
+        self.schedule([self.authored_tests_node(), self.build_node()]).run()
         self.assertEqual(self.states()["tests"], st.NodeState.MERGED.value)
         self.assertEqual(self.states()["build"], st.NodeState.MERGED.value)
 
@@ -246,7 +246,7 @@ class SchedulerSplitTests(SchedulerFixture):
         self.gate_script[("build", "pre")] = [red()]
         self.gate_script[("build", "post")] = [green()]
         self.gate_script[("build", "falsify")] = [red()]
-        self.schedule([self.tests_node(), self.build_node()]).run()
+        self.schedule([self.authored_tests_node(), self.build_node()]).run()
         self.assertEqual(self.states()["tests"], st.NodeState.MERGED.value)
         self.assertNotEqual(self.states()["build"], st.NodeState.MERGED.value)
 

@@ -1749,11 +1749,18 @@ class LifecycleStore:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             run = self.conn.execute(
-                "SELECT plan_digest FROM runs WHERE run_id=?", (run_id,)
+                "SELECT plan_digest, test_strength_contract FROM runs"
+                " WHERE run_id=?",
+                (run_id,),
             ).fetchone()
             if run is None:
                 raise LifecycleError(f"no run row for {run_id}")
             plan_digest = str(run[0])
+            contract = (
+                st.DEFAULT_TEST_STRENGTH_CONTRACT
+                if run[1] is None
+                else st.TestStrengthContract(str(run[1]))
+            )
             build = self.conn.execute(
                 "SELECT plan_digest, kind FROM dag_nodes WHERE run_id=? AND node_id=?",
                 (run_id, build_node_id),
@@ -1774,6 +1781,23 @@ class LifecycleStore:
                 raise LifecycleError(
                     f"{run_id}/{build_node_id}: only an agent or tests build "
                     "lane can own a derived review node"
+                )
+            if (
+                build[1] == st.NodeKind.TESTS.value
+                and contract is not st.TestStrengthContract.STRENGTH_V1
+            ):
+                # The store's own half of the rollout invariant. A tests node
+                # in a legacy-pinned run was admitted on its case count under
+                # rules that had no reviewer in them, and projecting one now
+                # does not merely add a row: it rewires every direct dependant
+                # to need the review instead, which reopens the dependency
+                # decision of nodes that are already terminal. The scheduler
+                # no longer asks for this; refusing it here means no future
+                # caller can reintroduce it by accident (§19 M42).
+                raise LifecycleError(
+                    f"{run_id}/{build_node_id}: a tests node in a run pinned "
+                    f"to the {contract.value} test-acceptance contract cannot "
+                    "own a derived review node"
                 )
 
             review = self.conn.execute(
@@ -2212,11 +2236,29 @@ class LifecycleStore:
         pinned it, and answering anything else here is what would retroactively
         change the rules an already-terminal node was decided under.
         """
+        pinned = self.pinned_test_strength_contract(run_id)
+        if pinned is None:
+            raise LifecycleError("no run row for {0}".format(run_id))
+        return pinned
+
+    @serialized
+    def pinned_test_strength_contract(
+        self, run_id: str
+    ) -> Optional[st.TestStrengthContract]:
+        """The pin, or `None` when there is no run to have pinned anything.
+
+        The separate question from `test_strength_contract`, and the one a
+        scheduler has to ask *before* it projects: "does this run already
+        exist, and if so under which rules?" A run that does not exist yet is
+        not legacy and is not `STRENGTH_V1` -- it has no pin, and answering
+        with either value would be inventing a durable fact that has not been
+        written. Existence and contract are one query because two would race.
+        """
         row = self.conn.execute(
             "SELECT test_strength_contract FROM runs WHERE run_id=?", (run_id,)
         ).fetchone()
         if row is None:
-            raise LifecycleError("no run row for {0}".format(run_id))
+            return None
         if row[0] is None:
             return st.DEFAULT_TEST_STRENGTH_CONTRACT
         try:
@@ -8094,6 +8136,20 @@ class LifecycleReader:
             )
             for row in rows
         )
+
+    def pinned_test_strength_contract(
+        self, run_id: str
+    ) -> Optional[st.TestStrengthContract]:
+        """The pin, or `None` when the ledger holds no row for this run.
+
+        A ledger predating the column is a different answer from a ledger with
+        no run: the first pinned nothing because nothing could pin, which is
+        the legacy contract; the second has nothing to say at all.
+        """
+        rows = self._rows("SELECT run_id FROM runs WHERE run_id=?", (run_id,))
+        if not rows:
+            return None
+        return self.test_strength_contract(run_id)
 
     def test_strength_contract(self, run_id: str) -> st.TestStrengthContract:
         """The contract this run was created under. NULL, and a ledger with no
