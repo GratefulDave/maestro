@@ -97,6 +97,17 @@ class TestsRefusal(_RemediedRefusal):
         "assertion to an old case creates no new case. Check before "
         "finishing with `--collect-only -q -o addopts=` that the new "
         "nodeids appear.")
+    PARENT_RUN_UNACCOUNTED = (
+        "TESTS_PARENT_RUN_UNACCOUNTED",
+        "This names the harness, not your tests: collection found the new "
+        "cases, and the parent run's report accounted for fewer of them "
+        "than were collected, so some or all of them were never judged at "
+        "all. No edit to the tests can change that count. The verdict "
+        "carries both numbers and the command that produced them; compare "
+        "the collected ids against the ids the runner's own report prints "
+        "back — an empty intersection means the two surfaces disagree "
+        "about how a case is named, which is a defect in the measurement "
+        "and needs an operator, not another attempt.")
     HOLLOW_AT_PARENT = (
         "TESTS_HOLLOW_AT_PARENT",
         "Strengthen every new case that passed at the parent commit so it "
@@ -269,6 +280,26 @@ def _blob_at(tree: Path, commit: str, path: str) -> Optional[bytes]:
                 object_id.decode("ascii", "replace"), path, commit))
     return shown.stdout
 
+#: How much of the collected-id list a refusal detail may carry. Long enough
+#: for a handful of vitest `file::Suite > title` ids — the shape that has to
+#: be *seen* to be recognised as disagreeing with the report's — short enough
+#: that one refusal cannot flood `transitions.detail_json`.
+_DETAIL_ID_BUDGET = 240
+
+
+def _elided(text: str, budget: int = _DETAIL_ID_BUDGET) -> str:
+    """`text`, cut to `budget` with the number of dropped characters stated.
+
+    Stated rather than silently truncated: a detail that ends mid-id would
+    read as an id that ends there, which is the same class of mistake as the
+    disagreement these details exist to expose.
+    """
+    if len(text) <= budget:
+        return text
+    return "{0}… (+{1} more characters)".format(
+        text[:budget], len(text) - budget)
+
+
 def adjudicate_parent_red(result: "wt.GateResult",
                           new_case_count: int) -> vf.VerificationVerdict:
     """Clause 4 of the tests chain: every new case is red at parent.
@@ -276,6 +307,32 @@ def adjudicate_parent_red(result: "wt.GateResult",
     `adjudicate_gate` expects green. This is the missing opposite: a
     parseable report whose new cases all failed, with collection/import
     crashes refused by name rather than counted as the red we wanted.
+
+    Two arithmetically different facts used to share `TESTS_NO_NEW_CASES`.
+    `new_case_count < 1` is the tester's: nothing new was written.
+    `counts.collected < new_case_count` is the *harness's*: collection found
+    N ids, the run was asked for those N ids, and the report accounted for
+    fewer than N — which no edit to the tests can change. In production that
+    second branch was never once the tester's doing. It fired three times on
+    `lane-wp6-tests`, each time from a different measurement defect:
+    collecting a `.test.ts` file with pytest (`407d7d3`),
+    `vitest list --json <path>` overwriting the file it was measuring
+    (`5273342`), and `vitest list` naming a case `Suite > title` while
+    `--reporter=json` joined the same parts with a plain space, so
+    `run()`'s `set(collected) & set(reported)` was empty by construction
+    (`c087469`). Nine correct cases, every one red at the parent for exactly
+    the reason a TDD case is red, refused with a string that said the tester
+    had written nothing — and the third bug cost a whole run to find because
+    the refusal named the agent instead of the measurement.
+
+    So the branch is `TESTS_PARENT_RUN_UNACCOUNTED`, it carries both counts
+    and the command that produced them, and it is ENVIRONMENTAL: re-running
+    the agent cannot repair a report that did not account for the cases it
+    was handed, and classifying it SEMANTIC spends the fix loop's budget
+    (§7.5) proving that twice. The observed ids are not reachable here — a
+    `GateResult` carries the ids that were *asked for* (`selector`) and the
+    five counts, not the per-case outcomes — so the detail states the side it
+    has and names the command that printed the other.
     """
     if new_case_count < 1:
         return _refused(TestsRefusal.NO_NEW_CASES,
@@ -297,10 +354,18 @@ def adjudicate_parent_red(result: "wt.GateResult",
             "{0} new case(s) passed at the parent commit"
             .format(counts.passed))
     if counts.collected < new_case_count:
+        unaccounted = new_case_count - counts.collected
         return _refused(
-            TestsRefusal.NO_NEW_CASES,
-            "parent run collected {0}, fewer than {1} new case(s)"
-            .format(counts.collected, new_case_count))
+            TestsRefusal.PARENT_RUN_UNACCOUNTED,
+            "collection found {0} new case(s) at the parent tree; the run "
+            "reported an outcome for {1} of them, {2} unaccounted{3}. "
+            "ran: `{4}`; collected ids: {5}".format(
+                new_case_count, counts.collected, unaccounted,
+                " — the report and the collected ids intersect nowhere, so "
+                "not one case was judged" if counts.collected == 0 else "",
+                " ".join(result.command) or "(no command recorded)",
+                _elided(result.selector) or "(none recorded)"),
+            retry_class=st.RetryClass.ENVIRONMENTAL)
     if counts.failed < new_case_count or counts.failed != counts.collected:
         return _refused(
             TestsRefusal.NOT_RED_AT_PARENT,
