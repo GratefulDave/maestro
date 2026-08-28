@@ -895,11 +895,40 @@ def parse_vitest_list(output: str) -> Tuple[str, ...]:
     return ()
 
 
+def _vitest_case_name(case: dict) -> str:
+    """The case name in the *same shape* `vitest list --json` prints.
+
+    The two vitest surfaces disagree, and the disagreement is silent. `vitest
+    list --json` joins a case's ancestor suites and its title with `" > "`;
+    `--reporter=json` also ships `fullName`, which joins them with a plain
+    space. Building a node id from `fullName` therefore produces an id that
+    can never equal the id collection produced for the very same case.
+
+    `VitestCaseRunner.run` runs the whole suite and keeps the outcomes whose
+    id is in the collected set, so an id shape that cannot match means the
+    kept set is empty for every vitest node — a report with nine failing
+    cases adjudicated as `parent run collected 0`, on every attempt, which no
+    edit to the tests could satisfy. Reconstructing the name from
+    `ancestorTitles + title` is the only form that agrees with collection;
+    `fullName` is the fallback for a report that omits the parts.
+    """
+    ancestors = case.get("ancestorTitles")
+    title = case.get("title")
+    if isinstance(ancestors, list) and isinstance(title, str) and title:
+        parts = [part for part in ancestors if isinstance(part, str) and part]
+        return " > ".join(parts + [title])
+    full = case.get("fullName") or title or ""
+    return full if isinstance(full, str) else ""
+
+
 def parse_vitest_report(output: str) -> Tuple[Tuple[CaseOutcome, ...], bool]:
     """Per-case outcomes from `vitest run --reporter=json`.
 
     Returns the outcomes and whether a report was parsed at all, so a run that
     produced no JSON is `collection_failed` rather than a green empty set.
+
+    Case ids are built to agree with `parse_vitest_list`; see
+    `_vitest_case_name` for why `fullName` is not that shape.
     """
     payload = _first_json(output)
     if not isinstance(payload, dict):
@@ -918,7 +947,7 @@ def parse_vitest_report(output: str) -> Tuple[Tuple[CaseOutcome, ...], bool]:
         for case in cases:
             if not isinstance(case, dict):
                 continue
-            title = case.get("fullName") or case.get("title") or ""
+            title = _vitest_case_name(case)
             status = {"passed": "passed", "failed": "failed",
                       "skipped": "skipped", "pending": "skipped",
                       "todo": "skipped"}.get(str(case.get("status")), "errored")
