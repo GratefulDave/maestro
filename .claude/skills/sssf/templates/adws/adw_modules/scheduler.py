@@ -404,6 +404,22 @@ class SchedulerDeps:
     kill_attempt: Optional[Callable[..., None]] = None
     #: Provision runs after worktree creation and before pre-gate/baseline.
     provision: Optional[Callable[[Path], None]] = None
+    #: `(node_id, attempt_no, phase, detail) -> None`. Display only.
+    #:
+    #: Everything between claiming an attempt and opening its pane is silent
+    #: work that takes minutes: provisioning a tree, running the pre-gate,
+    #: walking the baseline. An operator watching a terminal cannot tell that
+    #: window from a hang, and on
+    #: `run-9d03105407f440079f3730f1fe4c67b3` two attempts were killed by hand
+    #: inside it before a fault in the pre-gate was found that really did hang
+    #: there -- the same silence covering both.
+    #:
+    #: This is a reporter and never an input: §1.2 forbids a lifecycle
+    #: transition keyed on anything but a typed record, and nothing the
+    #: scheduler decides reads it back. `_say` swallows whatever it raises for
+    #: the same reason -- a terminal that cannot print must not fail an
+    #: attempt.
+    progress: Optional[Callable[[str, int, str, Mapping[str, object]], None]] = None
     #: The code-review stage (§7.3's review-node predicate). Runs after an
     #: attempt's own verification passes and before `mark_verified`, so a diff
     #: no model has read cannot reach the merge frontier.
@@ -1375,6 +1391,23 @@ class Scheduler:
         with self._lock:
             return self._attempt_dispatch.get((record.node_id, record.attempt_no), True)
 
+    def _say(self, node_id: str, attempt_no: int, phase: str,
+             **detail: object) -> None:
+        """Report one pre-dispatch phase to whoever is watching. Never fails.
+
+        The exception swallow is deliberate and narrow: this is the only call
+        in an attempt whose whole purpose is to be seen, so a broken terminal,
+        a closed pipe, or a reporter someone wired wrong must not take the
+        attempt with it. Nothing downstream reads what is printed here.
+        """
+        reporter = self.deps.progress
+        if reporter is None:
+            return
+        try:
+            reporter(node_id, attempt_no, phase, dict(detail))
+        except Exception:  # noqa: BLE001 - display must never fail an attempt
+            pass
+
     def _quiesce(
         self,
         record: st.AttemptRecord,
@@ -2311,14 +2344,25 @@ class Scheduler:
         pre_verdict = None
         try:
             if self.deps.provision is not None:
+                self._say(node.node_id, attempt_no, "provisioning",
+                          worktree=str(attempt.path))
+                provision_started = time.monotonic()
                 self.deps.provision(attempt.path)
+                self._say(node.node_id, attempt_no, "provisioned",
+                          seconds=round(time.monotonic() - provision_started, 1))
             # A slow provision may finish after a watchdog revoked this
             # generation. Its return is a fence: no stale worker reaches a
             # gate, runner, inventory, or commit.
             self._require_running(record)
             if node.kind is st.NodeKind.AGENT:
                 self._require_running(record)
+                self._say(node.node_id, attempt_no, "pre-gate",
+                          command=" ".join(node.gate_command))
+                gate_started = time.monotonic()
                 pre = self.deps.run_gate(attempt, node, "pre", self._cancelled.is_set)
+                self._say(node.node_id, attempt_no, "pre-gate-done",
+                          exit_code=pre.exit_code,
+                          seconds=round(time.monotonic() - gate_started, 1))
                 # A selector path this node is declared to produce, absent
                 # at its base, is the red clause 2 asks for -- not a broken
                 # runner. Asked per path, because the runner refuses to
@@ -2358,7 +2402,12 @@ class Scheduler:
             )
             return
 
+        self._say(node.node_id, attempt_no, "baseline")
+        baseline_started = time.monotonic()
         baseline = wt.take_baseline(attempt)
+        self._say(node.node_id, attempt_no, "baseline-done",
+                  paths=len(baseline),
+                  seconds=round(time.monotonic() - baseline_started, 1))
         # The bracket's before-side, written down while it still exists.
         # `take_baseline` walks the *provisioned* tree, which includes paths
         # git does not track and no commit holds. Once this process is gone
@@ -2414,6 +2463,7 @@ class Scheduler:
             # raises still leaves whatever it created behind, and the quiescer
             # must go on demanding a measured absence for it.
             self._attempt_dispatch[(record.node_id, record.attempt_no)] = True
+        self._say(node.node_id, record.attempt_no, "launching")
         guidance = rp.render_guidance(
             node, self._guidance.get(record.guidance_key), repair=basis
         )

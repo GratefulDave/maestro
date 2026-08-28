@@ -1161,6 +1161,9 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 _RUN_LEDGER_COMMANDS = (
     "status",
     "list",
+    # A read by default; `--prune` removes checkouts and never a branch, so
+    # nothing here needs key material or a receipt.
+    "worktrees",
     "pause",
     "cancel",
     "convergence",
@@ -5369,6 +5372,51 @@ class _RunProgress:
             )
 
 
+#: How each pre-dispatch phase is announced: its verb, and whether the line is
+#: the start of something slow or the end of it. Phases the scheduler emits and
+#: this table does not name print in a neutral form rather than vanishing --
+#: a reporter that silently drops an unknown phase is how B15's dead field
+#: happens, one release after someone adds one.
+_ATTEMPT_PHASES: Dict[str, str] = {
+    "provisioning": "provisioning the worktree",
+    "provisioned": "worktree provisioned",
+    "pre-gate": "running the pre-gate",
+    "pre-gate-done": "pre-gate finished",
+    "baseline": "measuring the baseline",
+    "baseline-done": "baseline measured",
+    "launching": "opening the agent pane",
+}
+
+
+def _attempt_progress_reporter(
+    console: "RichConsole",
+) -> Callable[[str, int, str, Mapping[str, object]], None]:
+    """A display-only reporter over one run's pre-dispatch phases.
+
+    Written as a closure over the console the run already prints through, so
+    the phase lines interleave with the preflight lines in one stream rather
+    than arriving on a second surface an operator has to know to watch.
+    """
+
+    def report(node_id: str, attempt_no: int, phase: str,
+               detail: Mapping[str, object]) -> None:
+        said = _ATTEMPT_PHASES.get(phase, phase)
+        extra = " ".join(
+            "{0}={1}".format(key, value) for key, value in sorted(detail.items())
+        )
+        console.print(
+            "[dim]{0}[/dim] [bold]{1}[/bold] [dim]a{2}[/dim] · {3}{4}".format(
+                time.strftime("%H:%M:%S"),
+                rich_escape(node_id),
+                attempt_no,
+                rich_escape(said),
+                " [dim]{0}[/dim]".format(rich_escape(extra)) if extra else "",
+            )
+        )
+
+    return report
+
+
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     worktree.bind_lane_concurrency(getattr(args, "concurrency", None))
     action = "resume" if resuming else "start"
@@ -5397,6 +5445,22 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         _refuse_cross_run_node_budget(args, plan)
         _validate_run_paths(args, plan)
         run_console.print("[green]✓[/green] paths and cross-run budgets validated")
+        # Said before the run takes the terminal, because leftovers from the
+        # previous attempt of this same run are exactly what an operator can
+        # act on now and will never look for later. Never removed here: §8.8
+        # retains a blocked node's checkout for post-mortem on purpose, and a
+        # start that quietly deleted one would take the evidence with it.
+        try:
+            _report_stale_worktrees(run_console, _stale_worktrees_at(args))
+        except Exception as exc:  # noqa: BLE001 - never stop a run over a report
+            # Said rather than swallowed. A guard that fails silently turns a
+            # broken report into a feature nobody knows stopped working, which
+            # is the same absence of a reader B15 refuses elsewhere.
+            run_console.print(
+                "[dim]stale-worktree report unavailable: {0}[/dim]".format(
+                    rich_escape(str(exc))
+                )
+            )
         run_console.print("[dim]preflight · resolving declared runners[/dim]")
         # A run precondition, in the same family as the integration branch already
         # being checked out: decided before the scheduler exists, so an unusable
@@ -6690,6 +6754,12 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # the ecosystem's missing install rather than for the node's
                 # missing work.
                 provision=_run_provisioner(args, route_runner),
+                # Everything between claiming an attempt and opening its pane
+                # is silent minutes of work. An operator cannot tell that
+                # window from a hang, and on this project has twice killed a
+                # healthy run inside it -- and once failed to notice a real
+                # one. Display only; nothing reads it back (§1.2).
+                progress=_attempt_progress_reporter(run_console),
                 kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
                 review_attempt=review_attempt,
                 continue_node=continue_node,
@@ -7619,6 +7689,226 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         )
         lines.append("    {}".format(json.dumps(row["payload"], sort_keys=True)))
     return "\n".join(lines)
+
+
+def _human_bytes(count: int) -> str:
+    """A size an operator reads at a glance. Base 1024, one decimal."""
+    size = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return "{0:.1f}{1}".format(size, unit) if unit != "B" else "{0:.0f}B".format(size)
+        size /= 1024.0
+    return "{0:.1f}TB".format(size)
+
+
+def _stale_worktrees_for(args: argparse.Namespace, reader: Any,
+                         measure: bool = True) -> Tuple[Any, ...]:
+    """This run's leftover attempt checkouts, read against the ledger."""
+    live = {
+        (record.node_id, record.attempt_no): record.state.value
+        for record in reader.attempts(args.run_id)
+    }
+    return worktree.stale_attempt_worktrees(
+        Path(args.worktrees_root), args.run_id, live, measure=measure
+    )
+
+
+def _report_stale_worktrees(console: "RichConsole",
+                            stale: Sequence[Any]) -> None:
+    """Say what is on disk and how to get it back. Never removes anything.
+
+    Printed at run start and resume because that is when an operator is
+    already looking at this run, and because the alternative -- removing them
+    silently -- would take the post-mortem §8.8 deliberately retains for a
+    blocked node.
+    """
+    if not stale:
+        return
+    total = sum(item.bytes_on_disk for item in stale)
+    console.print(
+        "[yellow]![/yellow] {0} stale attempt worktree(s) holding "
+        "[bold]{1}[/bold]".format(len(stale), _human_bytes(total))
+    )
+    for item in stale:
+        console.print(
+            "  [dim]{0} a{1} {2} · {3}[/dim]".format(
+                rich_escape(item.node_id),
+                item.attempt_no,
+                _human_bytes(item.bytes_on_disk),
+                rich_escape(item.attempt_state or "no ledger row"),
+            )
+        )
+    console.print(
+        "  [dim]remove them with `maestro run worktrees <run> --prune` "
+        "(branches are kept)[/dim]"
+    )
+
+
+def _stale_worktrees_at(args: argparse.Namespace) -> Tuple[Any, ...]:
+    """This run's leftovers, read with a reader this function owns.
+
+    `_execute_run` holds a writer over the same ledger and opens it later; a
+    short-lived read-only reader here keeps the report out of that lifetime.
+    """
+    reader = _open_reader(args.db)
+    try:
+        return _stale_worktrees_for(args, reader)
+    finally:
+        reader.close()
+
+
+#: A blocked attempt's checkout is retained on purpose (§8.8): it is the
+#: post-mortem for a node that failed, and it is the one leftover whose
+#: removal costs evidence rather than only disk. Listed like any other so the
+#: operator sees the space, never pruned unless they say so by name.
+_RETAINED_FOR_POST_MORTEM = frozenset({"BLOCKED"})
+
+
+def _prunable(item: Any, include_blocked: bool) -> bool:
+    return include_blocked or item.attempt_state not in _RETAINED_FOR_POST_MORTEM
+
+
+def _run_worktrees_across_runs(args: argparse.Namespace, reader: Any) -> int:
+    """Every run's leftovers in one listing, and with `--prune`, released.
+
+    A run's own live attempt is still excluded, per run, by the same ledger
+    read the single-run path uses: this widens which runs are asked about and
+    changes nothing about what counts as stale.
+    """
+    state = getattr(args, "repository_state", None)
+    if not state:
+        return _refusal(
+            "RUN_CONFIGURATION_REQUIRED",
+            "--all-runs needs a configured installation to locate each run's "
+            "worktree root",
+        )
+    runs_root = Path(state) / "runs"
+    rows: List[Dict[str, Any]] = []
+    released: List[Dict[str, Any]] = []
+    for record in reader.runs():
+        scoped = argparse.Namespace(
+            run_id=record.run_id,
+            worktrees_root=str(runs_root / record.run_id / "worktrees"),
+        )
+        for item in _stale_worktrees_for(scoped, reader):
+            rows.append({
+                "run_id": record.run_id,
+                "path": str(item.path),
+                "node_id": item.node_id,
+                "attempt_no": item.attempt_no,
+                "attempt_state": item.attempt_state or None,
+                "bytes_on_disk": item.bytes_on_disk,
+            })
+            if getattr(args, "prune", False) and _prunable(
+                item, getattr(args, "include_blocked", False)
+            ):
+                ok, detail = worktree.release_stale_worktree(
+                    Path(args.repo), item, force=getattr(args, "force", False)
+                )
+                released.append({
+                    "run_id": record.run_id,
+                    "path": str(item.path),
+                    "released": ok,
+                    "bytes_reclaimed": item.bytes_on_disk if ok else 0,
+                    "detail": detail,
+                })
+    if released:
+        subprocess.run(
+            ("git", "-C", str(args.repo), "worktree", "prune"),
+            capture_output=True, text=True, check=False,
+        )
+    print(json.dumps({
+        "outcome": "RUN_WORKTREES",
+        "run_id": None,
+        "stale": rows,
+        "bytes_on_disk": sum(row["bytes_on_disk"] for row in rows),
+        "released": released,
+        "bytes_reclaimed": sum(entry["bytes_reclaimed"] for entry in released),
+    }, sort_keys=True))
+    return 0
+
+
+def _run_worktrees(args: argparse.Namespace) -> int:
+    """List this run's attempt checkouts, and with `--prune` release the stale.
+
+    A separate verb rather than a flag on `run cancel`, because the disk is
+    reclaimable long before a run is over: the seven leftovers that prompted
+    this belonged to a run still executing its eighth attempt.
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        if getattr(args, "all_runs", False):
+            # Leftovers outlive the run that made them, so a verb that can
+            # only be asked about one run at a time makes the operator know
+            # every run id before they can reclaim anything -- which is the
+            # same as not being able to.
+            return _run_worktrees_across_runs(args, reader)
+        record = _select_run(reader, args)
+        args.run_id = record.run_id
+        # Derived here rather than bound by `_bind_run_ledger_configuration`,
+        # because the run root is a function of the run id and the id is not
+        # known until the selector above resolves. An explicitly supplied
+        # `--worktrees-root` still wins, the same way it does on salvage.
+        if not getattr(args, "worktrees_root", None):
+            state = getattr(args, "repository_state", None)
+            if not state:
+                return _refusal(
+                    "RUN_CONFIGURATION_REQUIRED",
+                    "--worktrees-root is required outside a configured "
+                    "installation, where the run root is derived from "
+                    "maestro.config.yaml",
+                )
+            args.worktrees_root = str(
+                Path(state) / "runs" / record.run_id / "worktrees"
+            )
+        stale = _stale_worktrees_for(args, reader)
+    finally:
+        reader.close()
+    rows = [
+        {
+            "path": str(item.path),
+            "node_id": item.node_id,
+            "attempt_no": item.attempt_no,
+            "attempt_state": item.attempt_state or None,
+            "bytes_on_disk": item.bytes_on_disk,
+        }
+        for item in stale
+    ]
+    released: List[Dict[str, Any]] = []
+    if getattr(args, "prune", False):
+        if not getattr(args, "repo", None):
+            return _refusal(
+                "RUN_CONFIGURATION_REQUIRED",
+                "--repo is required to release a checkout: the removal is "
+                "`git worktree remove` run against the repository that owns it",
+            )
+        for item in stale:
+            if not _prunable(item, getattr(args, "include_blocked", False)):
+                continue
+            ok, detail = worktree.release_stale_worktree(
+                Path(args.repo), item, force=getattr(args, "force", False)
+            )
+            released.append({
+                "path": str(item.path),
+                "released": ok,
+                "bytes_reclaimed": item.bytes_on_disk if ok else 0,
+                "detail": detail,
+            })
+        subprocess.run(
+            ("git", "-C", str(args.repo), "worktree", "prune"),
+            capture_output=True, text=True, check=False,
+        )
+    print(json.dumps({
+        "outcome": "RUN_WORKTREES",
+        "run_id": args.run_id,
+        "stale": rows,
+        "bytes_on_disk": sum(item.bytes_on_disk for item in stale),
+        "released": released,
+        "bytes_reclaimed": sum(entry["bytes_reclaimed"] for entry in released),
+    }, sort_keys=True))
+    return 0
 
 
 def _run_status(args: argparse.Namespace) -> int:
@@ -10361,6 +10651,38 @@ def build_parser() -> argparse.ArgumentParser:
     # Amendment takes the *amended* plan by name in the positional, so the
     # ordinary plan-resolution path binds it, and names the run it applies to
     # with a flag. Resume is the mirror image and deliberately stays bare.
+    worktrees_cmd = run_sub.add_parser("worktrees")
+    worktrees_cmd.add_argument("selector", metavar="PLAN_OR_RUN_ID", nargs="?")
+    worktrees_cmd.add_argument("--run-id")
+    worktrees_cmd.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="every run in the ledger, not just one; leftovers outlive the "
+             "run that made them",
+    )
+    # Both derived from `maestro.config.yaml` on a configured installation and
+    # required only outside one, which is the rule salvage follows.
+    worktrees_cmd.add_argument("--worktrees-root")
+    worktrees_cmd.add_argument("--repo")
+    worktrees_cmd.add_argument(
+        "--prune",
+        action="store_true",
+        help="remove the stale checkouts; their branches are kept",
+    )
+    worktrees_cmd.add_argument(
+        "--include-blocked",
+        action="store_true",
+        help="also prune a BLOCKED attempt's checkout, which §8.8 retains as "
+             "the post-mortem for a node that failed",
+    )
+    worktrees_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help="pass --force to `git worktree remove`, discarding uncommitted "
+             "content in a checkout git refuses to release",
+    )
+    _add_db(worktrees_cmd)
+    worktrees_cmd.set_defaults(handler=_run_worktrees)
     amend = run_sub.add_parser("amend")
     _add_run_execution_options(amend)
     amend.add_argument("plan_name")

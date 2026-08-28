@@ -2148,6 +2148,110 @@ def acceptance_specs(nodes: Iterable[NodeRecord]) -> Tuple[str, ...]:
     return tuple(sorted({spec for node in merged for spec in node.specs}))
 
 
+@dataclass(frozen=True)
+class StaleWorktree:
+    """One attempt checkout on disk whose attempt is no longer running.
+
+    `bytes_on_disk` is the reason this type exists. An attempt worktree of a
+    JavaScript project is a full `node_modules` -- 831MB on the run that
+    prompted this -- and a run that retried seven times left seven of them.
+    Nothing removed them, nothing counted them, and nothing told the operator
+    they were there; the disk simply filled while the console reported
+    progress.
+    """
+
+    path: Path
+    node_id: str
+    attempt_no: int
+    attempt_state: str
+    bytes_on_disk: int
+
+
+def _tree_bytes(path: Path) -> int:
+    """Apparent size of a directory tree, symlinks counted as their own size.
+
+    `os.walk` rather than `du`: this runs on the operator's own machine in a
+    verb whose whole output is a number, and shelling out for it would make
+    the number depend on which `du` is installed.
+    """
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _exc: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def stale_attempt_worktrees(
+    worktrees_root: Path,
+    run_id: str,
+    live: Mapping[Tuple[str, int], str],
+    measure: bool = True,
+) -> Tuple[StaleWorktree, ...]:
+    """Every checkout under `worktrees_root` whose attempt is not RUNNING.
+
+    `live` maps `(node_id, attempt_no)` to the attempt's recorded state, and is
+    the caller's read of the ledger rather than this function's: the ledger is
+    the authority on whether an attempt is still running, and a directory's
+    mtime is not. A directory with no ledger row at all is reported with an
+    empty state -- it is on disk, it is nobody's live attempt, and omitting it
+    would hide exactly the leftovers this exists to find.
+
+    Nothing is removed here. Deciding is the caller's, and the operator's.
+    """
+    root = Path(worktrees_root)
+    if not root.is_dir():
+        return ()
+    found: List[StaleWorktree] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not name.startswith(run_id + "-"):
+            continue
+        remainder = name[len(run_id) + 1:]
+        node_id, _, attempt = remainder.rpartition("-a")
+        if not node_id or not attempt.isdigit():
+            continue
+        attempt_no = int(attempt)
+        state = live.get((node_id, attempt_no), "")
+        if state == "RUNNING":
+            continue
+        found.append(StaleWorktree(
+            path=entry,
+            node_id=node_id,
+            attempt_no=attempt_no,
+            attempt_state=state,
+            bytes_on_disk=_tree_bytes(entry) if measure else 0,
+        ))
+    return tuple(found)
+
+
+def release_stale_worktree(repo: Path, stale: StaleWorktree,
+                           force: bool = False) -> Tuple[bool, str]:
+    """Remove one stale checkout, keeping its branch. `(released, detail)`.
+
+    The branch is deliberately left behind, and that is the whole difference
+    between this and `remove_attempt_worktree` above. A cancelled attempt's
+    branch may hold the only copy of work nobody merged, and it costs a ref;
+    the checkout costs a `node_modules`. Freeing the disk does not require
+    destroying the history, so this frees the disk and nothing else.
+
+    Unforced by default for the reason stated on `remove_attempt_worktree`: a
+    checkout that will not come away cleanly is evidence, and git's refusal is
+    surfaced rather than overridden. `--force` is the operator's to type.
+    """
+    argv = ["git", "-C", str(repo), "worktree", "remove", str(stale.path)]
+    if force:
+        argv.insert(-1, "--force")
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return True, ""
+    return False, (result.stderr or result.stdout or "").strip()
+
+
 def remove_attempt_worktree(
     attempt: AttemptWorktree,
     ancestry_proven: bool,
