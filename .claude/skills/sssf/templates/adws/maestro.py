@@ -6082,6 +6082,41 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     handles.pop(key)
                     proven_absent.add(key)
 
+            def mark_repair_launched(node, record, handle, dispatch):
+                """Re-point the attempt row at the pane that will repair it.
+
+                `attempts.extra` is written once per attempt, at first
+                launch, and a repair opens a *new* pane inside that same
+                attempt. Without this the row keeps naming the rejected
+                actor's transcript, pid, and start epoch for the rest of the
+                attempt: §7.6's transcript signal reads the wrong pane and
+                `attempt_liveness` measures a process that was cancelled,
+                over exactly the round -- rejected, repaired, merged -- that
+                anyone goes back to read. It is silent, because the stale
+                path still resolves and a transcript is still there.
+
+                The same `store.mark_launched` the first attempt calls, with
+                the replacement's identity in place of the original's.
+                `launched_at` is deliberately left to stamp now: it is what
+                arms those two signals, and the instant they became
+                measurable again is this launch, not the rejected one.
+                """
+                liveness_pid = handle.process_group
+                if liveness_pid is None:
+                    liveness_pid = handle.liveness_pid
+                store.mark_launched(
+                    args.run_id,
+                    node.node_id,
+                    record.attempt_no,
+                    liveness_pid,
+                    extra=_launch_attempt_extra(
+                        str(handle.transcript_path),
+                        vendor=dispatch.vendor,
+                        model=dispatch.model,
+                        route=dispatch.route,
+                    ),
+                )
+
             def continue_tests_node(
                 attempt,
                 node,
@@ -6218,6 +6253,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                         handle, finalization_window.time.monotonic() + 5.0
                     )
                     raise
+                mark_repair_launched(node, record, handle, dispatch)
                 with handles_lock:
                     # Tracked for quiescence, and deliberately *not* placed in
                     # `builder_handles`: a tester is not a retained session, so
@@ -6481,6 +6517,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     session = recovered.session
                     builder_generation = generation
                     mark_handoff_submitted(generation)
+                    mark_repair_launched(
+                        node, record, replacement, replacement_dispatch
+                    )
                     with handles_lock:
                         handles[key] = replacement
                         builder_handles[node.node_id] = replacement
