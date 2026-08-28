@@ -2843,6 +2843,14 @@ class Scheduler:
                 current_head = wt.resolve_commit(attempt.path, "HEAD")
                 if current_head != attempt.base:
                     output_sha = wt.sealed_descendant_tip(attempt, attempt.base)
+                    # Adopting a tip skips commit_measured_delta, and with it
+                    # §8.4's staging assertion; check_post_commit then compares
+                    # the working tree, never the sealed commit's tree. Assert
+                    # the adopted tree against the measured after-state here or
+                    # nothing does.
+                    wt.assert_tip_matches_measured(
+                        attempt, output_sha, measured, after
+                    )
                 else:
                     output_sha = wt.commit_measured_delta(
                         attempt,

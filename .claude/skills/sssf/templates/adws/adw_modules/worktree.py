@@ -1268,6 +1268,63 @@ def recover_sealed_descendant(
     return baseline, tip
 
 
+def _assert_carries_measured(
+    entries: Inventory,
+    measured: InventoryDelta,
+    after: Inventory,
+    what: str,
+    why: str,
+) -> None:
+    """§8.4's staging assertion over one git-side view of the delta paths.
+
+    `entries` is a second, independent measurement of the same paths — git's
+    own, taken either from the private index at staging time or from the tree
+    of a commit the harness is about to publish. Either way the question is the
+    same one: does the git state that will become the node's output carry
+    exactly what the after-inventory measured? A path that differs, or a
+    measured deletion that survived, means the output and the measurement are
+    about two different trees, which is what `StagingMismatch` names.
+    """
+    for rel in measured.added + measured.changed:
+        if entries.get(rel) != after.get(rel):
+            raise StagingMismatch(
+                f"{rel} {what} as {entries.get(rel)} but measured as "
+                f"{after.get(rel)} — {why}"
+            )
+    for rel in measured.removed:
+        if rel in entries:
+            raise StagingMismatch(
+                f"{rel} was measured as deleted but is still {what} — {why}"
+            )
+
+
+def assert_tip_matches_measured(
+    attempt: AttemptWorktree, tip: str, measured: InventoryDelta, after: Inventory
+) -> None:
+    """The adopted commit's tree must hold what the harness measured (§8.4).
+
+    A builder-authored tip is adopted rather than built by
+    `commit_measured_delta`, so it never crosses that function's staging
+    assertion, and `check_post_commit` compares the *working tree* against the
+    expected inventory rather than the sealed commit's tree. Without this, a
+    builder that commits one version of a path and then leaves a different
+    version uncommitted publishes a candidate whose bytes no harness
+    measurement ever saw: every inventory check passes on the working tree
+    while the merge consumes the commit.
+
+    The assertion is `commit_measured_delta`'s own, read from the tip's tree
+    instead of the private index, and it raises the same `StagingMismatch` —
+    ENVIRONMENTAL, because it is a write in a window where nothing may write.
+    """
+    _assert_carries_measured(
+        inventory_at_commit(attempt.repo, tip),
+        measured,
+        after,
+        f"committed in {tip[:10]}",
+        f"the adopted commit {tip[:10]} does not carry the measured tree",
+    )
+
+
 def commit_measured_delta(
     attempt: AttemptWorktree, measured: InventoryDelta, after: Inventory, message: str
 ) -> str:
@@ -1322,18 +1379,13 @@ def commit_measured_delta(
         # same paths, taken by git at staging time, must equal the tuples the
         # after-inventory measured. A write inside the window where nothing may
         # write surfaces here instead of passing silently into the commit.
-        staged = _index_entries(attempt, env)
-        for rel in measured.added + measured.changed:
-            if staged.get(rel) != after.get(rel):
-                raise StagingMismatch(
-                    f"{rel} staged as {staged.get(rel)} but measured as {after.get(rel)} — "
-                    "something wrote to the tree between the after-inventory and staging"
-                )
-        for rel in measured.removed:
-            if rel in staged:
-                raise StagingMismatch(
-                    f"{rel} was measured as deleted but is still staged"
-                )
+        _assert_carries_measured(
+            _index_entries(attempt, env),
+            measured,
+            after,
+            "staged",
+            "something wrote to the tree between the after-inventory and staging",
+        )
 
         tree = _out(attempt.path, "write-tree", env=env)
         output_sha = _out(

@@ -199,3 +199,53 @@ class RepairEnvironmentalBudgetTests(SchedulerFixture):
             builder_shas,
         )
 
+    def test_an_adopted_tip_that_does_not_carry_the_measured_tree_is_refused(self):
+        """The adopted commit must hold what the harness measured.
+
+        A tip is adopted rather than built by commit_measured_delta, so it
+        never crosses §8.4's staging assertion, and check_post_commit compares
+        the working tree rather than the sealed commit's tree. A builder that
+        commits one version of a path and then leaves a different version
+        uncommitted would otherwise publish a candidate whose bytes no harness
+        measurement ever saw.
+        """
+
+        def continue_node(
+            attempt,
+            node,
+            record,
+            prompt,
+            rejected_sha,
+            builder_generation,
+            cancel_requested,
+        ):
+            self._builder_commit(
+                attempt, "COMMITTED VERSION\n", "test(seo): repair descendant"
+            )
+            (attempt.path / "a.py").write_text("WORKTREE VERSION\n")
+            return sch.RepairExecution(
+                execution=sch.NodeExecution(envelope_parsed=True, exit_code=0),
+                acknowledged_rejected_sha=rejected_sha,
+                builder_generation=builder_generation,
+            )
+
+        self._drive(
+            self._deps([_reject(1)], continue_node),
+            config=self.config(environmental_retries=0),
+        )
+
+        candidates = self.store.lane_candidates("run1", "a")
+        self.assertEqual(
+            [c.candidate_sha for c in candidates[1:]],
+            [],
+            "a commit whose tree differs from the measured after-state must "
+            "not be published as a candidate",
+        )
+        self.assertEqual(len(self.reviewed), 1)
+        node = self.store.get_node("run1", "a")
+        self.assertIs(
+            node.block_reason, st.BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED
+        )
+        env_spends = self._env_spends()
+        self.assertEqual(len(env_spends), 1)
+        self.assertIn("StagingMismatch", str(env_spends[0].detail))
