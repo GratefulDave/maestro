@@ -5255,6 +5255,20 @@ class LifecycleStore:
         ).fetchone()
         return None if row is None else (str(row[0]), bytes(row[1]))
 
+    @serialized
+    def plan_versions(
+        self, run_id: str
+    ) -> Tuple[Tuple[int, str, bytes], ...]:
+        """The retained plan lineage, oldest first. Empty for a pre-retention run."""
+        rows = self.conn.execute(
+            "SELECT seq, plan_digest, plan_bytes FROM run_plan_versions"
+            " WHERE run_id=? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        return tuple(
+            (int(seq), str(digest), bytes(body)) for seq, digest, body in rows
+        )
+
     #: States whose `dag_nodes` row an amendment may never rewrite. MERGED and
     #: ACCEPTED carry evidence measured against the spec in that row; RUNNING
     #: has a live attempt launched against it.
@@ -5457,6 +5471,11 @@ class LifecycleStore:
         if row is None:
             raise LifecycleError("no run row for {0}".format(run_id))
         return int(row[0] or 0)
+
+    @serialized
+    def review_refresh_count(self, run_id: str) -> int:
+        """Public reader for callers outside `resume_run`'s transaction."""
+        return self._review_refresh_count(run_id)
 
     @serialized
     def retry_spend_floor(self, run_id: str, node_id: str) -> int:

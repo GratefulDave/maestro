@@ -203,6 +203,24 @@ ALLOWED: Dict[str, str] = {
     # with that lane; `launcher_failure` itself is already wired.
     "FailureSignal.binary_resolved": "DEFERRED: launcher-classification lane",
     "FailureSignal.process_started": "DEFERRED: launcher-classification lane",
+    "lifecycle.plan_versions": "public reader over run_plan_versions; "
+    "production writes via record_plan_version "
+    "and reads current_plan",
+    "lifecycle.review_refresh_count": "public reader; resume_run calls "
+    "_review_refresh_count inside its "
+    "transaction to avoid deadlock",
+    "ValidationConfig.review_payload_budget_bytes": "DEFERRED: plan_validate "
+    "reader; config writer not yet wired",
+    "coordinator_store.audit_transitions": "DEFERRED: diagnostics reader, tests only",
+    "coordinator_store.list_runs": "DEFERRED: diagnostics reader, tests only",
+    "finalization.graded_cells": "DEFERRED: test accessor over graded cells",
+    "finalization_window.opened_at_monotonic": "DEFERRED: test accessor",
+    "finalization_window.require_fresh_session_dir": "DEFERRED: test helper",
+    "gate_capture.scan_delta": "DEFERRED: detector/test helper",
+    "plan_model.registered_versions": "DEFERRED: schema table accessor, tests only",
+    "scheduler_types.exits_for": "DEFERRED: property table accessor, tests only",
+    "scheduler_types.pane_limit": "DEFERRED: property table accessor, tests only",
+    "scheduler_types.to_record": "DEFERRED: test helper over PlanNode",
 }
 
 #: Production dataclass names defined in more than one module, each with the
