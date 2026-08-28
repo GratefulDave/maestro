@@ -946,11 +946,17 @@ class Scheduler:
         #: as "absence unproven" and blocks the node terminally, burying the
         #: verdict the attempt had actually reached.
         #:
-        #: Deliberately **not** consulted by `pre-baseline`, `cancel`,
-        #: `watchdog`, or the watchdog's kill. Those meet an attempt whose
-        #: provision or pre-gate subprocess may be alive right now — §7.6's
-        #: window opens before the worktree exists — and a live harness process
-        #: is exactly what those proofs are for, dispatched or not.
+        #: Consulted by the watchdog's kill and by `fail`'s `watchdog`
+        #: quiesce. An attempt this scheduler leased and has not entered
+        #: `run_node` opened no pane and no agent process group. Asking the
+        #: runtime quiescer anyway raises `PROCESS_GROUP_UNTRACKED` and the
+        #: contain path turns a retryable NODE_TIMEOUT into terminal
+        #: `QUIESCENCE_UNPROVEN` (lane-wp6-build#1,
+        #: run-9d03105407f440079f3730f1fe4c67b3). Provision bounds itself at
+        #: 600s; node gates (pre/post/falsify) at `NODE_GATE_TIMEOUT_S` (600s)
+        #: via `run_harness_process`, which reaps the group on timeout. They
+        #: are not this map. `pre-baseline` and `cancel` still demand their
+        #: own proofs.
         #:
         #: A key absent from this map is an attempt **this scheduler did not
         #: lease** — an inherited RUNNING row from another process, whose owned
@@ -1808,6 +1814,8 @@ class Scheduler:
             self._fence_watchdog_generation(attempt)
             if self.deps.kill_attempt is None:
                 return
+            if not self._attempt_dispatched(attempt):
+                return
             try:
                 self.deps.kill_attempt(attempt)
             except BaseException as exc:
@@ -1839,7 +1847,8 @@ class Scheduler:
             if node is None:
                 return
             try:
-                self._quiesce(attempt, "watchdog")
+                if self._attempt_dispatched(attempt):
+                    self._quiesce(attempt, "watchdog")
             except QuiescenceFailure as exc:
                 self._contain_quiescence_failure(
                     node, attempt, exc, allow_watchdog_fence=True

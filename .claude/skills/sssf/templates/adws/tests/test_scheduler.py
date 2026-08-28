@@ -1186,23 +1186,29 @@ class QuiescenceTests(SchedulerFixture):
         self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
 
     def test_watchdog_kill_exception_blocks_that_generation_without_retry(self):
-        """A failed kill is unproven quiescence, not a swallowed watchdog error."""
-        kill_called = threading.Event()
-        watchdog_quiesced = threading.Event()
+        """A failed kill is unproven quiescence, not a swallowed watchdog error.
 
-        def provision(_path):
-            # The watchdog reads the injected clock. Jump past the 0.01s
-            # node timeout; do not wait it out on the machine.
+        The worker has entered `run_node`, so the attempt is dispatched. A
+        kill failure there is about owned execution. The never-dispatched
+        neighbour is `test_a_watchdog_timeout_before_dispatch_retries_an_untracked_kill`.
+        """
+        kill_called = threading.Event()
+
+        def runner(attempt, node, record, retry_prompt, on_launch, cancel_requested):
+            del attempt, node, retry_prompt, on_launch, cancel_requested
             self.expire_running_attempts(1.0)
-            self.assertTrue(watchdog_quiesced.wait(ARRIVAL_TIMEOUT_S))
+            deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
+            while time.monotonic() < deadline:
+                if kill_called.is_set():
+                    break
+                if self.store.get_node("run1", "a").state is st.NodeState.BLOCKED:
+                    break
+                time.sleep(0.01)
+            return sch.NodeExecution()
 
         def kill_attempt(_record):
             kill_called.set()
             raise RuntimeError("launcher kill failed")
-
-        def quiesce(_record, phase):
-            if phase == "watchdog":
-                watchdog_quiesced.set()
 
         report = self.schedule(
             [self.agent("a")],
@@ -1213,9 +1219,7 @@ class QuiescenceTests(SchedulerFixture):
                 backstop_t_s=5.0,
                 environmental_retries=3,
             ),
-            deps=self.deps(
-                provision=provision, kill_attempt=kill_attempt, quiesce_attempt=quiesce
-            ),
+            deps=self.deps(kill_attempt=kill_attempt, run_node=runner),
         ).run()
 
         node = self.store.get_node("run1", "a")
@@ -1337,6 +1341,84 @@ class GenerationFenceTests(SchedulerFixture):
         # Three gate runs on the surviving attempt and none on the convicted
         # one: pre, post, and §7.4's post-work falsify.
         self.assertEqual(gate_attempts, [2, 2, 2])
+        self.assertEqual(runner_attempts, [2])
+        self.assertIs(
+            self.store.get_attempt("run1", "a", 1).retry_class,
+            st.RetryClass.ENVIRONMENTAL,
+        )
+        self.assertIs(report.outcome, st.RunOutcome.ACCEPTED)
+
+    def test_a_watchdog_timeout_before_dispatch_retries_an_untracked_kill(self):
+        """NODE_TIMEOUT during provision must not become QUIESCENCE_UNPROVEN.
+
+        Production `kill_attempt` is `quiesce_attempt(record, "watchdog-kill")`.
+        Before `run_node` the handle map is empty, so that call raises
+        `PROCESS_GROUP_UNTRACKED` about a group that never existed
+        (lane-wp6-build on run-9d03105407f440079f3730f1fe4c67b3). Absence is
+        `_attempt_dispatched is False`, not an unproven kill. The stall is
+        ENVIRONMENTAL and retries.
+        """
+        provision_calls = []
+        runner_attempts = []
+
+        def untracked(record, phase):
+            raise RuntimeError(
+                "PROCESS_GROUP_UNTRACKED:{0}:{1}#{2}".format(
+                    phase, record.node_id, record.attempt_no
+                )
+            )
+
+        def provision(path):
+            provision_calls.append(path)
+            if len(provision_calls) == 1:
+                self.expire_running_attempts(5.0)
+                deadline = time.monotonic() + ARRIVAL_TIMEOUT_S
+                while time.monotonic() < deadline:
+                    node = self.store.get_node("run1", "a")
+                    attempt = self.store.get_attempt("run1", "a", 1)
+                    if attempt.retry_class is st.RetryClass.ENVIRONMENTAL:
+                        return
+                    if node.state is st.NodeState.BLOCKED:
+                        return
+                    time.sleep(0.01)
+                self.fail("watchdog did not settle attempt 1")
+            self.clock.set(time.time())
+
+        def runner(attempt, node, record, retry_prompt, on_launch, cancel_requested):
+            runner_attempts.append(record.attempt_no)
+            return self.run_node(
+                attempt, node, record, retry_prompt, on_launch, cancel_requested
+            )
+
+        self.written = {"a": {"a.py": "A\n"}}
+        report = self.schedule(
+            [self.agent("a")],
+            config=self.config(
+                node_timeout_s=4.0,
+                turn_timeout_s=4.0,
+                final_acceptance_timeout_s=4.0,
+                backstop_t_s=30.0,
+                environmental_retries=1,
+            ),
+            deps=self.deps(
+                provision=provision,
+                kill_attempt=lambda record: untracked(record, "watchdog-kill"),
+                quiesce_attempt=lambda record, phase: (
+                    untracked(record, phase)
+                    if phase in ("watchdog", "watchdog-kill")
+                    else None
+                ),
+                run_node=runner,
+            ),
+        ).run()
+
+        node = self.store.get_node("run1", "a")
+        self.assertIsNot(
+            node.block_reason,
+            st.BlockReason.QUIESCENCE_UNPROVEN,
+            "never-dispatched PROCESS_GROUP_UNTRACKED must not block terminally",
+        )
+        self.assertEqual(len(provision_calls), 2)
         self.assertEqual(runner_attempts, [2])
         self.assertIs(
             self.store.get_attempt("run1", "a", 1).retry_class,
