@@ -2398,6 +2398,55 @@ class EscapeTests(unittest.TestCase):
                 store.skip("run1", "a", accept_sha=head, repo_path=repo)
             self.assertEqual(store.get_node("run1", "a").state, st.NodeState.BLOCKED)
 
+    def test_every_stored_block_reason_admits_its_declared_escapes(self):
+        """§11.3's tested property, executed rather than asserted from the table.
+
+        Every declared escape either leaves ``BLOCKED`` immediately or, for a
+        retained review attempt, durably authorizes proof-backed recovery.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            good_sha = _init_git_repo(repo)
+
+            for reason in st.BlockReason:
+                for escape in st.Escape:
+                    with tempfile.TemporaryDirectory() as run_tmp:
+                        store = new_store(Path(run_tmp))
+                        store.create_run("run1", "d", [make_node("a", 0)])
+                        store.start_attempt("run1", "a", base_sha=good_sha)
+                        store.mark_blocked("run1", "a", reason)
+                        store.declare_outcome("run1")
+
+                        if escape is st.Escape.RETRY:
+                            store.retry("run1", "a")
+                        elif escape is st.Escape.RETRY_FORCE:
+                            store.retry("run1", "a", force=True)
+                        elif escape is st.Escape.SKIP:
+                            store.skip("run1", "a", accept_sha=good_sha, repo_path=repo)
+                        elif escape is st.Escape.ABANDON:
+                            store.abandon("run1", "a")
+                        else:
+                            self.fail(f"unhandled escape {escape!r}")
+
+                        final = store.get_node("run1", "a").state
+                        if (
+                            reason is st.BlockReason.REVIEW_BUDGET_EXHAUSTED
+                            and escape is st.Escape.RETRY_FORCE
+                        ):
+                            self.assertIs(final, st.NodeState.BLOCKED)
+                            self.assertEqual(
+                                store.retry_budget_blocked_attempts("run1"),
+                                (("a", 1),),
+                            )
+                        else:
+                            self.assertNotEqual(
+                                final,
+                                st.NodeState.BLOCKED,
+                                f"{reason} -> {escape} did not leave BLOCKED"
+                                f" (still {final})",
+                            )
+
 
 # ── concurrency ──────────────────────────────────────────────────────────────
 
