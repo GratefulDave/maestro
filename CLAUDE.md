@@ -228,3 +228,49 @@ must pass `-o addopts=` or it silently returns zero.
 Close every pane when its work is done — `herdr pane close <pane_id>`, positional; `--pane`
 fails. `kill_reviewer` does not reliably close panes. Reviewer panes are not named
 `maestro-*`; identify them by agent kind, repo cwd, and title.
+
+## Diagnosing a lane that will not advance — run the command, do not read it
+
+A node that retries forever is almost never the agent's fault. Before writing any fix,
+**execute the harness's own measurement by hand, in the attempt worktree, under the real
+binary.** The worktrees survive the run at
+`~/.maestro/<install>/runs/<run_id>/worktrees/<run_id>-<node_id>-a<N>/`, provisioned, with
+`node_modules` in place. Reproducing a refusal there costs seconds.
+
+Two incidents on 2026-08-27/28, both on `lane-wp6-tests`, both producing the byte-identical
+verdict `TESTS_NO_NEW_CASES: no new collected case versus the parent commit`, and each one
+alone sufficient to explain it:
+
+1. `_prove_tests_red_at_parent` did `del node` and collected with `_pytest_prefix()`
+   whatever the gate declared. pytest collects nothing from a `.test.ts` file, so a vitest
+   node measured zero on every attempt. Fixed by dispatching on `node.gate_command[0]`
+   (`407d7d3`).
+2. `VitestCaseRunner.collect` built `vitest list --json <paths>`. vitest's `--json` takes an
+   *optional value*, so the path was read as "write the listing here": collection
+   **overwrote the tester's committed test file with 47KB of vitest's own JSON**, printed
+   nothing, exited 0. Fixed by putting the filters before the flag (`5273342`).
+
+Bug 1 was shipped as the whole answer and the run failed again identically. The lesson is
+the ordering rule, not the two bugs: **the first sufficient explanation is not the
+explanation.** A refusal string identifies a measurement that returned zero; it does not say
+why, and two independent causes can produce the same string. Run the measurement under every
+runner the plan can name before concluding.
+
+Consequences that follow from this, and that the incidents paid for:
+
+- **A green suite proves nothing about a code path no test executes.** `VitestCaseRunner`
+  had no test at all — 2943 passing tests, and not one had ever called `collect()`. Check
+  with `grep -l <runner-or-subject> tests/*.py` *before* trusting the suite about it.
+- **A stubbed `subprocess.run` cannot observe an argv parser.** It records the argv you
+  passed and returns the stdout you scripted. Any claim about how an external tool *reads*
+  its arguments must be tested by running that tool. `tests/test_vitest_collect_argv.py`
+  installs vitest and compares the test file's bytes before and after collection; that is
+  the only case that could have caught bug 2.
+- **A measurement must never mutate its subject.** Bug 2 destroyed the evidence it was
+  measuring, then blamed the tester for its absence. Any harness command aimed at a
+  candidate's own files is suspect until proven read-only by byte comparison.
+- **A patch on disk does not reach a running scheduler.** Python binds modules at import, so
+  a fix applied after `run start` has no effect on that process — check the scheduler's
+  start time against the file mtime before telling anyone the run is fixed. Never hand over
+  a `run start` line until the fix it depends on has been executed against the real binary
+  in the real worktree.
