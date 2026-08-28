@@ -1436,6 +1436,20 @@ def _apply_repository_config(args: argparse.Namespace, argv: Sequence[str]) -> N
         # discovery -- printing the adoption notice for a runner the repository
         # had already declared, and pinning nothing.
         args.runners = dict(config.get("runners") or {})
+        # The same defect as `runners:` above, one field over, and it disabled a
+        # whole refusal rather than a notice. `_configured_runs_root` reads this
+        # and returns `None` when it is unset, and `None` is the *deliberate*
+        # answer for a run spelled out by hand on the command line -- a run root
+        # nothing declares cannot prove a worktree is this system's own. A
+        # configured `run start` is not that case, but it reached the same
+        # branch, so `_reclaim_stranded_integration_worktree` skipped its
+        # containment test on every configured run and never reclaimed
+        # anything. What the operator saw was the fallback refusal telling them
+        # a checkout under Maestro's own run root was "not among" the ones it
+        # reclaims, and to go move it by hand -- the precise sentence the
+        # reclaim exists to make unnecessary, about the precise case it was
+        # written for.
+        args.repository_state = str(config["repository_state"])
         args.run_id = run_id
         args.integration_path = str(run_root / "integration")
         args.worktrees_root = str(run_root / "worktrees")
