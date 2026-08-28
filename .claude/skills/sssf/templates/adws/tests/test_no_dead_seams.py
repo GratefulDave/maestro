@@ -144,6 +144,8 @@ ALLOWED: Dict[str, str] = {
     "process map, asserted in tests",
     "worktree.is_empty": "derived predicate over InventoryDelta",
     "lifecycle.audit_orphans": "accessor over recorded unreachable panes, asserted in tests",
+    "publication.prepare": "retained as the two-phase test seam for the "
+    "prepare-to-push window, not deferred work",
     # ── DEFERRED — audited, owner assigned, fix not yet landed ──────────────
     # Rows D1-D11 of the dead-seam audit. Each is a real instance of this
     # class; none is accepted as correct.

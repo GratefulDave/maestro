@@ -234,6 +234,46 @@ class RemoteRunner:
 
 class LocalPublicationTests(unittest.TestCase):
 
+    def test_prepare_preflights_every_head_and_a_moved_ref_creates_no_intent_or_update(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = make_repository(root, "api")
+            web = make_repository(root, "web")
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.LOCAL_REFS,
+                repositories=(api, web),
+            )
+            git(web.path, "update-ref", "refs/heads/main", web.moved_sha, web.base_sha)
+            runner = RecordingRunner()
+            publisher = publication.WorkspacePublisher(
+                store=store,
+                repository_paths={"api": api.path, "web": web.path},
+                command_runner=runner,
+            )
+
+            with self.assertRaises(publication.PublicationError):
+                publisher.publish(RUN_ID)
+
+            probes = tuple(
+                (command, cwd) for command, cwd in runner.calls
+                if command[:3] == ("git", "rev-parse", "--verify"))
+            self.assertEqual(
+                probes,
+                ((("git", "rev-parse", "--verify", "--quiet",
+                   "refs/heads/main^{commit}"), api.path),
+                 (("git", "rev-parse", "--verify", "--quiet",
+                   "refs/heads/main^{commit}"), web.path)),
+            )
+            self.assertEqual(git(api.path, "rev-parse", "refs/heads/main"), api.base_sha)
+            self.assertEqual(git(web.path, "rev-parse", "refs/heads/main"), web.moved_sha)
+            self.assertFalse(any(command[1:3] == ("update-ref", "refs/heads/main")
+                                 for command, _ in runner.calls))
+            with self.assertRaises(cs.PublicationRefused):
+                store.get_publication_intent(RUN_ID)
+            store.close()
+
+
     def test_publish_updates_targets_in_persisted_order_and_declares_published(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -598,6 +638,75 @@ class LocalPublicationTests(unittest.TestCase):
             )
             store.close()
 
+    def test_reopened_publisher_returns_existing_durable_intent_without_repreflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = make_repository(root, "api")
+            store_path = root / "coordinator.db"
+            store = cs.CoordinatorStore(store_path)
+            create_accepted_run(
+                store, mode=wm.PublicationMode.LOCAL_REFS, repositories=(api,),
+            )
+            first = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": api.path},
+                command_runner=RecordingRunner(),
+            )
+            prepared = first.publish(RUN_ID).intent
+            store.close()
+
+            reopened_store = cs.CoordinatorStore(store_path)
+            runner = RecordingRunner()
+            reopened = publication.WorkspacePublisher(
+                store=reopened_store, repository_paths={"api": api.path},
+                command_runner=runner,
+            )
+            recovered = reopened.publish(RUN_ID).intent
+
+            self.assertEqual(recovered, prepared)
+            self.assertEqual(recovered.targets[0].expected_base_sha, api.base_sha)
+            self.assertEqual(runner.calls, [])
+            reopened_store.close()
+
+    def test_path_mismatch_refuses_before_any_publication_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = make_repository(root, "api")
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.LOCAL_REFS, repositories=(api,))
+            runner = RecordingRunner()
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": root / "other"},
+                command_runner=runner)
+
+            with self.assertRaises(cs.RepositoryPathMismatch):
+                publisher.publish(RUN_ID)
+
+            self.assertEqual(runner.calls, [])
+            with self.assertRaises(cs.PublicationRefused):
+                store.get_publication_intent(RUN_ID)
+            store.close()
+
+    def test_unbound_legacy_run_refuses_before_any_publication_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            api = make_repository(root, "api")
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.LOCAL_REFS, repositories=(api,),
+                bind_paths=False)
+            runner = RecordingRunner()
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": api.path},
+                command_runner=runner)
+
+            with self.assertRaises(cs.RepositoryPathMismatch):
+                publisher.publish(RUN_ID)
+
+            self.assertEqual(runner.calls, [])
+            store.close()
+
+
 class PullRequestPublicationTests(unittest.TestCase):
 
     def test_remote_compare_create_only_push_and_pr_url_are_persisted(self):
@@ -649,6 +758,144 @@ class PullRequestPublicationTests(unittest.TestCase):
             )
             step = store.list_publication_steps(RUN_ID)[0]
             self.assertEqual(step.detail["url"], "https://github.com/acme/api/pull/42")
+            store.close()
+
+    def test_remote_retarget_after_prepare_refuses_before_push_or_pull_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = RepositoryFixture(
+                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
+            )
+            runner = RemoteRunner(
+                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha)
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": fixture.path},
+                command_runner=runner,
+            )
+
+            prepared = publisher.prepare(RUN_ID)
+            self.assertEqual(
+                prepared.targets[0].remote_url,
+                "https://github.com/acme/api.git")
+            self.assertEqual(prepared.targets[0].remote_repository, "acme/api")
+            runner.remote_url = "https://github.com/other/repository.git"
+
+            result = publisher.publish(RUN_ID)
+
+            self.assertEqual(result.outcome,
+                             wm.WorkspaceOutcome.MANUAL_RECOVERY_REQUIRED)
+            self.assertEqual(result.intent.targets[0].state,
+                             wm.PublicationState.FAILED)
+            self.assertFalse(any(
+                command[:2] == ("git", "push") or command[:3] == ("gh", "pr", "create")
+                for command, _ in runner.calls))
+            store.close()
+
+    def test_prepare_requires_gh_auth_before_creating_durable_intent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = RepositoryFixture(
+                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
+            )
+            refused_auth = subprocess.CompletedProcess(
+                ("gh", "auth", "status"), 1, "", "not authenticated")
+            runner = RemoteRunner(
+                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha,
+                auth_result=refused_auth,
+            )
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": fixture.path},
+                command_runner=runner,
+            )
+
+            with self.assertRaises(publication.PublicationError):
+                publisher.publish(RUN_ID)
+
+            candidate_ref = "refs/heads/{0}/api".format(ACCEPTED_BRANCH)
+            self.assertEqual(
+                runner.calls,
+                [
+                    (("git", "remote", "get-url", "--", "origin"), fixture.path),
+                    (("git", "ls-remote", "--", runner.remote_url,
+                      "refs/heads/main"), fixture.path),
+                    (("git", "ls-remote", "--", runner.remote_url,
+                      candidate_ref), fixture.path),
+                    (("gh", "auth", "status"), fixture.path),
+                ],
+            )
+            with self.assertRaises(cs.PublicationRefused):
+                store.get_publication_intent(RUN_ID)
+            store.close()
+
+    def test_prepare_refuses_a_foreign_candidate_without_intent_or_push(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = RepositoryFixture(
+                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
+            )
+            runner = RemoteRunner(
+                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha,
+                candidate_sha=fixture.moved_sha,
+            )
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": fixture.path},
+                command_runner=runner,
+            )
+
+            with self.assertRaises(publication.PublicationError):
+                publisher.publish(RUN_ID)
+
+            candidate_ref = "refs/heads/{0}/api".format(ACCEPTED_BRANCH)
+            self.assertEqual(
+                runner.calls,
+                [
+                    (("git", "remote", "get-url", "--", "origin"), fixture.path),
+                    (("git", "ls-remote", "--", runner.remote_url,
+                      "refs/heads/main"), fixture.path),
+                    (("git", "ls-remote", "--", runner.remote_url,
+                      candidate_ref), fixture.path),
+                ],
+            )
+            with self.assertRaises(cs.PublicationRefused):
+                store.get_publication_intent(RUN_ID)
+            store.close()
+
+    def test_preflight_rejects_non_github_remote_before_creating_intent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = RepositoryFixture(
+                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
+            )
+            runner = RemoteRunner(
+                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha,
+                remote_url="https://example.test/acme/api.git",
+            )
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": fixture.path},
+                command_runner=runner,
+            )
+
+            with self.assertRaises(publication.PublicationError):
+                publisher.publish(RUN_ID)
+
+            self.assertEqual(
+                runner.calls,
+                [(("git", "remote", "get-url", "--", "origin"), fixture.path)],
+            )
+            with self.assertRaises(cs.PublicationRefused):
+                store.get_publication_intent(RUN_ID)
             store.close()
 
 
@@ -847,6 +1094,45 @@ class PullRequestPublicationTests(unittest.TestCase):
                 2,
             )
             store.close()
+
+    def test_unexpected_prepared_target_records_failure_before_manual_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = RepositoryFixture(
+                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
+            )
+            runner = RemoteRunner(
+                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha,
+            )
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": fixture.path},
+                command_runner=runner,
+            )
+            publisher.prepare(RUN_ID)
+            store.conn.execute(
+                "UPDATE publication_targets SET state=?"
+                " WHERE run_id=? AND repository_id=?",
+                (wm.PublicationState.PREPARED.value, RUN_ID, fixture.repository_id),
+            )
+            store.conn.commit()
+
+            result = publisher.publish(RUN_ID)
+
+            self.assertEqual(
+                result.outcome, wm.WorkspaceOutcome.MANUAL_RECOVERY_REQUIRED)
+            self.assertEqual(result.intent.state, wm.PublicationState.FAILED)
+            self.assertEqual(len(result.steps), 1)
+            self.assertEqual(result.steps[0].from_state, wm.PublicationState.PREPARED)
+            self.assertEqual(result.steps[0].to_state, wm.PublicationState.FAILED)
+            self.assertEqual(
+                result.steps[0].detail["reason"],
+                "unexpected pull-request target state PREPARED",
+            )
+            store.close()
+
 
 
 if __name__ == "__main__":
