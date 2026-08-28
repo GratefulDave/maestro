@@ -2836,12 +2836,20 @@ class Scheduler:
         if sealed_output_sha is None:
             with self._lock:
                 self._require_running(record)
-                output_sha = wt.commit_measured_delta(
-                    attempt,
-                    measured,
-                    after,
-                    f"{node.node_id} attempt {record.attempt_no}",
-                )
+                # Builder-authored sealed descendant of this attempt: same
+                # lineage check recover_sealed_descendant already uses.
+                # commit_measured_delta with a stale attempt.base would raise
+                # HeadMoved and spend environmental budget on recovered work.
+                current_head = wt.resolve_commit(attempt.path, "HEAD")
+                if current_head != attempt.base:
+                    output_sha = wt.sealed_descendant_tip(attempt, attempt.base)
+                else:
+                    output_sha = wt.commit_measured_delta(
+                        attempt,
+                        measured,
+                        after,
+                        f"{node.node_id} attempt {record.attempt_no}",
+                    )
                 store.record_sealed_output(
                     self.run_id, node.node_id, record.attempt_no, output_sha
                 )

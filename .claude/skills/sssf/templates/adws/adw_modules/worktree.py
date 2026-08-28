@@ -1214,21 +1214,14 @@ def recover_unsealed_descendant(
     )
 
 
-def recover_sealed_descendant(
-    attempt: AttemptWorktree,
-    parent: str,
-    original_baseline: Inventory,
-) -> Tuple[Inventory, str]:
-    """Recover one quiesced repair lineage after its published parent.
+def sealed_descendant_tip(attempt: AttemptWorktree, parent: str) -> str:
+    """HEAD if it is this attempt's merge-free descendant of ``parent``.
 
-    The private-index commit can survive a scheduler crash before
-    ``record_sealed_output`` advances the attempt ledger. The retained builder
-    may then add follow-up commits in the same declared generation before the
-    harness consumes its final envelope. The attempt ref and a merge-free
-    parent-to-tip ancestry prove which candidate cycle produced that lineage.
-    The original provisioned baseline supplies the untracked paths that git
-    cannot retain; the published parent tree supplies the tracked side of the
-    repair bracket.
+    The retained builder may add follow-up commits in the same declared
+    generation. The attempt ref and a merge-free parent-to-tip ancestry
+    prove which candidate cycle produced that lineage. Raises ``HeadMoved``
+    when HEAD/ref is not that descendant, including when they still name
+    ``parent`` itself.
     """
     tip = attempt_ref_commit(
         attempt.repo, attempt.run_id, attempt.node_id, attempt.attempt_no
@@ -1247,6 +1240,26 @@ def recover_sealed_descendant(
             f"sealed repair {tip[:10]} is not a linear descendant of "
             f"candidate {parent[:10]}"
         )
+    return tip
+
+
+def recover_sealed_descendant(
+    attempt: AttemptWorktree,
+    parent: str,
+    original_baseline: Inventory,
+) -> Tuple[Inventory, str]:
+    """Recover one quiesced repair lineage after its published parent.
+
+    The private-index commit can survive a scheduler crash before
+    ``record_sealed_output`` advances the attempt ledger. The retained builder
+    may then add follow-up commits in the same declared generation before the
+    harness consumes its final envelope. The attempt ref and a merge-free
+    parent-to-tip ancestry prove which candidate cycle produced that lineage.
+    The original provisioned baseline supplies the untracked paths that git
+    cannot retain; the published parent tree supplies the tracked side of the
+    repair bracket.
+    """
+    tip = sealed_descendant_tip(attempt, parent)
 
     original_base = attempt.base
     baseline = _recover_candidate_baseline(
