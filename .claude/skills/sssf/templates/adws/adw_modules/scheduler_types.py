@@ -555,6 +555,18 @@ class BlockReason(str, Enum):
     #: the point is that this one demonstrably did not, twice, and a third
     #: dispatch is an operator's call rather than the scheduler's.
     SEMANTIC_REFUSAL_REPEATED = "SEMANTIC_REFUSAL_REPEATED"
+    #: A repair handoff reached a delivery path that cannot service it —
+    #: no launcher, or a node kind for which no repair route exists (§19
+    #: M41). Before this reason existed the condition raised
+    #: `AttemptOwnershipLost` out of the repair callback and the worker's
+    #: containment handler turned it into a bare `return`: no transition, no
+    #: `fail_handoff`, no log, and `attempts`/`node_lifecycle` left reading
+    #: RUNNING for a lane with no process. Observed on
+    #: `run-36dd33d262d9485ca815aea5001b2ce2`, node `lane-wp6-tests`, whose
+    #: last ledger row was the REPAIRING phase itself. Not a budget: the
+    #: refusal is about the route, so another attempt reproduces it exactly
+    #: and the escape is a code or plan change.
+    REPAIR_HANDOFF_UNSERVICEABLE = "REPAIR_HANDOFF_UNSERVICEABLE"
 
 
 #: The failures that fit no retry class, because re-running a

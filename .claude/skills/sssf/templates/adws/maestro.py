@@ -4546,13 +4546,75 @@ def _clear_turn_artifact(path: Path) -> None:
         pass
 
 
+@dataclasses.dataclass(frozen=True)
+class _ActorDispatch:
+    """Which actor a lane's pane launches as, and on whose route.
+
+    One resolution read by every site that opens a pane for a lane: the
+    first attempt in `run_node`, and the repair. Before this existed
+    `launch_replacement` hardcoded `args.agent_route`, `args.agent_model`
+    and `pane_role="builder"` for whatever node it was handed, so a repaired
+    tests node would have opened a *builder* pane on the build lane's
+    vendor. That is the wrong actor on the wrong route wearing the wrong
+    label: `tester_vendor` is bound to `lane_vendor` and is a separate route
+    on purpose, because the information barrier between the lane that writes
+    the tests and the lane judged by them is the node split (B12, §19 M41).
+    """
+
+    route: str
+    model: str
+    effort: str
+    profile: Optional[str]
+    vendor: Optional[str]
+
+
+def _lane_actor_dispatch(args: Any, node_kind: Any) -> _ActorDispatch:
+    """Resolve one lane kind's actor route, falling back to the agent route."""
+    if node_kind is scheduler_types.NodeKind.TESTS:
+        return _ActorDispatch(
+            route=getattr(args, "tester_route", None) or args.agent_route,
+            model=getattr(args, "tester_model", None) or args.agent_model,
+            effort=getattr(args, "tester_effort", None) or args.agent_effort,
+            profile=getattr(args, "tester_profile", None) or args.agent_profile,
+            # B15: tester.vendor is loaded onto args and recorded on the
+            # attempt row. `LaunchSpec` has no vendor field, so this travels
+            # through `_launch_attempt_extra` rather than through the spec.
+            vendor=getattr(args, "tester_vendor", None),
+        )
+    return _ActorDispatch(
+        route=args.agent_route,
+        model=args.agent_model,
+        effort=args.agent_effort,
+        profile=args.agent_profile,
+        vendor=getattr(args, "execution_vendor", None),
+    )
+
+
 def _repair_prompt_text(
     repair_prompt: str,
     rejected_candidate_sha: str,
     builder_generation: int,
     acknowledgement_path: Path,
+    *,
+    same_session: bool = True,
 ) -> str:
-    """Render the exact durable handoff plus a schema-bound acknowledgement."""
+    """Render the exact durable handoff plus a schema-bound acknowledgement.
+
+    `same_session` is false for a lane whose actor is one-shot -- a tests
+    node's tester, whose pane is cancelled when its attempt settles. Telling
+    a freshly opened actor to "keep working in this existing session" names
+    a session it has never had, and the worktree it inherits is the only
+    continuity there is.
+    """
+    continuation = (
+        "Keep working in this existing worktree and session."
+        if same_session
+        else (
+            "This is a fresh actor turn in the existing worktree of the "
+            "rejected attempt: read the tree rather than assuming any prior "
+            "session's context."
+        )
+    )
     return (
         "# Persistent repair handoff\n\n"
         "Rejected candidate SHA: `{}`\n"
@@ -4562,7 +4624,7 @@ def _repair_prompt_text(
         "`{}` (no additional keys):\n"
         '```json\n{{"builder_generation": {}, "kind": '
         '"repair_acknowledgement", "rejected_candidate_sha": "{}"}}\n```\n'
-        "Keep working in this existing worktree and session. Commit a distinct "
+        "{} Commit a distinct "
         "descendant candidate, then write the normal terminal envelope."
     ).format(
         rejected_candidate_sha,
@@ -4571,6 +4633,7 @@ def _repair_prompt_text(
         acknowledgement_path,
         builder_generation,
         rejected_candidate_sha,
+        continuation,
     )
 
 
@@ -5778,30 +5841,21 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 prompt = attempt.scratch / "agent-prompt.txt"
                 envelope = attempt.scratch / "agent-envelope.json"
                 plan_node = plan.node_by_id()[node.node_id]
+                # One resolution for both the first attempt and the repair,
+                # so the two cannot disagree about which actor a lane opens.
+                dispatch = _lane_actor_dispatch(args, node.kind)
                 if node.kind is scheduler_types.NodeKind.TESTS:
                     prompt_text = _tests_node_prompt(plan_node, envelope, retry_prompt)
-                    lane_route = getattr(args, "tester_route", None) or args.agent_route
-                    lane_model = getattr(args, "tester_model", None) or args.agent_model
-                    lane_effort = (
-                        getattr(args, "tester_effort", None) or args.agent_effort
-                    )
-                    lane_profile = (
-                        getattr(args, "tester_profile", None) or args.agent_profile
-                    )
-                    # B15: tester.vendor is loaded onto args and recorded here.
-                    # The information barrier is the node split, not a B12 vendor
-                    # pair, and LaunchSpec has no vendor field.
-                    lane_vendor = getattr(args, "tester_vendor", None)
                 else:
                     prompt_text = _agent_node_prompt(plan_node, envelope, retry_prompt)
                     prompt_text = _append_needed_tests(
                         prompt_text, attempt.path, node, plan
                     )
-                    lane_route = args.agent_route
-                    lane_model = args.agent_model
-                    lane_effort = args.agent_effort
-                    lane_profile = args.agent_profile
-                    lane_vendor = getattr(args, "execution_vendor", None)
+                lane_route = dispatch.route
+                lane_model = dispatch.model
+                lane_effort = dispatch.effort
+                lane_profile = dispatch.profile
+                lane_vendor = dispatch.vendor
                 # B13: the build handoff now carries the tests as well as the
                 # goal, so it is strictly larger. Same chokepoint as before.
                 _preflight_prompt(prompt_text, lane_route, lane_model)
@@ -6028,6 +6082,170 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     handles.pop(key)
                     proven_absent.add(key)
 
+            def continue_tests_node(
+                attempt,
+                node,
+                record,
+                repair_prompt,
+                rejected_candidate_sha,
+                builder_generation,
+                cancel_requested,
+            ):
+                """Open a fresh tester on one tests-node repair handoff.
+
+                A tests node's tester is one-shot by construction: nothing
+                registers a durable actor session for it and its pane is
+                cancelled when the attempt settles, so `continue_node`'s
+                adopt/resubmit/replace machinery has no session to act on and
+                its two guards both refuse -- which is how a REJECTED tests
+                node reached a `REPAIRING` phase that no code path could
+                service, and then stopped existing
+                (run-36dd33d262d9485ca815aea5001b2ce2, `lane-wp6-tests`).
+
+                The repair is therefore a new tester turn against the *same*
+                attempt worktree, carrying the reviewer's findings, placed in
+                the lane's existing Herdr tab by `lane_key`. Making testers
+                durable instead would be the larger change and is not this
+                one. §19 M41 requires a tests node to carry the full review
+                **and repair** apparatus; only its review half had shipped.
+                """
+                key = (node.node_id, record.attempt_no)
+                envelope_path = attempt.scratch / "agent-envelope.json"
+                acknowledgement_path = attempt.scratch / "repair-acknowledgement.json"
+                prompt_path = attempt.scratch / "repair-prompt.md"
+                launch_environment = worktree.launch_env(
+                    attempt.scratch, concurrency=getattr(args, "concurrency", None)
+                )
+                handoff = store.repair_handoff(
+                    args.run_id, node.node_id, rejected_candidate_sha
+                )
+                generation = builder_generation
+                # A fresh actor cannot own the rejected turn's envelope or a
+                # previous acknowledgement; this turn writes both itself.
+                _clear_turn_artifact(envelope_path)
+                _clear_turn_artifact(acknowledgement_path)
+                prompt_text = _repair_prompt_text(
+                    repair_prompt,
+                    rejected_candidate_sha,
+                    generation,
+                    acknowledgement_path,
+                    same_session=False,
+                )
+                dispatch = _lane_actor_dispatch(args, node.kind)
+                # B13 at the same chokepoint every other dispatched prompt
+                # crosses: a repair handoff carries the reviewer's findings on
+                # top of the goal, so it is strictly larger than the first
+                # tester prompt that already passed this check.
+                _preflight_prompt(prompt_text, dispatch.route, dispatch.model)
+                prompt_path.write_text(prompt_text, encoding="utf-8")
+                # A second rejection reaches this frame with the *previous*
+                # repair tester still tracked under this key, and overwriting
+                # the entry below would leave that pane open with nothing
+                # naming it -- one leaked rectangle per review round, up to the
+                # test-review ceiling. Proven absent through the harness's own
+                # quiescer rather than a bespoke cancel, so the absence is the
+                # same proof every other path takes.
+                #
+                # Conditioned on a tracked handle rather than called
+                # unconditionally, and that is not a shortcut: `quiesce_attempt`
+                # answers `PROCESS_GROUP_UNTRACKED` for a key it has never
+                # seen, and the scheduler blocks a node terminally on that
+                # answer. A recovered attempt reaches a repair without ever
+                # having entered `run_node`, so its key is untracked by
+                # construction and there is nothing to prove absent.
+                with handles_lock:
+                    stale = handles.get(key)
+                if stale is not None:
+                    quiesce_attempt(record, "repair-relaunch")
+                # The round, not just the generation. A tests node's repair
+                # rounds all happen inside one attempt, so `generation` is
+                # constant across them and a token built from it alone names
+                # two different panes; the rejected candidate is distinct per
+                # round by construction, so it is what separates them -- in
+                # the Herdr agent id this token hashes to, and in the session
+                # directory below.
+                round_key = "g{}-{}".format(generation, rejected_candidate_sha[:12])
+                spec = launcher.LaunchSpec(
+                    correlation_token="{}-{}-tester-{}".format(
+                        args.run_id, node.node_id, round_key
+                    ),
+                    worktree=attempt.path,
+                    prompt_path=prompt_path,
+                    envelope_path=envelope_path,
+                    route=dispatch.route,
+                    model=dispatch.model,
+                    effort=dispatch.effort,
+                    profile=dispatch.profile,
+                    session_dir=(
+                        attempt.scratch / "session-tester-{}".format(round_key)
+                    ),
+                    context_window_tokens=_route_context_window(
+                        dispatch.route, dispatch.model
+                    ),
+                    workspace_label=workspace_label,
+                    # The tab key, not the node id: `_tab_for` caches on
+                    # `lane_key`, so the repair tester splits into the tab the
+                    # lane already owns instead of opening a new one.
+                    lane_key=lane_placement[node.node_id],
+                    lane_label=lane_placement[node.node_id],
+                    pane_role="tester",
+                    attempt_no=generation,
+                    pane_group_size=3,
+                    restrict_tools=getattr(args, "restrict_actor_tools", False),
+                    environment=launch_environment,
+                )
+                handle = _typed_launch_pane(route_runner, spec)
+                try:
+                    _require_session_path(handle, node.node_id, generation)
+                    if handoff is not None:
+                        submission = store.mark_handoff_submitted(
+                            args.run_id,
+                            node.node_id,
+                            rejected_candidate_sha,
+                            builder_generation=generation,
+                        )
+                        if (
+                            not submission.submitted
+                            or submission.handoff.builder_generation != generation
+                        ):
+                            raise scheduler.AttemptOwnershipLost(
+                                "{}: tester handoff submission generation lost".format(
+                                    node.node_id
+                                )
+                            )
+                except BaseException:
+                    route_runner.cancel(
+                        handle, finalization_window.time.monotonic() + 5.0
+                    )
+                    raise
+                with handles_lock:
+                    # Tracked for quiescence, and deliberately *not* placed in
+                    # `builder_handles`: a tester is not a retained session, so
+                    # `repair-idle` must cancel and reclaim its pane rather
+                    # than wait for it to go idle and leave it open.
+                    handles[key] = handle
+                    proven_absent.discard(key)
+                execution = _poll_agent_execution(
+                    route_runner,
+                    handle,
+                    envelope_path,
+                    record,
+                    cancel_requested,
+                    quiesce_attempt,
+                )
+                acknowledged = (
+                    rejected_candidate_sha
+                    if _read_repair_acknowledgement(
+                        acknowledgement_path, rejected_candidate_sha, generation
+                    )
+                    else ""
+                )
+                return scheduler.RepairExecution(
+                    execution=execution,
+                    acknowledged_rejected_sha=acknowledged,
+                    builder_generation=generation,
+                )
+
             def continue_node(
                 attempt,
                 node,
@@ -6037,14 +6255,37 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 builder_generation,
                 cancel_requested,
             ):
-                """Resume or replace the durable builder for one repair handoff."""
-                if node.kind is not scheduler_types.NodeKind.AGENT:
-                    raise scheduler.AttemptOwnershipLost(
-                        "{} is not a persistent builder lane".format(node.node_id)
-                    )
+                """Deliver one repair handoff to the actor its lane kind owns.
+
+                Widened rather than paralleled: all three of the scheduler's
+                `REPAIRING` writers already funnel into this one callback, and
+                what the scheduler asks for -- "deliver this prompt to this
+                lane and return a `RepairExecution`" -- is kind-agnostic. Only
+                the *delivery mechanism* differs by kind, and the delivery
+                mechanism is exactly what this closure owns. A second
+                `SchedulerDeps` field would have put a kind test at three
+                scheduler call sites and in every test fake instead of here.
+                """
                 if route_runner is None:
-                    raise scheduler.AttemptOwnershipLost(
-                        "builder launcher is unavailable"
+                    raise scheduler.UnserviceableHandoff(
+                        "{}: the launcher is unavailable, so no repair handoff "
+                        "can be delivered".format(node.node_id)
+                    )
+                if node.kind is scheduler_types.NodeKind.TESTS:
+                    return continue_tests_node(
+                        attempt,
+                        node,
+                        record,
+                        repair_prompt,
+                        rejected_candidate_sha,
+                        builder_generation,
+                        cancel_requested,
+                    )
+                if node.kind is not scheduler_types.NodeKind.AGENT:
+                    raise scheduler.UnserviceableHandoff(
+                        "{} is a {} node, which has no repair route".format(
+                            node.node_id, node.kind.value
+                        )
                     )
                 session = store.current_actor_session(
                     args.run_id, node.node_id, "builder"
@@ -6138,32 +6379,59 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     _clear_turn_artifact(envelope_path)
                     _clear_turn_artifact(acknowledgement_path)
                     write_prompt(generation)
+                    # Resolved from the node's own kind rather than hardcoded
+                    # to `args.agent_*` and `"builder"`. This frame is reached
+                    # only for AGENT lanes today, so the two agree; they must
+                    # keep agreeing if another kind is ever routed here,
+                    # because a replacement that silently swaps a lane's actor
+                    # for the build vendor's is a B12 barrier failure that no
+                    # gate would catch.
+                    replacement_dispatch = _lane_actor_dispatch(args, node.kind)
+                    replacement_role = (
+                        "tester"
+                        if node.kind is scheduler_types.NodeKind.TESTS
+                        else "builder"
+                    )
                     replacement = _typed_launch_pane(
                         route_runner,
                         launcher.LaunchSpec(
                             correlation_token=(
-                                "{}-{}-builder-g{}".format(
-                                    args.run_id, node.node_id, generation
+                                "{}-{}-{}-g{}".format(
+                                    args.run_id,
+                                    node.node_id,
+                                    replacement_role,
+                                    generation,
                                 )
                             ),
                             worktree=attempt.path,
                             prompt_path=prompt_path,
                             envelope_path=envelope_path,
-                            route=args.agent_route,
-                            model=args.agent_model,
-                            effort=args.agent_effort,
-                            profile=args.agent_profile,
+                            route=replacement_dispatch.route,
+                            model=replacement_dispatch.model,
+                            effort=replacement_dispatch.effort,
+                            profile=replacement_dispatch.profile,
                             session_dir=(
                                 attempt.scratch
-                                / "session-builder-g{}".format(generation)
+                                / "session-{}-g{}".format(
+                                    replacement_role, generation
+                                )
                             ),
                             context_window_tokens=_route_context_window(
-                                args.agent_route, args.agent_model
+                                replacement_dispatch.route,
+                                replacement_dispatch.model,
                             ),
                             workspace_label=workspace_label,
                             lane_key=lane_placement[node.node_id],
                             lane_label=lane_placement[node.node_id],
-                            pane_role="builder",
+                            # Repeated as a literal rather than read off
+                            # `replacement_role`: `test_pane_placement` reads
+                            # the role off this call site's AST, and a name
+                            # here makes the site invisible to it.
+                            pane_role=(
+                                "tester"
+                                if node.kind is scheduler_types.NodeKind.TESTS
+                                else "builder"
+                            ),
                             attempt_no=generation,
                             pane_group_size=3,
                             restrict_tools=getattr(args, "restrict_actor_tools", False),

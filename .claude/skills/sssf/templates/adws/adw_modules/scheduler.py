@@ -238,6 +238,20 @@ class AttemptCancelled(RuntimeError):
     """Cancellation was requested while the attempt still held RUNNING."""
 
 
+class UnserviceableHandoff(AttemptOwnershipLost):
+    """A repair handoff reached a delivery path that cannot service it.
+
+    A subclass of `AttemptOwnershipLost` on purpose, so it keeps crossing
+    every deliberate re-raise between the repair callback and the worker's
+    top-level handler; only that handler, and `_continue_repair_handoff`,
+    distinguish it. The distinction is the whole point. Ordinary ownership
+    loss means *another* generation now owns this attempt and there is
+    nothing to record; this means nothing owns it and nothing ever will,
+    which is a terminal fact about the lane and must appear in the ledger as
+    a typed transition rather than be inferred from a dead process.
+    """
+
+
 class RunPaused(RuntimeError):
     """SIGINT or `request_pause` stopped the run without making it terminal.
 
@@ -1479,6 +1493,64 @@ class Scheduler:
                 ),
             )
 
+    def _block_unserviceable_handoff(
+        self,
+        node: st.PlanNode,
+        record: Optional[st.AttemptRecord],
+        failure: "UnserviceableHandoff",
+        *,
+        candidate_sha: Optional[str] = None,
+        builder_generation: Optional[int] = None,
+    ) -> None:
+        """Record a repair handoff nothing can deliver as a typed transition.
+
+        §1.2 — the transition keys on the exception's *type* and on the
+        lane's own durable rows, never on the message, which is carried only
+        as detail an operator can read. The message is diagnosis; the type is
+        the decision.
+
+        Idempotent by the same `_owns_running` fence every other terminal
+        path uses, so the precise call in `_continue_repair_handoff` and the
+        backstop in `_attempt` cannot both write.
+        """
+        if record is None:
+            return
+        with self._lock:
+            if not self._owns_running(record):
+                return
+            if candidate_sha:
+                self.deps.store.fail_handoff(
+                    self.run_id,
+                    node.node_id,
+                    candidate_sha,
+                    builder_generation=(
+                        builder_generation
+                        if builder_generation is not None
+                        else record.attempt_no
+                    ),
+                    reason=str(failure),
+                )
+            if self._review_for_build(node.node_id) is not None:
+                self._set_lane_phase(
+                    node.node_id,
+                    st.LanePhase.BLOCKED,
+                    record,
+                    allow_watchdog_fence=self._cancelled.is_set(),
+                )
+            detail = {
+                "reason": str(failure),
+                "exception_type": type(failure).__name__,
+                "node_kind": node.kind.value,
+            }
+            if candidate_sha:
+                detail["candidate_sha"] = candidate_sha
+            self.deps.store.mark_blocked(
+                self.run_id,
+                node.node_id,
+                st.BlockReason.REPAIR_HANDOFF_UNSERVICEABLE,
+                detail=detail,
+            )
+
     def _contain_quiescence_failure(
         self,
         node: st.PlanNode,
@@ -1898,9 +1970,28 @@ class Scheduler:
         context = _AttemptContext()
         try:
             self._attempt_body(node, context)
+        except UnserviceableHandoff as exc:
+            # Caught *before* the ownership clause below, and that ordering is
+            # the fix. `UnserviceableHandoff` subclasses `AttemptOwnershipLost`
+            # so it survives every deliberate re-raise on the way here, and
+            # without this clause it landed in that bare `return`: the lane
+            # simply stopped existing, with `attempts` and `node_lifecycle`
+            # still reading RUNNING and the ledger's last row being the
+            # REPAIRING phase it had just entered. A handoff nothing can
+            # deliver is a terminal fact and gets a typed transition
+            # (run-36dd33d262d9485ca815aea5001b2ce2, `lane-wp6-tests`).
+            try:
+                self._settle_context(context)
+            except QuiescenceFailure as quiescence:
+                self._contain_quiescence_failure(node, context.record, quiescence)
+                return
+            self._block_unserviceable_handoff(node, context.record, exc)
+            return
         except (AttemptCancelled, AttemptOwnershipLost):
             # Even a superseded/cancelled worker must prove its latest boundary
-            # quiescent before returning control to the scheduler loop.
+            # quiescent before returning control to the scheduler loop. A
+            # genuine cancel writes no outcome here and must not start doing
+            # so: the run-level cancel path owns that record.
             try:
                 self._settle_context(context)
             except QuiescenceFailure as exc:
@@ -3491,6 +3582,20 @@ class Scheduler:
                     self._cancelled.is_set,
                 )
                 break
+            except UnserviceableHandoff as exc:
+                # The precise site: this frame holds the rejected sha and the
+                # generation, so the handoff row is failed by name instead of
+                # being left PENDING forever behind a blocked node.
+                self._close_persistent_reviewer(node.node_id, record)
+                self._settle_context(context)
+                self._block_unserviceable_handoff(
+                    node,
+                    record,
+                    exc,
+                    candidate_sha=rejected_candidate_sha,
+                    builder_generation=builder_generation,
+                )
+                return None
             except (AttemptCancelled, AttemptOwnershipLost, QuiescenceFailure):
                 raise
             except Exception as exc:
