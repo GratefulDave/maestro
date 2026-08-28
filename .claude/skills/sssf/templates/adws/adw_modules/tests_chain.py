@@ -732,7 +732,16 @@ class VitestCaseRunner(CaseRunner):
         existing = [p for p in paths if (Path(tree) / p).exists()]
         if not existing:
             return ()
-        command = self._prefix() + ("list", "--json", *existing)
+        # The filters go BEFORE `--json`, and this order is load-bearing:
+        # vitest's `--json` takes an *optional value*, so `--json <path>` is
+        # parsed as "write the listing to <path>". Emitting the paths after
+        # the flag therefore made vitest OVERWRITE the first test file with
+        # its own JSON output, print nothing to stdout, and exit 0. On
+        # `run-6b8f607d89744eeb94a79713b3b5d234` that destroyed the tester's
+        # committed cases inside its attempt worktree, returned zero node
+        # ids, and refused `TESTS_NO_NEW_CASES` -- forever, because every
+        # retry rebuilt the file and every collection ate it again.
+        command = self._prefix() + ("list", *existing, "--json")
         result = subprocess.run(
             list(command), cwd=str(tree), env=_report_env(),
             capture_output=True, text=True, timeout=timeout_s, check=False)
