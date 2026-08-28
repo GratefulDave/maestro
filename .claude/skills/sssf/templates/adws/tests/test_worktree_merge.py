@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -960,6 +961,30 @@ class GateScope(WorktreeTestCase):
                 attempt.scratch,
                 cancel_requested=cancelled,
             )
+
+    def test_a_bounded_node_gate_times_out_and_reaps(self):
+        """Pre-gate used timeout=None. A hung vitest outlived NODE_TIMEOUT.
+
+        `run_node_gate` now passes NODE_GATE_TIMEOUT_S. This drives the same
+        `_run_gate` path with a short bound so the test does not wait 600s.
+        """
+        attempt = _attempt(self.repo, self.root)
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError) as caught:
+            wt._run_gate(
+                attempt.path,
+                _runner(sys.executable),
+                ("-c", "import time; time.sleep(30)"),
+                attempt.scratch,
+                "hung-gate",
+                "node",
+                "test_calc",
+                lambda: False,
+                timeout=0.4,
+            )
+        self.assertIn("HARNESS_CONTEXT_TIMEOUT", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 8.0)
+        self.assertEqual(wt.NODE_GATE_TIMEOUT_S, 600.0)
 
 
 # ── §8.5 deterministic merge order ──────────────────────────────────────────

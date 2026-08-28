@@ -84,6 +84,12 @@ MODE_SYMLINK = "120000"
 MODE_EXECUTABLE = "100755"
 MODE_REGULAR = "100644"
 
+#: Pre/post/falsify share `run_node_gate`. Provision already bounds itself at
+#: 600s (`HerdrLauncher.provision`). Default `node_timeout_s` is 1800. A hung
+#: vitest must reap its process group before the watchdog skips kill on an
+#: attempt that never entered `run_node`.
+NODE_GATE_TIMEOUT_S = 600.0
+
 # States that end a node without a merge. A node in one of these is excluded
 # from the frontier and cascades to its descendants for every reason, not only
 # for conflict (§8.5, §8.7).
@@ -1801,6 +1807,7 @@ def _run_gate(
     scope: str,
     selector: Optional[str],
     cancel_requested: Callable[[], bool],
+    timeout: Optional[float] = None,
 ) -> GateResult:
     """Run one gate through a resolved runner.
 
@@ -1827,6 +1834,7 @@ def _run_gate(
             cwd=worktree,
             env=launch_env(scratch),
             cancel_requested=cancel_requested,
+            timeout=timeout,
         )
     except HarnessCancelled as exc:
         raise GateCancelled("gate cancelled before a result was produced") from exc
@@ -1892,6 +1900,7 @@ def run_node_gate(
         "node",
         selector,
         cancel_requested,
+        timeout=NODE_GATE_TIMEOUT_S,
     )
 
 
