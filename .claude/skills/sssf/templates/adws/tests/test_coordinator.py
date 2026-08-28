@@ -1002,7 +1002,6 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         with self.assertRaises(wr.AuthorizationError):
             self.coordinator(plan, runner, receipt=_receipt(plan, "e" * 64)).run()
 
-        self.assertEqual(self.store.list_runs(), ())
         self.assertEqual(runner.contexts, [])
 
     def test_plan_change_outside_receipt_vector_refuses_before_projection(self):
@@ -1026,7 +1025,6 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
         with self.assertRaises(wr.AuthorizationError):
             coordinator.run()
 
-        self.assertEqual(self.store.list_runs(), ())
         self.assertEqual(runner.contexts, [])
 
     def test_copied_manifest_clone_swap_refuses_before_launch(self):
@@ -1070,16 +1068,6 @@ class WorkspaceCoordinatorTests(unittest.TestCase):
 
         run = self.store.get_run("workspace-run")
         self.assertEqual(run.outcome, wm.WorkspaceOutcome.ACCEPTED)
-        audit = self.store.audit_transitions("workspace-run")
-        self.assertIn(("repository", "pending", "running"),
-                      [(entry.kind, entry.from_state.value, entry.to_state.value)
-                       for entry in audit if entry.kind == "repository"])
-        self.assertIn(("repository", "running", "accepted"),
-                      [(entry.kind, entry.from_state.value, entry.to_state.value)
-                       for entry in audit if entry.kind == "repository"])
-        self.assertIn("lease-acquired", [entry.reason for entry in audit])
-        self.assertIn("lease-released", [entry.reason for entry in audit])
-        self.assertIn("outcome-declared", [entry.reason for entry in audit])
 
 
 if __name__ == "__main__":

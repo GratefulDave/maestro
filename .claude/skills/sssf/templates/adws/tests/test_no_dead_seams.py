@@ -106,18 +106,6 @@ ALLOWED: Dict[str, str] = {
     # registry accessor had no test reference before, so nothing was looking.
     # Production dispatches through `_PARSERS` directly.
     "plan_model.registered_versions": "accessor over the parser registry; production dispatches through _PARSERS",
-    # ── gate capture (§16.3 item 8, measured on lane-routing-chemical a3) ────
-    # `unexpected_cases` IS wired -- the pairing check calls it, which is what
-    # closes the class. These two are not, and each says why.
-    #
-    # DEFERRED: `scan_delta` is the early-refusal sweep over a candidate's
-    # non-test source. It is defence in depth rather than the repair, and
-    # `tests/test_gate_capture.py::ThePatternSweepIsNotSufficient` asserts its
-    # insufficiency on purpose, so wiring it is a separate decision about how
-    # loudly to refuse rather than about whether the hole is closed. Its caller
-    # belongs at the §8.3 permission chokepoint where a delta's paths and bytes
-    # are already in hand.
-    "gate_capture.scan_delta": "DEFERRED: early-refusal sweep; the provenance check is the repair and is wired",
     # ── plan amendment: the store half, landed ahead of its wiring ───────────
     # DEFERRED with a named successor. These are the durable half of amending a
     # run's plan without discarding merged work: retained plan bytes, the
@@ -143,7 +131,6 @@ ALLOWED: Dict[str, str] = {
     # each. Delete this line with that reader; do not delete the method, since
     # the rows it reads are written and an audit needs a way to see them.
     "lifecycle.plan_versions": "DEFERRED: lineage reader; its operator surface (`run status` plan history) is not built",
-    "lifecycle.review_refresh_count": "operator accessor over the §3.6 A9 allowance; the resume transaction uses the unserialized _review_refresh_count",
     # ── §1.2's detectors ────────────────────────────────────────────────────
     # Their job is to convict a planted violation from a test. Production never
     # calls a detector; a detector production called would be a linter.
@@ -163,11 +150,6 @@ ALLOWED: Dict[str, str] = {
     # A named view over state production already maintains, existing so a test
     # can state a property about it. Nothing branches on these in production,
     # so nothing is unreachable behind them.
-    "scheduler_types.exits_for": "§11.3 property table: every block_reason "
-    "admits an exit, proven from tests",
-    "finalization_window.opened_at_monotonic": "accessor over the private "
-    "_opened_at_monotonic that "
-    "production maintains",
     "participant.active_participant_ids": "accessor over the runner's live "
     "process map, asserted in tests",
     "scheduler.integration_untested": "derived flag on RunReport, asserted in tests",
@@ -225,10 +207,6 @@ ALLOWED: Dict[str, str] = {
     # Audited instances of this same class that sit on the deliver, workspace,
     # or diagnostics paths rather than on `run start`. Real, recorded, and
     # deferred to a pass that owns those paths.
-    "coordinator_store.audit_transitions": "DEFERRED: workspace-path audit "
-    "reader, no production caller",
-    "coordinator_store.list_runs": "DEFERRED: workspace-path query, no "
-    "production caller",
     "lifecycle.audit_transitions": "DEFERRED: diagnostics reader over the "
     "transitions table, no production caller",
     # Its reason used to read "finalization-path". That path is gone --
@@ -242,13 +220,6 @@ ALLOWED: Dict[str, str] = {
     "not call it yet",
     "publication.prepare": "DEFERRED: WorkspacePublisher.prepare, publication "
     "path, no production caller",
-    # Config keys whose only writer is a test, so the dataclass default is the
-    # production value in every run. Not broken branches — constants wearing a
-    # config key's clothes — but recorded so that "configurable" is not
-    # mistaken for "configured".
-    "ValidationConfig.review_payload_budget_bytes": "default is the production "
-    "value; tests vary it to "
-    "exercise the budget",
     # The launcher-classification lane's typed failure signal. Its writers land
     # with that lane; `launcher_failure` itself is already wired.
     "FailureSignal.binary_resolved": "DEFERRED: launcher-classification lane",
@@ -258,13 +229,6 @@ ALLOWED: Dict[str, str] = {
     # here is the point of #99 — a deliberate or deferred no-op must be stated
     # rather than look wired. The `maestro.py` call site is left for a follow-up
     # because that file is partly owned by a concurrent lane.
-    "FinalizationWindow.record_reviewer_session": "DEFERRED #99: production "
-    "constructor in maestro.py:"
-    "_code_review_runner still "
-    "passes lambda _s: None; "
-    "this lane names the seam "
-    "rather than colliding on "
-    "maestro.py",
     "RunBackstop.on_stuck": "DEFERRED: production constructor in scheduler.py "
     "passes lambda diagnostic: None; watchdog.py is "
     "owned by a concurrent lane",

@@ -5471,11 +5471,6 @@ class LifecycleStore:
         return int(row[0] or 0)
 
     @serialized
-    def review_refresh_count(self, run_id: str) -> int:
-        """How much of this run's §3.6 A9 review allowance has been spent."""
-        return self._review_refresh_count(run_id)
-
-    @serialized
     def retry_spend_floor(self, run_id: str, node_id: str) -> int:
         """The attempt number this node's retry budgets are counted from.
 
@@ -8980,20 +8975,6 @@ class LifecycleReader:
             )
             for row in rows
         )
-
-    def pinned_test_strength_contract(
-        self, run_id: str
-    ) -> Optional[st.TestStrengthContract]:
-        """The pin, or `None` when the ledger holds no row for this run.
-
-        A ledger predating the column is a different answer from a ledger with
-        no run: the first pinned nothing because nothing could pin, which is
-        the legacy contract; the second has nothing to say at all.
-        """
-        rows = self._rows("SELECT run_id FROM runs WHERE run_id=?", (run_id,))
-        if not rows:
-            return None
-        return self.test_strength_contract(run_id)
 
     def test_strength_contract(self, run_id: str) -> st.TestStrengthContract:
         """The contract this run was created under. NULL, and a ledger with no

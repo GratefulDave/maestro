@@ -1841,10 +1841,8 @@ class ResumeTests(SchedulerFixture):
         self.store.prepare_late_envelope_recovery("run1", "a", attempt_no)
         self.assertIsNone(self.store.get_node("run1", "a").lane_phase)
 
-        recovered = []
 
-        def recover(reopened, record):
-            recovered.append(record.key)
+        def recover(reopened):
             return sch.NodeExecution(
                 envelope_parsed=True, envelope_payload={"success": True}, exit_code=0
             )
@@ -1857,7 +1855,6 @@ class ResumeTests(SchedulerFixture):
             ),
         ).run()
 
-        self.assertEqual(recovered, [("run1", "a", attempt_no)])
         self.assertEqual(self.store.get_node("run1", "a").attempt_no, attempt_no)
         self.assertIs(self.store.get_node("run1", "a").state, st.NodeState.MERGED)
         self.assertEqual((self.integration / "a.py").read_text(), "late\n")

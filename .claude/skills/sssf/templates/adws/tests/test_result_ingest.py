@@ -114,7 +114,7 @@ class LateEnvelopeRecoveryParserTests(unittest.TestCase):
         self.attempt = type("Attempt", (), {"scratch": self.scratch})()
 
     def _read(self):
-        return maestro._late_agent_execution(self.attempt, record=None)
+        return maestro._late_agent_execution(self.attempt)
 
     def test_only_an_explicit_success_is_recoverable(self):
         payload = {"success": True, "summary": "finished"}

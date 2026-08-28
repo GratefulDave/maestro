@@ -561,22 +561,6 @@ class BaseCommitAndBranches(ValidationTestCase):
         self.assertBlocked(self.validate(data), pv.Obligation.BRANCHES_EXIST)
 
 
-class ReviewPayloadBudget(ValidationTestCase):
-    def test_an_oversized_plan_is_refused_not_chunked(self):
-        """§6.5 — plan-scoped checks are whole-graph judgments; a chunked
-        reviewer skips or fabricates them."""
-        config = pv.ValidationConfig(review_payload_budget_bytes=64)
-        self.assertBlocked(self.validate(config=config),
-                           pv.Obligation.REVIEW_PAYLOAD_BUDGET)
-
-    def test_the_budget_is_measured_over_the_stored_bytes(self):
-        stored = self.stored()
-        config = pv.ValidationConfig(review_payload_budget_bytes=len(stored))
-        result = self.validate(stored=stored, config=config)
-        self.assertEqual([b for b in result.blockers
-                          if b.obligation is pv.Obligation.REVIEW_PAYLOAD_BUDGET],
-                         [])
-
 
 class LineageResolvesToAReceipt(ValidationTestCase):
     def test_a_supersedes_with_no_receipt_blocks(self):

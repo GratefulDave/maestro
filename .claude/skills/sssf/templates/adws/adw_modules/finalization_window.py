@@ -97,7 +97,7 @@ earlier-firing detector at all.
 `time.monotonic` and nothing else. The lifecycle store keeps
 `last_transition_at` in **epoch** seconds, and mixing the two produced a
 real defect earlier in this build, so the window stamps both separately:
-`opened_at_monotonic` is the only value any comparison here reads, while
+`_opened_at_monotonic` is the only value any comparison here reads, while
 `ReviewerSession.opened_at_epoch` exists solely to be handed to the
 tracer row. No public entry point accepts a caller-supplied start time,
 so a caller cannot introduce the mix from outside either.
@@ -317,13 +317,6 @@ class ReportPoller(Protocol):
     def __call__(self) -> Optional[Any]: ...
 
 
-class SessionRecorder(Protocol):
-    """Writes the tracer's reviewer-session row — the durable record that
-    opens the window (§6.5, §11.2)."""
-
-    def __call__(self, session: ReviewerSession) -> None: ...
-
-
 class ReviewerKiller(Protocol):
     """Terminates the reviewer's process group. Called only where the
     group is harness-owned (§6.5, §8.3)."""
@@ -400,7 +393,6 @@ class FinalizationWindow:
         config: FinalizationConfig,
         launch: ReviewerLauncher,
         poll_report: ReportPoller,
-        record_reviewer_session: SessionRecorder,
         kill: ReviewerKiller,
         process_alive: Callable[[int], bool] = DEFAULT_PROCESS_ALIVE,
         transcript_record_count: Callable[[ReviewerSession], int] = (
@@ -412,7 +404,6 @@ class FinalizationWindow:
         self._config = config
         self._launch = launch
         self._poll_report = poll_report
-        self._record_reviewer_session = record_reviewer_session
         self._kill = kill
         self._process_alive = process_alive
         self._transcript_record_count = transcript_record_count
@@ -456,23 +447,15 @@ class FinalizationWindow:
     # ── the span ────────────────────────────────────────────────────────
 
     @property
-    def opened_at_monotonic(self) -> Optional[float]:
-        """The only stamp any timeout in this module compares against."""
-        return self._opened_at_monotonic
-
-    @property
     def session(self) -> Optional[ReviewerSession]:
         return self._session
 
     def open(self) -> ReviewerSession:
-        """Stamp the span clock, launch the reviewer, record the row.
+        """Stamp the span clock and launch the reviewer.
 
         The clock is stamped *before* `launch` is called so that a slow
         launch spends this window's budget rather than running unbounded
-        beside it. The tracer row is written immediately after the launch
-        returns, because the row carries the identity only the launch can
-        supply — and it is written before any poll, so a stall is
-        diagnosable from the store even though no run row exists (§6.5).
+        beside it.
         """
         if self._session is not None:
             raise RuntimeError(
@@ -481,7 +464,6 @@ class FinalizationWindow:
         session = self._launch()
         session.opened_at_epoch = self._wall_clock()
         self._session = session
-        self._record_reviewer_session(session)
         return session
 
     def report_launched(self, pid: Optional[int] = None,

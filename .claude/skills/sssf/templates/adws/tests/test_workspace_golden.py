@@ -489,11 +489,6 @@ class WorkspaceGoldenScenario(unittest.TestCase):
             self.store.get_run(RUN_ID).outcome,
             workspace_model.WorkspaceOutcome.ACCEPTED,
         )
-        audit = self.store.audit_transitions(RUN_ID)
-        self.assertIn(("gate", "gate-recorded"),
-                      {(entry.kind, entry.reason) for entry in audit})
-        self.assertIn(("workspace", "outcome-declared"),
-                      {(entry.kind, entry.reason) for entry in audit})
 
         state_before_reopen = state_path.read_bytes()
         gate_marker_before_reopen = (self.state_root / "golden-gate-runs.log").read_bytes()

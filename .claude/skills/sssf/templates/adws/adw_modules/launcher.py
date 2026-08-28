@@ -1816,42 +1816,6 @@ def prompt_submission_marks(
         return total
 
 
-def prompt_submission_recorded(
-    handle: LaunchHandle, prompt_path: Path, *, chunk_size: int = 64 * 1024
-) -> bool:
-    """Whether the actor transcript durably names this exact prompt submission.
-
-    This is the authoritative proof of submission.  Herdr's revision advance
-    cannot serve as one -- the paste itself repaints the pane, so the counter
-    moves identically for a submitted turn and for a composer still holding the
-    text -- and any live signal would in any case disappear if the scheduler
-    died before its next SQLite write.  The transcript's user-message record
-    is written by the agent runtime only when a turn actually starts, and it
-    survives that gap.  Match the absolute
-    ``@<path>`` bootstrap rather than pane text or a candidate label, and scan
-    in bounded chunks so a long-lived reviewer session is not copied into
-    memory merely to recover its latest dispatch.
-    """
-    transcript = handle.transcript_path
-    if transcript is None:
-        return False
-    marker = ("@" + str(Path(prompt_path).resolve())).encode("utf-8")
-    if chunk_size < len(marker):
-        chunk_size = len(marker)
-    overlap = b""
-    try:
-        with Path(transcript).open("rb") as source:
-            while True:
-                chunk = source.read(chunk_size)
-                if not chunk:
-                    return False
-                window = overlap + chunk
-                if marker in window:
-                    return True
-                overlap = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
-    except OSError:
-        return False
-
 
 def _rising_submission_record(
     handle: LaunchHandle, prompt_path: Path

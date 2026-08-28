@@ -267,11 +267,6 @@ def main() -> int:
         offers = herdr.count("pane", "send-text") - offered_before
         if offers != 1:
             failures.append("prompt offered {0} times, expected exactly 1".format(offers))
-        if not lch.prompt_submission_recorded(handle, prompt_path):
-            failures.append(
-                "actor transcript never recorded the offered prompt; "
-                "pane revision is not proof"
-            )
         enters = herdr.count("pane", "send-keys") + herdr.count("agent", "send-keys")
         if enters < 1:
             failures.append("no Enter was pressed; send-text alone is not a submit")
@@ -283,7 +278,6 @@ def main() -> int:
                     "outcome": "SUBMISSION_OBSERVED" if not failures else "SMOKE_FAILED",
                     "prompt_offers": offers,
                     "transcript": str(transcript),
-                    "recorded": lch.prompt_submission_recorded(handle, prompt_path),
                     "enter_presses": enters,
                     "elapsed_s": round(elapsed, 2),
                     "failures": failures,

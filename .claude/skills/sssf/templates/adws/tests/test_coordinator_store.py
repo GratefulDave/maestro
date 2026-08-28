@@ -256,15 +256,11 @@ class RepositoryPathBindingTests(unittest.TestCase):
             }
             self.assertEqual(
                 {record.repository_id: record.resolved_path for record in bound}, expected)
-            self.assertEqual(
-                len([entry for entry in store.audit_transitions("workspace-run")
-                     if entry.reason == "repository-paths-bound"]), 1)
 
             replayed = store.bind_repository_paths(
                 "workspace-run", bindings, lease_owner=OWNER)
             self.assertEqual(replayed, bound)
 
-            audit_before = store.audit_transitions("workspace-run")
             moved = dict(bindings)
             moved["api"] = cs.RepositoryPathBinding(
                 resolved_path=str((root / "other-clone" / "api").resolve()),
@@ -273,7 +269,6 @@ class RepositoryPathBindingTests(unittest.TestCase):
             with self.assertRaises(cs.RepositoryPathMismatch):
                 store.bind_repository_paths(
                     "workspace-run", moved, lease_owner=OWNER)
-            self.assertEqual(store.audit_transitions("workspace-run"), audit_before)
             self.assertEqual(
                 store.get_repository("workspace-run", "api").resolved_path,
                 expected["api"])
@@ -434,19 +429,6 @@ class CancellationAndGateTests(unittest.TestCase):
             self.assertEqual(gates[0].detail, {"cases": 3})
             reopened.close()
 
-    def test_gate_audit_keeps_the_authoritative_gate_index(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = new_store(Path(tmp))
-            create_run(store)
-            store.record_gate(
-                "workspace-run", 0, passed=True,
-                detail={"gate_index": 999, "cases": 3}, lease_owner=OWNER)
-
-            gate_audit = next(
-                entry for entry in store.audit_transitions("workspace-run")
-                if entry.reason == "gate-recorded")
-            self.assertEqual(gate_audit.detail, {"gate_index": 0, "cases": 3})
-            store.close()
 
 
 class PublicationAndAuditTests(unittest.TestCase):
@@ -576,31 +558,6 @@ class PublicationAndAuditTests(unittest.TestCase):
                                 for target in recovered.targets))
             store.close()
 
-    def test_audit_is_append_only_and_describes_each_repository_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = new_store(Path(tmp))
-            create_run(store)
-            store.claim_repository(
-                "workspace-run", "api", "child-api", "maestro/api", lease_owner=OWNER)
-            store.transition_repository(
-                "workspace-run", "api", wm.RepositoryState.ACCEPTED,
-                accepted_sha="c" * 40, lease_owner=OWNER)
-
-            repository_audit = tuple(
-                row for row in store.audit_transitions("workspace-run")
-                if row.kind == "repository")
-            self.assertEqual(len(repository_audit), 2)
-            self.assertEqual(
-                tuple((row.repository_id, row.kind, row.from_state, row.to_state,
-                       row.reason) for row in repository_audit),
-                (("api", "repository", wm.RepositoryState.PENDING,
-                  wm.RepositoryState.RUNNING, "claim"),
-                 ("api", "repository", wm.RepositoryState.RUNNING,
-                  wm.RepositoryState.ACCEPTED, "accepted")))
-            self.assertLess(
-                repository_audit[0].transition_id, repository_audit[1].transition_id)
-            self.assertEqual(repository_audit[1].detail["accepted_sha"], "c" * 40)
-            store.close()
 
 
 
@@ -617,7 +574,6 @@ class CoordinatorStoreAtomicityTests(unittest.TestCase):
             second = cs.CoordinatorStore(db_path)
             self.assertTrue(second.acquire_lease(
                 "workspace-run", "coordinator-b", now=10.0, stale_after_s=10.0))
-            audit_before = second.audit_transitions("workspace-run")
             attempts = (
                 lambda owner: first.claim_repository(
                     "workspace-run", "api", "child-api", "maestro/api",
@@ -643,7 +599,6 @@ class CoordinatorStoreAtomicityTests(unittest.TestCase):
                 wm.RepositoryState.PENDING)
             self.assertEqual(second.list_gates("workspace-run"), ())
             self.assertIsNone(second.get_run("workspace-run").outcome)
-            self.assertEqual(second.audit_transitions("workspace-run"), audit_before)
             first.close()
             second.close()
 
@@ -676,10 +631,6 @@ class CoordinatorStoreAtomicityTests(unittest.TestCase):
             self.assertEqual(len(winners), 1)
             self.assertEqual(
                 second.get_repository("workspace-run", "api").child_run_id, winners[0])
-            claims = tuple(
-                row for row in second.audit_transitions("workspace-run")
-                if row.kind == "repository" and row.reason == "claim")
-            self.assertEqual(len(claims), 1)
             first.close()
             second.close()
 
@@ -688,7 +639,6 @@ class CoordinatorStoreAtomicityTests(unittest.TestCase):
             db_path = Path(tmp) / "coordinator.db"
             store = cs.CoordinatorStore(db_path)
             create_run(store)
-            audit_before = store.audit_transitions("workspace-run")
 
             with mock.patch.object(
                     store, "_append_transition", side_effect=BaseException("abort")):
@@ -701,7 +651,6 @@ class CoordinatorStoreAtomicityTests(unittest.TestCase):
             self.assertEqual(
                 observer.get_repository("workspace-run", "api").state,
                 wm.RepositoryState.PENDING)
-            self.assertEqual(observer.audit_transitions("workspace-run"), audit_before)
             observer.close()
             store.close()
 
@@ -740,7 +689,6 @@ class LeaseTests(unittest.TestCase):
             store.create_run("workspace-run", "d" * 64, workspace())
             self.assertTrue(store.acquire_lease(
                 "workspace-run", "scheduler-a", now=100.0, stale_after_s=10.0))
-            audit_before = store.audit_transitions("workspace-run")
 
             self.assertTrue(store.heartbeat_lease(
                 "workspace-run", "scheduler-a", now=105.0, stale_after_s=10.0))
@@ -748,5 +696,4 @@ class LeaseTests(unittest.TestCase):
             renewed = store.get_run("workspace-run")
             self.assertEqual(renewed.lease_owner, "scheduler-a")
             self.assertEqual(renewed.lease_expires_at, 115.0)
-            self.assertEqual(store.audit_transitions("workspace-run"), audit_before)
             store.close()

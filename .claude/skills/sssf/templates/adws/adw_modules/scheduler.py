@@ -351,7 +351,7 @@ class SchedulerDeps:
     quiesce_attempt: QuiesceAttempt
     #: Re-read a declaration from an existing attempt; never launches.
     recover_node: Optional[
-        Callable[[wt.AttemptWorktree, st.AttemptRecord], Optional[NodeExecution]]
+        Callable[[wt.AttemptWorktree], Optional[NodeExecution]]
     ] = None
 
     #: The canonical bytes of the plan this run executes, retained on the run.
@@ -2586,7 +2586,7 @@ class Scheduler:
 
         try:
             execution = (
-                None if already_claimed else self.deps.recover_node(attempt, stranded)
+                None if already_claimed else self.deps.recover_node(attempt)
             )
         except (KeyboardInterrupt, SigintInterrupt):
             raise

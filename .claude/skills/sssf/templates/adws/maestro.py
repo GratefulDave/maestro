@@ -2542,7 +2542,6 @@ def _code_review_runner(
                 ),
                 launch=launch_reviewer,
                 poll_report=poll_report,
-                record_reviewer_session=lambda _s: None,
                 kill=lambda _s: close(build_node_id),
                 actor_status=read_status,
             )
@@ -4652,7 +4651,7 @@ def _poll_agent_execution(
 
 
 def _late_agent_execution(
-    attempt: worktree.AttemptWorktree, record: scheduler_types.AttemptRecord
+    attempt: worktree.AttemptWorktree,
 ) -> Optional[scheduler.NodeExecution]:
     """Read a successful declaration from an existing attempt; never launch."""
     envelope = attempt.scratch / "agent-envelope.json"
@@ -4722,7 +4721,7 @@ def _running_late_agent_execution(
         identity = worktree.check_at_create(reopened)
         baseline = store.attempt_baseline(args.run_id, node_id, attempt_no)
         ignored = store.attempt_ignored_at_base(args.run_id, node_id, attempt_no)
-        execution = _late_agent_execution(reopened, record)
+        execution = _late_agent_execution(reopened)
     except (lc.LifecycleError, worktree.WorktreeError) as exc:
         raise _RunRefused(
             "LATE_ENVELOPE_RECOVERY_INVALID",
@@ -5473,7 +5472,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                         ignored = store.attempt_ignored_at_base(
                             args.run_id, node_id, attempt_no
                         )
-                        execution = _late_agent_execution(reopened, record)
+                        execution = _late_agent_execution(reopened)
                     except (lc.LifecycleError, worktree.WorktreeError) as exc:
                         return _refusal(
                             "LATE_ENVELOPE_RECOVERY_INVALID",

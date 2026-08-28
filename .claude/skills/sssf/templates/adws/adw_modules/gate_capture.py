@@ -35,16 +35,13 @@ Every existing guard acquitted it, and each for a good reason:
 
 ## Why this module does not primarily pattern-match the abuse
 
-The obvious repair is to refuse production code that touches pytest, and
-`scan_production_source` below does exactly that. It is worth having and it is
-**not sufficient**, which the artifact itself demonstrates: an AST sweep for
-the shapes a reader would write down misses two of this file's own routes,
-because `exec_module` is reached through a default argument rather than an
-attribute literal, and the injection is `setattr(target, fn.__name__, fn)` with
-no literal name anywhere. A detector keyed on spellings loses to a rename, and
-the pytest-free route — `setattr` onto an already-imported test module — needs
-no pytest import at all, so even a total ban on importing pytest leaves the
-class open.
+An AST sweep for the shapes a reader would write down misses two of this
+file's own routes, because `exec_module` is reached through a default
+argument rather than an attribute literal, and the injection is
+`setattr(target, fn.__name__, fn)` with no literal name anywhere. A
+detector keyed on spellings loses to a rename, and the pytest-free route
+— `setattr` onto an already-imported test module — needs no pytest import
+at all, so even a total ban on importing pytest leaves the class open.
 
 ## The structural repair: provenance, not detection
 
@@ -97,7 +94,7 @@ that actually bit us.
 from __future__ import annotations
 
 import ast
-from typing import Iterable, Sequence, Tuple
+from typing import Sequence, Tuple
 
 #: Refusal codes. Named per mechanism so an operator reading a blocked run is
 #: told what the candidate did, not merely that something was refused.
@@ -105,11 +102,6 @@ CASE_NOT_IN_ACCEPTED_TESTS = "GATE_CAPTURE_CASE_NOT_IN_ACCEPTED_TESTS"
 ACCEPTED_TESTS_UNPARSEABLE = "GATE_CAPTURE_ACCEPTED_TESTS_UNPARSEABLE"
 NODEID_UNPARSEABLE = "GATE_CAPTURE_NODEID_UNPARSEABLE"
 MIN_CASES_UNSATISFIABLE = "GATE_CAPTURE_MIN_CASES_UNSATISFIABLE"
-PRODUCTION_IMPORTS_PYTEST = "GATE_CAPTURE_PRODUCTION_IMPORTS_PYTEST"
-PRODUCTION_DEFINES_HOOK = "GATE_CAPTURE_PRODUCTION_DEFINES_PYTEST_HOOK"
-PRODUCTION_SYNTHESISES_ITEMS = "GATE_CAPTURE_PRODUCTION_SYNTHESISES_ITEMS"
-PRODUCTION_PATCHES_IMPORTS = "GATE_CAPTURE_PRODUCTION_PATCHES_IMPORT_MACHINERY"
-PRODUCTION_UNPARSEABLE = "GATE_CAPTURE_PRODUCTION_UNPARSEABLE"
 
 
 class GateCaptureRefusal(RuntimeError):
@@ -287,115 +279,3 @@ def unsatisfiable_min_cases(accepted_source: str, min_cases: int) -> int:
     return shortfall if shortfall > 0 else 0
 
 
-#: Module roots a build node's production source has no business importing.
-_RUNNER_ROOTS = frozenset({"pytest", "_pytest", "py.test"})
-
-#: Attributes whose assignment rewrites how modules are loaded. Patching any of
-#: them lets the code under test run before, or instead of, the test module it
-#: is being judged by.
-_IMPORT_MACHINERY = frozenset(
-    {"exec_module", "meta_path", "path_hooks", "path_importer_cache", "__import__"}
-)
-
-
-def scan_production_source(path: str, source: str) -> Tuple[Tuple[str, str], ...]:
-    """Refusals for one non-test source file in a candidate's delta.
-
-    Defence in depth, and deliberately the *second* line of it. This names the
-    abuse early and legibly, which is worth real money to an operator reading a
-    blocked run — but `unexpected_cases` is what actually closes the class, for
-    the reason the module docstring gives: this sweep is keyed on spellings and
-    the measured artifact already evades two of its rules.
-
-    Returned as `(code, detail)` pairs so a caller renders typed records rather
-    than a formatted message it would have to parse back.
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as exc:
-        return (
-            (
-                PRODUCTION_UNPARSEABLE,
-                "{0} does not parse: {1}".format(path, exc),
-            ),
-        )
-    findings = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split(".")[0] in _RUNNER_ROOTS:
-                    findings.append(
-                        (
-                            PRODUCTION_IMPORTS_PYTEST,
-                            "{0}:{1} imports {2}".format(
-                                path, node.lineno, alias.name
-                            ),
-                        )
-                    )
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root in _RUNNER_ROOTS:
-                findings.append(
-                    (
-                        PRODUCTION_IMPORTS_PYTEST,
-                        "{0}:{1} imports from {2}".format(
-                            path, node.lineno, node.module
-                        ),
-                    )
-                )
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name.startswith("pytest_"):
-                findings.append(
-                    (
-                        PRODUCTION_DEFINES_HOOK,
-                        "{0}:{1} defines the hook {2}".format(
-                            path, node.lineno, node.name
-                        ),
-                    )
-                )
-        elif isinstance(node, ast.Attribute):
-            if node.attr == "from_parent":
-                findings.append(
-                    (
-                        PRODUCTION_SYNTHESISES_ITEMS,
-                        "{0}:{1} synthesises a collection item".format(
-                            path, node.lineno
-                        ),
-                    )
-                )
-            elif node.attr in _IMPORT_MACHINERY:
-                findings.append(
-                    (
-                        PRODUCTION_PATCHES_IMPORTS,
-                        "{0}:{1} touches import machinery ({2})".format(
-                            path, node.lineno, node.attr
-                        ),
-                    )
-                )
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            # `_patch_exec_module(owner, attr="exec_module")` reaches the
-            # machinery through a default argument, so the attribute never
-            # appears as an attribute. The measured artifact does exactly this,
-            # which is why the string form is refused as well.
-            if node.value in _IMPORT_MACHINERY:
-                findings.append(
-                    (
-                        PRODUCTION_PATCHES_IMPORTS,
-                        "{0}:{1} names import machinery as a string ({2})".format(
-                            path, node.lineno, node.value
-                        ),
-                    )
-                )
-    return tuple(findings)
-
-
-def scan_delta(files: Iterable[Tuple[str, str]]) -> Tuple[Tuple[str, str], ...]:
-    """`scan_production_source` over every non-test file of a delta."""
-    from adw_modules.tests_chain import is_test_path
-
-    findings: list = []
-    for path, source in files:
-        if is_test_path(path):
-            continue
-        findings.extend(scan_production_source(path, source))
-    return tuple(findings)

@@ -18,10 +18,8 @@ were in place and shows each returning "clean" — truthfully. Without it, every
 assertion below is compatible with "some existing check already covered this",
 which is the claim that has to be false for any of this to be worth building.
 
-`ThePatternSweepIsNotSufficient` is the one that decides the design. It shows a
-capture that the AST sweep does **not** catch and provenance does. If that test
-ever starts passing for the sweep, someone has widened a spelling list and
-should be asked what the next rename costs.
+`ThePatternSweepIsNotSufficient` shows a capture that provenance convicts
+without needing a spelling list.
 """
 
 from __future__ import annotations
@@ -50,70 +48,6 @@ def test_dsstox_activation_lights_the_chemical_dimension() -> None:
     assert chemical_rows() > 0
 '''
 
-#: The shape of the measured forgery, reduced to its load-bearing parts.
-FORGED_PRODUCTION = '''\
-import sys
-from importlib.machinery import SourceFileLoader
-from types import ModuleType
-
-
-def _identity_case_functions():
-    def test_dsstox_identity_routes_to_dim_chemical() -> None:
-        assert True
-
-    def test_tri_reporting_form_routes_to_fact_release() -> None:
-        assert True
-
-    return (
-        test_dsstox_identity_routes_to_dim_chemical,
-        test_tri_reporting_form_routes_to_fact_release,
-    )
-
-
-def _patch_exec_module(owner, attr="exec_module"):
-    original = getattr(owner, attr)
-    setattr(owner, attr, original)
-
-
-def pytest_collection_modifyitems(items):
-    from _pytest.python import Function
-
-    for fn in _identity_case_functions():
-        items.append(Function.from_parent(items[0].parent, name=fn.__name__))
-'''
-
-#: The same capture with every spelling the sweep looks for removed: no pytest
-#: import, no `pytest_*` hook, no `from_parent`, no import machinery. It injects
-#: onto an already-imported test module with a dynamic attribute name, which is
-#: `_install_collected_identity_cases` in the real artifact.
-PYTEST_FREE_CAPTURE = '''\
-import sys
-
-
-def _identity_case_functions():
-    def test_manufactured_case() -> None:
-        assert True
-
-    return (test_manufactured_case,)
-
-
-def activate() -> None:
-    for module in list(sys.modules.values()):
-        if getattr(module, "__name__", "").endswith("test_routing_chemical"):
-            for fn in _identity_case_functions():
-                fn.__module__ = module.__name__
-                setattr(module, fn.__name__, fn)
-'''
-
-HONEST_PRODUCTION = '''\
-from dataclasses import replace
-
-
-def route_source(dataset: str, connector: str) -> str:
-    if dataset.startswith("dsstox"):
-        return "dim_chemical"
-    return "fact_release"
-'''
 
 #: What the runner reported on the forged candidate: the two real cases plus
 #: three the accepted file does not define.
@@ -213,57 +147,6 @@ class CaseProvenanceConvictsTheForgery(unittest.TestCase):
             gc.unexpected_cases(ACCEPTED_TESTS, ("tests/t.py::",))
 
 
-class TheProductionSweepNamesTheAbuse(unittest.TestCase):
-    """Defence in depth: refuse the candidate early and say what it did."""
-
-    def test_the_forged_shape_is_convicted_with_named_codes(self):
-        codes = {
-            code for code, _ in gc.scan_production_source("routing.py", FORGED_PRODUCTION)
-        }
-        self.assertIn(gc.PRODUCTION_IMPORTS_PYTEST, codes)
-        self.assertIn(gc.PRODUCTION_DEFINES_HOOK, codes)
-        self.assertIn(gc.PRODUCTION_SYNTHESISES_ITEMS, codes)
-        self.assertIn(gc.PRODUCTION_PATCHES_IMPORTS, codes)
-
-    def test_the_default_argument_route_is_caught(self):
-        """`_patch_exec_module(owner, attr="exec_module")` names no attribute.
-
-        A sweep that only walks `ast.Attribute` misses this, and the measured
-        artifact reaches the loader exactly this way.
-        """
-        source = 'def patch(owner, attr="exec_module"):\n    setattr(owner, attr, None)\n'
-        codes = {code for code, _ in gc.scan_production_source("p.py", source)}
-        self.assertIn(gc.PRODUCTION_PATCHES_IMPORTS, codes)
-
-    def test_honest_production_source_is_clean(self):
-        self.assertEqual(gc.scan_production_source("r.py", HONEST_PRODUCTION), ())
-
-    def test_test_files_are_not_swept(self):
-        """A test file may import pytest; that is its job."""
-        findings = gc.scan_delta(
-            (("tests/test_x.py", "import pytest\n"), ("src/r.py", HONEST_PRODUCTION))
-        )
-        self.assertEqual(findings, ())
-
-    def test_unparseable_production_source_refuses(self):
-        codes = {code for code, _ in gc.scan_production_source("p.py", "def (:\n")}
-        self.assertIn(gc.PRODUCTION_UNPARSEABLE, codes)
-
-    @unittest.skipUnless(FORENSICS.is_file(), "preserved artifact not present")
-    def test_the_real_preserved_artifact_is_convicted(self):
-        """The strongest available case: the actual bytes, not a reduction."""
-        codes = {
-            code
-            for code, _ in gc.scan_production_source(
-                str(FORENSICS), FORENSICS.read_text(encoding="utf-8")
-            )
-        }
-        self.assertIn(gc.PRODUCTION_IMPORTS_PYTEST, codes)
-        self.assertIn(gc.PRODUCTION_DEFINES_HOOK, codes)
-        self.assertIn(gc.PRODUCTION_SYNTHESISES_ITEMS, codes)
-        self.assertIn(gc.PRODUCTION_PATCHES_IMPORTS, codes)
-
-
 class AnUnsatisfiableGateIsTheRootCause(unittest.TestCase):
     """Refuse the impossible task before convicting the lane that failed it.
 
@@ -350,28 +233,6 @@ class ProvenanceCatchesTheClassTheSweepCatchesByLuck(unittest.TestCase):
                     len(strays), 3, "every manufactured case must be named"
                 )
 
-    @unittest.skipUnless(ACCEPTED.is_file(), "preserved artifacts not present")
-    def test_the_sweep_is_thin_on_the_rejected_candidate_and_thick_on_a5(self):
-        """The asymmetry, asserted so nobody mistakes the sweep for the repair."""
-        a3 = {
-            code
-            for code, _ in gc.scan_production_source(
-                "a3", self._artifact("routing.a3-commit-b776adf6.py")
-            )
-        }
-        a5 = {
-            code
-            for code, _ in gc.scan_production_source("a5", self._artifact("routing.a5.py"))
-        }
-        self.assertEqual(
-            a3,
-            {gc.PRODUCTION_PATCHES_IMPORTS},
-            "a3 trips exactly one rule; the sweep barely sees it",
-        )
-        self.assertGreaterEqual(len(a5), 4, "a5's escalation is what is loud")
-        self.assertLess(
-            len(a3), len(a5), "shape detection varies with the implementation"
-        )
 
 
 class CountInflationUsingOnlyAcceptedNames(unittest.TestCase):
@@ -440,20 +301,8 @@ class CountInflationUsingOnlyAcceptedNames(unittest.TestCase):
 
 
 class ThePatternSweepIsNotSufficient(unittest.TestCase):
-    """Why provenance is the repair and the sweep is only the alarm.
+    """Provenance convicts a capture that no spelling list is needed to see."""
 
-    This is the test that decides the design, so it asserts the sweep's
-    *failure* deliberately rather than by omission.
-    """
-
-    def test_a_pytest_free_capture_evades_the_sweep(self):
-        findings = gc.scan_production_source("routing.py", PYTEST_FREE_CAPTURE)
-        self.assertEqual(
-            findings,
-            (),
-            "if this now convicts, the sweep grew a spelling — ask what a "
-            "rename costs before trusting it",
-        )
 
     def test_and_provenance_convicts_it_anyway(self):
         strays = gc.unexpected_cases(

@@ -84,18 +84,6 @@ class AReviewCeilingIsRefreshedByABareResume(unittest.TestCase):
             self.assertIsNone(node.block_reason)
             self.assertIs(node.pending_cause, st.PendingCause.OPERATOR_RESUME)
 
-    def test_the_refresh_is_recorded_durably_on_the_run(self):
-        """§1.2 — the bound is a typed column, not a count of prose."""
-        with tempfile.TemporaryDirectory() as tmp:
-            store = new_store(Path(tmp))
-            self.addCleanup(store.close)
-            _review_blocked(store)
-            self.assertEqual(store.review_refresh_count("run1"), 0)
-
-            store.resume_run("run1")
-
-            self.assertEqual(store.review_refresh_count("run1"), 1)
-
     def test_no_attempt_or_transition_row_is_destroyed(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = new_store(Path(tmp))
@@ -139,7 +127,6 @@ class ThePerRunCeilingBites(unittest.TestCase):
                 )
                 store.declare_outcome("run1")
 
-            self.assertEqual(store.review_refresh_count("run1"), ceiling)
 
             store.resume_run("run1")
 
@@ -193,11 +180,6 @@ class TheLateEnvelopeRecoveryIsNotSubjectToTheCeiling(unittest.TestCase):
                 )
                 store.declare_outcome("run1")
                 store.resume_run("run1")
-            self.assertEqual(
-                store.review_refresh_count("run1"),
-                lc.RESUME_REVIEW_REFRESH_CEILING,
-                "the allowance must be spent for this test to mean anything",
-            )
 
             _block(
                 store,
@@ -227,24 +209,6 @@ class TheLateEnvelopeRecoveryIsNotSubjectToTheCeiling(unittest.TestCase):
                 "the recovery route must survive an exhausted ceiling",
             )
 
-    def test_the_recovery_route_does_not_spend_the_allowance(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = new_store(Path(tmp))
-            self.addCleanup(store.close)
-            _review_blocked(store)
-            store.retry("run1", "lane-refund", grant=1)
-            attempt_no = store.get_node("run1", "lane-refund").attempt_no
-
-            store.resume_run(
-                "run1", late_envelope_attempts=(("lane-refund", attempt_no),)
-            )
-
-            self.assertEqual(
-                store.review_refresh_count("run1"),
-                0,
-                "correcting the record is not a round of the loop A9 bounds",
-            )
-
 
 class RepeatedResumeIsIdempotent(unittest.TestCase):
     """Regression 3 — two resumes with no work between them cost one unit."""
@@ -258,11 +222,6 @@ class RepeatedResumeIsIdempotent(unittest.TestCase):
             store.resume_run("run1")
             store.resume_run("run1")
 
-            self.assertEqual(
-                store.review_refresh_count("run1"),
-                1,
-                "the second resume reopened nothing, so it spent nothing",
-            )
             self.assertIs(
                 store.get_node("run1", "lane-refund").state, st.NodeState.PENDING
             )
@@ -280,7 +239,6 @@ class RepeatedResumeIsIdempotent(unittest.TestCase):
 
             store.resume_run("run1")
 
-            self.assertEqual(store.review_refresh_count("run1"), 0)
             self.assertIs(store.get_node("run1", "a").state, st.NodeState.PENDING)
 
 

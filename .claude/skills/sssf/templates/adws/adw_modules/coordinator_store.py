@@ -468,13 +468,6 @@ class CoordinatorStore:
     def get_run(self, run_id: str) -> WorkspaceRunRecord:
         return self._get_run(run_id)
 
-    @serialized
-    def list_runs(self) -> Tuple[WorkspaceRunRecord, ...]:
-        rows = self.conn.execute(
-            "SELECT run_id, workspace_id, workspace_digest, workspace_json, outcome,"
-            " cancel_requested, created_at, lease_owner, lease_expires_at"
-            " FROM workspace_runs ORDER BY run_id").fetchall()
-        return tuple(self._run_from_row(row) for row in rows)
 
     @serialized
     def get_repository(self, run_id: str, repository_id: str) -> RepositoryRecord:
@@ -1084,17 +1077,6 @@ class CoordinatorStore:
             "SELECT id, run_id, repository_id, from_state, to_state, detail_json, created_at"
             " FROM publication_steps WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
         return tuple(self._publication_step_from_row(row) for row in rows)
-
-    # ── audit and lease ───────────────────────────────────────────────────
-
-    @serialized
-    def audit_transitions(self, run_id: str) -> Tuple[TransitionRecord, ...]:
-        self._require_run(run_id)
-        rows = self.conn.execute(
-            "SELECT id, run_id, repository_id, kind, from_state, to_state, reason, actor,"
-            " detail_json, created_at FROM coordinator_transitions"
-            " WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
-        return tuple(self._transition_from_row(row) for row in rows)
 
     @transactional_mutation
     def acquire_lease(self, run_id: str, owner: str, now: float,
