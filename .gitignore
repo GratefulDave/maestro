@@ -154,6 +154,14 @@ adws/adw_data/sessions/
 # of which would have stamped a fake trace db into every target repo.
 sssf.db*
 
+# Claude Skills
+.claude/skills/*
+# ...except the sssf factory. Its template tree IS what the factory ships from
+# and is deliberately tracked (236 files). Ignoring it does not untrack those,
+# so nothing looks wrong — but every NEW runtime file under it becomes invisible
+# to `git add`, which is exactly the silent-loss shape CLAUDE.md records.
+!.claude/skills/sssf/
+
 # demo app runtime (example branch)
 apps/inkwell/inkwell.db*
 scratchpad/*
