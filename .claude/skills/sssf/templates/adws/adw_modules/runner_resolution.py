@@ -109,6 +109,27 @@ COLLECT_ARGS: Dict[str, Tuple[str, ...]] = {
     "vitest": ("list", "--run"),
 }
 
+#: The flags each runner needs to EXECUTE cases once, without its binary, and
+#: the exact counterpart of `COLLECT_ARGS` above.
+#:
+#: `plan_contract_ingress._parse_verifier_command` strips the `run`
+#: sub-command out of an authored `npx vitest run <paths>`, because the runner
+#: is `vitest` and `run` is that runner's mode rather than part of the gate's
+#: argv. Collection re-supplied its own mode through `COLLECT_ARGS`;
+#: execution re-supplied nothing, so every vitest gate executed as bare
+#: `vitest <paths>` -- which is vitest's WATCH mode. It ran the cases, printed
+#: the report, and then sat forever waiting for a file to change. The gate
+#: never returned, the pre-gate never finished, no agent pane was ever
+#: allocated, and on `run-9d03105407f440079f3730f1fe4c67b3` every attempt of
+#: `lane-wp6-build` died at the harness timeout without once launching.
+#:
+#: pytest has no such mode and its entry is empty on purpose: the table is
+#: keyed by runner so the asymmetry is visible rather than implied.
+EXECUTE_ARGS: Dict[str, Tuple[str, ...]] = {
+    "pytest": (),
+    "vitest": ("run",),
+}
+
 #: The capability probe: walk the whole tree, select nothing. Decoupled from
 #: the plan's selectors on purpose — see the module docstring for why the
 #: gate's own exit code cannot answer this question.
@@ -240,8 +261,21 @@ class ResolvedRunner:
 
     def execute_argv(self, argv: Sequence[str]) -> Tuple[str, ...]:
         """The execution invocation. `argv` is the gate's own argv tail: the
-        binary is this object's to decide and never the caller's to supply."""
-        return self.argv_prefix + tuple(argv)
+        binary *and the runner's own mode* are this object's to decide and
+        never the caller's to supply.
+
+        `EXECUTE_ARGS` is what makes the second half of that sentence true.
+        Without it this returned `vitest <paths>`, which is watch mode, and a
+        gate that never terminates is indistinguishable from a hung agent.
+        """
+        tail = tuple(argv)
+        mode = EXECUTE_ARGS[self.runner]
+        # An argv that already opens with the mode keeps exactly one copy of
+        # it. The ingress strips `run` today, but a gate reaching here with it
+        # still attached must execute, not fail on `vitest run run <paths>`.
+        if mode and tail[:len(mode)] == mode:
+            mode = ()
+        return self.argv_prefix + mode + tail
 
     def record(self) -> Dict[str, Any]:
         return {
