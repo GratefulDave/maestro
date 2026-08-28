@@ -153,8 +153,55 @@ def case_name_of(nodeid: str) -> str:
     return tail.split("[", 1)[0].strip()
 
 
+class _PytestReader:
+    """The Python-AST reader, kept as the default for every existing caller.
+
+    Extraction moved onto `tests_chain.CaseRunner`, because which names a file
+    defines and which part of a node id is the case name are facts about one
+    runner's language and id shape. This module held only the pytest answer
+    and applied it to every candidate: a vitest lane's TypeScript went through
+    `ast.parse`, raised `SyntaxError` on an apostrophe in a comment, and was
+    refused as an unreadable *machine* fault on every attempt until the node's
+    environmental budget was gone (§19, `run-9d03105407f440079f3730f1fe4c67b3`).
+
+    Callers that pass no runner still get exactly this, so a pytest gate is
+    byte-for-byte unchanged.
+    """
+
+    def defined_case_names(self, source: str) -> frozenset:
+        return case_names_defined(source)
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        return parametrised_case_names(source)
+
+    def case_name_of(self, nodeid: str) -> str:
+        return case_name_of(nodeid)
+
+
+def _reader(runner: object) -> object:
+    """The extraction surface for one runner, or pytest's when none is given.
+
+    A runner is accepted duck-typed rather than imported: `tests_chain`
+    already imports nothing from here, and taking the object keeps it that
+    way while making the dispatch explicit at the call site.
+    """
+    if runner is None:
+        return _PytestReader()
+    for name in ("defined_case_names", "parametrised_case_names",
+                 "case_name_of"):
+        if not callable(getattr(runner, name, None)):
+            raise GateCaptureRefusal(
+                "{0}: {1!r} cannot read the case names its own gate reports; "
+                "a runner that collects must also be able to say which names "
+                "its accepted source defines".format(
+                    ACCEPTED_TESTS_UNPARSEABLE, getattr(runner, "name", runner))
+            )
+    return runner
+
+
 def unexpected_cases(
-    accepted_source: str, reported_nodeids: Sequence[str]
+    accepted_source: str, reported_nodeids: Sequence[str],
+    runner: object = None,
 ) -> Tuple[str, ...]:
     """Reported cases the accepted test bytes do not define.
 
@@ -168,9 +215,10 @@ def unexpected_cases(
     nothing, and treating "no names" as "no violations" would admit exactly the
     candidate this exists to refuse.
     """
+    reader = _reader(runner)
     try:
-        defined = case_names_defined(accepted_source)
-        parametrised = parametrised_case_names(accepted_source)
+        defined = reader.defined_case_names(accepted_source)
+        parametrised = reader.parametrised_case_names(accepted_source)
     except SyntaxError as exc:
         raise GateCaptureRefusal(
             "{0}: the accepted test candidate does not parse ({1})".format(
@@ -181,7 +229,7 @@ def unexpected_cases(
     seen = set()
     for nodeid in reported_nodeids:
         text = str(nodeid)
-        name = case_name_of(text)
+        name = reader.case_name_of(text)
         # 1. A name the reviewed file does not define at all.
         if name not in defined:
             strays.append(text)
@@ -246,7 +294,8 @@ def parametrised_case_names(source: str) -> frozenset:
     return frozenset(names)
 
 
-def unsatisfiable_min_cases(accepted_source: str, min_cases: int) -> int:
+def unsatisfiable_min_cases(accepted_source: str, min_cases: int,
+                            runner: object = None) -> int:
     """The shortfall when a gate demands more cases than the tests define.
 
     **This is the root cause of the forgery `unexpected_cases` refuses, and it
@@ -268,7 +317,7 @@ def unsatisfiable_min_cases(accepted_source: str, min_cases: int) -> int:
     reason `unexpected_cases` does.
     """
     try:
-        defined = case_names_defined(accepted_source)
+        defined = _reader(runner).defined_case_names(accepted_source)
     except SyntaxError as exc:
         raise GateCaptureRefusal(
             "{0}: the accepted test candidate does not parse ({1})".format(

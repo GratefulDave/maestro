@@ -745,9 +745,51 @@ class CaseRunner:
             timeout_s: float = 300.0) -> CaseRun:
         raise NotImplementedError
 
+    # ── reading a test file's own case names ────────────────────────────────
+    #
+    # `gate_capture` compares the case ids a runner *reported* against the
+    # names the *accepted* test bytes define, and that comparison needs two
+    # things this class already knows how to be right about: which names a
+    # source file defines, and which part of a node id is the case name.
+    #
+    # They live here rather than in `gate_capture` because both answers are
+    # facts about one runner's language and id shape, and `gate_capture` held
+    # only the pytest answer: it parsed every accepted candidate with
+    # CPython's `ast.parse`. A TypeScript file is not Python, so on
+    # `run-9d03105407f440079f3730f1fe4c67b3` the parse raised `SyntaxError`
+    # for an apostrophe in a comment, the pairing check refused
+    # `TEST_PAIRING_TEST_TREE_UNREADABLE` -- "this names the machine, not the
+    # diff" -- and three retries of that refusal exhausted the node's
+    # environmental budget and blocked the run. No vitest build lane could
+    # ever have passed it.
+
+    def defined_case_names(self, source: str) -> frozenset:
+        """Every case name the source defines. May raise `SyntaxError`."""
+        raise NotImplementedError
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        """Names whose single definition can report more than one case."""
+        raise NotImplementedError
+
+    def case_name_of(self, nodeid: str) -> str:
+        """The case name inside one reported node id."""
+        raise NotImplementedError
+
 
 class PytestCaseRunner(CaseRunner):
     name = "pytest"
+
+    def defined_case_names(self, source: str) -> frozenset:
+        from . import gate_capture
+        return gate_capture.case_names_defined(source)
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        from . import gate_capture
+        return gate_capture.parametrised_case_names(source)
+
+    def case_name_of(self, nodeid: str) -> str:
+        from . import gate_capture
+        return gate_capture.case_name_of(nodeid)
 
     def collect(self, tree: Path, paths: Sequence[str],
                 timeout_s: float = 120.0) -> Tuple[str, ...]:
@@ -785,6 +827,89 @@ class VitestCaseRunner(CaseRunner):
     """
 
     name = "vitest"
+
+    #: One `it`/`test` call whose title is the first argument. Modifiers
+    #: (`.only`, `.skip`, `.concurrent`, `.todo`, `.fails`) are captured in
+    #: group 1 so a modifier cannot hide a case, and the title's own quote
+    #: style is captured so the closing quote is the matching one -- an
+    #: apostrophe inside a double-quoted title must not end it.
+    #:
+    #: `.each` is excluded here and matched separately below, because it does
+    #: not have this shape at all: `it.each(table)("title")` is curried, so
+    #: the first argument is the table and the title belongs to a *second*
+    #: call. Matched by this pattern it does not match anything, which is
+    #: worse than misclassifying it -- the case would be invisible to
+    #: `defined_case_names` and every row it reports would read as a stray.
+    _CASE = re.compile(
+        r"""\b(?:it|test)((?:\.(?!each\b)\w+)*)\s*\(\s*"""
+        r"""(['"`])(.*?)(?<!\\)\2""",
+        re.DOTALL,
+    )
+
+    #: The curried `.each` form, in both of its spellings: an array table
+    #: `it.each([...])("title")` and a template table ``it.each`…`("title")``.
+    #: The gap before the title is bounded by `;` so a table that fails to
+    #: close cannot swallow the next case's title along with it.
+    _EACH = re.compile(
+        r"""\b(?:it|test)(?:\.\w+)*\.each\b[^;]*?\)\s*\(\s*"""
+        r"""(['"`])(.*?)(?<!\\)\1""",
+        re.DOTALL,
+    )
+
+    def defined_case_names(self, source: str) -> frozenset:
+        """Every `it`/`test` title the source declares.
+
+        Read from the source text rather than from a syntax tree, and that is
+        a deliberate limit rather than an oversight: this process has no
+        TypeScript parser, shelling out to one would put a `node` invocation
+        on the pairing path of every attempt, and the question being asked is
+        only which titles the file declares. A title is a literal at the head
+        of a call, which the text carries exactly.
+
+        What this cannot see is a title that is not a literal -- a variable, a
+        concatenation, an interpolated template. Those are reported by the
+        runner under their computed name and would read as strays, so a
+        template literal carrying `${` is treated as parametrised below,
+        exactly as pytest's `parametrize` is: one definition, many reported
+        names, none of them predictable from the source.
+        """
+        return frozenset(
+            [match.group(3) for match in self._CASE.finditer(source)]
+            + [match.group(2) for match in self._EACH.finditer(source)]
+        )
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        """Titles that can report under a name the source does not spell.
+
+        Two shapes: `it.each([...])("...")`, whose title is a format string
+        vitest fills in per row, and any title carrying `${`, which the
+        runtime interpolates. Both are the vitest analogue of pytest's
+        `parametrize`, and `gate_capture` exempts them from the membership
+        test for the same reason it exempts that.
+        """
+        found = {match.group(2) for match in self._EACH.finditer(source)}
+        for match in self._CASE.finditer(source):
+            _modifiers, _quote, title = match.groups()
+            if "${" in title:
+                found.add(title)
+        return frozenset(found)
+
+    def case_name_of(self, nodeid: str) -> str:
+        """The title inside a vitest node id.
+
+        `parse_vitest_list` builds `<file>::<suite> > <suite> > <title>` and
+        `_vitest_case_name` joins the ancestors with the same `" > "`, so the
+        title is the last such segment. Splitting on `::` first drops the file,
+        which may itself contain no separator at all.
+        """
+        tail = str(nodeid).rsplit("::", 1)[-1].strip()
+        if not tail:
+            from . import gate_capture
+            raise gate_capture.GateCaptureRefusal(
+                "{0}:{1!r} carries no case name".format(
+                    gate_capture.NODEID_UNPARSEABLE, nodeid)
+            )
+        return tail.rsplit(" > ", 1)[-1].strip()
 
     def _prefix(self) -> Tuple[str, ...]:
         found = shutil.which("vitest")

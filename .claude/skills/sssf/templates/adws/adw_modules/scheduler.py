@@ -3251,8 +3251,12 @@ class Scheduler:
                 if accepted_bytes is None:
                     continue
                 try:
+                    # The runner is the one already resolved from the
+                    # accepted candidate above, so the names are read in the
+                    # language the tests are written in rather than in Python.
                     strays = gate_capture.unexpected_cases(
-                        accepted_bytes.decode("utf-8", "replace"), collected)
+                        accepted_bytes.decode("utf-8", "replace"), collected,
+                        runner)
                 except gate_capture.GateCaptureRefusal as exc:
                     return self._pairing_refused(
                         tc.PairingRefusal.UNREADABLE, str(exc),
@@ -3283,7 +3287,7 @@ class Scheduler:
                 # against a test candidate defining 2.
                 shortfall = gate_capture.unsatisfiable_min_cases(
                     accepted_bytes.decode("utf-8", "replace"),
-                    node.gate_min_cases)
+                    node.gate_min_cases, runner)
                 if shortfall:
                     return self._pairing_refused(
                         tc.PairingRefusal.GATE_NOT_GREEN,
