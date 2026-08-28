@@ -529,6 +529,10 @@ class TheOrdinaryRejectionRemainsAuthoritativeTest(TheReviewLaneFixture):
             {
                 st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
                 st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED,
+                # This lane scripts a constant reviewer, so every round carries
+                # byte-identical findings and the M49 identity now stops it on
+                # the truer reason rather than letting it spend the ceiling.
+                st.BlockReason.SEMANTIC_REFUSAL_REPEATED,
             },
         )
 

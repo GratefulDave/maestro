@@ -976,9 +976,6 @@ class Scheduler:
         #: Findings from the review that exhausted a node's budget, kept so the
         #: run report can surface *why* rather than only that a count ran out.
         self._review_findings: Dict[str, str] = {}
-        #: Findings-per-attempt per node, appended on every review rejection
-        #: and rebuilt from the store by `project`.
-        self._review_convergence: Dict[str, List[int]] = {}
         #: `node_id -> every harness-hygiene fact observed about that node`.
         #: Two surfaces write here — §8.3's pre-merge residue report and
         #: §8.8's cleanup refusal — and they **accumulate** rather than
@@ -1237,9 +1234,6 @@ class Scheduler:
         for build_node_id, attempt in latest_attempts.items():
             if self._review_for_build(build_node_id) is not None:
                 self._refresh_lane_guidance(build_node_id, attempt)
-        self._review_convergence = rp.review_convergence_from_reviews(
-            self.deps.store.candidate_reviews(self.run_id, limit=10_000)
-        )
         self._projected = True
 
     def cancel(self) -> None:
@@ -4326,8 +4320,13 @@ class Scheduler:
                 node.node_id, st.LanePhase.WAITING_FOR_NEW_CANDIDATE, record
             )
             return False
-        self._review_convergence.setdefault(node.node_id, []).append(
-            len(durable_review.findings)
+        # Read before this rejection's spend is written, so the window is
+        # the prior rejections (§7.5 refusal repetition).
+        current_refusal = _review_refusal(
+            durable_review.findings, candidate.candidate_sha
+        )
+        repeats = self._review_refusal_repeats(
+            node.node_id, review_node.node_id, candidate.candidate_sha, current_refusal
         )
         self._review_findings[node.node_id] = "\n".join(
             str(finding.get("message", "")) for finding in durable_review.findings
@@ -4346,30 +4345,41 @@ class Scheduler:
             },
         )
         guidance = self._refresh_lane_guidance(node.node_id, record)
-        if not allowed:
+        if not allowed or repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
             self._close_persistent_reviewer(node.node_id, record)
             self._settle_context(context)
             self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+            detail: Dict[str, Any] = {
+                "candidate_sha": candidate.candidate_sha,
+                "findings": list(durable_review.findings),
+                # Which budget ran out, named in the detail rather than in
+                # a second BlockReason. The operator escape is identical
+                # for both -- grant this lane more attempts -- so a second
+                # terminal vocabulary entry would be two names for one
+                # exit, while an operator still needs to know whether the
+                # loop that failed to converge was the tester's or the
+                # builder's.
+                "retry_class": (
+                    st.LaneRetryClass.TEST_REVIEW_REJECTION.value
+                    if node.kind is st.NodeKind.TESTS
+                    else st.LaneRetryClass.REVIEW_REJECTION.value
+                ),
+            }
+            if repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
+                # The reviewer's located findings are byte-identical to the
+                # ones the previous candidate was rejected on, so the repair
+                # prompt this rejection would produce is the prompt that
+                # already failed. Named ahead of the budget reason because it
+                # is the truer cause: this lane did not run out of attempts,
+                # it stopped moving, and "budget exhausted" would send an
+                # operator to grant more of exactly what was not the problem
+                # (§7.5).
+                reason = st.BlockReason.SEMANTIC_REFUSAL_REPEATED
+                detail = rp.repeated_refusal_detail(detail, current_refusal, repeats)
+            else:
+                reason = st.BlockReason.REVIEW_BUDGET_EXHAUSTED
             self.deps.store.mark_blocked(
-                self.run_id,
-                node.node_id,
-                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                detail={
-                    "candidate_sha": candidate.candidate_sha,
-                    "findings": list(durable_review.findings),
-                    # Which budget ran out, named in the detail rather than in
-                    # a second BlockReason. The operator escape is identical
-                    # for both -- grant this lane more attempts -- so a second
-                    # terminal vocabulary entry would be two names for one
-                    # exit, while an operator still needs to know whether the
-                    # loop that failed to converge was the tester's or the
-                    # builder's.
-                    "retry_class": (
-                        st.LaneRetryClass.TEST_REVIEW_REJECTION.value
-                        if node.kind is st.NodeKind.TESTS
-                        else st.LaneRetryClass.REVIEW_REJECTION.value
-                    ),
-                },
+                self.run_id, node.node_id, reason, detail=detail
             )
             return False
         repair_basis = rp.RepairBasis(
@@ -4872,6 +4882,46 @@ class Scheduler:
         )
         return rp.refusal_repetition(history, current)
 
+    def _review_refusal_repeats(
+        self,
+        node_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        current: rp.VerificationGuidance,
+    ) -> int:
+        """§7.5 refusal repetition over a lane's floored review rejections.
+
+        The review half of `_lane_refusal_repeats`, and the same predicate.
+        Only the history differs, because a rejection is durable on the
+        candidate review row rather than in a spend's detail. The window is
+        still the floored lane spends, so the operator boundary the budgets
+        honour is honoured here too: `retry --force` forgives the identity
+        chain along with the spend, and a replayed handoff after one is
+        compared against nothing rather than re-blocking before dispatch.
+
+        The current rejection is excluded by its candidate sha. Unlike the two
+        verification sites, this runs *after* the refusal is durable, and a
+        replay re-enters on the very row being compared.
+        """
+        store = self.deps.store
+        window = {
+            spend.candidate_sha
+            for spend in store.current_lane_retry_spends(
+                self.run_id, node_id, limit=10_000
+            )
+            if spend.retry_class in _REVIEW_REJECTION_CLASSES
+        }
+        history = [
+            _review_refusal(review.findings, review.candidate_sha)
+            for review in store.candidate_reviews(
+                self.run_id, review_node_id, limit=10_000
+            )
+            if review.verdict is st.ReviewVerdict.REJECTED
+            and review.candidate_sha != candidate_sha
+            and review.candidate_sha in window
+        ]
+        return rp.refusal_repetition(history, current)
+
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """Enforce the cumulative semantic ceiling across every attempt base.
 
@@ -5142,9 +5192,16 @@ class Scheduler:
             # dropping its findings here would be the only place they were
             # ever going to be read from.
             review_findings=dict(self._review_findings),
+            # Projected here rather than accumulated in memory. A dict the
+            # scheduler appended to on every rejection and `project` rebuilt
+            # from the store on every resume was a second representation of
+            # what `candidate_reviews` already holds, and the two could only
+            # ever agree by copying (§4).
             review_convergence={
                 node_id: tuple(counts)
-                for node_id, counts in self._review_convergence.items()
+                for node_id, counts in rp.review_convergence_from_reviews(
+                    store.candidate_reviews(self.run_id, limit=10_000)
+                ).items()
             },
             review_nodes={
                 node_id: state
@@ -5307,6 +5364,76 @@ def _is_merged(store, run_id: str, node_id: str) -> bool:
     return any(
         r.node_id == node_id and r.state == st.NodeState.MERGED.value
         for r in store.node_records(run_id)
+    )
+
+
+#: The lane retry classes a reviewer's rejection spends. Both name the same
+#: event -- a candidate refused on its findings -- so both bound the window
+#: inside which "the reviewer has said this before" holds.
+_REVIEW_REJECTION_CLASSES = (
+    st.LaneRetryClass.REVIEW_REJECTION,
+    st.LaneRetryClass.TEST_REVIEW_REJECTION,
+)
+
+#: Stamped on the refusal built from a rejection so `rp.refusal_repetition`
+#: admits it at all: that predicate refuses an identity claim from any surface
+#: that has not declared its refusal deterministic. Independent node review is
+#: §1.2's one typed semantic adjudication boundary, and the immutable,
+#: candidate-SHA-bound findings it rejects with are that declaration.
+_REVIEW_REFUSAL_CODE = "REVIEW_REJECTED"
+
+
+#: Stands in for the reviewed candidate's sha wherever a finding quotes it.
+#: `review_objects` names the diff object `diff:<output_sha>`, so the object
+#: id of every `diff.*` finding -- which is most of the blocking ones --
+#: differs on every round *by construction*, for the same reason
+#: `review_digest` does: the sha is what changed. Left in, it would make two
+#: byte-identical verdicts unequal and the check could never fire; taken out,
+#: what remains is the rubric cell, the object's identity, the grade, and
+#: what the reviewer said about it.
+_CANDIDATE_PLACEHOLDER = "<candidate>"
+
+
+def _review_refusal(
+    findings: Sequence[Mapping[str, Any]], candidate_sha: str
+) -> rp.VerificationGuidance:
+    """One rejection as the typed refusal `rp.refusal_repetition` compares.
+
+    Keyed on the located findings -- rubric cell, object, grade, and the
+    message that cell carries -- with the candidate sha masked out of all
+    four, and on nothing else. Not `review_digest`, the reviewer generation,
+    or a completion time.
+
+    The message is in the key because it *narrows* it. The typed cells alone
+    say "the same rubric check failed on the same object again", which is
+    what an honest repair loop looks like halfway to converging; stopping on
+    that would collapse ordinary iteration to two attempts, which is the
+    hazard §7.5 names when it refuses identity to a coarse refusal. Requiring
+    the reviewer to have said byte-identically the same thing about the same
+    cell is the non-convergence proof, and every field of it is read out of
+    the same immutable receipt record the rejection itself is adjudicated
+    from -- never from pane text, prompt text, or an agent's claim about its
+    own work (§1.2).
+    """
+
+    def cell(finding: Mapping[str, Any]) -> str:
+        rendered = "|".join(
+            # Declared value, not repr: `grade` arrives as the enum on the
+            # write path the rejection returns and as its JSON string when the
+            # same row is read back, and two spellings of one grade would make
+            # every comparison across that boundary unequal.
+            str(getattr(finding.get(field, ""), "value", finding.get(field, "")))
+            for field in ("check_id", "object_id", "grade", "message")
+        )
+        return (
+            rendered.replace(candidate_sha, _CANDIDATE_PLACEHOLDER)
+            if candidate_sha
+            else rendered
+        )
+
+    return rp.VerificationGuidance(
+        reason="\n".join(cell(finding) for finding in findings),
+        refusal_code=_REVIEW_REFUSAL_CODE,
     )
 
 

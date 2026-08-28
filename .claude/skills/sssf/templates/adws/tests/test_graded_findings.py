@@ -757,7 +757,13 @@ class SubThresholdFindingsStillMergeTest(SchedulerFixture):
         self.assertEqual(report.outcome, st.RunOutcome.BLOCKED)
         self.assertEqual(st.NodeState.BLOCKED.value, self.states()["build"])
         node = self.store.get_node("run1", "build")
-        self.assertIs(node.block_reason, st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED)
+        # The scripted reviewer is constant, so the second rejection carries
+        # findings byte-identical to the first. M49's identity now stops the
+        # lane there, on the reason that is true — the loop was not converging
+        # — instead of spending the ceiling and reporting exhaustion, which
+        # reads as though the content had failed. The lane still blocks, still
+        # does not merge, and still records both reviews.
+        self.assertIs(node.block_reason, st.BlockReason.SEMANTIC_REFUSAL_REPEATED)
         self.assertEqual(len(self.store.attempts_for("run1", "build")), 1)
         spends = self.store.lane_retry_spends("run1", "build", limit=100)
         self.assertEqual(
@@ -765,9 +771,9 @@ class SubThresholdFindingsStillMergeTest(SchedulerFixture):
             [
                 st.LaneRetryClass.REVIEW_REJECTION,
                 st.LaneRetryClass.REVIEW_REJECTION,
-                st.LaneRetryClass.SEMANTIC,
-                st.LaneRetryClass.SEMANTIC,
             ],
+            "the two SEMANTIC rows were the empty-delta repair failures (#113) "
+            "that followed; the lane no longer reaches them",
         )
         self.assertEqual(closed, ["build"])
         self.assertNotIn("build", report.merged)
