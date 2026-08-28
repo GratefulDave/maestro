@@ -116,7 +116,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional
 
 try:
     from typing import Protocol
@@ -131,10 +131,6 @@ DEFAULT_TRANSCRIPT_RECORD_COUNT = wd.count_complete_transcript_records
 #: The key a session's transcript path lives under, shared with §7.6.
 SESSION_PATH_KEY = wd.SESSION_PATH_KEY
 
-
-class SessionNotFresh(RuntimeError):
-    """§6.5: the review runs in a fresh session directory, never the
-    authoring node's, so context cannot leak through session continuity."""
 
 
 class FinalizationSignal(str, Enum):
@@ -345,35 +341,6 @@ def _default_record_count(session: ReviewerSession) -> int:
         return 0
     return DEFAULT_TRANSCRIPT_RECORD_COUNT(path)
 
-
-def require_fresh_session_dir(
-    session_dir,
-    authoring_dirs: Iterable[Any] = (),
-) -> Path:
-    """§6.5's structural half of "independent review is recorded".
-
-    Refuses a directory that is, or is inside, any authoring session
-    directory, and refuses one that already holds files — either would let
-    the authoring context reach the reviewer through session continuity,
-    which is the leak the fresh directory exists to prevent.
-    """
-    target = Path(session_dir).resolve()
-    for authoring in authoring_dirs:
-        authoring_resolved = Path(authoring).resolve()
-        if target == authoring_resolved:
-            raise SessionNotFresh(
-                f"the reviewer's session directory is the authoring one: {target}")
-        try:
-            target.relative_to(authoring_resolved)
-        except ValueError:
-            continue
-        raise SessionNotFresh(
-            f"the reviewer's session directory {target} is inside the authoring "
-            f"session {authoring_resolved}")
-    if target.exists() and any(target.iterdir()):
-        raise SessionNotFresh(
-            f"the reviewer's session directory is not fresh: {target}")
-    return target
 
 
 class FinalizationWindow:

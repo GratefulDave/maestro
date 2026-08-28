@@ -224,13 +224,6 @@ class WorkspacePublisher:
         for target in intent.targets:
             self._validate_target_branch(target.target_branch)
 
-    def prepare(self, run_id: str) -> cs.PublicationIntentRecord:
-        """Preflight all writable targets before creating the one durable intent."""
-        self._validate_persisted_target_branches(run_id)
-        with self._exclusive_publication_lock():
-            with self._publication_lease(run_id):
-                return self._prepare_unlocked(run_id)
-
     def _prepare_unlocked(self, run_id: str) -> cs.PublicationIntentRecord:
         """Create an intent only after every writable target is preflighted."""
         self._require_persisted_repository_paths(run_id)

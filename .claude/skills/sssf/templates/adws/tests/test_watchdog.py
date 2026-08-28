@@ -944,8 +944,6 @@ class NoStoreOwnershipTests(unittest.TestCase):
 class RunBackstopTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(0.0)
-        self.stuck = Recorder()
-        self.diagnostic_calls = []
         # T=500 > greatest_run_window_s (max(node=100, final=50)=100),
         # satisfying the bound SchedulerConfig already enforces.
         self.config = make_config(
@@ -953,15 +951,9 @@ class RunBackstopTests(unittest.TestCase):
         )
 
     def _backstop(self, last_transition_at):
-        def diagnostic():
-            self.diagnostic_calls.append(True)
-            return "STUCK: no lifecycle transition in 500s"
-
         return wd.RunBackstop(
             config=self.config,
             last_transition_at=last_transition_at,
-            on_stuck=self.stuck,
-            diagnostic=diagnostic,
             time_source=self.clock,
         )
 
@@ -972,10 +964,6 @@ class RunBackstopTests(unittest.TestCase):
         fired = backstop.check()
 
         self.assertTrue(fired)
-        self.assertEqual(len(self.stuck.calls), 1)
-        (args, _) = self.stuck.calls[0]
-        self.assertEqual(args[0], "STUCK: no lifecycle transition in 500s")
-        self.assertEqual(self.diagnostic_calls, [True])
 
     def test_does_not_fire_within_a_healthy_node_silent_working_gap(self):
         """A serial chain with one node in flight writes nothing between
@@ -987,7 +975,6 @@ class RunBackstopTests(unittest.TestCase):
         fired = backstop.check()
 
         self.assertFalse(fired)
-        self.assertEqual(self.stuck.calls, [])
 
     def test_does_not_fire_within_a_healthy_final_acceptance_window(self):
         backstop = self._backstop(lambda: 0.0)

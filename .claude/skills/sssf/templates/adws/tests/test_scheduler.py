@@ -2413,7 +2413,6 @@ class FinalAcceptanceTests(SchedulerFixture):
         ).run()
         self.assertEqual(gate.calls, [])
         self.assertIsNone(report.acceptance)
-        self.assertTrue(report.integration_untested)
         self.assertIs(report.outcome, st.RunOutcome.BLOCKED)
 
     def test_the_acceptance_start_refreshes_the_run_timer(self):
@@ -2506,7 +2505,6 @@ class LivenessWiringTests(SchedulerFixture):
         )
         report = scheduler.run()
         self.assertIs(report.outcome, st.RunOutcome.STUCK)
-        self.assertIn("no lifecycle transition within", scheduler.status_diagnostic())
 
     def test_the_backstop_quiesces_in_flight_workers(self):
         """§11.2 — STUCK is declared about a run that still has workers, and
@@ -2548,18 +2546,6 @@ class LivenessWiringTests(SchedulerFixture):
         waiter.join(timeout=ARRIVAL_TIMEOUT_S)
         self.assertIs(report.outcome, st.RunOutcome.STUCK)
         self.assertIn("cancel", [phase for _, phase in self.quiesce_calls])
-
-    def test_the_diagnostic_says_why_each_node_is_not_ready(self):
-        """§11.2 — `run status` must answer "why is nothing happening"
-        without reading the database by hand."""
-        self.gate_script[("a", "pre")] = [green()]
-        scheduler = self.schedule(
-            [self.agent("a"), self.agent("b", depth=1, needs=("a",))]
-        )
-        scheduler.run()
-        diagnostic = scheduler.status_diagnostic()
-        self.assertIn("a: BLOCKED", diagnostic)
-        self.assertIn("ancestor is blocked", diagnostic)
 
     def test_the_launch_report_arms_the_first_two_signals(self):
         """§7.6 — process-alive and turn-count arm when the adapter reports

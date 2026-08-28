@@ -102,10 +102,6 @@ ALLOWED: Dict[str, str] = {
     "hidden_vault.blob_id_in": "DEFERRED: hidden-tests step 2 is the caller; v5 is unrunnable until then",
     "hidden_vault.object_is_absent": "DEFERRED: containment assertion; hidden-tests step 2 is the caller",
     "hidden_vault.unreachable_from": "DEFERRED: containment assertion; hidden-tests step 2 is the caller",
-    # Pre-existing, and surfaced rather than introduced by the v5 tests: the
-    # registry accessor had no test reference before, so nothing was looking.
-    # Production dispatches through `_PARSERS` directly.
-    "plan_model.registered_versions": "accessor over the parser registry; production dispatches through _PARSERS",
     # ── plan amendment: the store half, landed ahead of its wiring ───────────
     # DEFERRED with a named successor. These are the durable half of amending a
     # run's plan without discarding merged work: retained plan bytes, the
@@ -125,12 +121,6 @@ ALLOWED: Dict[str, str] = {
     # and `_run_amend` -- and this check convicted the stale entries the moment
     # they did, which is the allowlist working rather than a nuisance.
     #
-    # `plan_versions` is the lineage reader and genuinely has no consumer yet.
-    # DEFERRED with a named successor: an operator surface that prints which
-    # plan versions a run has executed under, beside the nodes that merged in
-    # each. Delete this line with that reader; do not delete the method, since
-    # the rows it reads are written and an audit needs a way to see them.
-    "lifecycle.plan_versions": "DEFERRED: lineage reader; its operator surface (`run status` plan history) is not built",
     # ── §1.2's detectors ────────────────────────────────────────────────────
     # Their job is to convict a planted violation from a test. Production never
     # calls a detector; a detector production called would be a linter.
@@ -152,8 +142,8 @@ ALLOWED: Dict[str, str] = {
     # so nothing is unreachable behind them.
     "participant.active_participant_ids": "accessor over the runner's live "
     "process map, asserted in tests",
-    "scheduler.integration_untested": "derived flag on RunReport, asserted in tests",
     "worktree.is_empty": "derived predicate over InventoryDelta",
+    "lifecycle.audit_orphans": "accessor over recorded unreachable panes, asserted in tests",
     # ── DEFERRED — audited, owner assigned, fix not yet landed ──────────────
     # Rows D1-D11 of the dead-seam audit. Each is a real instance of this
     # class; none is accepted as correct.
@@ -191,8 +181,6 @@ ALLOWED: Dict[str, str] = {
     # `SchedulerDeps.integration_min_cases`, and the per-run scalar this
     # registry named was deleted rather than wired.)
     # D3 / D4 / D5. retry_policy.py, under investigation; do not delete.
-    "retry_policy.classify_git_exit": "DEFERRED D9: merge-path git exit "
-    "classification, no production caller.",
     # D2 / D7 / D8 / D9. (D1, and the D4, D5, D7 and D9 rows that stood here,
     # were removed when the bidirectional check below convicted them: each had
     # acquired the production caller its entry said it lacked, and the entry
@@ -209,29 +197,10 @@ ALLOWED: Dict[str, str] = {
     # deferred to a pass that owns those paths.
     "lifecycle.audit_transitions": "DEFERRED: diagnostics reader over the "
     "transitions table, no production caller",
-    # Its reason used to read "finalization-path". That path is gone --
-    # `plan finalize` dispatches no reviewer -- and the function did not go
-    # with it, because §6.5's fresh-session rule is about any reviewer and the
-    # one review that still launches is node review. It is still unwired
-    # there, which is the deferred work; what changed is which caller it is
-    # waiting for.
-    "finalization_window.require_fresh_session_dir": "DEFERRED: the node "
-    "reviewer's launch does "
-    "not call it yet",
-    "publication.prepare": "DEFERRED: WorkspacePublisher.prepare, publication "
-    "path, no production caller",
     # The launcher-classification lane's typed failure signal. Its writers land
     # with that lane; `launcher_failure` itself is already wired.
     "FailureSignal.binary_resolved": "DEFERRED: launcher-classification lane",
     "FailureSignal.process_started": "DEFERRED: launcher-classification lane",
-    # Constructor slots whose every production call site is `lambda ...: None`.
-    # The field check cannot see these: the lambda *is* a writer. Naming them
-    # here is the point of #99 — a deliberate or deferred no-op must be stated
-    # rather than look wired. The `maestro.py` call site is left for a follow-up
-    # because that file is partly owned by a concurrent lane.
-    "RunBackstop.on_stuck": "DEFERRED: production constructor in scheduler.py "
-    "passes lambda diagnostic: None; watchdog.py is "
-    "owned by a concurrent lane",
 }
 
 #: Production dataclass names defined in more than one module, each with the

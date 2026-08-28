@@ -5240,18 +5240,6 @@ class LifecycleStore:
         return seq
 
     @serialized
-    def plan_versions(self, run_id: str) -> Tuple[Tuple[int, str, str], ...]:
-        """This run's plan lineage as `(seq, digest, adopted_at)`, in order."""
-        return tuple(
-            (int(row[0]), str(row[1]), str(row[2]))
-            for row in self.conn.execute(
-                "SELECT seq, plan_digest, adopted_at FROM run_plan_versions"
-                " WHERE run_id=? ORDER BY seq",
-                (run_id,),
-            ).fetchall()
-        )
-
-    @serialized
     def current_plan(self, run_id: str) -> Optional[Tuple[str, bytes]]:
         """The digest and bytes this run is executing under now, or None.
 

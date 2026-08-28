@@ -1120,9 +1120,6 @@ def parser_for(version: str) -> Type[BaseModel]:
             (("/schema_version", "unregistered schema version"),))
 
 
-def registered_versions() -> Tuple[str, ...]:
-    return tuple(sorted(_PARSERS))
-
 
 register_parser(SCHEMA_V1, Plan)
 register_parser(SCHEMA_V2, PlanV2)

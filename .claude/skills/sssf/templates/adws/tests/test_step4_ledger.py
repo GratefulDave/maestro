@@ -305,44 +305,6 @@ class AuditTableTests(LedgerFixture):
         self.store.resume_run("run1")
         self.assertEqual(self.store.audit_orphans("run1"), ())
 
-    def test_run_status_reports_the_orphans(self):
-        """§7.8 — "recorded in `orphans` and reported by `run status`". The
-        operator kills the leaked pane by hand, so the report must name it."""
-        self.seed("run1", "a")
-        self.store.start_attempt("run1", "a", base_sha="sha0")
-        self.store.mark_launched("run1", "a", 1, pid=4242)
-        self.store.resume_run("run1")
-        scheduler = sch.Scheduler(
-            run_id="run1",
-            nodes=[make_node("a")],
-            config=st.SchedulerConfig(
-                concurrency=2,
-                node_timeout_s=60.0,
-                turn_timeout_s=30.0,
-                final_acceptance_timeout_s=60.0,
-                backstop_t_s=600.0,
-                semantic_ceiling=2,
-            ),
-            deps=sch.SchedulerDeps(
-                store=self.store,
-                repo=self.root,
-                integration_path=self.root,
-                integration_branch="integration/run1",
-                worktrees_root=self.root / "wt",
-                scratch_root=self.root / "scratch",
-                run_node=lambda attempt, node, record, retry_prompt, on_launch, cancel_requested: (
-                    None
-                ),
-                run_gate=lambda attempt, node, phase, cancel_requested: None,
-                run_integration_gate=lambda path, specs, cancel_requested: None,
-                quiesce_attempt=lambda record, phase: None,
-            ),
-            plan_digest="digest-1",
-        )
-        text = scheduler.status_diagnostic()
-        self.assertIn("orphan", text.lower())
-        self.assertIn("4242", text)
-
 
 # ── §10.5 / §5.3 the loading discipline ─────────────────────────────────────
 

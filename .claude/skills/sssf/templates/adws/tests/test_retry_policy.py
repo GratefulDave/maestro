@@ -273,25 +273,6 @@ class SemanticBudgetTests(unittest.TestCase):
             cfg, "n1", attempts, lifecycle.granted_extra_attempts))
 
 
-# ── §7.5 git results: only the documented not-found exit code is a fact ─────
-
-class GitClassificationTests(unittest.TestCase):
-
-    def test_zero_exit_is_present(self):
-        self.assertEqual(rp.classify_git_exit(0, not_found_exit_code=1), rp.GitResult.PRESENT)
-
-    def test_documented_not_found_code_is_absent(self):
-        self.assertEqual(rp.classify_git_exit(1, not_found_exit_code=1), rp.GitResult.ABSENT)
-
-    def test_every_other_nonzero_exit_is_environmental_never_absent(self):
-        """A transient git failure must never be recorded as a missing
-        object — the same principle as 'no report can ever be semantic',
-        applied to git (§7.5)."""
-        for exit_code in (128, 2, 255):
-            self.assertEqual(rp.classify_git_exit(exit_code, not_found_exit_code=1),
-                             rp.GitResult.ENVIRONMENTAL_FAILURE)
-
-
 # ── §7.5 AST detector #1: no comparison against process output text ─────────
 
 class OutputComparisonDetectorTests(unittest.TestCase):

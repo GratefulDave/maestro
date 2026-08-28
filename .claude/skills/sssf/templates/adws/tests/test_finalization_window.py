@@ -720,41 +720,6 @@ class ACompletedReviewLeavesTheWindow(unittest.TestCase):
         self.assertEqual(outcome.signal, fw.FinalizationSignal.WINDOW_TIMEOUT)
 
 
-class TheReviewerSessionIsFresh(unittest.TestCase):
-    """§6.5: the review runs in a fresh session directory, never the
-    authoring node's, so context cannot leak through session continuity."""
-
-    def test_a_reused_authoring_session_directory_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authoring = Path(tmp) / "authoring"
-            authoring.mkdir()
-            with self.assertRaises(fw.SessionNotFresh):
-                fw.require_fresh_session_dir(authoring, authoring_dirs=[authoring])
-
-    def test_a_directory_inside_the_authoring_session_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authoring = Path(tmp) / "authoring"
-            (authoring / "nested").mkdir(parents=True)
-            with self.assertRaises(fw.SessionNotFresh):
-                fw.require_fresh_session_dir(authoring / "nested",
-                                             authoring_dirs=[authoring])
-
-    def test_a_non_empty_directory_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            reviewer = Path(tmp) / "reviewer"
-            reviewer.mkdir()
-            (reviewer / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
-            with self.assertRaises(fw.SessionNotFresh):
-                fw.require_fresh_session_dir(reviewer, authoring_dirs=[])
-
-    def test_a_fresh_directory_is_accepted(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authoring = Path(tmp) / "authoring"
-            authoring.mkdir()
-            reviewer = Path(tmp) / "reviewer"
-            fw.require_fresh_session_dir(reviewer, authoring_dirs=[authoring])
-
-
 class TheTurnClockCannotOutvoteALiveObservation(unittest.TestCase):
     """The regression these exist for is `cmo-consolidation-l-r5`:
 

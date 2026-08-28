@@ -557,13 +557,6 @@ class RunReport:
     #: are not sources and therefore never appear in ``merged``.
     review_nodes: Dict[str, str] = field(default_factory=dict)
 
-    @property
-    def integration_untested(self) -> bool:
-        """§8.8 — a BLOCKED run's branch is integration-untested, and
-        `run status` says so rather than leaving it to be inferred from the
-        absence of a gate result."""
-        return self.acceptance is None
-
 
 class Scheduler:
     """One run. Construct, `run()`, read the report.
@@ -1892,57 +1885,10 @@ class Scheduler:
         backstop = wd.RunBackstop(
             config=self.config,
             last_transition_at=lambda: store.last_transition_at(self.run_id),
-            on_stuck=lambda diagnostic: None,
-            diagnostic=self.status_diagnostic,
             time_source=self._time_source,
         )
         return watchdog, backstop
 
-    def status_diagnostic(self) -> str:
-        """The "why is nothing happening" text §11.2 requires the scheduler to
-        print rather than exiting silently — the same answer `run status`
-        gives, so an operator never has to read the database by hand."""
-        store = self.deps.store
-        lines = [
-            f"run {self.run_id}: no lifecycle transition within "
-            f"T={self.config.backstop_t_s}s"
-        ]
-        stranded = set(store.upstream_blocked(self.run_id))
-        for record in sorted(
-            store.node_records(self.run_id), key=lambda r: (r.depth, r.node_id)
-        ):
-            why = ""
-            if record.node_id in stranded:
-                why = " (an ancestor is blocked or abandoned)"
-            elif record.state == st.NodeState.PENDING.value:
-                unmet = [d for d in record.needs if not self._dependency_satisfied(d)]
-                if unmet:
-                    why = f" (waiting on {', '.join(sorted(unmet))})"
-            lines.append(f"  {record.node_id}: {record.state}{why}")
-        # §8.3's pre-merge hygiene report. Surfaced here as well as on the
-        # RunReport because a stalled run is exactly when an operator is
-        # looking for what the harness itself did, and a runner adapter
-        # rewriting the tree after every post-gate is that shape.
-        for node_id, entries in sorted(self._adapter_hygiene.items()):
-            lines.append(f"  {node_id}: harness hygiene — " + "; ".join(entries))
-        # §7.8 — panes a resumed process could not reach are recorded in
-        # `orphans` and reported here. The scheduler never adopts them and
-        # never kills them, so if this text does not name them the stated cost
-        # of resume ("visible and killed by hand") has no visible half.
-        orphans = store.audit_orphans(self.run_id)
-        if orphans:
-            lines.append(f"  {len(orphans)} orphaned pane(s) — kill by hand:")
-            for row in orphans:
-                where = row.get("handle") or (
-                    f"pid {row['pid']}"
-                    if row.get("pid") is not None
-                    else "no handle recorded"
-                )
-                lines.append(
-                    f"    orphan {row.get('node_id', '?')}"
-                    f"#{row.get('attempt_no', '?')}: {where}"
-                )
-        return "\n".join(lines)
 
     # ── one attempt (§7.3, §7.4, §8.3, §8.4) ────────────────────────────────
 

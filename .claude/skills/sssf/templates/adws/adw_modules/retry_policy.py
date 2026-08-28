@@ -1211,33 +1211,6 @@ def render_guidance(
     return "\n".join(rendered)
 
 
-# ── §7.5 git results: only the documented not-found exit code is a fact ─────
-
-
-class GitResult(str, Enum):
-    """ "No report can ever be semantic" applied to git rather than to agents:
-    only git's own documented not-found exit code means the object is absent.
-    Every other nonzero exit is ENVIRONMENTAL, never a fact about the
-    repository."""
-
-    PRESENT = "PRESENT"
-    ABSENT = "ABSENT"
-    ENVIRONMENTAL_FAILURE = "ENVIRONMENTAL_FAILURE"
-
-
-def classify_git_exit(exit_code: int, not_found_exit_code: int) -> GitResult:
-    """§7.5 — the one-line fix: absence is an equality check against the
-    documented not-found code, and nothing else is ever read as absence. A
-    transient git failure must never be recorded as a missing object, because
-    every eligibility obligation that reads git objects would then silently
-    return a wrong answer instead of failing.
-    """
-    if exit_code == 0:
-        return GitResult.PRESENT
-    if exit_code == not_found_exit_code:
-        return GitResult.ABSENT
-    return GitResult.ENVIRONMENTAL_FAILURE
-
 
 # ── §7.5 AST detector #1: no comparison against process output text ─────────
 
