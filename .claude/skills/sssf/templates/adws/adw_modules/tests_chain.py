@@ -203,13 +203,20 @@ def new_nodeids(parent: Sequence[str], current: Sequence[str]) -> Tuple[str, ...
 
 
 def collect_parent_nodeids(tree: Path, commit: str, paths: Sequence[str],
-                           timeout_s: float = 120.0) -> Tuple[str, ...]:
+                           timeout_s: float = 120.0,
+                           runner: Optional["CaseRunner"] = None
+                           ) -> Tuple[str, ...]:
     """Cases collected from `paths` as they existed at `commit`.
 
     A path absent from that tree contributes nothing, so a newly created
     test file has no parent nodeids. A modified line in an existing file
     keeps the parent nodeids, which is how "new case" is distinguished
     from "edited line".
+
+    `runner` is the gate's own case runner. Omitting it collects with pytest,
+    which is only correct for a pytest gate: `RunnerUnsupported` already
+    states why measuring a vitest node with pytest is refused rather than
+    defaulted, and this is the same measurement one commit earlier.
     """
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -222,6 +229,8 @@ def collect_parent_nodeids(tree: Path, commit: str, paths: Sequence[str],
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(blob)
             present.append(path)
+        if runner is not None:
+            return runner.collect(root, present, timeout_s=timeout_s)
         return collect_nodeids(root, present, timeout_s=timeout_s)
 
 
@@ -780,6 +789,44 @@ def case_runner(name: str) -> CaseRunner:
             "{0}: {1} cannot resolve cases for this runner; supported: "
             "{2}".format(StrengthRefusal.RUNNER_UNSUPPORTED.value, name,
                          ", ".join(sorted(_RUNNERS)))) from None
+
+
+def run_cases_for(runner: CaseRunner, tree: Path, nodeids: Sequence[str],
+                  timeout_s: float = 300.0) -> "wt.GateResult":
+    """`run_cases`, but under the gate's own runner.
+
+    Clause 4 of the tests chain adjudicates a `GateResult`, and `run_cases`
+    can only produce one by driving pytest. That made the whole clause-3/4
+    chain pytest-only while the strength contract beside it was already
+    runner-dispatched, and on `run-8a200af7f9044ce7a11a51b6908f37e3` a vitest
+    tests node was collected with pytest, yielded zero nodeids, and refused
+    `TESTS_NO_NEW_CASES` on every attempt — the exact silent-zero failure
+    `RunnerUnsupported` documents, reached through the one path that had no
+    runner to refuse with. The pytest arm still runs `run_cases` verbatim so
+    its evidence is unchanged; every other runner is resolved through its
+    `CaseRun`, whose per-case outcomes carry the same five counts.
+
+    `collection_failed` maps to empty counts, which `GateCounts.parse` reads
+    as "no report" rather than "zero cases" — the distinction clause 4 needs
+    to call a collection failure environmental instead of red.
+    """
+    if isinstance(runner, PytestCaseRunner):
+        return run_cases(tree, nodeids, timeout_s=timeout_s)
+    executed = runner.run(tree, nodeids, timeout_s=timeout_s)
+    counts: dict = {}
+    if not executed.collection_failed:
+        counts = {
+            "collected": len(executed.outcomes),
+            "passed": executed.passed,
+            "failed": executed.failed,
+            "skipped": executed.skipped,
+            "errored": executed.errored,
+        }
+    return wt.GateResult(
+        label="parent-red", scope="node", selector=" ".join(nodeids),
+        command=tuple(executed.command),
+        exit_code=executed.exit_code, green=executed.exit_code == 0,
+        counts=counts, tail=tuple(executed.tail))
 
 
 def parse_pytest_outcomes(output: str,

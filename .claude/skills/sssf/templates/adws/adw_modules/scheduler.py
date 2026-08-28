@@ -2943,16 +2943,38 @@ class Scheduler:
         """Tests-node evidence: new cases, each red at this attempt's base.
 
         The worktree *is* the parent commit plus the tests this node wrote,
-        so running the new nodeids here is the parent-red check. Collection
-        uses `--collect-only -q -o addopts=`; a collection error or import
-        crash is not a satisfying red. Newly created test files have no
-        parent nodeids, which is the ordinary case this chain is for.
+        so running the new nodeids here is the parent-red check. A collection
+        error or import crash is not a satisfying red. Newly created test
+        files have no parent nodeids, which is the ordinary case this chain
+        is for.
+
+        The selector lives on the written test files rather than on the gate
+        command, but the *runner* does not: collection and execution are
+        dispatched on `node.gate_command[0]`, exactly as the strength contract
+        below does. Measuring with pytest whatever the gate declared is the
+        silent-zero `tc.RunnerUnsupported` exists to refuse, and reaching it
+        through this path instead reported `TESTS_NO_NEW_CASES` about a vitest
+        node on every attempt — a refusal no edit to the tests could satisfy,
+        so the node never merged and its derived reviewer never dispatched.
         """
-        del node  # selector lives on the written test files, not the command
-        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
-        current = tc.collect_nodeids(attempt.path, test_paths)
+        runner_name = node.gate_command[0] if node.gate_command else ""
         try:
-            parent = tc.collect_parent_nodeids(attempt.path, attempt.base, test_paths)
+            runner = tc.case_runner(runner_name)
+        except tc.RunnerUnsupported as exc:
+            return vf.VerificationVerdict(
+                verified=False,
+                failed_clause=3,
+                reason=str(exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+                refusal_code=tc.StrengthRefusal.RUNNER_UNSUPPORTED.value,
+                remedy=tc.StrengthRefusal.RUNNER_UNSUPPORTED.remedy,
+            )
+        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
+        current = runner.collect(attempt.path, test_paths)
+        try:
+            parent = tc.collect_parent_nodeids(
+                attempt.path, attempt.base, test_paths, runner=runner
+            )
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
                 verified=False,
@@ -2963,7 +2985,7 @@ class Scheduler:
                 remedy=tc.TestsRefusal.COLLECTION_FAILED.remedy,
             )
         new = tc.new_nodeids(parent, current)
-        parent_run = tc.run_cases(attempt.path, new)
+        parent_run = tc.run_cases_for(runner, attempt.path, new)
         return tc.adjudicate_parent_red(parent_run, len(new))
 
     def _tests_prerequisites(self, node: st.PlanNode) -> Tuple[st.PlanNode, ...]:
@@ -3222,7 +3244,7 @@ class Scheduler:
         try:
             current = runner.collect(attempt.path, test_paths)
             parent = tc.collect_parent_nodeids(
-                attempt.path, attempt.base, test_paths)
+                attempt.path, attempt.base, test_paths, runner=runner)
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
                 verified=False, failed_clause=3,
