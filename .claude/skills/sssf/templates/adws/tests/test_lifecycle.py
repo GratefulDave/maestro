@@ -1714,6 +1714,25 @@ class OutcomeRecordAndLegalityTests(unittest.TestCase):
             self.assertIn("resume:no-evidence-recorded", reasons)
             self.assertEqual([r for r in reasons if r.startswith("retry:")], [])
 
+    def test_no_evidence_resume_clears_a_terminal_lane_phase(self):
+        """Second live hang: resume:no-evidence-recorded left lane_phase
+        BLOCKED, so the fresh attempt's BUILDING CAS stranded RUNNING.
+        Without the clear, `set_lane_phase(BUILDING)` returns False."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = new_store(Path(tmp))
+            self.addCleanup(store.close)
+            store.create_run("run1", "d", [make_node("a", 0)])
+            store.start_attempt("run1", "a", base_sha="s1")
+            self.assertTrue(
+                store.set_lane_phase("run1", "a", st.LanePhase.BLOCKED)
+            )
+            store.resume_run("run1")
+            self.assertIsNone(store.get_node("run1", "a").lane_phase)
+            store.start_attempt("run1", "a", base_sha="s2")
+            self.assertTrue(
+                store.set_lane_phase("run1", "a", st.LanePhase.BUILDING)
+            )
+
     def test_repeated_restarts_cannot_exhaust_a_budget_they_did_not_spend(self):
         """The incident, in miniature: `lane-wp6-tests` in
         `run-8a200af7f9044ce7a11a51b6908f37e3` reached 2 of 2 environmental

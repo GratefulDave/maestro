@@ -6804,9 +6804,18 @@ class LifecycleStore:
                 # Guarded on the exact state *and* the exact block reason, so
                 # a node that moved between the eligibility read and this
                 # write is left alone rather than reopened on a stale premise.
+                #
+                # `lane_phase` is the other authority a quiescence block
+                # terminalizes. `prepare_late_envelope_recovery` already
+                # reopens both in one transaction: leaving the lane BLOCKED
+                # makes the recovered worker lose its first `_set_lane_phase`
+                # CAS and strand the node RUNNING after its future returns.
+                # This path is the same shape for an attempt that never ran,
+                # so the next generation's BUILDING CAS is an initial write
+                # (NULL), never a reopen of BLOCKED.
                 reopened = self.conn.execute(
                     "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
-                    " pending_cause=?, updated_at=?"
+                    " pending_cause=?, lane_phase=NULL, updated_at=?"
                     " WHERE run_id=? AND node_id=? AND attempt_no=?"
                     "   AND state=? AND block_reason=?",
                     (
@@ -7749,6 +7758,12 @@ class LifecycleStore:
         observed. §7.5 forbids an infra fault from decrementing a budget, and
         an attempt the operator ended by restarting the scheduler is a weaker
         fact still.
+
+        A quiescence block may already have terminalized `lane_phase`. The
+        next attempt's first `_set_lane_phase(BUILDING)` CAS refuses BLOCKED,
+        raises `AttemptOwnershipLost`, and strands the node RUNNING with no
+        worktree. Clear the phase in this same transaction so the fresh
+        attempt is an initial CAS, matching `prepare_late_envelope_recovery`.
         """
 
         def extra(lifecycle: st.NodeLifecycle):
@@ -7757,7 +7772,12 @@ class LifecycleStore:
                     "UPDATE attempts SET state=?"
                     " WHERE run_id=? AND node_id=? AND attempt_no=?",
                     (CLOSED_ATTEMPT_STATE.value, run_id, node_id, lifecycle.attempt_no),
-                )
+                ),
+                (
+                    "UPDATE node_lifecycle SET lane_phase=NULL"
+                    " WHERE run_id=? AND node_id=?",
+                    (run_id, node_id),
+                ),
             ]
 
         return self._transition_node(
