@@ -4428,15 +4428,52 @@ class Scheduler:
             else None
         )
         replayed_handoff = durable_handoff is not None
+        # Every fact a repair needs belongs to the *candidate*, not to the
+        # attempt that happens to be running: the commit it must descend from,
+        # the publication identity it must reassert, and the builder it must
+        # be delivered to. `lane_candidates.builder_generation` records that
+        # last one immutably, so a rejection of an already-published candidate
+        # binds its handoff there.
+        #
+        # `_active_actor_generation` is the right answer only for a candidate
+        # this attempt is publishing for the first time, where the running
+        # builder *is* the owner. Asked on a replay with no live builder it
+        # falls back to `max(record.attempt_no, ...)` and invents a generation
+        # no builder ever had. `_resume_unreviewed_candidate` reviews a
+        # candidate an earlier attempt built, so that is exactly what it did:
+        # a551049 was built by builder generation 10, and the rejection bound
+        # its handoff to 14. `continue_node` then looks up the builder session
+        # at 14, finds sessions only at 8-12, and raises
+        # `AttemptOwnershipLost: builder generation changed` -- forever, since
+        # no future attempt can conjure a session at 14 either.
+        # A live builder still outranks the candidate: the fence exists so a
+        # *superseded* builder cannot act, and a replacement registered after
+        # the candidate was sealed is the owner now. Preferring the
+        # publication unconditionally here made `_require_actor_generation`
+        # refuse `builder generation 1 was superseded` on exactly that case.
+        live_builder = self.deps.store.current_actor_session(
+            self.run_id, node.node_id, "builder"
+        )
         repair_builder_generation = (
             durable_handoff.builder_generation
             if durable_handoff is not None
+            else live_builder.generation
+            if live_builder is not None
+            else replay.builder_generation
+            if replay is not None
             else self._active_actor_generation(node.node_id, "builder", record)
         )
         # A replay reasserts immutable publication identity, not ownership of
         # the currently active builder.  New repair delivery below remains
         # fenced to that active builder; an existing handoff remains fenced to
         # its durable bound generation.
+        #
+        # Unchanged, and deliberately so. Substituting the handoff's
+        # generation for the publication's here is safe exactly while a
+        # handoff is bound to the candidate's own builder, which is what the
+        # expression above now guarantees. Rewriting this as well made no test
+        # fail once that held, so it would have been a second fix for a state
+        # the first one prevents.
         publication_builder_generation = (
             replay.builder_generation
             if replay is not None and durable_handoff is None

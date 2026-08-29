@@ -229,6 +229,40 @@ Close every pane when its work is done — `herdr pane close <pane_id>`, positio
 fails. `kill_reviewer` does not reliably close panes. Reviewer panes are not named
 `maestro-*`; identify them by agent kind, repo cwd, and title.
 
+## One wrong idea, not four bugs — and enumerate the path before handing over a command
+
+A cluster of refusals on one path is usually **one wrong idea wearing different
+faces**. Name the idea, make the smallest change that states it correctly, and let
+the symptoms fall together. Patching each refusal as it appears produces a sequence
+of confident "it's fixed, run it" handovers that each die at the next gate, and it
+grows the code by one special case per symptom.
+
+On 2026-08-29 `lane-wp6-build` produced four distinct refusals in a row —
+`HeadMoved: HEAD is 3b1f1beb70, not candidate parent a551049c94`,
+`late envelope is not usable`,
+`candidate replay disagrees with the immutable publication`, and
+`AttemptOwnershipLost: builder generation changed`. They were one idea:
+
+> **A repair is a property of the candidate, not of the attempt that happens to be
+> running.** The candidate owns the commit a repair must descend from, the
+> publication identity it must reassert, and the builder generation it must be
+> delivered to. `_resume_unreviewed_candidate` reviews a candidate an *earlier*
+> attempt built, so every one of those read off the running attempt instead.
+
+The operational half of the same rule: **walk the whole path and enumerate every
+gate on it, with its actual value from the ledger and from git, before writing a fix
+and before handing the operator a `run start` / `run resume` line.** A path has more
+gates than it has bugs, and the first sufficient explanation is not the explanation.
+For this path the gates were, in order: node state and block reason; the latest
+attempt's `extra_json` recovery keys; `attempt_sealed_output`;
+`lane_candidates.builder_generation` and `parent_candidate_sha`;
+`repair_handoffs.builder_generation` and state; `candidate_reviews.state`,
+`verdict`, and `reviewer_generation`; `current_actor_session` and the set of
+`actor_sessions` generations for both roles; `IDENTICAL_REFUSAL_LIMIT` against the
+stored refusals; then the worktree HEAD and `refs/heads/maestro/{run}/{node}/a{n}`.
+Four of those were wrong at once. Reading three of them and stopping is what cost
+four handovers.
+
 ## Diagnosing a lane that will not advance — run the command, do not read it
 
 A node that retries forever is almost never the agent's fault. Before writing any fix,

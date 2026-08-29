@@ -263,7 +263,11 @@ class ResumedCandidateIsRepairableTests(ResumeUnreviewedCandidateTests):
             "a::review",
             candidate,
             reviewer_generation=1,
-            builder_generation=1,
+            # The candidate's own builder generation, which is what a
+            # rejection binds a handoff to; see
+            # `test_a_rejection_binds_its_handoff_to_the_candidates_builder`.
+            builder_generation=self.store.lane_candidates("run1", "a")[0]
+            .builder_generation,
             review_digest="review-digest",
             receipt_path="/dev/null",
             findings=list(_Reject.findings),
@@ -332,4 +336,37 @@ class ResumedCandidateIsRepairableTests(ResumeUnreviewedCandidateTests):
                 scheduler.nodes["a"], sch._AttemptContext(record=None)
             ),
             "this one is reopenable, and reopening beats a new generation",
+        )
+
+    def test_a_rejection_binds_its_handoff_to_the_candidates_builder(self):
+        """The invariant the three symptoms share.
+
+        A repair is delivered to the builder that owns the candidate, and
+        `lane_candidates.builder_generation` is where that ownership is
+        recorded. `continue_node` resolves the handoff's generation to a
+        builder *session*; bound to a generation no builder ever had, it
+        raises `AttemptOwnershipLost: builder generation changed` on every
+        attempt, because no future attempt can conjure that session either.
+
+        a551049 was built by builder generation 10 and its handoff was bound
+        to 14, against builder sessions that existed only at 8-12.
+        """
+        candidate = self._wedge()
+        published = self.store.lane_candidates("run1", "a")[0]
+        _, review = self._capture(_Reject())
+        self._run_once(review)
+
+        handoff = self.store.repair_handoff("run1", "a", candidate)
+        self.assertEqual(
+            handoff.builder_generation,
+            published.builder_generation,
+            "the handoff names a builder that never existed",
+        )
+        # The same number reaches `publish_candidate`, which compares it
+        # against the immutable row and refuses `candidate replay disagrees
+        # with the immutable publication` when they differ.
+        self.assertEqual(
+            self.store.lane_candidates("run1", "a")[0].builder_generation,
+            published.builder_generation,
+            "an immutable publication does not change generation on replay",
         )
