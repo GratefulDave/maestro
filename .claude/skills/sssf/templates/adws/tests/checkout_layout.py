@@ -1,18 +1,15 @@
 """Locate this runtime's other checkouts from inside any working tree.
 
-Three modules in this suite have to reach outside their own checkout to do
-their job: `test_template_parity` compares the two template copies file by
-file, `test_schema_vocabulary_parity` pins this runtime's closed vocabularies
-to the Plan IR schema the-library publishes, and `test_plan_admission` reads
-that same authoring schema. All three need the same thing first -- the
-directory that holds the sibling checkouts -- and each used to derive it by
-walking up from ``__file__`` and taking the parent of the repository root.
+`test_template_parity` must reach outside its own checkout to compare the two
+template copies file by file. It first needs the directory that holds the
+sibling checkouts, and it used to derive that directory by walking up from
+``__file__`` and taking the parent of the repository root.
 
 That derivation is wrong in a linked git worktree, and a linked git worktree is
 where the work happens. Every lane authors its changes in one, so the ancestor
 that arithmetic lands on is ``.claude/worktrees/<lane>`` rather than the
-repository, and the peer is looked for in ``.claude/worktrees/the-library``,
-which no machine has. All three modules then skipped, and a skip is silent: the
+repository; the peer is looked for in ``.claude/worktrees/the-library``,
+which no machine has. The parity test then skipped, and a skip is silent: the
 one mechanical check holding the template copies together had never once looked
 at lane work, and reported nothing while not looking.
 
@@ -26,7 +23,7 @@ used, because it is right in the ordinary case and this module must not turn a
 working check into an error. The reason is carried out in ``provenance`` either
 way, so a caller that ends up skipping can say what it looked for and why.
 
-A fourth caller, `test_deployment_parity`, needs something adjacent: not a peer
+The second caller, `test_deployment_parity`, needs something adjacent: not a peer
 *template* but the list of deployed instances a person has asked to be watched.
 That list cannot be derived from the filesystem at all — a deployment lives
 wherever it was installed, and no arithmetic finds it — so it is declared in a
@@ -34,7 +31,7 @@ registry and this module only resolves where that registry is. Its absence is
 the ordinary case and skips; its presence and malformation is an error.
 
 Nothing here decides whether to skip. Each caller owns that: what it needs from
-a peer, and which absences are legitimate, differ between the four.
+a peer, and which absences are legitimate, differ between the two.
 """
 
 from __future__ import annotations
