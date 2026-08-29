@@ -266,16 +266,6 @@ class VerificationVerdict:
     #: only for verdicts whose refusal has no typed identity.
     remedy: str = ""
 
-    @property
-    def asserts_repository_wide(self) -> bool:
-        """Always false, and named so the bound cannot be assumed away.
-
-        VERIFIED asserts that this node's declared behaviour is present at
-        this base and that its writes were authorized. Reading it as the
-        wider claim is the conflation §7.3 exists to prevent, one level up.
-        """
-        return False
-
 
 def _permission_paths(permission: "wt.PermissionVerdict") -> Tuple[str, ...]:
     return tuple(permission.conjunct1_violations) + tuple(

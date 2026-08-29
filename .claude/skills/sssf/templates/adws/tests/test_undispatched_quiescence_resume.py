@@ -178,6 +178,33 @@ class DurableEvidenceTests(unittest.TestCase):
             )
             self.assertEqual(ledger.eligible(), ())
 
+    def test_undispatched_resume_clears_a_terminal_lane_phase(self):
+        """`_block_quiescence` terminalizes lane_phase with the node.
+
+        Leaving BLOCKED makes the recovered worker lose its first
+        `_set_lane_phase(BUILDING)` CAS and strand RUNNING with no worktree.
+        Without the reopen this test's last `set_lane_phase(BUILDING)`
+        returns False; with it the CAS is an initial write on NULL.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = _Ledger(Path(tmp))
+            self.assertTrue(
+                ledger.store.set_lane_phase(
+                    "run1", "a", st.LanePhase.BLOCKED
+                )
+            )
+            ledger.store.resume_run(
+                "run1", undispatched_attempts=ledger.eligible()
+            )
+            node = ledger.store.get_node("run1", "a")
+            self.assertIs(node.state, st.NodeState.PENDING)
+            self.assertIsNone(node.lane_phase)
+            self.assertTrue(
+                ledger.store.set_lane_phase(
+                    "run1", "a", st.LanePhase.BUILDING
+                )
+            )
+
 
 class AuthorityIsNeverTakenOnTrustTests(unittest.TestCase):
     def test_resume_refuses_authority_the_ledger_cannot_confirm(self):
@@ -469,6 +496,30 @@ class SameAttemptResumeTests(SchedulerFixture):
             )
         self.assertIs(
             self.store.get_node("run1", "a").state, st.NodeState.BLOCKED
+        )
+
+    def test_a_blocked_lane_phase_does_not_strand_the_redispatched_worker(self):
+        """Live hang on lane-wp6-build: resume reopened the node, not the
+        phase, so `_set_lane_phase(BUILDING)` raised AttemptOwnershipLost
+        and the worker returned leaving RUNNING. Without the reopen this
+        raises; with it the CAS lands BUILDING."""
+        scheduler, attempt_no = self._blocked_undispatched()
+        self.assertTrue(
+            self.store.set_lane_phase("run1", "a", st.LanePhase.BLOCKED)
+        )
+        self.store.resume_run(
+            "run1", undispatched_attempts=[("a", attempt_no)]
+        )
+        claimed = self.store.claim_undispatched_attempt(
+            "run1", "a", attempt_no
+        )
+        record = self.store.get_attempt("run1", "a", claimed)
+        with scheduler._lock:
+            scheduler._attempt_dispatch[("a", claimed)] = False
+        scheduler._set_lane_phase("a", st.LanePhase.BUILDING, record)
+        self.assertIs(
+            self.store.get_node("run1", "a").lane_phase,
+            st.LanePhase.BUILDING,
         )
 
 

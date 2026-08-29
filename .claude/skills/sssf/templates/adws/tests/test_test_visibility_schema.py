@@ -81,15 +81,6 @@ def _tests_node(visibility: str | None) -> dict:
 
 
 class TheVersionIsRegisteredAndParses(unittest.TestCase):
-    def test_v5_is_registered_and_v4_is_still_registered(self):
-        registered = plan_model.registered_versions()
-        self.assertIn(plan_model.SCHEMA_V5, registered)
-        self.assertIn(
-            plan_model.SCHEMA_V4,
-            registered,
-            "dropping a shipped version is what #104 did to deployments",
-        )
-
     def test_a_v5_tests_node_must_declare_a_visibility(self):
         """Required, not defaulted — the whole reason it is a new version.
 

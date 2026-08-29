@@ -582,7 +582,7 @@ class ReviewStalledClassificationTests(SchedulerFixture):
         config = self.config(environmental_retries=1, semantic_ceiling=1)
         deps = self.deps(
             review_attempt=review_attempt,
-            recover_node=lambda _attempt, _record: sch.NodeExecution(
+            recover_node=lambda _attempt: sch.NodeExecution(
                 envelope_parsed=True,
                 envelope_payload={"success": True},
                 exit_code=0,

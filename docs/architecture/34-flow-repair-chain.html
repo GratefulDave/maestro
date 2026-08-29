@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <title>Repair chain · Witness inherited from the root</title>
+  <title>Admit a repair, inherit the witness, then seal</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;   /* deep warm charcoal */
-      --color-ink:     #f5f5f5;   /* warm off-white */
-      --color-muted:   #bfc0c0;   /* silver */
-      --color-accent:  #f08a59;   /* accent */
+      --color-paper:   #2d3142;
+      --color-ink:     #f5f5f5;
+      --color-muted:   #bfc0c0;
+      --color-accent:  #f08a59;
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -59,11 +59,11 @@
 <body>
   <div class="frame">
     <p class="eyebrow">Flowchart · Maestro</p>
-    <h1>Repair chain · Witness inherited from the root</h1>
+    <h1>Admit a repair, inherit the witness, then seal</h1>
 
-    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="34-flow-repair-chain-title 34-flow-repair-chain-desc">
-      <title id="34-flow-repair-chain-title">Repair chain · Witness inherited from the root</title>
-      <desc id="34-flow-repair-chain-desc">Repair opens on a SEMANTIC failure with a proven output SHA — not on review REJECTED. The chain root's FAILED pre-node gate is the falsifiability witness; a later repair attempt bases on that output commit and inherits the witness (pre_gate_not_falsifiable with repairing=True). Five refusals — no SEMANTIC row with a stored output SHA, an unproven output, a moved integration head, REPAIR_CHAIN_LIMIT exceeded, or findings that rose — restart the node at the integration head instead.</desc>
+    <svg viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="34-flow-repair-chain-title 34-flow-repair-chain-desc">
+      <title id="34-flow-repair-chain-title">Admit a repair, inherit the witness, then seal</title>
+      <desc id="34-flow-repair-chain-desc">A repair chain opens only when the attempt is serviceable: _continue_repair_handoff still requires a SEMANTIC failure with a stored output SHA, and tests or builder REJECTED is delivered by continue_tests_node or continue_node, while an unserviceable handoff raises UnserviceableHandoff and _block_unserviceable_handoff records REPAIR_HANDOFF_UNSERVICEABLE; refusals restart at head with a fresh base and no repair_of, and an admitted attempt a2 bases on the output, re-points the pane, inherits the chain-root witness through _pre_candidate_base (earliest attempt.base_sha), then seals with commit_measured_delta if HEAD equals base or sealed_descendant_tip otherwise — adopt does not spend ENVIRONMENTAL — with identical findings blocking SEMANTIC_REFUSAL_REPEATED at IDENTICAL_REFUSAL_LIMIT 2. A worktree cut at the candidate is for review and repair landing, not a legal build base: a builder cut from the candidate blocks GATE_NOT_FALSIFIABLE.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -73,83 +73,99 @@
       <rect width="100%" height="100%" fill="#2d3142"/>
 
       <!-- Arrows (drawn first, behind nodes) -->
-      <line x1="440" y1="104" x2="440" y2="136" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="440" y1="184" x2="440" y2="216" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <path d="M 560,264 H 760" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="440" y1="312" x2="440" y2="344" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
-      <line x1="440" y1="392" x2="440" y2="424" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <path d="M 300,448 H 180 Q 172,448 172,440 V 168 Q 172,160 180,160 H 300"
-            fill="none" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <line x1="440" y1="96" x2="440" y2="136" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="184" x2="800" y2="184" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="440" y1="232" x2="440" y2="272" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="320" x2="800" y2="320" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="440" y1="368" x2="440" y2="392" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <line x1="440" y1="440" x2="440" y2="472" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="440" y1="520" x2="440" y2="552" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- Arrow labels -->
-      <rect x="628" y="244" width="60" height="12" rx="2" fill="#2d3142"/>
-      <text x="658" y="254" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REFUSED</text>
+      <rect x="664" y="164" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="680" y="174" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
 
-      <rect x="452" y="320" width="64" height="12" rx="2" fill="#2d3142"/>
-      <text x="484" y="330" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ADMITTED</text>
+      <rect x="404" y="246" width="28" height="12" rx="2" fill="#2d3142"/>
+      <text x="418" y="256" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
 
-      <rect x="80" y="298" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="120" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SEMANTIC AGAIN</text>
+      <rect x="652" y="300" width="56" height="12" rx="2" fill="#2d3142"/>
+      <text x="680" y="310" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REFUSED</text>
 
-      <!-- chain root attempt -->
-      <rect x="300" y="56" width="280" height="48" rx="6" fill="#2d3142"/>
-      <rect x="300" y="56" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="440" y="76" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt a1 · chain root</text>
-      <text x="440" y="92" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">base = head · pre RED, post GREEN</text>
+      <rect x="368" y="374" width="64" height="12" rx="2" fill="#2d3142"/>
+      <text x="400" y="384" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ADMITTED</text>
 
-      <!-- SEMANTIC with stored output SHA (review REJECTED is not the repair trigger) -->
-      <rect x="300" y="136" width="280" height="48" rx="6" fill="#2d3142"/>
-      <rect x="300" y="136" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="440" y="156" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SEMANTIC · output SHA</text>
-      <text x="440" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">not review REJECTED</text>
+      <!-- 1. chain root a1 -->
+      <rect x="300" y="40" width="280" height="56" rx="6" fill="#2d3142"/>
+      <rect x="300" y="40" width="280" height="56" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="440" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt a1 · chain root</text>
+      <text x="440" y="80" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">base = head · pre RED, post GREEN</text>
 
-      <!-- decide_repair admits? (focal) -->
-      <polygon points="440,216 560,264 440,312 320,264" fill="#2d3142"/>
-      <polygon points="440,216 560,264 440,312 320,264" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="440" y="260" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">decide_repair</text>
-      <text x="440" y="276" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">5 refusals · chain_length+1</text>
+      <!-- 2. repairable? -->
+      <polygon points="440,136 560,184 440,232 320,184" fill="#2d3142"/>
+      <polygon points="440,136 560,184 440,232 320,184" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="440" y="176" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">repairable?</text>
+      <text x="440" y="188" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SEMANTIC+SHA</text>
+      <text x="440" y="200" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">tests/builder REJECTED</text>
 
-      <!-- restart at head -->
-      <rect x="760" y="240" width="240" height="48" rx="24" fill="#2d3142"/>
-      <rect x="760" y="240" width="240" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="880" y="260" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">restart at head</text>
-      <text x="880" y="276" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">fresh base · no repair_of</text>
+      <!-- 3. unserviceable BLOCKED -->
+      <rect x="800" y="160" width="280" height="48" rx="24" fill="#2d3142"/>
+      <rect x="800" y="160" width="280" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="940" y="180" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
+      <text x="940" y="194" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">REPAIR_HANDOFF_UNSERVICEABLE</text>
 
-      <!-- repair attempt a2 (focal) -->
-      <rect x="300" y="344" width="280" height="48" rx="6" fill="#2d3142"/>
-      <rect x="300" y="344" width="280" height="48" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="440" y="364" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt a2 · repair</text>
-      <text x="440" y="380" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">base = a1's output commit</text>
+      <!-- 4. admit repair (focal) -->
+      <polygon points="440,272 560,320 440,368 320,320" fill="#2d3142"/>
+      <polygon points="440,272 560,320 440,368 320,320" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="440" y="316" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">admit repair</text>
+      <text x="440" y="332" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">chain limit · refusals</text>
 
-      <!-- clause 2: witness inherited -->
-      <rect x="300" y="424" width="280" height="48" rx="6" fill="#2d3142"/>
-      <rect x="300" y="424" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="440" y="444" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">witness from chain root</text>
-      <text x="440" y="460" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">falsifiability inherited</text>
+      <!-- 5. restart at head -->
+      <rect x="800" y="296" width="280" height="48" rx="24" fill="#2d3142"/>
+      <rect x="800" y="296" width="280" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="940" y="316" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">restart at head</text>
+      <text x="940" y="330" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">fresh base · no repair_of</text>
 
-      <!-- Callout -->
-      <text x="1240" y="360" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">Three repairs, then re-derived from the head.</text>
-      <path d="M 1000,372 Q 1000,340 1000,300" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
-      <circle cx="1000" cy="296" r="2" fill="#f5f5f5"/>
+      <!-- 6. repair attempt a2 (focal) -->
+      <rect x="300" y="392" width="280" height="48" rx="6" fill="#2d3142"/>
+      <rect x="300" y="392" width="280" height="48" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+      <text x="440" y="412" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt a2 · repair</text>
+      <text x="440" y="426" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">base = output · pane re-point</text>
+
+      <!-- 7. witness from chain root -->
+      <rect x="300" y="472" width="280" height="48" rx="6" fill="#2d3142"/>
+      <rect x="300" y="472" width="280" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="440" y="492" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">witness from chain root</text>
+      <text x="440" y="506" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">_pre_candidate_base</text>
+
+      <!-- 8. seal -->
+      <rect x="300" y="552" width="280" height="56" rx="24" fill="#2d3142"/>
+      <rect x="300" y="552" width="280" height="56" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
+      <text x="440" y="576" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">seal output</text>
+      <text x="440" y="592" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">commit if HEAD=base · else adopt tip</text>
+
+      <!-- Callouts -->
+      <text x="800" y="408" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif">Identical findings → SEMANTIC_REFUSAL_REPEATED (limit 2)</text>
+      <path d="M 792,416 H 588" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="580" cy="416" r="2" fill="#f5f5f5"/>
+
+      <text x="800" y="572" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif">Adopt does not spend ENVIRONMENTAL.</text>
+      <path d="M 792,580 H 588" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="580" cy="580" r="2" fill="#f5f5f5"/>
 
       <!-- Legend -->
       <line x1="40" y1="656" x2="1240" y2="656" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
       <text x="40" y="672" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND · SHAPE CARRIES TYPE</text>
-
       <rect x="40" y="688" width="24" height="12" rx="6" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="72" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">End (oval)</text>
+      <text x="72" y="698" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">End (oval)</text>
 
       <rect x="180" y="688" width="24" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="212" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Step</text>
+      <text x="212" y="698" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Step</text>
 
-      <polygon points="300,696 312,688 324,696 312,704" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="336" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision</text>
+      <polygon points="300,692 312,688 324,692 312,700" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="336" y="698" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision</text>
 
       <rect x="432" y="688" width="24" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="464" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal — decide_repair · repair attempt</text>
-
-      <line x1="800" y1="694" x2="828" y2="694" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
-      <text x="836" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Chain loop, bounded by REPAIR_CHAIN_LIMIT</text>
+      <text x="464" y="698" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal — admit repair · repair attempt</text>
     </svg>
   </div>
 </body>

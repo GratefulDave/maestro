@@ -1161,6 +1161,9 @@ def _named_plan_output(config: Dict[str, Any], name: str) -> Path:
 _RUN_LEDGER_COMMANDS = (
     "status",
     "list",
+    # A read by default; `--prune` removes checkouts and never a branch, so
+    # nothing here needs key material or a receipt.
+    "worktrees",
     "pause",
     "cancel",
     "convergence",
@@ -1436,6 +1439,20 @@ def _apply_repository_config(args: argparse.Namespace, argv: Sequence[str]) -> N
         # discovery -- printing the adoption notice for a runner the repository
         # had already declared, and pinning nothing.
         args.runners = dict(config.get("runners") or {})
+        # The same defect as `runners:` above, one field over, and it disabled a
+        # whole refusal rather than a notice. `_configured_runs_root` reads this
+        # and returns `None` when it is unset, and `None` is the *deliberate*
+        # answer for a run spelled out by hand on the command line -- a run root
+        # nothing declares cannot prove a worktree is this system's own. A
+        # configured `run start` is not that case, but it reached the same
+        # branch, so `_reclaim_stranded_integration_worktree` skipped its
+        # containment test on every configured run and never reclaimed
+        # anything. What the operator saw was the fallback refusal telling them
+        # a checkout under Maestro's own run root was "not among" the ones it
+        # reclaims, and to go move it by hand -- the precise sentence the
+        # reclaim exists to make unnecessary, about the precise case it was
+        # written for.
+        args.repository_state = str(config["repository_state"])
         args.run_id = run_id
         args.integration_path = str(run_root / "integration")
         args.worktrees_root = str(run_root / "worktrees")
@@ -2542,7 +2559,6 @@ def _code_review_runner(
                 ),
                 launch=launch_reviewer,
                 poll_report=poll_report,
-                record_reviewer_session=lambda _s: None,
                 kill=lambda _s: close(build_node_id),
                 actor_status=read_status,
             )
@@ -4533,13 +4549,75 @@ def _clear_turn_artifact(path: Path) -> None:
         pass
 
 
+@dataclasses.dataclass(frozen=True)
+class _ActorDispatch:
+    """Which actor a lane's pane launches as, and on whose route.
+
+    One resolution read by every site that opens a pane for a lane: the
+    first attempt in `run_node`, and the repair. Before this existed
+    `launch_replacement` hardcoded `args.agent_route`, `args.agent_model`
+    and `pane_role="builder"` for whatever node it was handed, so a repaired
+    tests node would have opened a *builder* pane on the build lane's
+    vendor. That is the wrong actor on the wrong route wearing the wrong
+    label: `tester_vendor` is bound to `lane_vendor` and is a separate route
+    on purpose, because the information barrier between the lane that writes
+    the tests and the lane judged by them is the node split (B12, §19 M41).
+    """
+
+    route: str
+    model: str
+    effort: str
+    profile: Optional[str]
+    vendor: Optional[str]
+
+
+def _lane_actor_dispatch(args: Any, node_kind: Any) -> _ActorDispatch:
+    """Resolve one lane kind's actor route, falling back to the agent route."""
+    if node_kind is scheduler_types.NodeKind.TESTS:
+        return _ActorDispatch(
+            route=getattr(args, "tester_route", None) or args.agent_route,
+            model=getattr(args, "tester_model", None) or args.agent_model,
+            effort=getattr(args, "tester_effort", None) or args.agent_effort,
+            profile=getattr(args, "tester_profile", None) or args.agent_profile,
+            # B15: tester.vendor is loaded onto args and recorded on the
+            # attempt row. `LaunchSpec` has no vendor field, so this travels
+            # through `_launch_attempt_extra` rather than through the spec.
+            vendor=getattr(args, "tester_vendor", None),
+        )
+    return _ActorDispatch(
+        route=args.agent_route,
+        model=args.agent_model,
+        effort=args.agent_effort,
+        profile=args.agent_profile,
+        vendor=getattr(args, "execution_vendor", None),
+    )
+
+
 def _repair_prompt_text(
     repair_prompt: str,
     rejected_candidate_sha: str,
     builder_generation: int,
     acknowledgement_path: Path,
+    *,
+    same_session: bool = True,
 ) -> str:
-    """Render the exact durable handoff plus a schema-bound acknowledgement."""
+    """Render the exact durable handoff plus a schema-bound acknowledgement.
+
+    `same_session` is false for a lane whose actor is one-shot -- a tests
+    node's tester, whose pane is cancelled when its attempt settles. Telling
+    a freshly opened actor to "keep working in this existing session" names
+    a session it has never had, and the worktree it inherits is the only
+    continuity there is.
+    """
+    continuation = (
+        "Keep working in this existing worktree and session."
+        if same_session
+        else (
+            "This is a fresh actor turn in the existing worktree of the "
+            "rejected attempt: read the tree rather than assuming any prior "
+            "session's context."
+        )
+    )
     return (
         "# Persistent repair handoff\n\n"
         "Rejected candidate SHA: `{}`\n"
@@ -4549,7 +4627,7 @@ def _repair_prompt_text(
         "`{}` (no additional keys):\n"
         '```json\n{{"builder_generation": {}, "kind": '
         '"repair_acknowledgement", "rejected_candidate_sha": "{}"}}\n```\n'
-        "Keep working in this existing worktree and session. Commit a distinct "
+        "{} Commit a distinct "
         "descendant candidate, then write the normal terminal envelope."
     ).format(
         rejected_candidate_sha,
@@ -4558,6 +4636,7 @@ def _repair_prompt_text(
         acknowledgement_path,
         builder_generation,
         rejected_candidate_sha,
+        continuation,
     )
 
 
@@ -4652,7 +4731,7 @@ def _poll_agent_execution(
 
 
 def _late_agent_execution(
-    attempt: worktree.AttemptWorktree, record: scheduler_types.AttemptRecord
+    attempt: worktree.AttemptWorktree,
 ) -> Optional[scheduler.NodeExecution]:
     """Read a successful declaration from an existing attempt; never launch."""
     envelope = attempt.scratch / "agent-envelope.json"
@@ -4722,7 +4801,7 @@ def _running_late_agent_execution(
         identity = worktree.check_at_create(reopened)
         baseline = store.attempt_baseline(args.run_id, node_id, attempt_no)
         ignored = store.attempt_ignored_at_base(args.run_id, node_id, attempt_no)
-        execution = _late_agent_execution(reopened, record)
+        execution = _late_agent_execution(reopened)
     except (lc.LifecycleError, worktree.WorktreeError) as exc:
         raise _RunRefused(
             "LATE_ENVELOPE_RECOVERY_INVALID",
@@ -5293,6 +5372,51 @@ class _RunProgress:
             )
 
 
+#: How each pre-dispatch phase is announced: its verb, and whether the line is
+#: the start of something slow or the end of it. Phases the scheduler emits and
+#: this table does not name print in a neutral form rather than vanishing --
+#: a reporter that silently drops an unknown phase is how B15's dead field
+#: happens, one release after someone adds one.
+_ATTEMPT_PHASES: Dict[str, str] = {
+    "provisioning": "provisioning the worktree",
+    "provisioned": "worktree provisioned",
+    "pre-gate": "running the pre-gate",
+    "pre-gate-done": "pre-gate finished",
+    "baseline": "measuring the baseline",
+    "baseline-done": "baseline measured",
+    "launching": "opening the agent pane",
+}
+
+
+def _attempt_progress_reporter(
+    console: "RichConsole",
+) -> Callable[[str, int, str, Mapping[str, object]], None]:
+    """A display-only reporter over one run's pre-dispatch phases.
+
+    Written as a closure over the console the run already prints through, so
+    the phase lines interleave with the preflight lines in one stream rather
+    than arriving on a second surface an operator has to know to watch.
+    """
+
+    def report(node_id: str, attempt_no: int, phase: str,
+               detail: Mapping[str, object]) -> None:
+        said = _ATTEMPT_PHASES.get(phase, phase)
+        extra = " ".join(
+            "{0}={1}".format(key, value) for key, value in sorted(detail.items())
+        )
+        console.print(
+            "[dim]{0}[/dim] [bold]{1}[/bold] [dim]a{2}[/dim] · {3}{4}".format(
+                time.strftime("%H:%M:%S"),
+                rich_escape(node_id),
+                attempt_no,
+                rich_escape(said),
+                " [dim]{0}[/dim]".format(rich_escape(extra)) if extra else "",
+            )
+        )
+
+    return report
+
+
 def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
     worktree.bind_lane_concurrency(getattr(args, "concurrency", None))
     action = "resume" if resuming else "start"
@@ -5321,6 +5445,22 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
         _refuse_cross_run_node_budget(args, plan)
         _validate_run_paths(args, plan)
         run_console.print("[green]✓[/green] paths and cross-run budgets validated")
+        # Said before the run takes the terminal, because leftovers from the
+        # previous attempt of this same run are exactly what an operator can
+        # act on now and will never look for later. Never removed here: §8.8
+        # retains a blocked node's checkout for post-mortem on purpose, and a
+        # start that quietly deleted one would take the evidence with it.
+        try:
+            _report_stale_worktrees(run_console, _stale_worktrees_at(args))
+        except Exception as exc:  # noqa: BLE001 - never stop a run over a report
+            # Said rather than swallowed. A guard that fails silently turns a
+            # broken report into a feature nobody knows stopped working, which
+            # is the same absence of a reader B15 refuses elsewhere.
+            run_console.print(
+                "[dim]stale-worktree report unavailable: {0}[/dim]".format(
+                    rich_escape(str(exc))
+                )
+            )
         run_console.print("[dim]preflight · resolving declared runners[/dim]")
         # A run precondition, in the same family as the integration branch already
         # being checked out: decided before the scheduler exists, so an unusable
@@ -5473,7 +5613,7 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                         ignored = store.attempt_ignored_at_base(
                             args.run_id, node_id, attempt_no
                         )
-                        execution = _late_agent_execution(reopened, record)
+                        execution = _late_agent_execution(reopened)
                     except (lc.LifecycleError, worktree.WorktreeError) as exc:
                         return _refusal(
                             "LATE_ENVELOPE_RECOVERY_INVALID",
@@ -5765,30 +5905,21 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 prompt = attempt.scratch / "agent-prompt.txt"
                 envelope = attempt.scratch / "agent-envelope.json"
                 plan_node = plan.node_by_id()[node.node_id]
+                # One resolution for both the first attempt and the repair,
+                # so the two cannot disagree about which actor a lane opens.
+                dispatch = _lane_actor_dispatch(args, node.kind)
                 if node.kind is scheduler_types.NodeKind.TESTS:
                     prompt_text = _tests_node_prompt(plan_node, envelope, retry_prompt)
-                    lane_route = getattr(args, "tester_route", None) or args.agent_route
-                    lane_model = getattr(args, "tester_model", None) or args.agent_model
-                    lane_effort = (
-                        getattr(args, "tester_effort", None) or args.agent_effort
-                    )
-                    lane_profile = (
-                        getattr(args, "tester_profile", None) or args.agent_profile
-                    )
-                    # B15: tester.vendor is loaded onto args and recorded here.
-                    # The information barrier is the node split, not a B12 vendor
-                    # pair, and LaunchSpec has no vendor field.
-                    lane_vendor = getattr(args, "tester_vendor", None)
                 else:
                     prompt_text = _agent_node_prompt(plan_node, envelope, retry_prompt)
                     prompt_text = _append_needed_tests(
                         prompt_text, attempt.path, node, plan
                     )
-                    lane_route = args.agent_route
-                    lane_model = args.agent_model
-                    lane_effort = args.agent_effort
-                    lane_profile = args.agent_profile
-                    lane_vendor = getattr(args, "execution_vendor", None)
+                lane_route = dispatch.route
+                lane_model = dispatch.model
+                lane_effort = dispatch.effort
+                lane_profile = dispatch.profile
+                lane_vendor = dispatch.vendor
                 # B13: the build handoff now carries the tests as well as the
                 # goal, so it is strictly larger. Same chokepoint as before.
                 _preflight_prompt(prompt_text, lane_route, lane_model)
@@ -6015,6 +6146,206 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     handles.pop(key)
                     proven_absent.add(key)
 
+            def mark_repair_launched(node, record, handle, dispatch):
+                """Re-point the attempt row at the pane that will repair it.
+
+                `attempts.extra` is written once per attempt, at first
+                launch, and a repair opens a *new* pane inside that same
+                attempt. Without this the row keeps naming the rejected
+                actor's transcript, pid, and start epoch for the rest of the
+                attempt: §7.6's transcript signal reads the wrong pane and
+                `attempt_liveness` measures a process that was cancelled,
+                over exactly the round -- rejected, repaired, merged -- that
+                anyone goes back to read. It is silent, because the stale
+                path still resolves and a transcript is still there.
+
+                The same `store.mark_launched` the first attempt calls, with
+                the replacement's identity in place of the original's.
+                `launched_at` is deliberately left to stamp now: it is what
+                arms those two signals, and the instant they became
+                measurable again is this launch, not the rejected one.
+                """
+                liveness_pid = handle.process_group
+                if liveness_pid is None:
+                    liveness_pid = handle.liveness_pid
+                store.mark_launched(
+                    args.run_id,
+                    node.node_id,
+                    record.attempt_no,
+                    liveness_pid,
+                    extra=_launch_attempt_extra(
+                        str(handle.transcript_path),
+                        vendor=dispatch.vendor,
+                        model=dispatch.model,
+                        route=dispatch.route,
+                    ),
+                )
+
+            def continue_tests_node(
+                attempt,
+                node,
+                record,
+                repair_prompt,
+                rejected_candidate_sha,
+                builder_generation,
+                cancel_requested,
+            ):
+                """Open a fresh tester on one tests-node repair handoff.
+
+                A tests node's tester is one-shot by construction: nothing
+                registers a durable actor session for it and its pane is
+                cancelled when the attempt settles, so `continue_node`'s
+                adopt/resubmit/replace machinery has no session to act on and
+                its two guards both refuse -- which is how a REJECTED tests
+                node reached a `REPAIRING` phase that no code path could
+                service, and then stopped existing
+                (run-36dd33d262d9485ca815aea5001b2ce2, `lane-wp6-tests`).
+
+                The repair is therefore a new tester turn against the *same*
+                attempt worktree, carrying the reviewer's findings, placed in
+                the lane's existing Herdr tab by `lane_key`. Making testers
+                durable instead would be the larger change and is not this
+                one. §19 M41 requires a tests node to carry the full review
+                **and repair** apparatus; only its review half had shipped.
+                """
+                key = (node.node_id, record.attempt_no)
+                envelope_path = attempt.scratch / "agent-envelope.json"
+                acknowledgement_path = attempt.scratch / "repair-acknowledgement.json"
+                prompt_path = attempt.scratch / "repair-prompt.md"
+                launch_environment = worktree.launch_env(
+                    attempt.scratch, concurrency=getattr(args, "concurrency", None)
+                )
+                handoff = store.repair_handoff(
+                    args.run_id, node.node_id, rejected_candidate_sha
+                )
+                generation = builder_generation
+                # A fresh actor cannot own the rejected turn's envelope or a
+                # previous acknowledgement; this turn writes both itself.
+                _clear_turn_artifact(envelope_path)
+                _clear_turn_artifact(acknowledgement_path)
+                prompt_text = _repair_prompt_text(
+                    repair_prompt,
+                    rejected_candidate_sha,
+                    generation,
+                    acknowledgement_path,
+                    same_session=False,
+                )
+                dispatch = _lane_actor_dispatch(args, node.kind)
+                # B13 at the same chokepoint every other dispatched prompt
+                # crosses: a repair handoff carries the reviewer's findings on
+                # top of the goal, so it is strictly larger than the first
+                # tester prompt that already passed this check.
+                _preflight_prompt(prompt_text, dispatch.route, dispatch.model)
+                prompt_path.write_text(prompt_text, encoding="utf-8")
+                # A second rejection reaches this frame with the *previous*
+                # repair tester still tracked under this key, and overwriting
+                # the entry below would leave that pane open with nothing
+                # naming it -- one leaked rectangle per review round, up to the
+                # test-review ceiling. Proven absent through the harness's own
+                # quiescer rather than a bespoke cancel, so the absence is the
+                # same proof every other path takes.
+                #
+                # Conditioned on a tracked handle rather than called
+                # unconditionally, and that is not a shortcut: `quiesce_attempt`
+                # answers `PROCESS_GROUP_UNTRACKED` for a key it has never
+                # seen, and the scheduler blocks a node terminally on that
+                # answer. A recovered attempt reaches a repair without ever
+                # having entered `run_node`, so its key is untracked by
+                # construction and there is nothing to prove absent.
+                with handles_lock:
+                    stale = handles.get(key)
+                if stale is not None:
+                    quiesce_attempt(record, "repair-relaunch")
+                # The round, not just the generation. A tests node's repair
+                # rounds all happen inside one attempt, so `generation` is
+                # constant across them and a token built from it alone names
+                # two different panes; the rejected candidate is distinct per
+                # round by construction, so it is what separates them -- in
+                # the Herdr agent id this token hashes to, and in the session
+                # directory below.
+                round_key = "g{}-{}".format(generation, rejected_candidate_sha[:12])
+                spec = launcher.LaunchSpec(
+                    correlation_token="{}-{}-tester-{}".format(
+                        args.run_id, node.node_id, round_key
+                    ),
+                    worktree=attempt.path,
+                    prompt_path=prompt_path,
+                    envelope_path=envelope_path,
+                    route=dispatch.route,
+                    model=dispatch.model,
+                    effort=dispatch.effort,
+                    profile=dispatch.profile,
+                    session_dir=(
+                        attempt.scratch / "session-tester-{}".format(round_key)
+                    ),
+                    context_window_tokens=_route_context_window(
+                        dispatch.route, dispatch.model
+                    ),
+                    workspace_label=workspace_label,
+                    # The tab key, not the node id: `_tab_for` caches on
+                    # `lane_key`, so the repair tester splits into the tab the
+                    # lane already owns instead of opening a new one.
+                    lane_key=lane_placement[node.node_id],
+                    lane_label=lane_placement[node.node_id],
+                    pane_role="tester",
+                    attempt_no=generation,
+                    pane_group_size=3,
+                    restrict_tools=getattr(args, "restrict_actor_tools", False),
+                    environment=launch_environment,
+                )
+                handle = _typed_launch_pane(route_runner, spec)
+                try:
+                    _require_session_path(handle, node.node_id, generation)
+                    if handoff is not None:
+                        submission = store.mark_handoff_submitted(
+                            args.run_id,
+                            node.node_id,
+                            rejected_candidate_sha,
+                            builder_generation=generation,
+                        )
+                        if (
+                            not submission.submitted
+                            or submission.handoff.builder_generation != generation
+                        ):
+                            raise scheduler.AttemptOwnershipLost(
+                                "{}: tester handoff submission generation lost".format(
+                                    node.node_id
+                                )
+                            )
+                except BaseException:
+                    route_runner.cancel(
+                        handle, finalization_window.time.monotonic() + 5.0
+                    )
+                    raise
+                mark_repair_launched(node, record, handle, dispatch)
+                with handles_lock:
+                    # Tracked for quiescence, and deliberately *not* placed in
+                    # `builder_handles`: a tester is not a retained session, so
+                    # `repair-idle` must cancel and reclaim its pane rather
+                    # than wait for it to go idle and leave it open.
+                    handles[key] = handle
+                    proven_absent.discard(key)
+                execution = _poll_agent_execution(
+                    route_runner,
+                    handle,
+                    envelope_path,
+                    record,
+                    cancel_requested,
+                    quiesce_attempt,
+                )
+                acknowledged = (
+                    rejected_candidate_sha
+                    if _read_repair_acknowledgement(
+                        acknowledgement_path, rejected_candidate_sha, generation
+                    )
+                    else ""
+                )
+                return scheduler.RepairExecution(
+                    execution=execution,
+                    acknowledged_rejected_sha=acknowledged,
+                    builder_generation=generation,
+                )
+
             def continue_node(
                 attempt,
                 node,
@@ -6024,14 +6355,37 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 builder_generation,
                 cancel_requested,
             ):
-                """Resume or replace the durable builder for one repair handoff."""
-                if node.kind is not scheduler_types.NodeKind.AGENT:
-                    raise scheduler.AttemptOwnershipLost(
-                        "{} is not a persistent builder lane".format(node.node_id)
-                    )
+                """Deliver one repair handoff to the actor its lane kind owns.
+
+                Widened rather than paralleled: all three of the scheduler's
+                `REPAIRING` writers already funnel into this one callback, and
+                what the scheduler asks for -- "deliver this prompt to this
+                lane and return a `RepairExecution`" -- is kind-agnostic. Only
+                the *delivery mechanism* differs by kind, and the delivery
+                mechanism is exactly what this closure owns. A second
+                `SchedulerDeps` field would have put a kind test at three
+                scheduler call sites and in every test fake instead of here.
+                """
                 if route_runner is None:
-                    raise scheduler.AttemptOwnershipLost(
-                        "builder launcher is unavailable"
+                    raise scheduler.UnserviceableHandoff(
+                        "{}: the launcher is unavailable, so no repair handoff "
+                        "can be delivered".format(node.node_id)
+                    )
+                if node.kind is scheduler_types.NodeKind.TESTS:
+                    return continue_tests_node(
+                        attempt,
+                        node,
+                        record,
+                        repair_prompt,
+                        rejected_candidate_sha,
+                        builder_generation,
+                        cancel_requested,
+                    )
+                if node.kind is not scheduler_types.NodeKind.AGENT:
+                    raise scheduler.UnserviceableHandoff(
+                        "{} is a {} node, which has no repair route".format(
+                            node.node_id, node.kind.value
+                        )
                     )
                 session = store.current_actor_session(
                     args.run_id, node.node_id, "builder"
@@ -6125,32 +6479,59 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     _clear_turn_artifact(envelope_path)
                     _clear_turn_artifact(acknowledgement_path)
                     write_prompt(generation)
+                    # Resolved from the node's own kind rather than hardcoded
+                    # to `args.agent_*` and `"builder"`. This frame is reached
+                    # only for AGENT lanes today, so the two agree; they must
+                    # keep agreeing if another kind is ever routed here,
+                    # because a replacement that silently swaps a lane's actor
+                    # for the build vendor's is a B12 barrier failure that no
+                    # gate would catch.
+                    replacement_dispatch = _lane_actor_dispatch(args, node.kind)
+                    replacement_role = (
+                        "tester"
+                        if node.kind is scheduler_types.NodeKind.TESTS
+                        else "builder"
+                    )
                     replacement = _typed_launch_pane(
                         route_runner,
                         launcher.LaunchSpec(
                             correlation_token=(
-                                "{}-{}-builder-g{}".format(
-                                    args.run_id, node.node_id, generation
+                                "{}-{}-{}-g{}".format(
+                                    args.run_id,
+                                    node.node_id,
+                                    replacement_role,
+                                    generation,
                                 )
                             ),
                             worktree=attempt.path,
                             prompt_path=prompt_path,
                             envelope_path=envelope_path,
-                            route=args.agent_route,
-                            model=args.agent_model,
-                            effort=args.agent_effort,
-                            profile=args.agent_profile,
+                            route=replacement_dispatch.route,
+                            model=replacement_dispatch.model,
+                            effort=replacement_dispatch.effort,
+                            profile=replacement_dispatch.profile,
                             session_dir=(
                                 attempt.scratch
-                                / "session-builder-g{}".format(generation)
+                                / "session-{}-g{}".format(
+                                    replacement_role, generation
+                                )
                             ),
                             context_window_tokens=_route_context_window(
-                                args.agent_route, args.agent_model
+                                replacement_dispatch.route,
+                                replacement_dispatch.model,
                             ),
                             workspace_label=workspace_label,
                             lane_key=lane_placement[node.node_id],
                             lane_label=lane_placement[node.node_id],
-                            pane_role="builder",
+                            # Repeated as a literal rather than read off
+                            # `replacement_role`: `test_pane_placement` reads
+                            # the role off this call site's AST, and a name
+                            # here makes the site invisible to it.
+                            pane_role=(
+                                "tester"
+                                if node.kind is scheduler_types.NodeKind.TESTS
+                                else "builder"
+                            ),
                             attempt_no=generation,
                             pane_group_size=3,
                             restrict_tools=getattr(args, "restrict_actor_tools", False),
@@ -6200,6 +6581,9 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                     session = recovered.session
                     builder_generation = generation
                     mark_handoff_submitted(generation)
+                    mark_repair_launched(
+                        node, record, replacement, replacement_dispatch
+                    )
                     with handles_lock:
                         handles[key] = replacement
                         builder_handles[node.node_id] = replacement
@@ -6370,6 +6754,12 @@ def _execute_run(args: argparse.Namespace, *, resuming: bool) -> int:
                 # the ecosystem's missing install rather than for the node's
                 # missing work.
                 provision=_run_provisioner(args, route_runner),
+                # Everything between claiming an attempt and opening its pane
+                # is silent minutes of work. An operator cannot tell that
+                # window from a hang, and on this project has twice killed a
+                # healthy run inside it -- and once failed to notice a real
+                # one. Display only; nothing reads it back (§1.2).
+                progress=_attempt_progress_reporter(run_console),
                 kill_attempt=lambda record: quiesce_attempt(record, "watchdog-kill"),
                 review_attempt=review_attempt,
                 continue_node=continue_node,
@@ -7299,6 +7689,226 @@ def _render_progress(progress: Dict[str, Any]) -> str:
         )
         lines.append("    {}".format(json.dumps(row["payload"], sort_keys=True)))
     return "\n".join(lines)
+
+
+def _human_bytes(count: int) -> str:
+    """A size an operator reads at a glance. Base 1024, one decimal."""
+    size = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return "{0:.1f}{1}".format(size, unit) if unit != "B" else "{0:.0f}B".format(size)
+        size /= 1024.0
+    return "{0:.1f}TB".format(size)
+
+
+def _stale_worktrees_for(args: argparse.Namespace, reader: Any,
+                         measure: bool = True) -> Tuple[Any, ...]:
+    """This run's leftover attempt checkouts, read against the ledger."""
+    live = {
+        (record.node_id, record.attempt_no): record.state.value
+        for record in reader.attempts(args.run_id)
+    }
+    return worktree.stale_attempt_worktrees(
+        Path(args.worktrees_root), args.run_id, live, measure=measure
+    )
+
+
+def _report_stale_worktrees(console: "RichConsole",
+                            stale: Sequence[Any]) -> None:
+    """Say what is on disk and how to get it back. Never removes anything.
+
+    Printed at run start and resume because that is when an operator is
+    already looking at this run, and because the alternative -- removing them
+    silently -- would take the post-mortem §8.8 deliberately retains for a
+    blocked node.
+    """
+    if not stale:
+        return
+    total = sum(item.bytes_on_disk for item in stale)
+    console.print(
+        "[yellow]![/yellow] {0} stale attempt worktree(s) holding "
+        "[bold]{1}[/bold]".format(len(stale), _human_bytes(total))
+    )
+    for item in stale:
+        console.print(
+            "  [dim]{0} a{1} {2} · {3}[/dim]".format(
+                rich_escape(item.node_id),
+                item.attempt_no,
+                _human_bytes(item.bytes_on_disk),
+                rich_escape(item.attempt_state or "no ledger row"),
+            )
+        )
+    console.print(
+        "  [dim]remove them with `maestro run worktrees <run> --prune` "
+        "(branches are kept)[/dim]"
+    )
+
+
+def _stale_worktrees_at(args: argparse.Namespace) -> Tuple[Any, ...]:
+    """This run's leftovers, read with a reader this function owns.
+
+    `_execute_run` holds a writer over the same ledger and opens it later; a
+    short-lived read-only reader here keeps the report out of that lifetime.
+    """
+    reader = _open_reader(args.db)
+    try:
+        return _stale_worktrees_for(args, reader)
+    finally:
+        reader.close()
+
+
+#: A blocked attempt's checkout is retained on purpose (§8.8): it is the
+#: post-mortem for a node that failed, and it is the one leftover whose
+#: removal costs evidence rather than only disk. Listed like any other so the
+#: operator sees the space, never pruned unless they say so by name.
+_RETAINED_FOR_POST_MORTEM = frozenset({"BLOCKED"})
+
+
+def _prunable(item: Any, include_blocked: bool) -> bool:
+    return include_blocked or item.attempt_state not in _RETAINED_FOR_POST_MORTEM
+
+
+def _run_worktrees_across_runs(args: argparse.Namespace, reader: Any) -> int:
+    """Every run's leftovers in one listing, and with `--prune`, released.
+
+    A run's own live attempt is still excluded, per run, by the same ledger
+    read the single-run path uses: this widens which runs are asked about and
+    changes nothing about what counts as stale.
+    """
+    state = getattr(args, "repository_state", None)
+    if not state:
+        return _refusal(
+            "RUN_CONFIGURATION_REQUIRED",
+            "--all-runs needs a configured installation to locate each run's "
+            "worktree root",
+        )
+    runs_root = Path(state) / "runs"
+    rows: List[Dict[str, Any]] = []
+    released: List[Dict[str, Any]] = []
+    for record in reader.runs():
+        scoped = argparse.Namespace(
+            run_id=record.run_id,
+            worktrees_root=str(runs_root / record.run_id / "worktrees"),
+        )
+        for item in _stale_worktrees_for(scoped, reader):
+            rows.append({
+                "run_id": record.run_id,
+                "path": str(item.path),
+                "node_id": item.node_id,
+                "attempt_no": item.attempt_no,
+                "attempt_state": item.attempt_state or None,
+                "bytes_on_disk": item.bytes_on_disk,
+            })
+            if getattr(args, "prune", False) and _prunable(
+                item, getattr(args, "include_blocked", False)
+            ):
+                ok, detail = worktree.release_stale_worktree(
+                    Path(args.repo), item, force=getattr(args, "force", False)
+                )
+                released.append({
+                    "run_id": record.run_id,
+                    "path": str(item.path),
+                    "released": ok,
+                    "bytes_reclaimed": item.bytes_on_disk if ok else 0,
+                    "detail": detail,
+                })
+    if released:
+        subprocess.run(
+            ("git", "-C", str(args.repo), "worktree", "prune"),
+            capture_output=True, text=True, check=False,
+        )
+    print(json.dumps({
+        "outcome": "RUN_WORKTREES",
+        "run_id": None,
+        "stale": rows,
+        "bytes_on_disk": sum(row["bytes_on_disk"] for row in rows),
+        "released": released,
+        "bytes_reclaimed": sum(entry["bytes_reclaimed"] for entry in released),
+    }, sort_keys=True))
+    return 0
+
+
+def _run_worktrees(args: argparse.Namespace) -> int:
+    """List this run's attempt checkouts, and with `--prune` release the stale.
+
+    A separate verb rather than a flag on `run cancel`, because the disk is
+    reclaimable long before a run is over: the seven leftovers that prompted
+    this belonged to a run still executing its eighth attempt.
+    """
+    if not getattr(args, "db", None):
+        return _refusal("RUN_CONFIGURATION_REQUIRED", "--db is required")
+    reader = _open_reader(args.db)
+    try:
+        if getattr(args, "all_runs", False):
+            # Leftovers outlive the run that made them, so a verb that can
+            # only be asked about one run at a time makes the operator know
+            # every run id before they can reclaim anything -- which is the
+            # same as not being able to.
+            return _run_worktrees_across_runs(args, reader)
+        record = _select_run(reader, args)
+        args.run_id = record.run_id
+        # Derived here rather than bound by `_bind_run_ledger_configuration`,
+        # because the run root is a function of the run id and the id is not
+        # known until the selector above resolves. An explicitly supplied
+        # `--worktrees-root` still wins, the same way it does on salvage.
+        if not getattr(args, "worktrees_root", None):
+            state = getattr(args, "repository_state", None)
+            if not state:
+                return _refusal(
+                    "RUN_CONFIGURATION_REQUIRED",
+                    "--worktrees-root is required outside a configured "
+                    "installation, where the run root is derived from "
+                    "maestro.config.yaml",
+                )
+            args.worktrees_root = str(
+                Path(state) / "runs" / record.run_id / "worktrees"
+            )
+        stale = _stale_worktrees_for(args, reader)
+    finally:
+        reader.close()
+    rows = [
+        {
+            "path": str(item.path),
+            "node_id": item.node_id,
+            "attempt_no": item.attempt_no,
+            "attempt_state": item.attempt_state or None,
+            "bytes_on_disk": item.bytes_on_disk,
+        }
+        for item in stale
+    ]
+    released: List[Dict[str, Any]] = []
+    if getattr(args, "prune", False):
+        if not getattr(args, "repo", None):
+            return _refusal(
+                "RUN_CONFIGURATION_REQUIRED",
+                "--repo is required to release a checkout: the removal is "
+                "`git worktree remove` run against the repository that owns it",
+            )
+        for item in stale:
+            if not _prunable(item, getattr(args, "include_blocked", False)):
+                continue
+            ok, detail = worktree.release_stale_worktree(
+                Path(args.repo), item, force=getattr(args, "force", False)
+            )
+            released.append({
+                "path": str(item.path),
+                "released": ok,
+                "bytes_reclaimed": item.bytes_on_disk if ok else 0,
+                "detail": detail,
+            })
+        subprocess.run(
+            ("git", "-C", str(args.repo), "worktree", "prune"),
+            capture_output=True, text=True, check=False,
+        )
+    print(json.dumps({
+        "outcome": "RUN_WORKTREES",
+        "run_id": args.run_id,
+        "stale": rows,
+        "bytes_on_disk": sum(item.bytes_on_disk for item in stale),
+        "released": released,
+        "bytes_reclaimed": sum(entry["bytes_reclaimed"] for entry in released),
+    }, sort_keys=True))
+    return 0
 
 
 def _run_status(args: argparse.Namespace) -> int:
@@ -10041,6 +10651,38 @@ def build_parser() -> argparse.ArgumentParser:
     # Amendment takes the *amended* plan by name in the positional, so the
     # ordinary plan-resolution path binds it, and names the run it applies to
     # with a flag. Resume is the mirror image and deliberately stays bare.
+    worktrees_cmd = run_sub.add_parser("worktrees")
+    worktrees_cmd.add_argument("selector", metavar="PLAN_OR_RUN_ID", nargs="?")
+    worktrees_cmd.add_argument("--run-id")
+    worktrees_cmd.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="every run in the ledger, not just one; leftovers outlive the "
+             "run that made them",
+    )
+    # Both derived from `maestro.config.yaml` on a configured installation and
+    # required only outside one, which is the rule salvage follows.
+    worktrees_cmd.add_argument("--worktrees-root")
+    worktrees_cmd.add_argument("--repo")
+    worktrees_cmd.add_argument(
+        "--prune",
+        action="store_true",
+        help="remove the stale checkouts; their branches are kept",
+    )
+    worktrees_cmd.add_argument(
+        "--include-blocked",
+        action="store_true",
+        help="also prune a BLOCKED attempt's checkout, which §8.8 retains as "
+             "the post-mortem for a node that failed",
+    )
+    worktrees_cmd.add_argument(
+        "--force",
+        action="store_true",
+        help="pass --force to `git worktree remove`, discarding uncommitted "
+             "content in a checkout git refuses to release",
+    )
+    _add_db(worktrees_cmd)
+    worktrees_cmd.set_defaults(handler=_run_worktrees)
     amend = run_sub.add_parser("amend")
     _add_run_execution_options(amend)
     amend.add_argument("plan_name")

@@ -489,11 +489,6 @@ class WorkspaceGoldenScenario(unittest.TestCase):
             self.store.get_run(RUN_ID).outcome,
             workspace_model.WorkspaceOutcome.ACCEPTED,
         )
-        audit = self.store.audit_transitions(RUN_ID)
-        self.assertIn(("gate", "gate-recorded"),
-                      {(entry.kind, entry.reason) for entry in audit})
-        self.assertIn(("workspace", "outcome-declared"),
-                      {(entry.kind, entry.reason) for entry in audit})
 
         state_before_reopen = state_path.read_bytes()
         gate_marker_before_reopen = (self.state_root / "golden-gate-runs.log").read_bytes()
@@ -517,15 +512,6 @@ class WorkspaceGoldenScenario(unittest.TestCase):
             repository_paths=repositories,
             actor="golden-workspace-test",
         )
-        intent = publisher.prepare(RUN_ID)
-        self.assertEqual(intent.state, workspace_model.PublicationState.PREPARED)
-        self.assertEqual([target.repository_id for target in intent.targets],
-                         ["api", "worker", "web"])
-        for target in intent.targets:
-            self.assertEqual(target.expected_base_sha, bases[target.repository_id])
-            self.assertEqual(target.accepted_sha,
-                             records[target.repository_id].accepted_sha)
-            self.assertEqual(target.state, workspace_model.PublicationState.PENDING)
 
         published = publisher.publish(RUN_ID)
         self.assertEqual(published.outcome, workspace_model.WorkspaceOutcome.PUBLISHED)

@@ -215,18 +215,19 @@
           <a class="card" href="architecture/12-classes-envelopes.html"><span class="tag">12 · classes</span><h3>Envelope ADW classes</h3><p>Typed envelopes that carry work across the ADW boundary.</p></a>
           <a class="card" href="architecture/20-state-node.html"><span class="tag">20 · state</span><h3>NodeState machine</h3><p>PENDING through MERGED; a review-budget grant is not BLOCKED→PENDING.</p></a>
           <a class="card" href="architecture/21-state-run.html"><span class="tag">21 · state</span><h3>Derived run state</h3><p>Run outcome projected from node states, not a separate machine.</p></a>
-          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · state</span><h3>Attempt retry class</h3><p>Retry classes plus resume identity, QUIESCENCE_UNPROVEN, and workspace_not_found absence.</p></a>
-          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · flow</span><h3>Run start flowchart</h3><p>Admit, schedule, isolate; merge waits on derived build::review PASS.</p></a>
+          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · state</span><h3>Attempt retry class</h3><p>Attempt settle plus resume: leftover reclaim via worktree.stale_attempt_worktrees; resume_run clears lane_phase.</p></a>
+          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · flow</span><h3>Run start flowchart</h3><p>Scheduler.run loop: ready_nodes, first-attempt falsify base, identical-stop, then _declare.</p></a>
           <a class="card" href="architecture/31-flow-plan.html"><span class="tag">31 · flow</span><h3>Plan ship flowchart</h3><p>Validate, finalize, and ship a plan until it is runnable.</p></a>
           <a class="card" href="architecture/32-flow-escape.html"><span class="tag">32 · flow</span><h3>Operator escape flowchart</h3><p>Semantic grant goes PENDING; review-budget grant stays BLOCKED until resume.</p></a>
-          <a class="card" href="architecture/33-flow-commit.html"><span class="tag">33 · flow</span><h3>Pre-commit refusal flowchart</h3><p>Gitignored outputs and unreferenced symbols, counted before the commit.</p></a>
-          <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · flow</span><h3>Repair chain flowchart</h3><p>SEMANTIC plus output SHA opens repair; review rejection is not the trigger.</p></a>
+          <a class="card" href="architecture/33-flow-commit.html"><span class="tag">33 · flow</span><h3>Pre-commit refusal flowchart</h3><p>Two counted refusals, then permission_check, then seal (commit or adopt tip).</p></a>
+          <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · flow</span><h3>Repair chain flowchart</h3><p>REJECTED tests/builder can repair; unserviceable blocks typed; witness `_pre_candidate_base`.</p></a>
+          <a class="card" href="architecture/35-flow-unreviewed.html"><span class="tag">35 · flow</span><h3>Unread candidate flowchart</h3><p>Unread candidate is reviewed, not rebuilt; worktree stands on the candidate so REJECT can repair; not a legal build base.</p></a>
           <a class="card" href="architecture/40-mind-modules.html"><span class="tag">40 · mind</span><h3>Runtime module tree</h3><p>Module ownership: who may mutate lifecycle, who is transport only.</p></a>
           <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · mind</span><h3>Verb groups</h3><p>plan, run, and workspace command groups on the operator CLI.</p></a>
           <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · mind</span><h3>Nine root verbs</h3><p>bootstrap, plan, deliver, run, retry, skip, abandon, attempt, workspace.</p></a>
           <a class="card" href="architecture/04-data-flow-receipts.html"><span class="tag">04 · data</span><h3>Receipt data flow</h3><p>Only typed records and signed receipts move lifecycle state.</p></a>
           <a class="card" href="architecture/13-uml-runtime.html"><span class="tag">13 · uml</span><h3>Runtime UML</h3><p>Scheduler, store review types, PlanV3/TestsNode, and the transport-only launcher.</p></a>
-          <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · seq</span><h3>Attempt sequence</h3><p>Candidate publish, then review PASS, then merge — or SEMANTIC retry.</p></a>
+          <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · seq</span><h3>Attempt sequence</h3><p>Publish candidate SHA, then derived build::review PASS, then merge — identical-stop or SEMANTIC repair.</p></a>
         </div>
       </section>
 

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <title>Two counted refusals, then permission, then commit</title>
+  <title>Two counted refusals, then permission, then seal</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -59,11 +59,11 @@
 <body>
   <div class="frame">
     <p class="eyebrow">Flowchart · Maestro</p>
-    <h1>Two counted refusals, then permission, then commit</h1>
+    <h1>Two counted refusals, then permission, then seal</h1>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="33-flow-commit-title 33-flow-commit-desc">
-      <title id="33-flow-commit-title">Two counted refusals before the commit</title>
-      <desc id="33-flow-commit-desc">Flowchart of the attempt's measured delta: a declared output that exists on disk but is gitignored blocks with DECLARED_OUTPUT_UNCOMMITTABLE; unreferenced produced symbols block a CODE node or fail non-CODE SEMANTIC. Those two counts are not the whole gate: permission_check over the inventory delta can still refuse, then commit_measured_delta writes a private-index commit, CAS advances the attempt ref, read-tree refreshes the worktree index, and merge consumes the SHA.</desc>
+      <title id="33-flow-commit-title">Two counted refusals before the seal</title>
+      <desc id="33-flow-commit-desc">Flowchart of the attempt's measured delta: a declared output that exists on disk but is gitignored blocks with DECLARED_OUTPUT_UNCOMMITTABLE; unreferenced produced symbols block a CODE node or fail non-CODE SEMANTIC. Those two counts are not the whole gate: permission_check over the inventory delta can still refuse, then the output is sealed: commit_measured_delta when HEAD is still the base, or sealed_descendant_tip plus assert_tip_matches_measured when a retained builder already committed a linear descendant. Merge consumes that SHA.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -151,8 +151,8 @@
 
       <rect x="340" y="468" width="200" height="56" rx="24" fill="#2d3142"/>
       <rect x="340" y="468" width="200" height="56" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="440" y="492" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">commit_measured_delta</text>
-      <text x="440" y="508" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">private index · CAS · read-tree</text>
+      <text x="440" y="492" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">seal output</text>
+      <text x="440" y="508" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">commit if HEAD=base · else adopt tip</text>
 
       <!-- Callout -->
       <text x="40" y="560" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif">Exempt: dunder, decorated, collected, at base. Merge consumes the SHA.</text>

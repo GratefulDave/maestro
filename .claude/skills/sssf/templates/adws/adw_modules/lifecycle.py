@@ -5240,18 +5240,6 @@ class LifecycleStore:
         return seq
 
     @serialized
-    def plan_versions(self, run_id: str) -> Tuple[Tuple[int, str, str], ...]:
-        """This run's plan lineage as `(seq, digest, adopted_at)`, in order."""
-        return tuple(
-            (int(row[0]), str(row[1]), str(row[2]))
-            for row in self.conn.execute(
-                "SELECT seq, plan_digest, adopted_at FROM run_plan_versions"
-                " WHERE run_id=? ORDER BY seq",
-                (run_id,),
-            ).fetchall()
-        )
-
-    @serialized
     def current_plan(self, run_id: str) -> Optional[Tuple[str, bytes]]:
         """The digest and bytes this run is executing under now, or None.
 
@@ -5266,6 +5254,20 @@ class LifecycleStore:
             (run_id,),
         ).fetchone()
         return None if row is None else (str(row[0]), bytes(row[1]))
+
+    @serialized
+    def plan_versions(
+        self, run_id: str
+    ) -> Tuple[Tuple[int, str, bytes], ...]:
+        """The retained plan lineage, oldest first. Empty for a pre-retention run."""
+        rows = self.conn.execute(
+            "SELECT seq, plan_digest, plan_bytes FROM run_plan_versions"
+            " WHERE run_id=? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        return tuple(
+            (int(seq), str(digest), bytes(body)) for seq, digest, body in rows
+        )
 
     #: States whose `dag_nodes` row an amendment may never rewrite. MERGED and
     #: ACCEPTED carry evidence measured against the spec in that row; RUNNING
@@ -5472,7 +5474,7 @@ class LifecycleStore:
 
     @serialized
     def review_refresh_count(self, run_id: str) -> int:
-        """How much of this run's §3.6 A9 review allowance has been spent."""
+        """Public reader for callers outside `resume_run`'s transaction."""
         return self._review_refresh_count(run_id)
 
     @serialized
@@ -6802,9 +6804,18 @@ class LifecycleStore:
                 # Guarded on the exact state *and* the exact block reason, so
                 # a node that moved between the eligibility read and this
                 # write is left alone rather than reopened on a stale premise.
+                #
+                # `lane_phase` is the other authority a quiescence block
+                # terminalizes. `prepare_late_envelope_recovery` already
+                # reopens both in one transaction: leaving the lane BLOCKED
+                # makes the recovered worker lose its first `_set_lane_phase`
+                # CAS and strand the node RUNNING after its future returns.
+                # This path is the same shape for an attempt that never ran,
+                # so the next generation's BUILDING CAS is an initial write
+                # (NULL), never a reopen of BLOCKED.
                 reopened = self.conn.execute(
                     "UPDATE node_lifecycle SET state=?, block_reason=NULL,"
-                    " pending_cause=?, updated_at=?"
+                    " pending_cause=?, lane_phase=NULL, updated_at=?"
                     " WHERE run_id=? AND node_id=? AND attempt_no=?"
                     "   AND state=? AND block_reason=?",
                     (
@@ -7747,6 +7758,12 @@ class LifecycleStore:
         observed. §7.5 forbids an infra fault from decrementing a budget, and
         an attempt the operator ended by restarting the scheduler is a weaker
         fact still.
+
+        A quiescence block may already have terminalized `lane_phase`. The
+        next attempt's first `_set_lane_phase(BUILDING)` CAS refuses BLOCKED,
+        raises `AttemptOwnershipLost`, and strands the node RUNNING with no
+        worktree. Clear the phase in this same transaction so the fresh
+        attempt is an initial CAS, matching `prepare_late_envelope_recovery`.
         """
 
         def extra(lifecycle: st.NodeLifecycle):
@@ -7755,7 +7772,12 @@ class LifecycleStore:
                     "UPDATE attempts SET state=?"
                     " WHERE run_id=? AND node_id=? AND attempt_no=?",
                     (CLOSED_ATTEMPT_STATE.value, run_id, node_id, lifecycle.attempt_no),
-                )
+                ),
+                (
+                    "UPDATE node_lifecycle SET lane_phase=NULL"
+                    " WHERE run_id=? AND node_id=?",
+                    (run_id, node_id),
+                ),
             ]
 
         return self._transition_node(
@@ -8980,20 +9002,6 @@ class LifecycleReader:
             )
             for row in rows
         )
-
-    def pinned_test_strength_contract(
-        self, run_id: str
-    ) -> Optional[st.TestStrengthContract]:
-        """The pin, or `None` when the ledger holds no row for this run.
-
-        A ledger predating the column is a different answer from a ledger with
-        no run: the first pinned nothing because nothing could pin, which is
-        the legacy contract; the second has nothing to say at all.
-        """
-        rows = self._rows("SELECT run_id FROM runs WHERE run_id=?", (run_id,))
-        if not rows:
-            return None
-        return self.test_strength_contract(run_id)
 
     def test_strength_contract(self, run_id: str) -> st.TestStrengthContract:
         """The contract this run was created under. NULL, and a ledger with no

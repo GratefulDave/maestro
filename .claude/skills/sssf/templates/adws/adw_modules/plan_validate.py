@@ -200,14 +200,6 @@ class ValidationResult:
         return self.outcome is Outcome.FINALIZATION_ELIGIBLE
 
 
-@dataclass(frozen=True)
-class ValidationConfig:
-    """Configuration, never plan content — the same reason retry budgets are
-    configuration (§6.2). Tuning a budget must not mint a new digest."""
-
-    review_payload_budget_bytes: int = 262144
-
-
 class CollectorUnavailable(RuntimeError):
     """The runner could not be run at all — a missing binary, an unreadable
     working directory. An operational refusal with no identity consequence
@@ -259,11 +251,9 @@ class SubprocessCollector:
     and a runner that cannot import the repository is exactly that.
     """
 
-    timeout_s: float = 120.0
     #: Declared `runners:` values by runner literal, from `maestro.config.yaml`.
     #: Empty means nothing is declared and discovery proposes.
     declared: Mapping[str, str] = field(default_factory=dict)
-    env: Optional[Mapping[str, str]] = None
     resolver: Any = staticmethod(rr.resolve)
     _cache: Dict[Tuple[str, str], "rr.ResolvedRunner"] = field(
         default_factory=dict, repr=False, compare=False)
@@ -274,7 +264,7 @@ class SubprocessCollector:
             try:
                 self._cache[key] = self.resolver(
                     gate.runner, Path(tree), gate.cwd,
-                    declared=self.declared.get(gate.runner), env=self.env)
+                    declared=self.declared.get(gate.runner))
             except rr.RunnerUnusable as exc:
                 raise CollectorUnavailable(
                     "{0}:{1}".format(rr.RUNNER_UNUSABLE, exc.detail)) from exc
@@ -291,17 +281,15 @@ class SubprocessCollector:
         try:
             result = subprocess.run(list(self.argv_for(gate, tree)),
                                     cwd=str(cwd),
-                                    env=dict(self.env) if self.env is not None
-                                    else None,
                                     capture_output=True, text=True,
-                                    timeout=self.timeout_s)
+                                    timeout=120.0)
         except FileNotFoundError as exc:
             raise CollectorUnavailable(
                 "{0} could not be run: {1}".format(gate.runner, exc))
         except subprocess.TimeoutExpired:
             raise CollectorUnavailable(
                 "{0} did not finish collecting in {1}s".format(
-                    gate.runner, self.timeout_s))
+                    gate.runner, 120.0))
         return self._count(result.stdout)
 
     @staticmethod
@@ -1192,15 +1180,13 @@ def _gate_floor_supplied(plan: "pm.Plan") -> List[Blocker]:
 
 
 def validate_plan(stored: bytes, repo: Union[str, Path], *,
-                  receipts: ReceiptIndex, collector: GateCollector,
-                  config: Optional[ValidationConfig] = None) -> ValidationResult:
+                  receipts: ReceiptIndex, collector: GateCollector) -> ValidationResult:
     """Run every deterministic obligation and emit exactly one outcome.
 
     `repo` is the working repository the git facts are read from. Nothing is
     written anywhere, no reviewer is launched, and nothing is published: the
     verb's whole output is the outcome below (§11.1).
     """
-    config = config or ValidationConfig()
     repo_path = Path(repo)
     blockers: List[Blocker] = []
 
@@ -1242,12 +1228,12 @@ def validate_plan(stored: bytes, repo: Union[str, Path], *,
             Obligation.BRANCHES_EXIST, "/merge_policy/integration_branch",
             "{0} is not a branch in this repository".format(branch)))
 
-    if len(stored) > config.review_payload_budget_bytes:
+    if len(stored) > 262144:
         blockers.append(Blocker(
             Obligation.REVIEW_PAYLOAD_BUDGET, "",
             "the review payload is {0} bytes, over the {1}-byte budget; "
             "oversized plans are refused, not chunked (§6.5)".format(
-                len(stored), config.review_payload_budget_bytes)))
+                len(stored), 262144)))
 
     if plan.supersedes is not None and not receipts.has_receipt(plan.supersedes):
         blockers.append(Blocker(

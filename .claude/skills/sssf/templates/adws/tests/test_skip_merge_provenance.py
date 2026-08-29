@@ -143,10 +143,6 @@ class MergeCauseVocabularyTests(unittest.TestCase):
         ):
             self.assertIsNone(st.merge_cause_label(state, None), state)
 
-    def test_operator_accepted_is_the_unevidenced_cause(self):
-        self.assertIn(st.MergeCause.OPERATOR_ACCEPTED, st.UNEVIDENCED_MERGE_CAUSES)
-        self.assertNotIn(st.MergeCause.SCHEDULER, st.UNEVIDENCED_MERGE_CAUSES)
-
 
 class MergeCauseIsStoredTests(unittest.TestCase):
     """The distinction is a typed column, not a reading of the git log."""

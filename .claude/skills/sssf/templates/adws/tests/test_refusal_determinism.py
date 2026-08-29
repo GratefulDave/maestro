@@ -92,15 +92,6 @@ class DeterministicPartitionTests(unittest.TestCase):
                                rp.LauncherFailure.TRANSPORT),
             st.BlockReason.LAUNCHER_BUDGET_EXHAUSTED)
 
-    def test_the_new_reason_admits_a_repair_and_not_only_abandon(self):
-        """§11.3's property, restated for the member this adds. The refusal is
-        deterministic against an unchanged configuration, not against every
-        configuration: the operator supplies what the launcher named missing
-        and plain retry is then a genuinely different launch."""
-        exits = set(st.exits_for(st.BlockReason.LAUNCH_REFUSED))
-        self.assertTrue(exits - {st.Escape.ABANDON})
-        self.assertIn(st.Escape.RETRY, exits)
-
     def test_classification_is_still_launcher_transient(self):
         """The class does not change; only the budget the member carries."""
         result = rp.classify(rp.FailureSignal(

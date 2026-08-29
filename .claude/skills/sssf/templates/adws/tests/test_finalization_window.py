@@ -86,7 +86,6 @@ class Harness:
         self.pid = pid
         self.calls = []
         self.killed = []
-        self.sessions = []
         self.launch_calls = 0
         self.alive = alive
         self.records = records
@@ -106,7 +105,6 @@ class Harness:
             config=config or make_config(),
             launch=self._launch,
             poll_report=self._poll_report,
-            record_reviewer_session=self._record_session,
             kill=self._kill,
             process_alive=lambda pid: self.alive,
             transcript_record_count=lambda session: self.records,
@@ -136,9 +134,6 @@ class Harness:
             return {"plan_digest": "abc"}
         return None
 
-    def _record_session(self, session):
-        self.calls.append("record_reviewer_session")
-        self.sessions.append(session)
 
     def _kill(self, session):
         self.calls.append("kill")
@@ -198,7 +193,6 @@ class TheWindowOpensWithADurableRecord(unittest.TestCase):
     def test_opening_records_the_reviewer_session_row(self):
         h = Harness()
         session = h.window.open()
-        self.assertEqual(h.sessions, [session])
         self.assertEqual(session.route, "omp")
         self.assertEqual(session.model, "opus")
         self.assertEqual(session.session_id, "sess-7")
@@ -232,15 +226,6 @@ class TheWindowOpensWithADurableRecord(unittest.TestCase):
         self.assertTrue(outcome.session.armed)
         self.assertIs(outcome.signal, fw.FinalizationSignal.TURN_TIMEOUT)
 
-    def test_the_row_is_written_before_the_first_poll(self):
-        """§6.5: a stall is diagnosable from the store even though no run
-        row exists -- which requires the row to exist before anything can
-        stall."""
-        h = Harness()
-        h.window.open()
-        h.window.poll()
-        self.assertEqual(h.calls[:2], ["launch", "record_reviewer_session"])
-
     def test_the_span_clock_starts_before_the_launch_call(self):
         """§16.3 item 33 records that the launch path before the window
         opens is outside every window. This window narrows that gap as far
@@ -251,7 +236,6 @@ class TheWindowOpensWithADurableRecord(unittest.TestCase):
         h = Harness()
         h.monotonic.advance(0.0)
         session = h.window.open()
-        self.assertEqual(h.window.opened_at_monotonic, 0.0)
         self.assertEqual(session.launched_at, None)
 
     def test_a_window_is_opened_once(self):
@@ -572,7 +556,6 @@ class ClocksAreNeverMixed(unittest.TestCase):
         h = Harness(monotonic_start=0.0, epoch_start=1_760_000_000.0)
         session = h.window.open()
         self.assertEqual(session.opened_at_epoch, 1_760_000_000.0)
-        self.assertEqual(h.window.opened_at_monotonic, 0.0)
 
     def test_the_epoch_clock_advancing_alone_never_expires_the_window(self):
         h = Harness(config=make_config(finalization_timeout_s=60.0))
@@ -622,7 +605,6 @@ class ExpiryConvertsToAKillAndATypedOutcome(unittest.TestCase):
             config=make_config(),
             launch=h._launch,
             poll_report=h._poll_report,
-            record_reviewer_session=h._record_session,
             kill=h._kill,
             time_source=h.monotonic,
             wall_clock=h.epoch,
@@ -736,41 +718,6 @@ class ACompletedReviewLeavesTheWindow(unittest.TestCase):
         outcome = h.window.run(sleep=tick)
         self.assertFalse(outcome.completed)
         self.assertEqual(outcome.signal, fw.FinalizationSignal.WINDOW_TIMEOUT)
-
-
-class TheReviewerSessionIsFresh(unittest.TestCase):
-    """§6.5: the review runs in a fresh session directory, never the
-    authoring node's, so context cannot leak through session continuity."""
-
-    def test_a_reused_authoring_session_directory_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authoring = Path(tmp) / "authoring"
-            authoring.mkdir()
-            with self.assertRaises(fw.SessionNotFresh):
-                fw.require_fresh_session_dir(authoring, authoring_dirs=[authoring])
-
-    def test_a_directory_inside_the_authoring_session_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authoring = Path(tmp) / "authoring"
-            (authoring / "nested").mkdir(parents=True)
-            with self.assertRaises(fw.SessionNotFresh):
-                fw.require_fresh_session_dir(authoring / "nested",
-                                             authoring_dirs=[authoring])
-
-    def test_a_non_empty_directory_is_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            reviewer = Path(tmp) / "reviewer"
-            reviewer.mkdir()
-            (reviewer / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
-            with self.assertRaises(fw.SessionNotFresh):
-                fw.require_fresh_session_dir(reviewer, authoring_dirs=[])
-
-    def test_a_fresh_directory_is_accepted(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authoring = Path(tmp) / "authoring"
-            authoring.mkdir()
-            reviewer = Path(tmp) / "reviewer"
-            fw.require_fresh_session_dir(reviewer, authoring_dirs=[authoring])
 
 
 class TheTurnClockCannotOutvoteALiveObservation(unittest.TestCase):

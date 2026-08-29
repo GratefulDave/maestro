@@ -97,6 +97,17 @@ class TestsRefusal(_RemediedRefusal):
         "assertion to an old case creates no new case. Check before "
         "finishing with `--collect-only -q -o addopts=` that the new "
         "nodeids appear.")
+    PARENT_RUN_UNACCOUNTED = (
+        "TESTS_PARENT_RUN_UNACCOUNTED",
+        "This names the harness, not your tests: collection found the new "
+        "cases, and the parent run's report accounted for fewer of them "
+        "than were collected, so some or all of them were never judged at "
+        "all. No edit to the tests can change that count. The verdict "
+        "carries both numbers and the command that produced them; compare "
+        "the collected ids against the ids the runner's own report prints "
+        "back — an empty intersection means the two surfaces disagree "
+        "about how a case is named, which is a defect in the measurement "
+        "and needs an operator, not another attempt.")
     HOLLOW_AT_PARENT = (
         "TESTS_HOLLOW_AT_PARENT",
         "Strengthen every new case that passed at the parent commit so it "
@@ -203,13 +214,20 @@ def new_nodeids(parent: Sequence[str], current: Sequence[str]) -> Tuple[str, ...
 
 
 def collect_parent_nodeids(tree: Path, commit: str, paths: Sequence[str],
-                           timeout_s: float = 120.0) -> Tuple[str, ...]:
+                           timeout_s: float = 120.0,
+                           runner: Optional["CaseRunner"] = None
+                           ) -> Tuple[str, ...]:
     """Cases collected from `paths` as they existed at `commit`.
 
     A path absent from that tree contributes nothing, so a newly created
     test file has no parent nodeids. A modified line in an existing file
     keeps the parent nodeids, which is how "new case" is distinguished
     from "edited line".
+
+    `runner` is the gate's own case runner. Omitting it collects with pytest,
+    which is only correct for a pytest gate: `RunnerUnsupported` already
+    states why measuring a vitest node with pytest is refused rather than
+    defaulted, and this is the same measurement one commit earlier.
     """
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -222,6 +240,8 @@ def collect_parent_nodeids(tree: Path, commit: str, paths: Sequence[str],
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(blob)
             present.append(path)
+        if runner is not None:
+            return runner.collect(root, present, timeout_s=timeout_s)
         return collect_nodeids(root, present, timeout_s=timeout_s)
 
 
@@ -260,6 +280,26 @@ def _blob_at(tree: Path, commit: str, path: str) -> Optional[bytes]:
                 object_id.decode("ascii", "replace"), path, commit))
     return shown.stdout
 
+#: How much of the collected-id list a refusal detail may carry. Long enough
+#: for a handful of vitest `file::Suite > title` ids — the shape that has to
+#: be *seen* to be recognised as disagreeing with the report's — short enough
+#: that one refusal cannot flood `transitions.detail_json`.
+_DETAIL_ID_BUDGET = 240
+
+
+def _elided(text: str, budget: int = _DETAIL_ID_BUDGET) -> str:
+    """`text`, cut to `budget` with the number of dropped characters stated.
+
+    Stated rather than silently truncated: a detail that ends mid-id would
+    read as an id that ends there, which is the same class of mistake as the
+    disagreement these details exist to expose.
+    """
+    if len(text) <= budget:
+        return text
+    return "{0}… (+{1} more characters)".format(
+        text[:budget], len(text) - budget)
+
+
 def adjudicate_parent_red(result: "wt.GateResult",
                           new_case_count: int) -> vf.VerificationVerdict:
     """Clause 4 of the tests chain: every new case is red at parent.
@@ -267,6 +307,32 @@ def adjudicate_parent_red(result: "wt.GateResult",
     `adjudicate_gate` expects green. This is the missing opposite: a
     parseable report whose new cases all failed, with collection/import
     crashes refused by name rather than counted as the red we wanted.
+
+    Two arithmetically different facts used to share `TESTS_NO_NEW_CASES`.
+    `new_case_count < 1` is the tester's: nothing new was written.
+    `counts.collected < new_case_count` is the *harness's*: collection found
+    N ids, the run was asked for those N ids, and the report accounted for
+    fewer than N — which no edit to the tests can change. In production that
+    second branch was never once the tester's doing. It fired three times on
+    `lane-wp6-tests`, each time from a different measurement defect:
+    collecting a `.test.ts` file with pytest (`407d7d3`),
+    `vitest list --json <path>` overwriting the file it was measuring
+    (`5273342`), and `vitest list` naming a case `Suite > title` while
+    `--reporter=json` joined the same parts with a plain space, so
+    `run()`'s `set(collected) & set(reported)` was empty by construction
+    (`c087469`). Nine correct cases, every one red at the parent for exactly
+    the reason a TDD case is red, refused with a string that said the tester
+    had written nothing — and the third bug cost a whole run to find because
+    the refusal named the agent instead of the measurement.
+
+    So the branch is `TESTS_PARENT_RUN_UNACCOUNTED`, it carries both counts
+    and the command that produced them, and it is ENVIRONMENTAL: re-running
+    the agent cannot repair a report that did not account for the cases it
+    was handed, and classifying it SEMANTIC spends the fix loop's budget
+    (§7.5) proving that twice. The observed ids are not reachable here — a
+    `GateResult` carries the ids that were *asked for* (`selector`) and the
+    five counts, not the per-case outcomes — so the detail states the side it
+    has and names the command that printed the other.
     """
     if new_case_count < 1:
         return _refused(TestsRefusal.NO_NEW_CASES,
@@ -288,10 +354,18 @@ def adjudicate_parent_red(result: "wt.GateResult",
             "{0} new case(s) passed at the parent commit"
             .format(counts.passed))
     if counts.collected < new_case_count:
+        unaccounted = new_case_count - counts.collected
         return _refused(
-            TestsRefusal.NO_NEW_CASES,
-            "parent run collected {0}, fewer than {1} new case(s)"
-            .format(counts.collected, new_case_count))
+            TestsRefusal.PARENT_RUN_UNACCOUNTED,
+            "collection found {0} new case(s) at the parent tree; the run "
+            "reported an outcome for {1} of them, {2} unaccounted{3}. "
+            "ran: `{4}`; collected ids: {5}".format(
+                new_case_count, counts.collected, unaccounted,
+                " — the report and the collected ids intersect nowhere, so "
+                "not one case was judged" if counts.collected == 0 else "",
+                " ".join(result.command) or "(no command recorded)",
+                _elided(result.selector) or "(none recorded)"),
+            retry_class=st.RetryClass.ENVIRONMENTAL)
     if counts.failed < new_case_count or counts.failed != counts.collected:
         return _refused(
             TestsRefusal.NOT_RED_AT_PARENT,
@@ -671,9 +745,51 @@ class CaseRunner:
             timeout_s: float = 300.0) -> CaseRun:
         raise NotImplementedError
 
+    # ── reading a test file's own case names ────────────────────────────────
+    #
+    # `gate_capture` compares the case ids a runner *reported* against the
+    # names the *accepted* test bytes define, and that comparison needs two
+    # things this class already knows how to be right about: which names a
+    # source file defines, and which part of a node id is the case name.
+    #
+    # They live here rather than in `gate_capture` because both answers are
+    # facts about one runner's language and id shape, and `gate_capture` held
+    # only the pytest answer: it parsed every accepted candidate with
+    # CPython's `ast.parse`. A TypeScript file is not Python, so on
+    # `run-9d03105407f440079f3730f1fe4c67b3` the parse raised `SyntaxError`
+    # for an apostrophe in a comment, the pairing check refused
+    # `TEST_PAIRING_TEST_TREE_UNREADABLE` -- "this names the machine, not the
+    # diff" -- and three retries of that refusal exhausted the node's
+    # environmental budget and blocked the run. No vitest build lane could
+    # ever have passed it.
+
+    def defined_case_names(self, source: str) -> frozenset:
+        """Every case name the source defines. May raise `SyntaxError`."""
+        raise NotImplementedError
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        """Names whose single definition can report more than one case."""
+        raise NotImplementedError
+
+    def case_name_of(self, nodeid: str) -> str:
+        """The case name inside one reported node id."""
+        raise NotImplementedError
+
 
 class PytestCaseRunner(CaseRunner):
     name = "pytest"
+
+    def defined_case_names(self, source: str) -> frozenset:
+        from . import gate_capture
+        return gate_capture.case_names_defined(source)
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        from . import gate_capture
+        return gate_capture.parametrised_case_names(source)
+
+    def case_name_of(self, nodeid: str) -> str:
+        from . import gate_capture
+        return gate_capture.case_name_of(nodeid)
 
     def collect(self, tree: Path, paths: Sequence[str],
                 timeout_s: float = 120.0) -> Tuple[str, ...]:
@@ -712,6 +828,89 @@ class VitestCaseRunner(CaseRunner):
 
     name = "vitest"
 
+    #: One `it`/`test` call whose title is the first argument. Modifiers
+    #: (`.only`, `.skip`, `.concurrent`, `.todo`, `.fails`) are captured in
+    #: group 1 so a modifier cannot hide a case, and the title's own quote
+    #: style is captured so the closing quote is the matching one -- an
+    #: apostrophe inside a double-quoted title must not end it.
+    #:
+    #: `.each` is excluded here and matched separately below, because it does
+    #: not have this shape at all: `it.each(table)("title")` is curried, so
+    #: the first argument is the table and the title belongs to a *second*
+    #: call. Matched by this pattern it does not match anything, which is
+    #: worse than misclassifying it -- the case would be invisible to
+    #: `defined_case_names` and every row it reports would read as a stray.
+    _CASE = re.compile(
+        r"""\b(?:it|test)((?:\.(?!each\b)\w+)*)\s*\(\s*"""
+        r"""(['"`])(.*?)(?<!\\)\2""",
+        re.DOTALL,
+    )
+
+    #: The curried `.each` form, in both of its spellings: an array table
+    #: `it.each([...])("title")` and a template table ``it.each`…`("title")``.
+    #: The gap before the title is bounded by `;` so a table that fails to
+    #: close cannot swallow the next case's title along with it.
+    _EACH = re.compile(
+        r"""\b(?:it|test)(?:\.\w+)*\.each\b[^;]*?\)\s*\(\s*"""
+        r"""(['"`])(.*?)(?<!\\)\1""",
+        re.DOTALL,
+    )
+
+    def defined_case_names(self, source: str) -> frozenset:
+        """Every `it`/`test` title the source declares.
+
+        Read from the source text rather than from a syntax tree, and that is
+        a deliberate limit rather than an oversight: this process has no
+        TypeScript parser, shelling out to one would put a `node` invocation
+        on the pairing path of every attempt, and the question being asked is
+        only which titles the file declares. A title is a literal at the head
+        of a call, which the text carries exactly.
+
+        What this cannot see is a title that is not a literal -- a variable, a
+        concatenation, an interpolated template. Those are reported by the
+        runner under their computed name and would read as strays, so a
+        template literal carrying `${` is treated as parametrised below,
+        exactly as pytest's `parametrize` is: one definition, many reported
+        names, none of them predictable from the source.
+        """
+        return frozenset(
+            [match.group(3) for match in self._CASE.finditer(source)]
+            + [match.group(2) for match in self._EACH.finditer(source)]
+        )
+
+    def parametrised_case_names(self, source: str) -> frozenset:
+        """Titles that can report under a name the source does not spell.
+
+        Two shapes: `it.each([...])("...")`, whose title is a format string
+        vitest fills in per row, and any title carrying `${`, which the
+        runtime interpolates. Both are the vitest analogue of pytest's
+        `parametrize`, and `gate_capture` exempts them from the membership
+        test for the same reason it exempts that.
+        """
+        found = {match.group(2) for match in self._EACH.finditer(source)}
+        for match in self._CASE.finditer(source):
+            _modifiers, _quote, title = match.groups()
+            if "${" in title:
+                found.add(title)
+        return frozenset(found)
+
+    def case_name_of(self, nodeid: str) -> str:
+        """The title inside a vitest node id.
+
+        `parse_vitest_list` builds `<file>::<suite> > <suite> > <title>` and
+        `_vitest_case_name` joins the ancestors with the same `" > "`, so the
+        title is the last such segment. Splitting on `::` first drops the file,
+        which may itself contain no separator at all.
+        """
+        tail = str(nodeid).rsplit("::", 1)[-1].strip()
+        if not tail:
+            from . import gate_capture
+            raise gate_capture.GateCaptureRefusal(
+                "{0}:{1!r} carries no case name".format(
+                    gate_capture.NODEID_UNPARSEABLE, nodeid)
+            )
+        return tail.rsplit(" > ", 1)[-1].strip()
+
     def _prefix(self) -> Tuple[str, ...]:
         found = shutil.which("vitest")
         if found:
@@ -723,7 +922,16 @@ class VitestCaseRunner(CaseRunner):
         existing = [p for p in paths if (Path(tree) / p).exists()]
         if not existing:
             return ()
-        command = self._prefix() + ("list", "--json", *existing)
+        # The filters go BEFORE `--json`, and this order is load-bearing:
+        # vitest's `--json` takes an *optional value*, so `--json <path>` is
+        # parsed as "write the listing to <path>". Emitting the paths after
+        # the flag therefore made vitest OVERWRITE the first test file with
+        # its own JSON output, print nothing to stdout, and exit 0. On
+        # `run-6b8f607d89744eeb94a79713b3b5d234` that destroyed the tester's
+        # committed cases inside its attempt worktree, returned zero node
+        # ids, and refused `TESTS_NO_NEW_CASES` -- forever, because every
+        # retry rebuilt the file and every collection ate it again.
+        command = self._prefix() + ("list", *existing, "--json")
         result = subprocess.run(
             list(command), cwd=str(tree), env=_report_env(),
             capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -780,6 +988,44 @@ def case_runner(name: str) -> CaseRunner:
             "{0}: {1} cannot resolve cases for this runner; supported: "
             "{2}".format(StrengthRefusal.RUNNER_UNSUPPORTED.value, name,
                          ", ".join(sorted(_RUNNERS)))) from None
+
+
+def run_cases_for(runner: CaseRunner, tree: Path, nodeids: Sequence[str],
+                  timeout_s: float = 300.0) -> "wt.GateResult":
+    """`run_cases`, but under the gate's own runner.
+
+    Clause 4 of the tests chain adjudicates a `GateResult`, and `run_cases`
+    can only produce one by driving pytest. That made the whole clause-3/4
+    chain pytest-only while the strength contract beside it was already
+    runner-dispatched, and on `run-8a200af7f9044ce7a11a51b6908f37e3` a vitest
+    tests node was collected with pytest, yielded zero nodeids, and refused
+    `TESTS_NO_NEW_CASES` on every attempt — the exact silent-zero failure
+    `RunnerUnsupported` documents, reached through the one path that had no
+    runner to refuse with. The pytest arm still runs `run_cases` verbatim so
+    its evidence is unchanged; every other runner is resolved through its
+    `CaseRun`, whose per-case outcomes carry the same five counts.
+
+    `collection_failed` maps to empty counts, which `GateCounts.parse` reads
+    as "no report" rather than "zero cases" — the distinction clause 4 needs
+    to call a collection failure environmental instead of red.
+    """
+    if isinstance(runner, PytestCaseRunner):
+        return run_cases(tree, nodeids, timeout_s=timeout_s)
+    executed = runner.run(tree, nodeids, timeout_s=timeout_s)
+    counts: dict = {}
+    if not executed.collection_failed:
+        counts = {
+            "collected": len(executed.outcomes),
+            "passed": executed.passed,
+            "failed": executed.failed,
+            "skipped": executed.skipped,
+            "errored": executed.errored,
+        }
+    return wt.GateResult(
+        label="parent-red", scope="node", selector=" ".join(nodeids),
+        command=tuple(executed.command),
+        exit_code=executed.exit_code, green=executed.exit_code == 0,
+        counts=counts, tail=tuple(executed.tail))
 
 
 def parse_pytest_outcomes(output: str,
@@ -839,11 +1085,40 @@ def parse_vitest_list(output: str) -> Tuple[str, ...]:
     return ()
 
 
+def _vitest_case_name(case: dict) -> str:
+    """The case name in the *same shape* `vitest list --json` prints.
+
+    The two vitest surfaces disagree, and the disagreement is silent. `vitest
+    list --json` joins a case's ancestor suites and its title with `" > "`;
+    `--reporter=json` also ships `fullName`, which joins them with a plain
+    space. Building a node id from `fullName` therefore produces an id that
+    can never equal the id collection produced for the very same case.
+
+    `VitestCaseRunner.run` runs the whole suite and keeps the outcomes whose
+    id is in the collected set, so an id shape that cannot match means the
+    kept set is empty for every vitest node — a report with nine failing
+    cases adjudicated as `parent run collected 0`, on every attempt, which no
+    edit to the tests could satisfy. Reconstructing the name from
+    `ancestorTitles + title` is the only form that agrees with collection;
+    `fullName` is the fallback for a report that omits the parts.
+    """
+    ancestors = case.get("ancestorTitles")
+    title = case.get("title")
+    if isinstance(ancestors, list) and isinstance(title, str) and title:
+        parts = [part for part in ancestors if isinstance(part, str) and part]
+        return " > ".join(parts + [title])
+    full = case.get("fullName") or title or ""
+    return full if isinstance(full, str) else ""
+
+
 def parse_vitest_report(output: str) -> Tuple[Tuple[CaseOutcome, ...], bool]:
     """Per-case outcomes from `vitest run --reporter=json`.
 
     Returns the outcomes and whether a report was parsed at all, so a run that
     produced no JSON is `collection_failed` rather than a green empty set.
+
+    Case ids are built to agree with `parse_vitest_list`; see
+    `_vitest_case_name` for why `fullName` is not that shape.
     """
     payload = _first_json(output)
     if not isinstance(payload, dict):
@@ -862,7 +1137,7 @@ def parse_vitest_report(output: str) -> Tuple[Tuple[CaseOutcome, ...], bool]:
         for case in cases:
             if not isinstance(case, dict):
                 continue
-            title = case.get("fullName") or case.get("title") or ""
+            title = _vitest_case_name(case)
             status = {"passed": "passed", "failed": "failed",
                       "skipped": "skipped", "pending": "skipped",
                       "todo": "skipped"}.get(str(case.get("status")), "errored")

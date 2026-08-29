@@ -369,7 +369,7 @@
                 <span class="card-dot soft" aria-hidden="true"></span>
                 <h3>Attempt retry class</h3>
               </div>
-              <p>Attempt settle plus resume: identity-bound envelope, QUIESCENCE_UNPROVEN, exact actor adopt, workspace_not_found is absence.</p>
+              <p>Attempt settle plus resume: leftover reclaim via worktree.stale_attempt_worktrees; resume_run clears lane_phase.</p>
             </a>
           </li>
         </ul>
@@ -385,7 +385,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Run start flowchart</h3>
               </div>
-              <p>Scheduler.run loop: ready_nodes, falsify before VERIFIED, then _declare.</p>
+              <p>Scheduler.run loop: ready_nodes, first-attempt falsify base, identical-stop, then _declare.</p>
             </a>
           </li>
           <li>
@@ -415,7 +415,7 @@
                 <span class="card-dot link" aria-hidden="true"></span>
                 <h3>Pre-commit refusal flowchart</h3>
               </div>
-              <p>Two counted refusals, then permission_check, then the private-index commit.</p>
+              <p>Two counted refusals, then permission_check, then seal (commit or adopt tip).</p>
             </a>
           </li>
           <li>
@@ -425,7 +425,17 @@
                 <span class="card-dot coral" aria-hidden="true"></span>
                 <h3>Repair chain flowchart</h3>
               </div>
-              <p>A repair inherits its falsifiability witness from the chain root, bounded by REPAIR_CHAIN_LIMIT.</p>
+              <p>REJECTED tests/builder can repair; unserviceable blocks typed; witness `_pre_candidate_base`.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="35-flow-unreviewed.html">
+              <p class="card-file">35-flow-unreviewed.html</p>
+              <div class="card-header">
+                <span class="card-dot muted" aria-hidden="true"></span>
+                <h3>Unread candidate flowchart</h3>
+              </div>
+              <p>Unread candidate is reviewed, not rebuilt; worktree stands on the candidate so REJECT can repair; not a legal build base.</p>
             </a>
           </li>
         </ul>
@@ -441,7 +451,7 @@
                 <span class="card-dot coral" aria-hidden="true"></span>
                 <h3>Attempt sequence</h3>
               </div>
-              <p>Publish candidate SHA, then derived build::review PASS, then merge — or SEMANTIC retry.</p>
+              <p>Publish candidate SHA, then derived build::review PASS, then merge — identical-stop or SEMANTIC repair.</p>
             </a>
           </li>
         </ul>
@@ -486,7 +496,7 @@
 
     <footer class="footer">
       <a href="../index.html">Maestro docs home</a>
-      <span>17 diagrams · Architecture gallery</span>
+      <span>18 diagrams · Architecture gallery</span>
     </footer>
   </div>
 </body>

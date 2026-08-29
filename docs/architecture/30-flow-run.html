@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1280 800" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="30-flow-run-title 30-flow-run-desc">
       <title id="30-flow-run-title">Scheduler.run · ready_nodes until _declare</title>
-      <desc id="30-flow-run-desc">Scheduler.run loops on ready_nodes after create_run. Admission checks the PASS receipt, plan eligibility, and SEMANTIC budget before any ledger write. Post-gate fail is fail_attempt with PENDING retry. For an agent node whose post-node gate PASSED, falsify_outputs runs before mark_verified. Merge waits on a derived build::review PASS for the current candidate SHA. After resume, lane retry reads floored spend, not a raised ceiling. Quiescence goes to _declare.</desc>
+      <desc id="30-flow-run-desc">Scheduler.run loops on ready_nodes after create_run. Admission checks the PASS receipt, plan eligibility, and SEMANTIC budget before any ledger write. Post-gate fail is fail_attempt with PENDING SEMANTIC retry unless identical refusal or budget. For an agent node whose post-node gate PASSED, falsify_outputs reverts to `_pre_candidate_base`. Merge waits on a derived build::review PASS for the current candidate SHA. After resume, lane retry reads floored spend, not a raised ceiling. Quiescence goes to _declare.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -151,14 +151,14 @@
       <rect x="880" y="384" width="240" height="168" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
       <text x="1000" y="444" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">fail_attempt</text>
       <text x="1000" y="464" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PENDING retry · SEMANTIC</text>
-      <text x="1000" y="480" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BLOCKED only on budget</text>
+      <text x="1000" y="480" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BLOCKED on budget or SEMANTIC_REFUSAL_REPEATED</text>
       <text x="1000" y="500" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">resume: lane retry reads floor</text>
       <text x="1000" y="516" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">not a raised ceiling</text>
 
       <polygon points="560,480 660,528 560,576 460,528" fill="#2d3142"/>
       <polygon points="560,480 660,528 560,576 460,528" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <text x="560" y="524" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">falsify first?</text>
-      <text x="560" y="540" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">before mark_verified</text>
+      <text x="560" y="540" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">revert to first-attempt base</text>
 
       <rect x="460" y="608" width="200" height="48" rx="6" fill="#2d3142"/>
       <rect x="460" y="608" width="200" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>

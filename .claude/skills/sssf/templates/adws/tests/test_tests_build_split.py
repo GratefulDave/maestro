@@ -391,6 +391,11 @@ class TesterConfigKeyTests(unittest.TestCase):
 
         raw = yaml.safe_load((ADWS / "maestro.config.yaml").read_text(encoding="utf-8"))
         self.assertIn("tester", raw)
-        self.assertIsInstance(raw["tester"]["profile"], str)
-        self.assertTrue(raw["tester"]["profile"].strip())
-        self.assertEqual("omp", raw["tester"]["route"])
+        tester = raw["tester"]
+        self.assertIn(tester.get("route"), ("omp", "claude"))
+        if tester["route"] == "omp":
+            self.assertIsInstance(tester["profile"], str)
+            self.assertTrue(tester["profile"].strip())
+        else:
+            self.assertIsInstance(tester.get("model"), str)
+            self.assertTrue(str(tester["model"]).strip())

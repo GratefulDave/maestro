@@ -27,12 +27,13 @@ phase (`pre-baseline` returns silently) and left every other phase to convict:
 `settle` on the worktree-check and gate-not-falsifiable paths as well as on the
 refused launch, each reaching an attempt that dispatched nothing.
 
-The exemption stops at the settle, and the boundary is not cosmetic. §7.6's
-window opens before the worktree exists, so `cancel`, `watchdog`, and the
-watchdog's kill reach attempts whose *provision or pre-gate subprocess may be
-alive right now*, and `pre-baseline` exists to prove exactly those absent.
-Those four keep demanding the proof and keep blocking when they cannot have it;
-`tests/test_scheduler.py::QuiescenceTests` holds their controls.
+The exemption stops at the settle for `pre-baseline` and `cancel`.
+The watchdog's kill and `fail`'s `watchdog` quiesce now consult
+`_attempt_dispatched`: an attempt that never entered `run_node` has
+no pane to prove absent, and answering `PROCESS_GROUP_UNTRACKED`
+there is terminal (lane-wp6-build#1). Those two skip; the other two
+keep demanding the proof. `tests/test_scheduler.py::QuiescenceTests`
+and `GenerationFenceTests` hold the controls.
 
 Every skip below keeps its negative control. A refusal that may have left a
 pane still demands the measured proof; a refusal typed deterministic still

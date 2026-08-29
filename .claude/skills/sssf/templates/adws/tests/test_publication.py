@@ -253,7 +253,7 @@ class LocalPublicationTests(unittest.TestCase):
             )
 
             with self.assertRaises(publication.PublicationError):
-                publisher.prepare(RUN_ID)
+                publisher.publish(RUN_ID)
 
             probes = tuple(
                 (command, cwd) for command, cwd in runner.calls
@@ -272,6 +272,7 @@ class LocalPublicationTests(unittest.TestCase):
             with self.assertRaises(cs.PublicationRefused):
                 store.get_publication_intent(RUN_ID)
             store.close()
+
 
     def test_publish_updates_targets_in_persisted_order_and_declares_published(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -650,7 +651,7 @@ class LocalPublicationTests(unittest.TestCase):
                 store=store, repository_paths={"api": api.path},
                 command_runner=RecordingRunner(),
             )
-            prepared = first.prepare(RUN_ID)
+            prepared = first.publish(RUN_ID).intent
             store.close()
 
             reopened_store = cs.CoordinatorStore(store_path)
@@ -659,13 +660,12 @@ class LocalPublicationTests(unittest.TestCase):
                 store=reopened_store, repository_paths={"api": api.path},
                 command_runner=runner,
             )
-            recovered = reopened.prepare(RUN_ID)
+            recovered = reopened.publish(RUN_ID).intent
 
             self.assertEqual(recovered, prepared)
             self.assertEqual(recovered.targets[0].expected_base_sha, api.base_sha)
             self.assertEqual(runner.calls, [])
             reopened_store.close()
-
 
     def test_path_mismatch_refuses_before_any_publication_command(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -680,7 +680,7 @@ class LocalPublicationTests(unittest.TestCase):
                 command_runner=runner)
 
             with self.assertRaises(cs.RepositoryPathMismatch):
-                publisher.prepare(RUN_ID)
+                publisher.publish(RUN_ID)
 
             self.assertEqual(runner.calls, [])
             with self.assertRaises(cs.PublicationRefused):
@@ -701,10 +701,11 @@ class LocalPublicationTests(unittest.TestCase):
                 command_runner=runner)
 
             with self.assertRaises(cs.RepositoryPathMismatch):
-                publisher.prepare(RUN_ID)
+                publisher.publish(RUN_ID)
 
             self.assertEqual(runner.calls, [])
             store.close()
+
 
 class PullRequestPublicationTests(unittest.TestCase):
 
@@ -814,7 +815,7 @@ class PullRequestPublicationTests(unittest.TestCase):
             )
 
             with self.assertRaises(publication.PublicationError):
-                publisher.prepare(RUN_ID)
+                publisher.publish(RUN_ID)
 
             candidate_ref = "refs/heads/{0}/api".format(ACCEPTED_BRANCH)
             self.assertEqual(
@@ -851,7 +852,7 @@ class PullRequestPublicationTests(unittest.TestCase):
             )
 
             with self.assertRaises(publication.PublicationError):
-                publisher.prepare(RUN_ID)
+                publisher.publish(RUN_ID)
 
             candidate_ref = "refs/heads/{0}/api".format(ACCEPTED_BRANCH)
             self.assertEqual(
@@ -867,6 +868,36 @@ class PullRequestPublicationTests(unittest.TestCase):
             with self.assertRaises(cs.PublicationRefused):
                 store.get_publication_intent(RUN_ID)
             store.close()
+
+    def test_preflight_rejects_non_github_remote_before_creating_intent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = RepositoryFixture(
+                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
+            store = cs.CoordinatorStore(root / "coordinator.db")
+            create_accepted_run(
+                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
+            )
+            runner = RemoteRunner(
+                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha,
+                remote_url="https://example.test/acme/api.git",
+            )
+            publisher = publication.WorkspacePublisher(
+                store=store, repository_paths={"api": fixture.path},
+                command_runner=runner,
+            )
+
+            with self.assertRaises(publication.PublicationError):
+                publisher.publish(RUN_ID)
+
+            self.assertEqual(
+                runner.calls,
+                [(("git", "remote", "get-url", "--", "origin"), fixture.path)],
+            )
+            with self.assertRaises(cs.PublicationRefused):
+                store.get_publication_intent(RUN_ID)
+            store.close()
+
 
     def test_resume_recovers_a_unique_matching_open_pull_request_without_recreate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -989,34 +1020,6 @@ class PullRequestPublicationTests(unittest.TestCase):
             publication.WorkspacePublisher._github_repository_from_url(
                 "https://example.test/acme/api.git")
 
-    def test_preflight_rejects_non_github_remote_before_creating_intent(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fixture = RepositoryFixture(
-                "api", (root / "api").resolve(), "a" * 40, "c" * 40, "b" * 40)
-            store = cs.CoordinatorStore(root / "coordinator.db")
-            create_accepted_run(
-                store, mode=wm.PublicationMode.PULL_REQUESTS, repositories=(fixture,),
-            )
-            runner = RemoteRunner(
-                base_sha=fixture.base_sha, accepted_sha=fixture.accepted_sha,
-                remote_url="https://example.test/acme/api.git",
-            )
-            publisher = publication.WorkspacePublisher(
-                store=store, repository_paths={"api": fixture.path},
-                command_runner=runner,
-            )
-
-            with self.assertRaises(publication.PublicationError):
-                publisher.prepare(RUN_ID)
-
-            self.assertEqual(
-                runner.calls,
-                [(("git", "remote", "get-url", "--", "origin"), fixture.path)],
-            )
-            with self.assertRaises(cs.PublicationRefused):
-                store.get_publication_intent(RUN_ID)
-            store.close()
 
     def test_create_ignores_unrelated_urls_and_records_bound_pull_request(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1129,6 +1132,8 @@ class PullRequestPublicationTests(unittest.TestCase):
                 "unexpected pull-request target state PREPARED",
             )
             store.close()
+
+
 
 if __name__ == "__main__":
     unittest.main()

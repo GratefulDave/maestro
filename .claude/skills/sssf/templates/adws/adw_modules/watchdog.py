@@ -202,19 +202,6 @@ class LastTransitionReader(Protocol):
     def __call__(self) -> float: ...
 
 
-class StuckHandler(Protocol):
-    """Declares the run STUCK, given the same diagnostic `run status`
-    would print."""
-
-    def __call__(self, diagnostic: str) -> None: ...
-
-
-class DiagnosticProvider(Protocol):
-    """The "why is nothing happening" text `run status` already knows how
-    to print (§11.2). The backstop does not compute this itself."""
-
-    def __call__(self) -> str: ...
-
 
 # ── the three structural signals ─────────────────────────────────────────────
 
@@ -740,14 +727,10 @@ class RunBackstop:
         self,
         config: st.SchedulerConfig,
         last_transition_at: LastTransitionReader,
-        on_stuck: StuckHandler,
-        diagnostic: DiagnosticProvider,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._last_transition_at = last_transition_at
-        self._on_stuck = on_stuck
-        self._diagnostic = diagnostic
         self._time_source = time_source
 
     def check(self) -> bool:
@@ -760,6 +743,5 @@ class RunBackstop:
         now = self._time_source()
         last = self._last_transition_at()
         if now - last > self._config.backstop_t_s:
-            self._on_stuck(self._diagnostic())
             return True
         return False

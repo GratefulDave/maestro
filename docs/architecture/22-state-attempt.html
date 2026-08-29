@@ -155,11 +155,11 @@
   <div class="frame">
     <p class="eyebrow">State machine · Maestro</p>
     <h1>Attempt settle · Only SEMANTIC mutates_prompt</h1>
-    <p class="subtitle">Classify a live attempt. Resume is a different machine: identity-bound late envelope, undispatched claim of the same generation, or stay QUIESCENCE_UNPROVEN. Prompt proof is a transcript turn.</p>
+    <p class="subtitle">Classify a live attempt. Resume is a different machine: identity-bound late envelope, undispatched claim of the same generation, leftover reclaim via worktree.stale_attempt_worktrees, or stay QUIESCENCE_UNPROVEN. LifecycleStore.resume_run reopening a no-evidence node clears lane_phase. Pre-dispatch NODE_TIMEOUT retries if never dispatched. Prompt proof is a transcript turn.</p>
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="22-state-attempt-title 22-state-attempt-desc">
       <title id="22-state-attempt-title">Attempt settle · Only SEMANTIC mutates_prompt</title>
-      <desc id="22-state-attempt-desc">One live AttemptRecord starts RUNNING under idx_one_live_attempt_per_node; _settle_failure classifies SEMANTIC, ENVIRONMENTAL, or LAUNCHER_TRANSIENT, while _release_unclassified_attempt leaves retry_class NULL; CLOSED_ATTEMPT_STATE CANCELLED releases the index; only SEMANTIC mutates_prompt; CREDENTIAL and DETERMINISTIC_REFUSAL spend launcher_retry_budget 0. Resume: an identity-bound late envelope continues; an absent envelope stays QUIESCENCE_UNPROVEN; undispatched_quiescence_attempts plus claim_undispatched_attempt reclaim the same generation that never crossed dispatch; prompt proof is the actor transcript turn, not pane revision meter, not agent_status; a persistent actor adopts only on exact pane, cwd, session, correlation, role, and generation; workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
+      <desc id="22-state-attempt-desc">One live AttemptRecord starts RUNNING under idx_one_live_attempt_per_node; _settle_failure classifies SEMANTIC, ENVIRONMENTAL, or LAUNCHER_TRANSIENT, while _release_unclassified_attempt leaves retry_class NULL; CLOSED_ATTEMPT_STATE CANCELLED releases the index; only SEMANTIC mutates_prompt; CREDENTIAL and DETERMINISTIC_REFUSAL spend launcher_retry_budget 0. Resume: an identity-bound late envelope continues; an absent envelope stays QUIESCENCE_UNPROVEN; undispatched_quiescence_attempts plus claim_undispatched_attempt reclaim the same generation that never crossed dispatch; leftover reclaim is worktree.stale_attempt_worktrees on disk; LifecycleStore.resume_run reopening a no-evidence node clears lane_phase; pre-dispatch NODE_TIMEOUT retries if never dispatched and is not QUIESCENCE_UNPROVEN; prompt proof is the actor transcript turn, not pane revision meter, not agent_status; a persistent actor adopts only on exact pane, cwd, session, correlation, role, and generation; workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -311,6 +311,9 @@
           <li><strong>Absent envelope</strong> — stays QUIESCENCE_UNPROVEN until an explicit retry. Bare resume neither grants budget nor relaunches completed work.</li>
           <li><strong>Undispatched claim</strong> — <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">undispatched_quiescence_attempts</code> names a generation that never crossed dispatch; <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">claim_undispatched_attempt</code> reopens that same attempt_no, allocating nothing.</li>
           <li><strong>Late envelope</strong> — identity-bound success continues the attempt. Adopt only on exact pane, cwd, session, correlation, role, and generation.</li>
+          <li><strong>Leftover reclaim</strong> — <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">worktree.stale_attempt_worktrees</code> reclaims leftover attempt trees on disk.</li>
+          <li><strong>lane_phase clear</strong> — <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">LifecycleStore.resume_run</code> reopening a no-evidence node clears <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">lane_phase</code>.</li>
+          <li><strong>Pre-dispatch NODE_TIMEOUT</strong> — retries if never dispatched; not QUIESCENCE_UNPROVEN.</li>
         </ul>
       </div>
       <div class="card">
@@ -327,8 +330,8 @@
     </div>
 
     <div class="footer">
-      <span>Maestro · lifecycle.claim_undispatched_attempt · launcher.submit_agent_prompt</span>
-      <span>SEMANTIC mutates_prompt · transcript turn</span>
+      <span>Maestro · lifecycle.claim_undispatched_attempt · lifecycle.resume_run · worktree.stale_attempt_worktrees · launcher.submit_agent_prompt</span>
+      <span>SEMANTIC mutates_prompt · transcript turn · NODE_TIMEOUT pre-dispatch retry</span>
     </div>
   </div>
 </body>

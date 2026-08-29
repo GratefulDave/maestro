@@ -238,6 +238,20 @@ class AttemptCancelled(RuntimeError):
     """Cancellation was requested while the attempt still held RUNNING."""
 
 
+class UnserviceableHandoff(AttemptOwnershipLost):
+    """A repair handoff reached a delivery path that cannot service it.
+
+    A subclass of `AttemptOwnershipLost` on purpose, so it keeps crossing
+    every deliberate re-raise between the repair callback and the worker's
+    top-level handler; only that handler, and `_continue_repair_handoff`,
+    distinguish it. The distinction is the whole point. Ordinary ownership
+    loss means *another* generation now owns this attempt and there is
+    nothing to record; this means nothing owns it and nothing ever will,
+    which is a terminal fact about the lane and must appear in the ledger as
+    a typed transition rather than be inferred from a dead process.
+    """
+
+
 class RunPaused(RuntimeError):
     """SIGINT or `request_pause` stopped the run without making it terminal.
 
@@ -351,7 +365,7 @@ class SchedulerDeps:
     quiesce_attempt: QuiesceAttempt
     #: Re-read a declaration from an existing attempt; never launches.
     recover_node: Optional[
-        Callable[[wt.AttemptWorktree, st.AttemptRecord], Optional[NodeExecution]]
+        Callable[[wt.AttemptWorktree], Optional[NodeExecution]]
     ] = None
 
     #: The canonical bytes of the plan this run executes, retained on the run.
@@ -390,6 +404,22 @@ class SchedulerDeps:
     kill_attempt: Optional[Callable[..., None]] = None
     #: Provision runs after worktree creation and before pre-gate/baseline.
     provision: Optional[Callable[[Path], None]] = None
+    #: `(node_id, attempt_no, phase, detail) -> None`. Display only.
+    #:
+    #: Everything between claiming an attempt and opening its pane is silent
+    #: work that takes minutes: provisioning a tree, running the pre-gate,
+    #: walking the baseline. An operator watching a terminal cannot tell that
+    #: window from a hang, and on
+    #: `run-9d03105407f440079f3730f1fe4c67b3` two attempts were killed by hand
+    #: inside it before a fault in the pre-gate was found that really did hang
+    #: there -- the same silence covering both.
+    #:
+    #: This is a reporter and never an input: §1.2 forbids a lifecycle
+    #: transition keyed on anything but a typed record, and nothing the
+    #: scheduler decides reads it back. `_say` swallows whatever it raises for
+    #: the same reason -- a terminal that cannot print must not fail an
+    #: attempt.
+    progress: Optional[Callable[[str, int, str, Mapping[str, object]], None]] = None
     #: The code-review stage (§7.3's review-node predicate). Runs after an
     #: attempt's own verification passes and before `mark_verified`, so a diff
     #: no model has read cannot reach the merge frontier.
@@ -514,8 +544,6 @@ class _DerivedReviewNode:
     review_of: str
     depth: int
     needs: Tuple[str, ...]
-    kind: st.NodeKind = st.NodeKind.REVIEW
-    outputs: Tuple[str, ...] = ()
     specs: Tuple[str, ...] = ()
 
 
@@ -558,13 +586,6 @@ class RunReport:
     #: Scheduler-derived review-node state by stable review id.  These nodes
     #: are not sources and therefore never appear in ``merged``.
     review_nodes: Dict[str, str] = field(default_factory=dict)
-
-    @property
-    def integration_untested(self) -> bool:
-        """§8.8 — a BLOCKED run's branch is integration-untested, and
-        `run status` says so rather than leaving it to be inferred from the
-        absence of a gate result."""
-        return self.acceptance is None
 
 
 class Scheduler:
@@ -941,11 +962,17 @@ class Scheduler:
         #: as "absence unproven" and blocks the node terminally, burying the
         #: verdict the attempt had actually reached.
         #:
-        #: Deliberately **not** consulted by `pre-baseline`, `cancel`,
-        #: `watchdog`, or the watchdog's kill. Those meet an attempt whose
-        #: provision or pre-gate subprocess may be alive right now — §7.6's
-        #: window opens before the worktree exists — and a live harness process
-        #: is exactly what those proofs are for, dispatched or not.
+        #: Consulted by the watchdog's kill and by `fail`'s `watchdog`
+        #: quiesce. An attempt this scheduler leased and has not entered
+        #: `run_node` opened no pane and no agent process group. Asking the
+        #: runtime quiescer anyway raises `PROCESS_GROUP_UNTRACKED` and the
+        #: contain path turns a retryable NODE_TIMEOUT into terminal
+        #: `QUIESCENCE_UNPROVEN` (lane-wp6-build#1,
+        #: run-9d03105407f440079f3730f1fe4c67b3). Provision bounds itself at
+        #: 600s; node gates (pre/post/falsify) at `NODE_GATE_TIMEOUT_S` (600s)
+        #: via `run_harness_process`, which reaps the group on timeout. They
+        #: are not this map. `pre-baseline` and `cancel` still demand their
+        #: own proofs.
         #:
         #: A key absent from this map is an attempt **this scheduler did not
         #: lease** — an inherited RUNNING row from another process, whose owned
@@ -971,9 +998,6 @@ class Scheduler:
         #: Findings from the review that exhausted a node's budget, kept so the
         #: run report can surface *why* rather than only that a count ran out.
         self._review_findings: Dict[str, str] = {}
-        #: Findings-per-attempt per node, appended on every review rejection
-        #: and rebuilt from the store by `project`.
-        self._review_convergence: Dict[str, List[int]] = {}
         #: `node_id -> every harness-hygiene fact observed about that node`.
         #: Two surfaces write here — §8.3's pre-merge residue report and
         #: §8.8's cleanup refusal — and they **accumulate** rather than
@@ -1232,9 +1256,6 @@ class Scheduler:
         for build_node_id, attempt in latest_attempts.items():
             if self._review_for_build(build_node_id) is not None:
                 self._refresh_lane_guidance(build_node_id, attempt)
-        self._review_convergence = rp.review_convergence_from_reviews(
-            self.deps.store.candidate_reviews(self.run_id, limit=10_000)
-        )
         self._projected = True
 
     def cancel(self) -> None:
@@ -1370,6 +1391,23 @@ class Scheduler:
         with self._lock:
             return self._attempt_dispatch.get((record.node_id, record.attempt_no), True)
 
+    def _say(self, node_id: str, attempt_no: int, phase: str,
+             **detail: object) -> None:
+        """Report one pre-dispatch phase to whoever is watching. Never fails.
+
+        The exception swallow is deliberate and narrow: this is the only call
+        in an attempt whose whole purpose is to be seen, so a broken terminal,
+        a closed pipe, or a reporter someone wired wrong must not take the
+        attempt with it. Nothing downstream reads what is printed here.
+        """
+        reporter = self.deps.progress
+        if reporter is None:
+            return
+        try:
+            reporter(node_id, attempt_no, phase, dict(detail))
+        except Exception:  # noqa: BLE001 - display must never fail an attempt
+            pass
+
     def _quiesce(
         self,
         record: st.AttemptRecord,
@@ -1486,6 +1524,64 @@ class Scheduler:
                     and prior_phase is not st.LanePhase.BLOCKED
                     else None
                 ),
+            )
+
+    def _block_unserviceable_handoff(
+        self,
+        node: st.PlanNode,
+        record: Optional[st.AttemptRecord],
+        failure: "UnserviceableHandoff",
+        *,
+        candidate_sha: Optional[str] = None,
+        builder_generation: Optional[int] = None,
+    ) -> None:
+        """Record a repair handoff nothing can deliver as a typed transition.
+
+        §1.2 — the transition keys on the exception's *type* and on the
+        lane's own durable rows, never on the message, which is carried only
+        as detail an operator can read. The message is diagnosis; the type is
+        the decision.
+
+        Idempotent by the same `_owns_running` fence every other terminal
+        path uses, so the precise call in `_continue_repair_handoff` and the
+        backstop in `_attempt` cannot both write.
+        """
+        if record is None:
+            return
+        with self._lock:
+            if not self._owns_running(record):
+                return
+            if candidate_sha:
+                self.deps.store.fail_handoff(
+                    self.run_id,
+                    node.node_id,
+                    candidate_sha,
+                    builder_generation=(
+                        builder_generation
+                        if builder_generation is not None
+                        else record.attempt_no
+                    ),
+                    reason=str(failure),
+                )
+            if self._review_for_build(node.node_id) is not None:
+                self._set_lane_phase(
+                    node.node_id,
+                    st.LanePhase.BLOCKED,
+                    record,
+                    allow_watchdog_fence=self._cancelled.is_set(),
+                )
+            detail = {
+                "reason": str(failure),
+                "exception_type": type(failure).__name__,
+                "node_kind": node.kind.value,
+            }
+            if candidate_sha:
+                detail["candidate_sha"] = candidate_sha
+            self.deps.store.mark_blocked(
+                self.run_id,
+                node.node_id,
+                st.BlockReason.REPAIR_HANDOFF_UNSERVICEABLE,
+                detail=detail,
             )
 
     def _contain_quiescence_failure(
@@ -1751,6 +1847,8 @@ class Scheduler:
             self._fence_watchdog_generation(attempt)
             if self.deps.kill_attempt is None:
                 return
+            if not self._attempt_dispatched(attempt):
+                return
             try:
                 self.deps.kill_attempt(attempt)
             except BaseException as exc:
@@ -1782,7 +1880,8 @@ class Scheduler:
             if node is None:
                 return
             try:
-                self._quiesce(attempt, "watchdog")
+                if self._attempt_dispatched(attempt):
+                    self._quiesce(attempt, "watchdog")
             except QuiescenceFailure as exc:
                 self._contain_quiescence_failure(
                     node, attempt, exc, allow_watchdog_fence=True
@@ -1894,57 +1993,10 @@ class Scheduler:
         backstop = wd.RunBackstop(
             config=self.config,
             last_transition_at=lambda: store.last_transition_at(self.run_id),
-            on_stuck=lambda diagnostic: None,
-            diagnostic=self.status_diagnostic,
             time_source=self._time_source,
         )
         return watchdog, backstop
 
-    def status_diagnostic(self) -> str:
-        """The "why is nothing happening" text §11.2 requires the scheduler to
-        print rather than exiting silently — the same answer `run status`
-        gives, so an operator never has to read the database by hand."""
-        store = self.deps.store
-        lines = [
-            f"run {self.run_id}: no lifecycle transition within "
-            f"T={self.config.backstop_t_s}s"
-        ]
-        stranded = set(store.upstream_blocked(self.run_id))
-        for record in sorted(
-            store.node_records(self.run_id), key=lambda r: (r.depth, r.node_id)
-        ):
-            why = ""
-            if record.node_id in stranded:
-                why = " (an ancestor is blocked or abandoned)"
-            elif record.state == st.NodeState.PENDING.value:
-                unmet = [d for d in record.needs if not self._dependency_satisfied(d)]
-                if unmet:
-                    why = f" (waiting on {', '.join(sorted(unmet))})"
-            lines.append(f"  {record.node_id}: {record.state}{why}")
-        # §8.3's pre-merge hygiene report. Surfaced here as well as on the
-        # RunReport because a stalled run is exactly when an operator is
-        # looking for what the harness itself did, and a runner adapter
-        # rewriting the tree after every post-gate is that shape.
-        for node_id, entries in sorted(self._adapter_hygiene.items()):
-            lines.append(f"  {node_id}: harness hygiene — " + "; ".join(entries))
-        # §7.8 — panes a resumed process could not reach are recorded in
-        # `orphans` and reported here. The scheduler never adopts them and
-        # never kills them, so if this text does not name them the stated cost
-        # of resume ("visible and killed by hand") has no visible half.
-        orphans = store.audit_orphans(self.run_id)
-        if orphans:
-            lines.append(f"  {len(orphans)} orphaned pane(s) — kill by hand:")
-            for row in orphans:
-                where = row.get("handle") or (
-                    f"pid {row['pid']}"
-                    if row.get("pid") is not None
-                    else "no handle recorded"
-                )
-                lines.append(
-                    f"    orphan {row.get('node_id', '?')}"
-                    f"#{row.get('attempt_no', '?')}: {where}"
-                )
-        return "\n".join(lines)
 
     # ── one attempt (§7.3, §7.4, §8.3, §8.4) ────────────────────────────────
 
@@ -1954,9 +2006,28 @@ class Scheduler:
         context = _AttemptContext()
         try:
             self._attempt_body(node, context)
+        except UnserviceableHandoff as exc:
+            # Caught *before* the ownership clause below, and that ordering is
+            # the fix. `UnserviceableHandoff` subclasses `AttemptOwnershipLost`
+            # so it survives every deliberate re-raise on the way here, and
+            # without this clause it landed in that bare `return`: the lane
+            # simply stopped existing, with `attempts` and `node_lifecycle`
+            # still reading RUNNING and the ledger's last row being the
+            # REPAIRING phase it had just entered. A handoff nothing can
+            # deliver is a terminal fact and gets a typed transition
+            # (run-36dd33d262d9485ca815aea5001b2ce2, `lane-wp6-tests`).
+            try:
+                self._settle_context(context)
+            except QuiescenceFailure as quiescence:
+                self._contain_quiescence_failure(node, context.record, quiescence)
+                return
+            self._block_unserviceable_handoff(node, context.record, exc)
+            return
         except (AttemptCancelled, AttemptOwnershipLost):
             # Even a superseded/cancelled worker must prove its latest boundary
-            # quiescent before returning control to the scheduler loop.
+            # quiescent before returning control to the scheduler loop. A
+            # genuine cancel writes no outcome here and must not start doing
+            # so: the run-level cancel path owns that record.
             try:
                 self._settle_context(context)
             except QuiescenceFailure as exc:
@@ -2112,6 +2183,167 @@ class Scheduler:
             handoff,
         )
 
+    def _resume_unreviewed_candidate(
+        self, node: st.PlanNode, context: _AttemptContext
+    ) -> bool:
+        """Review a published candidate nobody ever read, instead of rebuilding.
+
+        `publish_candidate` writes the candidate before the reviewer is
+        constructed, and the publication is immutable. Anything that kills
+        the launch in that window -- a crash, a dead pane, a reboot, or the
+        `FinalizationWindow` TypeError a half-applied mirror produced --
+        leaves the lane owing a descendant of a commit no reviewer has seen.
+
+        The retry cannot pay that debt. It is cut from the integration head,
+        so its commit is a *sibling* of the published candidate and
+        `publish_candidate` refuses it as "equal to or not a proven
+        descendant of its parent", on every attempt, for the life of the
+        run. Cutting it from the candidate instead is not the alternative:
+        a candidate contains the implementation, so §7.4's pre-node clause
+        finds its gate green and blocks the node GATE_NOT_FALSIFIABLE,
+        which is terminal.
+
+        There is no base that satisfies both, because building again is the
+        wrong move. The candidate is already built, already gate-verified,
+        already falsified -- everything up to the review passed before it
+        was published. What it lacks is a reader. So this dispatches one,
+        and no builder runs.
+
+        Keyed on the durable review row, never on pane text or an agent's
+        claim (§1.2): PUBLISHED means no prompt was proven submitted,
+        DISPATCHED means one was and no terminal report came back, and
+        `_publish_and_review_candidate` already drives both. Any terminal
+        state, or no candidate at all, falls through to an ordinary attempt.
+
+        run-9d03105407f440079f3730f1fe4c67b3's `lane-wp6-build` sat on
+        candidate a551049 in PUBLISHED across nine retries and two
+        operator resumes.
+        """
+        store = self.deps.store
+        review_node = self._review_for_build(node.node_id)
+        if review_node is None or self.deps.review_attempt is None:
+            return False
+        candidates = store.lane_candidates(self.run_id, node.node_id, limit=10_000)
+        if not candidates:
+            return False
+        candidate = candidates[-1]
+        review = store.candidate_review(
+            self.run_id, review_node.node_id, candidate.candidate_sha
+        )
+        if review is None:
+            return False
+        unread = review.state in {
+            st.CandidateReviewState.PUBLISHED,
+            st.CandidateReviewState.DISPATCHED,
+        }
+        # The candidate was read and rejected, and the repair it was rejected
+        # into never started. `PENDING` is that fact and the only state that
+        # is: `mark_handoff_submitted` moves the row the moment a repair
+        # prompt is proven delivered, so a still-`PENDING` handoff means no
+        # repair builder ever held these findings.
+        #
+        # This is the same debt as an unread candidate wearing a later face.
+        # `_durable_repair_resume` is the wrong owner for it -- that one
+        # reopens the rejected attempt to continue a builder that already
+        # produced something, and an attempt which only *reviewed* produced
+        # nothing, so recovery reaches `accepted_result_payload`, finds no
+        # payload, and raises "late envelope is not usable". Handing it here
+        # instead costs nothing extra: `_publish_and_review_candidate` replays
+        # an immutable publication, skips the dispatch loop on a COMPLETED
+        # review, and lands directly on the repair round with the verdict it
+        # already has.
+        #
+        # Fenced to `PENDING` so a genuinely mid-flight repair -- `SUBMITTED`
+        # or `ACKNOWLEDGED` -- still belongs to `_durable_repair_resume`.
+        handoff = store.repair_handoff(
+            self.run_id, node.node_id, candidate.candidate_sha
+        )
+        unrepaired = (
+            review.verdict is st.ReviewVerdict.REJECTED
+            and handoff is not None
+            and handoff.state is st.RepairHandoffState.PENDING
+        )
+        if not unread and not unrepaired:
+            return False
+
+        head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
+        attempt_no = store.start_attempt(
+            self.run_id,
+            node.node_id,
+            head,
+            detail={
+                "repair": "review-unreviewed-candidate"
+                if unread
+                else "repair-unstarted-candidate"
+            },
+        )
+        with self._lock:
+            self._attempt_dispatch.setdefault((node.node_id, attempt_no), False)
+        record = store.get_attempt(self.run_id, node.node_id, attempt_no)
+        context.record = record
+        self._require_running(record)
+        self._set_lane_phase(node.node_id, st.LanePhase.CANDIDATE_READY, record)
+
+        # Cut at the candidate, not at the integration head, and the review is
+        # not what decides that -- the rejection after it is. A reviewer reads
+        # two immutable shas and never the checkout, so for a PASS either base
+        # would serve. A REJECT goes on to `prepare_descendant_candidate`,
+        # which refuses `HeadMoved` unless the worktree HEAD *and*
+        # `refs/heads/maestro/{run}/{node}/a{n}` both already hold the
+        # candidate, because a repair must commit a descendant of the thing
+        # that was rejected. Creating the worktree at the candidate is what
+        # sets both: `create_attempt_worktree` branches at the commit it is
+        # given.
+        #
+        # Cut from the head instead, this path reviewed the candidate
+        # correctly and then died on its own findings --
+        # `HeadMoved: HEAD is 3b1f1beb70, not candidate parent a551049c94`,
+        # classified ENVIRONMENTAL, retried into the same refusal. Reaching
+        # the reviewer is only half the debt; the repair it hands back has to
+        # land somewhere.
+        #
+        # This does not reopen GATE_NOT_FALSIFIABLE. That block came from
+        # §7.4's pre-node gate on a *build* attempt whose base contained the
+        # implementation; no builder runs here and no pre-node gate is
+        # evaluated, and the falsifiability that a later repair round does run
+        # reads `_pre_candidate_base`, which is the earliest attempt's base
+        # and never a candidate.
+        attempt = wt.create_attempt_worktree(
+            self.deps.repo,
+            self.run_id,
+            node.node_id,
+            attempt_no,
+            candidate.candidate_sha,
+            Path(self.deps.worktrees_root),
+            Path(self.deps.scratch_root),
+        )
+        with self._lock:
+            self._attempt_worktrees[node.node_id] = attempt
+        self._require_running(record)
+
+        # No builder ran, so there is no execution to account for and no
+        # measured delta to take. The candidate's own attempt already
+        # crossed every gate this one would re-ask.
+        execution = NodeExecution(envelope_parsed=True, exit_code=0)
+        if not self._publish_and_review_candidate(
+            node,
+            context,
+            attempt,
+            record,
+            wt.take_baseline(attempt),
+            execution,
+            head,
+            candidate.candidate_sha,
+        ):
+            return True
+        with self._lock:
+            self._require_running(record)
+            self._output_shas[node.node_id] = candidate.candidate_sha
+            store.mark_verified(
+                self.run_id, node.node_id, candidate.candidate_sha
+            )
+        return True
+
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
         existing: Optional[st.AttemptRecord] = None
@@ -2123,6 +2355,8 @@ class Scheduler:
             if existing.extra.get(lc.LATE_ENVELOPE_RECOVERY_KEY) is True:
                 self._recover_attempt_body(node, context, existing)
                 return
+        if self._resume_unreviewed_candidate(node, context):
+            return
         #: A `QUIESCENCE_UNPROVEN` block the resume boundary proved was written
         #: over an attempt that never crossed dispatch. Both halves of that
         #: proof are already durable by the time this reads the marker -- the
@@ -2178,6 +2412,15 @@ class Scheduler:
                 if basis is not None
                 else wt.integration_head(self.deps.repo, self.deps.integration_branch)
             )
+            # NOT the latest published candidate, however tempting. A
+            # candidate contains the implementation, and §7.4's pre-node
+            # clause requires this attempt's starting tree to be one where
+            # the gate is RED. Cutting the attempt from a candidate makes
+            # the pre-node gate green and blocks the node
+            # GATE_NOT_FALSIFIABLE, which is terminal -- strictly worse than
+            # the descent refusal it was meant to avoid. An unreviewed
+            # published candidate is resumed by reviewing it, above, never
+            # by building on top of it.
             base = basis.base_sha if basis is not None else head
 
             # §7.6 — the window opens BEFORE the worktree exists, so a hung
@@ -2273,14 +2516,25 @@ class Scheduler:
         pre_verdict = None
         try:
             if self.deps.provision is not None:
+                self._say(node.node_id, attempt_no, "provisioning",
+                          worktree=str(attempt.path))
+                provision_started = time.monotonic()
                 self.deps.provision(attempt.path)
+                self._say(node.node_id, attempt_no, "provisioned",
+                          seconds=round(time.monotonic() - provision_started, 1))
             # A slow provision may finish after a watchdog revoked this
             # generation. Its return is a fence: no stale worker reaches a
             # gate, runner, inventory, or commit.
             self._require_running(record)
             if node.kind is st.NodeKind.AGENT:
                 self._require_running(record)
+                self._say(node.node_id, attempt_no, "pre-gate",
+                          command=" ".join(node.gate_command))
+                gate_started = time.monotonic()
                 pre = self.deps.run_gate(attempt, node, "pre", self._cancelled.is_set)
+                self._say(node.node_id, attempt_no, "pre-gate-done",
+                          exit_code=pre.exit_code,
+                          seconds=round(time.monotonic() - gate_started, 1))
                 # A selector path this node is declared to produce, absent
                 # at its base, is the red clause 2 asks for -- not a broken
                 # runner. Asked per path, because the runner refuses to
@@ -2320,7 +2574,12 @@ class Scheduler:
             )
             return
 
+        self._say(node.node_id, attempt_no, "baseline")
+        baseline_started = time.monotonic()
         baseline = wt.take_baseline(attempt)
+        self._say(node.node_id, attempt_no, "baseline-done",
+                  paths=len(baseline),
+                  seconds=round(time.monotonic() - baseline_started, 1))
         # The bracket's before-side, written down while it still exists.
         # `take_baseline` walks the *provisioned* tree, which includes paths
         # git does not track and no commit holds. Once this process is gone
@@ -2376,6 +2635,7 @@ class Scheduler:
             # raises still leaves whatever it created behind, and the quiescer
             # must go on demanding a measured absence for it.
             self._attempt_dispatch[(record.node_id, record.attempt_no)] = True
+        self._say(node.node_id, record.attempt_no, "launching")
         guidance = rp.render_guidance(
             node, self._guidance.get(record.guidance_key), repair=basis
         )
@@ -2588,7 +2848,7 @@ class Scheduler:
 
         try:
             execution = (
-                None if already_claimed else self.deps.recover_node(attempt, stranded)
+                None if already_claimed else self.deps.recover_node(attempt)
             )
         except (KeyboardInterrupt, SigintInterrupt):
             raise
@@ -2807,12 +3067,28 @@ class Scheduler:
         if sealed_output_sha is None:
             with self._lock:
                 self._require_running(record)
-                output_sha = wt.commit_measured_delta(
-                    attempt,
-                    measured,
-                    after,
-                    f"{node.node_id} attempt {record.attempt_no}",
-                )
+                # Builder-authored sealed descendant of this attempt: same
+                # lineage check recover_sealed_descendant already uses.
+                # commit_measured_delta with a stale attempt.base would raise
+                # HeadMoved and spend environmental budget on recovered work.
+                current_head = wt.resolve_commit(attempt.path, "HEAD")
+                if current_head != attempt.base:
+                    output_sha = wt.sealed_descendant_tip(attempt, attempt.base)
+                    # Adopting a tip skips commit_measured_delta, and with it
+                    # §8.4's staging assertion; check_post_commit then compares
+                    # the working tree, never the sealed commit's tree. Assert
+                    # the adopted tree against the measured after-state here or
+                    # nothing does.
+                    wt.assert_tip_matches_measured(
+                        attempt, output_sha, measured, after
+                    )
+                else:
+                    output_sha = wt.commit_measured_delta(
+                        attempt,
+                        measured,
+                        after,
+                        f"{node.node_id} attempt {record.attempt_no}",
+                    )
                 store.record_sealed_output(
                     self.run_id, node.node_id, record.attempt_no, output_sha
                 )
@@ -2921,6 +3197,14 @@ class Scheduler:
             falsified = self._falsify_outputs(
                 node,
                 attempt,
+                # The repair arm names the integration head rather than
+                # `attempt.base` for the reason `_pre_candidate_base`
+                # states: `prepare_descendant_candidate` has moved that
+                # field onto the published candidate, so reverting to it
+                # would take back only the delta since this node's own
+                # previous output. The `basis is None` arm is reached only
+                # by an attempt cut from the integration head, where the
+                # two are the same commit.
                 basis.integration_head if basis is not None else attempt.base,
             )
             self._require_running(record)
@@ -2999,16 +3283,41 @@ class Scheduler:
         """Tests-node evidence: new cases, each red at this attempt's base.
 
         The worktree *is* the parent commit plus the tests this node wrote,
-        so running the new nodeids here is the parent-red check. Collection
-        uses `--collect-only -q -o addopts=`; a collection error or import
-        crash is not a satisfying red. Newly created test files have no
-        parent nodeids, which is the ordinary case this chain is for.
+        so running the new nodeids here is the parent-red check. A collection
+        error or import crash is not a satisfying red. Newly created test
+        files have no parent nodeids, which is the ordinary case this chain
+        is for.
+
+        The selector lives on the written test files rather than on the gate
+        command, but the *runner* does not: collection and execution are
+        dispatched on `node.gate_command[0]`, exactly as the strength contract
+        below does. Measuring with pytest whatever the gate declared is the
+        silent-zero `tc.RunnerUnsupported` exists to refuse, and reaching it
+        through this path instead reported `TESTS_NO_NEW_CASES` about a vitest
+        node on every attempt — a refusal no edit to the tests could satisfy,
+        so the node never merged and its derived reviewer never dispatched.
         """
-        del node  # selector lives on the written test files, not the command
-        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
-        current = tc.collect_nodeids(attempt.path, test_paths)
+        runner_name = node.gate_command[0] if node.gate_command else ""
         try:
-            parent = tc.collect_parent_nodeids(attempt.path, attempt.base, test_paths)
+            runner = tc.case_runner(runner_name)
+        except tc.RunnerUnsupported as exc:
+            return vf.VerificationVerdict(
+                verified=False,
+                failed_clause=3,
+                reason=str(exc),
+                retry_class=st.RetryClass.ENVIRONMENTAL,
+                refusal_code=tc.StrengthRefusal.RUNNER_UNSUPPORTED.value,
+                remedy=tc.StrengthRefusal.RUNNER_UNSUPPORTED.remedy,
+            )
+        test_paths = tuple(p for p in measured.touched if tc.is_test_path(p))
+        current = runner.collect(attempt.path, test_paths)
+        try:
+            parent = tc.collect_parent_nodeids(
+                attempt.path,
+                self._pre_candidate_base(node, attempt),
+                test_paths,
+                runner=runner,
+            )
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
                 verified=False,
@@ -3019,8 +3328,44 @@ class Scheduler:
                 remedy=tc.TestsRefusal.COLLECTION_FAILED.remedy,
             )
         new = tc.new_nodeids(parent, current)
-        parent_run = tc.run_cases(attempt.path, new)
+        parent_run = tc.run_cases_for(runner, attempt.path, new)
         return tc.adjudicate_parent_red(parent_run, len(new))
+
+    def _pre_candidate_base(
+        self, node: st.PlanNode, attempt: wt.AttemptWorktree
+    ) -> str:
+        """The commit this lane started from, before it published anything.
+
+        Two questions read it. A tests node's cases must be *red* here,
+        where the implementation does not exist. An agent node's declared
+        outputs must be reverted back to here for §7.4's falsification to
+        have a subject.
+
+        Deliberately NOT `attempt.base`. That field is documented as the
+        *mutable measurement* base and three separate paths move it onto an
+        already-published candidate: `prepare_descendant_candidate` on every
+        repair round, the sealed/unsealed repair recoveries, and a retry that
+        continues from a candidate no reviewer read. A candidate already
+        contains the tests, so collecting the parent there proves nothing
+        about them -- only cases added since the previous candidate are
+        counted new and run, every case already accepted is never re-proven,
+        and a tester that strengthens an assertion on an existing case adds
+        no nodeid and is refused `TESTS_NO_NEW_CASES` for doing the right
+        thing.
+
+        The falsifiability question is "are these cases red where the
+        implementation does not exist", and the only commit that answers it
+        is the one the lane started from, before it published anything. That
+        is the base of this node's earliest attempt: the ledger row is
+        written once by `start_attempt` and no candidate cycle rewrites it,
+        and no candidate can predate the first attempt. Integration moving
+        underneath does not weaken it -- an older commit is further from the
+        implementation, not nearer.
+        """
+        rows = self.deps.store.attempts_for(self.run_id, node.node_id)
+        if not rows:
+            return attempt.base
+        return min(rows, key=lambda row: row.attempt_no).base_sha
 
     def _tests_prerequisites(self, node: st.PlanNode) -> Tuple[st.PlanNode, ...]:
         """The tests nodes this implementation node is gated by.
@@ -3125,8 +3470,12 @@ class Scheduler:
                 if accepted_bytes is None:
                     continue
                 try:
+                    # The runner is the one already resolved from the
+                    # accepted candidate above, so the names are read in the
+                    # language the tests are written in rather than in Python.
                     strays = gate_capture.unexpected_cases(
-                        accepted_bytes.decode("utf-8", "replace"), collected)
+                        accepted_bytes.decode("utf-8", "replace"), collected,
+                        runner)
                 except gate_capture.GateCaptureRefusal as exc:
                     return self._pairing_refused(
                         tc.PairingRefusal.UNREADABLE, str(exc),
@@ -3157,7 +3506,7 @@ class Scheduler:
                 # against a test candidate defining 2.
                 shortfall = gate_capture.unsatisfiable_min_cases(
                     accepted_bytes.decode("utf-8", "replace"),
-                    node.gate_min_cases)
+                    node.gate_min_cases, runner)
                 if shortfall:
                     return self._pairing_refused(
                         tc.PairingRefusal.GATE_NOT_GREEN,
@@ -3275,10 +3624,11 @@ class Scheduler:
                 retry_class=st.RetryClass.ENVIRONMENTAL,
                 refusal_code=tc.StrengthRefusal.RUNNER_UNSUPPORTED.value,
                 remedy=tc.StrengthRefusal.RUNNER_UNSUPPORTED.remedy)
+        falsifiability_base = self._pre_candidate_base(node, attempt)
         try:
             current = runner.collect(attempt.path, test_paths)
             parent = tc.collect_parent_nodeids(
-                attempt.path, attempt.base, test_paths)
+                attempt.path, falsifiability_base, test_paths, runner=runner)
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
                 verified=False, failed_clause=3,
@@ -3311,7 +3661,11 @@ class Scheduler:
                         repo=Path(attempt.repo),
                         tree=attempt.path,
                         candidate_sha=output_sha,
-                        base_commit=base or attempt.base,
+                        # `attempt.base` is the mutable measurement base and
+                        # is an already-published candidate on every repair
+                        # round, which carries the tests the control exists
+                        # to remove. See `_pre_candidate_base`.
+                        base_commit=base or falsifiability_base,
                         nodeids=current,
                         scratch_root=Path(self.deps.scratch_root),
                         # The coverage run and a `baseline_absent` control are
@@ -3525,6 +3879,20 @@ class Scheduler:
                     self._cancelled.is_set,
                 )
                 break
+            except UnserviceableHandoff as exc:
+                # The precise site: this frame holds the rejected sha and the
+                # generation, so the handoff row is failed by name instead of
+                # being left PENDING forever behind a blocked node.
+                self._close_persistent_reviewer(node.node_id, record)
+                self._settle_context(context)
+                self._block_unserviceable_handoff(
+                    node,
+                    record,
+                    exc,
+                    candidate_sha=rejected_candidate_sha,
+                    builder_generation=builder_generation,
+                )
+                return None
             except (AttemptCancelled, AttemptOwnershipLost, QuiescenceFailure):
                 raise
             except Exception as exc:
@@ -4255,8 +4623,13 @@ class Scheduler:
                 node.node_id, st.LanePhase.WAITING_FOR_NEW_CANDIDATE, record
             )
             return False
-        self._review_convergence.setdefault(node.node_id, []).append(
-            len(durable_review.findings)
+        # Read before this rejection's spend is written, so the window is
+        # the prior rejections (§7.5 refusal repetition).
+        current_refusal = _review_refusal(
+            durable_review.findings, candidate.candidate_sha
+        )
+        repeats = self._review_refusal_repeats(
+            node.node_id, review_node.node_id, candidate.candidate_sha, current_refusal
         )
         self._review_findings[node.node_id] = "\n".join(
             str(finding.get("message", "")) for finding in durable_review.findings
@@ -4275,30 +4648,41 @@ class Scheduler:
             },
         )
         guidance = self._refresh_lane_guidance(node.node_id, record)
-        if not allowed:
+        if not allowed or repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
             self._close_persistent_reviewer(node.node_id, record)
             self._settle_context(context)
             self._set_lane_phase(node.node_id, st.LanePhase.BLOCKED, record)
+            detail: Dict[str, Any] = {
+                "candidate_sha": candidate.candidate_sha,
+                "findings": list(durable_review.findings),
+                # Which budget ran out, named in the detail rather than in
+                # a second BlockReason. The operator escape is identical
+                # for both -- grant this lane more attempts -- so a second
+                # terminal vocabulary entry would be two names for one
+                # exit, while an operator still needs to know whether the
+                # loop that failed to converge was the tester's or the
+                # builder's.
+                "retry_class": (
+                    st.LaneRetryClass.TEST_REVIEW_REJECTION.value
+                    if node.kind is st.NodeKind.TESTS
+                    else st.LaneRetryClass.REVIEW_REJECTION.value
+                ),
+            }
+            if repeats >= rp.IDENTICAL_REFUSAL_LIMIT:
+                # The reviewer's located findings are byte-identical to the
+                # ones the previous candidate was rejected on, so the repair
+                # prompt this rejection would produce is the prompt that
+                # already failed. Named ahead of the budget reason because it
+                # is the truer cause: this lane did not run out of attempts,
+                # it stopped moving, and "budget exhausted" would send an
+                # operator to grant more of exactly what was not the problem
+                # (§7.5).
+                reason = st.BlockReason.SEMANTIC_REFUSAL_REPEATED
+                detail = rp.repeated_refusal_detail(detail, current_refusal, repeats)
+            else:
+                reason = st.BlockReason.REVIEW_BUDGET_EXHAUSTED
             self.deps.store.mark_blocked(
-                self.run_id,
-                node.node_id,
-                st.BlockReason.REVIEW_BUDGET_EXHAUSTED,
-                detail={
-                    "candidate_sha": candidate.candidate_sha,
-                    "findings": list(durable_review.findings),
-                    # Which budget ran out, named in the detail rather than in
-                    # a second BlockReason. The operator escape is identical
-                    # for both -- grant this lane more attempts -- so a second
-                    # terminal vocabulary entry would be two names for one
-                    # exit, while an operator still needs to know whether the
-                    # loop that failed to converge was the tester's or the
-                    # builder's.
-                    "retry_class": (
-                        st.LaneRetryClass.TEST_REVIEW_REJECTION.value
-                        if node.kind is st.NodeKind.TESTS
-                        else st.LaneRetryClass.REVIEW_REJECTION.value
-                    ),
-                },
+                self.run_id, node.node_id, reason, detail=detail
             )
             return False
         repair_basis = rp.RepairBasis(
@@ -4801,6 +5185,46 @@ class Scheduler:
         )
         return rp.refusal_repetition(history, current)
 
+    def _review_refusal_repeats(
+        self,
+        node_id: str,
+        review_node_id: str,
+        candidate_sha: str,
+        current: rp.VerificationGuidance,
+    ) -> int:
+        """§7.5 refusal repetition over a lane's floored review rejections.
+
+        The review half of `_lane_refusal_repeats`, and the same predicate.
+        Only the history differs, because a rejection is durable on the
+        candidate review row rather than in a spend's detail. The window is
+        still the floored lane spends, so the operator boundary the budgets
+        honour is honoured here too: `retry --force` forgives the identity
+        chain along with the spend, and a replayed handoff after one is
+        compared against nothing rather than re-blocking before dispatch.
+
+        The current rejection is excluded by its candidate sha. Unlike the two
+        verification sites, this runs *after* the refusal is durable, and a
+        replay re-enters on the very row being compared.
+        """
+        store = self.deps.store
+        window = {
+            spend.candidate_sha
+            for spend in store.current_lane_retry_spends(
+                self.run_id, node_id, limit=10_000
+            )
+            if spend.retry_class in _REVIEW_REJECTION_CLASSES
+        }
+        history = [
+            _review_refusal(review.findings, review.candidate_sha)
+            for review in store.candidate_reviews(
+                self.run_id, review_node_id, limit=10_000
+            )
+            if review.verdict is st.ReviewVerdict.REJECTED
+            and review.candidate_sha != candidate_sha
+            and review.candidate_sha in window
+        ]
+        return rp.refusal_repetition(history, current)
+
     def _semantic_ceiling_reached(self, node_id: str, granted: int) -> bool:
         """Enforce the cumulative semantic ceiling across every attempt base.
 
@@ -5071,9 +5495,16 @@ class Scheduler:
             # dropping its findings here would be the only place they were
             # ever going to be read from.
             review_findings=dict(self._review_findings),
+            # Projected here rather than accumulated in memory. A dict the
+            # scheduler appended to on every rejection and `project` rebuilt
+            # from the store on every resume was a second representation of
+            # what `candidate_reviews` already holds, and the two could only
+            # ever agree by copying (§4).
             review_convergence={
                 node_id: tuple(counts)
-                for node_id, counts in self._review_convergence.items()
+                for node_id, counts in rp.review_convergence_from_reviews(
+                    store.candidate_reviews(self.run_id, limit=10_000)
+                ).items()
             },
             review_nodes={
                 node_id: state
@@ -5236,6 +5667,76 @@ def _is_merged(store, run_id: str, node_id: str) -> bool:
     return any(
         r.node_id == node_id and r.state == st.NodeState.MERGED.value
         for r in store.node_records(run_id)
+    )
+
+
+#: The lane retry classes a reviewer's rejection spends. Both name the same
+#: event -- a candidate refused on its findings -- so both bound the window
+#: inside which "the reviewer has said this before" holds.
+_REVIEW_REJECTION_CLASSES = (
+    st.LaneRetryClass.REVIEW_REJECTION,
+    st.LaneRetryClass.TEST_REVIEW_REJECTION,
+)
+
+#: Stamped on the refusal built from a rejection so `rp.refusal_repetition`
+#: admits it at all: that predicate refuses an identity claim from any surface
+#: that has not declared its refusal deterministic. Independent node review is
+#: §1.2's one typed semantic adjudication boundary, and the immutable,
+#: candidate-SHA-bound findings it rejects with are that declaration.
+_REVIEW_REFUSAL_CODE = "REVIEW_REJECTED"
+
+
+#: Stands in for the reviewed candidate's sha wherever a finding quotes it.
+#: `review_objects` names the diff object `diff:<output_sha>`, so the object
+#: id of every `diff.*` finding -- which is most of the blocking ones --
+#: differs on every round *by construction*, for the same reason
+#: `review_digest` does: the sha is what changed. Left in, it would make two
+#: byte-identical verdicts unequal and the check could never fire; taken out,
+#: what remains is the rubric cell, the object's identity, the grade, and
+#: what the reviewer said about it.
+_CANDIDATE_PLACEHOLDER = "<candidate>"
+
+
+def _review_refusal(
+    findings: Sequence[Mapping[str, Any]], candidate_sha: str
+) -> rp.VerificationGuidance:
+    """One rejection as the typed refusal `rp.refusal_repetition` compares.
+
+    Keyed on the located findings -- rubric cell, object, grade, and the
+    message that cell carries -- with the candidate sha masked out of all
+    four, and on nothing else. Not `review_digest`, the reviewer generation,
+    or a completion time.
+
+    The message is in the key because it *narrows* it. The typed cells alone
+    say "the same rubric check failed on the same object again", which is
+    what an honest repair loop looks like halfway to converging; stopping on
+    that would collapse ordinary iteration to two attempts, which is the
+    hazard §7.5 names when it refuses identity to a coarse refusal. Requiring
+    the reviewer to have said byte-identically the same thing about the same
+    cell is the non-convergence proof, and every field of it is read out of
+    the same immutable receipt record the rejection itself is adjudicated
+    from -- never from pane text, prompt text, or an agent's claim about its
+    own work (§1.2).
+    """
+
+    def cell(finding: Mapping[str, Any]) -> str:
+        rendered = "|".join(
+            # Declared value, not repr: `grade` arrives as the enum on the
+            # write path the rejection returns and as its JSON string when the
+            # same row is read back, and two spellings of one grade would make
+            # every comparison across that boundary unequal.
+            str(getattr(finding.get(field, ""), "value", finding.get(field, "")))
+            for field in ("check_id", "object_id", "grade", "message")
+        )
+        return (
+            rendered.replace(candidate_sha, _CANDIDATE_PLACEHOLDER)
+            if candidate_sha
+            else rendered
+        )
+
+    return rp.VerificationGuidance(
+        reason="\n".join(cell(finding) for finding in findings),
+        refusal_code=_REVIEW_REFUSAL_CODE,
     )
 
 

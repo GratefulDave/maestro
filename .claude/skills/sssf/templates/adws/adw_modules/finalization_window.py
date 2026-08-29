@@ -97,7 +97,7 @@ earlier-firing detector at all.
 `time.monotonic` and nothing else. The lifecycle store keeps
 `last_transition_at` in **epoch** seconds, and mixing the two produced a
 real defect earlier in this build, so the window stamps both separately:
-`opened_at_monotonic` is the only value any comparison here reads, while
+`_opened_at_monotonic` is the only value any comparison here reads, while
 `ReviewerSession.opened_at_epoch` exists solely to be handed to the
 tracer row. No public entry point accepts a caller-supplied start time,
 so a caller cannot introduce the mix from outside either.
@@ -116,7 +116,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional
 
 try:
     from typing import Protocol
@@ -131,10 +131,6 @@ DEFAULT_TRANSCRIPT_RECORD_COUNT = wd.count_complete_transcript_records
 #: The key a session's transcript path lives under, shared with §7.6.
 SESSION_PATH_KEY = wd.SESSION_PATH_KEY
 
-
-class SessionNotFresh(RuntimeError):
-    """§6.5: the review runs in a fresh session directory, never the
-    authoring node's, so context cannot leak through session continuity."""
 
 
 class FinalizationSignal(str, Enum):
@@ -276,7 +272,6 @@ class ReviewerSession:
     pid: Optional[int] = None
     launched_at: Optional[float] = None
     opened_at_epoch: float = 0.0
-    turn_count: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -318,13 +313,6 @@ class ReportPoller(Protocol):
     def __call__(self) -> Optional[Any]: ...
 
 
-class SessionRecorder(Protocol):
-    """Writes the tracer's reviewer-session row — the durable record that
-    opens the window (§6.5, §11.2)."""
-
-    def __call__(self, session: ReviewerSession) -> None: ...
-
-
 class ReviewerKiller(Protocol):
     """Terminates the reviewer's process group. Called only where the
     group is harness-owned (§6.5, §8.3)."""
@@ -354,35 +342,6 @@ def _default_record_count(session: ReviewerSession) -> int:
     return DEFAULT_TRANSCRIPT_RECORD_COUNT(path)
 
 
-def require_fresh_session_dir(
-    session_dir,
-    authoring_dirs: Iterable[Any] = (),
-) -> Path:
-    """§6.5's structural half of "independent review is recorded".
-
-    Refuses a directory that is, or is inside, any authoring session
-    directory, and refuses one that already holds files — either would let
-    the authoring context reach the reviewer through session continuity,
-    which is the leak the fresh directory exists to prevent.
-    """
-    target = Path(session_dir).resolve()
-    for authoring in authoring_dirs:
-        authoring_resolved = Path(authoring).resolve()
-        if target == authoring_resolved:
-            raise SessionNotFresh(
-                f"the reviewer's session directory is the authoring one: {target}")
-        try:
-            target.relative_to(authoring_resolved)
-        except ValueError:
-            continue
-        raise SessionNotFresh(
-            f"the reviewer's session directory {target} is inside the authoring "
-            f"session {authoring_resolved}")
-    if target.exists() and any(target.iterdir()):
-        raise SessionNotFresh(
-            f"the reviewer's session directory is not fresh: {target}")
-    return target
-
 
 class FinalizationWindow:
     """One bounded span around exactly one reviewer (§6.5, §11.2).
@@ -401,7 +360,6 @@ class FinalizationWindow:
         config: FinalizationConfig,
         launch: ReviewerLauncher,
         poll_report: ReportPoller,
-        record_reviewer_session: SessionRecorder,
         kill: ReviewerKiller,
         process_alive: Callable[[int], bool] = DEFAULT_PROCESS_ALIVE,
         transcript_record_count: Callable[[ReviewerSession], int] = (
@@ -413,7 +371,6 @@ class FinalizationWindow:
         self._config = config
         self._launch = launch
         self._poll_report = poll_report
-        self._record_reviewer_session = record_reviewer_session
         self._kill = kill
         self._process_alive = process_alive
         self._transcript_record_count = transcript_record_count
@@ -457,23 +414,15 @@ class FinalizationWindow:
     # ── the span ────────────────────────────────────────────────────────
 
     @property
-    def opened_at_monotonic(self) -> Optional[float]:
-        """The only stamp any timeout in this module compares against."""
-        return self._opened_at_monotonic
-
-    @property
     def session(self) -> Optional[ReviewerSession]:
         return self._session
 
     def open(self) -> ReviewerSession:
-        """Stamp the span clock, launch the reviewer, record the row.
+        """Stamp the span clock and launch the reviewer.
 
         The clock is stamped *before* `launch` is called so that a slow
         launch spends this window's budget rather than running unbounded
-        beside it. The tracer row is written immediately after the launch
-        returns, because the row carries the identity only the launch can
-        supply — and it is written before any poll, so a stall is
-        diagnosable from the store even though no run row exists (§6.5).
+        beside it.
         """
         if self._session is not None:
             raise RuntimeError(
@@ -482,7 +431,6 @@ class FinalizationWindow:
         session = self._launch()
         session.opened_at_epoch = self._wall_clock()
         self._session = session
-        self._record_reviewer_session(session)
         return session
 
     def report_launched(self, pid: Optional[int] = None,
@@ -541,7 +489,6 @@ class FinalizationWindow:
         elif record_count > self._turn_observed_count:
             self._turn_observed_count = record_count
             self._turn_observed_at = self._time_source()
-        session.turn_count = self._turn_observed_count
 
         now = self._time_source()
         status: Optional[str] = None

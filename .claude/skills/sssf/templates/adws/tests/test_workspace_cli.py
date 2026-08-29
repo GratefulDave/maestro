@@ -153,6 +153,12 @@ class WorkspaceCliContract(unittest.TestCase):
             "plan set-aside", "plan set-aside-log",
             "deliver",
             "run start", "run status", "run list", "run pause", "run cancel",
+            # `run worktrees` reads and, on `--prune`, releases the attempt
+            # checkouts a finished attempt leaves behind -- 15.7GB across nine
+            # runs when it was written. `run amend` predates this list and was
+            # missing from it, which is why this assertion was failing before
+            # the new verb was added rather than because of it.
+            "run worktrees", "run amend",
             "run resume", "run convergence", "run findings",
             "run test-strength",
             "retry", "skip", "abandon",

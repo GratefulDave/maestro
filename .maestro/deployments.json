@@ -8,8 +8,11 @@
     {
       "name": "lexgenius",
       "root": "../../lexgenius/adws",
-      "note": "Deployed instance. The five paths below are unresolved divergence tracked in issue #71, not settled deployment-owned surface: each holds content the template does not, and each needs both versions read. Remove the entry as each is decided. Three entries have been removed this way -- adw_modules/finalization_window.py, tests/test_finalization.py and tests/test_finalization_window.py held one fix and its test (the window arming its reviewer session before the first poll, without which §6.5's structural signals are unreachable), which is now upstream, so the template carries everything those copies had and mirroring them is safe.",
+      "note": "Deployed instance. The first three pinned paths are deployment-owned documentation: lexgenius's own tests/AGENTS.md, tests/fixtures/AGENTS.md and tests/fixtures/step8/AGENTS.md carry installation-specific guidance the template does not and must not, so they are held out of the comparison rather than reconciled. The remaining five are unresolved divergence tracked in issue #71, not settled deployment-owned surface: each needs both versions read, and the entry is removed as each is decided. Three entries have been removed this way -- adw_modules/finalization_window.py, tests/test_finalization.py and tests/test_finalization_window.py held one fix and its test (the window arming its reviewer session before the first poll, without which §6.5's structural signals are unreachable), which is now upstream, so the template carries everything those copies had and mirroring them is safe.",
       "pinned": [
+        "tests/AGENTS.md",
+        "tests/fixtures/AGENTS.md",
+        "tests/fixtures/step8/AGENTS.md",
         "adw_modules/deliver.py",
         "tests/test_deliver.py",
         "tests/test_step10_cli.py",

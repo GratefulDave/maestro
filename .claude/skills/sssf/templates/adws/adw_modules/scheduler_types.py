@@ -32,8 +32,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from . import worktree as wt
-
 
 # ── §7.3 states, and the two kinds of terminal ──────────────────────────────
 
@@ -102,9 +100,6 @@ ABSOLUTELY_TERMINAL: Tuple[NodeState, ...] = (
     NodeState.ACCEPTED,
     NodeState.CANCELLED,
 )
-
-#: Operator action may unblock these; they are stopped, not immutable.
-OPERATOR_TERMINAL: Tuple[NodeState, ...] = (NodeState.BLOCKED,)
 
 #: States that stop a node without merging source output. Shared with the
 #: merge frontier so cascade semantics cannot drift from lifecycle semantics.
@@ -384,12 +379,6 @@ class MergeCause(str, Enum):
     OPERATOR_ACCEPTED = "OPERATOR_ACCEPTED"
 
 
-#: The merge causes that carry no evidence chain of their own (§1.1 item 4),
-#: so an audit looking for merges whose evidence must be established some
-#: other way reads this list rather than naming the member. Data rather than
-#: a branch, exactly as `REOPENABLE_CANCEL_CAUSES` is.
-UNEVIDENCED_MERGE_CAUSES: Tuple[MergeCause, ...] = (MergeCause.OPERATOR_ACCEPTED,)
-
 #: What a reader says about a `MERGED` node whose cause was never recorded:
 #: a row written before the column existed. It is deliberately **not** a
 #: `MergeCause` member, because it is the absence of the fact rather than a
@@ -566,6 +555,18 @@ class BlockReason(str, Enum):
     #: the point is that this one demonstrably did not, twice, and a third
     #: dispatch is an operator's call rather than the scheduler's.
     SEMANTIC_REFUSAL_REPEATED = "SEMANTIC_REFUSAL_REPEATED"
+    #: A repair handoff reached a delivery path that cannot service it —
+    #: no launcher, or a node kind for which no repair route exists (§19
+    #: M41). Before this reason existed the condition raised
+    #: `AttemptOwnershipLost` out of the repair callback and the worker's
+    #: containment handler turned it into a bare `return`: no transition, no
+    #: `fail_handoff`, no log, and `attempts`/`node_lifecycle` left reading
+    #: RUNNING for a lane with no process. Observed on
+    #: `run-36dd33d262d9485ca815aea5001b2ce2`, node `lane-wp6-tests`, whose
+    #: last ledger row was the REPAIRING phase itself. Not a budget: the
+    #: refusal is about the route, so another attempt reproduces it exactly
+    #: and the escape is a code or plan change.
+    REPAIR_HANDOFF_UNSERVICEABLE = "REPAIR_HANDOFF_UNSERVICEABLE"
 
 
 #: The failures that fit no retry class, because re-running a
@@ -573,14 +574,8 @@ class BlockReason(str, Enum):
 #: answer (§7.5). Without a dedicated reason each of these falls to the
 #: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
 #: then blocks with an infra-flavoured reason for what is a fact about content.
-#: Named as a set rather than behind a predicate. An `is_retryable(reason)`
-#: helper stood here and had no production caller for as long as it existed:
-#: production decides retryability from the `RetryClass` at classification
-#: time — `classify` returns a `block_reason` for exactly these and a
-#: `retry_class` for everything else, so by the time a `BlockReason` exists
-#: the decision is already made and asking it again is a second representation
-#: of one fact (RC1). The tuple stays because §7.5's membership rule is a
-#: statement worth naming and testing; the predicate over it does not.
+#: Named as a set rather than behind a predicate. The tuple stays because
+#: §7.5's membership rule is a statement worth naming and testing.
 NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.GATE_NOT_FALSIFIABLE,
     BlockReason.CODE_NODE_NO_EFFECT,
@@ -589,116 +584,6 @@ NON_RETRYABLE: Tuple[BlockReason, ...] = (
     BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
 )
 
-
-#: §11.3's tested property, as a table rather than a sentence: every stored
-#: reason admits a legal transition out, and — the part that makes the
-#: property mean something — every one admits a *repair*, not only `abandon`.
-#: While `UPSTREAM_BLOCKED` was stored this was satisfiable vacuously, since
-#: abandon exits every blocked state and a cascaded descendant had no other.
-_EXITS: Dict[BlockReason, Tuple[Escape, ...]] = {
-    # Re-running an agent cannot make a gate falsifiable, and re-running a
-    # deterministic command cannot write different paths. The repair is the
-    # operator doing the work by hand and supplying the SHA.
-    BlockReason.GATE_NOT_FALSIFIABLE: (Escape.SKIP, Escape.ABANDON),
-    BlockReason.CODE_NODE_NO_EFFECT: (Escape.SKIP, Escape.ABANDON),
-    BlockReason.PERMISSION_SCOPE_VIOLATION: (Escape.SKIP, Escape.ABANDON),
-    BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE: (Escape.SKIP, Escape.ABANDON),
-    BlockReason.PRODUCED_SYMBOL_UNREFERENCED: (Escape.SKIP, Escape.ABANDON),
-    # K is a ceiling on a spend, not a verdict, so the forced grant is the
-    # designed exit — one attempt per invocation, never a raised cap (§7.5).
-    BlockReason.SEMANTIC_BUDGET_EXHAUSTED: (
-        Escape.RETRY_FORCE,
-        Escape.SKIP,
-        Escape.ABANDON,
-    ),
-    # Same shape as the semantic ceiling, and the same exit: the reviewer's
-    # findings are a verdict about content, so a plain retry against unchanged
-    # bytes replays the stored FAIL (B10). `retry --force` grants the one extra
-    # attempt, which is also B10's missing operator escape — Strav's
-    # `EMPTY_RESUBMISSION_GUARD_V1` shipped with no override at all, so a flaky
-    # or environmental FAIL stranded the producer until it minted a new SHA.
-    BlockReason.REVIEW_BUDGET_EXHAUSTED: (
-        Escape.RETRY_FORCE,
-        Escape.SKIP,
-        Escape.ABANDON,
-    ),
-    # The one reason whose repair is deliberately *not* plain retry even
-    # though its actor is an agent. K is not exhausted here — the block fired
-    # because two consecutive attempts produced the byte-identical refusal —
-    # so a plain `retry` would be admitted on budget and would re-dispatch the
-    # identical node against the identical input, which is precisely the
-    # non-convergence this reason was added to stop. `retry --force` is the
-    # same verb carrying the operator's signature: a third dispatch becomes a
-    # decision somebody made once, rather than one the scheduler keeps making.
-    # The repair the block's detail actually points at is upstream of all
-    # three — change the inputs the refusal named — and that arrives as a new
-    # plan or a new base, not as an escape.
-    BlockReason.SEMANTIC_REFUSAL_REPEATED: (
-        Escape.RETRY_FORCE,
-        Escape.SKIP,
-        Escape.ABANDON,
-    ),
-    # Infra faults: a healthier machine genuinely can produce a different
-    # answer, so plain retry is the repair.
-    BlockReason.ENVIRONMENTAL_BUDGET_EXHAUSTED: (
-        Escape.RETRY,
-        Escape.SKIP,
-        Escape.ABANDON,
-    ),
-    BlockReason.LAUNCHER_BUDGET_EXHAUSTED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
-    BlockReason.CREDENTIAL_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
-    # The refusal is deterministic against an unchanged configuration, not
-    # against every configuration: the operator's repair is to supply what the
-    # launcher said was missing, and plain retry is then a genuinely different
-    # launch. That is why this is not in NON_RETRYABLE beside the three
-    # content-level reasons, which no operator action outside the plan repairs.
-    BlockReason.LAUNCH_REFUSED: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
-    # A process group whose absence cannot be proven must be repaired before
-    # retry; a retry would overlap an owned survivor with a new attempt.
-    BlockReason.QUIESCENCE_UNPROVEN: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
-    # A durable SHA that does not name the recorded commit cannot be merged.
-    BlockReason.OUTPUT_IDENTITY_INVALID: (Escape.RETRY, Escape.SKIP, Escape.ABANDON),
-    # §8.7 — resolution is human, because a conflict means two output sets
-    # overlapped in content though their declared globs did not, which is a
-    # planning defect that re-prompting papers over.
-    BlockReason.MERGE_CONFLICT: (Escape.SKIP, Escape.ABANDON),
-}
-
-
-class UnmappedBlockReason(LookupError):
-    """A stored block reason with no declared escape (§11.3).
-
-    Deliberately not a bare `KeyError`. A `KeyError` raised at a dict
-    subscript reads as a lookup that happened to miss, and reprs its argument
-    instead of saying anything; this is a build defect — a member was added to
-    `BlockReason` and `_EXITS` was not extended, so the runtime is carrying a
-    reason it can offer an operator no way out of. `LookupError` keeps it
-    catchable as the lookup failure it technically is while letting the
-    message name what has to change.
-
-    Raised at the point of use rather than asserted at import: an import-time
-    completeness check would make a missing entry brick every consumer of this
-    module, including the operator verbs someone would reach for to diagnose
-    it. Completeness is proved in the suite instead
-    (`test_every_block_reason_is_mapped`), which is where a defect of this
-    shape should be found — this exception is the backstop for when it was
-    not.
-    """
-
-
-def exits_for(reason: BlockReason) -> Tuple[Escape, ...]:
-    """The legal transitions out of a stored block reason (§11.3)."""
-    try:
-        return _EXITS[reason]
-    except KeyError:
-        raise UnmappedBlockReason(
-            f"{reason.value} is a stored block reason with no entry in _EXITS: "
-            "a node blocked with it is a dead end that declares no escape. "
-            "Every BlockReason member needs its exits and the comment saying "
-            "why those and not others (§11.3); "
-            "tests/test_scheduler_types.py::BlockReasonExitTests"
-            "::test_every_block_reason_is_mapped is what fails when it does not."
-        ) from None
 
 
 # ── §7.7 results ────────────────────────────────────────────────────────────
@@ -1051,21 +936,6 @@ class PlanNode:
                     "for (§7.3); a threshold here is a number nothing reads"
                 )
 
-    def to_record(self, state: NodeState) -> "wt.NodeRecord":
-        """Project onto the merge protocol's record (§7.1, §8.5).
-
-        A projection, not a conversion: every field is copied unchanged, so
-        re-projecting at the same digest and diffing the rows makes a bug in
-        this function observable rather than silent.
-        """
-        return wt.NodeRecord(
-            node_id=self.node_id,
-            depth=self.depth,
-            needs=tuple(self.needs),
-            state=NodeState(state).value,
-            specs=tuple(self.specs),
-        )
-
 
 # ── §11.2 configuration, and the bound preflight enforces ───────────────────
 
@@ -1159,11 +1029,6 @@ class SchedulerConfig:
         window has no run row, so it is not one of them."""
         return max(self.node_timeout_s, self.final_acceptance_timeout_s)
 
-    @property
-    def pane_limit(self) -> int:
-        """§7.2 — the concurrency limit is also the pane limit, because one
-        in-flight node holds at most one launch."""
-        return self.concurrency
 
     def retry_budget(self, retry_class: RetryClass) -> int:
         """The non-semantic budgets. SEMANTIC is absent deliberately: its

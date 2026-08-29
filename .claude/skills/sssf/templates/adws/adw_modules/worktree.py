@@ -84,6 +84,12 @@ MODE_SYMLINK = "120000"
 MODE_EXECUTABLE = "100755"
 MODE_REGULAR = "100644"
 
+#: Pre/post/falsify share `run_node_gate`. Provision already bounds itself at
+#: 600s (`HerdrLauncher.provision`). Default `node_timeout_s` is 1800. A hung
+#: vitest must reap its process group before the watchdog skips kill on an
+#: attempt that never entered `run_node`.
+NODE_GATE_TIMEOUT_S = 600.0
+
 # States that end a node without a merge. A node in one of these is excluded
 # from the frontier and cascades to its descendants for every reason, not only
 # for conflict (§8.5, §8.7).
@@ -1214,21 +1220,14 @@ def recover_unsealed_descendant(
     )
 
 
-def recover_sealed_descendant(
-    attempt: AttemptWorktree,
-    parent: str,
-    original_baseline: Inventory,
-) -> Tuple[Inventory, str]:
-    """Recover one quiesced repair lineage after its published parent.
+def sealed_descendant_tip(attempt: AttemptWorktree, parent: str) -> str:
+    """HEAD if it is this attempt's merge-free descendant of ``parent``.
 
-    The private-index commit can survive a scheduler crash before
-    ``record_sealed_output`` advances the attempt ledger. The retained builder
-    may then add follow-up commits in the same declared generation before the
-    harness consumes its final envelope. The attempt ref and a merge-free
-    parent-to-tip ancestry prove which candidate cycle produced that lineage.
-    The original provisioned baseline supplies the untracked paths that git
-    cannot retain; the published parent tree supplies the tracked side of the
-    repair bracket.
+    The retained builder may add follow-up commits in the same declared
+    generation. The attempt ref and a merge-free parent-to-tip ancestry
+    prove which candidate cycle produced that lineage. Raises ``HeadMoved``
+    when HEAD/ref is not that descendant, including when they still name
+    ``parent`` itself.
     """
     tip = attempt_ref_commit(
         attempt.repo, attempt.run_id, attempt.node_id, attempt.attempt_no
@@ -1247,12 +1246,89 @@ def recover_sealed_descendant(
             f"sealed repair {tip[:10]} is not a linear descendant of "
             f"candidate {parent[:10]}"
         )
+    return tip
+
+
+def recover_sealed_descendant(
+    attempt: AttemptWorktree,
+    parent: str,
+    original_baseline: Inventory,
+) -> Tuple[Inventory, str]:
+    """Recover one quiesced repair lineage after its published parent.
+
+    The private-index commit can survive a scheduler crash before
+    ``record_sealed_output`` advances the attempt ledger. The retained builder
+    may then add follow-up commits in the same declared generation before the
+    harness consumes its final envelope. The attempt ref and a merge-free
+    parent-to-tip ancestry prove which candidate cycle produced that lineage.
+    The original provisioned baseline supplies the untracked paths that git
+    cannot retain; the published parent tree supplies the tracked side of the
+    repair bracket.
+    """
+    tip = sealed_descendant_tip(attempt, parent)
 
     original_base = attempt.base
     baseline = _recover_candidate_baseline(
         attempt, parent, original_base, original_baseline
     )
     return baseline, tip
+
+
+def _assert_carries_measured(
+    entries: Inventory,
+    measured: InventoryDelta,
+    after: Inventory,
+    what: str,
+    why: str,
+) -> None:
+    """§8.4's staging assertion over one git-side view of the delta paths.
+
+    `entries` is a second, independent measurement of the same paths — git's
+    own, taken either from the private index at staging time or from the tree
+    of a commit the harness is about to publish. Either way the question is the
+    same one: does the git state that will become the node's output carry
+    exactly what the after-inventory measured? A path that differs, or a
+    measured deletion that survived, means the output and the measurement are
+    about two different trees, which is what `StagingMismatch` names.
+    """
+    for rel in measured.added + measured.changed:
+        if entries.get(rel) != after.get(rel):
+            raise StagingMismatch(
+                f"{rel} {what} as {entries.get(rel)} but measured as "
+                f"{after.get(rel)} — {why}"
+            )
+    for rel in measured.removed:
+        if rel in entries:
+            raise StagingMismatch(
+                f"{rel} was measured as deleted but is still {what} — {why}"
+            )
+
+
+def assert_tip_matches_measured(
+    attempt: AttemptWorktree, tip: str, measured: InventoryDelta, after: Inventory
+) -> None:
+    """The adopted commit's tree must hold what the harness measured (§8.4).
+
+    A builder-authored tip is adopted rather than built by
+    `commit_measured_delta`, so it never crosses that function's staging
+    assertion, and `check_post_commit` compares the *working tree* against the
+    expected inventory rather than the sealed commit's tree. Without this, a
+    builder that commits one version of a path and then leaves a different
+    version uncommitted publishes a candidate whose bytes no harness
+    measurement ever saw: every inventory check passes on the working tree
+    while the merge consumes the commit.
+
+    The assertion is `commit_measured_delta`'s own, read from the tip's tree
+    instead of the private index, and it raises the same `StagingMismatch` —
+    ENVIRONMENTAL, because it is a write in a window where nothing may write.
+    """
+    _assert_carries_measured(
+        inventory_at_commit(attempt.repo, tip),
+        measured,
+        after,
+        f"committed in {tip[:10]}",
+        f"the adopted commit {tip[:10]} does not carry the measured tree",
+    )
 
 
 def commit_measured_delta(
@@ -1309,18 +1385,13 @@ def commit_measured_delta(
         # same paths, taken by git at staging time, must equal the tuples the
         # after-inventory measured. A write inside the window where nothing may
         # write surfaces here instead of passing silently into the commit.
-        staged = _index_entries(attempt, env)
-        for rel in measured.added + measured.changed:
-            if staged.get(rel) != after.get(rel):
-                raise StagingMismatch(
-                    f"{rel} staged as {staged.get(rel)} but measured as {after.get(rel)} — "
-                    "something wrote to the tree between the after-inventory and staging"
-                )
-        for rel in measured.removed:
-            if rel in staged:
-                raise StagingMismatch(
-                    f"{rel} was measured as deleted but is still staged"
-                )
+        _assert_carries_measured(
+            _index_entries(attempt, env),
+            measured,
+            after,
+            "staged",
+            "something wrote to the tree between the after-inventory and staging",
+        )
 
         tree = _out(attempt.path, "write-tree", env=env)
         output_sha = _out(
@@ -1736,6 +1807,7 @@ def _run_gate(
     scope: str,
     selector: Optional[str],
     cancel_requested: Callable[[], bool],
+    timeout: Optional[float] = None,
 ) -> GateResult:
     """Run one gate through a resolved runner.
 
@@ -1762,6 +1834,7 @@ def _run_gate(
             cwd=worktree,
             env=launch_env(scratch),
             cancel_requested=cancel_requested,
+            timeout=timeout,
         )
     except HarnessCancelled as exc:
         raise GateCancelled("gate cancelled before a result was produced") from exc
@@ -1827,6 +1900,7 @@ def run_node_gate(
         "node",
         selector,
         cancel_requested,
+        timeout=NODE_GATE_TIMEOUT_S,
     )
 
 
@@ -2072,6 +2146,110 @@ def acceptance_specs(nodes: Iterable[NodeRecord]) -> Tuple[str, ...]:
     """
     merged = [n for n in nodes if n.state == "MERGED"]
     return tuple(sorted({spec for node in merged for spec in node.specs}))
+
+
+@dataclass(frozen=True)
+class StaleWorktree:
+    """One attempt checkout on disk whose attempt is no longer running.
+
+    `bytes_on_disk` is the reason this type exists. An attempt worktree of a
+    JavaScript project is a full `node_modules` -- 831MB on the run that
+    prompted this -- and a run that retried seven times left seven of them.
+    Nothing removed them, nothing counted them, and nothing told the operator
+    they were there; the disk simply filled while the console reported
+    progress.
+    """
+
+    path: Path
+    node_id: str
+    attempt_no: int
+    attempt_state: str
+    bytes_on_disk: int
+
+
+def _tree_bytes(path: Path) -> int:
+    """Apparent size of a directory tree, symlinks counted as their own size.
+
+    `os.walk` rather than `du`: this runs on the operator's own machine in a
+    verb whose whole output is a number, and shelling out for it would make
+    the number depend on which `du` is installed.
+    """
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _exc: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def stale_attempt_worktrees(
+    worktrees_root: Path,
+    run_id: str,
+    live: Mapping[Tuple[str, int], str],
+    measure: bool = True,
+) -> Tuple[StaleWorktree, ...]:
+    """Every checkout under `worktrees_root` whose attempt is not RUNNING.
+
+    `live` maps `(node_id, attempt_no)` to the attempt's recorded state, and is
+    the caller's read of the ledger rather than this function's: the ledger is
+    the authority on whether an attempt is still running, and a directory's
+    mtime is not. A directory with no ledger row at all is reported with an
+    empty state -- it is on disk, it is nobody's live attempt, and omitting it
+    would hide exactly the leftovers this exists to find.
+
+    Nothing is removed here. Deciding is the caller's, and the operator's.
+    """
+    root = Path(worktrees_root)
+    if not root.is_dir():
+        return ()
+    found: List[StaleWorktree] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not name.startswith(run_id + "-"):
+            continue
+        remainder = name[len(run_id) + 1:]
+        node_id, _, attempt = remainder.rpartition("-a")
+        if not node_id or not attempt.isdigit():
+            continue
+        attempt_no = int(attempt)
+        state = live.get((node_id, attempt_no), "")
+        if state == "RUNNING":
+            continue
+        found.append(StaleWorktree(
+            path=entry,
+            node_id=node_id,
+            attempt_no=attempt_no,
+            attempt_state=state,
+            bytes_on_disk=_tree_bytes(entry) if measure else 0,
+        ))
+    return tuple(found)
+
+
+def release_stale_worktree(repo: Path, stale: StaleWorktree,
+                           force: bool = False) -> Tuple[bool, str]:
+    """Remove one stale checkout, keeping its branch. `(released, detail)`.
+
+    The branch is deliberately left behind, and that is the whole difference
+    between this and `remove_attempt_worktree` above. A cancelled attempt's
+    branch may hold the only copy of work nobody merged, and it costs a ref;
+    the checkout costs a `node_modules`. Freeing the disk does not require
+    destroying the history, so this frees the disk and nothing else.
+
+    Unforced by default for the reason stated on `remove_attempt_worktree`: a
+    checkout that will not come away cleanly is evidence, and git's refusal is
+    surfaced rather than overridden. `--force` is the operator's to type.
+    """
+    argv = ["git", "-C", str(repo), "worktree", "remove", str(stale.path)]
+    if force:
+        argv.insert(-1, "--force")
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return True, ""
+    return False, (result.stderr or result.stdout or "").strip()
 
 
 def remove_attempt_worktree(

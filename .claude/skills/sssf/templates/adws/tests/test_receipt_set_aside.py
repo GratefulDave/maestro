@@ -81,8 +81,9 @@ REASON = ("the BLOCKING cell was a projection defect in Maestro "
 def failing_report(matrix=None):
     """A report whose one BLOCKING finding makes the derived verdict FAIL."""
     matrix = matrix_for() if matrix is None else matrix
-    blocking = next(cell for cell in matrix.graded_cells
-                    if FIXTURE_RUBRIC.check(cell.check_id).severity
+    blocking = next(cell for cell in matrix.cells
+                    if not cell.is_canary
+                    and FIXTURE_RUBRIC.check(cell.check_id).severity
                     is fin.Severity.BLOCKING)
     return graded_payload(
         matrix, findings=((blocking.check_id, blocking.object_id),))

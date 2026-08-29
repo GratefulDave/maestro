@@ -16,7 +16,6 @@ The tests below are the agreement, executed:
   §7.3   six states, two kinds of terminal, and the outcome set
   §7.3   UPSTREAM_BLOCKED is derived, so it is neither a state nor a reason
   §7.5   three retry classes, and the three failures that belong to none
-  §11.3  every *stored* block reason admits a real exit, not just abandon
   §7.4   an agent node cannot be constructed without its own gate selector
   §7.3   a code node's acceptance is its exit code, so it carries no gate
   §11.2  T must exceed the greatest run-window timeout, or preflight refuses
@@ -67,8 +66,6 @@ class StatesTests(unittest.TestCase):
             set(st.ABSOLUTELY_TERMINAL),
             {st.NodeState.MERGED, st.NodeState.ACCEPTED, st.NodeState.CANCELLED},
         )
-        self.assertEqual(set(st.OPERATOR_TERMINAL), {st.NodeState.BLOCKED})
-        self.assertFalse(set(st.ABSOLUTELY_TERMINAL) & set(st.OPERATOR_TERMINAL))
 
     def test_terminal_without_merge_matches_the_merge_protocol(self):
         """One representation of the cascade set, shared with §8.5's frontier.
@@ -143,130 +140,26 @@ class RetryClassTests(unittest.TestCase):
                 st.BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
             },
         )
-        # The `is_retryable(reason)` predicate that stood here was deleted: it
-        # had no production caller, because `classify` already decides
-        # retryability from the RetryClass at classification time and a
-        # BlockReason only exists once that decision has been made. What the
-        # membership means operationally is asserted where it is observable —
-        # `test_non_retryable_reasons_do_not_offer_retry` below.
 
 
-# ── §11.3 every stored block reason has a real exit ─────────────────────────
 
 
 class BlockReasonExitTests(unittest.TestCase):
-    def test_every_reason_admits_a_legal_exit(self):
-        for reason in st.BlockReason:
-            with self.subTest(reason=reason.value):
-                self.assertTrue(st.exits_for(reason), f"{reason.value} is a dead end")
-
-    def test_no_reason_is_satisfied_by_abandon_alone(self):
-        """The non-vacuity §8.7 bought by deriving UPSTREAM_BLOCKED.
-
-        `abandon` is a legal exit from every blocked state, so a property
-        proved only by abandon proves a kill switch exists and nothing more.
-        Every *stored* reason names a node that actually failed at something,
-        so every stored reason has a repair as well as a kill.
-        """
-        for reason in st.BlockReason:
-            with self.subTest(reason=reason.value):
-                repairs = set(st.exits_for(reason)) - {st.Escape.ABANDON}
-                self.assertTrue(repairs, f"{reason.value} admits only abandon")
-
-    def test_semantic_exhaustion_is_the_forced_retry_case(self):
-        """§7.5 — `retry --force` grants one attempt beyond K, never raises K."""
-        self.assertIn(
-            st.Escape.RETRY_FORCE,
-            st.exits_for(st.BlockReason.SEMANTIC_BUDGET_EXHAUSTED),
-        )
-
-    def test_non_retryable_reasons_do_not_offer_retry(self):
-        """Re-running an agent cannot make a gate falsifiable, and re-running
-        a deterministic command cannot write different paths."""
-        for reason in st.NON_RETRYABLE:
-            with self.subTest(reason=reason.value):
-                offered = set(st.exits_for(reason))
-                self.assertNotIn(st.Escape.RETRY, offered)
-                self.assertNotIn(st.Escape.RETRY_FORCE, offered)
-
-    def test_every_block_reason_is_mapped(self):
-        """The completeness the other tests in this class assume.
-
-        `test_every_reason_admits_a_legal_exit` proves the *value* is
-        non-empty, which it can only do once the lookup has already succeeded;
-        a member absent from `_EXITS` fails it with a lookup error rather than
-        with the fact. `SEMANTIC_REFUSAL_REPEATED` shipped in the enum with no
-        entry and nothing in production noticed, because nothing in production
-        reads this table at all — the map is asserted about here and consulted
-        nowhere else, so the suite is the only thing standing between an added
-        member and a blocked node that declares no way out.
-
-        Set equality, in both directions on purpose: a missing key is the
-        defect that happened, and a stale key is the same defect run backwards
-        — an escape declared for a reason nothing can store any more.
-        """
-        self.assertEqual(
-            set(st._EXITS),
-            set(st.BlockReason),
-            "every stored block reason declares its exits, and only stored "
-            "reasons appear in the table",
-        )
-
-    def test_repeated_semantic_refusal_does_not_offer_plain_retry(self):
-        """The escape the block exists to withhold.
-
-        The reason fires when two consecutive attempts produced the identical
-        content-level refusal, and K is not exhausted when it does — so plain
-        `retry` is admitted on budget and re-dispatches the identical node
-        against the identical input, which is the loop this member was added
-        to cut. `retry --force` is the same dispatch with an operator's
-        signature on it, so it stays.
-        """
-        offered = set(st.exits_for(st.BlockReason.SEMANTIC_REFUSAL_REPEATED))
-        self.assertNotIn(st.Escape.RETRY, offered)
-        self.assertIn(st.Escape.RETRY_FORCE, offered)
-        self.assertTrue(offered - {st.Escape.ABANDON}, "a kill is not a repair")
-
-    def test_an_unmapped_reason_reads_as_a_build_defect(self):
-        """The failure an added-and-unmapped member gets from now on.
-
-        A bare `KeyError` at a dict subscript reprs the member and says
-        nothing about what to do; the point of the reason existing at all is
-        that a blocked operator is told their way out.
-        """
-
-        class Unmapped(str, Enum):
-            NOT_IN_THE_TABLE = "NOT_IN_THE_TABLE"
-
-        with self.assertRaises(st.UnmappedBlockReason) as caught:
-            st.exits_for(Unmapped.NOT_IN_THE_TABLE)
-        message = str(caught.exception)
-        self.assertIn("NOT_IN_THE_TABLE", message)
-        self.assertIn("_EXITS", message)
-        self.assertIn("no entry", message)
-        self.assertIsInstance(caught.exception, LookupError)
-
     def test_the_enum_derived_tuples_are_subsets_and_not_tables(self):
-        """The sibling shapes, and why only one of them owes completeness.
-
-        `_EXITS` is the module's only enum-keyed *table* — a structure whose
-        contract is that it answers for every member — which is why a member
-        can go missing from it. The other seven module-level constants derived
-        from an enum are deliberately partial: each names the subset of its
-        enum for which some property holds, so a member's absence is the
-        answer `no`, not a gap. What they can still get wrong is holding a
-        value from the wrong enum, which is what this checks.
+        """Module-level constants derived from an enum are deliberately
+        partial: each names the subset of its enum for which some property
+        holds, so a member's absence is the answer `no`, not a gap. What they
+        can still get wrong is holding a value from the wrong enum, which is
+        what this checks.
         """
         subsets = {
             "LANE_PHASE_TERMINAL": (st.LANE_PHASE_TERMINAL, st.LanePhase),
             "ABSOLUTELY_TERMINAL": (st.ABSOLUTELY_TERMINAL, st.NodeState),
-            "OPERATOR_TERMINAL": (st.OPERATOR_TERMINAL, st.NodeState),
             "TERMINAL_WITHOUT_MERGE": (st.TERMINAL_WITHOUT_MERGE, st.NodeState),
             "REOPENABLE_CANCEL_CAUSES": (
                 st.REOPENABLE_CANCEL_CAUSES,
                 st.CancelCause,
             ),
-            "UNEVIDENCED_MERGE_CAUSES": (st.UNEVIDENCED_MERGE_CAUSES, st.MergeCause),
             "NON_RETRYABLE": (st.NON_RETRYABLE, st.BlockReason),
         }
         for name, (members, enum) in subsets.items():
@@ -360,23 +253,6 @@ class PlanNodeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.agent(needs=("n1",))
 
-    def test_projects_to_the_merge_protocol_record(self):
-        """§7.1 — one authored node type, projected, never converted."""
-        node = self.agent(depth=2, needs=("a", "b"), specs=("tests/test_n1.py",))
-        record = node.to_record(st.NodeState.VERIFIED)
-        self.assertIsInstance(record, wt.NodeRecord)
-        self.assertEqual(record.node_id, "n1")
-        self.assertEqual(record.depth, 2)
-        self.assertEqual(record.needs, ("a", "b"))
-        self.assertEqual(record.state, "VERIFIED")
-        self.assertEqual(record.specs, ("tests/test_n1.py",))
-
-    def test_projection_is_reprojectable_and_stable(self):
-        """§7.1 — re-project at the same digest and diff the rows."""
-        node = self.agent()
-        self.assertEqual(
-            node.to_record(st.NodeState.PENDING), node.to_record(st.NodeState.PENDING)
-        )
 
 
 # ── §11.2 the liveness bound preflight enforces ─────────────────────────────
@@ -442,10 +318,6 @@ class SchedulerConfigTests(unittest.TestCase):
         semantic failure, which is a different design, not a configuration."""
         with self.assertRaises(ValueError):
             self.cfg(semantic_ceiling=0)
-
-    def test_concurrency_is_also_the_pane_limit(self):
-        """§7.2 — one in-flight node holds at most one launch."""
-        self.assertEqual(self.cfg(concurrency=6).pane_limit, 6)
 
 
 # ── §7.7 results adjudication vocabulary ────────────────────────────────────

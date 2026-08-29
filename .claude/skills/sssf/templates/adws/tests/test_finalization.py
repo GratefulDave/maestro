@@ -225,7 +225,6 @@ class TheMatrixIsComputedByCode(unittest.TestCase):
     def test_pair_count_includes_the_canaries_the_reviewer_must_answer(self):
         matrix = matrix_for()
         self.assertEqual(matrix.pair_count, len(matrix.cells))
-        self.assertEqual(len(matrix.graded_cells), matrix.pair_count - 2)
 
 
 class VerdictAndSeverityAreUnrepresentable(unittest.TestCase):
@@ -391,8 +390,9 @@ class VerdictDerivation(unittest.TestCase):
 
     def test_a_blocking_finding_is_a_fail(self):
         matrix = matrix_for()
-        blocking = next(c for c in matrix.graded_cells
-                        if FIXTURE_RUBRIC.check(c.check_id).severity
+        blocking = next(c for c in matrix.cells
+                        if not c.is_canary
+                        and FIXTURE_RUBRIC.check(c.check_id).severity
                         is fin.Severity.BLOCKING)
         self.assertEqual(
             derived_verdict(
@@ -402,8 +402,9 @@ class VerdictDerivation(unittest.TestCase):
 
     def test_an_advisory_finding_alone_is_still_a_pass(self):
         matrix = matrix_for()
-        advisory = next(c for c in matrix.graded_cells
-                        if FIXTURE_RUBRIC.check(c.check_id).severity
+        advisory = next(c for c in matrix.cells
+                        if not c.is_canary
+                        and FIXTURE_RUBRIC.check(c.check_id).severity
                         is fin.Severity.ADVISORY)
         derived = derived_verdict(
             matrix, findings=((advisory.check_id, advisory.object_id),))

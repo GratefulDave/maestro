@@ -210,10 +210,6 @@ class ApplicabilityMatrix:
         return len(self.cells)
 
     @property
-    def graded_cells(self) -> Tuple[MatrixCell, ...]:
-        return tuple(c for c in self.cells if not c.is_canary)
-
-    @property
     def canary_cells(self) -> Tuple[MatrixCell, ...]:
         return tuple(c for c in self.cells if c.is_canary)
 
