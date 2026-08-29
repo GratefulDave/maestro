@@ -2230,10 +2230,40 @@ class Scheduler:
         review = store.candidate_review(
             self.run_id, review_node.node_id, candidate.candidate_sha
         )
-        if review is None or review.state not in {
+        if review is None:
+            return False
+        unread = review.state in {
             st.CandidateReviewState.PUBLISHED,
             st.CandidateReviewState.DISPATCHED,
-        }:
+        }
+        # The candidate was read and rejected, and the repair it was rejected
+        # into never started. `PENDING` is that fact and the only state that
+        # is: `mark_handoff_submitted` moves the row the moment a repair
+        # prompt is proven delivered, so a still-`PENDING` handoff means no
+        # repair builder ever held these findings.
+        #
+        # This is the same debt as an unread candidate wearing a later face.
+        # `_durable_repair_resume` is the wrong owner for it -- that one
+        # reopens the rejected attempt to continue a builder that already
+        # produced something, and an attempt which only *reviewed* produced
+        # nothing, so recovery reaches `accepted_result_payload`, finds no
+        # payload, and raises "late envelope is not usable". Handing it here
+        # instead costs nothing extra: `_publish_and_review_candidate` replays
+        # an immutable publication, skips the dispatch loop on a COMPLETED
+        # review, and lands directly on the repair round with the verdict it
+        # already has.
+        #
+        # Fenced to `PENDING` so a genuinely mid-flight repair -- `SUBMITTED`
+        # or `ACKNOWLEDGED` -- still belongs to `_durable_repair_resume`.
+        handoff = store.repair_handoff(
+            self.run_id, node.node_id, candidate.candidate_sha
+        )
+        unrepaired = (
+            review.verdict is st.ReviewVerdict.REJECTED
+            and handoff is not None
+            and handoff.state is st.RepairHandoffState.PENDING
+        )
+        if not unread and not unrepaired:
             return False
 
         head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
@@ -2241,7 +2271,11 @@ class Scheduler:
             self.run_id,
             node.node_id,
             head,
-            detail={"repair": "review-unreviewed-candidate"},
+            detail={
+                "repair": "review-unreviewed-candidate"
+                if unread
+                else "repair-unstarted-candidate"
+            },
         )
         with self._lock:
             self._attempt_dispatch.setdefault((node.node_id, attempt_no), False)
@@ -2250,16 +2284,36 @@ class Scheduler:
         self._require_running(record)
         self._set_lane_phase(node.node_id, st.LanePhase.CANDIDATE_READY, record)
 
-        # The worktree carries this attempt's identity, not its subject: the
-        # reviewer reads the candidate sha against the head, both immutable,
-        # and nothing here writes to the checkout. Cut from the head for the
-        # same reason every other attempt is.
+        # Cut at the candidate, not at the integration head, and the review is
+        # not what decides that -- the rejection after it is. A reviewer reads
+        # two immutable shas and never the checkout, so for a PASS either base
+        # would serve. A REJECT goes on to `prepare_descendant_candidate`,
+        # which refuses `HeadMoved` unless the worktree HEAD *and*
+        # `refs/heads/maestro/{run}/{node}/a{n}` both already hold the
+        # candidate, because a repair must commit a descendant of the thing
+        # that was rejected. Creating the worktree at the candidate is what
+        # sets both: `create_attempt_worktree` branches at the commit it is
+        # given.
+        #
+        # Cut from the head instead, this path reviewed the candidate
+        # correctly and then died on its own findings --
+        # `HeadMoved: HEAD is 3b1f1beb70, not candidate parent a551049c94`,
+        # classified ENVIRONMENTAL, retried into the same refusal. Reaching
+        # the reviewer is only half the debt; the repair it hands back has to
+        # land somewhere.
+        #
+        # This does not reopen GATE_NOT_FALSIFIABLE. That block came from
+        # §7.4's pre-node gate on a *build* attempt whose base contained the
+        # implementation; no builder runs here and no pre-node gate is
+        # evaluated, and the falsifiability that a later repair round does run
+        # reads `_pre_candidate_base`, which is the earliest attempt's base
+        # and never a candidate.
         attempt = wt.create_attempt_worktree(
             self.deps.repo,
             self.run_id,
             node.node_id,
             attempt_no,
-            head,
+            candidate.candidate_sha,
             Path(self.deps.worktrees_root),
             Path(self.deps.scratch_root),
         )
