@@ -2253,8 +2253,27 @@ class Scheduler:
         # review, and lands directly on the repair round with the verdict it
         # already has.
         #
-        # Fenced to `PENDING` so a genuinely mid-flight repair -- `SUBMITTED`
-        # or `ACKNOWLEDGED` -- still belongs to `_durable_repair_resume`.
+        # Fenced on *who built the candidate*, which is the fact that decides
+        # which resume can work, and `PENDING` is not it: a scheduler that
+        # dies between the verdict and the repair prompt also leaves a
+        # `PENDING` handoff, and there `_durable_repair_resume` is right --
+        # the rejected attempt sealed that candidate, so its worktree and ref
+        # already stand on the thing a repair must descend from, and reopening
+        # it is cheaper and keeps the attempt number. Claiming those here
+        # minted a replacement generation instead and broke both of
+        # `PersistentCandidateLoopTests`' restarts.
+        #
+        # An attempt that only *reviewed* sealed nothing. Nobody can reopen
+        # into a repair that never had a builder, which is precisely why this
+        # path has to start a new attempt on the candidate.
+        lifecycle = store.get_node(self.run_id, node.node_id)
+        sealed = (
+            store.attempt_sealed_output(
+                self.run_id, node.node_id, lifecycle.attempt_no
+            )
+            if lifecycle.attempt_no
+            else None
+        )
         handoff = store.repair_handoff(
             self.run_id, node.node_id, candidate.candidate_sha
         )
@@ -2262,6 +2281,7 @@ class Scheduler:
             review.verdict is st.ReviewVerdict.REJECTED
             and handoff is not None
             and handoff.state is st.RepairHandoffState.PENDING
+            and sealed != candidate.candidate_sha
         )
         if not unread and not unrepaired:
             return False

@@ -230,21 +230,76 @@ class ResumedCandidateIsRepairableTests(ResumeUnreviewedCandidateTests):
         )
 
     def test_a_rejected_candidate_whose_repair_never_started_is_resumed(self):
-        """The crash window after the verdict and before the repair.
+        """A verdict delivered by an attempt that built nothing.
 
-        `reject_and_create_handoff` writes the findings durably, and the
-        repair builder is launched after it. A death in between leaves the
-        handoff `PENDING` -- read, rejected, and never repaired. That is the
-        unread candidate's debt wearing a later face, and it must not fall to
-        `_durable_repair_resume`, which reopens the rejected attempt to
-        continue a builder that in this case never ran, finds no accepted
-        payload, and raises "late envelope is not usable".
+        This path reviews inside a *fresh* attempt, so when the verdict is
+        REJECTED the lane holds a rejected candidate whose repair never
+        started and whose current attempt sealed no output. Nothing can
+        reopen into that repair -- `_durable_repair_resume` would hand the
+        attempt to `_recover_attempt_body`, which looks for an accepted
+        payload, finds none, and raises "late envelope is not usable".
 
-        Written against the ledger rather than by driving a rejection through
-        the fixture, because the state under test is the one a *death* leaves:
-        the verdict durable, the repair unstarted, and the node still
-        resumable.
+        Built against the ledger rather than by driving a rejection through
+        the fixture, because the state under test is what a *death* between
+        the verdict and the repair prompt leaves behind, and because the
+        fixture's review-rejection budget would block the lane first.
         """
+        candidate = self._wedge()
+        # A second attempt that reviews and seals nothing -- what this path
+        # creates, and what attempt 14 of
+        # run-9d03105407f440079f3730f1fe4c67b3 was.
+        reviewing = self.store.start_attempt(
+            "run1",
+            "a",
+            self.store.get_attempt("run1", "a", 1).base_sha,
+            detail={"repair": "review-unreviewed-candidate"},
+        )
+        self.store.begin_review("run1", "a::review", candidate, reviewer_generation=1)
+        self.store.mark_review_dispatched(
+            "run1", "a::review", candidate, reviewer_generation=1
+        )
+        self.store.reject_and_create_handoff(
+            "run1",
+            "a::review",
+            candidate,
+            reviewer_generation=1,
+            builder_generation=1,
+            review_digest="review-digest",
+            receipt_path="/dev/null",
+            findings=list(_Reject.findings),
+        )
+        self.store.fail_attempt("run1", "a", st.RetryClass.ENVIRONMENTAL)
+
+        self.assertIsNone(
+            self.store.attempt_sealed_output("run1", "a", reviewing),
+            "the reviewing attempt built nothing; that is the whole reason "
+            "its repair cannot be reopened in place",
+        )
+        self.assertIs(
+            self.store.repair_handoff("run1", "a", candidate).state,
+            st.RepairHandoffState.PENDING,
+            "a handoff a repair builder held would be SUBMITTED",
+        )
+
+        scheduler = self.schedule(
+            [self.agent("a")], deps=self.deps(review_attempt=self._accepting)
+        )
+        scheduler.project()
+        self.assertTrue(
+            scheduler._resume_unreviewed_candidate(
+                scheduler.nodes["a"], sch._AttemptContext(record=None)
+            ),
+            "a rejected candidate whose repair never started still owes a "
+            "descendant, and no fresh build can produce one",
+        )
+
+    def test_a_rejected_candidate_the_current_attempt_built_is_left_alone(self):
+        """The fence. When the rejected attempt sealed the candidate itself,
+        its worktree and ref already stand on what a repair must descend
+        from, so `_durable_repair_resume` reopens that attempt -- cheaper,
+        and it keeps the attempt number. Claiming it here mints a replacement
+        generation and breaks both of `PersistentCandidateLoopTests`'
+        restarts."""
         candidate = self._wedge()
         self.store.begin_review("run1", "a::review", candidate, reviewer_generation=1)
         self.store.mark_review_dispatched(
@@ -261,21 +316,20 @@ class ResumedCandidateIsRepairableTests(ResumeUnreviewedCandidateTests):
             findings=list(_Reject.findings),
         )
 
-        handoff = self.store.repair_handoff("run1", "a", candidate)
+        lifecycle = self.store.get_node("run1", "a")
         self.assertEqual(
-            handoff.state,
-            st.RepairHandoffState.PENDING,
-            "a handoff a repair builder held would be SUBMITTED",
+            self.store.attempt_sealed_output("run1", "a", lifecycle.attempt_no),
+            candidate,
+            "the builder attempt sealed the candidate it is being rejected on",
         )
 
         scheduler = self.schedule(
             [self.agent("a")], deps=self.deps(review_attempt=self._accepting)
         )
         scheduler.project()
-        self.assertTrue(
+        self.assertFalse(
             scheduler._resume_unreviewed_candidate(
                 scheduler.nodes["a"], sch._AttemptContext(record=None)
             ),
-            "a rejected candidate whose repair never started still owes a "
-            "descendant, and no fresh build can produce one",
+            "this one is reopenable, and reopening beats a new generation",
         )
