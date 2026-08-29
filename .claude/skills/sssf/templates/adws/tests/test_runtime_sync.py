@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Tuple
 from unittest import mock
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -1230,6 +1231,670 @@ class TheRecordDoesNotOverstateTests(RecordingFixture):
         self.assertIn("are now byte-identical over 4 file(s)", message)
         self.assertNotIn("NOT byte-identical", message)
         self.assertNotIn("Held out", message)
+
+
+
+class PruneFixture(RecordingFixture):
+    """Two template git checkouts: source deletes, destination still has the blob."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.peer_repo = self.world / "the-library"
+        self.init_repo(self.peer_repo)
+
+    def seed(self, relative: str, body: str) -> None:
+        _write(self.template, relative, body)
+        _write(self.peer, relative, body)
+
+    def commit_both(self, message: str) -> Tuple[str, str]:
+        source_sha = self.commit_everything(self.source_repo, message)
+        dest_sha = self.commit_everything(self.peer_repo, message)
+        return source_sha, dest_sha
+
+    def delete_source(self, relative: str, message: str = "delete path") -> Tuple[str, str]:
+        pre = self.git(self.source_repo, "rev-parse", "HEAD").strip()
+        (self.template / relative).unlink()
+        self.git(self.source_repo, "add", "-A")
+        self.git(self.source_repo, "commit", "-q", "-m", message)
+        deletion = self.git(self.source_repo, "rev-parse", "HEAD").strip()
+        return pre, deletion
+
+    def prune(self, *relatives: str, apply: bool = False, commit: bool = False, **kwargs):
+        source, destination = self.copies(self.template, self.peer)
+        deletion = kwargs.pop("deletion_sha", None)
+        predecessor = kwargs.pop("pre_deletion_sha", None)
+        if deletion is None or predecessor is None:
+            raise AssertionError("deletion_sha and pre_deletion_sha are required")
+        return rs.prune(
+            source,
+            destination,
+            deletion_sha=deletion,
+            pre_deletion_sha=predecessor,
+            paths=relatives,
+            apply=apply,
+            commit=commit,
+            **kwargs,
+        )
+
+
+class PruneSuccessTests(PruneFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.relative = "adw_modules/gone.py"
+        self.seed(self.relative, "identical blob\n")
+        self.commit_both("add gone.py")
+        self.pre, self.deletion = self.delete_source(self.relative)
+
+    def test_dry_run_is_the_default_and_removes_nothing(self):
+        result = self.prune(self.relative, deletion_sha=self.deletion, pre_deletion_sha=self.pre)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.is_clean)
+        self.assertEqual((), result.removed)
+        self.assertEqual((self.relative,), result.paths)
+        self.assertTrue((self.peer / self.relative).exists())
+        self.assertIn("would prune", result.describe())
+        self.assertEqual(1, len(self.commits(self.peer_repo)))
+
+    def test_the_cli_defaults_to_a_plan(self):
+        code = rs.main([
+            "prune",
+            str(self.template),
+            str(self.peer),
+            "--deletion-sha",
+            self.deletion,
+            "--pre-deletion-sha",
+            self.pre,
+            "--path",
+            self.relative,
+        ])
+
+        self.assertEqual(0, code)
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_apply_and_commit_removes_only_the_named_path_and_records_both_shas(self):
+        _write(self.peer, "maestro.py", "keep me\n")
+        self.commit_everything(self.peer_repo, "unrelated dest file")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual(rs.COMMIT_RECORDED, result.commit.reason)
+        self.assertEqual((self.relative,), result.removed)
+        self.assertEqual((self.relative,), result.commit.staged)
+        self.assertFalse((self.peer / self.relative).exists())
+        self.assertTrue((self.peer / "maestro.py").exists())
+        message = self.git(self.peer_repo, "log", "-1", "--pretty=%B")
+        self.assertIn(self.deletion, message)
+        self.assertIn(self.pre, message)
+        self.assertIn(self.relative, message)
+        self.assertEqual(message.strip(), result.commit.message.strip())
+        self.assertEqual(
+            {LIBRARY_LAYOUT.as_posix() + "/" + self.relative},
+            self.committed_paths(self.peer_repo),
+        )
+
+    def test_apply_without_commit_is_a_no_op(self):
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_COMMIT_REQUIRED,), tuple(item.code for item in result.refusals))
+        self.assertEqual((), result.removed)
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_delayed_invocation_is_proved_from_git_object_bytes_not_mtime(self):
+        dest = self.peer / self.relative
+        later = dest.stat().st_mtime + 10_000
+        os.utime(dest, (later, later))
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertFalse(dest.exists())
+
+    def test_pathspec_magic_filename_removes_only_the_named_file(self):
+        magic = ":(glob)gone.py"
+        sibling = "adw_modules/sibling.py"
+        self.seed(magic, "magic blob\n")
+        self.seed(sibling, "sibling blob\n")
+        self.commit_both("add magic and sibling")
+        pre, deletion = self.delete_source(magic)
+
+        result = self.prune(
+            magic,
+            deletion_sha=deletion,
+            pre_deletion_sha=pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertEqual((magic,), result.removed)
+        self.assertFalse((self.peer / magic).exists())
+        self.assertTrue((self.peer / sibling).exists())
+        self.assertEqual("sibling blob\n", (self.peer / sibling).read_text(encoding="utf-8"))
+
+class PruneRefusalTests(PruneFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.relative = "adw_modules/gone.py"
+        self.seed(self.relative, "identical blob\n")
+        self.seed("maestro.py", "survives every refusal\n")
+        self.commit_both("add gone.py")
+        self.pre, self.deletion = self.delete_source(self.relative)
+
+    def test_wrong_parent_refuses_and_removes_nothing(self):
+        other = self.git(self.source_repo, "rev-parse", "HEAD~0").strip()
+        empty = self.git(
+            self.source_repo, "commit-tree", self.pre + "^{tree}", "-m", "unrelated"
+        ).strip()
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=empty,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertIn(rs.PRUNE_WRONG_PARENT, tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+        self.assertEqual(other, self.git(self.source_repo, "rev-parse", "HEAD").strip())
+
+    def test_a_merge_commit_is_refused_even_when_the_named_sha_is_a_parent(self):
+        self.git(self.source_repo, "checkout", "-q", "-b", "side", self.pre)
+        self.git(
+            self.source_repo,
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "side",
+        )
+        side = self.git(self.source_repo, "rev-parse", "HEAD").strip()
+        self.git(self.source_repo, "checkout", "-q", "main")
+        self.git(self.source_repo, "merge", "-q", "--no-ff", "-m", "merge deletion", side)
+        merge = self.git(self.source_repo, "rev-parse", "HEAD").strip()
+        parents = self.git(self.source_repo, "rev-list", "--parents", "-n", "1", merge).split()
+        self.assertGreaterEqual(len(parents), 3)
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=merge,
+            pre_deletion_sha=self.deletion,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertIn(rs.PRUNE_MERGE_COMMIT, tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_destination_diverged_bytes_refuse_the_prune(self):
+        (self.peer / self.relative).write_text("not the predecessor\n", encoding="utf-8")
+        self.git(self.peer_repo, "add", "-A")
+        self.git(self.peer_repo, "commit", "-q", "-m", "diverge")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            (rs.PRUNE_DESTINATION_DIVERGED,),
+            tuple(item.code for item in result.refusals),
+        )
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_destination_modified_worktree_refuses(self):
+        (self.peer / self.relative).write_text("dirty worktree\n", encoding="utf-8")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            (rs.PRUNE_DESTINATION_DIRTY,),
+            tuple(item.code for item in result.refusals),
+        )
+        self.assertEqual("dirty worktree\n", (self.peer / self.relative).read_text(encoding="utf-8"))
+
+    def test_destination_modified_index_refuses(self):
+        (self.peer / self.relative).write_text("dirty index\n", encoding="utf-8")
+        self.git(self.peer_repo, "add", "--", str(self.peer / self.relative))
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            (rs.PRUNE_DESTINATION_DIRTY,),
+            tuple(item.code for item in result.refusals),
+        )
+
+    def test_destination_untracked_refuses(self):
+        (self.peer / self.relative).unlink()
+        self.git(self.peer_repo, "rm", "-q", "--cached", "--", str(self.peer / self.relative))
+        self.git(self.peer_repo, "commit", "-q", "-m", "untrack")
+        (self.peer / self.relative).write_text("identical blob\n", encoding="utf-8")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            (rs.PRUNE_DESTINATION_UNTRACKED,),
+            tuple(item.code for item in result.refusals),
+        )
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_destination_absent_refuses(self):
+        (self.peer / self.relative).unlink()
+        self.git(self.peer_repo, "add", "-A")
+        self.git(self.peer_repo, "commit", "-q", "-m", "already gone")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            (rs.PRUNE_DESTINATION_ABSENT,),
+            tuple(item.code for item in result.refusals),
+        )
+
+    def test_wrong_source_head_refuses(self):
+        self.git(self.source_repo, "commit", "-q", "--allow-empty", "-m", "later")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertIn(rs.PRUNE_HEAD_MISMATCH, tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_source_path_still_present_at_deletion_sha_refuses(self):
+        present = "adw_modules/stays.py"
+        self.seed(present, "still here\n")
+        self.commit_everything(self.source_repo, "add stays")
+        head = self.git(self.source_repo, "rev-parse", "HEAD").strip()
+        parent = self.git(self.source_repo, "rev-parse", "HEAD^").strip()
+        _write(self.peer, present, "still here\n")
+        self.commit_everything(self.peer_repo, "add stays dest")
+
+        result = self.prune(
+            present,
+            deletion_sha=head,
+            pre_deletion_sha=parent,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertIn(
+            rs.PRUNE_SOURCE_STILL_PRESENT, tuple(item.code for item in result.refusals)
+        )
+        self.assertTrue((self.peer / present).exists())
+
+    def test_predecessor_path_absent_refuses(self):
+        missing = "adw_modules/never.py"
+        result = self.prune(
+            missing,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertIn(
+            rs.PRUNE_PREDECESSOR_MISSING, tuple(item.code for item in result.refusals)
+        )
+
+    def test_predecessor_path_that_is_not_a_blob_refuses(self):
+        result = self.prune(
+            "adw_modules",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertIn(
+            rs.PRUNE_PREDECESSOR_NOT_BLOB, tuple(item.code for item in result.refusals)
+        )
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_one_invalid_path_makes_a_multi_path_request_a_no_op(self):
+        keep = "adw_modules/keep.py"
+        self.seed(keep, "keep blob\n")
+        self.commit_everything(self.source_repo, "add keep source")
+        # Destination already has keep from this seed; commit it.
+        self.commit_everything(self.peer_repo, "add keep dest")
+        pre, deletion = self.delete_source(keep)
+        # HEAD is now the keep deletion, but gone.py was deleted in an earlier
+        # commit. Re-seed gone.py onto this HEAD so a two-path prune is about
+        # this deletion-sha: keep is absent, gone is still present → invalid.
+        result = self.prune(
+            keep,
+            self.relative,
+            deletion_sha=deletion,
+            pre_deletion_sha=pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.refusals)
+        self.assertTrue((self.peer / keep).exists())
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_backslash_path_is_refused(self):
+        result = self.prune(
+            "adw_modules\\gone.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertEqual((), result.removed)
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_nul_in_path_is_refused(self):
+        result = self.prune(
+            "adw_modules/gone\x00.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertEqual((), result.removed)
+        self.assertNotIn("\x00", result.describe())
+
+    def test_ascii_control_in_path_is_refused(self):
+        result = self.prune(
+            "adw_modules/gone\n.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertEqual((), result.removed)
+
+    def test_del_in_path_is_refused(self):
+        result = self.prune(
+            "adw_modules/gone\x7f.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertEqual((), result.removed)
+        self.assertNotIn("\x7f", result.describe())
+
+    def test_doubled_separator_is_refused(self):
+        result = self.prune(
+            "adw_modules//gone.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_dot_component_is_refused(self):
+        result = self.prune(
+            "adw_modules/./gone.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_dotdot_component_is_refused(self):
+        result = self.prune(
+            "adw_modules/../adw_modules/gone.py",
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_source_repo_prefix_alias_is_refused(self):
+        alias = ".claude/skills/sssf/templates/adws/" + self.relative
+        result = self.prune(
+            alias,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+        )
+        self.assertFalse(result.applied)
+        self.assertEqual((rs.PRUNE_PATH_INVALID,), tuple(item.code for item in result.refusals))
+        self.assertTrue((self.peer / self.relative).exists())
+
+    def test_tracked_symlink_is_refused_without_reading_the_target(self):
+        dest = self.peer / self.relative
+        dest.unlink()
+        dest.symlink_to("nowhere-on-purpose")
+        self.git(self.peer_repo, "add", "-A")
+        self.git(self.peer_repo, "commit", "-q", "-m", "symlink")
+
+        result = self.prune(
+            self.relative,
+            deletion_sha=self.deletion,
+            pre_deletion_sha=self.pre,
+            apply=True,
+            commit=True,
+        )
+
+        self.assertFalse(result.applied)
+        self.assertEqual(
+            (rs.PRUNE_DESTINATION_NOT_REGULAR,),
+            tuple(item.code for item in result.refusals),
+        )
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual((), result.removed)
+
+
+class PruneMutationAtomicityTests(PruneFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.relative = "adw_modules/gone.py"
+        self.seed(self.relative, "identical blob\n")
+        self.commit_both("add gone.py")
+        self.pre, self.deletion = self.delete_source(self.relative)
+
+    def snapshot(self):
+        dest = self.peer / self.relative
+        return (
+            self.git(self.peer_repo, "status", "--porcelain"),
+            dest.read_bytes(),
+            self.git(self.peer_repo, "rev-parse", "HEAD").strip(),
+        )
+
+    def test_injected_rm_failure_leaves_porcelain_and_bytes_unchanged(self):
+        before = self.snapshot()
+        real = rs._git
+
+        def wrapped(repo, *args):
+            if args and args[0] == "rm":
+                return subprocess.CompletedProcess(
+                    args=["git", *args],
+                    returncode=1,
+                    stdout="",
+                    stderr="injected rm failure",
+                )
+            return real(repo, *args)
+
+        with mock.patch.object(rs, "_git", side_effect=wrapped):
+            result = self.prune(
+                self.relative,
+                deletion_sha=self.deletion,
+                pre_deletion_sha=self.pre,
+                apply=True,
+                commit=True,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual((), result.removed)
+        self.assertEqual(rs.COMMIT_FAILED, result.commit.reason)
+        self.assertEqual(before, self.snapshot())
+
+    def test_injected_commit_failure_restores_index_and_worktree(self):
+        before = self.snapshot()
+        real = rs._git
+
+        def wrapped(repo, *args):
+            if args and args[0] == "commit":
+                return subprocess.CompletedProcess(
+                    args=["git", *args],
+                    returncode=1,
+                    stdout="",
+                    stderr="injected commit failure",
+                )
+            return real(repo, *args)
+
+        with mock.patch.object(rs, "_git", side_effect=wrapped):
+            result = self.prune(
+                self.relative,
+                deletion_sha=self.deletion,
+                pre_deletion_sha=self.pre,
+                apply=True,
+                commit=True,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertEqual((), result.removed)
+        self.assertEqual(rs.COMMIT_FAILED, result.commit.reason)
+        self.assertEqual(before, self.snapshot())
+
+    def test_injected_post_commit_head_lookup_failure_matches_durable_state(self):
+        before_head = self.git(self.peer_repo, "rev-parse", "HEAD").strip()
+        real = rs._git
+        seen_commit = []
+
+        def wrapped(repo, *args):
+            if args and args[0] == "commit":
+                result = real(repo, *args)
+                seen_commit.append(True)
+                return result
+            if seen_commit and args and args[0] == "rev-parse":
+                return subprocess.CompletedProcess(
+                    args=["git", *args],
+                    returncode=1,
+                    stdout="",
+                    stderr="injected rev-parse failure",
+                )
+            return real(repo, *args)
+
+        with mock.patch.object(rs, "_git", side_effect=wrapped):
+            result = self.prune(
+                self.relative,
+                deletion_sha=self.deletion,
+                pre_deletion_sha=self.pre,
+                apply=True,
+                commit=True,
+            )
+
+        after_head = self.git(self.peer_repo, "rev-parse", "HEAD").strip()
+        self.assertTrue(result.applied)
+        self.assertEqual((), result.refusals)
+        self.assertFalse(result.rollback_failed)
+        self.assertEqual(rs.COMMIT_RECORDED, result.commit.reason)
+        self.assertEqual((self.relative,), result.removed)
+        self.assertFalse((self.peer / self.relative).exists())
+        self.assertNotEqual(before_head, after_head)
+        self.assertIn("commit succeeded; HEAD lookup failed", result.commit.detail)
+        self.assertIn("commit succeeded; HEAD lookup failed", result.describe())
+        self.assertNotIn("nothing was removed", result.describe())
+
+    def test_rollback_failure_does_not_claim_nothing_was_removed(self):
+        real = rs._git
+
+        def wrapped(repo, *args):
+            if args and args[0] == "commit":
+                return subprocess.CompletedProcess(
+                    args=["git", *args],
+                    returncode=1,
+                    stdout="",
+                    stderr="injected commit failure",
+                )
+            if args and args[0] == "checkout":
+                return subprocess.CompletedProcess(
+                    args=["git", *args],
+                    returncode=1,
+                    stdout="",
+                    stderr="injected checkout failure",
+                )
+            return real(repo, *args)
+
+        with mock.patch.object(rs, "_git", side_effect=wrapped):
+            result = self.prune(
+                self.relative,
+                deletion_sha=self.deletion,
+                pre_deletion_sha=self.pre,
+                apply=True,
+                commit=True,
+            )
+
+        self.assertFalse(result.applied)
+        self.assertTrue(result.rollback_failed)
+        self.assertIn("rollback failed", result.describe())
+        self.assertNotIn("nothing was removed", result.describe())
+class MirrorRemainsNonDeletingTests(PruneFixture):
+    def test_mirror_does_not_delete_a_destination_file_missing_from_source(self):
+        self.seed("adw_modules/gone.py", "identical blob\n")
+        self.commit_both("add gone.py")
+        self.delete_source("adw_modules/gone.py")
+        source, destination = self.copies(self.template, self.peer)
+
+        result = rs.mirror(source, destination, apply=True)
+
+        self.assertEqual(("adw_modules/gone.py",), result.left_in_destination)
+        self.assertTrue((self.peer / "adw_modules/gone.py").exists())
+        self.assertFalse(hasattr(rs.mirror, "delete_missing"))
 
 
 if __name__ == "__main__":
