@@ -45,7 +45,6 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import launcher as lch  # noqa: E402
-from adw_modules import worktree as wt  # noqa: E402
 
 
 class RecordingHerdr:
@@ -97,39 +96,39 @@ def main() -> int:
         "--cwd",
         default=None,
         help="pane working directory. Defaults to the scratch root, which is "
-             "right for omp; the claude route blocks on folder trust in a "
-             "directory it has never seen, and production always launches it "
-             "in the repository, so pass that here.",
+        "right for omp; the claude route blocks on folder trust in a "
+        "directory it has never seen, and production always launches it "
+        "in the repository, so pass that here.",
     )
     parser.add_argument(
         "--start-window-s",
         type=float,
         default=120.0,
         help="bounded window for re-offering `agent start` over herdr's typed "
-             "survivable codes; wider than production's because this boots a "
-             "cold agent in a fresh workspace",
+        "survivable codes; wider than production's because this boots a "
+        "cold agent in a fresh workspace",
     )
     parser.add_argument(
         "--xdg-cache",
         default=None,
         help="ALSO pass `--env XDG_CACHE_HOME=<path>` into the pane. Maestro "
-             "stopped redirecting this on 2026-08-27 because a pane's login "
-             "shell reads its credentials through it; passing a fresh empty "
-             "directory here reproduces the incident on demand, which is the "
-             "live control for that removal.",
+        "stopped redirecting this on 2026-08-27 because a pane's login "
+        "shell reads its credentials through it; passing a fresh empty "
+        "directory here reproduces the incident on demand, which is the "
+        "live control for that removal.",
     )
     parser.add_argument(
         "--env-keys",
         default=None,
         help="comma-separated subset of the production redirection keys to "
-             "apply, for bisecting which one a route cannot start under",
+        "apply, for bisecting which one a route cannot start under",
     )
     parser.add_argument(
         "--production-env",
         action="store_true",
         help="create the pane with the same scratch redirection a run uses "
-             "(`worktree.launch_env` -> `pane_env_flags`). Production always "
-             "does; a smoke that does not is testing a different pane.",
+        "(`worktree.launch_env` -> `pane_env_flags`). Production always "
+        "does; a smoke that does not is testing a different pane.",
     )
     args = parser.parse_args()
 
@@ -169,7 +168,11 @@ def main() -> int:
     try:
         env_flags: List[str] = []
         if args.production_env or args.env_keys:
-            full = list(lch.pane_env_flags(wt.launch_env(root / "harness-scratch")))
+            scratch = root / "harness-scratch"
+            scratch.mkdir(parents=True, exist_ok=True)
+            env = dict(os.environ)
+            env["TMPDIR"] = str(scratch)
+            full = list(lch.pane_env_flags(env))
             if args.env_keys:
                 wanted = {k.strip() for k in args.env_keys.split(",") if k.strip()}
                 env_flags = []
@@ -266,7 +269,9 @@ def main() -> int:
 
         offers = herdr.count("pane", "send-text") - offered_before
         if offers != 1:
-            failures.append("prompt offered {0} times, expected exactly 1".format(offers))
+            failures.append(
+                "prompt offered {0} times, expected exactly 1".format(offers)
+            )
         enters = herdr.count("pane", "send-keys") + herdr.count("agent", "send-keys")
         if enters < 1:
             failures.append("no Enter was pressed; send-text alone is not a submit")
@@ -275,7 +280,9 @@ def main() -> int:
                 {
                     "route": args.route,
                     "profile": args.profile,
-                    "outcome": "SUBMISSION_OBSERVED" if not failures else "SMOKE_FAILED",
+                    "outcome": "SUBMISSION_OBSERVED"
+                    if not failures
+                    else "SMOKE_FAILED",
                     "prompt_offers": offers,
                     "transcript": str(transcript),
                     "enter_presses": enters,
@@ -328,7 +335,10 @@ def _first_pane(herdr: RecordingHerdr, workspace_id: str) -> Optional[str]:
     if not isinstance(panes, list):
         return None
     for pane in panes:
-        if isinstance(pane, dict) and str(pane.get("workspace_id") or "") == workspace_id:
+        if (
+            isinstance(pane, dict)
+            and str(pane.get("workspace_id") or "") == workspace_id
+        ):
             return str(pane.get("pane_id") or "") or None
     return None
 

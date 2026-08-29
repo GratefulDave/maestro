@@ -1,1356 +1,910 @@
-"""The scheduler's shared vocabulary — states, outcomes, classes, node model.
-
-Step 6 is three separately-implemented pieces — the lifecycle store, the retry
-policy, and the watchdog — plus the worker body that composes them. All four
-must agree on the names below *exactly*. Three private copies of one enum,
-reconciled by everyone having read the same section, is the RC1 shape (§4)
-this design convicts everywhere else; it would drift silently, because no
-piece's own tests can see another piece's copy.
-
-So the vocabulary is one module, imported by all of them, and the agreement is
-executed in `tests/test_scheduler_types.py` rather than assumed.
-
-What lives here is only what more than one piece needs, plus the two
-constructions that must refuse invalid input at the point it is written rather
-than at the point it is used:
-
-* `PlanNode`, because §7.4's scope rule and §7.3's code-node clauses are
-  structural facts about a node, and a node that violates either is a deadlock
-  or an unevaluatable state rather than a runtime error to be handled.
-* `SchedulerConfig`, because §11.2's liveness bound is preflight's refusal and
-  a scheduler constructed below the bound kills healthy runs.
-
-What deliberately does *not* live here: the outcome function (§7.3), the
-classifier (§7.5), and the watchdog's signals (§7.6). Each is behaviour owned
-by exactly one piece, and putting behaviour beside a shared vocabulary is how
-a vocabulary module becomes a second scheduler.
-"""
+"""Artifact-factory kernel DTOs. Lane stage is the only durable workflow authority."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 
-# ── §7.3 states, and the two kinds of terminal ──────────────────────────────
+CANONICAL_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = "artifact-factory.v1"
+
+NO_TEST_REVIEW = "NO_TEST_REVIEW"
+NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
+NO_CODE_REVIEW = "NO_CODE_REVIEW"
+NO_BASE_INVALIDATION = "NO_BASE_INVALIDATION"
+NO_CODE_REVIEW_REVISE = "NO_CODE_REVIEW_REVISE"
+NO_FINAL_REVIEW = "NO_FINAL_REVIEW"
+NO_PREDECESSOR = "NO_PREDECESSOR"
+
+FORBIDDEN_PRIVATE_KEYS = frozenset(
+    {
+        "expected_literals",
+        "fixture",
+        "fixtures",
+        "private_bytes",
+        "private_source",
+        "selector",
+        "selectors",
+        "test_source",
+        "vault_path",
+        "vault_paths",
+    }
+)
+
+REVISE_FINDING_KEYS = (
+    "implementation_area",
+    "observed_behavior",
+    "required_behavior",
+    "violated_requirement",
+)
 
 
-class NodeState(str, Enum):
-    """The durable node states.
-
-    ``ACCEPTED`` belongs only to a derived review node: it is terminal review
-    evidence and deliberately does not mean that a source-producing node was
-    merged. Build lanes still use ``VERIFIED`` then ``MERGED``.
-    """
-
-    PENDING = "PENDING"
-    RUNNING = "RUNNING"
-    VERIFIED = "VERIFIED"
-    ACCEPTED = "ACCEPTED"
-    MERGED = "MERGED"
-    BLOCKED = "BLOCKED"
-    CANCELLED = "CANCELLED"
-
-
-class LanePhase(str, Enum):
-    """The persistent build/review loop phase for one reviewable lane."""
-
+class LaneStage(str, Enum):
+    PLANNED = "PLANNED"
+    WRITING_TESTS = "WRITING_TESTS"
+    REVIEWING_TESTS = "REVIEWING_TESTS"
+    TESTS_SEALED = "TESTS_SEALED"
     BUILDING = "BUILDING"
-    CANDIDATE_READY = "CANDIDATE_READY"
-    REVIEWING = "REVIEWING"
-    REPAIR_HANDOFF = "REPAIR_HANDOFF"
-    REPAIRING = "REPAIRING"
-    WAITING_FOR_NEW_CANDIDATE = "WAITING_FOR_NEW_CANDIDATE"
-    ACCEPTED = "ACCEPTED"
-    BLOCKED = "BLOCKED"
-    CANCELLED = "CANCELLED"
+    REVIEWING_CODE = "REVIEWING_CODE"
+    READY_TO_MERGE = "READY_TO_MERGE"
+    MERGED = "MERGED"
+    WAITING_FOR_USER = "WAITING_FOR_USER"
 
 
-LANE_PHASE_TERMINAL: Tuple[LanePhase, ...] = (
-    LanePhase.ACCEPTED,
-    LanePhase.BLOCKED,
-    LanePhase.CANCELLED,
-)
-
-
-class CandidateReviewState(str, Enum):
-    """A reviewer dispatch is published before prompt submission, then final."""
-
-    PUBLISHED = "PUBLISHED"
-    DISPATCHED = "DISPATCHED"
-    COMPLETED = "COMPLETED"
-
-
-class ReviewVerdict(str, Enum):
+class ReviewerVerdict(str, Enum):
     PASS = "PASS"
-    REJECTED = "REJECTED"
+    REVISE = "REVISE"
 
 
-class RepairHandoffState(str, Enum):
-    PENDING = "PENDING"
-    SUBMITTED = "SUBMITTED"
-    ACKNOWLEDGED = "ACKNOWLEDGED"
-    FAILED = "FAILED"
+class ArtifactKind(str, Enum):
+    LANE_PLAN = "LANE_PLAN"
+    TEST_DRAFT = "TEST_DRAFT"
+    TEST_REVIEW = "TEST_REVIEW"
+    SEALED_TEST_BUNDLE = "SEALED_TEST_BUNDLE"
+    BUILDER_OUTPUT = "BUILDER_OUTPUT"
+    CODE_REVIEW = "CODE_REVIEW"
+    INTEGRATION_MERGE = "INTEGRATION_MERGE"
+    BASE_INVALIDATION = "BASE_INVALIDATION"
+    USER_WAIT = "USER_WAIT"
+    USER_DECISION = "USER_DECISION"
+    FINAL_INTEGRATION_REVIEW = "FINAL_INTEGRATION_REVIEW"
+    MAIN_PUBLICATION = "MAIN_PUBLICATION"
+    PLAN_AMENDMENT = "PLAN_AMENDMENT"
 
 
-#: Nothing transitions out of these, ever (§7.3).
-ABSOLUTELY_TERMINAL: Tuple[NodeState, ...] = (
-    NodeState.MERGED,
-    NodeState.ACCEPTED,
-    NodeState.CANCELLED,
+class WaitReason(str, Enum):
+    PAUSE = "PAUSE"
+    AMENDMENT_REQUIRED = "AMENDMENT_REQUIRED"
+
+
+class BuildingEntryKind(str, Enum):
+    INITIAL = "INITIAL"
+    CODE_REVISE = "CODE_REVISE"
+    BASE_INVALIDATION = "BASE_INVALIDATION"
+
+
+class RunStatus(str, Enum):
+    COMPLETE = "complete"
+    WAITING = "waiting"
+    EXECUTING = "executing"
+    INTEGRATION_REVIEW_PENDING = "integration_review_pending"
+    PUBLISHABLE = "publishable"
+
+
+LANE_STAGES: Tuple[LaneStage, ...] = tuple(LaneStage)
+PAUSEABLE_STAGES: Tuple[LaneStage, ...] = (
+    LaneStage.PLANNED,
+    LaneStage.WRITING_TESTS,
+    LaneStage.REVIEWING_TESTS,
+    LaneStage.TESTS_SEALED,
+    LaneStage.BUILDING,
+    LaneStage.REVIEWING_CODE,
+    LaneStage.READY_TO_MERGE,
+)
+UNSTARTED_STAGES: Tuple[LaneStage, ...] = (
+    LaneStage.PLANNED,
+    LaneStage.WRITING_TESTS,
+    LaneStage.REVIEWING_TESTS,
+    LaneStage.TESTS_SEALED,
+)
+STARTED_IMPLEMENTATION_STAGES: Tuple[LaneStage, ...] = (
+    LaneStage.BUILDING,
+    LaneStage.REVIEWING_CODE,
+    LaneStage.READY_TO_MERGE,
+)
+LANE_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
+    ArtifactKind.LANE_PLAN,
+    ArtifactKind.TEST_DRAFT,
+    ArtifactKind.TEST_REVIEW,
+    ArtifactKind.SEALED_TEST_BUNDLE,
+    ArtifactKind.BUILDER_OUTPUT,
+    ArtifactKind.CODE_REVIEW,
+    ArtifactKind.INTEGRATION_MERGE,
+    ArtifactKind.BASE_INVALIDATION,
+    ArtifactKind.USER_WAIT,
+    ArtifactKind.USER_DECISION,
+)
+RUN_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
+    ArtifactKind.FINAL_INTEGRATION_REVIEW,
+    ArtifactKind.MAIN_PUBLICATION,
+    ArtifactKind.PLAN_AMENDMENT,
 )
 
-#: States that stop a node without merging source output. Shared with the
-#: merge frontier so cascade semantics cannot drift from lifecycle semantics.
-TERMINAL_WITHOUT_MERGE: Tuple[NodeState, ...] = (NodeState.BLOCKED, NodeState.CANCELLED)
+
+class KernelError(RuntimeError):
+    code = "KERNEL_ERROR"
+
+    def __init__(self, detail: str = "") -> None:
+        suffix = "" if not detail else f":{detail}"
+        super().__init__(f"{self.code}{suffix}")
 
 
-class LaneRetryClass(str, Enum):
-    """Durable correction-loop budget classes, separate from attempts.
-
-    `TEST_REVIEW_REJECTION` is its own class rather than a use of
-    `REVIEW_REJECTION`, because the two loops converge differently and
-    sharing one budget makes the shorter one govern both. An implementation
-    review rejects a diff whose gate already passes; a test review rejects a
-    candidate whose whole purpose is to be able to fail, and the corrections
-    it asks for -- a missing negative case, a fixture that is not real, an
-    assertion on plumbing -- are rewrites rather than repairs. A tester that
-    spends the implementation lane's budget arriving at a strong test suite
-    leaves nothing for the implementation it was written to gate.
-    """
-
-    SEMANTIC = "SEMANTIC"
-    ENVIRONMENTAL = "ENVIRONMENTAL"
-    LAUNCHER_TRANSIENT = "LAUNCHER_TRANSIENT"
-    REVIEW_REJECTION = "REVIEW_REJECTION"
-    TEST_REVIEW_REJECTION = "TEST_REVIEW_REJECTION"
+class IllegalStageEdge(KernelError):
+    code = "ILLEGAL_STAGE_EDGE"
 
 
-class TestStrengthContract(str, Enum):
-    """Which test-acceptance rules a run was **created** under.
-
-    A run is pinned to this at creation and it is never rewritten. That is the
-    whole rollout invariant: a run created before executable gate-strength
-    existed stays reproducible under the contract it was created with, and a
-    run created after it cannot escape into the older one.
-
-    ``LEGACY`` is what a NULL ledger column reads as — a run created when a
-    tests node was accepted on "new cases, red at the parent". Its tests nodes
-    are classified (`LEGACY_TEST_STRENGTH_UNPROVEN`) and reported, never
-    retroactively reopened, invalidated, or rerun.
-
-    ``STRENGTH_V1`` is the contract this runtime creates runs under: an
-    independently reviewed test candidate, measured coverage, an executed
-    negative control, and an implementation bound to the exact accepted test
-    bytes.
-    """
-
-    LEGACY = "LEGACY"
-    STRENGTH_V1 = "test-strength.v1"
+class CanonicalIdentityError(KernelError):
+    code = "CANONICAL_IDENTITY_INVALID"
 
 
-#: The contract a run is pinned to when its ledger records none. Named rather
-#: than spelled `LEGACY` at each reader, because "NULL means legacy" is one
-#: decision and three copies of it would be three places to disagree.
-DEFAULT_TEST_STRENGTH_CONTRACT = TestStrengthContract.LEGACY
+def canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
 
 
-class TestStrengthPhase(str, Enum):
-    """What an operator surface calls a node under the strength contract.
-
-    A projection of `(kind, NodeState, LanePhase, accepted?, paired?)`, not a
-    fourth state machine. Nothing transitions on these and nothing stores one:
-    a second durable lifecycle beside `NodeState` and `LanePhase` would be two
-    representations of one fact, which is the shape this design convicts
-    everywhere else.
-
-    It exists because the surfaces were lying by omission. A tests node whose
-    candidate had been authored and committed rendered as `tester MERGED`,
-    which reads as "these tests are done and good" — and in
-    run-8d1a71f463e4430f92a125a8f8b3731d it meant "these bytes reached the
-    integration branch", nothing more. The distinction between *private
-    acceptance* and *paired merge* is the one an operator most needs and the
-    one the old vocabulary could not express.
-    """
-
-    TEST_BUILDING = "TEST_BUILDING"
-    TEST_CANDIDATE_READY = "TEST_CANDIDATE_READY"
-    TEST_REVIEWING = "TEST_REVIEWING"
-    TEST_REJECTED = "TEST_REJECTED"
-    TEST_REPAIRING = "TEST_REPAIRING"
-    TEST_ACCEPTED = "TEST_ACCEPTED"
-    TEST_BLOCKED = "TEST_BLOCKED"
-    #: Integrated, and with no evidence attributable to the exact candidate
-    #: its state rests on. The rollout's classification, rendered: the node
-    #: stays terminal and its dependants stay admitted, and an operator
-    #: reading the run is told what is unproven rather than shown
-    #: `TEST_BUILDING`, which is false, or `TEST_ACCEPTED`, which is worse.
-    TEST_LEGACY_UNPROVEN = "TEST_LEGACY_UNPROVEN"
-    IMPLEMENTATION_PENDING = "IMPLEMENTATION_PENDING"
-    IMPLEMENTATION_BUILDING = "IMPLEMENTATION_BUILDING"
-    IMPLEMENTATION_REVIEWING = "IMPLEMENTATION_REVIEWING"
-    IMPLEMENTATION_ACCEPTED = "IMPLEMENTATION_ACCEPTED"
-    PAIRED_MERGED = "PAIRED_MERGED"
+def digest_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-#: Where a tests node's bytes are, which `MERGED` alone cannot say.
-class TestBytesLocation(str, Enum):
-    PRIVATE = "private"        # committed to the attempt's candidate ref only
-    STAGED = "staged"          # accepted, not yet on the integration branch
-    INTEGRATED = "integrated"  # merged into the integration branch
+def digest_canonical(value: Any) -> str:
+    return digest_bytes(canonical_bytes(value))
 
 
-def test_strength_phase(
-    kind: "NodeKind",
-    state: NodeState,
-    lane_phase: Optional[LanePhase],
+def json_ready(value: Any) -> Any:
+    return json.loads(canonical_bytes(value).decode("utf-8"))
+
+
+def require_hex_digest(value: str, *, name: str, length: int = 64) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or any(ch not in "0123456789abcdef" for ch in value)
+    ):
+        raise CanonicalIdentityError(f"{name} must be {length} lowercase hex")
+    return value
+
+
+def require_git_sha(value: str, *, name: str) -> str:
+    if not isinstance(value, str) or len(value) not in (40, 64):
+        raise CanonicalIdentityError(f"{name} must be a 40- or 64-hex SHA")
+    lowered = value.lower()
+    if any(ch not in "0123456789abcdef" for ch in lowered):
+        raise CanonicalIdentityError(f"{name} must be a 40- or 64-hex SHA")
+    return lowered
+
+
+def _reject_private_keys(value: Any, *, path: str = "") -> None:
+    if isinstance(value, Mapping):
+        for key, inner in value.items():
+            joined = f"{path}.{key}" if path else str(key)
+            if key in FORBIDDEN_PRIVATE_KEYS:
+                raise CanonicalIdentityError(f"private field refused:{joined}")
+            _reject_private_keys(inner, path=joined)
+    elif isinstance(value, (list, tuple)):
+        for index, inner in enumerate(value):
+            _reject_private_keys(inner, path=f"{path}[{index}]")
+
+
+def require_revise_findings(
+    findings: Sequence[Mapping[str, Any]],
+) -> Tuple[Mapping[str, Any], ...]:
+    if not findings:
+        raise CanonicalIdentityError("REVISE requires actionable findings")
+    normalized = []
+    for finding in findings:
+        if set(finding) != set(REVISE_FINDING_KEYS):
+            raise CanonicalIdentityError("REVISE finding keys are not actionable")
+        for key in REVISE_FINDING_KEYS:
+            text = finding[key]
+            if not isinstance(text, str) or not text.strip():
+                raise CanonicalIdentityError(f"REVISE finding {key} is empty")
+        _reject_private_keys(finding)
+        normalized.append({key: finding[key] for key in REVISE_FINDING_KEYS})
+    return tuple(normalized)
+
+
+def lane_projection_digest(
+    spec_digest: str,
+    needs: Sequence[str],
+    declared_outputs: Sequence[str],
+) -> str:
+    return digest_canonical(
+        {
+            "declared_outputs": list(declared_outputs),
+            "needs": list(needs),
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+        }
+    )
+
+
+def lane_input_digest(members: Mapping[str, Any]) -> str:
+    payload = json_ready(members)
+    if payload.get("schema_version") != CANONICAL_SCHEMA_VERSION:
+        raise CanonicalIdentityError("input envelope schema_version")
+    for key in (
+        "run_id",
+        "lane_id",
+        "stage",
+        "plan_revision",
+        "plan_digest",
+        "spec_digest",
+        "lane_projection_digest",
+        "input_artifact_ids",
+    ):
+        if key not in payload:
+            raise CanonicalIdentityError(f"input envelope missing {key}")
+    return digest_canonical(payload)
+
+
+def planned_input_digest(
     *,
-    accepted: bool = False,
-    paired: bool = False,
-) -> Optional[TestStrengthPhase]:
-    """Name this node's position in the test-strength lifecycle.
-
-    `None` for a kind the lifecycle does not describe — a code node, a derived
-    review node — so a surface renders nothing rather than an invented phase.
-    """
-    if kind is NodeKind.TESTS:
-        if state is NodeState.BLOCKED:
-            return TestStrengthPhase.TEST_BLOCKED
-        if accepted:
-            # TEST_ACCEPTED whether or not the bytes reached the integration
-            # branch, because acceptance and integration are different facts
-            # and the surface reports the second one separately
-            # (`TestBytesLocation`). Collapsing them is what made a private
-            # acceptance render as `tester MERGED`.
-            return TestStrengthPhase.TEST_ACCEPTED
-        if state in (NodeState.MERGED, NodeState.ACCEPTED):
-            return TestStrengthPhase.TEST_LEGACY_UNPROVEN
-        if lane_phase is LanePhase.CANDIDATE_READY:
-            return TestStrengthPhase.TEST_CANDIDATE_READY
-        if lane_phase is LanePhase.REVIEWING:
-            return TestStrengthPhase.TEST_REVIEWING
-        if lane_phase is LanePhase.REPAIR_HANDOFF:
-            return TestStrengthPhase.TEST_REJECTED
-        if lane_phase in (LanePhase.REPAIRING,
-                          LanePhase.WAITING_FOR_NEW_CANDIDATE):
-            return TestStrengthPhase.TEST_REPAIRING
-        return TestStrengthPhase.TEST_BUILDING
-    if kind is NodeKind.AGENT:
-        if state is NodeState.MERGED:
-            return (TestStrengthPhase.PAIRED_MERGED if paired
-                    else TestStrengthPhase.IMPLEMENTATION_ACCEPTED)
-        if lane_phase is LanePhase.ACCEPTED:
-            return TestStrengthPhase.IMPLEMENTATION_ACCEPTED
-        if lane_phase in (LanePhase.REVIEWING, LanePhase.CANDIDATE_READY,
-                          LanePhase.REPAIR_HANDOFF):
-            return TestStrengthPhase.IMPLEMENTATION_REVIEWING
-        if state is NodeState.PENDING:
-            return TestStrengthPhase.IMPLEMENTATION_PENDING
-        return TestStrengthPhase.IMPLEMENTATION_BUILDING
-    return None
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    plan_artifact_ref: str,
+    needs: Sequence[str],
+    declared_outputs: Sequence[str],
+) -> str:
+    return lane_input_digest(
+        {
+            "declared_outputs": list(declared_outputs),
+            "input_artifact_ids": [],
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "needs": list(needs),
+            "plan_artifact_ref": plan_artifact_ref,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.PLANNED.value,
+        }
+    )
 
 
-class ActorSessionState(str, Enum):
-    ACTIVE = "ACTIVE"
-    CLOSED = "CLOSED"
+def writing_tests_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    lane_plan_id: str,
+    test_review_id: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "input_artifact_ids": [lane_plan_id, test_review_id],
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.WRITING_TESTS.value,
+        }
+    )
 
 
-class RunOutcome(str, Enum):
-    """Declared exactly once, at the point the run stops (§7.3)."""
-
-    ACCEPTED = "ACCEPTED"
-    BLOCKED = "BLOCKED"
-    CANCELLED = "CANCELLED"
-    STUCK = "STUCK"
-
-
-#: The residual class, named rather than enumerated: a combination nobody
-#: anticipated lands here with a report, never outside the set (§7.3).
-RESIDUAL_OUTCOME = RunOutcome.BLOCKED
-
-
-class CancelCause(str, Enum):
-    """Why a `CANCELLED` was written — the same vocabulary at both levels.
-
-    `CANCELLED` was one word carrying two facts, exactly as "terminal" was
-    before §7.3 split it. A run, or a node, reaches `CANCELLED` down one of
-    two paths, and they are not alike:
-
-    * `RUN_CANCEL` — the operator ran `run cancel`. The machine was asked to
-      stop. Nothing was adjudicated, no result was reached, and there is no
-      outcome to protect from being reopened. `run cancel` is the operator's
-      only stop control, so this is also the cause written when an operator
-      wanted to pause and had no verb that said so. `run pause` is that verb
-      now, and it writes nothing at all: a pause is not a lifecycle
-      transition, so a run stopped that way has no cause because it has no
-      declared outcome to attach one to.
-    * `DISCARDED` — the operator ran `run cancel --discard`, which is the
-      destructive verb: it exists to end a run for good, and a resume that
-      reopened it would defeat the only thing it does. It is a separate
-      member rather than a reuse of `ABANDONED` because the two are different
-      facts — `ABANDONED` says every node was individually adjudicated as
-      work the run should finish without, and `DISCARDED` says the operator
-      threw the run away without adjudicating anything. §1.2 wants that
-      distinction structural, in the stored value, not inferred from which
-      verb an operator is remembered to have typed. Adding a member is
-      additive: a receipt or ledger written before it exists carries one of
-      the two older values and parses unchanged, unlike a field made
-      unconditionally required after the fact (§19 M21).
-    * `ABANDONED` — the work itself was given up on, node by node, through
-      `abandon` (§11.3). At run level it is the shape §7.3 names "every node
-      is CANCELLED": a run stopped deliberately, just piecewise. Each node in
-      it was individually adjudicated as work the run should finish without,
-      which is a decision about the work and is closer to `ACCEPTED` than to
-      a stop request.
-
-    Stored typed, at both levels, because `run resume`'s legality keys on it
-    and §1.2 forbids a lifecycle transition keyed on prose. The run-level
-    value is an attribute of the *declared outcome* and is rewritten by every
-    `declare_outcome`; `runs.cancel_requested` is the separate, live fact that
-    a stop was *requested*, consumed by the outcome function as an input and
-    cleared by a resume. One is the question put to the scheduler, the other
-    is the answer it recorded.
-    """
-
-    RUN_CANCEL = "RUN_CANCEL"
-    DISCARDED = "DISCARDED"
-    ABANDONED = "ABANDONED"
+def reviewing_tests_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    lane_plan_id: str,
+    test_draft_id: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "input_artifact_ids": [lane_plan_id, test_draft_id],
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.REVIEWING_TESTS.value,
+        }
+    )
 
 
-#: The causes a `CANCELLED` may be reopened from (§7.3, §7.8). `MERGED`, an
-#: `ABANDONED` `CANCELLED`, and a `DISCARDED` one remain absolutely terminal;
-#: a `RUN_CANCEL` `CANCELLED` is terminal only because the operator asked the
-#: machine to stop, and a resume of that same run is the operator withdrawing
-#: the request. `DISCARDED` is not withdrawable in that sense: the operator
-#: asked for the run to end, not to stop, and `run pause` is the verb for the
-#: other intent. Membership is data rather than a branch so that the guard,
-#: the resume predicate, and the tests read one list.
-REOPENABLE_CANCEL_CAUSES: Tuple[CancelCause, ...] = (CancelCause.RUN_CANCEL,)
+def tests_sealed_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    lane_plan_id: str,
+    test_draft_id: str,
+    test_review_id: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "input_artifact_ids": [lane_plan_id, test_draft_id, test_review_id],
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.TESTS_SEALED.value,
+        }
+    )
 
 
-class MergeCause(str, Enum):
-    """How a node reached `MERGED` — the same shape as `CancelCause`, one
-    column over, and forced by the same defect one state along.
-
-    `MERGED` was one word carrying two facts. A node reaches it down one of
-    two paths, and §1.1 item 4 is the whole difference between them:
-
-    * `SCHEDULER` — the run merged it. The node passed §7.3's four-clause
-      verification predicate, went `VERIFIED`, and was merged by §8.5's
-      deterministic frontier with the ancestry proof §8.6 requires. The
-      complete evidence chain scoped to its kind exists and is enumerable
-      from the ledger: attempt row, output commit, gate results, the
-      permission check over the measured delta, and — for an agent node —
-      a reviewer that passed the diff before `mark_verified` was called.
-    * `OPERATOR_ACCEPTED` — `maestro skip` (§11.3). The operator supplied the
-      work by hand and asserted it. The five identity gates `skip` runs are
-      real and are not relaxed by this member: the accepted SHA is still a
-      canonical digest, still descends from the latest attempt base, is still
-      an ancestor of HEAD, still *equals* HEAD, and the tree is still clean.
-      What it does not carry is the rest of the chain — no reviewer verdict
-      is required, no post-node gate need have passed, no permission check
-      over a measured delta was taken, and there is no merge commit. Those
-      are the facts §1.1 item 4 enumerates, and a node merged this way holds
-      none of them.
-
-    Stored typed on `node_lifecycle.merge_cause`, because §1.2 forbids a
-    reader reconstructing a lifecycle fact from prose — and reconstructing it
-    was the only thing an operator could do. In git the difference is visible:
-    a merged lane leaves a merge commit and a skipped lane leaves only the
-    attempt commit, so reading the integration log was the sole way to tell
-    the two apart. `run status` reported both as `MERGED` with an
-    `output_sha`, identically, over a node whose every attempt was `CANCELLED`
-    or `BLOCKED` and none of which carried a verdict (#93).
-
-    The absent evidence itself is *not* a second member here. What the chain
-    holds is a set of facts about a node's history, and encoding a summary of
-    them in this vocabulary would be one fact in two representations — the RC1
-    shape §4 convicts. The cause says who wrote the state; the skip
-    transition's typed detail says what the ledger could and could not show
-    about the node at the moment it was written.
-
-    Adding a member later stays additive, as it did for `CancelCause`: a
-    ledger written before this column carries neither value and reads
-    `UNRECORDED` (below), never one of these two.
-    """
-
-    SCHEDULER = "SCHEDULER"
-    OPERATOR_ACCEPTED = "OPERATOR_ACCEPTED"
+def building_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    input_artifact_ids: Sequence[str],
+    entry_kind: BuildingEntryKind,
+    builder_base_sha: str,
+    prior_builder: str,
+    code_review: str,
+    base_invalidation: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "base_invalidation": base_invalidation,
+            "builder_base_sha": builder_base_sha,
+            "code_review": code_review,
+            "entry_kind": entry_kind.value,
+            "input_artifact_ids": list(input_artifact_ids),
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "prior_builder": prior_builder,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.BUILDING.value,
+        }
+    )
 
 
-#: What a reader says about a `MERGED` node whose cause was never recorded:
-#: a row written before the column existed. It is deliberately **not** a
-#: `MergeCause` member, because it is the absence of the fact rather than a
-#: third value of it, and nothing may ever write it. The migration invents no
-#: facts (§7.3's rule for an unrecorded `cancel_cause`): reading an
-#: unrecorded merge as `SCHEDULER` would have every pre-existing row assert
-#: an evidence chain nobody checked, which is the exact false confidence this
-#: column exists to remove.
-MERGE_CAUSE_UNRECORDED = "UNRECORDED"
+def reviewing_code_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    lane_plan_id: str,
+    sealed_bundle_id: str,
+    builder_output_id: str,
+    builder_base_sha: str,
+    candidate_ref: str,
+    candidate_sha: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "builder_base_sha": builder_base_sha,
+            "candidate_ref": candidate_ref,
+            "candidate_sha": candidate_sha,
+            "input_artifact_ids": [lane_plan_id, sealed_bundle_id, builder_output_id],
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.REVIEWING_CODE.value,
+        }
+    )
 
 
-def merge_cause_label(
-    state: NodeState, merge_cause: Optional[MergeCause]
-) -> Optional[str]:
-    """The one derivation of "how did this node reach MERGED".
-
-    Three answers and a fourth non-answer: the two `MergeCause` members,
-    `UNRECORDED` for a `MERGED` row older than the column, and `None` for a
-    node that is not `MERGED` at all — where the question does not arise and
-    the column is NULL for that reason instead. `run status`, the visualizer,
-    and the tests read this function rather than each re-deriving the pair,
-    so the three cannot drift into three answers (RC1).
-    """
-    if state is not NodeState.MERGED:
-        return None
-    return merge_cause.value if merge_cause else MERGE_CAUSE_UNRECORDED
-
-
-class PendingCause(str, Enum):
-    """How a node reached `PENDING` after leaving it — the same shape as
-    `CancelCause` and `MergeCause`, one column over.
-
-    `PENDING` was one word carrying three facts. A node reaches it down one
-    of three paths after it has already left the frontier, and a reader of
-    `node_lifecycle` could not tell which (#103):
-
-    * `SCHEDULER` — `fail_attempt`, or the resume path that closes an
-      inherited RUNNING attempt. The machine put the node back on the
-      frontier. Nothing about the operator is in this write.
-    * `OPERATOR_RETRY` — `retry` / `retry --force` / `retry --grant`. The
-      operator handed the node back. A grant's magnitude stays on
-      `granted_extra_attempts`; this member is the identity of the writer,
-      so a plain retry (delta 0) is no longer indistinguishable from a
-      scheduler write. The grant column is not reused as a proxy for who.
-    * `OPERATOR_RESUME` — `_reopen_run_cancelled_node`, the resume half of
-      `run cancel`. The operator withdrew a stop request. Nothing was
-      adjudicated about the node, which is why the reopen exists; the cause
-      still has to say so, because PENDING itself does not.
-
-    Seeded PENDING — `create_run`'s initial row — never left the frontier,
-    so the question does not arise and the column stays NULL. NULL on a
-    PENDING row written before this column is the same absence, never
-    `SCHEDULER`: the migration invents no facts.
-
-    Stored typed on `node_lifecycle.pending_cause`, because §1.2 forbids a
-    reader reconstructing a lifecycle fact from transition prose.
-    """
-
-    SCHEDULER = "SCHEDULER"
-    OPERATOR_RETRY = "OPERATOR_RETRY"
-    OPERATOR_RESUME = "OPERATOR_RESUME"
+def ready_to_merge_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    builder_output_id: str,
+    code_review_id: str,
+    builder_base_sha: str,
+    candidate_ref: str,
+    candidate_sha: str,
+    integration_head: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "builder_base_sha": builder_base_sha,
+            "candidate_ref": candidate_ref,
+            "candidate_sha": candidate_sha,
+            "input_artifact_ids": [builder_output_id, code_review_id],
+            "integration_head": integration_head,
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.READY_TO_MERGE.value,
+        }
+    )
 
 
-def pending_cause_label(
-    state: NodeState, pending_cause: Optional[PendingCause]
-) -> Optional[str]:
-    """The one derivation of "who put this node on the frontier".
-
-    Four answers: the three `PendingCause` members, and `None` both for a
-    node that is not `PENDING` and for a `PENDING` row that never left the
-    frontier (or whose cause was never recorded). `run status` and the
-    tests read this function rather than each re-deriving the pair (RC1).
-    A reader must not guess `SCHEDULER` from a NULL.
-    """
-    if state is not NodeState.PENDING:
-        return None
-    return pending_cause.value if pending_cause else None
-
-
-# ── §7.5 retry classes ──────────────────────────────────────────────────────
-
-
-class RetryClass(str, Enum):
-    """Three, mutually exclusive, classified structurally and never lexically."""
-
-    SEMANTIC = "SEMANTIC"
-    ENVIRONMENTAL = "ENVIRONMENTAL"
-    LAUNCHER_TRANSIENT = "LAUNCHER_TRANSIENT"
-
-
-#: Fail-closed. Any exception reaching a worker's top-level handler without a
-#: classification is ENVIRONMENTAL, so an engine bug can never be recorded as
-#: a verdict about the code under test (§7.5 containment).
-DEFAULT_RETRY_CLASS = RetryClass.ENVIRONMENTAL
-
-
-def mutates_prompt(retry_class: RetryClass) -> bool:
-    """Only SEMANTIC rewrites the agent's instructions (§7.5).
-
-    An infra fault must never produce a code verdict, an ownership entry, or
-    a budget decrement, and mutating the prompt on one would be all three.
-    """
-    return retry_class is RetryClass.SEMANTIC
+def base_invalidation_input_digest(
+    *,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+    plan_digest: str,
+    spec_digest: str,
+    projection_digest: str,
+    builder_output_id: str,
+    code_review_id: str,
+    stale_builder_base_sha: str,
+    stale_candidate_sha: str,
+    integration_head: str,
+) -> str:
+    return lane_input_digest(
+        {
+            "input_artifact_ids": [builder_output_id, code_review_id],
+            "integration_head": integration_head,
+            "lane_id": lane_id,
+            "lane_projection_digest": projection_digest,
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "run_id": run_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "spec_digest": spec_digest,
+            "stage": LaneStage.READY_TO_MERGE.value,
+            "stale_builder_base_sha": stale_builder_base_sha,
+            "stale_candidate_sha": stale_candidate_sha,
+        }
+    )
 
 
-class Escape(str, Enum):
-    """The operator's exits from a blocked node (§11.3)."""
-
-    RETRY = "retry"
-    RETRY_FORCE = "retry --force"
-    SKIP = "skip"
-    ABANDON = "abandon"
-
-
-class EscapeRefusal(str, Enum):
-    """Why an escape against a RUNNING node failed closed.
-
-    The race these name is a run-level fact — is the scheduler still a
-    process — not a node-state fact. UNKNOWN is not dead.
-    """
-
-    SCHEDULER_STILL_ALIVE = "SCHEDULER_STILL_ALIVE"
-    SCHEDULER_LIVENESS_UNKNOWN = "SCHEDULER_LIVENESS_UNKNOWN"
-
-
-class BlockReason(str, Enum):
-    """Every *stored* reason a node stopped.
-
-    `UPSTREAM_BLOCKED` is absent on purpose and its absence is load-bearing
-    (§8.7): stored, the cascade was irreversible, so a rescue that un-blocked
-    the origin left five descendants in a durable terminal state with no rule
-    anywhere to bring them back. Derived, the origin leaves the blocked set
-    and the predicate simply stops holding.
-    """
-
-    GATE_NOT_FALSIFIABLE = "GATE_NOT_FALSIFIABLE"
-    CODE_NODE_NO_EFFECT = "CODE_NODE_NO_EFFECT"
-    PERMISSION_SCOPE_VIOLATION = "PERMISSION_SCOPE_VIOLATION"
-    SEMANTIC_BUDGET_EXHAUSTED = "SEMANTIC_BUDGET_EXHAUSTED"
-    REVIEW_BUDGET_EXHAUSTED = "REVIEW_BUDGET_EXHAUSTED"
-    ENVIRONMENTAL_BUDGET_EXHAUSTED = "ENVIRONMENTAL_BUDGET_EXHAUSTED"
-    LAUNCHER_BUDGET_EXHAUSTED = "LAUNCHER_BUDGET_EXHAUSTED"
-    CREDENTIAL_REFUSED = "CREDENTIAL_REFUSED"
-    #: A launcher refusal that is deterministic by construction (§16.3 item
-    #: 46). It names the refusal rather than the budget, because there was no
-    #: budget: `LAUNCHER_BUDGET_EXHAUSTED` on a refusal that could never have
-    #: succeeded tells an operator a number ran out and nothing about the
-    #: configuration or plan that has to change.
-    LAUNCH_REFUSED = "LAUNCH_REFUSED"
-    MERGE_CONFLICT = "MERGE_CONFLICT"
-    QUIESCENCE_UNPROVEN = "QUIESCENCE_UNPROVEN"
-    OUTPUT_IDENTITY_INVALID = "OUTPUT_IDENTITY_INVALID"
-    #: A declared output exists on disk but git will not commit it — gitignored,
-    #: excluded, or otherwise outside inventory's universe. Re-running the
-    #: agent cannot make git carry the path; the declaration or the ignore
-    #: rule has to change.
-    DECLARED_OUTPUT_UNCOMMITTABLE = "DECLARED_OUTPUT_UNCOMMITTABLE"
-    #: A code node's command defined module-level symbols that nothing on the
-    #: merged surface references (#118). `min_cases` is a floor with no
-    #: ceiling, so before this an attempt could ship arbitrary unreachable
-    #: machinery and stay green. Re-running a deterministic command against an
-    #: unchanged base emits the same symbols, so the repair is the command or
-    #: the plan, never another attempt.
-    PRODUCED_SYMBOL_UNREFERENCED = "PRODUCED_SYMBOL_UNREFERENCED"
-    #: The same content-level refusal, byte-identical as a typed record, was
-    #: produced by two consecutive SEMANTIC attempts (§7.5). Re-dispatch
-    #: against inputs the loop has just proven unchanged reproduces the same
-    #: refusal until the budget is gone — observed as nine attempts on one
-    #: node spending an entire ceiling on two facts. The block's detail names
-    #: the repeated `refusal_code`, quotes the refusal, and counts the
-    #: identical occurrences; the escape is an operator changing the inputs
-    #: or granting an attempt (`maestro retry --force`). Not in
-    #: `NON_RETRYABLE`: the actor is an agent, so a retry *could* differ —
-    #: the point is that this one demonstrably did not, twice, and a third
-    #: dispatch is an operator's call rather than the scheduler's.
-    SEMANTIC_REFUSAL_REPEATED = "SEMANTIC_REFUSAL_REPEATED"
-    #: A repair handoff reached a delivery path that cannot service it —
-    #: no launcher, or a node kind for which no repair route exists (§19
-    #: M41). Before this reason existed the condition raised
-    #: `AttemptOwnershipLost` out of the repair callback and the worker's
-    #: containment handler turned it into a bare `return`: no transition, no
-    #: `fail_handoff`, no log, and `attempts`/`node_lifecycle` left reading
-    #: RUNNING for a lane with no process. Observed on
-    #: `run-36dd33d262d9485ca815aea5001b2ce2`, node `lane-wp6-tests`, whose
-    #: last ledger row was the REPAIRING phase itself. Not a budget: the
-    #: refusal is about the route, so another attempt reproduces it exactly
-    #: and the escape is a code or plan change.
-    REPAIR_HANDOFF_UNSERVICEABLE = "REPAIR_HANDOFF_UNSERVICEABLE"
+def user_wait_input_digest(
+    *,
+    predecessor_artifact_id: str,
+    predecessor_sequence: int,
+    wait_reason: WaitReason,
+    resume_stage: LaneStage,
+    resume_input_digest: str,
+    run_id: str,
+    lane_id: str,
+    plan_revision: int,
+) -> str:
+    payload = {
+        "lane_id": lane_id,
+        "plan_revision": plan_revision,
+        "predecessor_artifact_id": predecessor_artifact_id,
+        "predecessor_sequence": predecessor_sequence,
+        "resume_input_digest": resume_input_digest,
+        "resume_stage": resume_stage.value,
+        "run_id": run_id,
+        "schema_version": CANONICAL_SCHEMA_VERSION,
+        "wait_reason": wait_reason.value,
+    }
+    return digest_canonical(payload)
 
 
-#: The failures that fit no retry class, because re-running a
-#: deterministic thing against an unchanged base cannot produce a different
-#: answer (§7.5). Without a dedicated reason each of these falls to the
-#: ENVIRONMENTAL default, is retried twice, reproduces itself exactly, and
-#: then blocks with an infra-flavoured reason for what is a fact about content.
-#: Named as a set rather than behind a predicate. The tuple stays because
-#: §7.5's membership rule is a statement worth naming and testing.
-NON_RETRYABLE: Tuple[BlockReason, ...] = (
-    BlockReason.GATE_NOT_FALSIFIABLE,
-    BlockReason.CODE_NODE_NO_EFFECT,
-    BlockReason.PERMISSION_SCOPE_VIOLATION,
-    BlockReason.DECLARED_OUTPUT_UNCOMMITTABLE,
-    BlockReason.PRODUCED_SYMBOL_UNREFERENCED,
+def user_decision_input_digest(
+    *,
+    user_wait_artifact_id: str,
+    action: str,
+    decision_payload: Mapping[str, Any],
+) -> str:
+    return digest_canonical(
+        {
+            "action": action,
+            "decision_payload": json_ready(decision_payload),
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "user_wait_artifact_id": user_wait_artifact_id,
+        }
+    )
+
+
+def final_review_input_fingerprint(
+    *,
+    integration_sha: str,
+    plan_revision: int,
+    plan_digest: str,
+    lanes: Sequence[Mapping[str, str]],
+) -> str:
+    return digest_canonical(
+        {
+            "integration_sha": integration_sha,
+            "lanes": [json_ready(row) for row in lanes],
+            "plan_digest": plan_digest,
+            "plan_revision": plan_revision,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+        }
+    )
+
+
+def runtime_state_fingerprint(realpath: str, device: int, inode: int) -> str:
+    return digest_canonical(
+        {
+            "device": device,
+            "inode": inode,
+            "realpath": realpath,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+        }
+    )
+
+
+def topological_integration_order(lanes: Sequence["LaneProjection"]) -> Tuple[str, ...]:
+    needs = {lane.lane_id: tuple(lane.needs) for lane in lanes}
+    remaining = {lane.lane_id: set(lane.needs) for lane in lanes}
+    ordered: list[str] = []
+    while remaining:
+        ready = sorted(lane_id for lane_id, deps in remaining.items() if not deps)
+        if not ready:
+            raise CanonicalIdentityError("plan DAG is cyclic")
+        chosen = ready[0]
+        ordered.append(chosen)
+        del remaining[chosen]
+        for deps in remaining.values():
+            deps.discard(chosen)
+    missing = {dep for deps in needs.values() for dep in deps if dep not in needs}
+    if missing:
+        raise CanonicalIdentityError("needs lane does not exist")
+    return tuple(ordered)
+
+
+def amendment_reset_stage(
+    current: LaneStage,
+    *,
+    changed: bool,
+    wait_reason: Optional[WaitReason],
+) -> LaneStage:
+    if wait_reason is WaitReason.PAUSE:
+        return LaneStage.WAITING_FOR_USER
+    if wait_reason is WaitReason.AMENDMENT_REQUIRED:
+        if not changed:
+            raise IllegalStageEdge("AMENDMENT_DOES_NOT_ADDRESS_REVIEW")
+        return LaneStage.PLANNED
+    if changed:
+        return LaneStage.PLANNED
+    if current in UNSTARTED_STAGES:
+        return current
+    if current in STARTED_IMPLEMENTATION_STAGES or current is LaneStage.MERGED:
+        return LaneStage.BUILDING
+    raise IllegalStageEdge(f"no amendment reset for {current.value}")
+
+
+def candidate_ref(run_id: str, lane_id: str, input_digest: str) -> str:
+    return f"refs/maestro/candidates/{run_id}/{lane_id}/{input_digest}"
+
+
+def integration_ref(run_id: str) -> str:
+    return f"refs/maestro/integration/{run_id}"
+
+
+def publication_ref(run_id: str, review_input_fingerprint: str) -> str:
+    return f"refs/maestro/publications/{run_id}/{review_input_fingerprint}"
+
+
+@dataclass(frozen=True)
+class LaneProjection:
+    lane_id: str
+    needs: Tuple[str, ...]
+    spec_digest: str
+    declared_outputs: Tuple[str, ...]
+    lane_projection_digest: str
+    public_acceptance: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.lane_id:
+            raise CanonicalIdentityError("lane_id is empty")
+        require_hex_digest(self.spec_digest, name="spec_digest")
+        if tuple(self.needs) != tuple(sorted(self.needs)):
+            raise CanonicalIdentityError("needs must be ordered by lane ID")
+        if tuple(self.declared_outputs) != tuple(sorted(self.declared_outputs)):
+            raise CanonicalIdentityError("declared outputs must be ordered by path")
+        expected = lane_projection_digest(
+            self.spec_digest, self.needs, self.declared_outputs
+        )
+        if self.lane_projection_digest != expected:
+            raise CanonicalIdentityError("lane_projection_digest mismatch")
+
+
+@dataclass(frozen=True)
+class CompiledPlan:
+    plan_bytes: bytes
+    plan_artifact_ref: str
+    plan_digest: str
+    plan_revision: int
+    lanes: Tuple[LaneProjection, ...]
+    integration_order: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.plan_bytes, (bytes, bytearray)):
+            raise CanonicalIdentityError("plan_bytes must be bytes")
+        if digest_bytes(bytes(self.plan_bytes)) != self.plan_digest:
+            raise CanonicalIdentityError("plan_digest mismatch")
+        if self.plan_revision < 1:
+            raise CanonicalIdentityError("plan_revision must be >= 1")
+        if not self.plan_artifact_ref:
+            raise CanonicalIdentityError("plan_artifact_ref is empty")
+        ids = tuple(lane.lane_id for lane in self.lanes)
+        if len(ids) != len(set(ids)):
+            raise CanonicalIdentityError("duplicate lane_id")
+        computed = topological_integration_order(self.lanes)
+        if self.integration_order != computed:
+            raise CanonicalIdentityError("integration_order mismatch")
+        if ids and set(ids) != set(self.integration_order):
+            raise CanonicalIdentityError("integration_order lane set mismatch")
+
+
+@dataclass(frozen=True)
+class RunBinding:
+    runtime_state_root: str
+    runtime_state_fingerprint: str
+    integration_ref: str
+    integration_initial_sha: str
+    target_repository_root: str
+    target_git_common_dir: str
+    target_worktree_git_dir: str
+    target_object_format: str
+    target_repository_fingerprint: str
+    target_sync_journal_fingerprint: str
+    target_initial_main_sha: str
+    target_main_ref: str
+
+    def __post_init__(self) -> None:
+        require_hex_digest(
+            self.runtime_state_fingerprint, name="runtime_state_fingerprint"
+        )
+        require_hex_digest(
+            self.target_repository_fingerprint, name="target_repository_fingerprint"
+        )
+        require_hex_digest(
+            self.target_sync_journal_fingerprint,
+            name="target_sync_journal_fingerprint",
+        )
+        initial = require_git_sha(
+            self.integration_initial_sha, name="integration_initial_sha"
+        )
+        main = require_git_sha(
+            self.target_initial_main_sha, name="target_initial_main_sha"
+        )
+        if initial != main:
+            raise CanonicalIdentityError(
+                "integration_initial_sha != target_initial_main_sha"
+            )
+        if not self.integration_ref.startswith("refs/maestro/integration/"):
+            raise CanonicalIdentityError("integration_ref name")
+        if not self.target_main_ref.startswith("refs/"):
+            raise CanonicalIdentityError("target_main_ref")
+
+
+@dataclass(frozen=True)
+class LaneReset:
+    lane_id: str
+    from_stage: LaneStage
+    to_stage: LaneStage
+
+
+@dataclass(frozen=True)
+class RetainedInput:
+    lane_id: str
+    plan_revision: int
+    lane_projection_digest: str
+    stage: LaneStage
+    input_digest: str
+    artifact_ids: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LaneArtifact:
+    kind: ArtifactKind
+    plan_revision: int
+    spec_digest: str
+    lane_projection_digest: str
+    input_digest: str
+    output_digest: str
+    artifact_ref: str
+    payload: Mapping[str, Any]
+    verdict: Optional[ReviewerVerdict] = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in LANE_ARTIFACT_KINDS:
+            raise CanonicalIdentityError("not a lane artifact kind")
+        require_hex_digest(self.spec_digest, name="spec_digest")
+        require_hex_digest(self.lane_projection_digest, name="lane_projection_digest")
+        require_hex_digest(self.input_digest, name="input_digest")
+        require_hex_digest(self.output_digest, name="output_digest")
+        if not self.artifact_ref:
+            raise CanonicalIdentityError("artifact_ref is empty")
+        object.__setattr__(self, "payload", json_ready(self.payload))
+        _reject_private_keys(self.payload)
+        echoed = self.payload.get("input_digest")
+        if echoed != self.input_digest:
+            raise CanonicalIdentityError("payload input_digest mismatch")
+        if self.kind in (ArtifactKind.TEST_REVIEW, ArtifactKind.CODE_REVIEW):
+            if self.verdict is None:
+                raise CanonicalIdentityError("review artifact requires verdict")
+            if self.payload.get("verdict") != self.verdict.value:
+                raise CanonicalIdentityError("payload verdict mismatch")
+            if self.verdict is ReviewerVerdict.REVISE:
+                require_revise_findings(self.payload.get("findings") or ())
+            elif self.payload.get("findings"):
+                raise CanonicalIdentityError("PASS findings must be empty")
+        elif self.verdict is not None:
+            raise CanonicalIdentityError("verdict only belongs on review artifacts")
+
+
+@dataclass(frozen=True)
+class RunArtifact:
+    kind: ArtifactKind
+    plan_revision: int
+    input_digest: str
+    output_digest: str
+    artifact_ref: str
+    payload: Mapping[str, Any]
+    verdict: Optional[ReviewerVerdict] = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in RUN_ARTIFACT_KINDS:
+            raise CanonicalIdentityError("not a run artifact kind")
+        require_hex_digest(self.input_digest, name="input_digest")
+        require_hex_digest(self.output_digest, name="output_digest")
+        object.__setattr__(self, "payload", json_ready(self.payload))
+        _reject_private_keys(self.payload)
+        if self.payload.get("input_digest") != self.input_digest:
+            raise CanonicalIdentityError("payload input_digest mismatch")
+        if self.kind is ArtifactKind.FINAL_INTEGRATION_REVIEW:
+            if self.verdict is None:
+                raise CanonicalIdentityError("final review requires verdict")
+            if self.payload.get("verdict") != self.verdict.value:
+                raise CanonicalIdentityError("payload verdict mismatch")
+            if self.verdict is ReviewerVerdict.REVISE:
+                require_revise_findings(self.payload.get("findings") or ())
+
+
+@dataclass(frozen=True)
+class StageEdge:
+    current: LaneStage
+    kind: ArtifactKind
+    verdict: Optional[ReviewerVerdict]
+    next_stage: LaneStage
+
+
+COMPLETE_STAGE_EDGES: Tuple[StageEdge, ...] = (
+    StageEdge(LaneStage.PLANNED, ArtifactKind.LANE_PLAN, None, LaneStage.WRITING_TESTS),
+    StageEdge(
+        LaneStage.WRITING_TESTS,
+        ArtifactKind.TEST_DRAFT,
+        None,
+        LaneStage.REVIEWING_TESTS,
+    ),
+    StageEdge(
+        LaneStage.REVIEWING_TESTS,
+        ArtifactKind.TEST_REVIEW,
+        ReviewerVerdict.PASS,
+        LaneStage.TESTS_SEALED,
+    ),
+    StageEdge(
+        LaneStage.REVIEWING_TESTS,
+        ArtifactKind.TEST_REVIEW,
+        ReviewerVerdict.REVISE,
+        LaneStage.WRITING_TESTS,
+    ),
+    StageEdge(
+        LaneStage.TESTS_SEALED,
+        ArtifactKind.SEALED_TEST_BUNDLE,
+        None,
+        LaneStage.BUILDING,
+    ),
+    StageEdge(
+        LaneStage.BUILDING,
+        ArtifactKind.BUILDER_OUTPUT,
+        None,
+        LaneStage.REVIEWING_CODE,
+    ),
+    StageEdge(
+        LaneStage.REVIEWING_CODE,
+        ArtifactKind.CODE_REVIEW,
+        ReviewerVerdict.PASS,
+        LaneStage.READY_TO_MERGE,
+    ),
+    StageEdge(
+        LaneStage.REVIEWING_CODE,
+        ArtifactKind.CODE_REVIEW,
+        ReviewerVerdict.REVISE,
+        LaneStage.BUILDING,
+    ),
+    StageEdge(
+        LaneStage.READY_TO_MERGE,
+        ArtifactKind.INTEGRATION_MERGE,
+        None,
+        LaneStage.MERGED,
+    ),
+    StageEdge(
+        LaneStage.READY_TO_MERGE,
+        ArtifactKind.BASE_INVALIDATION,
+        None,
+        LaneStage.BUILDING,
+    ),
 )
 
 
-
-# ── §7.7 results ────────────────────────────────────────────────────────────
-
-
-class Adjudication(str, Enum):
-    """A result is adjudicated solely against the attempt row it names,
-    never against the node's current state (§7.7)."""
-
-    ACCEPTED = "ACCEPTED"
-    SUPERSEDED = "SUPERSEDED"
-    UNKNOWN_ATTEMPT = "UNKNOWN_ATTEMPT"
-    SHA_MISMATCH = "SHA_MISMATCH"
-
-
-@dataclass(frozen=True)
-class ResultRecord:
-    """One result, with its payload and its adjudication in one row (§7.7).
-
-    The payload is retained in all four outcomes and cannot be omitted: an
-    adjudication recorded without its payload is how a correct FAIL carrying
-    two real findings disappeared behind a byte-identical journal.
-    """
-
-    node_id: str
-    attempt_no: int
-    subject_sha: str
-    payload: Optional[Mapping[str, Any]]
-    adjudication: Optional[Adjudication] = None
-
-    def __post_init__(self) -> None:
-        if self.payload is None:
-            raise ValueError(
-                "a result row carries its payload and its adjudication together; "
-                "recording one without the other is what §7.7 exists to prevent"
-            )
-
-    @property
-    def key(self) -> Tuple[str, int, str]:
-        """`(node_id, attempt_no, subject_sha)` — what a result binds (§7.7)."""
-        return (self.node_id, self.attempt_no, self.subject_sha)
-
-
-# ── §7.1 the node the scheduler consumes directly ───────────────────────────
-
-
-class NodeKind(str, Enum):
-    """Four kinds, each with its own VERIFIED predicate (§7.3, §1.1 item 4).
-
-    `REVIEW` is a kind at the type level and never an authored one. B11's
-    lesson is that reviewing and producing must be separated in the *type*
-    system from day one — Strav made `Role.verifier` mean both "independent
-    Verdict-only reviewer" and "artifact-producing task", and PR #74's attempt
-    to split them found 33 workflows depending on the hybrid and was closed
-    rather than merged. A review node therefore has its own kind, its own
-    predicate (§7.3's five clauses, enforced along the review path itself and
-    sequenced by `code_review.review_attempt`), and its own evidence chain,
-    and shares none of an agent node's clauses.
-
-    But it is **derived by the scheduler, one per build-node attempt**, not
-    written by a plan author. An authored review node cannot deliver what this
-    gate exists for: "no build lane merges unreviewed" is a property of every
-    run, and a property that depends on an author remembering to declare it is
-    a property the system does not have. The edge also runs backwards through
-    the graph — the build node must be VERIFIED before its review can start,
-    and a review FAIL sends the build node back to PENDING — which is a
-    scheduler loop, not a dependency. `PlanNode` refuses this kind outright.
-
-    `TESTS` is authored. It writes the test files a later `AGENT` (build)
-    node must make pass, and it carries its own evidence chain: test files
-    only, at least one new collected case, each new case red at the parent
-    commit. Reusing the agent chain here is how hollow tests shipped.
-    """
-
-    AGENT = "agent"
-    CODE = "code"
-    REVIEW = "review"
-    TESTS = "tests"
-
-
-#: Whether a tests node's files reach the builders that its cases judge.
-#:
-#: "merged" is every plan authored before this existed and is what §7.4's
-#: in-worktree gate and `tests_chain.compare_test_bytes` assume: the tests node
-#: merges into the integration branch, the build lane inherits the files, and
-#: its own commit must carry them byte-identically.
-#:
-#: "hidden" withholds them. The bytes live in a vault outside the run
-#: repository (`hidden_vault`), because a linked worktree shares its parent's
-#: object database and withholding a *path* while leaving the *object* in reach
-#: is not containment — measured 2026-08-27, one `git cat-file` printed the
-#: assertions from a builder's own worktree.
-#:
-#: These live here rather than in `plan_model` because `plan_model` imports this
-#: module and both ends need the vocabulary; one representation of the fact
-#: rather than two reconciled by convention (§4 RC1).
-TestVisibility = str
-VISIBILITY_MERGED: TestVisibility = "merged"
-VISIBILITY_HIDDEN: TestVisibility = "hidden"
-TEST_VISIBILITIES = (VISIBILITY_MERGED, VISIBILITY_HIDDEN)
-
-
-@dataclass(frozen=True)
-class PlanNode:
-    """A plan node, consumed directly — no second authored type, no converter.
-
-    The constructor refuses three shapes that are not runtime errors but
-    design violations, because each is a wedge rather than a failure:
-
-    * an agent node without its own gate selector, which is §7.4's measured
-      deadlock — an unscoped post-node gate is red for a sibling's absent
-      work, so no node verifies, nothing merges, and the run cannot progress;
-    * a code node carrying a gate, which is state nothing evaluates, since a
-      code node's acceptance is its exit code and clauses 1-3 do not apply;
-    * an agent node carrying `expects_changes`, which is a code-node clause
-      and on an agent node would be a field nothing reads (§12.3).
-    """
-
-    node_id: str
-    kind: NodeKind
-    depth: int
-    needs: Tuple[str, ...] = ()
-    outputs: Tuple[str, ...] = ()
-    specs: Tuple[str, ...] = ()
-    gate_command: Tuple[str, ...] = ()
-    gate_selector: Optional[str] = None
-    #: §10.2's counting threshold for THIS node's gate, carried from the plan.
-    #:
-    #: It lives on the node because it is a per-gate fact. It used to live
-    #: nowhere: `Plan.to_plan_nodes` copied the gate's runner, argv and
-    #: selector and dropped its `min_cases`, so the three adjudication sites
-    #: read one unset per-run scalar that was always its default of 1. A plan
-    #: declaring 70 told its agent 70 and verified it at 1, and
-    #: run-4ee9e079 reached ACCEPTED that way.
-    #:
-    #: The default of 1 is §10.2's floor rather than a fallback: it is what a
-    #: gate means when it demands nothing more than one passing case, and
-    #: `verification.adjudicate_counts` refuses anything below it.
-    gate_min_cases: int = 1
-    command: Tuple[str, ...] = ()
-    expects_changes: bool = False
-    #: §3.6 B9's first field of the reviewer's declared contract: what this
-    #: node was asked to do, carried verbatim from the plan.
-    #:
-    #: It lives on the node because the reviewer is handed a node, not a plan.
-    #: It used to live nowhere: `Plan.to_plan_nodes` copied the id, needs,
-    #: outputs and gate and dropped `instruction`, so `build_handoff` read it
-    #: through a `getattr(node, "instruction", "")` that could only ever
-    #: answer `""`. Every agent node in every run therefore reached its
-    #: reviewer with a goal derived from its own gate — "make this command
-    #: pass" — and a reviewer that cannot see the contract judges the diff it
-    #: was given against the only standard it has, which is not the standard
-    #: the plan set.
-    #:
-    #: The empty default belongs to a code node and to no other kind: a code
-    #: node's goal is its command (§6.2), and `AgentNode.instruction` is
-    #: `min_length=1`, so a blank one on an agent node is never a plan the
-    #: author wrote — it is a projection that dropped the field. Both halves
-    #: are refused below rather than defaulted around.
-    instruction: str = ""
-    #: What this node is authorised to do about each act its plan forbids.
-    #:
-    #: The reviewer's contract answered *where* work could happen — declared
-    #: outputs, the gate, `reads`, `needs` — and nothing answered *what the
-    #: code inside may do*. Against the attempt-3 prompt from
-    #: run-0120c32064d144c2aa55c344087e0b0a, whose whole brief was "make the
-    #: gate pass over selector …, changing only the declared outputs", an
-    #: executing object materializer was compliant: the words "pure
-    #: derivation", "object mutation", and "injected clients" appeared zero
-    #: times, and the reviewers that found real defects did so because that
-    #: was the only work available to them.
-    #:
-    #: Typed rather than prose, and a closed enum over a closed enum. Handing
-    #: the reviewer the requirement's own text instead was considered and
-    #: declined: the text of the node this exists for says both "pure
-    #: derivation and policy module" and "server-side copy it", which puts the
-    #: reviewer in the builder's position adjudicating a contradiction, and a
-    #: verdict turning on which clause a model weighted is §1.2's prose
-    #: deciding a transition by the back door. Admission removes the
-    #: contradiction; this carries what survives it.
-    #:
-    #: The element type is the plan's own `NodeEffect`, which cannot be named
-    #: here: `plan_model` imports this module, so naming it would close the
-    #: cycle. The projection carries those objects verbatim rather than
-    #: re-encoding them, so there is one representation and
-    #: `_assert_projection_is_total` compares them by value.
-    effects: Tuple[Any, ...] = ()
-    #: The tests node's authored test-strength contract, or `None`.
-    #:
-    #: `None` is the v3 shape and only the v3 shape. It is not a default this
-    #: runtime works around: `maestro run start` refuses to *create* a run
-    #: whose tests nodes carry none, and the run row records which contract
-    #: the run was created under, so a v3 run resumes under v3 rules while a
-    #: new run cannot be started under them (`TEST_STRENGTH_CONTRACT_ABSENT`).
-    #:
-    #: Typed as `Any` for the reason `effects` is: the concrete type is
-    #: `plan_model.TestStrength`, `plan_model` imports this module, and naming
-    #: it here would close the cycle. The projection carries the object
-    #: verbatim so `_assert_projection_is_total` compares it by value.
-    test_strength: Optional[Any] = None
-
-    #: `VISIBILITY_MERGED` is the v4-and-earlier shape and the default forever,
-    #: exactly as `test_strength=None` is the v3 shape: a plan authored before
-    #: visibility existed declared nothing, and the projection must not invent
-    #: a decision its author never made. A v5 tests node declares one, which is
-    #: what makes "this author chose" a recoverable fact rather than a guess
-    #: (§3.6 B8 — a field added later is optional forever).
-    test_visibility: TestVisibility = VISIBILITY_MERGED
-
-    def __post_init__(self) -> None:
-        if not str(self.node_id).strip():
-            raise ValueError("a node needs a non-empty id; identity is not optional")
-        if self.depth < 0:
-            raise ValueError(f"{self.node_id}: depth is a graph fact, never negative")
-        if self.node_id in self.needs:
-            raise ValueError(f"{self.node_id}: a node cannot depend on itself")
-
-        if self.test_strength is not None and self.kind is not NodeKind.TESTS:
-            raise ValueError(
-                f"{self.node_id}: a test-strength contract belongs to a tests "
-                "node; on any other kind it is a field nothing reads (§12.3)"
-            )
-
-        if self.test_visibility not in TEST_VISIBILITIES:
-            raise ValueError(
-                f"{self.node_id}: test_visibility {self.test_visibility!r} is "
-                f"not one of {TEST_VISIBILITIES}; an unrecognised visibility "
-                "would read as 'not hidden' everywhere downstream, which is "
-                "the fail-open direction"
-            )
-
-        if (
-            self.test_visibility == VISIBILITY_HIDDEN
-            and self.kind is not NodeKind.TESTS
-        ):
-            raise ValueError(
-                f"{self.node_id}: only a tests node has visibility; on any "
-                "other kind it is a field nothing reads (§3.6 B15)"
-            )
-
-        # Hidden visibility is measured through the accepted contract's
-        # coverage obligations -- they are the entire vocabulary the sanitised
-        # repair handoff is allowed to use. A hidden tests node without one
-        # would leave the builder with counts and no way to name what is unmet.
-        if (
-            self.test_visibility == VISIBILITY_HIDDEN
-            and self.test_strength is None
-        ):
-            raise ValueError(
-                f"{self.node_id}: a hidden tests node needs a test-strength "
-                "contract; its coverage obligations are the only vocabulary a "
-                "sanitised repair handoff may speak"
-            )
-
-        if self.kind is NodeKind.REVIEW:
-            raise ValueError(
-                f"{self.node_id}: a review node is derived by the scheduler from a "
-                "build node's verified attempt, never authored in a plan (§7.3). An "
-                "authored one would make 'every merged lane was reviewed' depend on "
-                "the author remembering to write it"
-            )
-
-        if self.kind is NodeKind.AGENT:
-            if not self.gate_command:
-                raise ValueError(
-                    f"{self.node_id}: an agent node's VERIFIED predicate is its own "
-                    "gate run twice (§7.4); without a command there is nothing to run"
-                )
-            if not (self.gate_selector or "").strip():
-                raise ValueError(
-                    f"{self.node_id}: an agent node needs its own gate selector "
-                    "(§7.4). A whole-suite post-node gate is red for a sibling's "
-                    "unmerged work, so no node could verify and nothing could merge"
-                )
-            if self.command:
-                raise ValueError(
-                    f"{self.node_id}: an agent node's work is the agent's, not a "
-                    "command; a command here would be a second execution path"
-                )
-            if self.expects_changes:
-                raise ValueError(
-                    f"{self.node_id}: expects_changes is a code-node clause (§7.3); "
-                    "on an agent node it is a field nothing reads"
-                )
-            if self.gate_min_cases < 1:
-                raise ValueError(
-                    f"{self.node_id}: §10.2 counts `passed >= min_cases >= 1`; a "
-                    "gate demanding zero passing cases is green on an empty run"
-                )
-            if not self.instruction.strip():
-                raise ValueError(
-                    f"{self.node_id}: an agent node carries the instruction the "
-                    "plan declared for it (§3.6 B9). `AgentNode.instruction` is "
-                    "min_length=1, so a blank one here is not a plan that omitted "
-                    "a goal -- it is a projection that dropped one, and the "
-                    "reviewer would be handed a goal derived from the very gate "
-                    "it is meant to judge independently"
-                )
-        elif self.kind is NodeKind.TESTS:
-            if not self.gate_command:
-                raise ValueError(
-                    f"{self.node_id}: a tests node's evidence chain counts "
-                    "cases from its gate; without a command there is nothing "
-                    "to collect"
-                )
-            if not (self.gate_selector or "").strip():
-                raise ValueError(
-                    f"{self.node_id}: a tests node needs its own gate selector "
-                    "so new cases can be counted against that selector"
-                )
-            if self.command:
-                raise ValueError(
-                    f"{self.node_id}: a tests node's work is the agent's, not a "
-                    "command; a command here would be a second execution path"
-                )
-            if self.expects_changes:
-                raise ValueError(
-                    f"{self.node_id}: expects_changes is a code-node clause "
-                    "(§7.3); on a tests node it is a field nothing reads"
-                )
-            if self.gate_min_cases < 1:
-                raise ValueError(
-                    f"{self.node_id}: a tests node counts `new cases >= 1`; a "
-                    "gate demanding zero cases cannot refuse a hollow file"
-                )
-            if not self.instruction.strip():
-                raise ValueError(
-                    f"{self.node_id}: a tests node carries the instruction the "
-                    "plan declared for it (§3.6 B9)"
-                )
-        else:
-            if self.instruction:
-                raise ValueError(
-                    f"{self.node_id}: a code node's goal is its command (§6.2); an "
-                    "instruction here is a field nothing reads (§12.3)"
-                )
-            if not self.command:
-                raise ValueError(
-                    f"{self.node_id}: a code node's acceptance is its command's exit "
-                    "code (§6.2); without a command there is nothing to accept"
-                )
-            if self.gate_command or self.gate_selector:
-                raise ValueError(
-                    f"{self.node_id}: a code node has no gate and no min_cases "
-                    "(§7.3); a gate here is state nothing evaluates"
-                )
-            if self.gate_min_cases != 1:
-                raise ValueError(
-                    f"{self.node_id}: a code node has no gate to count cases "
-                    "for (§7.3); a threshold here is a number nothing reads"
-                )
-
-
-# ── §11.2 configuration, and the bound preflight enforces ───────────────────
-
-
-class LivenessBoundUnsatisfied(ValueError):
-    """`T` does not exceed the greatest run-window timeout (§9.5, §11.2).
-
-    Refused at construction rather than warned about, because a scheduler
-    below the bound does not degrade — below the node timeout it kills healthy
-    nodes inside their silent working gap, and below the final-acceptance
-    timeout it kills healthy acceptance, which resume then re-runs against the
-    same quiescent shape: `STUCK` at the same minute of every resume.
-    """
-
-
-@dataclass(frozen=True)
-class SchedulerConfig:
-    """Configuration, never plan content — the same reason retry budgets are.
-
-    The finalization timeout (§6.5) is deliberately not a field: no run exists
-    at plan time, so it takes no part in the bound below.
-    """
-
-    concurrency: int
-    node_timeout_s: float
-    turn_timeout_s: float
-    final_acceptance_timeout_s: float
-    backstop_t_s: float
-    semantic_ceiling: int
-    #: §7.5's ceiling applied to code review, counted separately and never
-    #: merged with `semantic_ceiling`. They bound different things: the
-    #: semantic ceiling bounds attempts whose *gate* went red, this one bounds
-    #: attempts whose gate went green and whose *diff* a reviewer rejected. One
-    #: counter would let a node with two gate failures merge unreviewed on its
-    #: third try because the shared budget was already spent.
-    review_ceiling: int = 3
-    #: §7.5's ceiling applied to **test** review, counted separately from
-    #: `review_ceiling` for the reason that one is counted separately from
-    #: `semantic_ceiling`: they bound different loops. A rejected test
-    #: candidate is corrected by writing cases that did not exist, which is a
-    #: different and usually longer convergence than repairing a diff whose
-    #: gate is already green. Sharing one counter would let a lane whose tests
-    #: took three rounds to become strong reach its implementation review with
-    #: no budget left, and block a lane that never failed a diff review.
-    test_review_ceiling: int = 3
-    environmental_retries: int = 2
-    launcher_retries: int = 2
-    credential_retries: int = 0
-
-    def __post_init__(self) -> None:
-        if self.concurrency < 1:
-            raise ValueError("concurrency is also the pane limit (§7.2); it is ≥ 1")
-        if self.semantic_ceiling < 1:
-            raise ValueError(
-                "a semantic ceiling of zero blocks every agent node on its first "
-                "semantic failure, which is a different design, not a setting"
-            )
-        if self.review_ceiling < 1:
-            raise ValueError(
-                "a review ceiling of zero blocks every node on its first review "
-                "rejection, which is a different design, not a setting"
-            )
-        if self.test_review_ceiling < 1:
-            raise ValueError(
-                "a test review ceiling of zero blocks every tests node on its "
-                "first review rejection, which is a different design, not a "
-                "setting"
-            )
-        for name in (
-            "node_timeout_s",
-            "turn_timeout_s",
-            "final_acceptance_timeout_s",
-            "backstop_t_s",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} is a wall clock; it is positive")
-        for name in ("environmental_retries", "launcher_retries", "credential_retries"):
-            if getattr(self, name) < 0:
-                raise ValueError(f"{name} is a count; it is not negative")
-        if self.backstop_t_s <= self.greatest_run_window_s:
-            raise LivenessBoundUnsatisfied(
-                "LIVENESS_BOUND_UNSATISFIED: the run-level backstop must exceed "
-                "the greatest run-window timeout, or it fires inside a healthy "
-                f"window. T={self.backstop_t_s}, node_timeout={self.node_timeout_s}, "
-                f"final_acceptance_timeout={self.final_acceptance_timeout_s}"
-            )
-
-    @property
-    def greatest_run_window_s(self) -> float:
-        """The greater of the two run windows (§11.2). The finalization
-        window has no run row, so it is not one of them."""
-        return max(self.node_timeout_s, self.final_acceptance_timeout_s)
-
-
-    def retry_budget(self, retry_class: RetryClass) -> int:
-        """The non-semantic budgets. SEMANTIC is absent deliberately: its
-        budget is scoped to `(node_id, base_sha)` with a cumulative ceiling
-        over `(run_id, node_id)`, which is a query over attempt rows rather
-        than a constant (§7.5)."""
-        if retry_class is RetryClass.ENVIRONMENTAL:
-            return self.environmental_retries
-        if retry_class is RetryClass.LAUNCHER_TRANSIENT:
-            return self.launcher_retries
-        raise ValueError(
-            "the semantic budget is a COUNT(*) over attempt rows scoped to "
-            "(node_id, base_sha) under a (run_id, node_id) ceiling, not a constant"
-        )
-
-
-# ── lifecycle rows the three pieces share ───────────────────────────────────
-
-
-@dataclass
-class NodeLifecycle:
-    """A node's authority-tier row — the only tier read at runtime (§5.3).
-
-    `granted_extra_attempts` is the one column §7.5's forced retry costs. It
-    exists because the grant must be readable by the scheduler's pre-launch
-    guard, and the escape's durable operator-attributed transition lives in
-    the audit tier, which §5.3 forbids reading at runtime. An earlier draft
-    claimed the ceiling introduced no new state; that was false the moment
-    `retry --force` existed.
-    """
-
-    node_id: str
-    state: NodeState = NodeState.PENDING
-    attempt_no: int = 0
-    block_reason: Optional[BlockReason] = None
-    output_sha: Optional[str] = None
-    granted_extra_attempts: int = 0
-    #: The durable authority that returned a node to the frontier. Seeded
-    #: PENDING rows and non-PENDING states carry no cause.
-    pending_cause: Optional[PendingCause] = None
-    #: The durable build/review-loop authority.  It is absent for ordinary
-    #: DAG nodes and for ledgers written before persistent review existed.
-    lane_phase: Optional[LanePhase] = None
-
-    def __post_init__(self) -> None:
-        if (self.block_reason is not None) != (self.state is NodeState.BLOCKED):
-            raise ValueError(
-                f"{self.node_id}: a block reason and the BLOCKED state are one "
-                "fact; storing either without the other is a row that cannot be "
-                "reported and an exit that cannot be looked up (§11.3)"
-            )
-
-
-@dataclass(frozen=True)
-class LaneCandidate:
-    """One immutable commit the persistent builder published for review."""
-
-    run_id: str
-    build_node_id: str
-    candidate_seq: int
-    candidate_sha: str
-    parent_candidate_sha: Optional[str]
-    builder_generation: int
-    created_at: str
-
-
-@dataclass(frozen=True)
-class CandidateReview:
-    """One exactly-once review of one immutable candidate commit."""
-
-    run_id: str
-    review_node_id: str
-    candidate_sha: str
-    reviewer_generation: int
-    state: CandidateReviewState
-    dispatched_at: Optional[str]
-    review_digest: Optional[str]
-    receipt_path: Optional[str]
-    findings: Tuple[Mapping[str, Any], ...]
-    verdict: Optional[ReviewVerdict]
-    completed_at: Optional[str]
-
-    @property
-    def terminal(self) -> bool:
-        return self.state is CandidateReviewState.COMPLETED
-
-
-@dataclass(frozen=True)
-class RepairHandoff:
-    """The one builder-targeted repair handoff for a rejected candidate."""
-
-    run_id: str
-    build_node_id: str
-    rejected_candidate_sha: str
-    findings: Tuple[Mapping[str, Any], ...]
-    state: RepairHandoffState
-    builder_generation: int
-    submitted_at: Optional[str]
-    acknowledged_at: Optional[str]
-
-
-@dataclass(frozen=True)
-class CandidatePublication:
-    """The publication result; ``created=False`` is a deterministic replay."""
-
-    candidate: LaneCandidate
-    created: bool
-
-
-@dataclass(frozen=True)
-class ReviewBegin:
-    """Whether a caller owns the first dispatch for this candidate review."""
-
-    review: CandidateReview
-    created: bool
-    should_dispatch: bool
-
-
-@dataclass(frozen=True)
-class ReviewCompletion:
-    """The first terminal review result, or a persisted late/duplicate no-op."""
-
-    review: CandidateReview
-    completed: bool
-
-
-@dataclass(frozen=True)
-class RejectionHandoff:
-    """The atomic review rejection and its optional persisted handoff."""
-
-    review: CandidateReview
-    handoff: Optional[RepairHandoff]
-    completed: bool
-    created: bool
-
-
-@dataclass(frozen=True)
-class HandoffSubmission:
-    """Whether the exact persisted handoff was delivered to its builder."""
-
-    handoff: RepairHandoff
-    submitted: bool
-
-
-@dataclass(frozen=True)
-class HandoffAcknowledgement:
-    """Whether this generation acknowledged the exact rejected candidate."""
-
-    handoff: RepairHandoff
-    acknowledged: bool
-
-
-@dataclass(frozen=True)
-class LaneRetrySpend:
-    """One correction-loop budget debit, independent of builder attempts."""
-
-    run_id: str
-    build_node_id: str
-    retry_class: LaneRetryClass
-    cycle_seq: int
-    candidate_sha: Optional[str]
-    detail: Mapping[str, Any]
-    created_at: str
-
-
-@dataclass(frozen=True)
-class LaneRetrySpendRecord:
-    spend: LaneRetrySpend
-    created: bool
-
-
-@dataclass(frozen=True)
-class ActorSession:
-    """The durable identity of one persistent builder or reviewer generation."""
-
-    run_id: str
-    build_node_id: str
-    actor_role: str
-    generation: int
-    state: ActorSessionState
-    pane_id: Optional[str]
-    tab_id: Optional[str]
-    session_path: Optional[str]
-    correlation_token: Optional[str]
-    updated_at: str
-
-
-@dataclass(frozen=True)
-class ActorSessionRecovery:
-    session: ActorSession
-    recovered: bool
-
-
-#: The `attempts.extra_json` key a repair attempt's own row carries: which
-#: rejected attempt it is repairing, which integration head it was nevertheless
-#: derived from, and how long the repair chain it ends is.
-#:
-#: Declared here rather than in `retry_policy` because `AttemptRecord` reads it
-#: and this module is read-only from there — the shared vocabulary lives with
-#: the row it describes, and `retry_policy` imports the name so the writer and
-#: the three readers below cannot drift into two spellings.
-REPAIR_KEY = "repair_of"
-
-
-@dataclass
-class AttemptRecord:
-    """One attempt of one node. The window §7.6 watches opens with this row.
-
-    `launched_at` is `None` until the adapter reports the agent launched, and
-    that is what arms the process-alive and turn-count signals. Before it, the
-    two are undefined by construction rather than by omission: the attempt
-    window covers worktree creation, provision, the pre-gate, and the baseline
-    inventory, none of which have a process or a transcript yet.
-    """
-
-    run_id: str
-    node_id: str
-    attempt_no: int
-    base_sha: str
-    state: NodeState = NodeState.RUNNING
-    started_at: float = 0.0
-    launched_at: Optional[float] = None
-    pid: Optional[int] = None
-    turn_count: int = 0
-    retry_class: Optional[RetryClass] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
-    #: Host whose pid namespace `pid` belongs to, and the start time of
-    #: that process. `None` on a ledger written before the columns and
-    #: when no pid was recorded. `attempt_liveness` reads both as
-    #: unknown, never as dead and never as alive.
-    attempt_host: Optional[str] = None
-    attempt_start_epoch: Optional[float] = None
-
-    @property
-    def armed(self) -> bool:
-        """Whether §7.6's first two signals apply yet."""
-        return self.launched_at is not None
-
-    @property
-    def key(self) -> Tuple[str, str, int]:
-        return (self.run_id, self.node_id, self.attempt_no)
-
-    @property
-    def integration_head(self) -> str:
-        """The integration head this attempt was derived from (§8.1).
-
-        Equal to `base_sha` for every attempt that branched straight off the
-        integration head, which was every attempt before repair bases existed
-        and is still every attempt that is not repairing a rejected diff. A
-        repair attempt branches from the *rejected attempt's output commit*
-        instead, so its `base_sha` is no longer the integration head, and the
-        head it was nevertheless derived from is recorded on its own row under
-        `REPAIR_KEY` when the row is opened.
-
-        Read from the stored marker rather than recomputed, because the fact
-        wanted here is which head the attempt was *branched from*, and
-        `worktree.integration_head` answers which head exists *now* — the two
-        differ exactly when a sibling merged, which is the case every reader of
-        this property exists to detect.
-        """
-        marker = (self.extra or {}).get(REPAIR_KEY)
-        if isinstance(marker, dict):
-            head = marker.get("integration_head")
-            if isinstance(head, str) and head:
-                return head
-        return self.base_sha
-
-    @property
-    def repair_chain_length(self) -> int:
-        """How many consecutive repair attempts this row is the end of.
-
-        Zero for an attempt branched from the integration head, which is what a
-        row written before repair bases existed reads as — correct rather than
-        merely convenient, since under that code no attempt ever repaired
-        anything.
-        """
-        marker = (self.extra or {}).get(REPAIR_KEY)
-        if isinstance(marker, dict):
-            length = marker.get("chain_length")
-            if isinstance(length, int) and length > 0:
-                return length
-        return 0
-
-    @property
-    def repair_of_attempt(self) -> Optional[int]:
-        """The attempt number whose rejected diff this attempt is repairing."""
-        marker = (self.extra or {}).get(REPAIR_KEY)
-        if isinstance(marker, dict):
-            prior = marker.get("attempt_no")
-            if isinstance(prior, int):
-                return prior
-        return None
-
-    @property
-    def guidance_key(self) -> Tuple[str, str]:
-        """The scope retry guidance is valid within: `(node_id, integration_head)`.
-
-        §7.5 already scopes the prompt-mutation budget this way, and for the
-        same reason the guidance itself must be: a review finding or a
-        verification failure is evidence *about a tree*. When an upstream merge
-        advances the integration head, the next attempt starts from a base at
-        which that tree no longer exists, and handing the agent findings
-        derived from it is instructing it to fix code that is not there. Keyed
-        on `node_id` alone the ledger had no expiry at all — nothing cleared
-        it when the base moved, because nothing knew the base had moved.
-
-        A tuple rather than a cleared counter, for the reason §7.5 gives about
-        the budget itself: the scope is derived from a stored fact the attempt
-        row already carries, so there is no reset event to fire and nothing
-        that can drift.
-
-        **The integration head and not `base_sha`, and the distinction only
-        appeared when repair bases did.** The paragraph above says "when an
-        upstream merge advances the integration head" — the head was always the
-        fact the expiry was about, and `base_sha` was its proxy only for as
-        long as the two were the same string. A repair attempt bases on the
-        rejected attempt's output commit, so keying on `base_sha` would mint a
-        fresh, empty ledger for the very attempt whose whole purpose is to act
-        on the findings in it, and the repair prompt would carry none of them.
-        Keyed on the head, a repair chain accumulates guidance across its
-        attempts and still expires the instant a sibling merges — which is also
-        the instant the repair basis itself is refused, so the two rules cannot
-        come apart.
-        """
-        return (self.node_id, self.integration_head)
+def next_stage_for(
+    current: LaneStage, kind: ArtifactKind, verdict: Optional[ReviewerVerdict]
+) -> LaneStage:
+    for edge in COMPLETE_STAGE_EDGES:
+        if edge.current is current and edge.kind is kind and edge.verdict is verdict:
+            return edge.next_stage
+    raise IllegalStageEdge(f"{current.value}->{kind.value}")
+
+
+def completed_stage_for(kind: ArtifactKind, payload: Mapping[str, Any]) -> LaneStage:
+    if kind is ArtifactKind.LANE_PLAN:
+        return LaneStage.PLANNED
+    if kind is ArtifactKind.TEST_DRAFT:
+        return LaneStage.WRITING_TESTS
+    if kind is ArtifactKind.TEST_REVIEW:
+        return LaneStage.REVIEWING_TESTS
+    if kind is ArtifactKind.SEALED_TEST_BUNDLE:
+        return LaneStage.TESTS_SEALED
+    if kind is ArtifactKind.BUILDER_OUTPUT:
+        return LaneStage.BUILDING
+    if kind is ArtifactKind.CODE_REVIEW:
+        return LaneStage.REVIEWING_CODE
+    if kind in (ArtifactKind.INTEGRATION_MERGE, ArtifactKind.BASE_INVALIDATION):
+        return LaneStage.READY_TO_MERGE
+    if kind is ArtifactKind.USER_WAIT:
+        return LaneStage(payload["resume_stage"])
+    if kind is ArtifactKind.USER_DECISION:
+        return LaneStage.WAITING_FOR_USER
+    raise CanonicalIdentityError(f"no completed stage for {kind.value}")
+
+
+def derive_run_status(
+    *,
+    stages: Sequence[LaneStage],
+    publication_for_active_fingerprint: bool,
+    passing_final_review_for_active_fingerprint: bool,
+) -> RunStatus:
+    if publication_for_active_fingerprint:
+        return RunStatus.COMPLETE
+    if any(stage is LaneStage.WAITING_FOR_USER for stage in stages):
+        return RunStatus.WAITING
+    if any(stage is not LaneStage.MERGED for stage in stages):
+        return RunStatus.EXECUTING
+    if not passing_final_review_for_active_fingerprint:
+        return RunStatus.INTEGRATION_REVIEW_PENDING
+    return RunStatus.PUBLISHABLE

@@ -1,196 +1,178 @@
-"""`run start` binds `repository_state`, and the class that key belongs to.
-
-`test_declared_runners_reach_the_run` fixed one instance of a shape and said so
-in its own docstring: a value the loader parses, a reader that wants it, and no
-assignment in between for the verbs that execute a run. `args.runners` was
-written in exactly one place, `_bind_layout_executables`, which serves
-`bootstrap`, `plan author` and the run *ledger* verbs -- and no run-execution
-verb goes through it.
-
-`repository_state` was the next key in that same one place, and it was still
-unbound on `run start` and `run resume` after `runners` was fixed. Its reader is
-`_configured_runs_root`, which returns `None` when the attribute is missing.
-`None` is a *deliberate* answer there -- a run spelled out entirely on the
-command line declares no run root, so no worktree can be proven to be this
-system's own and `_reclaim_stranded_integration_worktree` correctly stays out of
-it. A configured `run start` is the opposite case and still landed on the same
-answer, so the reclaim skipped its containment test on every configured run and
-took back nothing, ever.
-
-What that cost is a refusal that misdescribes its own subject. Asked to start a
-run while a previous run's integration checkout still held the branch, Maestro
-answered:
-
-    Maestro reclaims the stranded integration checkouts inside its own run
-    root without asking, and this one is not among them
-
-about a checkout at `<state>/runs/<run_id>/integration` -- which is inside its
-own run root, and is precisely what the reclaim was written to take back. The
-operator was told to go move it by hand: the exact instruction the reclaim
-exists to make unnecessary. Worse, the accurate refusal was reachable and
-suppressed. That run had no declared outcome, so a live reclaim raises
-`_RunStateStillHeld` and refuses `INTEGRATION_WORKTREE_RUN_NOT_OVER`, naming the
-run and offering `run cancel --discard`. Both refusals stop the run; only one of
-them tells the operator what is actually true.
-
-The last test is the general one. Rather than waiting for a third key to be
-added to `_bind_layout_executables` and silently dropped, it asserts that every
-attribute that binder assigns is also assigned on the branch `start` and
-`resume` share -- with `layout` exempt, and exempt for a stated reason rather
-than by omission.
-"""
+"""run start binds deployment config, --repo, and Git common dir."""
 
 from __future__ import annotations
 
-import argparse
-import ast
-import sys
+import json
+import subprocess
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from unittest import mock
 
 import maestro
-
-from test_declared_runners_reach_the_run import _configured_start_args
-
-ADWS = Path(__file__).resolve().parent.parent
-
-#: `args.layout` carries the whole parsed layout and has exactly one reader,
-#: `_bootstrap`, which reaches it through `_bind_layout_executables`. A run
-#: verb has no use for it -- the run branch binds the individual values it
-#: needs -- so its absence from that branch is a decision, recorded here so
-#: that the guard below tests the rule rather than restating the current code.
-BOOTSTRAP_ONLY = {"layout"}
+import yaml
 
 
-def _binder_assignments(name: str) -> set:
-    """Attributes of `args` assigned inside the named function."""
-    source = ast.parse((ADWS / "maestro.py").read_text(encoding="utf-8"))
-    function = next(
-        node for node in ast.walk(source)
-        if isinstance(node, ast.FunctionDef) and node.name == name)
-    return _assigned_names(function.body)
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
-def _assigned_names(body) -> set:
-    names = set()
-    for statement in body:
-        for assignment in ast.walk(statement):
-            if not isinstance(assignment, ast.Assign):
-                continue
-            for target in assignment.targets:
-                if (isinstance(target, ast.Attribute)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id == "args"):
-                    names.add(target.attr)
-    return names
+def _init_repo(path: Path) -> None:
+    path.mkdir()
+    _git(path, "init", "-b", "main")
+    _git(path, "config", "user.email", "factory@example.test")
+    _git(path, "config", "user.name", "factory")
+    (path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(path, "add", "seed.txt")
+    _git(path, "commit", "-m", "seed")
 
 
-def _run_branch_assignments() -> set:
-    """Attributes bound on the one branch `run start` and `run resume` share.
+def _install_deployment(product: Path, state: Path) -> Path:
+    adws = product / "adws"
+    adws.mkdir()
+    maestro_file = adws / "maestro.py"
+    maestro_file.write_text("# deployment\n", encoding="utf-8")
+    (adws / "maestro.config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema": "maestro-config.v1",
+                "runtime_state_root": str(state.resolve()),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return maestro_file
 
-    Located by the presence of `args.db`, exactly as
-    `StartAndResumeBindTheSameRunnersTest` locates it, so the two tests cannot
-    disagree about which branch is the run branch.
-    """
-    source = ast.parse((ADWS / "maestro.py").read_text(encoding="utf-8"))
-    binder = next(
-        node for node in ast.walk(source)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_apply_repository_config")
-    for node in ast.walk(binder):
-        if isinstance(node, ast.If) and "db" in _assigned_names(node.body):
-            return _assigned_names(node.body)
-    raise AssertionError(
-        "_apply_repository_config has no branch binding args.db")
+
+def _outcome(argv: list[str]) -> tuple[int, dict]:
+    buf = StringIO()
+    with mock.patch("sys.stdout", buf):
+        code = maestro.main(argv)
+    text = buf.getvalue().strip()
+    return code, json.loads(text) if text else {}
 
 
 class RunStartBindsRepositoryStateTest(unittest.TestCase):
+    def test_start_requires_repo_and_main_ref(self) -> None:
+        parser = maestro.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["run", "start", "plan.json", "--main-ref", "refs/heads/main"]
+            )
+        args = parser.parse_args(
+            [
+                "run",
+                "start",
+                "plan.json",
+                "--repo",
+                "/abs/product",
+                "--main-ref",
+                "refs/heads/main",
+            ]
+        )
+        self.assertEqual(args.repo, "/abs/product")
+        self.assertEqual(args.main_ref, "refs/heads/main")
 
-    def test_a_configured_start_binds_the_repository_state(self):
-        """The instance. Without this the attribute is simply absent."""
+    def test_config_is_loaded_from_executing_deployment_not_cwd_or_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            args = _configured_start_args(Path(tmp).resolve(), None)
-        self.assertTrue(
-            hasattr(args, "repository_state"),
-            "run start left repository_state unbound")
-        self.assertTrue(Path(args.repository_state).is_absolute())
+            root = Path(tmp)
+            deploy = root / "deploy"
+            other = root / "other"
+            cwd = root / "cwd"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(deploy)
+            _init_repo(other)
+            cwd.mkdir()
+            (cwd / "adws").mkdir()
+            (cwd / "adws" / "maestro.config.yaml").write_text(
+                "schema: maestro-config.v1\nruntime_state_root: /cwd/state\n",
+                encoding="utf-8",
+            )
+            (other / "adws").mkdir()
+            (other / "adws" / "maestro.config.yaml").write_text(
+                "schema: maestro-config.v1\nruntime_state_root: /other/state\n",
+                encoding="utf-8",
+            )
+            maestro_file = _install_deployment(deploy, state)
+            loaded = maestro._load_deployment_config(maestro_file)
+            self.assertEqual(loaded["repo"], deploy.resolve())
+            self.assertEqual(loaded["runtime_state_root"], state.resolve())
+            self.assertNotEqual(loaded["runtime_state_root"], Path("/cwd/state"))
+            self.assertNotEqual(loaded["runtime_state_root"], Path("/other/state"))
 
-    def test_the_reclaim_can_name_a_run_root_after_a_configured_start(self):
-        """What the binding is *for*.
-
-        `_configured_runs_root` is the reader, and a `None` from it is what
-        disables the containment test in
-        `_reclaim_stranded_integration_worktree`. Asserting the attribute
-        exists without asserting its reader answers would leave the defect
-        expressible as a bound value the reader still rejects.
-        """
+    def test_relative_runtime_state_root_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            args = _configured_start_args(Path(tmp).resolve(), None)
-            runs_root = maestro._configured_runs_root(args)
-        self.assertIsNotNone(
-            runs_root,
-            "a configured run start still declares no run root, so the "
-            "stranded-integration reclaim cannot prove any worktree is its own")
-        self.assertEqual(Path(str(runs_root)).name, "runs")
+            repo = Path(tmp)
+            config = repo / "adws" / "maestro.config.yaml"
+            config.parent.mkdir()
+            config.write_text(
+                "schema: maestro-config.v1\nruntime_state_root: state\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(maestro._MaestroConfigurationError):
+                maestro._load_maestro_config(repo, config)
 
-    def test_a_hand_spelled_run_still_declares_no_run_root(self):
-        """The other half, and the reason `None` is not simply a bug.
+    def test_template_source_start_refuses(self) -> None:
+        code, payload = _outcome(
+            [
+                "run",
+                "start",
+                "plan.json",
+                "--repo",
+                "/abs/product",
+                "--main-ref",
+                "refs/heads/main",
+            ]
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["outcome"], "RUN_REPOSITORY_MISMATCH")
 
-        A run assembled from flags has no installed configuration behind it, so
-        nothing can prove a worktree belongs to this system and the reclaim must
-        stay out of it. If this stopped being expressible, the fix above would
-        have bought the reclaim's correctness with its restraint.
-        """
-        args = argparse.Namespace(command="run", run_command="start")
-        self.assertIsNone(maestro._configured_runs_root(args))
+    def test_wrong_common_dir_start_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deploy = root / "deploy"
+            target = root / "target"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(deploy)
+            _init_repo(target)
+            maestro_file = _install_deployment(deploy, state)
+            with mock.patch.object(
+                maestro, "_executing_maestro_file", return_value=maestro_file
+            ):
+                code, payload = _outcome(
+                    [
+                        "run",
+                        "start",
+                        "plan.json",
+                        "--repo",
+                        str(target),
+                        "--main-ref",
+                        "refs/heads/main",
+                    ]
+                )
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["outcome"], "RUN_REPOSITORY_MISMATCH")
 
-    def test_the_binding_lives_on_the_branch_start_and_resume_share(self):
-        """`resume` re-enters a run whose integration checkout it must hold, so
-        a `repository_state` bound for `start` alone would leave the reclaim
-        dead on exactly the verb used to recover a run."""
-        self.assertIn("repository_state", _run_branch_assignments())
-
-
-class EveryLayoutBindingReachesTheRunTest(unittest.TestCase):
-    """The class, not the key.
-
-    `runners` was fixed, then `repository_state` was found unbound beside it in
-    the same function. A third key added to `_bind_layout_executables` would be
-    dropped the same way and stay invisible for the same reason: each end reads
-    correctly on its own, and nothing compares them.
-    """
-
-    def test_the_run_branch_binds_everything_the_layout_binder_does(self):
-        """Compared against the whole of `_apply_repository_config`, not
-        against the `args.db` branch alone.
-
-        The run path is not one block: `repo`, `herdr`, `omp`, `claude` and
-        `route_receipt` are bound further out than the branch that binds `db`,
-        and a guard reading only the inner block would report five false
-        positives while still catching nothing it was written for. Every
-        assignment in this function is on some configured path, which is the
-        property that matters -- a value assigned nowhere in it, as
-        `repository_state` was, reaches no configured verb at all.
-        """
-        layout_bound = _binder_assignments("_bind_layout_executables")
-        run_bound = _binder_assignments("_apply_repository_config")
-        missing = sorted(layout_bound - run_bound - BOOTSTRAP_ONLY)
-        self.assertEqual(
-            missing, [],
-            "_bind_layout_executables binds {} for bootstrap, plan author "
-            "and the run ledger verbs, and no run-execution verb goes through "
-            "it, so nothing binds them for a configured run. Bind them in "
-            "_apply_repository_config too, or name them in BOOTSTRAP_ONLY with "
-            "the reason a run has no use for them.".format(missing))
-
-    def test_the_exemption_names_only_attributes_that_binder_sets(self):
-        """An exemption for a key that no longer exists silences nothing and
-        hides that it is stale, so it is a failure rather than a no-op."""
-        layout_bound = _binder_assignments("_bind_layout_executables")
-        self.assertEqual(sorted(BOOTSTRAP_ONLY - layout_bound), [])
+    def test_start_has_no_legacy_state_or_reclaim_flags(self) -> None:
+        parser = maestro.build_parser()
+        args = parser.parse_args(
+            [
+                "run",
+                "start",
+                "plan.json",
+                "--repo",
+                "/abs/product",
+                "--main-ref",
+                "refs/heads/main",
+            ]
+        )
+        self.assertFalse(hasattr(args, "data_dir"))
+        self.assertFalse(hasattr(args, "state_root"))
+        self.assertFalse(hasattr(args, "reclaim"))
 
 
 if __name__ == "__main__":

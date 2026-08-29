@@ -1,267 +1,166 @@
-"""Tool policy is the omp profile. Maestro does not deny tools by default.
-
-`--tools` / `--disallowedTools` is a secondary hatch behind
-`execution.restrict_actor_tools`, default off. `argv_denies_delegation` is
-an observation about an argv, not a launch gate.
-
-Run:  uv run adw_test.py -k delegation_capability
-"""
+"""CLI has no tool-policy flags. Dispatch uses a fresh worktree and session."""
 
 from __future__ import annotations
 
-import json
+import argparse
+import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TypedDict, cast
 
 import maestro
+from adw_modules import git_publication as gitpub
 from adw_modules import launcher as lch
-from adw_modules import permissions
-from adw_modules import route_admission
+from adw_modules.scheduler import LaneContext
+from adw_modules.scheduler_types import (
+    LaneProjection,
+    LaneStage,
+    lane_projection_digest,
+)
 
 
-def _spec(
-    route: str, session_dir: Path, prompt: Path, restrict_tools: bool = False
-) -> lch.LaunchSpec:
-    return lch.LaunchSpec(
-        correlation_token="cap-test",
-        worktree=session_dir,
-        prompt_path=prompt,
-        envelope_path=session_dir / "envelope.json",
-        route=route,
-        model="openai-codex/gpt-5.6-luna",
-        effort="high",
-        profile="openai-performance" if route == "omp" else None,
-        session_dir=session_dir,
-        pane_role="reviewer",
-        restrict_tools=restrict_tools,
-    )
+class LaunchRecord(TypedDict):
+    worktree: Path
+    session_dir: Path
+    head: str
+    jsonl_at_launch: list[Path]
+    dirty_at_launch: bool
+    argv: tuple[str, ...]
 
 
-class RouteCapabilityPolicyTests(unittest.TestCase):
-    """The policy itself, before anything puts it on a command line."""
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
-    def test_every_route_with_a_policy_names_its_delegation_tools(self) -> None:
-        # A route absent from this table is a route whose actors are
-        # unconstrained, which is the state the whole run above was in.
-        self.assertEqual(
-            set(permissions.DELEGATION_TOOLS),
-            {"omp", "claude"},
-            "a route Maestro launches must declare what delegation means on it",
+
+def _init_repo(path: Path) -> str:
+    path.mkdir()
+    _git(path, "init", "-b", "main")
+    _git(path, "config", "user.email", "factory@example.test")
+    _git(path, "config", "user.name", "factory")
+    (path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(path, "add", "seed.txt")
+    _git(path, "commit", "-m", "seed")
+    return _git(path, "rev-parse", "HEAD")
+
+
+class CliHasNoDelegationPolicyFlagsTest(unittest.TestCase):
+    def test_frozen_verbs_have_no_tool_allowlist_flags(self) -> None:
+        parser = maestro.build_parser()
+        run = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ).choices["run"]
+        run_sub = next(
+            action
+            for action in run._actions
+            if isinstance(action, argparse._SubParsersAction)
         )
-        self.assertIn("task", permissions.DELEGATION_TOOLS["omp"])
-        self.assertIn("hub", permissions.DELEGATION_TOOLS["omp"])
-
-    def test_the_allowlist_subtracts_delegation_rather_than_agreeing_with_it(
-        self,
-    ) -> None:
-        """B15's shape: the invariant is a computation, not two lists in sync.
-
-        Adding a delegation tool to `ROUTE_TOOLS` must not re-grant it. If the
-        subtraction were done by hand at authoring time, this mutation would
-        pass and the capability would be back with nothing to notice.
-        """
-        original = permissions.ROUTE_TOOLS["omp"]
-        permissions.ROUTE_TOOLS["omp"] = original + ("task", "hub")
-        try:
-            allowed = permissions.route_tool_allowlist("omp")
-        finally:
-            permissions.ROUTE_TOOLS["omp"] = original
-        self.assertNotIn("task", allowed)
-        self.assertNotIn("hub", allowed)
-
-    def test_the_allowlist_keeps_every_tool_the_run_actually_used(self) -> None:
-        """Measured, not guessed — a starved actor is its own failure mode.
-
-        These are the tools invoked across that run's 39 reviewer and 48
-        builder sessions, minus the two delegation tools. Removing one of them
-        would contain the actor by breaking it.
-        """
-        allowed = set(permissions.route_tool_allowlist("omp"))
-        for tool in ("read", "write", "bash", "grep", "glob", "todo", "edit", "eval"):
-            self.assertIn(tool, allowed)
-
-    def test_an_unknown_route_yields_no_flags(self) -> None:
-        # Unreachable rather than permissive: `HerdrLauncher.launch` refuses an
-        # unknown route `UNSUPPORTED_ROUTE` before an argv builder is reached.
-        self.assertEqual(permissions.route_capability_argv("pi"), ())
-
-
-class BuiltArgvTests(unittest.TestCase):
-    """The real builders, which are what a launch actually executes."""
-
-    def setUp(self) -> None:
-        self.root = Path(__file__).resolve().parent
-        self.prompt = self.root / "fixtures"
-        self.session = self.root / "no-such-session-dir"
-
-    def test_the_omp_argv_denies_delegation(self) -> None:
-        """Default launch passes no `--tools`. The profile is the policy.
-
-        This test previously asserted the detector True on an argv that still
-        listed `eval`. That pinned an inaccurate observation. The law is now
-        that a reviewer launch grants every tool the profile provides, and
-        the detector reports that as not-denied.
-        """
-        argv = lch.build_omp_argv(
-            Path("/usr/local/bin/omp"), _spec("omp", self.session, self.prompt)
-        )
-        self.assertIn("--profile", argv)
-        self.assertEqual(argv[argv.index("--profile") + 1], "openai-performance")
-        self.assertNotIn("--tools", argv)
-        self.assertFalse(permissions.argv_denies_delegation("omp", argv))
-
-    def test_the_claude_argv_denies_delegation(self) -> None:
-        argv = lch.build_claude_argv(
-            Path("/usr/local/bin/claude"), _spec("claude", self.session, self.prompt)
-        )
-        self.assertNotIn("--disallowedTools", argv)
-        self.assertNotIn("--disallowed-tools", argv)
-        self.assertFalse(permissions.argv_denies_delegation("claude", argv))
-
-    def test_the_omp_argv_keeps_the_prompt_out_of_startup(self) -> None:
-        """OMP reaches its interactive composer before prompt submission."""
-        argv = lch.build_omp_argv(
-            Path("/usr/local/bin/omp"),
-            _spec("omp", self.session, self.prompt, restrict_tools=True),
-        )
-        self.assertFalse(any(arg.startswith("@") for arg in argv))
-        self.assertEqual(
-            argv[argv.index("--tools") + 1], "read,write,edit,bash,grep,glob,todo,eval"
-        )
-
-    def test_the_restriction_hatch_actually_restricts(self) -> None:
-        argv = lch.build_omp_argv(
-            Path("/usr/local/bin/omp"),
-            _spec("omp", self.session, self.prompt, restrict_tools=True),
-        )
-        self.assertIn("--tools", argv)
-        granted = argv[argv.index("--tools") + 1].split(",")
-        self.assertNotIn("task", granted)
-        self.assertNotIn("hub", granted)
-
-    def test_the_admission_capture_argv_denies_delegation(self) -> None:
-        """Admission uses the same builders. Default: no `--tools` hatch."""
-        spec = route_admission.RouteCaptureSpec(
-            route="omp",
-            cwd=self.root,
-            herdr=Path("/usr/local/bin/herdr"),
-            binary=Path("/usr/local/bin/omp"),
-            model="openai-codex/gpt-5.6-luna",
-            effort="high",
-            profile="openai-performance",
-            session_dir=self.session,
-            timeout_s=60.0,
-        )
-        argv = route_admission._route_argv(spec, continuing=False, session_id=None)
-        self.assertNotIn("--tools", argv)
-        self.assertFalse(permissions.argv_denies_delegation("omp", argv))
-
-
-class DetectorTests(unittest.TestCase):
-    """§13.4: convict the planted violation, acquit the real tree."""
-
-    def test_an_argv_with_no_containment_at_all_is_convicted(self) -> None:
-        # This is verbatim what `build_omp_argv` produces.
-        unconstrained = (
-            "/usr/local/bin/omp",
-            "--profile",
-            "openai-performance",
-            "--session-dir",
-            "/tmp/s",
-            "@/tmp/prompt.md",
-        )
-        self.assertFalse(permissions.argv_denies_delegation("omp", unconstrained))
-
-    def test_an_allowlist_that_admits_a_delegation_tool_is_convicted(self) -> None:
-        planted = (
-            "/usr/local/bin/omp",
+        banned = (
+            "--disallowedTools",
+            "--allowedTools",
+            "--restrict-actor-tools",
             "--tools",
-            "read,write,task",
-            "@/tmp/prompt.md",
         )
-        self.assertFalse(permissions.argv_denies_delegation("omp", planted))
-
-    def test_a_deny_list_missing_one_spelling_is_convicted(self) -> None:
-        """`Task` alone leaves `Agent`, which is the current spelling."""
-        planted = ("/usr/local/bin/claude", "--disallowedTools", "Task")
-        self.assertFalse(permissions.argv_denies_delegation("claude", planted))
-
-    def test_the_hyphenated_claude_spelling_is_accepted(self) -> None:
-        # `claude --help` documents both `--disallowedTools` and
-        # `--disallowed-tools`; a detector that knew only one would acquit a
-        # constrained argv as unconstrained.
-        argv = ("/usr/local/bin/claude", "--disallowed-tools", "Task", "Agent")
-        self.assertTrue(permissions.argv_denies_delegation("claude", argv))
-
-    def test_an_argv_that_grants_eval_does_not_deny_delegation(self) -> None:
-        planted = (
-            "/usr/local/bin/omp",
-            "--tools",
-            "read,write,edit,bash,grep,glob,todo,eval",
-            "@/tmp/prompt.md",
-        )
-        self.assertFalse(permissions.argv_denies_delegation("omp", planted))
+        for name in ("start", "resume", "amend", "status"):
+            flags = []
+            for action in run_sub.choices[name]._actions:
+                flags.extend(action.option_strings)
+            for flag in banned:
+                self.assertNotIn(flag, flags)
 
 
-class RestrictActorToolsConfigTests(unittest.TestCase):
-    """The hatch is reachable from maestro.config.yaml, default off."""
+class RecordingLauncher:
+    def __init__(self) -> None:
+        self.launches: list[LaunchRecord] = []
 
-    def test_the_shipped_config_leaves_the_hatch_off(self) -> None:
-        raw = (
-            Path(__file__).resolve().parent.parent / "maestro.config.yaml"
-        ).read_text(encoding="utf-8")
-        self.assertIn("restrict_actor_tools: false", raw)
-
-    def test_the_config_switch_reaches_the_layout(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            repo = root / "project"
-            (repo / "adws").mkdir(parents=True)
-            (repo / "plans").mkdir()
-            (repo / ".git").mkdir()
-            binaries = {}
-            for name in ("herdr", "omp", "claude"):
-                binary = root / name
-                binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                binary.chmod(0o755)
-                binaries[name] = str(binary)
-            config = {
-                "schema": "maestro-config.v1",
-                "plans_dir": "plans",
-                "state_root": "../maestro-state",
-                "keys": {
-                    "verify_key_env": "MAESTRO_TEST_VERIFY_KEY",
-                    "signing_seed_env": "MAESTRO_TEST_SIGNING_SEED",
-                    "route_verify_key_env": "MAESTRO_TEST_ROUTE_VERIFY_KEY",
-                },
-                "executables": binaries,
-                "route_receipts": {"omp": "route-receipts/omp.json"},
-                "reviewer": {
-                    "route": "omp",
-                    "model": "review-model",
-                    "effort": "high",
-                    "finalization_timeout_s": 60,
-                    "turn_timeout_s": 20,
-                    "poll_interval_s": 1,
-                },
-                "execution": {
-                    "route": "omp",
-                    "model": "execution-model",
-                    "effort": "medium",
-                    "concurrency": 2,
-                    "node_timeout_s": 120,
-                    "turn_timeout_s": 30,
-                    "final_acceptance_timeout_s": 45,
-                    "backstop_t_s": 600,
-                    "semantic_ceiling": 3,
-                    "restrict_actor_tools": True,
-                },
+    def launch(self, spec: lch.LaunchSpec) -> SimpleNamespace:
+        head = _git(spec.worktree, "rev-parse", "HEAD")
+        argv = lch.build_omp_argv(Path("omp"), replace(spec, profile="grok-maestro"))
+        self.launches.append(
+            {
+                "worktree": spec.worktree,
+                "session_dir": spec.session_dir,
+                "head": head,
+                "jsonl_at_launch": list(spec.session_dir.glob("*.jsonl")),
+                "dirty_at_launch": (spec.worktree / "dirty.txt").exists(),
+                "argv": argv,
             }
-            path = repo / "adws" / "maestro.config.yaml"
-            path.write_text(json.dumps(config), encoding="utf-8")
-            layout = maestro._load_maestro_layout(repo.resolve(), path)
-        self.assertTrue(layout["execution"]["restrict_actor_tools"])
+        )
+        (spec.session_dir / "stale.jsonl").write_text("{}\n", encoding="utf-8")
+        (spec.worktree / "dirty.txt").write_text("stale\n", encoding="utf-8")
+        spec.envelope_path.write_text("{}", encoding="utf-8")
+        return SimpleNamespace(envelope_path=spec.envelope_path)
+
+    def poll(self, handle: object) -> SimpleNamespace:
+        del handle
+        return SimpleNamespace(state=lch.PollState.EXITED)
+
+    def cancel(self, handle: object, deadline: float) -> None:
+        del handle, deadline
+
+
+class FreshAttemptDispatchTest(unittest.TestCase):
+    def test_two_dispatches_same_input_get_distinct_clean_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            worktrees = state / "worktrees"
+            head = _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            spec_digest = "ab" * 32
+            needs: tuple[str, ...] = ()
+            outputs = ("a.txt",)
+            lane = LaneProjection(
+                lane_id="lane-a",
+                needs=needs,
+                spec_digest=spec_digest,
+                declared_outputs=outputs,
+                lane_projection_digest=lane_projection_digest(
+                    spec_digest, needs, outputs
+                ),
+            )
+            ctx = LaneContext(
+                run_id="run-1",
+                lane=lane,
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="ef" * 32,
+                stage=LaneStage.BUILDING,
+                artifacts={},
+                builder_base_sha=head,
+            )
+            recorder = RecordingLauncher()
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, recorder), worktrees, target
+            )
+            actor.write_tests(ctx)
+            actor.write_tests(ctx)
+            self.assertEqual(len(recorder.launches), 2)
+            first, second = recorder.launches
+            self.assertNotEqual(first["worktree"], second["worktree"])
+            self.assertNotEqual(first["session_dir"], second["session_dir"])
+            for record in (first, second):
+                worktree = Path(str(record["worktree"]))
+                session = Path(str(record["session_dir"]))
+                self.assertEqual(record["head"], head)
+                self.assertEqual(record["jsonl_at_launch"], [])
+                self.assertFalse(record["dirty_at_launch"])
+                self.assertTrue(worktrees.resolve() in worktree.resolve().parents)
+                self.assertTrue(worktrees.resolve() in session.resolve().parents)
+                self.assertFalse(
+                    str(product.resolve()) in str(worktree.resolve())
+                    and worktree.resolve() == product.resolve()
+                )
+                self.assertNotEqual(worktree.resolve(), product.resolve())
+            self.assertNotIn("-c", second["argv"])
+            self.assertNotIn("-c", first["argv"])
 
 
 if __name__ == "__main__":
