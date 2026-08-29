@@ -40,7 +40,7 @@
       font-family: var(--sans);
       line-height: 1.65;
     }
-    a { color: var(--link); }
+    a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     code, pre { font-family: var(--mono); }
     code { color: var(--ink); }
     ::selection { background: var(--accent-tint); color: var(--ink); }
@@ -137,6 +137,9 @@
     .metric span { color: var(--soft); font-size: .74rem; }
     footer { margin-top: 6rem; padding-top: 1.3rem; border-top: 1px solid var(--rule); color: var(--soft); font: .72rem var(--mono); }
 
+    .shell { max-width: 100%; }
+    main { min-width: 0; max-width: 100%; }
+    .table-wrap, pre { max-width: 100%; }
     @media (max-width: 920px) {
       .shell { display: block; }
       .sidebar { position: relative; height: auto; padding: 1rem 1.25rem; border-right: 0; border-bottom: 1px solid var(--rule); }
@@ -166,7 +169,7 @@
       </a>
       <nav aria-label="Documentation">
         <p class="nav-label">Diagrams</p>
-        <a href="#architecture">Architecture</a>
+        <a href="architecture/00-artifact-factory.html">Current factory</a>
         <a href="architecture/index.html">Gallery</a>
         <p class="nav-label">System</p>
         <a href="#overview">Overview</a>
@@ -204,10 +207,14 @@
       <section id="architecture">
         <div class="section-head">
           <span class="section-no">GALLERY</span>
-          <div><h2>Architecture diagrams</h2><p class="section-copy">All gallery diagrams predate the nine-stage source cutover and are <strong>historical / superseded</strong>. They are retained as evidence, not as the control plane. Live authority is <code>lane_state.stage</code> plus immutable artifacts, operated through <code>uv run adws/maestro.py run start|resume|amend|status</code>. Open the <a href="architecture/index.html">historical architecture gallery</a>.</p></div>
+          <div><h2>Architecture diagrams</h2><p class="section-copy">Current diagrams describe the shipped nine-stage factory: one <code>lane_state.stage</code> field, immutable artifacts under an external <code>runtime_state_root</code>, private test sealing, exactly-once integration, final review, and receipt-backed publication through <code>uv run adws/maestro.py run start|resume|amend|status</code>. Every other gallery page is <strong>historical / superseded</strong> and retained as evidence, not as the control plane. Open the <a href="architecture/index.html">architecture gallery</a>.</p></div>
+        </div>
+        <div class="grid" style="margin-bottom:.85rem">
+          <a class="card" href="architecture/00-artifact-factory.html"><span class="tag">00 · current</span><h3>Nine-stage artifact factory</h3><p>Operator CLI, <code>lane_state.stage</code>, sealed vault, exactly-once integration, and receipt-backed publication.</p></a>
+          <a class="card" href="architecture/00-lane-stage.html"><span class="tag">00 · current</span><h3>Lane stage machine</h3><p>The nine persisted stages, <code>REVISE</code> loops, <code>BASE_INVALIDATION</code>, and <code>WAITING_FOR_USER</code>.</p></a>
         </div>
         <div class="grid-3">
-          <a class="card" href="architecture/01-system.html"><span class="tag">01 · system</span><h3>System architecture</h3><p>Control plane, derived build::review, isolated worktrees, and the SQLite trace.</p></a>
+          <a class="card" href="architecture/01-system.html"><span class="tag">01 · historical</span><h3>System architecture</h3><p>Control plane, derived build::review, isolated worktrees, and the SQLite trace. Superseded.</p></a>
           <a class="card" href="architecture/02-layers.html"><span class="tag">02 · layers</span><h3>Control-plane layers</h3><p>Authority stacked from plan schema through scheduling, launch, and merge.</p></a>
           <a class="card" href="architecture/03-deployment.html"><span class="tag">03 · deploy</span><h3>Deployment</h3><p>Host, panes, worktrees, durable review rows; workspace_not_found is absence.</p></a>
           <a class="card" href="architecture/10-classes-plan.html"><span class="tag">10 · classes</span><h3>Plan model classes</h3><p>Typed plan nodes, dependencies, gates, and scheduler projection.</p></a>

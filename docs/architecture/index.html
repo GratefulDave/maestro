@@ -35,7 +35,7 @@
       color: var(--color-ink);
     }
 
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1200px; margin: 0 auto; overflow-x: auto; }
 
     a {
       color: var(--color-link);
@@ -229,14 +229,15 @@
 <body>
   <div class="container">
     <header class="header">
-      <p class="header-eyebrow">Historical gallery · superseded</p>
+      <p class="header-eyebrow">Current factory · historical gallery marked superseded</p>
       <h1>Architecture gallery</h1>
-      <p class="subtitle">All 18 diagrams predate the nine-stage source cutover and are retained as historical evidence, not live authority. The shipped contract is <code>lane_state.stage</code> plus immutable artifacts, operated through <code>uv run adws/maestro.py run start|resume|amend|status</code>.</p>
+      <p class="subtitle">Current diagrams are the shipped nine-stage contract: <code>lane_state.stage</code>, immutable artifacts, external runtime-state root, private test sealing, exactly-once integration, final review, receipt-backed publication, and four CLI verbs. The 18 older pages predate that cutover and are retained as historical evidence, not live authority.</p>
       <a class="home-link" href="../index.html">Maestro docs home</a>
     </header>
 
     <nav aria-label="Diagram groups">
       <ul class="toc">
+        <li><a href="#current">Current</a></li>
         <li><a href="#architecture">Architecture</a></li>
         <li><a href="#classes">Classes</a></li>
         <li><a href="#state">State</a></li>
@@ -246,9 +247,34 @@
       </ul>
     </nav>
 
-    <main>
+      <section class="group" id="current" aria-labelledby="current-heading">
+        <h2 id="current-heading">Current</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="00-artifact-factory.html">
+              <p class="card-file">00-artifact-factory.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Nine-stage artifact factory</h3>
+              </div>
+              <p>Four-verb CLI, one durable stage field, sealed private tests, exactly-once integration, receipt-backed publication.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="00-lane-stage.html">
+              <p class="card-file">00-lane-stage.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Lane stage machine</h3>
+              </div>
+              <p>The nine <code>lane_state.stage</code> values. <code>REVISE</code> is artifact data. Pause and amendment wait explicitly.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
       <section class="group" id="architecture" aria-labelledby="architecture-heading">
-        <h2 id="architecture-heading">Architecture</h2>
+        <h2 id="architecture-heading">Architecture (historical)</h2>
         <ul class="cards">
           <li>
             <a class="card" href="01-system.html">
@@ -496,7 +522,7 @@
 
     <footer class="footer">
       <a href="../index.html">Maestro docs home</a>
-      <span>18 diagrams · Architecture gallery</span>
+      <span>2 current · 18 historical · Architecture gallery</span>
     </footer>
   </div>
 </body>

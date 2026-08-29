@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#2d3142">
+  <title>Nine-stage artifact factory · Maestro</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      color-scheme: dark;
+      --color-paper:   #2d3142;
+      --color-paper-2: #393e53;
+      --color-ink:     #f5f5f5;
+      --color-muted:   #bfc0c0;
+      --color-soft:    #8e98ac;
+      --color-accent:  #f08a59;
+      --color-link:    #6a95d8;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    html { color-scheme: dark; background: var(--color-paper); }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { overflow-x: auto; max-width: 1280px; width: 100%; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+    .lede {
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      line-height: 1.55;
+      color: var(--color-muted);
+      margin-bottom: 1.5rem;
+      max-width: 48rem;
+    }
+    .lede a { color: var(--color-link); }
+    .lede a:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+    .figure { overflow-x: auto; }
+    svg { width: 100%; height: auto; display: block; }
+    @media (max-width: 720px) {
+      body { padding: 2rem 1.25rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Current · Architecture</p>
+    <h1>Nine-stage artifact factory</h1>
+    <p class="lede">Durable authority is one <code>lane_state.stage</code> field plus immutable artifacts under an external <code>runtime_state_root</code>. Herdr and OMP are transport only. Historical gallery diagrams are superseded. <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
+
+    <div class="figure">
+    <svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-artifact-factory-title 00-artifact-factory-desc">
+      <title id="00-artifact-factory-title">Nine-stage artifact factory</title>
+      <desc id="00-artifact-factory-desc">Operator four-verb CLI dispatches the factory scheduler, which CAS-updates lane_state.stage and appends immutable artifacts under an external runtime-state root; sealed tests stay in a private vault; accepted lanes merge exactly once into the integration ref; passing final review publishes a receipt to main.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- Zones -->
+      <rect x="440" y="212" width="456" height="292" rx="8"
+            fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <rect x="608" y="216" width="120" height="12" rx="2" fill="#2d3142"/>
+      <text x="668" y="225" fill="rgba(245,245,245,0.40)" font-size="8" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">RUNTIME STATE</text>
+
+      <rect x="912" y="212" width="240" height="292" rx="8"
+            fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <rect x="980" y="216" width="104" height="12" rx="2" fill="#2d3142"/>
+      <text x="1032" y="225" fill="rgba(245,245,245,0.40)" font-size="8" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">PRODUCT GIT</text>
+
+      <!-- Arrows -->
+      <line x1="184" y1="288" x2="232" y2="288" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="408" y1="288" x2="456" y2="288" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="552" y1="328" x2="552" y2="376" stroke="#f08a59" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <line x1="648" y1="424" x2="696" y2="424" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="784" y1="392" x2="784" y2="328" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 872,424 H 888 Q 896,424 896,416 V 296 Q 896,288 904,288 H 944"
+            fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1032" y1="328" x2="1032" y2="392" stroke="#f08a59" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+
+      <!-- Arrow labels -->
+      <rect x="190" y="268" width="36" height="12" rx="2" fill="#2d3142"/>
+      <text x="208" y="277" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERBS</text>
+
+      <rect x="416" y="268" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="432" y="277" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RUN</text>
+
+      <rect x="564" y="344" width="28" height="12" rx="2" fill="#2d3142"/>
+      <text x="578" y="353" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CAS</text>
+
+      <rect x="656" y="404" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="672" y="413" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">WRITE</text>
+
+      <rect x="796" y="352" width="32" height="12" rx="2" fill="#2d3142"/>
+      <text x="812" y="361" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SEAL</text>
+
+      <rect x="908" y="348" width="40" height="12" rx="2" fill="#2d3142"/>
+      <text x="928" y="357" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGE</text>
+
+      <rect x="1044" y="352" width="52" height="12" rx="2" fill="#2d3142"/>
+      <text x="1070" y="361" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RECEIPT</text>
+
+      <!-- Operator -->
+      <rect x="40" y="256" width="144" height="64" rx="6" fill="#2d3142"/>
+      <rect x="40" y="256" width="144" height="64" rx="6" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <rect x="48" y="264" width="24" height="12" rx="2" fill="transparent" stroke="rgba(142,152,172,0.40)" stroke-width="0.8"/>
+      <text x="60" y="273" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OP</text>
+      <text x="112" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Operator</text>
+      <text x="112" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">four verbs</text>
+
+      <!-- maestro.py -->
+      <rect x="232" y="256" width="176" height="64" rx="6" fill="#2d3142"/>
+      <rect x="232" y="256" width="176" height="64" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="240" y="264" width="28" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
+      <text x="254" y="273" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CLI</text>
+      <text x="320" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">maestro.py</text>
+      <text x="320" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">start resume amend status</text>
+
+      <!-- FactoryScheduler -->
+      <rect x="456" y="248" width="192" height="80" rx="6" fill="#2d3142"/>
+      <rect x="456" y="248" width="192" height="80" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="464" y="256" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
+      <text x="480" y="265" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RUN</text>
+      <text x="552" y="288" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">FactoryScheduler</text>
+      <text x="552" y="304" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ready set · merge once</text>
+
+      <!-- Private vault -->
+      <rect x="696" y="248" width="176" height="80" rx="6" fill="#2d3142"/>
+      <rect x="696" y="248" width="176" height="80" rx="6" fill="rgba(240,138,89,0.05)" stroke="rgba(240,138,89,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+      <rect x="704" y="256" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.40)" stroke-width="0.8"/>
+      <text x="724" y="265" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VAULT</text>
+      <text x="784" y="288" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Private vault</text>
+      <text x="784" y="304" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">sealed tests hidden</text>
+
+      <!-- Integration ref -->
+      <rect x="944" y="248" width="176" height="80" rx="6" fill="#2d3142"/>
+      <rect x="944" y="248" width="176" height="80" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <rect x="952" y="256" width="28" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
+      <text x="966" y="265" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">GIT</text>
+      <text x="1032" y="288" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Integration ref</text>
+      <text x="1032" y="304" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">exactly-once merge</text>
+
+      <!-- lane_state.stage (focal) -->
+      <rect x="456" y="376" width="192" height="96" rx="6" fill="#2d3142"/>
+      <rect x="456" y="376" width="192" height="96" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="464" y="384" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
+      <text x="484" y="393" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <text x="552" y="420" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">lane_state.stage</text>
+      <text x="552" y="436" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">nine values</text>
+      <text x="552" y="452" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">sole durable authority</text>
+
+      <!-- Immutable artifacts -->
+      <rect x="696" y="392" width="176" height="64" rx="6" fill="#2d3142"/>
+      <rect x="696" y="392" width="176" height="64" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <rect x="704" y="400" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
+      <text x="720" y="409" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ART</text>
+      <text x="784" y="428" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Artifacts</text>
+      <text x="784" y="444" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">immutable envelopes</text>
+
+      <!-- Publication (focal) -->
+      <rect x="944" y="392" width="176" height="64" rx="6" fill="#2d3142"/>
+      <rect x="944" y="392" width="176" height="64" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="952" y="400" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
+      <text x="972" y="409" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MAIN</text>
+      <text x="1032" y="428" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Publication</text>
+      <text x="1032" y="444" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">receipt-backed</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="552" x2="1240" y2="552" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <text x="40" y="572" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="40" y="588" width="16" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <text x="64" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal / stage · receipt</text>
+
+      <rect x="248" y="588" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+      <text x="272" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Backend</text>
+
+      <rect x="368" y="588" width="16" height="12" rx="2" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <text x="392" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Store</text>
+
+      <rect x="472" y="588" width="16" height="12" rx="2" fill="rgba(240,138,89,0.05)" stroke="rgba(240,138,89,0.50)" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="496" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Private vault</text>
+
+      <rect x="632" y="588" width="16" height="12" rx="2" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
+      <text x="656" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Operator</text>
+
+      <text x="40" y="624" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">runtime_state_root is external · Herdr/OMP transport never advances a lane · resume restarts the incomplete stage</text>
+    </svg>
+    </div>
+  </div>
+</body>
+</html>

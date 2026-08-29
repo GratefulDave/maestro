@@ -6,6 +6,8 @@ This repository packages that factory as the `sssf` skill under `.claude/skills/
 
 Authoritative contract: [`MAESTRO_architecture.md`](MAESTRO_architecture.md). Agent contract: [`maestro_prompt.md`](maestro_prompt.md).
 
+Rendered docs: [`docs/index.html`](docs/index.html). Current architecture diagram: [`docs/architecture/00-artifact-factory.html`](docs/architecture/00-artifact-factory.html).
+
 ---
 
 ## Product flow
