@@ -2249,25 +2249,16 @@ class Scheduler:
                 if basis is not None
                 else wt.integration_head(self.deps.repo, self.deps.integration_branch)
             )
+            # NOT the latest published candidate, however tempting. A
+            # candidate contains the implementation, and §7.4's pre-node
+            # clause requires this attempt's starting tree to be one where
+            # the gate is RED. Cutting the attempt from a candidate makes
+            # the pre-node gate green and blocks the node
+            # GATE_NOT_FALSIFIABLE, which is terminal -- strictly worse than
+            # the descent refusal it was meant to avoid. An unreviewed
+            # published candidate is resumed by reviewing it, above, never
+            # by building on top of it.
             base = basis.base_sha if basis is not None else head
-            if basis is None:
-                # A published candidate outlives the attempt that produced it,
-                # and `publish_candidate` requires every later candidate to be
-                # a proven descendant of the last one. `_durable_repair_resume`
-                # supplies a basis only for a candidate a reviewer REJECTED; a
-                # candidate whose review never started -- an ENVIRONMENTAL
-                # retry taken between publication and the reviewer's first
-                # turn -- leaves none. Basing that retry on integration HEAD
-                # mints a sibling of the published candidate, and the descent
-                # assertion then refuses it on every attempt for the life of
-                # the run: the lane rebuilds forever and is never reviewed.
-                # The published candidate is the lane's real tip, so continue
-                # from it rather than from HEAD.
-                published = store.lane_candidates(
-                    self.run_id, node.node_id, limit=10_000
-                )
-                if published:
-                    base = published[-1].candidate_sha
 
             # §7.6 — the window opens BEFORE the worktree exists, so a hung
             # `git worktree add` is inside it rather than outside.
@@ -3043,17 +3034,15 @@ class Scheduler:
             falsified = self._falsify_outputs(
                 node,
                 attempt,
-                # A repair round already refuses `attempt.base` here and
-                # names the integration head instead, for the reason
-                # `_pre_candidate_base` states: the base has been moved onto
-                # a published candidate, so `paths_written_since` would see
-                # only the delta since this node's own previous output and
-                # revert almost nothing. The `basis is None` arm needs the
-                # same protection -- a retry continuing from an unreviewed
-                # candidate reaches it with `attempt.base` already moved.
-                basis.integration_head
-                if basis is not None
-                else self._pre_candidate_base(node, attempt),
+                # The repair arm names the integration head rather than
+                # `attempt.base` for the reason `_pre_candidate_base`
+                # states: `prepare_descendant_candidate` has moved that
+                # field onto the published candidate, so reverting to it
+                # would take back only the delta since this node's own
+                # previous output. The `basis is None` arm is reached only
+                # by an attempt cut from the integration head, where the
+                # two are the same commit.
+                basis.integration_head if basis is not None else attempt.base,
             )
             self._require_running(record)
             if not falsified.verified:
