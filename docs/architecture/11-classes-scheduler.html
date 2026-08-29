@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <title>Scheduler · UML class diagram</title>
+  <title>Historical · Scheduler UML (superseded)</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -16,6 +16,7 @@
       --color-muted:   #bfc0c0;
       --color-soft:    #8e98ac;
       --color-accent:  #f08a59;
+      --color-accent-tint: rgba(240,138,89,0.10);
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -34,6 +35,18 @@
     }
 
     .frame { max-width: 1280px; width: 100%; }
+
+    .hist {
+      margin: 0 0 1.25rem;
+      padding: 0.9rem 1.1rem;
+      border-left: 2px solid var(--color-accent);
+      background: var(--color-accent-tint);
+      color: var(--color-muted);
+      font-size: 0.92rem;
+      line-height: 1.55;
+    }
+    .hist strong { color: var(--color-ink); }
+    .hist code { font-family: var(--font-mono); font-size: 0.85em; color: var(--color-ink); }
 
     .eyebrow {
       font-family: var(--font-mono);
@@ -60,8 +73,10 @@
 </head>
 <body>
   <div class="frame">
-    <p class="eyebrow">UML class · Maestro scheduler</p>
+    <p class="eyebrow">Historical diagram · superseded</p>
     <h1>Scheduler · store, amend, floored retry</h1>
+    <p class="hist"><strong>Superseded.</strong> This UML is not live authority. Shipped scheduler is the nine-stage artifact factory: durable <code>lane_state.stage</code> plus immutable artifacts; CLI <code>uv run adws/maestro.py run start|resume|amend|status</code>. LifecycleStore attempt rows, <code>_lane_retry</code>, granted extra attempts, NodeState, and cancel are not current. The SVG below is retained as historical evidence; it was not redrawn.</p>
+
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="11-classes-scheduler-title 11-classes-scheduler-desc">
       <title id="11-classes-scheduler-title">Scheduler · UML class diagram</title>

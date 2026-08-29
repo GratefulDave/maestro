@@ -1,14 +1,25 @@
 # maestro — read this before doing anything
 
-Maestro is a **dependency-DAG software factory**: lanes plan, build, and review, each node
-attempt isolated in its own git worktree, each agent node launched in a visible Herdr pane,
-with deterministic merge, typed envelopes, gates, and a SQLite lifecycle store.
+Maestro is a **nine-stage artifact factory**. Durable workflow authority is the one
+mutable `lane_state.stage` field (`PLANNED`, `WRITING_TESTS`, `REVIEWING_TESTS`,
+`TESTS_SEALED`, `BUILDING`, `REVIEWING_CODE`, `READY_TO_MERGE`, `MERGED`,
+`WAITING_FOR_USER`). Git commits and sealed artifact digests identify immutable
+inputs and outputs; they do not independently encode stage. Ledger, vault, locks,
+receipts, copied plans, and ephemeral worktrees live only under the deployment's
+absolute `runtime_state_root` (mode `0700`, outside the target repository). Every
+`run start`, `run resume`, `run amend`, and `run status` revalidates
+`runtime_state_fingerprint`. Operator execution is only
+`uv run adws/maestro.py run start|resume|amend|status` from the stamped `adws/`
+copy against a bound `--repo` publication worktree. Template-source run creation
+refuses `RUN_REPOSITORY_MISMATCH`. Herdr and OMP are transport for agent dispatch;
+pane text, process liveness, and session directories are not workflow authority.
+There is no retry, skip, abandon, attempt-salvage, or coordinator/workspace verb.
 
 ## Mandatory reading, before writing any code or spawning any agent
 
 | Document | What it binds |
 |---|---|
-| `MAESTRO_architecture.md` | The acceptance predicate (§1), the failure predicate (§1.2), node kinds and their evidence chains (§7.3), and §3.5–§3.6 — a corpus of real incidents with the design lessons already extracted |
+| `MAESTRO_architecture.md` | Executable factory contract: nine stages, compiler checks, artifacts, runtime binding, private-test boundary, operator verbs |
 | `docs/plan-authoring.md` | The only supported path from a source document to an executable plan |
 | `AGENTS.md` | Repository layout and where the implementation actually lives |
 
@@ -17,11 +28,14 @@ you were given contradicts them, the documents win — say so rather than follow
 
 ## Two rules that invalidate work if broken
 
-1. **§1.2** — a run FAILS its acceptance predicate if *any* lifecycle transition is caused by
-   pane text, prompt text, a free-text envelope field, or an agent's claim about its own work.
-   Transitions key on typed records and signed receipts, never on model prose.
-2. **§1.1 item 4** — every merged node carries a complete evidence chain **scoped to its node
-   kind**. A new node kind means extending that scoping, not reusing another kind's chain.
+1. **Typed records only** — a run fails if any lifecycle transition is caused by
+   pane text, prompt text, a free-text envelope field, or an agent's claim about
+   its own work. Transitions key on immutable artifacts and `PASS` / `REVISE`
+   verdicts, never on model prose.
+2. **Sealed tests stay private** — accepted tests are sealed in the vault. The
+   builder receives the public contract, architecture constraints, allowed paths,
+   prior redacted review, and sealed digest. It does not receive private source,
+   fixtures, selectors, expected literals, or vault paths.
 
 ## Where the implementation lives
 
@@ -66,7 +80,8 @@ assuming it is current against a deployment** — run `runtime_sync.py check` ag
 rather than trusting this file, which can itself go stale. When landing a change, say explicitly which copies
 you touched, and mirror deliberately rather than assuming a mirror already happened.
 
-**State as of 2026-08-22, re-derived by running both the tool and the test.**
+**Historical snapshot as of 2026-08-22** (attempt-host / retry-policy PRs named below
+are not factory diagnostics; the parity counts are a dated observation):
 `tests/test_template_parity.py` **passes** from this repo — 2 passed in 0.32s,
 both assertions, same-files and byte-identical-contents — and
 `runtime_sync.py check` agrees: template and the-library are level over **214**
@@ -104,11 +119,11 @@ each still under a commit named "Mirror the ADW runtime from maestro into this
 deployment". Tracking is not levelness. The 2026-08-20 reading that recorded
 those copies as level is superseded by the 2026-08-22 check below.
 
-Re-derived **2026-08-27** with `runtime_sync.py check`, which is the tool to use —
+**Historical snapshot re-derived 2026-08-27** with `runtime_sync.py check` (not
+current factory diagnostics; identical-refusal retry/block is withdrawn authority):
 not `diff -rq`, which reports a filename without saying which side is ahead.
-This reading supersedes the 2026-08-22 one; the counts moved because two test
-files were added that day, which is exactly why a count dates a snapshot rather
-than describing an invariant:
+The counts moved because two test files were added that day, which is exactly why
+a count dates a snapshot rather than describing an invariant:
 
 | comparison | result |
 | --- | --- |
@@ -175,7 +190,7 @@ does compare it between the two template copies.
 The visualizer (`.claude/skills/sssf/apps/visualizer/`) exists only in this repo — no copies,
 no ambiguity.
 
-## Reviewer design — settled, do not re-derive
+## Historical — reviewer design incidents (not current factory diagnostics)
 
 `MAESTRO_architecture.md` §3.6 (Family B) records these as observed production failures:
 
@@ -213,23 +228,24 @@ derived review edge covered agent nodes only, so a `tests` node reached MERGED w
 independent reader at all (§19 M41). A lesson in the list above is not a property of the code;
 read §19 beside it.
 
-## Verifiers
+## Historical — per-node Gate.runner / min_cases (withdrawn as current-facing)
 
-`Gate.runner` is `Literal["pytest", "vitest"]` and nothing else projects, because Maestro
-counts executed cases against `min_cases`. A shell script, Makefile target, `psql` migration,
-or `curl` check proves nothing countable and is refused with `maestro.command`. Verify such
-work by asserting its effect from a test the runner can count.
+`Gate.runner` was `Literal["pytest", "vitest"]` because Maestro counted executed
+cases against `min_cases`. A shell script, Makefile target, `psql` migration,
+or `curl` check proved nothing countable and was refused with `maestro.command`.
+Factory code review still runs sealed pytest against a candidate; that runner is
+not a lane-stage gate and `min_cases` is not workflow authority. Counting note
+that remains true for any pytest invocation: a repo whose `pytest.ini` sets `-v`
+cancels `-q`, so collection must pass `-o addopts=` or it silently returns zero.
 
-Counting note: a repo whose `pytest.ini` sets `-v` cancels `-q`, so every collection count
-must pass `-o addopts=` or it silently returns zero.
-
-## Herdr panes
+## Herdr panes (transport only)
 
 Close every pane when its work is done — `herdr pane close <pane_id>`, positional; `--pane`
 fails. `kill_reviewer` does not reliably close panes. Reviewer panes are not named
-`maestro-*`; identify them by agent kind, repo cwd, and title.
+`maestro-*`; identify them by agent kind, repo cwd, and title. Pane liveness is not
+lane stage.
 
-## One wrong idea, not four bugs — and enumerate the path before handing over a command
+## Historical — 2026-08-29 attempt/repair cluster (not current diagnostics)
 
 A cluster of refusals on one path is usually **one wrong idea wearing different
 faces**. Name the idea, make the smallest change that states it correctly, and let
@@ -263,7 +279,7 @@ stored refusals; then the worktree HEAD and `refs/heads/maestro/{run}/{node}/a{n
 Four of those were wrong at once. Reading three of them and stopping is what cost
 four handovers.
 
-## Diagnosing a lane that will not advance — run the command, do not read it
+## Historical — diagnosing attempt-worktree retries (not current diagnostics)
 
 A node that retries forever is almost never the agent's fault. Before writing any fix,
 **execute the harness's own measurement by hand, in the attempt worktree, under the real

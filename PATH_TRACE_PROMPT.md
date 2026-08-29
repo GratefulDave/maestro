@@ -4,12 +4,12 @@ Give this verbatim to another coder. Fill in the three bracketed values.
 
 ---
 
-You are auditing one execution path in the maestro ADW runtime. **Do not write a
+You are auditing one execution path in the maestro artifact-factory runtime. **Do not write a
 fix. Do not run the workflow. Produce a table.**
 
 - Repo (deployed instance): `[REPO PATH]`
-- Ledger: `[~/.maestro/<install>/lifecycle.sqlite3]`
-- Run and node: `[run-… / lane-…]`
+- Ledger: `[<runtime_state_root>/lifecycle.sqlite3]` from the deployment's absolute `runtime_state_root` (not a template tree)
+- Run and lane: `[run-… / lane-…]`
 
 ## What you are being asked for
 
@@ -21,65 +21,84 @@ value* it will see, and a verdict of PASS or REFUSE for each.
 
 ## Method — in this order, no skipping
 
-**1. Read the durable state. Never pane text, never an agent's claim, never the
-`attempts` table's summary fields.**
+**1. Read the durable state. Never pane text, never an agent's claim, never process
+liveness, never a dirty worktree.**
+
+The persisted `lane_state.stage` field is the sole durable workflow authority.
+Git commits and sealed artifact digests identify immutable inputs and outputs; they
+do not independently encode stage. Operator verbs are only `run start`, `run resume`,
+`run amend`, and `run status`.
 
 ```bash
-sqlite3 -header <ledger> "select id,node_id,from_state,to_state,reason,created_at,detail_json
-  from transitions where run_id='<run>' order by id desc limit 30;"
+sqlite3 -header <ledger> "select lane_id, stage from lane_state where run_id='<run>' order by lane_id;"
+sqlite3 -header <ledger> "select sequence, lane_id, artifact_kind, input_digest, artifact_ref, payload_json
+  from lane_artifacts where run_id='<run>' order by sequence desc limit 30;"
+sqlite3 -header <ledger> "select sequence, artifact_kind, input_digest, artifact_ref
+  from run_artifacts where run_id='<run>' order by sequence desc limit 30;"
 ```
 
-`transitions.detail_json` carries the real refusal. Note the `created_at` values —
-they are UTC. Convert to local and compare against the mtime of every runtime file
+Note timestamps — they are UTC. Convert to local and compare against the mtime of every runtime file
 you are about to reason about. **Python binds modules at import: a fix written after
-a scheduler started did not run in it.** A run whose transitions predate the file's
+a scheduler started did not run in it.** A run whose artifacts predate the file's
 mtime tells you nothing about the current code.
 
 **2. Find the entry point in `adws/adw_modules/scheduler.py` and read forward, not
-around.** Start at `_attempt_body` and follow the *first* branch whose predicate the
-durable state satisfies. Write down each branch predicate and evaluate it against
-real values as you go. Do not jump to the function whose name matches the error.
+around.** Start at `FactoryScheduler.run` / `_advance` for the lane's current
+`lane_state.stage` and follow the *first* branch whose predicate the durable state
+satisfies. Write down each branch predicate and evaluate it against real values as
+you go. Do not jump to the function whose name matches the error.
 
 **3. Enumerate every gate.** A gate is anything that can raise, return `False`, or
-write a `BlockReason`. For this runtime they cluster in five places, and you must
+refuse a frozen transition. For this runtime they cluster in five places, and you must
 check all five even when the first one explains the symptom:
 
-- **Lifecycle state** — node `state`, `block_reason`, `pending_cause`, `lane_phase`;
-  and whether that block reason is in `NON_RETRYABLE` (`scheduler_types.py`). A
-  reason in that tuple is *not* cleared by `run resume`; `_EXITS` names its escapes.
-  Note that `LifecycleStore.retry` does **not** consult either table.
-- **Attempt identity** — `attempts.extra_json` recovery keys
-  (`late_envelope_recovery`, `repair_handoff_recovery`, `undispatched_resume`),
-  `attempt_sealed_output`, `base_sha`. Each key routes to a *different* body.
-- **Immutable publications** — `lane_candidates` (`candidate_sha`,
-  `parent_candidate_sha`, `builder_generation`) and `candidate_reviews` (`state`,
-  `verdict`, `reviewer_generation`). `publish_candidate` refuses any replay whose
-  parent **or generation** disagrees with the stored row.
-- **Actor generations** — `current_actor_session` and the full
-  `actor_sessions(actor_role=…)` generation list, for `builder` *and* `reviewer`.
-  Then check that every generation referenced by a durable row
-  (`repair_handoffs.builder_generation`, `candidate_reviews.reviewer_generation`)
-  **has a session in that list**. A row naming a generation with no session is
-  permanently undeliverable: `continue_node` resolves it to a session and raises
-  `AttemptOwnershipLost` forever, because no future attempt can conjure that session
-  either. This is invisible to every test that stubs the launcher.
-- **Git** — the attempt worktree `HEAD` and `refs/heads/maestro/{run}/{node}/a{n}`.
-  `prepare_descendant_candidate` requires **both** to already equal the candidate.
-  Worktrees survive at
-  `~/.maestro/<install>/runs/<run>/worktrees/<run>-<node>-a<N>/`; run the harness's
-  own measurement there, under the real binary, for **every runner the plan can
-  name** — a stubbed `subprocess.run` replays the stdout you scripted and cannot
-  observe how a real tool parses argv.
+- **Lane stage** — `lane_state.stage` is exactly one of `PLANNED`, `WRITING_TESTS`,
+  `REVIEWING_TESTS`, `TESTS_SEALED`, `BUILDING`, `REVIEWING_CODE`, `READY_TO_MERGE`,
+  `MERGED`, `WAITING_FOR_USER`. Reviewer verdicts are artifact data (`PASS`/`REVISE`),
+  not stages. Review roles are stages of the lane, never synthetic DAG nodes.
+  `run resume` continues the next incomplete stage from the last accepted immutable
+  artifact. After `PAUSE` it restores that stage/input. After `AMENDMENT_REQUIRED` it
+  leaves the lane waiting. There is no retry/skip/abandon/cancel/bootstrap/plan
+  subcommand, attempt identity, recovery marker, or actor generation to consult.
+- **Immutable artifacts** — required input artifacts for the current stage
+  (`LANE_PLAN`, `TEST_DRAFT`, `TEST_REVIEW`, `SEALED_TEST_BUNDLE`, `BUILDER_OUTPUT`,
+  `CODE_REVIEW`, `INTEGRATION_MERGE`, run `FINAL_INTEGRATION_REVIEW` /
+  `MAIN_PUBLICATION` / `PLAN_AMENDMENT` / `USER_WAIT` as applicable). Check input
+  digest, artifact ref, and payload against the frozen transition table. Sealed
+  private tests are vault digest/reference plus public contract; private bytes are
+  absent from the run repo and builder input.
+- **Git refs, not mutable branches** — immutable candidate ref/SHA on
+  `BUILDER_OUTPUT`; run integration ref `refs/maestro/integration/<run-id>`;
+  receipt-backed publication ref
+  `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus
+  `MAIN_PUBLICATION`. Never treat a mutable candidate branch, live pane, or dirty
+  worktree as stage. `main` at the same SHA without Maestro's receipt is external
+  activity and is refused.
+- **Runtime binding** — `runtime_state_root` is the absolute external directory from
+  the deployment config. Revalidate `runtime_state_fingerprint` before reading or
+  mutating run state. Ledger, vault, locks, receipts, and ephemeral worktree roots
+  live only there. Do not adopt an old worktree; resume recreates the stage from its
+  last immutable input.
+- **Readiness and merge serialization** — a lane is ready when its stage is not
+  `MERGED` or `WAITING_FOR_USER` and every `needs` lane is `MERGED`. Independent ready
+  lanes may author/review/build concurrently. Integration merge, final review, and
+  publication are serialized. Dependent builder bases are the accepted integration
+  artifact.
 
-**4. Cross-check the invariants that hold *between* those tables.** This is where
+**4. Cross-check the invariants that hold *between* those rows.** This is where
 the defects that survive a green suite live. At minimum:
 
-- `repair_handoffs.builder_generation` == `lane_candidates.builder_generation` for
-  the same candidate.
-- every generation named by a durable row has a matching `actor_sessions` row.
-- a candidate's `parent_candidate_sha` is an ancestor of it in git.
-- the attempt a resume path will reopen actually produced what that path expects it
-  to have produced.
+- current stage matches the last committed stage-advancing artifact for that lane;
+- required immutable inputs for that stage exist and their digests match the
+  transition's input fingerprint;
+- sealed-test digest on builder/code-review paths is the vault reference, not private
+  source;
+- candidate SHA named by `BUILDER_OUTPUT` equals the immutable candidate ref;
+- integration `before_sha`/`after_sha` match the integration ref;
+- publication SHA matches the receipt ref; same SHA on `main` without a receipt is
+  not success;
+- resume would start the current incomplete stage from those artifacts, not from a
+  live agent or dirty tree.
 
 State each invariant, then evaluate it. An invariant nothing checks is where the
 next four hours go.
@@ -93,7 +112,7 @@ nothing at all.
 
 One table, one row per gate, in execution order:
 
-| # | file:line | gate / predicate | actual value here | PASS / REFUSE | refusal string and its retry class |
+| # | file:line | gate / predicate | actual value here | PASS / REFUSE | refusal code and next stage if any |
 |---|-----------|------------------|-------------------|---------------|------------------------------------|
 
 Then, below it:

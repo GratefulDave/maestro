@@ -9,15 +9,21 @@ Runtime: `.claude/skills/sssf/templates/adws/`
 
 ## What the product is actually required to do
 
-Four things. Nothing else is a requirement.
+The shipped contract is `MAESTRO_architecture.md`: a two-lane artifact factory. Nothing else is a
+current execution requirement.
 
-1. **Agent builder** — builds.
-2. **Tests node** — writes tests that can actually fail, reviewed, with actionable feedback on
-   failure, and it uses the last attempt rather than restarting from scratch.
-3. **Reviewer** — actionable feedback on test failure, uses the last attempt.
-4. **Dashboard + DAG graph.**
+1. **Private tests** — author → review (`PASS`/`REVISE`) → seal; sealed bytes hidden from the builder.
+2. **Implementation** — builder → code review with actionable redacted feedback; no private-test leak.
+3. **Integration** — each accepted lane merges exactly once into the run integration ref; dependents
+   start from that artifact; final review then receipt-backed publication to `main`.
+4. **Resume/amend** — `run start|resume|amend|status` only. Resume restarts the incomplete stage from
+   the last immutable artifact. Amend invalidates only the affected stage and transitive dependents.
+   Durable authority is `lane_state.stage` plus immutable artifacts under `runtime_state_root`.
 
-Every line of runtime either serves one of those four or is a candidate for deletion.
+Every line of runtime either serves that slice or is a candidate for deletion. Sequential SSSF ADWs
+and the polled visualizer are a separate product surface; do not treat attempt identities,
+retry/skip/abandon/cancel/bootstrap/plan subcommands, synthetic review nodes, recovery markers,
+actor generations, or mutable candidate branches as live Maestro authority.
 
 ## The stance
 
@@ -31,24 +37,28 @@ it alive.
 This is the whole difficulty of the task. Get it wrong in either direction and the plan is useless.
 
 **EARNED — keep, do not propose removing.** Added in response to a real end-to-end run that
-failed in a specific way. This codebase's complexity is largely scar tissue from actual
-incidents, documented in `MAESTRO_architecture.md` §3.5, §3.6 and §19. Known examples:
+failed in a specific way. **Historical (pre-artifact-factory) scar tissue** was documented in
+older `MAESTRO_architecture.md` §3.5, §3.6 and §19. Those sections are evidence of prior
+incidents, not current stage authority. Known historical examples:
 
 - Falsifiability strategy and deterministic gate validation — added because tests were written
   that could not fail.
 - Refusal remedies, the repeated-refusal block — added because reviewers gave feedback the
   builder could not act on, and nodes burned their whole budget on identical refusals.
 - Guidance ledger, repair basis — added because the reviewer forced the builder to restart from
-  scratch instead of using the last attempt.
-- Cross-vendor review, located ERROR findings — §3.6 Family B.
+  scratch instead of using the last attempt. **Current factory:** resume from the last immutable
+  artifact; no attempt identity.
+- Cross-vendor review, located ERROR findings — historical §3.6 Family B.
 
-Before proposing removal of ANYTHING, search §3.5, §3.6 and §19 for it. If an incident is
-recorded, it stays, and you say so in one line and move on.
+Before proposing removal of ANYTHING, search the shipped `MAESTRO_architecture.md` for it. If the
+nine-stage table or private-test/publication contract still requires it, it stays. Historical
+§3.5/§3.6/§19 hits explain why old machinery existed; they do not reauthorize attempt/generation
+ledgers.
 
 **UNEARNED — propose removal.** Machinery that was added defensively, speculatively, or in
 reaction to a red unit test, with no run behind it. It is identifiable by one or more of:
 
-- **Zero production readers.** Only tests call it. Verified examples found on 2026-08-27:
+- **Zero production readers.** Only tests call it. Verified historical examples found on 2026-08-27:
   - `scheduler_types.exits_for` / `_EXITS` — the §11.3 escape-legality table. 6 call sites, all
     in `tests/`. `_require_escape_legal` never consults `block_reason`. Production admits all 30
     (block reason × escape) combinations; 22 contradict the table. Filed as issue #155.
@@ -67,8 +77,9 @@ reaction to a red unit test, with no run behind it. It is identifiable by one or
 
 ## Start here: the last three days of PRs
 
-This is your primary audit surface. Eleven PRs merged since 2026-08-24, totalling roughly
-**+49,000 / −13,600 lines**:
+**Historical audit surface (2026-08-24..27, pre-cutover runtime).** Eleven PRs merged since
+2026-08-24, totalling roughly **+49,000 / −13,600 lines**. Use it as evidence of what landed then,
+not as the current operator surface.
 
 | PR | diff | title |
 |---|---|---|
@@ -89,7 +100,7 @@ whether both bodies of code survive.
 
 For each PR, answer three questions and put the answers in the plan:
 
-1. **What run failure prompted it?** Name the run id or the §19 / §3.6 entry. If none exists,
+1. **What run failure prompted it?** Name the run id or the historical §19 / §3.6 entry. If none exists,
    that PR was speculative and everything it added is a removal candidate by default.
 2. **Is what it added still reachable from an entry point today?** A later PR may have replaced
    the mechanism without removing it. That is the single most likely place to find dead weight
@@ -97,7 +108,7 @@ For each PR, answer three questions and put the answers in the plan:
 3. **Did it add a guard, table, or declaration that requires manual upkeep?** List each one.
 
 Diff a PR with `gh pr diff <n>`. Read the PR body for the stated justification, then check that
-justification against §19 rather than believing it.
+justification against the shipped architecture rather than believing it.
 
 ## Method — evidence rules, non-negotiable
 
@@ -111,9 +122,10 @@ justification against §19 rather than believing it.
   fields to the other. Resolve by module, not by bare name.
 - Beware bare-keyword matching. A field can look "written" because an unrelated callee somewhere
   takes a keyword of the same name (issue #156). Confirm the writer is the same type.
-- **Trace from entry points, not from symbols.** Start at: `maestro run start`, `run resume`,
-  `retry`, `skip`, `abandon`, and the scheduler's node dispatch loop. Walk forward. Anything you
-  never arrive at is your candidate list.
+- **Trace from entry points, not from symbols.** Start at: `uv run adws/maestro.py run start`,
+  `run resume`, `run amend`, `run status`, and `FactoryScheduler.run`. There is no retry, skip,
+  abandon, cancel, bootstrap, or plan subcommand. Walk forward. Anything you never arrive at is
+  your candidate list.
 
 ## Deliverable
 

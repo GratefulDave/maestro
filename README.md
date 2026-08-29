@@ -66,20 +66,27 @@ Run these from a **deployment** whose canonical Git common directory equals the 
 ```bash
 uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>
 uv run adws/maestro.py run resume <run-id>
-uv run adws/maestro.py run amend
+uv run adws/maestro.py run amend <approved-plan> --run <run-id>
 uv run adws/maestro.py run status <run-id>
 ```
 
 | Verb | Effect |
 |---|---|
-| `run start` | Bind one dedicated publication worktree and main ref, record `runtime_state_root`, insert the run and initial `PLANNED` lanes, create `refs/maestro/integration/<run-id>` |
+| `run start` | Bind one dedicated publication worktree and main ref, record `runtime_state_root`, insert the run and initial `PLANNED` lanes, create `refs/maestro/integration/<run-id>` from zero (`INTEGRATION_REF_COLLISION` if that ref exists at another SHA) |
 | `run resume` | Continue the next incomplete stage from the last accepted immutable artifact. Restores an explicit `PAUSE`. Does **not** resolve `AMENDMENT_REQUIRED` waits |
-| `run amend` | Apply a `PLAN_AMENDMENT`. Required after final-review `REVISE`. Named lanes are already `MERGED`, so `needs`/output changes are refused; the amendment must change `spec_digest` of every named lane (hence `lane_projection_digest`) or refuse `AMENDMENT_DOES_NOT_ADDRESS_REVIEW`. Those named lanes restart at `PLANNED` |
+| `run amend` | `run amend <approved-plan> --run <run-id>` applies a `PLAN_AMENDMENT`. Required after final-review `REVISE`. Named lanes are already `MERGED`, so `needs`/output changes are refused; the amendment must change `spec_digest` of every named lane (hence `lane_projection_digest`) or refuse `AMENDMENT_DOES_NOT_ADDRESS_REVIEW`. Those named lanes restart at `PLANNED` |
 | `run status` | Derived run status from durable rows (complete / waiting / executing / integration review pending / publishable). Not a second lane-stage enum |
 
-`adws/maestro.config.yaml` must declare one absolute `runtime_state_root` directory, mode `0700`, outside the target repository and both template checkouts. Every start, resume, amend, status, and publication revalidates that fingerprint.
+`adws/maestro.config.yaml` must declare one absolute `runtime_state_root` directory, mode `0700`, outside the target repository and both template checkouts. `runtime_state_fingerprint` is SHA-256 over canonical realpath, device, and inode. Every start, resume, amend, status, and publication revalidates that fingerprint.
 
-`--repo` is the dedicated non-bare publication worktree, distinct from implementation-agent worktrees and from Maestro/the-library template trees. Implementation agents never edit it. `HEAD` must be the configured main ref at start.
+`--repo` is the dedicated non-bare publication worktree, distinct from implementation-agent worktrees and from Maestro/the-library template trees. Implementation agents never edit it. `HEAD` must be the configured main ref at start. Recorded equalities: `integration_initial_sha == target_initial_main_sha == <resolved target_main_ref SHA>`.
+
+Immutable Git identities (not stage):
+
+- candidate: `refs/maestro/candidates/<run-id>/<lane-id>/<input-digest>` on each `BUILDER_OUTPUT`
+- publication: `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus `MAIN_PUBLICATION`
+
+The final-review input fingerprint is SHA-256 of canonical JSON (`schema_version` 1) containing the integration SHA, active plan revision and digest, and ordered lanes `{lane_id, spec_digest, public_contract_artifact_id, sealed_test_bundle_artifact_id}`. Observed target-main SHA is publication's expected-before value, not review identity. `main` matching that SHA without Maestro's receipt refuses `PUBLICATION_EXTERNAL_MISMATCH`. Failure to acquire the target-worktree lock refuses `PUBLICATION_WORKTREE_LOCK_REFUSED`. A later stage using an invalidated input refuses `STALE_STAGE_INPUT`.
 
 ### Pause and amendment
 

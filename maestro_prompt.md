@@ -85,13 +85,13 @@ Execute only from a stamped deployment (`adws/maestro.py`) whose canonical Git c
 ```text
 uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>
 uv run adws/maestro.py run resume <run-id>
-uv run adws/maestro.py run amend
+uv run adws/maestro.py run amend <approved-plan> --run <run-id>
 uv run adws/maestro.py run status <run-id>
 ```
 
-Template-source `run start` refuses `RUN_REPOSITORY_MISMATCH`.
+Template-source `run start` refuses `RUN_REPOSITORY_MISMATCH`. Opening a legacy ledger for execution refuses `LEDGER_SCHEMA_UNSUPPORTED`. Preserve it read-only. Start a new run/database. Do not guess a mapping from prior rows.
 
-Opening a legacy ledger for execution refuses `LEDGER_SCHEMA_UNSUPPORTED`. Preserve it read-only. Start a new run/database. Do not guess a mapping from prior rows.
+`run start` creates `refs/maestro/integration/<run-id>` from zero (`INTEGRATION_REF_COLLISION` if occupied at another SHA). Each `BUILDER_OUTPUT` pins `refs/maestro/candidates/<run-id>/<lane-id>/<input-digest>`. Publication is `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus `MAIN_PUBLICATION` (`PUBLICATION_EXTERNAL_MISMATCH` if `main` matches without that receipt; `PUBLICATION_WORKTREE_LOCK_REFUSED` if the target-worktree lock fails). Final-review fingerprint is SHA-256 of canonical JSON (`schema_version` 1) over integration SHA, plan revision/digest, and ordered `{lane_id, spec_digest, public_contract_artifact_id, sealed_test_bundle_artifact_id}`. Invalidated stage input refuses `STALE_STAGE_INPUT`.
 
 ## Plan compiler — objective checks only
 

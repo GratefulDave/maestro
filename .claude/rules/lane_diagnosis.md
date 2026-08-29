@@ -4,37 +4,47 @@ Scope: this repository and the ADW runtime it ships. MUST, not advisory.
 
 ## Rule
 
-- **Execute the harness's own measurement by hand before writing any fix.** Run it in the
-  attempt worktree, under the real binary, for **every runner the plan can name** —
-  `pytest` and `vitest` both, not just the one you suspect.
+- **Execute the harness's own measurement by hand before writing any fix.** Run it under
+  the real binary, for **every runner the plan can name** — `pytest` and `vitest` both,
+  not just the one you suspect. Recreate a fresh worktree from the immutable input
+  commit/artifact. Do not adopt a previous pane, process, or dirty tree.
 - **The first sufficient explanation is not the explanation.** A refusal string names a
   measurement that returned zero; it does not say why. Two independent causes can produce a
   byte-identical verdict. Keep looking until you have run the measurement, not until you
   have found a story that fits it.
-- **Never hand the operator a `run start` / `run resume` line until the fix it depends on
-  has been executed against the real binary in the real worktree.** A command on screen is a
-  command they will run.
+- **Never hand the operator a `run start` / `run resume` / `run amend` / `run status` line
+  until the fix it depends on has been executed against the real binary in the real
+  worktree.** A command on screen is a command they will run. Those four verbs are the
+  frozen operator surface.
 - **Check the scheduler's start time against the file mtime** before claiming a running run
   picks up a patch. Python binds modules at import; a fix applied after `run start` does
   nothing to that process.
 
 ## Where to run it
 
-Attempt worktrees survive the run, provisioned, with `node_modules` in place:
+Durable state lives under the deployment's absolute `runtime_state_root` (mode `0700`,
+outside the target repository). Do not treat template-source trees or `~/.maestro/...`
+attempt directories as live authority.
 
 ```
-~/.maestro/<install>/runs/<run_id>/worktrees/<run_id>-<node_id>-a<N>/
+<runtime_state_root>/lifecycle.sqlite3
+<runtime_state_root>/worktrees/   # ephemeral; recreate from immutable input, never adopt
 ```
 
-The verdict that sent the node back is in the ledger, not in pane text:
+The stage that names the next work is `lane_state.stage`. The verdict that sent a lane
+back is in the immutable artifact (`TEST_REVIEW` / `CODE_REVIEW` / `USER_WAIT` /
+`PLAN_AMENDMENT`), not pane text and not an attempts table:
 
 ```bash
-sqlite3 ~/.maestro/<install>/lifecycle.sqlite3 \
-  "select id, node_id, reason, detail_json from transitions
-   where run_id='<run_id>' order by id;"
+sqlite3 <runtime_state_root>/lifecycle.sqlite3 \
+  "select lane_id, stage from lane_state where run_id='<run_id>' order by lane_id;"
+sqlite3 <runtime_state_root>/lifecycle.sqlite3 \
+  "select sequence, lane_id, artifact_kind, input_digest, artifact_ref
+   from lane_artifacts where run_id='<run_id>' order by sequence;"
 ```
 
-`detail_json` carries the real reason. The `attempts` table does not.
+`lane_state.stage` plus those artifacts are workflow authority. Git candidate /
+integration / publication refs identify immutable bytes; they do not encode stage.
 
 ## Evidence rules
 
@@ -48,8 +58,9 @@ sqlite3 ~/.maestro/<install>/lifecycle.sqlite3 \
 
 ## Why this exists
 
-On 2026-08-27/28 `lane-wp6-tests` retried until it was stopped by hand, four runs, zero
-nodes merged. Two independent bugs produced the identical verdict
+Historical incident (2026-08-27/28, pre-artifact-factory runtime): `lane-wp6-tests`
+retried until it was stopped by hand, four runs, zero nodes merged. Two independent bugs
+produced the identical verdict
 `TESTS_NO_NEW_CASES: no new collected case versus the parent commit`:
 
 1. `_prove_tests_red_at_parent` discarded the node and collected with pytest whatever the
@@ -59,4 +70,6 @@ nodes merged. Two independent bugs produced the identical verdict
    printed nothing, exited 0 (`5273342`).
 
 The first was shipped as the whole answer and the run failed again identically. Fifteen
-seconds running `vitest list` in the a1 worktree would have named both at once.
+seconds running `vitest list` in the then-current a1 worktree would have named both at once.
+That worktree-survival layout is not current factory authority; diagnose today's runs from
+`lane_state.stage` and immutable artifacts under `runtime_state_root`.

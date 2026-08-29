@@ -180,83 +180,84 @@
         <a href="hidden-tests-design.html">Hidden tests</a>
         <p class="nav-label">Operations</p>
         <a href="#launcher">Herdr launcher</a>
-        <a href="#workspace">Workspace coordinator</a>
+        <a href="#workspace">Runtime binding</a>
         <a href="#cli">Operator CLI</a>
         <a href="#guarantees">Guarantees</a>
       </nav>
-      <div class="sidebar-foot">Typed envelopes<br>SQLite trace<br>Deterministic merge</div>
+      <div class="sidebar-foot">Nine stages<br>Immutable artifacts<br>Receipt-backed publication</div>
     </aside>
 
     <main id="top">
       <header>
         <div class="eyebrow">Technical documentation / current implementation</div>
         <h1>Code moves.<br><span>Control stays.</span></h1>
-        <p class="lede">Maestro executes software plans as dependency graphs. Every attempt gets an isolated worktree, every agent gets a visible Herdr pane, and every accepted change crosses deterministic gates before merge. Workspace coordination composes independent repository runs without weakening their local authority.</p>
+        <p class="lede">Maestro executes an approved plan as a two-lane artifact factory. Durable authority is <code>lane_state.stage</code> plus immutable artifacts under an external <code>runtime_state_root</code>. Independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref. Herdr is transport. Resume restarts the incomplete stage from the last immutable artifact.</p>
         <div class="hero-meta">
-          <span class="pill">Dependency DAG</span>
-          <span class="pill">Visible agents</span>
-          <span class="pill">Repository DAG</span>
-          <span class="pill">Replayable trace</span>
-          <span class="pill">Bounded retries</span>
+          <span class="pill">Nine lane stages</span>
+          <span class="pill">Immutable artifacts</span>
+          <span class="pill">Hidden sealed tests</span>
+          <span class="pill">Receipt-backed publication</span>
+          <span class="pill">Stage-restart resume</span>
         </div>
       </header>
 
       <section id="architecture">
         <div class="section-head">
-          <span class="section-no">LIVE</span>
-          <div><h2>Architecture diagrams</h2><p class="section-copy">These diagrams are live-code views of the shipped control plane, not slides. Open the <a href="architecture/index.html">architecture gallery</a>, or jump to a specific diagram below.</p></div>
+          <span class="section-no">GALLERY</span>
+          <div><h2>Architecture diagrams</h2><p class="section-copy">All gallery diagrams predate the nine-stage source cutover and are <strong>historical / superseded</strong>. They are retained as evidence, not as the control plane. Live authority is <code>lane_state.stage</code> plus immutable artifacts, operated through <code>uv run adws/maestro.py run start|resume|amend|status</code>. Open the <a href="architecture/index.html">historical architecture gallery</a>.</p></div>
         </div>
         <div class="grid-3">
           <a class="card" href="architecture/01-system.html"><span class="tag">01 · system</span><h3>System architecture</h3><p>Control plane, derived build::review, isolated worktrees, and the SQLite trace.</p></a>
           <a class="card" href="architecture/02-layers.html"><span class="tag">02 · layers</span><h3>Control-plane layers</h3><p>Authority stacked from plan schema through scheduling, launch, and merge.</p></a>
           <a class="card" href="architecture/03-deployment.html"><span class="tag">03 · deploy</span><h3>Deployment</h3><p>Host, panes, worktrees, durable review rows; workspace_not_found is absence.</p></a>
           <a class="card" href="architecture/10-classes-plan.html"><span class="tag">10 · classes</span><h3>Plan model classes</h3><p>Typed plan nodes, dependencies, gates, and scheduler projection.</p></a>
-          <a class="card" href="architecture/11-classes-scheduler.html"><span class="tag">11 · classes</span><h3>Scheduler lifecycle classes</h3><p>LifecycleStore owns CandidateReview, ActorSession, handoff, and granted_extra_attempts.</p></a>
-          <a class="card" href="architecture/12-classes-envelopes.html"><span class="tag">12 · classes</span><h3>Envelope ADW classes</h3><p>Typed envelopes that carry work across the ADW boundary.</p></a>
-          <a class="card" href="architecture/20-state-node.html"><span class="tag">20 · state</span><h3>NodeState machine</h3><p>PENDING through MERGED; a review-budget grant is not BLOCKED→PENDING.</p></a>
-          <a class="card" href="architecture/21-state-run.html"><span class="tag">21 · state</span><h3>Derived run state</h3><p>Run outcome projected from node states, not a separate machine.</p></a>
-          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · state</span><h3>Attempt retry class</h3><p>Attempt settle plus resume: leftover reclaim via worktree.stale_attempt_worktrees; resume_run clears lane_phase.</p></a>
-          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · flow</span><h3>Run start flowchart</h3><p>Scheduler.run loop: ready_nodes, first-attempt falsify base, identical-stop, then _declare.</p></a>
-          <a class="card" href="architecture/31-flow-plan.html"><span class="tag">31 · flow</span><h3>Plan ship flowchart</h3><p>Validate, finalize, and ship a plan until it is runnable.</p></a>
-          <a class="card" href="architecture/32-flow-escape.html"><span class="tag">32 · flow</span><h3>Operator escape flowchart</h3><p>Semantic grant goes PENDING; review-budget grant stays BLOCKED until resume.</p></a>
+          <a class="card" href="architecture/11-classes-scheduler.html"><span class="tag">11 · historical</span><h3>Scheduler UML (superseded)</h3><p>Pre-factory LifecycleStore / attempt / floored-retry UML. Not live. SVG unchanged.</p></a>
+          <a class="card" href="architecture/12-classes-envelopes.html"><span class="tag">12 · classes</span><h3>Envelope ADW classes</h3><p>Typed envelopes that carry work across the sequential ADW boundary.</p></a>
+          <a class="card" href="architecture/20-state-node.html"><span class="tag">20 · historical</span><h3>NodeState machine (superseded)</h3><p>Old PENDING–MERGED NodeState with retry/skip/abandon. Not <code>lane_state.stage</code>.</p></a>
+          <a class="card" href="architecture/21-state-run.html"><span class="tag">21 · historical</span><h3>Derived run state (superseded)</h3><p>Run outcome projected from NodeState. Historical; not live stage.</p></a>
+          <a class="card" href="architecture/22-state-attempt.html"><span class="tag">22 · historical</span><h3>Attempt retry class (superseded)</h3><p>Attempt settle, LanePhase, stale worktrees. Not current resume.</p></a>
+          <a class="card" href="architecture/30-flow-run.html"><span class="tag">30 · historical</span><h3>Run start flowchart (superseded)</h3><p>Old Scheduler.run / first-attempt loop. Not FactoryScheduler stages.</p></a>
+          <a class="card" href="architecture/31-flow-plan.html"><span class="tag">31 · historical</span><h3>Plan ship flowchart (superseded)</h3><p>Old plan validate/finalize/ship. No <code>plan gate|review|ship</code> verb.</p></a>
+          <a class="card" href="architecture/32-flow-escape.html"><span class="tag">32 · historical</span><h3>Operator escape flowchart (superseded)</h3><p>retry/skip/abandon and review-budget grant. Not frozen CLI.</p></a>
           <a class="card" href="architecture/33-flow-commit.html"><span class="tag">33 · flow</span><h3>Pre-commit refusal flowchart</h3><p>Two counted refusals, then permission_check, then seal (commit or adopt tip).</p></a>
-          <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · flow</span><h3>Repair chain flowchart</h3><p>REJECTED tests/builder can repair; unserviceable blocks typed; witness `_pre_candidate_base`.</p></a>
-          <a class="card" href="architecture/35-flow-unreviewed.html"><span class="tag">35 · flow</span><h3>Unread candidate flowchart</h3><p>Unread candidate is reviewed, not rebuilt; worktree stands on the candidate so REJECT can repair; not a legal build base.</p></a>
+          <a class="card" href="architecture/34-flow-repair-chain.html"><span class="tag">34 · historical</span><h3>Repair chain flowchart (superseded)</h3><p>SEMANTIC repair chain. Not current REVISE→same lane stage.</p></a>
+          <a class="card" href="architecture/35-flow-unreviewed.html"><span class="tag">35 · historical</span><h3>Unread candidate flowchart (superseded)</h3><p>Unread candidate repair. Not immutable candidate refs.</p></a>
           <a class="card" href="architecture/40-mind-modules.html"><span class="tag">40 · mind</span><h3>Runtime module tree</h3><p>Module ownership: who may mutate lifecycle, who is transport only.</p></a>
-          <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · mind</span><h3>Verb groups</h3><p>plan, run, and workspace command groups on the operator CLI.</p></a>
-          <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · mind</span><h3>Nine root verbs</h3><p>bootstrap, plan, deliver, run, retry, skip, abandon, attempt, workspace.</p></a>
-          <a class="card" href="architecture/04-data-flow-receipts.html"><span class="tag">04 · data</span><h3>Receipt data flow</h3><p>Only typed records and signed receipts move lifecycle state.</p></a>
-          <a class="card" href="architecture/13-uml-runtime.html"><span class="tag">13 · uml</span><h3>Runtime UML</h3><p>Scheduler, store review types, PlanV3/TestsNode, and the transport-only launcher.</p></a>
-          <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · seq</span><h3>Attempt sequence</h3><p>Publish candidate SHA, then derived build::review PASS, then merge — identical-stop or SEMANTIC repair.</p></a>
+          <a class="card" href="architecture/41-mind-cli.html"><span class="tag">41 · historical</span><h3>Verb groups (superseded)</h3><p>Old plan/run/workspace groups. Live verbs are run start|resume|amend|status.</p></a>
+          <a class="card" href="architecture/42-mind-cli-roots.html"><span class="tag">42 · historical</span><h3>Nine root verbs (superseded)</h3><p>bootstrap, plan, retry, skip, abandon. Not the frozen four-verb CLI.</p></a>
+          <a class="card" href="architecture/04-data-flow-receipts.html"><span class="tag">04 · data</span><h3>Receipt data flow</h3><p>Publication is receipt-backed; <code>main</code> at the same SHA without a receipt is refused.</p></a>
+          <a class="card" href="architecture/13-uml-runtime.html"><span class="tag">13 · historical</span><h3>Runtime UML (superseded)</h3><p>Pre-factory Scheduler/store UML. Not live nine-stage types.</p></a>
+          <a class="card" href="architecture/50-sequence-attempt.html"><span class="tag">50 · historical</span><h3>Attempt sequence (superseded)</h3><p>Attempt identity sequence. Resume is stage restart from artifacts.</p></a>
         </div>
       </section>
+
 
       <section id="overview">
         <div class="section-head">
           <span class="section-no">01 / 08</span>
-          <div><h2>Small control plane. Hard boundaries.</h2><p class="section-copy">Prompts propose work; Python owns execution. Plans, scheduling, acceptance, recovery, and publication remain explicit, typed, and inspectable.</p></div>
+          <div><h2>Small control plane. Hard boundaries.</h2><p class="section-copy">Prompts propose work; Python owns execution. <code>lane_state.stage</code>, immutable artifacts, and receipt-backed publication remain explicit and inspectable.</p></div>
         </div>
         <div class="grid">
-          <article class="card"><span class="tag">Plan</span><h3>Validated before execution</h3><p>Typed agent and code nodes declare dependencies, outputs, gates, evidence, and model configuration.</p></article>
-          <article class="card"><span class="tag">Isolation</span><h3>One attempt, one worktree</h3><p>Concurrent ready nodes cannot share mutable files or silently certify another node’s output.</p></article>
-          <article class="card"><span class="tag">Acceptance</span><h3>Evidence before merge</h3><p>Scoped gates, verification verdicts, integration gates, and ancestry checks determine publication.</p></article>
-          <article class="card"><span class="tag">Trace</span><h3>SQLite is durable truth</h3><p>Transitions, attempts, receipts, outcomes, and operator escapes survive restart without log reconstruction.</p></article>
+          <article class="card"><span class="tag">Plan</span><h3>Approved before execution</h3><p>Planning skills emit one executable plan. The compiler checks schema, DAG, ownership, and acceptance. No <code>plan gate|review|ship</code> or <code>bootstrap</code> verb.</p></article>
+          <article class="card"><span class="tag">Isolation</span><h3>Fresh worktree per stage</h3><p>Each incomplete stage starts from the immutable input commit. Never adopt a pane, process, or dirty tree.</p></article>
+          <article class="card"><span class="tag">Acceptance</span><h3>Sealed tests, then merge once</h3><p>Private tests seal before building. Each accepted lane merges exactly once into the run integration ref. Publication is receipt-backed.</p></article>
+          <article class="card"><span class="tag">Trace</span><h3>Stage plus artifacts</h3><p>SQLite under <code>runtime_state_root</code> stores <code>lane_state.stage</code> and immutable artifacts. Attempts and operator escapes are not authority.</p></article>
         </div>
       </section>
 
       <section id="execution">
         <div class="section-head">
           <span class="section-no">02 / 08</span>
-          <div><h2>Execution model</h2><p class="section-copy">Only dependency-ready nodes enter the worker pool. Completion order may vary; merge order does not.</p></div>
+          <div><h2>Execution model</h2><p class="section-copy">A lane is ready when its stage is not <code>MERGED</code> or <code>WAITING_FOR_USER</code> and every <code>needs</code> lane is <code>MERGED</code>. Author/review/build may overlap; merges are serialized.</p></div>
         </div>
         <div class="flow" aria-label="Maestro execution flow">
-          <div class="flow-step"><code>01</code><b>Project</b><small>Persist the validated DAG and immutable plan digest.</small></div>
-          <div class="flow-step"><code>02</code><b>Provision</b><small>Create worktree, run ecosystem setup, capture baseline.</small></div>
-          <div class="flow-step"><code>03</code><b>Execute</b><small>Launch omp or Claude in a correlated visible pane.</small></div>
-          <div class="flow-step"><code>04</code><b>Verify</b><small>Run scoped gate and classify structured evidence.</small></div>
-          <div class="flow-step"><code>05</code><b>Merge</b><small>Consume output SHA in deterministic frontier order.</small></div>
+          <div class="flow-step"><code>01</code><b>Start</b><small><code>run start</code> writes the plan revision, DAG projection, and <code>PLANNED</code> lanes, then the integration ref.</small></div>
+          <div class="flow-step"><code>02</code><b>Private tests</b><small>Author → review → seal. Builder never sees private source.</small></div>
+          <div class="flow-step"><code>03</code><b>Build / review</b><small>Builder then code review. <code>REVISE</code> returns redacted findings; <code>PASS</code> advances.</small></div>
+          <div class="flow-step"><code>04</code><b>Merge</b><small>Exactly-once integration merge from the immutable candidate SHA.</small></div>
+          <div class="flow-step"><code>05</code><b>Publish</b><small>Final review, then receipt-backed publication to <code>main</code>.</small></div>
         </div>
-        <div class="callout"><strong>Concurrency invariant.</strong> Independent ready nodes execute together. Shared output ownership, missing dependencies, and gate-core aliasing are refused before launch.</div>
+        <div class="callout"><strong>Resume.</strong> Process death restarts the current incomplete stage from its last immutable input. <code>run amend</code> invalidates only the affected stage and transitive dependents. No retry/skip/abandon/cancel verb.</div>
       </section>
 
       <section id="components">
@@ -268,23 +269,14 @@
           <table>
             <thead><tr><th>Module</th><th>Responsibility</th><th>Authority</th></tr></thead>
             <tbody>
-              <tr><td>plan_model.py</td><td>Typed plan schema, parser registry, scheduler projection</td><td>Plan shape</td></tr>
-              <tr><td>plan_validate.py</td><td>Deterministic obligations, lineage, executable gates</td><td>Authoring eligibility</td></tr>
-              <tr><td>plan_amendment.py</td><td>Adopt corrected plan bytes on an in-flight run when settled evidence stays valid</td><td>In-flight plan identity</td></tr>
-              <tr><td>hidden_vault.py</td><td>Hidden-tests attempts live in a separate bare repo under harness-private state. Schema and vault exist; composed hidden-gate execution is not built, and v5 is not runnable</td><td>Object-graph containment</td></tr>
-              <tr><td>gate_capture.py</td><td>Counted cases must be defined in the accepted test bytes; provenance is independent of visibility</td><td>Gate provenance</td></tr>
-              <tr><td>scheduler.py</td><td>Ready set, attempts, retries, verification, merge frontier</td><td>Run coordination</td></tr>
-              <tr><td>launcher.py</td><td>Herdr panes, process lifecycle, transcripts, quiescence</td><td>Transport only</td></tr>
-              <tr><td>lifecycle.py</td><td>SQLite states, transitions, recovery, operator escapes</td><td>Durable state</td></tr>
-              <tr><td>finalization.py</td><td>Applicability matrix and signed review receipt</td><td>Plan finalization</td></tr>
-              <tr><td>workspace_model.py</td><td>Closed workspace schema, repository graph, global gates, publication mode</td><td>Workspace shape</td></tr>
-              <tr><td>workspace_canonical.py / workspace_digest.py</td><td>Canonical stored bytes and SHA-256 workspace digest</td><td>Workspace identity</td></tr>
-              <tr><td>workspace_receipt.py</td><td>Ed25519 workspace receipt and child receipt admission</td><td>Workspace authorization</td></tr>
-              <tr><td>coordinator_store.py</td><td>Workspace projection, repository state, lease, publication intent, audit</td><td>Coordinator durable state</td></tr>
-              <tr><td>participant.py</td><td>Child process launch and strict participant-result protocol</td><td>Repository boundary</td></tr>
-              <tr><td>coordinator.py / workspace_runtime.py</td><td>Ready repository claims, acceptance worktrees, global gates, outcomes</td><td>Workspace execution</td></tr>
-              <tr><td>publication.py</td><td>Persisted local-ref and pull-request publication with rollback</td><td>Workspace publication</td></tr>
-              <tr><td>enforcement.py</td><td>Static obligation ledger and detector pairs</td><td>Architecture conformance</td></tr>
+              <tr><td>plan_compiler.py</td><td>Objective schema, DAG, dependency, output-ownership, acceptance, and integration-order checks</td><td>Executable plan projection</td></tr>
+              <tr><td>lifecycle.py</td><td>One <code>lane_state.stage</code> field, immutable artifacts, audit rows, and atomic transition operations</td><td>Durable workflow state</td></tr>
+              <tr><td>scheduler.py</td><td>Ready-set selection, fresh stage dispatch, review loops, and serialized merge/publication decisions</td><td>Run orchestration</td></tr>
+              <tr><td>hidden_vault.py / private_review.py</td><td>Private object storage, sealed test bundles, controlled review materialization, and redaction</td><td>Private-test boundary</td></tr>
+              <tr><td>runtime_state.py</td><td>External state-root descriptor, product-repository identity, permissions, and overlap refusal</td><td>Runtime binding</td></tr>
+              <tr><td>git_publication.py</td><td>Immutable candidate/integration/publication refs, compare-and-swap updates, and Git receipts</td><td>Repository mutation</td></tr>
+              <tr><td>launcher.py</td><td>Fresh Herdr panes, explicit Claude/OMP routes, process lifecycle, and transcripts</td><td>Transport only</td></tr>
+              <tr><td>route_admission.py</td><td>Signed launcher-route admission and exact profile/command binding</td><td>Runner capability</td></tr>
             </tbody>
           </table>
         </div>
@@ -293,20 +285,23 @@
       <section id="lifecycle">
         <div class="section-head">
           <span class="section-no">04 / 08</span>
-          <div><h2>Node lifecycle</h2><p class="section-copy">Six terminal and non-terminal states make partial work explicit. Every legal transition is transactional.</p></div>
+          <div><h2>Lane stages</h2><p class="section-copy"><code>lane_state.stage</code> is the sole durable workflow authority. Git SHAs identify bytes, not stage. Every legal transition commits an immutable artifact atomically with the next stage.</p></div>
         </div>
-        <div class="states" aria-label="Primary node state path">
-          <span class="state">PENDING</span><span class="arrow">→</span>
-          <span class="state run">RUNNING</span><span class="arrow">→</span>
-          <span class="state good">VERIFIED</span><span class="arrow">→</span>
+        <div class="states" aria-label="Primary lane stage path">
+          <span class="state">PLANNED</span><span class="arrow">→</span>
+          <span class="state run">WRITING_TESTS</span><span class="arrow">→</span>
+          <span class="state run">REVIEWING_TESTS</span><span class="arrow">→</span>
+          <span class="state">TESTS_SEALED</span><span class="arrow">→</span>
+          <span class="state run">BUILDING</span><span class="arrow">→</span>
+          <span class="state run">REVIEWING_CODE</span><span class="arrow">→</span>
+          <span class="state">READY_TO_MERGE</span><span class="arrow">→</span>
           <span class="state good">MERGED</span>
           <span class="arrow">or</span>
-          <span class="state bad">BLOCKED</span>
-          <span class="state bad">CANCELLED</span>
+          <span class="state">WAITING_FOR_USER</span>
         </div>
         <div class="grid" style="margin-top:.85rem">
-          <article class="card"><span class="tag">Retry</span><h3>Same-session, bounded</h3><p>Semantic, environmental, and launcher-transient failures follow distinct budgets. Semantic <code>--force</code>/<code>--grant</code> returns PENDING immediately. A review-budget grant stays BLOCKED on that exact attempt until absence-proven <code>run resume</code>.</p></article>
-          <article class="card"><span class="tag">Recovery</span><h3>Restart-safe</h3><p><code>SEMANTIC_BUDGET_EXHAUSTED</code> bare <code>run resume</code> floors spend (<code>retry_spend_floor</code>, <code>lane_retry_spend_floor</code>) and returns the node to the frontier — a floor, not ceiling removal. Only absence-proven <code>run resume</code> returns a review-budget grant to PENDING, same attempt, no replacement worktree. An identity-bound late envelope continues; an absent envelope stays <code>QUIESCENCE_UNPROVEN</code>. Persistent actors adopt only on exact pane, cwd, session, correlation, role, and generation. <code>workspace_not_found</code> is absence for every pane and invalidates cached lane layouts.</p></article>
+          <article class="card"><span class="tag">Verdicts</span><h3>PASS or REVISE</h3><p>Reviewer verdicts are artifact data, not stages. <code>REVISE</code> returns to the author or builder with redacted findings. Review is a lane stage, never a synthetic DAG node.</p></article>
+          <article class="card"><span class="tag">Resume</span><h3>Last immutable artifact</h3><p><code>run resume</code> continues the next incomplete stage from the last accepted artifact. After <code>PAUSE</code> it restores that stage. After <code>AMENDMENT_REQUIRED</code> the lane stays waiting. No retry budget, skip, abandon, or cancel verb.</p></article>
         </div>
       </section>
 
@@ -321,8 +316,8 @@
             <tbody>
               <tr><td>launch(spec)</td><td>Allocate pane, bind exact worktree cwd, start explicit omp or Claude route, return correlation handle. OMP argv uses <code>--profile</code>.</td></tr>
               <tr><td>poll(handle)</td><td>Report starting, running, exited, or gone. Herdr state is advisory; the last complete structured transcript envelope synthesizes terminal exit truth.</td></tr>
-              <tr><td>cancel(handle)</td><td>Close the pane and terminate a harness-owned process group by bounded TERM→KILL ladder; report quiescence or pane failures.</td></tr>
-              <tr><td>reclaim(token)</td><td>Recover exact correlation matches only; never infer ownership from nearby panes.</td></tr>
+              <tr><td>close(handle)</td><td>Transport only: close the pane and terminate a harness-owned process group. Not a Maestro operator <code>cancel</code> verb and not a lane stage.</td></tr>
+              <tr><td>reclaim(token)</td><td>Never adopt a pane, process, or dirty worktree as workflow state. Resume recreates the stage from its last immutable artifact.</td></tr>
               <tr><td>classify(error)</td><td>Map launch faults into fixed configuration, authentication, transient, protocol, or execution classes.</td></tr>
               <tr><td>provision(worktree)</td><td>Run ecosystem setup after worktree creation and before baseline or pre-gate measurement.</td></tr>
               <tr><td>wait_for_interactive_agent(name)</td><td>Block on <code>herdr agent wait &lt;name&gt; --until idle --timeout</code>, the documented readiness gate for coding agents. No undocumented status field is polled and no per-agent startup banner is scraped from the pane.</td></tr>
@@ -336,72 +331,48 @@
       <section id="workspace">
         <div class="section-head">
           <span class="section-no">06 / 08</span>
-          <div><h2>Workspace coordinator</h2><p class="section-copy">Multi-repository work composes complete single-repository runs. <code>WorkspaceCoordinator</code> owns repository ordering and execution; <code>CoordinatorStore</code> owns durable state; <code>WorkspacePublisher</code> owns publication. Each participant keeps its own plan, scheduler, verification, and final-acceptance authority.</p></div>
+          <div><h2>Runtime and repository binding</h2><p class="section-copy">Every run binds one external <code>runtime_state_root</code> to one product Git common directory. Template trees and deployment worktrees are different roles; source/deployment confusion refuses before a run is created.</p></div>
         </div>
-        <div class="flow" aria-label="Workspace coordination flow">
-          <div class="flow-step"><code>01</code><b>Finalize</b><small>Canonical workspace bytes receive a SHA-256 digest and an Ed25519 receipt bound to each writable child PASS receipt.</small></div>
-          <div class="flow-step"><code>02</code><b>Coordinate</b><small>Lease the acyclic repository DAG and start independent ready participants concurrently.</small></div>
-          <div class="flow-step"><code>03</code><b>Compose</b><small>Pin accepted candidate SHAs in detached read-only acceptance worktrees, then run ordered global gates.</small></div>
-          <div class="flow-step"><code>04</code><b>Publish</b><small>Persist a compare-and-swap target vector before local-ref or pull-request publication.</small></div>
+        <div class="flow" aria-label="Runtime binding flow">
+          <div class="flow-step"><code>01</code><b>Resolve</b><small>Canonicalize <code>--repo</code>, <code>--main-ref</code>, and the external runtime-state root.</small></div>
+          <div class="flow-step"><code>02</code><b>Refuse</b><small>Reject template-source execution, unsafe permissions, symlinks, and runtime/product path overlap.</small></div>
+          <div class="flow-step"><code>03</code><b>Bind</b><small>Persist repository identity, initial main SHA, plan revision, integration ref, and lane projection atomically.</small></div>
+          <div class="flow-step"><code>04</code><b>Recheck</b><small><code>run resume|amend|status</code> revalidate the descriptor and repository fingerprint before reading or mutating run state.</small></div>
         </div>
         <div class="grid" style="margin-top:.85rem">
-          <article class="card"><span class="tag">Authorization</span><h3>Closed, signed workspace</h3><p><code>maestro-workspace.v1</code> declares ordered write/read-only repositories, exact base commits, child-plan bindings, dependencies, gates, and publication mode. Stored canonical bytes—not a reserialization—are digest authority.</p></article>
-          <article class="card"><span class="tag">Participants</span><h3>Strict process boundary</h3><p>A writable repository returns fresh, bounded <code>maestro-participant-result.v1</code> output. Its accepted SHA must equal the candidate head and descend from the declared base; zero exit alone is failure.</p></article>
-          <article class="card"><span class="tag">Recovery</span><h3>Exact identities survive restart</h3><p>Durable state binds repository paths, child run IDs, candidate refs, worktrees, accepted SHAs, gates, and lease ownership. Accepted repositories and recorded gates never relaunch.</p></article>
-          <article class="card"><span class="tag">Publication</span><h3>Partial success is not acceptance</h3><p><code>none</code>, <code>local_refs</code>, and <code>pull_requests</code> are explicit modes. Local refs use compare-and-swap rollback; PR publishing uses force-with-lease and may require manual recovery.</p></article>
+          <article class="card"><span class="tag">External state</span><h3>Never under the product worktree</h3><p>The ledger, vault, locks, receipts, artifacts, and ephemeral worktree roots live under the bound <code>runtime_state_root</code>, never under the repository being built.</p></article>
+          <article class="card"><span class="tag">One repository</span><h3>Exact Git identity</h3><p>All stage worktrees, candidate refs, the run integration ref, final review, and target-main publication belong to the same bound Git common directory.</p></article>
+          <article class="card"><span class="tag">Immutable lineage</span><h3>Refs identify bytes</h3><p>Candidate, integration, and publication SHAs are artifact inputs and receipt subjects. They never become a second stage or mutable recovery branch.</p></article>
+          <article class="card"><span class="tag">Refusal</span><h3>No inferred recovery</h3><p>Descriptor mismatch, missing receipts, external main movement, stale stage input, or wrong repository refuses explicitly. Resume does not adopt live processes or dirty worktrees.</p></article>
         </div>
       </section>
 
       <section id="cli">
         <div class="section-head">
           <span class="section-no">07 / 08</span>
-          <div><h2>Operator CLI</h2><p class="section-copy">The public surface exposes validation, publication, execution, inspection, recovery, and deliberate escapes.</p></div>
+          <div><h2>Operator CLI</h2><p class="section-copy">Frozen surface. Invoke the deployment copy only. Template-source run creation refuses <code>RUN_REPOSITORY_MISMATCH</code>. No bootstrap, plan gate/review/ship/finalize, retry, skip, abandon, or cancel verb.</p></div>
         </div>
-        <pre aria-label="Maestro command examples"><span class="comment"># route admission</span>
-<span class="prompt">$</span> ./maestro.py bootstrap
-
-<span class="comment"># authoring</span>
-<span class="prompt">$</span> ./maestro.py plan validate plan.json
-<span class="prompt">$</span> ./maestro.py plan finalize plan.json
-<span class="prompt">$</span> ./maestro.py plan show &lt;digest&gt;
-<span class="prompt">$</span> ./maestro.py plan list
-
-<span class="comment"># execution and inspection</span>
-<span class="prompt">$</span> ./maestro.py run start &lt;digest&gt;
-<span class="prompt">$</span> ./maestro.py run status &lt;run-id&gt;
-<span class="prompt">$</span> ./maestro.py run cancel &lt;run-id&gt;
-<span class="prompt">$</span> ./maestro.py run resume &lt;run-id&gt;
-<span class="prompt">$</span> ./maestro.py run amend &lt;plan&gt; --run &lt;id&gt;
-
-<span class="comment"># explicit operator escapes</span>
-<span class="prompt">$</span> ./maestro.py retry &lt;run-id&gt; &lt;node-id&gt;
-<span class="prompt">$</span> ./maestro.py skip &lt;run-id&gt; &lt;node-id&gt; --accept-sha &lt;sha&gt;
-<span class="prompt">$</span> ./maestro.py abandon &lt;run-id&gt; &lt;node-id&gt;
-
-<span class="comment"># workspace coordination</span>
-<span class="prompt">$</span> ./maestro.py workspace validate --manifest-file &lt;workspace.json&gt;
-<span class="prompt">$</span> ./maestro.py workspace finalize --manifest-file &lt;workspace.json&gt; --plan-receipt-dir &lt;dir&gt; --workspace-receipt-dir &lt;dir&gt; --data-dir &lt;dir&gt; --verify-key &lt;hex&gt; --signing-seed &lt;hex&gt;
-<span class="prompt">$</span> ./maestro.py workspace start --manifest-file &lt;workspace.json&gt; --workspace-receipt-dir &lt;dir&gt; --data-dir &lt;dir&gt; --verify-key &lt;hex&gt; --db &lt;db&gt; --state-root &lt;dir&gt; --run-id &lt;id&gt; --max-workers &lt;n&gt; --lease-owner &lt;id&gt; --lease-stale-after-s &lt;seconds&gt; --participant-timeout-s &lt;seconds&gt; --cancellation-timeout-s &lt;seconds&gt; --poll-interval-s &lt;seconds&gt;
-<span class="prompt">$</span> ./maestro.py workspace status --db &lt;db&gt; --run-id &lt;id&gt;
-<span class="prompt">$</span> ./maestro.py workspace cancel --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;
-<span class="prompt">$</span> ./maestro.py workspace resume --manifest-file &lt;workspace.json&gt; --workspace-receipt-dir &lt;dir&gt; --data-dir &lt;dir&gt; --verify-key &lt;hex&gt; --db &lt;db&gt; --state-root &lt;dir&gt; --run-id &lt;id&gt; --max-workers &lt;n&gt; --lease-owner &lt;id&gt; --lease-stale-after-s &lt;seconds&gt; --participant-timeout-s &lt;seconds&gt; --cancellation-timeout-s &lt;seconds&gt; --poll-interval-s &lt;seconds&gt;
-<span class="prompt">$</span> ./maestro.py workspace publish --manifest-dir &lt;dir&gt; --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;
-<span class="prompt">$</span> ./maestro.py workspace rollback --manifest-dir &lt;dir&gt; --db &lt;db&gt; --run-id &lt;id&gt; --actor &lt;actor&gt;</pre>
-        <div class="callout"><strong>Bootstrap.</strong> <code>bootstrap</code> provisions key material and admits every configured route before any run may use it. Admission is a real capture, not a version probe: each route answers a marker prompt in a visible pane, answers it again from a resumed session to prove continuity, and is then cancelled to prove the pane closes. Only then is a signed route receipt written. A route whose receipt already verifies is reported as reused. <code>run amend</code> is its own verb: it adopts corrected plan bytes on an in-flight run; it is not a resume flag.</div>
+        <pre aria-label="Maestro command examples"><span class="comment"># frozen operator surface</span>
+<span class="prompt">$</span> uv run adws/maestro.py run start &lt;approved-plan&gt; --repo &lt;target-worktree-root&gt; --main-ref &lt;ref&gt;
+<span class="prompt">$</span> uv run adws/maestro.py run resume &lt;run-id&gt;
+<span class="prompt">$</span> uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;
+<span class="prompt">$</span> uv run adws/maestro.py run status &lt;run-id&gt;</pre>
+        <div class="callout"><strong>Amend, not bootstrap.</strong> <code>run amend</code> is the only verb that may apply a <code>PLAN_AMENDMENT</code>. Publication after a passing final review is receipt-backed on <code>refs/maestro/publications/&lt;run-id&gt;/&lt;fingerprint&gt;</code>; <code>main</code> at the same SHA without that receipt is refused.</div>
       </section>
+
 
       <section id="guarantees">
         <div class="section-head">
           <span class="section-no">08 / 08</span>
-          <div><h2>Executable guarantees</h2><p class="section-copy">Maestro’s claims are defended by behavioral scenarios, route captures, static enforcement, and the complete offline suite. Each workspace invocation emits one machine-readable JSON object; start, resume, and publish exit nonzero until their accepted outcome.</p></div>
+          <div><h2>Executable guarantees</h2><p class="section-copy">Maestro’s claims are defended by observable factory behavior: sealed private tests, exactly-once merge, receipt-backed publication, and stage-restart resume.</p></div>
         </div>
         <div class="metric-grid">
-          <div class="metric"><b>Scoped</b><span>offline contract suite</span></div>
-          <div class="metric"><b>2</b><span>real route receipt types</span></div>
-          <div class="metric"><b>8</b><span>launcher operations</span></div>
-          <div class="metric"><b>8</b><span>workspace operator verbs</span></div>
+          <div class="metric"><b>9</b><span>lane stages</span></div>
+          <div class="metric"><b>4</b><span>operator verbs</span></div>
+          <div class="metric"><b>2</b><span>dependent lanes in the proven slice</span></div>
+          <div class="metric"><b>1</b><span>durable stage field</span></div>
         </div>
-        <div class="callout"><strong>Golden scenarios.</strong> Run A proves concurrent isolated work, deterministic merges, and an <code>ACCEPTED</code> outcome. Run B proves a conflict reaches <code>BLOCKED</code>, then exercises recovery without inventing ancestry.</div>
+        <div class="callout"><strong>Golden scenarios.</strong> Two dependent lanes prove private-test sealing, builder isolation, exactly-once merge, dependent builder bases, final review, and resume from the last immutable artifact — not from a live agent or dirty worktree.</div>
       </section>
 
       <footer>Maestro documentation · generated from the shipped implementation · dark interface by design</footer>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <title>NodeState lifecycle</title>
+  <title>Historical · NodeState lifecycle (superseded)</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -36,6 +36,18 @@
     }
 
     .frame { max-width: 1280px; width: 100%; }
+
+    .hist {
+      margin: 0 0 1.25rem;
+      padding: 0.9rem 1.1rem;
+      border-left: 2px solid var(--color-accent);
+      background: var(--color-accent-tint);
+      color: var(--color-muted);
+      font-size: 0.92rem;
+      line-height: 1.55;
+    }
+    .hist strong { color: var(--color-ink); }
+    .hist code { font-family: var(--font-mono); font-size: 0.85em; color: var(--color-ink); }
 
     .eyebrow {
       font-family: var(--font-mono);
@@ -146,6 +158,7 @@
       gap: 0.5rem;
     }
 
+
     @media (max-width: 800px) {
       .cards { grid-template-columns: 1fr; }
     }
@@ -153,9 +166,11 @@
 </head>
 <body>
   <div class="frame">
-    <p class="eyebrow">State machine · Maestro</p>
+    <p class="eyebrow">Historical diagram · superseded</p>
     <h1>The six NodeStates</h1>
-    <p class="subtitle">Same six states. Two BLOCKED exits that look alike are not: a review-budget grant stays put; a semantic-budget resume floors spend and returns the node to PENDING.</p>
+    <p class="hist"><strong>Superseded.</strong> This diagram is not live authority. Shipped workflow is nine <code>lane_state.stage</code> values — <code>PLANNED</code>, <code>WRITING_TESTS</code>, <code>REVIEWING_TESTS</code>, <code>TESTS_SEALED</code>, <code>BUILDING</code>, <code>REVIEWING_CODE</code>, <code>READY_TO_MERGE</code>, <code>MERGED</code>, <code>WAITING_FOR_USER</code> — plus immutable artifacts. Operator CLI is <code>uv run adws/maestro.py run start|resume|amend|status</code>. NodeState, LanePhase, retry/skip/abandon/cancel, and attempt identity are not current stage. The SVG below is retained as historical evidence; it was not redrawn.</p>
+    <p class="subtitle">Historical NodeState machine (PENDING through MERGED / BLOCKED / CANCELLED), including operator retry, skip, and abandon edges that the factory no longer has.</p>
+
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="20-state-node-title 20-state-node-desc">
       <title id="20-state-node-title">NodeState lifecycle</title>
@@ -308,7 +323,7 @@
 
     <div class="cards">
       <div class="card">
-        <p class="eyebrow">REVIEW_BUDGET_EXHAUSTED</p>
+        <p class="eyebrow">Historical annotation · REVIEW_BUDGET_EXHAUSTED</p>
         <div class="card-header">
           <span class="card-dot muted"></span>
           <h3>Grant is not BLOCKED → PENDING</h3>
@@ -320,7 +335,7 @@
         </ul>
       </div>
       <div class="card">
-        <p class="eyebrow">SEMANTIC_BUDGET_EXHAUSTED</p>
+        <p class="eyebrow">Historical annotation · SEMANTIC_BUDGET_EXHAUSTED</p>
         <div class="card-header">
           <span class="card-dot coral"></span>
           <h3>Bare resume floors spend → PENDING</h3>
@@ -328,14 +343,14 @@
         <ul>
           <li>Joins <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">_RESUME_REFRESHED_BLOCK_REASONS</code>.</li>
           <li>Bare <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">run resume</code> raises <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">retry_spend_floor</code> / <code style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-ink);">lane_retry_spend_floor</code> and returns the node to PENDING.</li>
-          <li>Floor, not grant, not ceiling removal. Scheduler retry reads floored lane spends.</li>
+          <li>Floor, not grant, not ceiling removal. Scheduler retry reads floored lane spends. These cards annotate the superseded SVG only.</li>
         </ul>
       </div>
     </div>
 
     <div class="footer">
-      <span>Maestro · scheduler_types.NodeState · lifecycle.retry / resume_run</span>
-      <span>six states · grant ≠ semantic floor</span>
+      <span>Historical · scheduler_types.NodeState · not live lane_state.stage</span>
+      <span>superseded · SVG unchanged</span>
     </div>
   </div>
 </body>

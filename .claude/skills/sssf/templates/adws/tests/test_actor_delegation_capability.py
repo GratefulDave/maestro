@@ -5,11 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, TypedDict, cast
+from typing import Any, TypedDict, cast
+
+ADWS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ADWS))
+
 
 import maestro
 from adw_modules import git_publication as gitpub

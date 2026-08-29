@@ -164,7 +164,7 @@ Run status is derived in this precedence:
 4. integration review pending if all lanes are `MERGED` and no passing final-review artifact exists for the active fingerprint
 5. publishable if a passing final-review artifact exists for the active fingerprint
 
-The final-review input fingerprint is the SHA-256 of canonical JSON containing the integration SHA, active plan revision and digest, and the ordered active lane IDs, spec digests, public contract artifact IDs, and sealed-test-bundle artifact IDs. The observed target-main SHA is publication's expected-before value; it is not review identity.
+The final-review input fingerprint is SHA-256 of canonical JSON (`schema_version` 1) containing `integration_sha`, `plan_revision`, `plan_digest`, and ordered `lanes` of `{lane_id, spec_digest, public_contract_artifact_id, sealed_test_bundle_artifact_id}`. The observed target-main SHA is publication's expected-before value; it is not review identity.
 
 No mutable `latest_outcome`, scheduler PID/host/claim, cancellation cause, review refresh count, or spend ceiling is stored as workflow authority.
 
@@ -295,7 +295,7 @@ Three additional operations handle irreducibly multi-row decisions without addin
 - `apply_amendment(...)` — acquire locks 1–3, reconcile any existing publication receipt, and refuse if publication has occurred; then under one `BEGIN IMMEDIATE` validate publication/topology and the canonical `PLAN_AMENDMENT`; require every final-review-named lane to have a changed `spec_digest` (which changes `lane_projection_digest`) and a `PLANNED` reset — named lanes are already `MERGED`, so `needs`/output changes are refused; insert the complete new projection; CAS affected lanes to policy-selected stages; release the locks only after that atomic reset.
 - `complete_publication(...)` — require the still-active review fingerprint and exact immutable Git receipt; exact-replay `MAIN_PUBLICATION`.
 
-No alias or compatibility writer survives source cutover.
+No alias or compatibility writer remains.
 
 ---
 
@@ -347,7 +347,7 @@ Zero-delta revalidation records `before_sha == candidate_sha == after_sha` with 
 
 Final reviewer evaluates the exact integration HEAD against the active plan revision, ordered public contracts, sealed lane tests, and architecture constraints named by the fingerprint.
 
-Publication is exactly-once and receipt-backed: immutable `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus `MAIN_PUBLICATION`. `main` reaching the same SHA without Maestro's receipt is external activity and is refused, never inferred as successful publication.
+Publication is exactly-once and receipt-backed: immutable `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus `MAIN_PUBLICATION`. `main` reaching the same SHA without Maestro's receipt is external activity and refuses `PUBLICATION_EXTERNAL_MISMATCH`, never inferred as successful publication.
 
 A crash after Git mutation but before ledger commit is idempotently reconciled from exact SHA/receipt evidence without adopting process state.
 
@@ -360,13 +360,14 @@ Frozen operator surface:
 ```text
 uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>
 uv run adws/maestro.py run resume <run-id>
-uv run adws/maestro.py run amend
+uv run adws/maestro.py run amend <approved-plan> --run <run-id>
 uv run adws/maestro.py run status <run-id>
+
 ```
 
-- `run start` creates the run, initial plan revision, complete DAG projection, and initial `PLANNED` lane states in one transaction, then creates the integration ref.
+- `run start` creates the run, initial plan revision, complete DAG projection, and initial `PLANNED` lane states in one transaction, then creates the integration ref from zero.
 - `run resume` continues the next incomplete stage from the last accepted immutable artifact. After an explicit `PAUSE`, it restores the recorded stage/input. After `AMENDMENT_REQUIRED`, it leaves the lane waiting.
-- `run amend` is the only verb that may apply a `PLAN_AMENDMENT`.
+- `run amend <approved-plan> --run <run-id>` is the only verb that may apply a `PLAN_AMENDMENT`.
 - `run status` derives §6 from durable rows after revalidating `runtime_state_fingerprint`.
 
 An explicit pause records `USER_WAIT` as specified in §5. Publication after a passing final review is the runtime's exactly-once receipt step, not a second stage enum.
@@ -383,9 +384,9 @@ No old run is mapped from prior state, phase, candidate, or generation rows. Sta
 
 ---
 
-## 15. Exact deletion list
+## 15. Removed authorities (historical)
 
-These mechanisms are forbidden in the artifact factory. Source cutover deletes them; this contract already withdraws them. Owners are the current template paths that still contain them until that cutover.
+Source cutover deleted these mechanisms. They are not in the current factory and must not be reintroduced. Former owners are recorded so leftover vocabulary in older docs or logs is recognizable as removed history, not live contract.
 
 | Item | Owner | Why deleted |
 |---|---|---|
@@ -443,7 +444,7 @@ Two-lane vertical slice: lane A has no `needs`; lane B `needs` A. Independent au
 | `README.md` | operator-facing contract |
 | `maestro_prompt.md` | agent-facing contract |
 | `.claude/skills/sssf/templates/adws/` | development template source (not a run host) |
-| `.claude/skills/sssf/templates/adws/maestro.py` | CLI to be cut over to this contract |
+| `.claude/skills/sssf/templates/adws/maestro.py` | template copy of the frozen CLI (not a run host) |
 | `.claude/skills/sssf/templates/adws/maestro.config.yaml` | stamped deployment config; must require absolute `runtime_state_root` |
 | `.claude/skills/sssf/templates/adws/adw_modules/hidden_vault.py` | private vault isolation (retained) |
 | `.claude/skills/sssf/scripts/install.py` | stamps the template into a product repo as `adws/` |

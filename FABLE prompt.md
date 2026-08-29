@@ -1,5 +1,7 @@
 # Fable Goal: Build Maestro from the SSSF Fork
 
+**Shipped execution (current):** this file is the 2026-08-13 architecture-session brief. Live Maestro is the nine-stage artifact factory in `MAESTRO_architecture.md`. Operator verbs are only `run start`, `run resume`, `run amend`, and `run status`. Durable authority is `lane_state.stage` plus immutable artifacts under an external `runtime_state_root`. Candidate, integration, and publication Git refs are immutable; publication is receipt-backed. Herdr and OMP are transport. Do not treat attempt identities, retry/skip/abandon/cancel/bootstrap/plan subcommands, synthetic review nodes, recovery markers, actor generations, or mutable candidate branches as live workflow authority. The Strav inventory below remains historical evidence.
+
 You are the Fable team lead and principal architect for **Maestro**, the existing fork of `disler/super-simple-software-factory` (SSSF).
 
 ## Hard deadline
@@ -15,13 +17,13 @@ You are the Fable team lead and principal architect for **Maestro**, the existin
 Starting from Maestro’s current SSSF fork, design the smallest robust software factory that can:
 
 1. accept planning work from **planf3**, **arch-review/brownfield**, and **prd-to-strav** and produce one internally consistent, mechanically executable, finalized plan;
-2. execute that plan as a dependency DAG, running independent ready nodes in parallel;
-3. isolate every work node in its own Git worktree and merge completed work deterministically;
-4. launch every agent node in a visible **Herdr** pane through an explicit launcher abstraction:
+2. execute that plan as a two-lane dependency DAG: private test author → test review → seal → builder → code review; independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref; dependents start from that integration artifact; final review then receipt-backed publication to `main`;
+3. dispatch each incomplete stage from a fresh ephemeral worktree at the immutable input commit; never adopt a pane, process, dirty tree, or mutable candidate branch; crash resume restarts the current stage from its last immutable artifact;
+4. launch agents in visible **Herdr** panes as transport only through an explicit launcher abstraction:
    - Claude directly;
    - OMP only with explicit `--profile`;
    - Kimi and Grok only through explicit configured routes;
-5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session retries, and SQLite trace.
+5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session correction, and SQLite trace for sequential ADWs; Maestro’s workflow authority is `lane_state.stage`, not envelopes, panes, or attempt rows.
 
 The result must be an **expansion of SSSF**, not another Strav rewrite. Preserve SSSF’s understandable control plane. Add only the capabilities above and the minimum machinery needed to make them correct, durable, observable, and testable.
 
@@ -92,14 +94,14 @@ Minimum roles:
    - eliminate parallel planning authorities and post-validation semantic surprises.
 
 4. **Opus — DAG/worktree/integration architect**
-   - define ready-set scheduling, parallel safety, attempts, crash recovery, worktree ownership, output commits, deterministic merge, conflicts, integration, and cancellation.
+   - define ready-set scheduling, parallel safety, nine-stage `lane_state.stage` authority, crash as stage restart from the last immutable artifact, ephemeral worktree ownership, immutable candidate/integration/publication refs, deterministic merge, conflicts, and receipt-backed publication.
 
 5. **Sonnet — Herdr/launcher architect**
    - source-verify Herdr and launcher behavior;
-   - define route validation, exact argv, pane/worktree binding, session/resume, lifecycle, output normalization, credentials, failures, and trace events for Claude, OMP, Kimi, and Grok.
+   - define route validation, exact argv, pane/worktree binding, session/resume, output normalization, credentials, failures, and trace events for Claude, OMP, Kimi, and Grok. Herdr remains transport, not workflow authority.
 
 6. **Fable — simplicity/adversarial reviewer**
-   - attack every proposed component for duplicate authority, hidden state, unnecessary cryptography, retry ambiguity, nondeterminism, and operator burden;
+   - attack every proposed component for duplicate authority, hidden state, unnecessary cryptography, retry-as-authority, nondeterminism, and operator burden;
    - continually compare design weight with SSSF’s simple spine.
 
 The controlling Fable session owns decomposition and final synthesis only. It must not duplicate worker assignments. Workers must report to the lead and challenge one another directly. If `/team` cannot spawn Fable as a worker, the Fable lead performs Fable synthesis/review after Opus and Sonnet report. Do not silently omit any model family.
@@ -121,7 +123,7 @@ Each worker returns:
 - Opus reviews Fable’s planning/finalization design.
 - Fable reviews Opus’s DAG/worktree design.
 - Sonnet reviews both against actual SSSF code and simplicity.
-- Herdr/launcher architect verifies every node can launch, resume, cancel, and report through every required route.
+- Herdr/launcher architect verifies every lane can launch and report through every required route; cancel is not a Maestro operator verb.
 - Failure archaeologist checks every known Strav failure against a target prevention or detection.
 
 Every challenge names a violated invariant, unsupported assumption, duplicate authority, missing transition, or unverifiable acceptance claim.
@@ -343,14 +345,13 @@ The minimum model must make these distinctions explicit and enforceable:
 - observed current source/evidence;
 - expected producer output absent at base commit;
 - semantic hypothesis requiring review;
-- code node versus agent node;
-- node input/output ownership;
-- dependencies;
-- worktree/base/branch identity;
-- launcher route;
+- code lane versus agent lane;
+- lane input/output ownership;
+- dependencies (`needs`) and declared outputs;
+- immutable candidate/integration/publication refs, not mutable branches;
+- launcher route (transport only);
 - gates and exact acceptance behavior;
-- retry policy by failure class;
-- integration/merge responsibility.
+- integration/merge responsibility (exactly-once merge into the run integration ref).
 
 Do not import Strav’s frozen model wholesale.
 
@@ -361,9 +362,8 @@ Authoring emits exactly one of:
 - one canonical plan digest;
 - all deterministic obligations resolved;
 - no known material caveat;
-- routes and Herdr capabilities preflighted;
 - DAG acyclic/executable;
-- inputs, outputs, worktrees, gates, retries, and merge policy complete;
+- inputs, outputs, gates, and merge policy complete;
 - safe for exactly one independent semantic decision.
 
 ### `AUTHORING_BLOCKED`
@@ -388,41 +388,39 @@ Finalization must be simple:
 
 Add the smallest explicit DAG extension to SSSF. Specify:
 
-- node/edge model;
+- lane/edge model (exactly two dependent lanes in the proven slice);
 - cycle and reference validation;
-- ready-set calculation and stable tie-break;
-- configurable concurrency limit;
-- fan-out/fan-in/barriers;
-- leases and exact attempt identities;
-- idempotent crash recovery;
-- bounded retry classes;
-- cancellation propagation;
-- stale result rejection;
-- dependency output acceptance before launch;
-- one understandable node primitive for code and agents;
-- SQLite representation of decisions/transitions.
+- ready-set: stage is not `MERGED` or `WAITING_FOR_USER` and every `needs` lane is `MERGED`;
+- independent ready lanes may author/review/build concurrently; merges are serialized;
+- nine-stage `lane_state.stage` as the sole durable workflow authority;
+- crash resume restarts the incomplete stage from the last accepted immutable artifact;
+- `run amend` invalidates only the affected stage and transitive dependents;
+- reviewer `PASS`/`REVISE` as artifact data, never synthetic review nodes;
+- dependency integration artifact accepted before a dependent builder starts;
+- SQLite representation of stage and artifacts only — no attempt identity, recovery marker, or actor generation as authority.
 
-Independent ready nodes must overlap in execution. A plan DAG serviced by one serial action loop fails this requirement.
+Independent ready lanes must overlap in execution. A plan DAG serviced by one serial action loop fails this requirement.
 
-Choose one durable lifecycle authority. SQLite may own or mirror it, but DB, JSONL, envelopes, process/pane state, worktree files, and UI cannot compete. Define transaction, crash, and replay semantics.
+Choose one durable lifecycle authority: `lane_state.stage`. SQLite stores it; JSONL, envelopes, process/pane state, worktree files, and UI cannot compete. Define transaction, crash, and replay as stage-boundary commits.
 
 ## C. Per-node worktrees and deterministic merge
 
 Specify:
 
-- clean base commit;
-- unique worktree/branch per node attempt;
-- Herdr pane cwd exactly equal to node worktree;
+- clean immutable input commit;
+- fresh ephemeral worktree per incomplete stage; never adopt a prior pane, process, or dirty tree;
+- Herdr pane cwd exactly equal to that worktree when an agent is dispatched;
 - allowed writes;
-- envelope and commit SHA binding;
-- dirty/unauthorized-write handling;
+- artifact digest and commit SHA binding;
+- dirty/unauthorized-write handling: discard the tree; resume from the last immutable artifact;
 - cleanup;
 - deterministic merge-ready ordering despite nondeterministic finish order;
-- ancestry proof;
-- conflict state/resolution authority;
+- ancestry proof on the integration ref;
+- merge conflict refuses without moving the ref;
 - post-merge acceptance;
-- downstream invalidation;
-- no “merged” state without Git proof.
+- downstream invalidation via `run amend`;
+- no `MERGED` stage without Git proof on `refs/maestro/integration/<run-id>`.
+Never merge a mutable candidate branch. Candidates are immutable refs/SHAs on `BUILDER_OUTPUT`.
 
 ## D. Herdr and launcher abstraction
 
@@ -430,15 +428,14 @@ All agent nodes launch in visible Herdr panes. Herdr is transport/observability,
 
 Define one adapter contract covering:
 
-- allocate/reuse exact pane and recognized agent identity;
-- bind pane cwd to node worktree;
-- launch/readiness/stream/exit/cancel;
-- session creation and continuation;
-- stale/closed/busy/mis-adopted pane detection;
-- typed normalized events;
-- durable pane/agent/attempt correlation in SQLite;
-- token/cost accounting;
-- retryable versus terminal errors;
+- allocate a fresh pane; never adopt a stale/closed/busy pane as workflow state;
+- bind pane cwd to the stage worktree;
+- launch/readiness/stream/exit (transport cancel is not a Maestro operator verb);
+- session creation for the stage only; no live-session adoption on resume;
+- stale/closed/busy/mis-adopted pane detection as transport failure, not stage;
+- typed normalized events as evidence only;
+- no durable pane/agent/attempt identity as workflow authority;
+- token/cost accounting as observation;
 - fake Herdr adapter for offline tests.
 
 Required routes:
@@ -466,19 +463,18 @@ Required routes:
 
 Every route defines binary/provider, model/profile/effort, env/credentials, capability preflight, argv, process/session behavior, normalized outputs/errors, and fake coverage. Launcher behavior cannot hide in prompts.
 
-## E. Typed envelopes, gates, retries, SQLite trace
+## E. Typed envelopes, gates, SQLite trace
 
-Preserve SSSF boundaries but make them DAG/Herdr safe:
+Preserve SSSF sequential-ADW boundaries; Maestro does not use envelopes as stage:
 
-- typed envelope per node kind;
+- typed envelope per sequential ADW phase only;
 - one canonical schema source; generate/check prompt Report examples against it;
 - deterministic post-output gates;
 - gates prove behavior/outputs, not existence only;
-- known commands are code nodes;
-- bounded same-session correction through the same Herdr agent session;
-- budgets per attempt/failure class;
+- known commands are code phases;
+- bounded same-session correction is sequential-ADW only, not a Maestro retry budget;
 - raw output and pane text are evidence only;
-- SQLite records plan digest, run, nodes, edges, attempts, launcher routes/sessions, Herdr panes/agents, processes, envelopes, gate items, worktrees, commits, merges, costs, and events;
+- Maestro SQLite records plan digest, run, `lane_state.stage`, immutable lane/run artifacts, integration/publication receipts; Herdr panes/sessions are observation;
 - one query path serves live and history;
 - no dashboard-only schema or fixture-only truth.
 
@@ -525,17 +521,17 @@ The architecture and implementation plan must prove this using fake Herdr/launch
 7. identical inputs reproduce identical canonical bytes/digest;
 8. one fake independent PASS publishes exactly one runnable identity;
 9. replay performs no second review/publication;
-10. scheduler starts the two independent nodes concurrently in separate worktrees and visible fake Herdr panes;
+10. scheduler starts the two independent ready lanes concurrently in separate ephemeral worktrees and visible fake Herdr panes;
 11. pane cwd matches each worktree;
 12. at least two launcher kinds execute; full matrix covers Claude, OMP, Kimi, Grok;
-13. dependent cannot start early;
-14. each success binds typed envelope, attempt, worktree, and Git commit;
+13. dependent cannot start before every `needs` lane is `MERGED`;
+14. each success binds immutable artifacts, `lane_state.stage`, worktree input commit, and Git SHA — not an attempt identity;
 15. gates reject missing/wrong output, zero/skipped tests, unrelated tests, and unauthorized writes;
-16. commits merge in deterministic order with ancestry proof;
-17. conflict enters one explicit blocked/resolution state;
+16. accepted lanes merge exactly once into the run integration ref with ancestry proof;
+17. merge conflict refuses without moving the ref;
 18. post-merge acceptance proves nonzero real checks;
-19. SQLite reconstructs identical run/node/attempt/pane/merge state after restart;
-20. run accepts only after DAG completion, merge, and integration gates.
+19. after process death, resume reconstructs the incomplete stage from the last immutable artifact, not from pane or dirty-tree state;
+20. publication is receipt-backed after passing final review; `main` at the same SHA without a receipt is refused.
 
 # Required negatives and anti-inert cases
 
@@ -544,22 +540,22 @@ At minimum:
 - DAG cycle, missing dependency, duplicate output owner;
 - future output declared current, or current fact disguised as future output;
 - nonexistent/unrelated selector; zero/skipped/unparseable execution;
-- concurrent nodes share worktree;
-- pane cwd mismatch; stale/closed/busy/mis-adopted pane;
-- pane text falsely says “done” without accepted envelope/event;
-- stale prior-attempt result;
+- concurrent lanes share a worktree;
+- pane cwd mismatch; stale/closed/busy/mis-adopted pane treated as stage;
+- pane text falsely says “done” without an accepted artifact/stage commit;
+- stale prior-stage result treated as current input;
 - missing launcher binary/profile/credential;
 - OMP without `pm_profile`;
 - inferred Kimi/Grok route;
 - Claude routed through OMP;
-- unauthorized write; dirty/divergent worktree; missing output commit;
-- claimed merge without ancestry; nondeterministic ordering; merge conflict;
-- transient launcher failure beyond budget;
+- unauthorized write; dirty/divergent worktree adopted; missing output commit;
+- claimed merge without ancestry; nondeterministic ordering; merge conflict that still moves the ref;
+- treating launcher failure as a Maestro retry/skip/abandon verb;
 - semantic finalization FAIL;
 - same-identity replay; changed bytes with stale receipt;
 - key rotation with unchanged plan;
-- crash during node; crash between completion and durable transition;
-- remove scheduler edge, gate invocation, publication wiring, ancestry guard, profile propagation, pane/worktree binding, or one SQLite transition write.
+- crash during a stage; crash between completion and the durable stage commit;
+- remove scheduler edge, gate invocation, publication wiring, ancestry guard, profile propagation, pane/worktree binding, or one SQLite stage/artifact write.
 
 For every mutation name the deterministic diagnostic/state/test that goes red and one unrelated control that remains green.
 
@@ -573,11 +569,11 @@ Write `/Users/davidandrews/PycharmProjects/maestro/MAESTRO architecture.md` with
 4. **Root causes** — smallest cause set behind the four-week cycle.
 5. **Target Maestro architecture** — components, ownership, one data-flow diagram, one durable authority.
 6. **Canonical planning/finalization model** — concrete models/pseudocode, three planning modes, evidence types, eligibility, review, replay.
-7. **DAG scheduler/state machine** — all states/transitions, ready-set, concurrency, retry, cancel, recovery.
-8. **Worktree/deterministic merge protocol** — Git invariants, order, conflicts, ancestry, cleanup.
-9. **Herdr/launcher architecture** — pane binding plus exact Claude/OMP/Kimi/Grok route/process/session/error contracts.
-10. **Typed envelopes, gates, and SQLite schema** — ownership, transactions, authority versus observation, query path.
-11. **Public operator workflow** — exact proposed CLI for plan, finalize, run, block, fail, resume, cancel, replay.
+7. **DAG scheduler/state machine** — nine `lane_state.stage` values, frozen transitions, ready-set, concurrency, stage-restart resume, `run amend`; no retry/cancel/recovery-marker authority.
+8. **Worktree/deterministic merge protocol** — Git invariants, immutable candidate/integration/publication refs, order, conflicts, ancestry, cleanup.
+9. **Herdr/launcher architecture** — pane binding plus exact Claude/OMP/Kimi/Grok route/process/session/error contracts; transport only.
+10. **Typed envelopes, gates, and SQLite schema** — sequential-ADW envelopes versus Maestro stage/artifacts; ownership, transactions, authority versus observation, query path.
+11. **Public operator workflow** — frozen CLI `run start|resume|amend|status` only; no plan/bootstrap/retry/skip/abandon/cancel subcommands.
 12. **Greenfield implementation plan in Maestro** — ordered slices from current fork, exact files/interfaces, no Strav reuse.
 13. **Verification matrix** — golden, negatives, anti-inert controls, fake Herdr/launchers, install/smoke and before→after proof.
 14. **Simplicity accounting** — modules/LOC, authority/state/reviewer/write counts, rejected complexity.
@@ -592,8 +588,8 @@ Every team member must answer before finalization:
 1. Does this remain recognizably SSSF rather than rebuilding Strav?
 2. Is there exactly one canonical executable plan?
 3. Is every known Strav failure prevented, detected, or explicitly ruled out?
-4. Do independent ready nodes actually overlap?
-5. Can each node prove attempt, pane, worktree, output commit, gates, and merge ancestry?
+4. Do independent ready lanes actually overlap?
+5. Can each lane prove `lane_state.stage`, immutable artifacts, worktree input commit, output SHA, gates, and merge ancestry — without an attempt identity?
 6. Are Claude, OMP, Kimi, and Grok explicit preflighted routes?
 7. Can a lost secret invalidate unchanged plan semantics?
 8. Can any sidecar, prompt, pane, transcript, UI, or prose advance lifecycle state?

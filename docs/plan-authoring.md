@@ -2,15 +2,15 @@
 
 # From a source document to an executable plan
 
-Maestro executes `maestro-plan.v1`. It does not read audits, interview transcripts, architecture
-decks, or HTML specifications, and there is no converter that turns one into a plan. Every such
-document enters the pipeline the same way: as a hash-pinned `source_artifacts` entry inside a
-`plan-contract.v1` Plan IR authored by a planning skill. That IR — with its bound rendered view and
-an independent PASS review receipt — is the single input Maestro accepts.
+Maestro is a nine-stage artifact factory. It does not read audits, interview transcripts,
+architecture decks, or HTML specifications, and there is no converter that turns one into a plan.
+Every such document enters the pipeline the same way: as a hash-pinned `source_artifacts` entry
+inside a `plan-contract.v1` Plan IR authored by a planning skill. That IR — with its bound rendered
+view and an independent PASS review receipt — is the single input the plan compiler accepts.
 
 ```
-source documents ──► plan-contract.v1 Plan IR  ──► maestro-plan.v1 ──► run
-   (audit HTML,       + extensions.maestro          (projection)
+source documents ──► plan-contract.v1 Plan IR  ──► approved plan revision ──► run
+   (audit HTML,       + extensions.maestro            (compiler-admitted)
     interview,        + bound HTML view
     arch deck)        + PASS review receipt
 ```
@@ -18,31 +18,95 @@ source documents ──► plan-contract.v1 Plan IR  ──► maestro-plan.v1 �
 Because there is exactly one entry format, "support a new kind of input document" never means
 building a new adapter. It means citing that document as a source in a plan.
 
-## The projection boundary
+The shipped operator surface after an approved plan exists is only:
 
-`plan_contract_ingress.author_from_plan_contract` is an authoring boundary, not a lossy converter.
-It verifies the receipt against the exact IR bytes, projects the IR onto a Maestro draft, and
-refuses anything it cannot execute:
+```text
+uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>
+uv run adws/maestro.py run resume <run-id>
+uv run adws/maestro.py run amend <approved-plan> --run <run-id>
+uv run adws/maestro.py run status <run-id>
+```
 
-| Contract element | Becomes |
-| --- | --- |
-| `lanes[]` | plan nodes |
-| `lane.depends_on` | node `needs` |
-| `lane.execution_context` | the node gate's `cwd` |
-| `verifiers[]` | node gates (`runner`, `argv`, `min_cases`) |
-| `source_artifacts[]` | observed evidence |
-| `extensions.maestro.outputs` | produced evidence |
-| `extensions.maestro.integration_gate` | the merge policy's integration gate |
+`run start` must execute from the stamped deployment (`adws/maestro.py`), not from Maestro,
+the-library, or any other template source (`RUN_REPOSITORY_MISMATCH`). Ledger, vault, locks,
+receipts, copied plans, and ephemeral worktrees live only under the deployment's absolute
+`runtime_state_root` (mode `0700`, outside the target repository). Every start, resume, amend, and
+status revalidates `runtime_state_fingerprint` before reading or mutating run state.
 
-Two consequences follow from the receipt being bound to the IR bytes:
+Authoritative contract: `MAESTRO_architecture.md`.
 
-1. `extensions.maestro` MUST be present before the plan is rendered and reviewed. Adding it to an
-   approved IR changes the bytes and the projection refuses with `RECEIPT_IR_MISMATCH`.
-2. Repairing a plan means re-rendering, re-validating, and obtaining a fresh receipt — never
-   editing an approved IR in place.
+## The compiler boundary
 
-An `architecture` plan is refused outright (`ARCHITECTURE_NOT_EXECUTABLE`). It is the anchor a
-brownfield plan pins, not something that runs.
+The plan compiler admits a plan if and only if these objective properties hold. It does not judge
+produced-symbol reachability, narrative quality, or other generic semantics.
+
+- Schema and required fields are present and well-typed.
+- Every `needs` ID exists in the same plan.
+- The dependency graph is acyclic.
+- Declared outputs are exact normalized repository-relative POSIX file paths, never directories or
+  globs.
+- Paths have no absolute, empty, `.`, or `..` components.
+- No duplicate, equal, ancestor, or descendant ownership conflicts exist across lanes.
+- Each lane declares public acceptance criteria.
+- Integration order is deterministic from the DAG.
+
+Runtime path comparison is byte-exact after that normalization. It never follows a candidate
+symlink.
+
+An `architecture` plan is refused as executable work (`ARCHITECTURE_NOT_EXECUTABLE`). It is the
+anchor a brownfield plan pins, not something that runs.
+
+Repairing a plan means a new approved revision (and, once a run exists, `run amend`), never editing
+an approved IR in place.
+
+## Nine-stage lane execution
+
+Exactly these stages exist. The persisted `lane_state.stage` field is the sole durable workflow
+authority. Git commits and sealed artifact digests identify immutable inputs and outputs; they do
+not independently encode stage.
+
+```text
+PLANNED
+WRITING_TESTS
+REVIEWING_TESTS
+TESTS_SEALED
+BUILDING
+REVIEWING_CODE
+READY_TO_MERGE
+MERGED
+WAITING_FOR_USER
+```
+
+Product flow for every ready lane:
+
+1. Materialize `LANE_PLAN` from the approved plan artifact (`PLANNED` → `WRITING_TESTS`).
+2. Private test author emits `TEST_DRAFT` (private draft digest/ref plus public behavioral
+   contract).
+3. Test reviewer emits `TEST_REVIEW`: `PASS` seals; `REVISE` returns to the author with four-key
+   actionable findings.
+4. `SEALED_TEST_BUNDLE` records vault digest/reference. Private bytes are absent from the run
+   repository and from every builder input.
+5. Builder emits `BUILDER_OUTPUT` bound to plan revision, integration base SHA, sealed-test digest,
+   and an immutable candidate ref/SHA. The builder receives the public contract, architecture
+   constraints, allowed paths, prior redacted review, and the sealed digest. It never receives
+   private source, fixtures, selectors, expected literals, or vault paths.
+6. Code reviewer runs the sealed tests against the candidate and emits `CODE_REVIEW`. `PASS`
+   advances to merge; `REVISE` returns to `BUILDING` with redacted findings.
+7. `INTEGRATION_MERGE` records `before_sha`, accepted candidate SHA, and `after_sha`. Each accepted
+   lane merges exactly once into `refs/maestro/integration/<run-id>`.
+8. A dependent lane's first `BUILDING` input includes every needed lane's accepted integration
+   artifact.
+9. When every lane is `MERGED`, final integration review evaluates the integration commit with all
+   sealed tests. `PASS` permits exactly-once publication to `main` with an immutable receipt;
+   `REVISE` waits for `run amend`.
+
+`REVISE` is artifact data, not a stage. Review roles are stages of the lane, never synthetic DAG
+nodes. Resume after process death recreates the current incomplete stage from its last immutable
+input. No live actor, pane, dirty worktree, or process is adopted.
+
+A `REVISE` finding must include violated requirement, observed behavior, required behavior, and
+implementation area. It must not include private test source, fixtures, selectors, expected
+literals, or vault paths.
 
 ## Single repository
 
@@ -51,384 +115,205 @@ Run these in the repository the plan will change.
 1. `/arch-review <master-spec>` — author or refresh the approved architecture IR. It produces
    `.maestro/<stem>.plan.json`, `.maestro/<stem>.html`, and `.maestro/<stem>.plan-review.json`.
    Skip only when an approved architecture IR already exists.
-2. `/plan-brownfield "<what to build>" <master-spec>` — author one executable work package per
-   reviewable unit, each carrying `extensions.maestro`. Place the IR, its bound HTML view, and its
-   review receipt under `.maestro/` — `.maestro/<name>.plan.json`, `.maestro/<name>.html`,
-   `.maestro/<name>.plan-review.json` — alongside `.maestro/plans/`, where Maestro projects the
-   finished plan.
-3. `maestro plan gate <plan-name>` — the author renders, validates, and mutates the IR.
-4. `maestro plan review <plan-name>` — a second person, holding the reviewer's key rather than the
-   author's, reviews the mutated IR and re-validates it against the approved-receipt requirement:
-   `planctl review` followed by `planctl validate --require-approved`. **No model is dispatched.**
-   The verb takes the reviewer's configured identity and vendor as strings and signs a receipt
-   bound to the IR bytes by `ir_sha256`; it does not contain a semantic reading of `surface` or
-   `effects`. Those two fields have no independent reader before a run begins (#31). Whatever
-   judgement the review represents is the reviewer's own, made before they run the verb — the verb
-   records that it happened and to which exact bytes, and nothing more.
-5. `maestro plan ship <plan-name>` — projects the reviewed IR into a `maestro-plan.v2` plan,
-   validates the projection, and finalizes it. Finalizing is required before the plan can run, and
-   before it can participate in a workspace. **No model is dispatched here either.**
-   `maestro plan finalize` runs the deterministic obligations and, if the plan is eligible, writes
-   the signed receipt itself — verdict PASS, rubric version `maestro-deterministic.v1`, no cells,
-   and a reviewer identity of `(deterministic, plan_validate, <digest>)`, because that is what
-   actually judged the bytes. It used to launch a reviewer in a pane and derive the verdict from
-   that reviewer's per-cell answers; the prompt it handed over was the matrix of check ids, the
-   plan digest, and a path to write to, and it never contained the plan. A lifecycle transition
-   caused by a model's answers about a plan it was not shown is what §1.2 forbids, so the reviewer
-   was removed rather than repaired. Eligibility is unchanged, and an ineligible plan still exits 2
-   with typed blockers and no receipt.
+2. `/plan-brownfield "<what to build>" <master-spec>` or `/planf3` — author one executable work
+   package per reviewable unit, each carrying `extensions.maestro`. Place the IR, its bound HTML
+   view, and its review receipt under `.maestro/`.
+3. Obtain an independent PASS review receipt bound to the exact IR bytes. Adding
+   `extensions.maestro` after that receipt changes the bytes and is refused.
+4. `uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>`
+   — creates the run, initial plan revision, complete DAG projection, and `PLANNED` lanes in one
+   transaction, then creates the integration ref. Operator execution is only from the stamped
+   `adws/` deployment.
+5. `run resume <run-id>` continues the next incomplete stage from the last accepted immutable
+   artifact. After an explicit pause it restores the recorded stage/input. After
+   `AMENDMENT_REQUIRED` it leaves the lane waiting.
+6. `run amend <approved-plan> --run <run-id>` is the only verb that may apply a `PLAN_AMENDMENT`. Named already-merged lanes must
+   change `spec_digest` (hence `lane_projection_digest`); `needs`/output changes on merged lanes are
+   refused.
+7. `run status <run-id>` derives run status from durable rows after revalidating
+   `runtime_state_fingerprint`.
 
-The version the projection emits is `maestro-plan.v2`, and a run refuses anything older. The bump
-is not a structural change: v2 carries the same in-plan types, the same fields, and the same
-obligations as v1, and `plan_model.PlanV2` subclasses the frozen `Plan` for exactly that reason.
-What moved is what the projection *puts in* an agent node's `instruction`. It used to write the
-lane's title there and drop `requirements[].text`, so every builder and every reviewer downstream
-was handed a summary of the lane's contract instead of the contract itself (§19 M26). A populated
-field cannot be audited by its consumers: the fixed projection went on emitting the same
-`maestro-plan.v1` the degenerate one emitted, so a plan shipped before the fix and a plan shipped
-after it were indistinguishable to a runtime carrying every fix. The version string is the only
-channel that difference can travel on.
+There is no `retry`, `skip`, `abandon`, or `attempt salvage` verb. Those mechanisms are withdrawn.
 
-`_load_runnable_plan` — the one function that turns plan bytes into a plan a run will execute, and
-so the point `run start`, `run resume`, and a workspace participant all cross — refuses a plan whose
-declared version is outside `_RUNNABLE_PLAN_SCHEMA_VERSIONS` with
-`RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE`, naming the plan, the version found, and the remedy. It is an
-allowlist rather than a denylist: a version registered later and not added to it refuses rather than
-runs. A `maestro-plan.v1` plan stays readable, canonical, validatable, and finalizable; only running
-it is refused.
+## Public contract a tests lane must declare
 
-If you hold a plan shipped before the bump, re-ship it. There is no upgrade function and no in-place
-edit (§6.3) — the requirement text a v1 plan is missing is not recoverable from the projected plan,
-only from the IR it was projected from. Run `maestro plan ship <plan-name>` again against the same
-`.maestro/<name>.plan.json` and its existing `.maestro/<name>.plan-review.json`: nothing needs to be
-re-approved, because the IR bytes and the receipt bound to them are unchanged. The projection is
-simply re-run by code that carries the requirement text, and the plan is re-validated and
-re-finalized under a new digest.
+A tests lane authors private tests that later judge a builder. What the compiler and builder see is
+the **public behavioral contract**, not the test source.
 
-`gate`, `review`, and `ship` are the plan CLI's shipped surface — one verb, one argument,
-everything else resolved from `maestro.config.yaml`. They landed in commit 6707e50 (PR #8) and are
-registered on the `plan` subparser in `maestro.py`. Run them directly; "What each verb runs" below
-documents the calls each one wraps, for reading the trace rather than for hand-running the steps.
+Author public acceptance criteria on the lane. Declared outputs are the implementation files the
+paired build lane may write — never the private test paths. The sealed bundle's public payload is
+acceptance criteria plus declared outputs plus `sealed_digest`. Private draft bytes stay in the
+vault.
 
-`gate` and `review` are two separate commands, on purpose, because of who is allowed to hold what.
-A review receipt only proves that someone other than the author looked at the plan if the author
-is structurally incapable of producing one, which means the HMAC key that signs receipts must never
-sit in the author's environment. Maestro owns that key itself rather than handing it to whoever
-types the command: `maestro bootstrap` mints it once into the repository's state root, next to the
-Ed25519 signing material it already manages, and `maestro plan review <plan-name>` — which takes
-the plan name and nothing else — injects the key into the `planctl review` subprocess directly. No
-shell ever holds it, no export line exists, and there is no reviewer identity to pass. (An
-environment-variable override remains, for a reviewer who deliberately supplies their own key, the
-same way the Ed25519 signing key already supports one; the ordinary path never touches it.)
+**The builder cannot read those tests.** That is the shipped contract, not a future option. Sealed
+tests never enter the run repository, the builder worktree, builder refs, rev-list, or fetch paths.
+Anyone auditing a builder prompt and finding private test source, fixtures, selectors, or expected
+literals is looking at a leak.
 
-Bootstrap's environment files are split along the same line, because for a while they were not.
-`maestro bootstrap` writes two files into `<state-root>/<repo>/keys/`, both 0600: `maestro.env`,
-carrying the verify key, the signing seed, and the route verify key — everything author-side work
-needs, and nothing that can make a gate refuse — and `reviewer-hmac.env`, carrying the reviewer
-binding and nothing else. Source `maestro.env` freely. Nothing in Maestro's supported path reads
-`reviewer-hmac.env`: it exists only for driving `planctl review` directly, outside Maestro, as
-`/arch-review` does for an architecture IR, and sourcing it in an authoring shell is exactly what
-`REVIEWER_KEY_PRESENT` is there to catch. While the two bindings shared one file, an operator who
-sourced it to finalize or start a run had the reviewer's key in their shell, `gate` correctly
-refused their own plan, and the only way forward was unsetting and re-exporting a variable by hand
-between stages — which is where the key got lost. Maestro's own bootstrap was what put it there.
+A `REVISE` from code review may name the violated public requirement and the implementation area. It
+must not quote the private assertion.
 
-If your state root still holds a combined `maestro.env`, re-run `maestro bootstrap`: it rewrites
-that file in place without the reviewer binding and writes `reviewer-hmac.env` beside it. No key is
-regenerated and no receipt already signed is invalidated — `provision_keys` reuses the key material
-it finds. Re-running does **not** clean a shell that already sourced the old file, so in any shell
-that did, `unset PLANCTL_REVIEWER_HMAC_KEY` (or open a new one) before `maestro plan gate`.
+### Practical authoring rules
 
-`gate` enforces the same boundary from the other side: it refuses outright if that key is present
-in its own environment, because a gate command able to see the reviewer's key would no longer prove
-that
-gating and reviewing happen on two sides of a line neither side can cross. Nobody has to remember to
-keep the key separate — Maestro checks for it before either command does anything else.
-
-### What each verb runs
-
-```bash
-# maestro plan gate <plan-name>
-planctl render <name>.plan.json --repo-root .
-planctl validate <name>.plan.json --repo-root .
-planctl mutate <name>.plan.json --repo-root .
-
-# maestro plan review <plan-name>  — runs with the reviewer's key, never the author's
-planctl review <name>.plan.json --repo-root .
-planctl validate <name>.plan.json --repo-root . --require-approved
-
-# maestro plan ship <plan-name>
-maestro plan author <plan-name> \
-  --from-plan-contract .maestro/<name>.plan.json \
-  --plan-contract-receipt .maestro/<name>.plan-review.json \
-  --plan-contract-rendered .maestro/<name>.html
-maestro plan validate <plan-name>
-maestro plan finalize <plan-name>
-```
-
-Every `planctl` call carries `--repo-root .` because the IR lives in `.maestro/` while the
-`source_artifacts` paths it cites are repo-relative (`docs/AUDIT.md`, not `.maestro/docs/AUDIT.md`).
-Without `--repo-root`, planctl resolves those paths relative to the IR's own directory, so that same
-source would have to be written `../docs/AUDIT.md` to be reached from inside `.maestro/` — and
-Maestro refuses any path that escapes with `..`. `--repo-root .` is what lets the IR live in
-`.maestro/` at all; `gate` and `review` pass it on every call so `planctl` and Maestro agree on
-where "repo-relative" starts.
-
-`validate` reproduces every ingress refusal a later step would hit, so a plan that passes it inside
-`gate` is a plan that projects inside `ship`.
-
-## Choosing a verifier command
-
-Every lane declares one verifier — the command that proves the lane's work happened. Maestro does
-not merely run it; it counts how many test cases actually executed and checks that count against
-the lane's `min_cases` floor. Counting is why the runner set is closed: Maestro has to parse the
-runner's report, so `Gate.runner` is `Literal["pytest", "vitest"]` and nothing else projects.
-
-| Verifying | Command shape |
-| --- | --- |
-| Python | `pytest <targets>` or `python3 -m pytest <targets>` |
-| JavaScript / TypeScript, including React and Next.js | `npx vitest run <targets>` or `vitest <targets>` |
-
-A shell script, a Makefile target, a migration applied with `psql`, or a `curl` health check proves
-nothing countable and is refused with `maestro.command`. That is not a gap to work around — it is
-the reason the gate means something. Work of that kind is verified by asserting its *effect* from a
-test the runner can count:
-
-```python
-# tests/test_mdl_schema.py — verifier command: pytest tests/test_mdl_schema.py
-def test_mdl_cases_carries_a_docket_number():
-    assert "docket_number" in columns_of("mdl_cases")
-```
-
-### Practical rules
-
-- **Pass the real argv, never a script alias.** `npm test` and `make test` are refused even when
-  they ultimately invoke vitest, because Maestro has to see the selector to know what the gate
-  actually covers. Write `npx vitest run src/ingest.test.ts`.
-- **Choose vitest over Jest when setting up a new JavaScript or TypeScript repository.** Adding
-  tests to such a repository is ordinary project work — `npm i -D vitest @testing-library/react
-  jsdom` — and needs no change to Maestro. Choosing Jest does: `Gate.runner` would have to accept
-  it and the executor would have to parse its report.
-- **Playwright and Cypress cannot currently be gates** for the same reason. End-to-end coverage
-  either waits on that change or is asserted through a countable test.
-- **One verifier per lane.** The projection gives each node exactly one gate, so a lane binding
-  zero or several verifiers is refused with `maestro.lane_gate`. When a lane genuinely needs two
-  independent checks, either widen one command's selector to cover both or split the lane.
-
-## What a tests lane must declare
-
-A `tests` lane writes the tests a later build lane has to make pass. It also declares **what those
-tests must prove**, in a field the runtime executes rather than reads.
-
-You author it on the lane's **verifier**, in the plan-contract IR:
-
-```json
-"verifiers": [
-  {
-    "verifier_id": "verify-refund-tests",
-    "lane_ids": ["lane-refund-tests"],
-    "command": "pytest tests/test_refund.py",
-    "min_executed": 2,
-    "test_strength": { … the object below … }
-  }
-]
-```
-
-`maestro plan ship` projects it onto the tests node and emits `maestro-plan.v4`. A tests lane
-whose verifier declares none is refused at projection with
-`UNMAPPABLE_VERIFIERS:<lane>.test_strength`, and a build lane's verifier that declares one is
-refused the same way — it would be a field nothing reads. The projected node looks like this:
-
-```json
-"test_strength": {
-  "coverage": [
-    {"requirement_id": "R-refund-01", "aspect": "positive",
-     "case_selector": "test_refund_pays_the_balance", "min_cases": 1},
-    {"requirement_id": "R-refund-01", "aspect": "negative",
-     "case_selector": "test_refund_rejects_a_negative_amount", "min_cases": 1}
-  ],
-  "falsifiability": {
-    "strategy": "baseline_absent",
-    "mutation": null,
-    "expected_failing_selector": "test_refund",
-    "expected_reason_pattern": "refund must be positive"
-  }
-}
-```
-
-`maestro run start` refuses a plan whose tests lanes declare none —
-`RUN_TEST_STRENGTH_CONTRACT_ABSENT`. An existing run of an older plan is unaffected and stays
-resumable; it is pinned to the contract it was created under. There is no upgrade function and no
-in-place edit (§6.3): add the block to the IR and re-ship.
-
-**Why the plan declares the case names.** §1.2 forbids keying a lifecycle transition on an agent's
-account of its own work, so the tester is never asked whether it covered a requirement. The plan
-says which case ids would prove it did, and code counts them. `case_selector` is a substring of the
-case id (`path::case` under pytest, `file::full name` under vitest), because it has to mean the same
-thing under both runners and they disagree about `-k` and `--testNamePattern`.
-
-**Every requirement needs a positive and a negative obligation.** A contract that names only happy
-paths does not parse. That rule exists because of one measured run: a tests lane reached `MERGED` on
-four non-skipped cases and every implementation candidate it existed to gate was independently
-rejected — the tests asserted what the code should do and never what it must refuse.
-
-**The falsifiability strategy is executed, not stored.**
-
-| strategy | what runs | when to use it |
-| --- | --- | --- |
-| `baseline_absent` | the candidate's own cases, in a tree where the implementation does not exist yet | test-first: the paired build lane has not run |
-| `controlled_mutation` | the same cases against a scratch copy with `mutation.paths` reverted to the plan's `base_commit` | brownfield: the behaviour already exists and the control must remove it |
-
-The failure must **match** `expected_reason_pattern` — a Python regular expression over the runner's
-own reported reason. A random exception, an import error, or a collection failure is refused by
-name: it proves the tree does not import, not that the cases discriminate. A `controlled_mutation`
-may only revert paths the **paired build lane** declares as outputs, and never the tests lane's own
-files; both are refused at admission with `TEST_STRENGTH_COHERENT`.
-
-Nothing is mutated in place. The control materialises the candidate commit into a scratch directory
-outside every worktree, reverts there, and discards it; the attempt worktree's cleanliness is
-compared across the whole operation and a control that leaves dirt behind is refused.
-
-**What the pair costs downstream.** The build lane that needs this tests lane cannot start until the
-tests lane has an *accepted candidate* — strong measured evidence **and** a passed independent
-review, both bound to one immutable sha. When it does run, its own commit must carry the accepted
-test files byte-identically, and the accepted contract's coverage obligations must be green against
-it. The merge verifies that exact pair and refuses anything else.
-
-**The build lane can read those tests, and that is the design rather than a leak.** They merged
-before it branched, they are in its worktree, and the rule above requires its own commit to carry
-them. Anyone auditing a builder prompt and finding the test source in it is looking at the contract
-working: the prompt attaches bytes the builder already holds, which saves it the context of going to
-find them.
-
-## `test_visibility` — authored in v5, not yet runnable
-
-A `maestro-plan.v5` tests lane declares `test_visibility`, either `"merged"` or `"hidden"`.
-
-`"merged"` is everything above and is what every v1–v4 plan means. Nothing about those plans
-changes, and they remain runnable — a version this project has dropped before, and #104 is the
-record of what that cost.
-
-`"hidden"` withholds the test files from the builders their cases judge. It is **declarable and not
-yet executable**: `maestro-plan.v5` is deliberately absent from the runtime's runnable set, so a v5
-plan is refused at `run start` with `RUN_PLAN_SCHEMA_VERSION_UNRUNNABLE` until the out-of-band gate
-machinery exists. Authoring one today is therefore a statement of intent, not a runnable plan.
-
-What has landed is the prerequisite the feature turns on. A hidden tests node's attempt runs in a
-separate bare repository — the vault — so its bytes never enter the run repository's object
-database, which is the only place containment can live: a linked worktree shares its parent's
-object database, and on 2026-08-27 a live builder worktree printed the blob of the test file its own
-lane was gated by. A hidden lane must also declare a `test_strength` contract, because that
-contract's coverage obligations are the entire vocabulary a sanitised repair handoff is permitted to
-speak back to a builder that cannot see the cases.
-
-The full design, including what it does not buy, is `docs/hidden-tests-design.md`.
+- **Write the public acceptance so it is falsifiable without leaking the encoding.** "Negative
+  amounts are refused" is a contract. The private `assert` message is not.
+- **Keep private tests out of declared outputs.** A path the builder is allowed to write cannot also
+  be the hidden suite.
+- **One owner per path.** Exactly one lane may own a path — a second lane declaring it is refused.
+  A lane's instruction has to be dischargeable inside that permission.
+- **Do not invent a second gate command for the builder.** Code review runs the sealed suite in a
+  harness scratch tree composed from the candidate commit plus vault blobs. The builder does not
+  receive runner argv that names private paths.
 
 ## What a lane's outputs must cover
 
 A lane's `outputs` are not a summary of what it will touch. They are its entire write permission.
-Exactly one lane may own a path — a second lane declaring it is refused with
-`SINGLE_OUTPUT_OWNER` — and the attempt's permission check convicts any diff that touches a path
-the lane did not declare. Nothing in between exists: a file is yours to write or it is not.
+Exactly one lane may own a path, and a candidate that touches an undeclared path is refused. Write
+the instruction and the outputs together, and ask one question before shipping: **could an agent
+satisfy this sentence by changing only these files?**
 
-So a lane's instruction has to be dischargeable inside that permission. Write the instruction and
-the outputs together, and ask one question before shipping: **could an agent satisfy this sentence
-by changing only these files?**
-
-An instruction that fails that question is unsatisfiable from its first attempt, and the failure is
-silent. The node reviewer correctly rejects every diff that does not do what the instruction says;
-the permission check would correctly reject every diff that does. The lane then spends its whole
-review budget alternating between the two before ending `BLOCKED` with `REVIEW_BUDGET_EXHAUSTED` —
-with a green gate and a rising case count every attempt, because the work it *was* permitted to do
-was fine.
-
-**Nothing downstream will catch this for you.** A plan-finalization reviewer used to be asked it as
-a rubric cell, `node.writes_are_sufficient`; that reviewer is gone, and `maestro plan finalize` is
-deterministic now, so no check between the authored bytes and the run reads an instruction against
-its `outputs`. It is a question for the authoring round and for `maestro plan review`, where a
-person holding the reviewer's key reads the IR — and the whole cost of getting it wrong is paid at
-run time, one lane's review budget at a time.
+The compiler does not read an instruction against its outputs. That question belongs to the
+authoring round and the independent plan review. The cost of getting it wrong is paid at run time:
+code review `REVISE` loops, not a review-budget exhaustion state.
 
 The shape that trips it is an end-to-end behavioural claim over code the lane does not own:
 
 ```
 # refused — the property is about src/dispatch.py, which another lane owns
 lane: enrichment-ordering
-outputs: [src/enrichment_gate.py, tests/test_enrichment_gate.py]
+outputs: [src/enrichment_gate.py]
 instruction: "run enrichment only after binary and identity validation"
 ```
 
-Two ways to fix it, and the choice is a real one:
+Two ways to fix it:
 
 - **Give the lane the wiring.** Add the production file to its `outputs`, which means no other lane
   may own it. Use this when the ordering *is* the work.
-- **Split it, and make the wiring a lane.** One lane produces the module and says so — "add
-  `src/enrichment_gate.py` exposing `enrich_after_validation`; wiring it into dispatch belongs to
-  `lane-dispatch-wiring`" — and a downstream lane owns `src/dispatch.py` and calls it. Both lanes
-  pass, because each instruction stops at the files its lane may write.
+- **Split it.** One lane produces the module; a downstream lane owns `src/dispatch.py` and calls
+  it. Both pass because each instruction stops at the files its lane may write.
 
-A lane whose outputs are all new files is not itself suspect; it is the ordinary case, and most
-lanes in a greenfield package look like that. What is suspect is a lane whose *sentence* only comes
-true once some file it may not write changes. If nothing in the plan ever wires the new module into
-the codebase, that is a different defect and a different check —
-`plan.intent_is_accomplished_by_the_graph`, which asks whether the lanes taken together leave
-anything load-bearing unowned.
+A lane whose outputs are all new files is the ordinary greenfield case. What is suspect is a lane
+whose *sentence* only comes true once some file it may not write changes.
 
 ## What a review rejection costs
 
-A rejection is not a fresh start. It records typed findings and one repair
-handoff, then returns to the retained builder session and worktree. Review is
-not the repair trigger: a `SEMANTIC` failure with a proven output SHA still
-opens the chain. The builder is asked to change the rejected candidate — the
-findings name what to change, and the lane's `instruction` still leads the
-prompt and still bounds the work. Consecutive rejections are therefore rounds
-of refinement on one artifact rather than independent implementations, and a
-`review_ceiling` of six buys six rounds rather than six one-shot guesses.
+A rejection is not a fresh start and it is not a retry budget. `TEST_REVIEW(REVISE)` returns the
+lane to `WRITING_TESTS` with the same `LANE_PLAN` and four-key findings. `CODE_REVIEW(REVISE)`
+returns the lane to `BUILDING` from the sealed bundle and redacted findings. Neither loop requires
+`run amend`.
 
-Two consequences for authoring. First, write the `instruction` so it reads correctly a second time,
-against a tree that already contains a partial answer: a sentence that only makes sense as a
-green-field brief ("create `src/gap_policy.py`") is weaker on a repair attempt than one that names
-the property the file must have. Second, a repair is refused, and the attempt falls back to a fresh
-base, whenever a sibling lane has merged since the rejection was measured — the rejected commit no
-longer sits on the integration head, and handing the builder a tree missing the sibling's work
-would be worse than restarting. Lanes that finish close together therefore lose repair chains to
-each other, which is one more reason to keep a phase's lanes genuinely independent.
+Two consequences for authoring. First, write the instruction so it reads correctly a second time,
+against a tree that already contains a partial answer. Second, if a sibling lane has merged, a
+zero-delta or stale-base candidate is handled by `BASE_INVALIDATION` back to `BUILDING` from the
+new integration HEAD — not by salvaging a dirty worktree.
 
-The chain is bounded: `REPAIR_CHAIN_LIMIT` caps consecutive repairs, a repair whose findings rose
-above the rejection it repaired ends the chain, and the number of chains is bounded by
-`review_ceiling`, which the loop does not change. Nothing here adds attempts; it changes only what
-an attempt the budget had already paid for starts from.
+Process death restarts the current incomplete stage from its last immutable artifact. `run resume`
+does not adopt a live session.
 
-`maestro run convergence` is how you read this from outside. It reports findings per attempt for
-each lane, which is the trend a repair chain is supposed to produce, and it distinguishes a run
-that ended without converging from one that has not converged *yet*: a live run reports "not
-converged yet" with cause `run still in flight`, and a run whose scheduler cannot be found on this
-machine reports that it cannot say rather than asserting either answer.
+`run status` is how you read this from outside. It derives complete / waiting / executing /
+integration-review-pending / publishable from durable rows. Pane text and scheduler liveness are
+not authority.
 
 ## Several repositories
 
-There is no multi-repository Plan IR. Each repository runs the whole single-repository sequence to
-a PASS finalization receipt; the repositories are then bound by one `maestro-workspace.v1` manifest
-that declares participation and cross-repository ordering and nothing else.
-
-```bash
-maestro workspace author --from workspace-draft.json --out workspace.json --root .
-maestro workspace validate --manifest-file workspace.json
-```
-
-`workspace author` fills each writer's `plan_digest` and `base_commit` from its stored plan and
-refuses a writer whose finalization receipt is missing, not PASS, or bound to different plan bytes.
-A manifest therefore cannot be authored ahead of the work it coordinates. See the `plan-workspace`
-skill for the draft shape and the full refusal list.
+There is no multi-repository Plan IR in the proven two-lane slice. Each repository is one run
+against one `--repo` publication worktree. Cross-repository workspace leases are not workflow
+authority.
 
 ## Which skill authors what
 
 | Input | Skill | Emits | Executable |
 | --- | --- | --- | --- |
 | a mapped codebase, a master spec | `arch-review` | `plan_kind: architecture` | no — anchor only |
-| an approved architecture IR plus a change request | `plan-brownfield` | `plan_kind: brownfield` | yes |
-| a greenfield request | `planf3` | `plan_kind: implementation` | yes |
-| finalized plans in several repositories | `plan-workspace` | `maestro-workspace.v1` | yes |
+| an approved architecture IR plus a change request | `plan-brownfield` / `arch-brownfield` | `plan_kind: brownfield` | yes, after compiler admission |
+| a greenfield request | `planf3` | `plan_kind: implementation` | yes, after compiler admission |
+| interview notes | `deep-interview` | requirements that feed the IR | no — input only |
 
-The shared contract, the `extensions.maestro` shape, and every diagnostic that mirrors an ingress
-refusal are documented in the `plan-contract` skill.
+The shared contract and the `extensions.maestro` shape are documented in the `plan-contract` skill.
+Execution after admission is `MAESTRO_architecture.md`.
+
+---
+
+## Historical — plan CLI, schema versions, and merged tests
+
+The remainder records withdrawn operator surface and the pre-factory pairing rule. It is not the
+shipped contract. Do not follow it for new plans or runs.
+
+### Historical projection and `maestro-plan.v*`
+
+Ingress used to project Plan IR onto `maestro-plan.v1`/`v2`/`v4` node graphs with per-node gates
+(`runner`, `argv`, `min_cases`). `_load_runnable_plan` refused versions outside
+`_RUNNABLE_PLAN_SCHEMA_VERSIONS`. `maestro-plan.v5` `test_visibility` was authored and then excluded
+from the runnable set so a hidden node could not half-execute. The factory compiler no longer
+admits a plan by schema-version allowlist of those projections; it admits objective DAG/schema
+properties only.
+
+`plan_contract_ingress.author_from_plan_contract` verified a receipt against IR bytes and projected
+lanes onto nodes, `depends_on` onto `needs`, `execution_context` onto gate `cwd`, and `verifiers[]`
+onto `pytest`/`vitest` gates. That gate object is not a lane stage.
+
+### Historical `plan gate` / `review` / `ship` and bootstrap keys
+
+The plan CLI's shipped surface was `maestro plan gate|review|ship`. `gate` wrapped `planctl render`,
+`validate`, and `mutate`. `review` injected a reviewer HMAC key into `planctl review` and
+`--require-approved`. `ship` projected IR into a Maestro plan and ran deterministic `plan finalize`
+(rubric `maestro-deterministic.v1`), after an earlier pane-launched reviewer was removed as a §1.2
+violation.
+
+`maestro bootstrap` minted `maestro.env` and `reviewer-hmac.env` under the state root so authors
+could not sign their own review receipts. `REVIEWER_KEY_PRESENT` refused `gate` if the reviewer key
+was in the environment. Combined `maestro.env` files had to be rewritten. That key split is not the
+factory operator surface. Factory execution uses `run start|resume|amend|status` against
+`runtime_state_root`.
+
+`planctl` calls carried `--repo-root .` because IR lived in `.maestro/` while `source_artifacts`
+were repo-relative. Maestro refused `..` escapes.
+
+### Historical verifier commands and `test_strength`
+
+Every lane declared one countable verifier. `Gate.runner` was `Literal["pytest", "vitest"]`. Shell
+scripts, Make targets, and health checks were refused as `maestro.command`. Authors were told to
+pass real argv (`npx vitest run …`), never `npm test`. Playwright/Cypress could not be gates.
+
+A tests lane's verifier carried `test_strength`: `coverage[]` with `requirement_id`, `aspect`
+(positive and negative both required), `case_selector` substring, `min_cases`, plus
+`falsifiability.strategy` of `baseline_absent` or `controlled_mutation` matching
+`expected_reason_pattern`. `maestro run start` refused `RUN_TEST_STRENGTH_CONTRACT_ABSENT`.
+`case_selector` existed so lifecycle would not key on an agent's account of coverage.
+
+Those fields named private selectors and expected literals. They must not appear on a builder
+prompt or in public `CODE_REVIEW` findings under the factory contract. Public acceptance criteria
+replace them as the builder-visible obligation.
+
+### Historical merged-test pairing
+
+A tests lane used to merge into the integration branch before the build lane branched. The build
+lane's commit had to carry the accepted test files byte-identically
+(`tests_chain.compare_test_bytes`, `PairingRefusal.BYTES_SUBSTITUTED`). **The build lane could read
+those tests, and that was then specified as the design rather than a leak.**
+
+That pairing rule is withdrawn. Sealed private tests never merge into the builder's tree. The
+factory equivalent is `SEALED_TEST_BUNDLE` in the vault plus absence proofs against the run
+repository and builder worktree. Final integration review runs sealed tests against the integration
+commit; publication is receipt-backed exactly once onto `main`.
+
+`test_visibility: "merged" | "hidden"` on `maestro-plan.v5` was the migration sketch for that
+withdrawal. Hidden visibility is now the only builder-facing behavior; there is no merged-test
+compatibility path in the factory slice.
+
+### Historical review budgets and repair chains
+
+A rejection used to return to a retained builder session and worktree, bounded by
+`review_ceiling`, `REPAIR_CHAIN_LIMIT`, and semantic spend ceilings. Sibling merges aborted the
+repair chain. `maestro run convergence` reported findings per attempt.
+
+Those budgets prevented explicit user continuation and are deleted. Factory repair is
+`REVISE` → `WRITING_TESTS` or `BUILDING` from immutable artifacts. Pause is `USER_WAIT`. Amendment
+is `run amend`. Status is derived, not a convergence verb.
+
+### Historical workspace CLI
+
+`maestro workspace author` / `workspace validate` bound several repositories by
+`maestro-workspace.v1` after each repo had a PASS finalization receipt. Coordinator workspace
+leases are not factory workflow authority. The proven slice is exactly two dependent lanes in one
+run.
