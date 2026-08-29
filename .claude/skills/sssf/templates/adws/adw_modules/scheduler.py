@@ -2183,6 +2183,113 @@ class Scheduler:
             handoff,
         )
 
+    def _resume_unreviewed_candidate(
+        self, node: st.PlanNode, context: _AttemptContext
+    ) -> bool:
+        """Review a published candidate nobody ever read, instead of rebuilding.
+
+        `publish_candidate` writes the candidate before the reviewer is
+        constructed, and the publication is immutable. Anything that kills
+        the launch in that window -- a crash, a dead pane, a reboot, or the
+        `FinalizationWindow` TypeError a half-applied mirror produced --
+        leaves the lane owing a descendant of a commit no reviewer has seen.
+
+        The retry cannot pay that debt. It is cut from the integration head,
+        so its commit is a *sibling* of the published candidate and
+        `publish_candidate` refuses it as "equal to or not a proven
+        descendant of its parent", on every attempt, for the life of the
+        run. Cutting it from the candidate instead is not the alternative:
+        a candidate contains the implementation, so §7.4's pre-node clause
+        finds its gate green and blocks the node GATE_NOT_FALSIFIABLE,
+        which is terminal.
+
+        There is no base that satisfies both, because building again is the
+        wrong move. The candidate is already built, already gate-verified,
+        already falsified -- everything up to the review passed before it
+        was published. What it lacks is a reader. So this dispatches one,
+        and no builder runs.
+
+        Keyed on the durable review row, never on pane text or an agent's
+        claim (§1.2): PUBLISHED means no prompt was proven submitted,
+        DISPATCHED means one was and no terminal report came back, and
+        `_publish_and_review_candidate` already drives both. Any terminal
+        state, or no candidate at all, falls through to an ordinary attempt.
+
+        run-9d03105407f440079f3730f1fe4c67b3's `lane-wp6-build` sat on
+        candidate a551049 in PUBLISHED across nine retries and two
+        operator resumes.
+        """
+        store = self.deps.store
+        review_node = self._review_for_build(node.node_id)
+        if review_node is None or self.deps.review_attempt is None:
+            return False
+        candidates = store.lane_candidates(self.run_id, node.node_id, limit=10_000)
+        if not candidates:
+            return False
+        candidate = candidates[-1]
+        review = store.candidate_review(
+            self.run_id, review_node.node_id, candidate.candidate_sha
+        )
+        if review is None or review.state not in {
+            st.CandidateReviewState.PUBLISHED,
+            st.CandidateReviewState.DISPATCHED,
+        }:
+            return False
+
+        head = wt.integration_head(self.deps.repo, self.deps.integration_branch)
+        attempt_no = store.start_attempt(
+            self.run_id,
+            node.node_id,
+            head,
+            detail={"repair": "review-unreviewed-candidate"},
+        )
+        with self._lock:
+            self._attempt_dispatch.setdefault((node.node_id, attempt_no), False)
+        record = store.get_attempt(self.run_id, node.node_id, attempt_no)
+        context.record = record
+        self._require_running(record)
+        self._set_lane_phase(node.node_id, st.LanePhase.CANDIDATE_READY, record)
+
+        # The worktree carries this attempt's identity, not its subject: the
+        # reviewer reads the candidate sha against the head, both immutable,
+        # and nothing here writes to the checkout. Cut from the head for the
+        # same reason every other attempt is.
+        attempt = wt.create_attempt_worktree(
+            self.deps.repo,
+            self.run_id,
+            node.node_id,
+            attempt_no,
+            head,
+            Path(self.deps.worktrees_root),
+            Path(self.deps.scratch_root),
+        )
+        with self._lock:
+            self._attempt_worktrees[node.node_id] = attempt
+        self._require_running(record)
+
+        # No builder ran, so there is no execution to account for and no
+        # measured delta to take. The candidate's own attempt already
+        # crossed every gate this one would re-ask.
+        execution = NodeExecution(envelope_parsed=True, exit_code=0)
+        if not self._publish_and_review_candidate(
+            node,
+            context,
+            attempt,
+            record,
+            wt.take_baseline(attempt),
+            execution,
+            head,
+            candidate.candidate_sha,
+        ):
+            return True
+        with self._lock:
+            self._require_running(record)
+            self._output_shas[node.node_id] = candidate.candidate_sha
+            store.mark_verified(
+                self.run_id, node.node_id, candidate.candidate_sha
+            )
+        return True
+
     def _attempt_body(self, node: st.PlanNode, context: _AttemptContext) -> None:
         store = self.deps.store
         existing: Optional[st.AttemptRecord] = None
@@ -2194,6 +2301,8 @@ class Scheduler:
             if existing.extra.get(lc.LATE_ENVELOPE_RECOVERY_KEY) is True:
                 self._recover_attempt_body(node, context, existing)
                 return
+        if self._resume_unreviewed_candidate(node, context):
+            return
         #: A `QUIESCENCE_UNPROVEN` block the resume boundary proved was written
         #: over an attempt that never crossed dispatch. Both halves of that
         #: proof are already durable by the time this reads the marker -- the
