@@ -10,8 +10,9 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-import maestro
 import yaml
+
+import maestro
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -38,6 +39,7 @@ def _install_deployment(product: Path, state: Path) -> Path:
             {
                 "schema": "maestro-config.v1",
                 "runtime_state_root": str(state.resolve()),
+                "runner_profile": "grok-maestro",
             },
             sort_keys=True,
         ),

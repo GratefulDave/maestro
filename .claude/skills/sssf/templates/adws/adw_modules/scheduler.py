@@ -7,14 +7,17 @@ import json
 import os
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
+from . import code_review as cr
 from . import git_publication as gitpub
 from . import private_review as prv
 from . import scheduler_types as st
+from . import tests_chain as tc
 from .lifecycle import AmendmentRefused, ArtifactRecord, ArtifactStore, RunAlreadyExists
 from .runtime_state import RuntimeStateRoot
 
@@ -389,7 +392,6 @@ class StageActor(Protocol):
     def review_tests(
         self, ctx: LaneContext
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]: ...
-    def seal_tests(self, ctx: LaneContext) -> Mapping[str, Any]: ...
     def build(self, ctx: LaneContext) -> Mapping[str, Any]: ...
     def review_code(
         self, ctx: LaneContext
@@ -415,34 +417,70 @@ class OrderedLocks:
         self._run_path = runtime.path / "locks" / "run.lock"
         self._integration_path = runtime.path / "locks" / "integration.lock"
         self._worktree_git_dir = worktree_git_dir
+        self._worktree_lock_path = os.path.join(
+            worktree_git_dir, "maestro-publication.lock"
+        )
+        self._locals: list[threading.RLock] = []
         self._fds: list[int] = []
+        self._worktree_cm: Any = None
 
     def acquire(self, levels: int) -> None:
         self.release()
-        paths = [self._run_path, self._integration_path]
-        for path in paths[:levels]:
-            path.touch(exist_ok=True)
-            fd = os.open(path, os.O_RDWR)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            self._fds.append(fd)
+        file_paths = [self._run_path, self._integration_path][:levels]
+        local_paths = [str(path) for path in file_paths]
+        if levels >= 3:
+            local_paths.append(self._worktree_lock_path)
+        try:
+            for path in local_paths:
+                lock = _process_lock(path)
+                lock.acquire()
+                self._locals.append(lock)
+            for path in file_paths:
+                path.touch(exist_ok=True)
+                fd = os.open(path, os.O_RDWR)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._fds.append(fd)
+        except Exception:
+            self.release()
+            raise
         if levels >= 3:
             try:
                 cm = gitpub.target_worktree_lock(self._worktree_git_dir)
+                cm.__enter__()
                 self._worktree_cm = cm
-                self._worktree_cm.__enter__()
             except Exception as exc:
                 self.release()
                 raise PublicationWorktreeLockRefused(str(exc)) from exc
 
     def release(self) -> None:
-        cm = getattr(self, "_worktree_cm", None)
-        if cm is not None:
+        try:
+            cm = self._worktree_cm
+            if cm is not None:
+                try:
+                    cm.__exit__(None, None, None)
+                finally:
+                    self._worktree_cm = None
+        finally:
             try:
-                cm.__exit__(None, None, None)
+                while self._fds:
+                    os.close(self._fds.pop())
             finally:
-                self._worktree_cm = None
-        while self._fds:
-            os.close(self._fds.pop())
+                while self._locals:
+                    self._locals.pop().release()
+
+
+def _process_lock(path: str) -> threading.RLock:
+    key = os.path.realpath(path)
+    with _PROCESS_LOCK_GUARD:
+        lock = _PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROCESS_LOCKS[key] = lock
+        return lock
+
+
+_PROCESS_LOCK_GUARD = threading.Lock()
+_PROCESS_LOCKS: dict[str, threading.RLock] = {}
 
 
 def _request(ctx: LaneContext) -> prv.VaultLaneRequest:
@@ -469,6 +507,43 @@ def _complete(
         ctx.input_digest,
         artifact,
         next_stage,
+    )
+
+
+def _with_input_artifact_ids(
+    artifact: st.LaneArtifact, ids: Sequence[str]
+) -> st.LaneArtifact:
+    payload = dict(artifact.payload)
+    payload["input_artifact_ids"] = list(ids)
+    return st.LaneArtifact(
+        kind=artifact.kind,
+        plan_revision=artifact.plan_revision,
+        spec_digest=artifact.spec_digest,
+        lane_projection_digest=artifact.lane_projection_digest,
+        input_digest=artifact.input_digest,
+        output_digest=st.digest_canonical(payload),
+        artifact_ref=artifact.artifact_ref,
+        payload=payload,
+        verdict=artifact.verdict,
+    )
+
+
+def _record_as_lane_artifact(
+    record: ArtifactRecord, lane: st.LaneProjection
+) -> st.LaneArtifact:
+    verdict = None
+    if record.kind in (st.ArtifactKind.TEST_REVIEW, st.ArtifactKind.CODE_REVIEW):
+        verdict = st.ReviewerVerdict(str(record.payload["verdict"]))
+    return st.LaneArtifact(
+        kind=record.kind,
+        plan_revision=record.plan_revision,
+        spec_digest=lane.spec_digest,
+        lane_projection_digest=lane.lane_projection_digest,
+        input_digest=record.input_digest,
+        output_digest=record.output_digest,
+        artifact_ref=record.artifact_ref,
+        payload=dict(record.payload),
+        verdict=verdict,
     )
 
 
@@ -926,28 +1001,27 @@ class FactoryScheduler:
             },
         )
         extra = dict(self.actor.write_tests(ctx))
+        files = extra.get("files") or extra.get("private_files") or {}
+        if not files:
+            raise FactoryRefused("write_tests produced no private files")
         contract = prv.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
         )
-        tokens = prv.collect_private_tokens(
-            files=extra.get("private_files") or {},
-            extra=tuple(extra.get("private_tokens") or ()),
-        )
-        payload = {
-            "input_artifact_ids": [plan.artifact_id, review_id],
-            "input_digest": digest,
-            "public_contract": contract,
-            "draft_digest": extra.get("draft_digest") or st.digest_canonical(contract),
-        }
-        prv.refuse_private_leak(payload, tokens)
-        artifact = prv.make_lane_artifact(
-            kind=st.ArtifactKind.TEST_DRAFT,
+        artifact = tc.write_test_draft(
             request=_request(ctx),
-            payload=payload,
-            artifact_ref=extra.get("artifact_ref") or f"test-draft:{digest}",
+            state_root=self.runtime.path,
+            run_repo=Path(self.target.target_repository_root),
+            integration_ref=st.integration_ref(self.run_id),
+            files=files,
+            public_contract=contract,
+            worktrees_root=self.runtime.path / "worktrees",
         )
-        _complete(self.store, ctx, artifact)
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(artifact, [plan.artifact_id, review_id]),
+        )
 
     def _reviewing_tests(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -977,24 +1051,24 @@ class FactoryScheduler:
             public_contract=draft.payload.get("public_contract"),
         )
         verdict, findings = self.actor.review_tests(ctx)
-        tokens = prv.collect_private_tokens(
-            extra=tuple(draft.payload.get("private_tokens") or ())
+        draft_artifact = _record_as_lane_artifact(draft, lane)
+        tokens = tc.draft_private_tokens(
+            state_root=self.runtime.path,
+            run_id=self.run_id,
+            draft=draft_artifact,
         )
-        checked = prv.actionable_findings(verdict, findings, tokens)
-        payload = {
-            "findings": list(checked),
-            "input_artifact_ids": [plan.artifact_id, draft.artifact_id],
-            "input_digest": digest,
-            "verdict": verdict.value,
-        }
-        artifact = prv.make_lane_artifact(
-            kind=st.ArtifactKind.TEST_REVIEW,
+        artifact = tc.review_test_draft(
             request=_request(ctx),
-            payload=payload,
-            artifact_ref=f"test-review:{digest}",
             verdict=verdict,
+            findings=findings,
+            test_draft=draft_artifact,
+            private_tokens=tokens,
         )
-        _complete(self.store, ctx, artifact)
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(artifact, [plan.artifact_id, draft.artifact_id]),
+        )
 
     def _tests_sealed(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -1031,29 +1105,21 @@ class FactoryScheduler:
             artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft, "TEST_REVIEW": review},
             public_contract=draft.payload.get("public_contract"),
         )
-        extra = dict(self.actor.seal_tests(ctx))
-        vault_digest = extra.get("vault_digest") or st.digest_canonical(
-            {"lane": lane_id, "digest": digest}
-        )
-        payload = {
-            "input_artifact_ids": [
-                plan.artifact_id,
-                draft.artifact_id,
-                review.artifact_id,
-            ],
-            "input_digest": digest,
-            "public_contract": draft.payload.get("public_contract"),
-            "vault_digest": vault_digest,
-            "vault_ref": extra.get("vault_ref") or f"vault:{vault_digest}",
-        }
-        prv.refuse_private_leak(payload, prv.collect_private_tokens())
-        artifact = prv.make_lane_artifact(
-            kind=st.ArtifactKind.SEALED_TEST_BUNDLE,
+        artifact = tc.seal_accepted_tests(
             request=_request(ctx),
-            payload=payload,
-            artifact_ref=payload["vault_ref"],
+            state_root=self.runtime.path,
+            run_repo=Path(self.target.target_repository_root),
+            builder_worktree=None,
+            test_draft=_record_as_lane_artifact(draft, lane),
+            test_review=_record_as_lane_artifact(review, lane),
         )
-        _complete(self.store, ctx, artifact)
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(
+                artifact, [plan.artifact_id, draft.artifact_id, review.artifact_id]
+            ),
+        )
 
     def _building(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -1162,7 +1228,7 @@ class FactoryScheduler:
             builder_base_sha=builder_base,
             entry_kind=entry,
             public_contract=sealed.payload.get("public_contract"),
-            sealed_digest=str(sealed.payload.get("vault_digest") or ""),
+            sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
         )
         extra = dict(self.actor.build(ctx))
         candidate_sha = extra["candidate_sha"]
@@ -1244,31 +1310,30 @@ class FactoryScheduler:
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_ref=builder.payload["candidate_ref"],
             candidate_sha=builder.payload["candidate_sha"],
-            sealed_digest=str(sealed.payload.get("vault_digest") or ""),
+            sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
         )
         verdict, findings = self.actor.review_code(ctx)
-        checked = prv.actionable_findings(verdict, findings)
-        payload = {
-            "builder_base_sha": ctx.builder_base_sha,
-            "candidate_ref": ctx.candidate_ref,
-            "candidate_sha": ctx.candidate_sha,
-            "findings": list(checked),
-            "input_artifact_ids": [
-                plan.artifact_id,
-                sealed.artifact_id,
-                builder.artifact_id,
-            ],
-            "input_digest": digest,
-            "verdict": verdict.value,
-        }
-        artifact = prv.make_lane_artifact(
-            kind=st.ArtifactKind.CODE_REVIEW,
+        constraints = tuple(lane.public_acceptance) or ("produce declared outputs",)
+        artifact = cr.review_builder_output(
             request=_request(ctx),
-            payload=payload,
-            artifact_ref=f"code-review:{digest}",
+            state_root=self.runtime.path,
+            candidate_repo=Path(self.target.target_repository_root),
+            candidate_sha=builder.payload["candidate_sha"],
+            candidate_ref=builder.payload["candidate_ref"],
+            builder_base_sha=builder.payload["builder_base_sha"],
+            sealed_bundle=_record_as_lane_artifact(sealed, lane),
             verdict=verdict,
+            findings=findings,
+            scratch_root=self.runtime.path / "worktrees",
+            architecture_constraints=constraints,
         )
-        _complete(self.store, ctx, artifact)
+        _complete(
+            self.store,
+            ctx,
+            _with_input_artifact_ids(
+                artifact, [plan.artifact_id, sealed.artifact_id, builder.artifact_id]
+            ),
+        )
 
     def _ready_to_merge(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)

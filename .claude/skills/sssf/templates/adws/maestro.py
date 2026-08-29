@@ -14,16 +14,21 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
+
+# This must run before third-party and local imports can dirty a deployed checkout.
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
+
 import yaml
 
-
 from adw_modules import git_publication as gitpub
+from adw_modules import hidden_vault as hv
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import scheduler_types as st
 from adw_modules.lifecycle import ArtifactStore, LedgerSchemaUnsupported
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
-from adw_modules.runtime_state import RuntimeStateRoot, RuntimeStateRefused
+from adw_modules.runtime_state import RuntimeStateRefused, RuntimeStateRoot
 from adw_modules.scheduler import (
     FactoryRefused,
     FactoryScheduler,
@@ -84,6 +89,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     if not root.is_absolute():
         raise _MaestroConfigurationError("runtime_state_root must be absolute")
     loaded["runtime_state_root"] = root
+    loaded["runner_profile"] = _config_string(
+        loaded.get("runner_profile"), "runner_profile"
+    )
     loaded["repo"] = repo.resolve()
     return loaded
 
@@ -113,14 +121,36 @@ class HerdrStageActor:
     def __init__(
         self,
         launcher: lch.LauncherAdapter,
-        worktrees: Path,
+        state_root: Path,
         target: gitpub.TargetBinding,
+        runner_profile: str,
     ) -> None:
+        if not runner_profile.strip():
+            raise FactoryRefused("RUNNER_PROFILE_REQUIRED")
         self.launcher = launcher
-        self.worktrees = worktrees
+        self.state_root = Path(state_root)
+        self.worktrees = self.state_root / "worktrees"
         self.target = target
+        self.runner_profile = runner_profile.strip()
 
-    def _checkout_sha(self, ctx: LaneContext) -> str:
+    def _git(self, repo: Path, *args: str, check: bool = True) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            raise FactoryRefused(
+                (result.stderr or result.stdout or "git failed").strip()
+            )
+        return (result.stdout or "").strip()
+
+    def _base_sha(self, ctx: LaneContext, role: str, integration_sha: str = "") -> str:
+        if role == "code-reviewer" and ctx.candidate_sha:
+            return ctx.candidate_sha
+        if role == "integration-reviewer" and integration_sha:
+            return integration_sha
         if ctx.builder_base_sha:
             return ctx.builder_base_sha
         if ctx.integration_head:
@@ -141,21 +171,12 @@ class HerdrStageActor:
     def _add_worktree(self, dest: Path, sha: str) -> None:
         repo = Path(self.target.target_repository_root)
         subprocess.check_call(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "worktree",
-                "add",
-                "--detach",
-                str(dest),
-                sha,
-            ],
+            ["git", "-C", str(repo), "worktree", "add", "--detach", str(dest), sha],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-    def _safe_remove_attempt(self, attempt: Path, checkout: Path) -> None:
+    def _safe_remove_attempt(self, attempt: Path, checkout: Path | None) -> None:
         try:
             resolved = attempt.resolve()
         except OSError:
@@ -164,7 +185,7 @@ class HerdrStageActor:
         if root not in resolved.parents or resolved == root:
             return
         repo = Path(self.target.target_repository_root)
-        if checkout.exists():
+        if checkout is not None and checkout.exists():
             subprocess.run(
                 [
                     "git",
@@ -181,90 +202,271 @@ class HerdrStageActor:
             )
         shutil.rmtree(resolved, ignore_errors=True)
 
-    def _request(self, ctx: LaneContext, role: str) -> Mapping[str, Any]:
-        return st.json_ready(
-            {
-                "builder_base_sha": ctx.builder_base_sha,
-                "candidate_ref": ctx.candidate_ref,
-                "candidate_sha": ctx.candidate_sha,
-                "input_digest": ctx.input_digest,
-                "lane_id": ctx.lane.lane_id,
-                "plan_digest": ctx.plan_digest,
-                "plan_revision": ctx.plan_revision,
-                "public_contract": ctx.public_contract,
-                "role": role,
-                "run_id": ctx.run_id,
-                "sealed_digest": ctx.sealed_digest,
-                "spec_digest": ctx.lane.spec_digest,
-                "stage": ctx.stage.value,
-            }
-        )
+    def _schema(self, role: str) -> dict[str, Any]:
+        findings = list(st.REVISE_FINDING_KEYS)
+        if role == "tester":
+            return {"private_files": {"<path>": "<utf-8 contents>"}}
+        if role == "builder":
+            return {"candidate_sha": "<optional git sha>", "changed": "<optional bool>"}
+        if role in ("test-reviewer", "code-reviewer"):
+            return {"verdict": "PASS|REVISE", "findings": findings}
+        return {
+            "verdict": "PASS|REVISE",
+            "findings": findings,
+            "affected_lanes": ["<lane-id>"],
+        }
 
-    def _dispatch(self, ctx: LaneContext, role: str) -> Mapping[str, Any]:
-        sha = self._checkout_sha(ctx)
-        attempt = self._new_attempt_dir(ctx)
-        checkout = attempt / "checkout"
-        session = attempt / "session"
-        session.mkdir()
-        prompt = attempt / "prompt.json"
-        envelope = attempt / "envelope.json"
-        try:
-            self._add_worktree(checkout, sha)
-            request = self._request(ctx, role)
-            prompt.write_bytes(st.canonical_bytes(request))
-            spec = lch.LaunchSpec(
-                correlation_token="{}:{}:{}:{}".format(
-                    ctx.run_id, ctx.lane.lane_id, ctx.stage.value, ctx.input_digest[:12]
-                ),
-                worktree=checkout,
-                prompt_path=prompt,
-                envelope_path=envelope,
-                route="omp",
-                model="",
-                effort="",
-                profile=None,
-                session_dir=session,
-                context_window_tokens=8192,
-                lane_key=ctx.lane.lane_id,
-                pane_role=role,
-                workspace_label=ctx.run_id,
+    def _prompt(
+        self,
+        ctx: LaneContext,
+        role: str,
+        envelope: Path,
+        cwd: Path,
+        extra: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        envelope_path = str(envelope.resolve())
+        schema = self._schema(role)
+        instructions = (
+            "Write UTF-8 JSON to {0} and stop. Schema: {1}. CWD: {2}."
+        ).format(envelope_path, json.dumps(schema, sort_keys=True), cwd.resolve())
+        if role == "tester":
+            instructions += " Create private tests here. Do not git commit. Do not write the product repo."
+        elif role == "test-reviewer":
+            instructions += " Inspect this private TEST_DRAFT tree. Return PASS or REVISE findings. No leaked literals."
+        elif role == "builder":
+            instructions += " Edit only declared_outputs. Commit those files. No private tests, fixtures, or vault paths."
+        elif role == "code-reviewer":
+            instructions += (
+                " Inspect this candidate product checkout. Private tests are absent."
             )
-            handle = self.launcher.launch(spec)
-            try:
-                while True:
-                    result = self.launcher.poll(handle)
-                    if result.state in (lch.PollState.EXITED, lch.PollState.GONE):
-                        break
-                declared = handle.envelope_path or envelope
-                if declared is None or not Path(declared).is_file():
-                    raise FactoryRefused("STAGE_PAYLOAD_MISSING")
-                return json.loads(Path(declared).read_text(encoding="utf-8"))
-            finally:
-                self.launcher.cancel(handle, time.monotonic() + 5.0)
+        elif role == "integration-reviewer":
+            instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
+        if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
+            instructions += " PASS requires findings=[]. REVISE requires at least one actionable finding."
+        if role == "integration-reviewer":
+            instructions += " PASS requires affected_lanes=[]. REVISE requires a nonempty affected_lanes subset."
+        body: dict[str, Any] = {
+            "envelope_path": envelope_path,
+            "envelope_schema": schema,
+            "instructions": instructions,
+            "lane_id": ctx.lane.lane_id,
+            "plan_revision": ctx.plan_revision,
+            "role": role,
+            "run_id": ctx.run_id,
+            "stage": ctx.stage.value,
+            "working_directory": str(cwd.resolve()),
+        }
+        body.update(extra)
+        if role == "builder":
+            for key in list(body):
+                if key in st.FORBIDDEN_PRIVATE_KEYS or key in (
+                    "private_files",
+                    "vault_path",
+                    "vault_ref",
+                ):
+                    del body[key]
+            text = json.dumps(body, sort_keys=True)
+            if "vaults/" in text or "private_files" in text:
+                raise FactoryRefused("PRIVATE_TEST_LEAK")
+        return st.json_ready(body)
+
+    def _collect_uncommitted(self, checkout: Path) -> dict[str, str]:
+        listed = self._git(
+            checkout, "ls-files", "-o", "-m", "--exclude-standard", check=False
+        )
+        files: dict[str, str] = {}
+        for rel in listed.splitlines():
+            rel = rel.strip()
+            if not rel:
+                continue
+            path = checkout / rel
+            if path.is_file():
+                files[rel.replace("\\", "/")] = path.read_text(encoding="utf-8")
+        return files
+
+    def _commit_declared(
+        self, checkout: Path, outputs: Sequence[str], base: str
+    ) -> tuple[str, bool]:
+        for rel in outputs:
+            if (checkout / rel).is_file():
+                self._git(checkout, "add", "--", rel)
+        if self._git(checkout, "status", "--porcelain"):
+            self._git(checkout, "config", "user.email", "maestro-builder@invalid")
+            self._git(checkout, "config", "user.name", "maestro-builder")
+            self._git(checkout, "commit", "-m", "declared outputs")
+        sha = self._git(checkout, "rev-parse", "HEAD")
+        return sha, sha != base
+
+    @staticmethod
+    def _launch_environment(attempt: Path) -> dict[str, str]:
+        scratch = attempt / "scratch"
+        redirects = {
+            "TMPDIR": str(scratch / "tmp"),
+            "PYTHONPYCACHEPREFIX": str(scratch / "pycache"),
+            "PYTEST_ADDOPTS": "-o cache_dir={}".format(scratch / "pytest_cache"),
+            "COVERAGE_FILE": str(scratch / "coverage"),
+            "RUFF_CACHE_DIR": str(scratch / "ruff"),
+            "npm_config_cache": str(scratch / "npm"),
+        }
+        if set(redirects) != set(lch.SCRATCH_ENV_KEYS):
+            raise FactoryRefused("SCRATCH_ENV_CONTRACT_MISMATCH")
+        for key in (
+            "TMPDIR",
+            "PYTHONPYCACHEPREFIX",
+            "RUFF_CACHE_DIR",
+            "npm_config_cache",
+        ):
+            Path(redirects[key]).mkdir(parents=True, exist_ok=True)
+        (scratch / "pytest_cache").mkdir(parents=True, exist_ok=True)
+        environment = dict(os.environ)
+        environment.update(redirects)
+        return environment
+
+    def _launch(
+        self,
+        ctx: LaneContext,
+        role: str,
+        cwd: Path,
+        extra: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        attempt = cwd if cwd.name != "checkout" else cwd.parent
+        if (attempt / "session").parent != attempt:
+            attempt = cwd.parent
+        session = attempt / "session"
+        session.mkdir(exist_ok=True)
+        envelope = attempt / "envelope.json"
+        prompt = attempt / "prompt.json"
+        prompt.write_bytes(
+            st.canonical_bytes(self._prompt(ctx, role, envelope, cwd, extra))
+        )
+        spec = lch.LaunchSpec(
+            correlation_token="{}:{}:{}:{}".format(
+                ctx.run_id, ctx.lane.lane_id, ctx.stage.value, ctx.input_digest[:12]
+            ),
+            worktree=cwd,
+            prompt_path=prompt,
+            envelope_path=envelope,
+            route="omp",
+            model="",
+            effort="",
+            profile=self.runner_profile,
+            session_dir=session,
+            environment=self._launch_environment(attempt),
+            context_window_tokens=8192,
+            lane_key=ctx.lane.lane_id,
+            pane_role=role,
+            workspace_label=ctx.run_id,
+        )
+        handle = self.launcher.launch(spec)
+        try:
+            while True:
+                result = self.launcher.poll(handle)
+                if result.state in (lch.PollState.EXITED, lch.PollState.GONE):
+                    break
+            declared = handle.envelope_path or envelope
+            if declared is None or not Path(declared).is_file():
+                raise FactoryRefused("STAGE_PAYLOAD_MISSING")
+            return json.loads(Path(declared).read_text(encoding="utf-8"))
         finally:
-            self._safe_remove_attempt(attempt, checkout)
+            self.launcher.cancel(handle, time.monotonic() + 5.0)
+
+    def _prepare(
+        self, ctx: LaneContext, role: str, *, sha: str | None, private_tree: bool
+    ) -> tuple[Path, Path | None]:
+        attempt = self._new_attempt_dir(ctx)
+        cwd = attempt / "checkout"
+        checkout: Path | None = None
+        if private_tree:
+            draft = ctx.artifacts.get("TEST_DRAFT")
+            if draft is None:
+                raise FactoryRefused("missing TEST_DRAFT")
+            vault = hv.ensure_vault(self.state_root, ctx.run_id)
+            hv.materialize_commit(vault, hv.rev_parse(vault, draft.artifact_ref), cwd)
+            return attempt, None
+        if not sha:
+            raise FactoryRefused("missing checkout sha")
+        self._add_worktree(cwd, sha)
+        return attempt, cwd
 
     def write_tests(self, ctx: LaneContext) -> Mapping[str, Any]:
-        return self._dispatch(ctx, "tester")
+        sha = self._base_sha(ctx, "tester")
+        attempt, checkout = self._prepare(ctx, "tester", sha=sha, private_tree=False)
+        try:
+            extra = {
+                "declared_outputs": list(ctx.lane.declared_outputs),
+                "public_acceptance": list(ctx.lane.public_acceptance),
+            }
+            payload = self._launch(
+                ctx, "tester", checkout or attempt / "checkout", extra
+            )
+            files = dict(payload.get("private_files") or {})
+            if checkout is not None:
+                files.update(self._collect_uncommitted(checkout))
+                self._git(checkout, "reset", "--hard", sha, check=False)
+                self._git(checkout, "clean", "-fd", check=False)
+            return {"private_files": files}
+        finally:
+            self._safe_remove_attempt(attempt, checkout)
 
     def review_tests(
         self, ctx: LaneContext
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]:
-        return self._review_payload(self._dispatch(ctx, "test-reviewer"))
-
-    def seal_tests(self, ctx: LaneContext) -> Mapping[str, Any]:
-        return self._dispatch(ctx, "sealer")
+        attempt, checkout = self._prepare(
+            ctx, "test-reviewer", sha=None, private_tree=True
+        )
+        try:
+            cwd = attempt / "checkout"
+            payload = self._launch(
+                ctx, "test-reviewer", cwd, {"public_contract": ctx.public_contract}
+            )
+            return self._review_payload(payload)
+        finally:
+            self._safe_remove_attempt(attempt, checkout)
 
     def build(self, ctx: LaneContext) -> Mapping[str, Any]:
-        payload = dict(self._dispatch(ctx, "builder"))
-        if "candidate_sha" not in payload:
-            raise FactoryRefused("BUILDER_CANDIDATE_MISSING")
-        return payload
+        sha = self._base_sha(ctx, "builder")
+        extra = {
+            "builder_base_sha": sha,
+            "declared_outputs": list(ctx.lane.declared_outputs),
+            "public_contract": ctx.public_contract,
+            "sealed_digest": ctx.sealed_digest,
+        }
+        attempt, checkout = self._prepare(ctx, "builder", sha=sha, private_tree=False)
+        try:
+            if checkout is None:
+                raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
+            payload = self._launch(ctx, "builder", checkout, extra)
+            candidate_sha, changed = self._commit_declared(
+                checkout, ctx.lane.declared_outputs, sha
+            )
+            if payload.get("candidate_sha"):
+                candidate_sha = str(payload["candidate_sha"])
+            if "changed" in payload:
+                changed = bool(payload["changed"])
+            return {"candidate_sha": candidate_sha, "changed": changed}
+        finally:
+            self._safe_remove_attempt(attempt, checkout)
 
     def review_code(
         self, ctx: LaneContext
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]:
-        return self._review_payload(self._dispatch(ctx, "code-reviewer"))
+        extra = {
+            "candidate_sha": ctx.candidate_sha,
+            "declared_outputs": list(ctx.lane.declared_outputs),
+            "public_contract": ctx.public_contract,
+            "sealed_digest": ctx.sealed_digest,
+        }
+        sha = self._base_sha(ctx, "code-reviewer")
+        attempt, checkout = self._prepare(
+            ctx, "code-reviewer", sha=sha, private_tree=False
+        )
+        try:
+            payload = self._launch(
+                ctx, "code-reviewer", checkout or attempt / "checkout", extra
+            )
+            return self._review_payload(payload)
+        finally:
+            self._safe_remove_attempt(attempt, checkout)
 
     def review_integration(
         self,
@@ -272,12 +474,22 @@ class HerdrStageActor:
         lanes: Sequence[st.LaneProjection],
         integration_sha: str,
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]], Sequence[str]]:
-        payload = dict(self._dispatch(ctx, "integration-reviewer"))
-        payload.setdefault("integration_sha", integration_sha)
-        payload.setdefault("lane_ids", [lane.lane_id for lane in lanes])
-        verdict, findings = self._review_payload(payload)
-        affected = tuple(payload.get("affected_lanes") or ())
-        return verdict, findings, affected
+        extra = {
+            "integration_sha": integration_sha,
+            "lane_ids": [lane.lane_id for lane in lanes],
+        }
+        sha = self._base_sha(ctx, "integration-reviewer", integration_sha)
+        attempt, checkout = self._prepare(
+            ctx, "integration-reviewer", sha=sha, private_tree=False
+        )
+        try:
+            payload = self._launch(
+                ctx, "integration-reviewer", checkout or attempt / "checkout", extra
+            )
+            verdict, findings = self._review_payload(payload)
+            return verdict, findings, tuple(payload.get("affected_lanes") or ())
+        finally:
+            self._safe_remove_attempt(attempt, checkout)
 
     def publish(
         self,
@@ -307,10 +519,14 @@ def _actor_for(
     runtime: RuntimeStateRoot,
     layout: Mapping[str, Any],
     target: gitpub.TargetBinding,
+    run_id: str,
 ) -> StageActor:
     executables = layout.get("executables") or {}
     if not isinstance(executables, dict):
         executables = {}
+    profile = layout.get("runner_profile")
+    if not isinstance(profile, str) or not profile.strip():
+        raise FactoryRefused("RUNNER_PROFILE_REQUIRED")
     receipts = layout.get("route_receipts") or {}
     key_paths = layout.get("route_verify_keys") or ()
     if not isinstance(receipts, dict) or not receipts or not key_paths:
@@ -325,9 +541,9 @@ def _actor_for(
         omp_path=Path(str(executables.get("omp") or "omp")),
         claude_path=Path(str(executables.get("claude") or "claude")),
         admitted_routes=admitted,
-        workspace_label="maestro-factory",
+        workspace_label=run_id,
     )
-    return HerdrStageActor(launcher, runtime.path / "worktrees", target)
+    return HerdrStageActor(launcher, runtime.path, target, profile.strip())
 
 
 def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
@@ -367,7 +583,11 @@ def _run_start(args: argparse.Namespace) -> int:
                 target=target,
             )
             scheduler = FactoryScheduler(
-                store, run_id, _actor_for(runtime, layout, target), runtime, target
+                store,
+                run_id,
+                _actor_for(runtime, layout, target, run_id),
+                runtime,
+                target,
             )
             status = scheduler.run()
         finally:
@@ -418,7 +638,11 @@ def _run_resume(args: argparse.Namespace) -> int:
     try:
         try:
             scheduler = FactoryScheduler(
-                store, run_id, _actor_for(runtime, layout, target), runtime, target
+                store,
+                run_id,
+                _actor_for(runtime, layout, target, run_id),
+                runtime,
+                target,
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -453,7 +677,11 @@ def _run_amend(args: argparse.Namespace) -> int:
                 target=target,
             )
             scheduler = FactoryScheduler(
-                store, run_id, _actor_for(runtime, layout, target), runtime, target
+                store,
+                run_id,
+                _actor_for(runtime, layout, target, run_id),
+                runtime,
+                target,
             )
             status = scheduler.run()
         finally:
@@ -476,7 +704,11 @@ def _run_status(args: argparse.Namespace) -> int:
         try:
             gitpub.revalidate_binding(target)
             scheduler = FactoryScheduler(
-                store, run_id, _actor_for(runtime, layout, target), runtime, target
+                store,
+                run_id,
+                _actor_for(runtime, layout, target, run_id),
+                runtime,
+                target,
             )
             status = scheduler.status()
             stages = {

@@ -15,6 +15,13 @@ from . import private_review as pr
 from . import scheduler_types as st
 from . import tests_chain as tc
 
+_RUNNER_REVISE = {
+    "implementation_area": "declared product outputs",
+    "observed_behavior": "sealed private tests failed, errored, or did not execute",
+    "required_behavior": "the candidate must pass every sealed private test",
+    "violated_requirement": "accepted sealed tests bind the candidate",
+}
+
 
 def builder_view(
     *,
@@ -105,13 +112,17 @@ def review_builder_output(
         "passed": run["counts"]["passed"],
         "skipped": run["counts"]["skipped"],
     }
-    if verdict is st.ReviewerVerdict.PASS:
-        if run["returncode"] != 0 or summary["failed"] or summary["errored"]:
-            raise pr.PrivateReviewError(
-                "PASS is refused when private tests failed or errored"
-            )
-        if summary["executed"] < 1:
-            raise pr.PrivateReviewError("PASS requires executed private tests")
+    runner_failed = bool(
+        run["returncode"] != 0
+        or summary["failed"]
+        or summary["errored"]
+        or summary["executed"] < 1
+    )
+    if runner_failed:
+        if verdict is st.ReviewerVerdict.PASS:
+            verdict = st.ReviewerVerdict.REVISE
+        if not findings:
+            findings = (_RUNNER_REVISE,)
     private_files = {
         path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in files.items()
     }
@@ -142,6 +153,7 @@ def review_builder_output(
         "candidate_ref": candidate_ref,
         "candidate_sha": candidate_sha,
         "findings": [dict(item) for item in findings_out],
+        "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
         "private_results_digest": results_digest,
         "public_result_summary": summary,

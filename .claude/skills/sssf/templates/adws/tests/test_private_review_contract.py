@@ -192,12 +192,15 @@ class PrivateReviewContract(unittest.TestCase):
         self.assertEqual(
             set(first.payload),
             {
+                "input_artifact_ids",
                 "input_digest",
                 "private_draft_digest",
                 "private_draft_ref",
                 "public_contract",
             },
         )
+        self.assertEqual(first.payload["input_artifact_ids"], [])
+        self.assertEqual(first.payload["input_digest"], first.input_digest)
         revise = self._review(
             first,
             _digest("review-1"),
@@ -324,23 +327,31 @@ class PrivateReviewContract(unittest.TestCase):
             view["prior_code_review"]["verdict"], st.ReviewerVerdict.REVISE.value
         )
         self.assertNotIn(SECRET_LITERAL, json.dumps(view))
-        with self.assertRaises(pr.PrivateReviewError):
-            cr.review_builder_output(
-                request=_request(
-                    run_id=self.run_id,
-                    lane_id=self.lane_id,
-                    input_digest=_digest("code-review-pass-on-red"),
-                ),
-                state_root=self.state,
-                candidate_repo=self.repo,
-                candidate_sha=bad_sha,
-                candidate_ref=bad_ref,
-                builder_base_sha=base,
-                sealed_bundle=sealed,
-                verdict=st.ReviewerVerdict.PASS,
-                scratch_root=self.root / "scratch-pass-red",
-                architecture_constraints=CONSTRAINTS,
-            )
+        demoted = cr.review_builder_output(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("code-review-pass-on-red"),
+            ),
+            state_root=self.state,
+            candidate_repo=self.repo,
+            candidate_sha=bad_sha,
+            candidate_ref=bad_ref,
+            builder_base_sha=base,
+            sealed_bundle=sealed,
+            verdict=st.ReviewerVerdict.PASS,
+            scratch_root=self.root / "scratch-pass-red",
+            architecture_constraints=CONSTRAINTS,
+        )
+        self.assertIs(demoted.verdict, st.ReviewerVerdict.REVISE)
+        self.assertEqual(demoted.payload["verdict"], st.ReviewerVerdict.REVISE.value)
+        self.assertGreater(demoted.payload["public_result_summary"]["failed"], 0)
+        self.assertEqual(
+            set(demoted.payload["findings"][0]),
+            set(st.REVISE_FINDING_KEYS),
+        )
+        self.assertNotIn(SECRET_LITERAL, json.dumps(demoted.payload))
+        self.assertNotEqual(demoted.payload["verdict"], st.ReviewerVerdict.PASS.value)
         good_sha, good_ref = self._candidate(FIXED)
         accepted = cr.review_builder_output(
             request=_request(

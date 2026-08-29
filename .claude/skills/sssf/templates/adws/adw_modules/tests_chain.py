@@ -65,6 +65,7 @@ def write_test_draft(
         )
     )
     payload = {
+        "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
         "private_draft_digest": private_draft_digest,
         "private_draft_ref": ref,
@@ -109,6 +110,7 @@ def review_test_draft(
     findings_out = pr.actionable_findings(verdict, findings, private_tokens)
     payload = {
         "findings": [dict(item) for item in findings_out],
+        "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
         "verdict": verdict.value,
     }
@@ -176,6 +178,7 @@ def seal_accepted_tests(
         )
     )
     payload = {
+        "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
         "public_contract": test_draft.payload["public_contract"],
         "sealed_digest": sealed_digest,

@@ -1,5 +1,6 @@
 schema: maestro-config.v1
 runtime_state_root: /nonexistent/maestro-runtime-state
+runner_profile: grok-maestro
 executables:
   herdr: herdr
   omp: omp

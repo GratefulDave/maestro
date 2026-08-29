@@ -107,7 +107,9 @@ def _install_deployment(product: Path, state: Path) -> Path:
     maestro_file = adws / "maestro.py"
     maestro_file.write_text("# deployment\n", encoding="utf-8")
     (adws / "maestro.config.yaml").write_text(
-        f"schema: maestro-config.v1\nruntime_state_root: {state.resolve()}\n",
+        "schema: maestro-config.v1\n"
+        f"runtime_state_root: {state.resolve()}\n"
+        "runner_profile: grok-maestro\n",
         encoding="utf-8",
     )
     return maestro_file

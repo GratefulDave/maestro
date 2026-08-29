@@ -42,6 +42,7 @@ class VaultLaneRequest:
     spec_digest: str
     lane_projection_digest: str
     input_digest: str
+    input_artifact_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _ID.fullmatch(self.run_id):
@@ -55,6 +56,8 @@ class VaultLaneRequest:
             self.lane_projection_digest, name="lane_projection_digest"
         )
         st.require_hex_digest(self.input_digest, name="input_digest")
+        ids = tuple(str(item) for item in self.input_artifact_ids)
+        object.__setattr__(self, "input_artifact_ids", ids)
 
 
 def make_lane_artifact(

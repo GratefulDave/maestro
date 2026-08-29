@@ -14,6 +14,7 @@ from pathlib import Path
 
 import maestro
 from adw_modules import git_publication as gitpub
+from adw_modules import hidden_vault as hv
 from adw_modules import plan_compiler
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
@@ -75,8 +76,15 @@ class ScriptedActor:
         self.building_entries: list[tuple[str, st.BuildingEntryKind, int]] = []
 
     def write_tests(self, ctx: sch.LaneContext) -> dict:
+        name = ctx.lane.lane_id.replace("-", "_")
+        lines = ["# secret-selector", "from pathlib import Path", ""]
+        for output in ctx.lane.declared_outputs:
+            ident = Path(output).stem.replace("-", "_")
+            lines.append("def test_{0}_{1}_exists():".format(name, ident))
+            lines.append("    assert Path({0!r}).is_file()".format(output))
+            lines.append("")
         return {
-            "draft_digest": st.digest_canonical({"lane": ctx.lane.lane_id}),
+            "files": {"tests/test_{0}_private.py".format(name): "\n".join(lines)},
             "private_tokens": ("secret-selector",),
         }
 
@@ -86,10 +94,6 @@ class ScriptedActor:
         if n == 0:
             return st.ReviewerVerdict.REVISE, (FINDING,)
         return st.ReviewerVerdict.PASS, ()
-
-    def seal_tests(self, ctx: sch.LaneContext) -> dict:
-        digest = st.digest_canonical({"sealed": ctx.input_digest})
-        return {"vault_digest": digest, "vault_ref": "vault:" + digest}
 
     def build(self, ctx: sch.LaneContext) -> dict:
         self.building_entries.append(
@@ -239,6 +243,8 @@ class FactoryCutoverTests(unittest.TestCase):
             a_entries,
             [st.BuildingEntryKind.INITIAL, st.BuildingEntryKind.CODE_REVISE],
         )
+        self._assert_private_tests_executed(run_id, "lane-a")
+        self._assert_private_tests_executed(run_id, "lane-b")
 
     def test_death_before_building_resumes_from_sealed_stage(self) -> None:
         compiled = plan_compiler.compile_plan(
@@ -312,6 +318,67 @@ class FactoryCutoverTests(unittest.TestCase):
         return plan_compiler.compile_plan(
             _plan_bytes(a_goal=a_goal), plan_revision=revision, plan_artifact_ref=ref
         )
+
+    def _lane_rows(
+        self, run_id: str, kind: st.ArtifactKind, lane_id: str
+    ) -> list[tuple[str, str, dict]]:
+        rows = []
+        for artifact_id, digest, payload in self.store.conn.execute(
+            "SELECT artifact_id, input_digest, payload_json FROM lane_artifacts "
+            "WHERE run_id=? AND lane_id=? AND artifact_kind=? ORDER BY sequence",
+            (run_id, lane_id, kind.value),
+        ):
+            rows.append((artifact_id, digest, json.loads(payload)))
+        return rows
+
+    def _run_rows(
+        self, run_id: str, kind: st.ArtifactKind
+    ) -> list[tuple[str, str, dict]]:
+        rows = []
+        for artifact_id, digest, payload in self.store.conn.execute(
+            "SELECT artifact_id, input_digest, payload_json FROM run_artifacts "
+            "WHERE run_id=? AND artifact_kind=? ORDER BY sequence",
+            (run_id, kind.value),
+        ):
+            rows.append((artifact_id, digest, json.loads(payload)))
+        return rows
+
+    def _assert_vault_isolated(self, run_id: str) -> Path:
+        vault = hv.vault_path(self.runtime.path, run_id)
+        self.assertTrue(vault.is_dir())
+        vault_res = vault.resolve()
+        state_res = self.runtime.path.resolve()
+        repo_res = self.repo.resolve()
+        self.assertTrue(str(vault_res).startswith(str(state_res) + "/"))
+        self.assertFalse(str(vault_res).startswith(str(repo_res) + "/"))
+        self.assertNotEqual(vault_res, repo_res)
+        return vault
+
+    def _assert_private_tests_executed(self, run_id: str, lane_id: str) -> None:
+        vault = self._assert_vault_isolated(run_id)
+        sealed_ref = self.store.conn.execute(
+            "SELECT artifact_ref FROM lane_artifacts "
+            "WHERE run_id=? AND lane_id=? AND artifact_kind=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE.value),
+        ).fetchone()
+        self.assertIsNotNone(sealed_ref)
+        commit = hv.rev_parse(vault, sealed_ref[0])
+        self.assertTrue(hv.object_is_absent(self.repo, commit))
+        passing = [
+            payload
+            for _aid, _digest, payload in self._lane_rows(
+                run_id, st.ArtifactKind.CODE_REVIEW, lane_id
+            )
+            if payload.get("verdict") == st.ReviewerVerdict.PASS.value
+        ]
+        self.assertGreaterEqual(len(passing), 1)
+        summary = passing[-1]["public_result_summary"]
+        self.assertGreaterEqual(summary["executed"], 1)
+        self.assertGreaterEqual(summary["passed"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["errored"], 0)
+        self.assertNotIn("secret-selector", json.dumps(passing[-1]))
 
     def test_create_run_replays_sqlite_before_ref(self) -> None:
         compiled = self._compile(revision=1, ref="plan:replay-sqlite")
@@ -423,7 +490,9 @@ class FactoryCutoverTests(unittest.TestCase):
         sch.gitpub.publish_or_reconcile_locked = wrapped  # type: ignore[method-assign]
 
         def amend() -> None:
-            started.wait(timeout=5)
+            if not started.wait(timeout=60):
+                outcome["err"] = TimeoutError("publication lock never entered")
+                return
             try:
                 sch.apply_factory_amendment(
                     self.store,
@@ -718,6 +787,197 @@ class FactoryCutoverTests(unittest.TestCase):
             target,
         )
         self.assertEqual(follow.run(), st.RunStatus.COMPLETE)
+
+    def test_two_dependent_lanes_twelve_step_sequence(self) -> None:
+        compiled = self._compile(revision=1, ref="plan:twelve-step")
+        target = self._binding_target()
+        run_id = "run-twelve-step"
+        sch.create_factory_run(
+            store=self.store,
+            run_id=run_id,
+            compiled=compiled,
+            runtime=self.runtime,
+            target=target,
+        )
+
+        class TwelveStepActor(ScriptedActor):
+            def __init__(self, repo, worktrees, *, fail_b: bool) -> None:
+                super().__init__(repo, worktrees)
+                self.fail_b = fail_b
+
+            def write_tests(self, ctx: sch.LaneContext) -> dict:
+                extra = super().write_tests(ctx)
+                n = self.test_rounds[ctx.lane.lane_id]
+                files = {}
+                for path, body in extra["files"].items():
+                    files[path] = body + "# round {0}\n".format(n)
+                extra["files"] = files
+                return extra
+
+            def review_tests(self, ctx: sch.LaneContext):
+                n = self.test_rounds[ctx.lane.lane_id]
+                self.test_rounds[ctx.lane.lane_id] += 1
+                if ctx.lane.lane_id == "lane-a" and n < 2:
+                    return st.ReviewerVerdict.REVISE, (FINDING,)
+                return st.ReviewerVerdict.PASS, ()
+
+            def review_code(self, ctx: sch.LaneContext):
+                n = self.code_rounds[ctx.lane.lane_id]
+                self.code_rounds[ctx.lane.lane_id] += 1
+                if ctx.lane.lane_id == "lane-a" and n == 0:
+                    return st.ReviewerVerdict.REVISE, (FINDING,)
+                return st.ReviewerVerdict.PASS, ()
+
+            def build(self, ctx: sch.LaneContext) -> dict:
+                if ctx.lane.lane_id == "lane-b" and self.fail_b:
+                    raise RuntimeError("interrupt B before builder output")
+                return super().build(ctx)
+
+        first = TwelveStepActor(self.repo, self.runtime.path / "worktrees", fail_b=True)
+        with self.assertRaises(RuntimeError):
+            sch.FactoryScheduler(self.store, run_id, first, self.runtime, target).run()
+        self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.MERGED)
+        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.BUILDING)
+        self.assertEqual(
+            self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-b"), []
+        )
+
+        a_test_reviews = self._lane_rows(run_id, st.ArtifactKind.TEST_REVIEW, "lane-a")
+        self.assertEqual(len(a_test_reviews), 3)
+        self.assertEqual(
+            a_test_reviews[0][2]["verdict"], st.ReviewerVerdict.REVISE.value
+        )
+        self.assertEqual(
+            a_test_reviews[1][2]["verdict"], st.ReviewerVerdict.REVISE.value
+        )
+        self.assertEqual(a_test_reviews[2][2]["verdict"], st.ReviewerVerdict.PASS.value)
+        self.assertNotEqual(a_test_reviews[0][0], a_test_reviews[1][0])
+        self.assertNotEqual(a_test_reviews[0][1], a_test_reviews[1][1])
+        self.assertEqual(
+            len(self._lane_rows(run_id, st.ArtifactKind.TEST_DRAFT, "lane-a")), 3
+        )
+        sealed = self._lane_rows(run_id, st.ArtifactKind.SEALED_TEST_BUNDLE, "lane-a")
+        self.assertEqual(len(sealed), 1)
+        self.assertNotIn("secret-selector", json.dumps(sealed[0][2]))
+        a_code = self._lane_rows(run_id, st.ArtifactKind.CODE_REVIEW, "lane-a")
+        self.assertEqual(len(a_code), 2)
+        self.assertEqual(a_code[0][2]["verdict"], st.ReviewerVerdict.REVISE.value)
+        self.assertEqual(a_code[-1][2]["verdict"], st.ReviewerVerdict.PASS.value)
+        self._assert_private_tests_executed(run_id, "lane-a")
+        a_builders = self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-a")
+        self.assertEqual(len(a_builders), 2)
+        for _aid, _digest, payload in a_builders:
+            self.assertNotIn("secret-selector", json.dumps(payload))
+            self.assertNotIn("vault_path", payload)
+        self.assertEqual(
+            [
+                entry
+                for lane_id, entry, _rev in first.building_entries
+                if lane_id == "lane-a"
+            ],
+            [st.BuildingEntryKind.INITIAL, st.BuildingEntryKind.CODE_REVISE],
+        )
+        a_merges = self._lane_rows(run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-a")
+        self.assertEqual(len(a_merges), 1)
+        self.assertNotIn("secret-selector", _git(self.repo, "log", "--all", "-p"))
+
+        resumed = TwelveStepActor(
+            self.repo, self.runtime.path / "worktrees", fail_b=False
+        )
+        scheduler = sch.FactoryScheduler(
+            self.store, run_id, resumed, self.runtime, target
+        )
+        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
+        b_builders = self._lane_rows(run_id, st.ArtifactKind.BUILDER_OUTPUT, "lane-b")
+        self.assertEqual(len(b_builders), 1)
+        self.assertEqual(
+            b_builders[0][2]["builder_base_sha"], a_merges[0][2]["after_sha"]
+        )
+        b_merges = self._lane_rows(run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-b")
+        self.assertEqual(len(b_merges), 1)
+        reviews = self._run_rows(run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0][2]["verdict"], st.ReviewerVerdict.PASS.value)
+        pubs = self._run_rows(run_id, st.ArtifactKind.MAIN_PUBLICATION)
+        self.assertEqual(len(pubs), 1)
+        tip = sch.durable_integration_tip(self.store, run_id)
+        self.assertEqual(pubs[0][2]["published_sha"], tip)
+        self.assertEqual(_git(self.repo, "rev-parse", "refs/heads/main"), tip)
+        self.assertEqual(b_merges[0][2]["after_sha"], tip)
+        again = sch.FactoryScheduler(
+            self.store,
+            run_id,
+            TwelveStepActor(self.repo, self.runtime.path / "worktrees", fail_b=False),
+            self.runtime,
+            target,
+        ).run()
+        self.assertEqual(again, st.RunStatus.COMPLETE)
+        self.assertEqual(
+            len(self._lane_rows(run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-a")), 1
+        )
+        self.assertEqual(
+            len(self._lane_rows(run_id, st.ArtifactKind.INTEGRATION_MERGE, "lane-b")), 1
+        )
+        self.assertEqual(
+            len(self._run_rows(run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW)), 1
+        )
+        self.assertEqual(
+            len(self._run_rows(run_id, st.ArtifactKind.MAIN_PUBLICATION)), 1
+        )
+        self._assert_private_tests_executed(run_id, "lane-b")
+
+    def test_publication_refuses_external_same_sha_without_receipt(self) -> None:
+        compiled = self._compile(revision=1, ref="plan:same-sha")
+        target = self._binding_target()
+        run_id = "run-same-sha"
+        sch.create_factory_run(
+            store=self.store,
+            run_id=run_id,
+            compiled=compiled,
+            runtime=self.runtime,
+            target=target,
+        )
+
+        class PassActor(ScriptedActor):
+            def review_tests(self, ctx):
+                del ctx
+                return st.ReviewerVerdict.PASS, ()
+
+            def review_code(self, ctx):
+                del ctx
+                return st.ReviewerVerdict.PASS, ()
+
+        original = sch.gitpub.publish_or_reconcile_locked
+
+        def wrapped(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("stop before publication")
+
+        sch.gitpub.publish_or_reconcile_locked = wrapped  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(RuntimeError):
+                sch.FactoryScheduler(
+                    self.store,
+                    run_id,
+                    PassActor(self.repo, self.runtime.path / "worktrees"),
+                    self.runtime,
+                    target,
+                ).run()
+        finally:
+            sch.gitpub.publish_or_reconcile_locked = original  # type: ignore[method-assign]
+        tip = sch.durable_integration_tip(self.store, run_id)
+        _git(self.repo, "update-ref", "refs/heads/main", tip)
+        with self.assertRaises(gitpub.GitPublicationRefused) as raised:
+            sch.FactoryScheduler(
+                self.store,
+                run_id,
+                PassActor(self.repo, self.runtime.path / "worktrees"),
+                self.runtime,
+                target,
+            ).run()
+        self.assertEqual(raised.exception.code, "PUBLICATION_EXTERNAL_SAME_SHA")
+        self.assertFalse(sch._has_publication(self.store, run_id))
+        self.assertEqual(_git(self.repo, "rev-parse", "refs/heads/main"), tip)
 
 
 if __name__ == "__main__":
