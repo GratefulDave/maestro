@@ -45,7 +45,8 @@ the answer to that sentence, and every design decision below is one clause of it
    list: a file that stops being compared without saying so is the same defect
    as a file that stops existing without saying so.
 4. **Dry-run is the default.** `mirror` plans; `mirror(apply=True)` writes.
-   Destroying a copy is never the shorter command.
+   `prune` plans; mutation requires `prune(..., apply=True, commit=True)` /
+   `--apply --commit`. Destroying a copy is never the shorter command.
 5. **A destination that looks ahead is refused by name.** Two independent
    signals, either alone sufficient: `DESTINATION_NEWER` (differing bytes and a
    strictly newer mtime) and `DESTINATION_LONGER` (strictly more lines than the
@@ -55,9 +56,12 @@ the answer to that sentence, and every design decision below is one clause of it
    source tree is newer than every file in a long-lived destination. Overriding
    is the explicitly named `overwrite_ahead=True` / `--overwrite-ahead`, and the
    refusals it overrode stay in the result rather than disappearing.
-6. **Nothing is ever deleted.** Files present only in the destination are
+6. **Mirror never deletes.** Files present only in the destination are
    reported as `left_in_destination` and left where they are. A mirror that
-   prunes is the loss mode this module exists to prevent, so it does not prune.
+   prunes is the loss mode this module exists to prevent, so `mirror` does
+   not prune. The sole verified deletion path is `prune`: it removes only
+   named destination paths proved deleted by a single-parent source commit,
+   and only after every check on the whole request succeeds.
 7. **A mirror can record itself, and a mirror that would destroy unrecorded work
    refuses instead.** `mirror(apply=True, commit=True)` — `--apply --commit` —
    stages *only the paths it wrote*, by name, and commits them with a message
@@ -237,6 +241,24 @@ COMMIT_DESTINATION_DIRTY = "COMMIT_DESTINATION_DIRTY"
 COMMIT_NOTHING_TO_COMMIT = "COMMIT_NOTHING_TO_COMMIT"
 COMMIT_RECORDED = "COMMIT_RECORDED"
 COMMIT_FAILED = "COMMIT_FAILED"
+
+#: Named prune refusals. Any one aborts the entire request before mutation.
+PRUNE_HEAD_MISMATCH = "PRUNE_HEAD_MISMATCH"
+PRUNE_MERGE_COMMIT = "PRUNE_MERGE_COMMIT"
+PRUNE_WRONG_PARENT = "PRUNE_WRONG_PARENT"
+PRUNE_PATH_INVALID = "PRUNE_PATH_INVALID"
+PRUNE_PATH_DUPLICATE = "PRUNE_PATH_DUPLICATE"
+PRUNE_SOURCE_STILL_PRESENT = "PRUNE_SOURCE_STILL_PRESENT"
+PRUNE_PREDECESSOR_MISSING = "PRUNE_PREDECESSOR_MISSING"
+PRUNE_PREDECESSOR_NOT_BLOB = "PRUNE_PREDECESSOR_NOT_BLOB"
+PRUNE_DESTINATION_ABSENT = "PRUNE_DESTINATION_ABSENT"
+PRUNE_DESTINATION_UNTRACKED = "PRUNE_DESTINATION_UNTRACKED"
+PRUNE_DESTINATION_DIRTY = "PRUNE_DESTINATION_DIRTY"
+PRUNE_DESTINATION_DIVERGED = "PRUNE_DESTINATION_DIVERGED"
+PRUNE_DESTINATION_NOT_REGULAR = "PRUNE_DESTINATION_NOT_REGULAR"
+PRUNE_COMMIT_REQUIRED = "PRUNE_COMMIT_REQUIRED"
+PRUNE_NO_REPOSITORY = "PRUNE_NO_REPOSITORY"
+PRUNE_GIT_FAILED = "PRUNE_GIT_FAILED"
 
 
 class VerificationError(RuntimeError):
@@ -1059,12 +1081,15 @@ class CommitOutcome:
                 "not record them.".format(repo=self.repository),
                 "  " + self.detail.strip().replace("\n", "\n  "),
             ]
-        return [
+        lines = [
             "  committed {rev} in {repo}, staging {n} named path(s). "
             "Nothing was pushed.".format(
                 rev=self.revision, repo=self.repository, n=len(self.staged)
             )
         ]
+        if self.detail.strip():
+            lines.append("  " + self.detail.strip().replace("\n", "\n  "))
+        return lines
 
 
 @dataclass(frozen=True)
@@ -1392,6 +1417,508 @@ def mirror(
     return _result(apply, _record(result, source_revision(source.root)))
 
 
+def _git_bytes(repo: os.PathLike | str, *args: str) -> subprocess.CompletedProcess:
+    """Git subprocess returning raw bytes. Blob identity is not text."""
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=False,
+    )
+
+
+def _normalize_named_path(raw: str) -> Optional[str]:
+    """Exact runtime-root-relative POSIX path, or None if the name is inadmissible.
+
+    Rejects backslashes, doubled separators, and dot components instead of
+    canonicalizing them. The returned string is the operator's spelling.
+    """
+    if not raw:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        return None
+    if "\\" in raw or "//" in raw:
+        return None
+    candidate = pathlib.PurePosixPath(raw)
+    native = pathlib.PurePath(raw)
+    if candidate.is_absolute() or native.is_absolute() or candidate.anchor:
+        return None
+    parts = candidate.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    if candidate.as_posix() != raw:
+        return None
+    return raw
+
+
+def _full_commit(repo: pathlib.Path, spec: str) -> Optional[str]:
+    resolved = _git(repo, "rev-parse", "--verify", "{0}^{{commit}}".format(spec))
+    if resolved.returncode != 0:
+        return None
+    sha = resolved.stdout.strip()
+    return sha or None
+
+
+def _commit_parents(repo: pathlib.Path, sha: str) -> Tuple[str, ...]:
+    listed = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+    if listed.returncode != 0 or not listed.stdout.strip():
+        return ()
+    parts = listed.stdout.strip().split()
+    return tuple(parts[1:])
+
+
+def _object_type(repo: pathlib.Path, spec: str) -> Optional[str]:
+    typed = _git(repo, "cat-file", "-t", spec)
+    if typed.returncode != 0:
+        return None
+    kind = typed.stdout.strip()
+    return kind or None
+
+
+def _blob_bytes(repo: pathlib.Path, spec: str) -> Optional[bytes]:
+    blob = _git_bytes(repo, "cat-file", "blob", spec)
+    if blob.returncode != 0:
+        return None
+    return blob.stdout
+
+
+def _runtime_repo_prefix(copy: RuntimeCopy, repo: pathlib.Path) -> str:
+    return copy.root.resolve().relative_to(repo.resolve()).as_posix()
+
+
+def _join_git_path(runtime_prefix: str, named: str) -> str:
+    if not runtime_prefix:
+        return named
+    return runtime_prefix.rstrip("/") + "/" + named
+
+
+def _is_source_repo_alias(named: str, source_prefix: str) -> bool:
+    if not source_prefix:
+        return False
+    return named == source_prefix or named.startswith(source_prefix + "/")
+
+
+def _literal_pathspec(git_path: str) -> str:
+    """Encode a destination git path so Git cannot treat it as magic pathspec."""
+    return ":(literal){0}".format(git_path)
+
+
+@dataclass(frozen=True)
+class PruneRefusal:
+    """One named reason a prune was refused.
+
+    A refusal raised before mutation is a no-op. ``PruneResult.rollback_failed``
+    means mutation already happened and restore did not, so the refusal is not
+    a no-op.
+    """
+
+    code: str
+    detail: str
+    path: str = ""
+
+    def describe(self) -> str:
+        if self.path:
+            return "{code} {path}: {detail}".format(
+                code=self.code, path=self.path, detail=self.detail
+            )
+        return "{code}: {detail}".format(code=self.code, detail=self.detail)
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """What a prune did, or — when ``applied`` is false — what it would do."""
+
+    source: RuntimeCopy
+    destination: RuntimeCopy
+    applied: bool
+    deletion_sha: str
+    pre_deletion_sha: str
+    paths: Tuple[str, ...]
+    removed: Tuple[str, ...] = ()
+    refusals: Tuple[PruneRefusal, ...] = ()
+    commit: CommitOutcome = field(default_factory=CommitOutcome)
+    rollback_failed: bool = False
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.refusals and not self.commit.refused
+
+    def describe(self) -> str:
+        verb = "pruned" if self.applied else "would prune"
+        lines = [
+            "{verb} {n} path(s) from {b} (deletion {d}, predecessor {p})".format(
+                verb=verb,
+                n=len(self.paths),
+                b=self.destination.name,
+                d=self.deletion_sha,
+                p=self.pre_deletion_sha,
+            )
+        ]
+        lines.extend("  " + path for path in self.paths)
+        if self.refusals:
+            if self.rollback_failed:
+                lines.append("  REFUSED; rollback failed, destination may have changed:")
+            else:
+                lines.append("  REFUSED, nothing was removed:")
+            lines.extend("    " + item.describe() for item in self.refusals)
+        lines.extend(self.commit.describe())
+        return "\n".join(lines)
+
+
+def _build_prune_commit_message(
+    destination: RuntimeCopy,
+    deletion_sha: str,
+    pre_deletion_sha: str,
+    paths: Sequence[str],
+) -> str:
+    lines = [
+        "Prune ADW runtime paths from {name}".format(name=destination.name),
+        "",
+        "deletion-sha: {0}".format(deletion_sha),
+        "pre-deletion-sha: {0}".format(pre_deletion_sha),
+        "",
+        "Removed:",
+    ]
+    lines.extend("  {0}".format(path) for path in paths)
+    return "\n".join(lines) + "\n"
+
+
+def _destination_state(dest_repo: pathlib.Path, dest_git_path: str, dest_file: pathlib.Path) -> Optional[str]:
+    """Return a destination refusal code, or None when the path is tracked and clean.
+
+    Presence uses ``lstat`` (no symlink follow). Git command failures are
+    refusals, never treated as a clean tree.
+    """
+    try:
+        dest_file.lstat()
+        present = True
+    except FileNotFoundError:
+        present = False
+    except OSError:
+        return PRUNE_GIT_FAILED
+
+    spec = _literal_pathspec(dest_git_path)
+    tracked = _git(dest_repo, "ls-files", "--error-unmatch", "--", spec)
+    if tracked.returncode not in (0, 1):
+        return PRUNE_GIT_FAILED
+    others = _git(
+        dest_repo, "ls-files", "--others", "--exclude-standard", "--", spec
+    )
+    if others.returncode != 0:
+        return PRUNE_GIT_FAILED
+    if others.stdout.strip():
+        return PRUNE_DESTINATION_UNTRACKED
+    if tracked.returncode != 0:
+        return PRUNE_DESTINATION_ABSENT if not present else PRUNE_DESTINATION_UNTRACKED
+
+    staged = _git(dest_repo, "ls-files", "-s", "--", spec)
+    if staged.returncode != 0:
+        return PRUNE_GIT_FAILED
+    fields = staged.stdout.split()
+    if not fields:
+        return PRUNE_GIT_FAILED
+    if fields[0] not in ("100644", "100755"):
+        return PRUNE_DESTINATION_NOT_REGULAR
+
+    worktree = _git(dest_repo, "diff", "--name-only", "--", spec)
+    if worktree.returncode != 0:
+        return PRUNE_GIT_FAILED
+    index = _git(dest_repo, "diff", "--cached", "--name-only", "--", spec)
+    if index.returncode != 0:
+        return PRUNE_GIT_FAILED
+    if worktree.stdout.strip() or index.stdout.strip():
+        return PRUNE_DESTINATION_DIRTY
+    return None
+
+
+def _restore_destination_paths(dest_repo: pathlib.Path, git_paths: Sequence[str]) -> subprocess.CompletedProcess:
+    """Put named paths back to HEAD index and worktree after a failed mutation."""
+    specs = [_literal_pathspec(path) for path in git_paths]
+    return _git(dest_repo, "checkout", "HEAD", "--", *specs)
+
+def prune(
+    source: RuntimeCopy,
+    destination: RuntimeCopy,
+    *,
+    deletion_sha: str,
+    pre_deletion_sha: str,
+    paths: Sequence[str],
+    apply: bool = False,
+    commit: bool = False,
+) -> PruneResult:
+    """Remove verified destination paths proved deleted in the source commit.
+
+    Never consults destination/source ancestry, mtimes, or line counts. Dry-run
+    unless both ``apply`` and ``commit`` are set. One refusal aborts everything.
+    """
+
+    def _result(
+        applied: bool,
+        *,
+        deletion: str = deletion_sha,
+        predecessor: str = pre_deletion_sha,
+        named: Sequence[str] = paths,
+        removed: Sequence[str] = (),
+        refusals: Sequence[PruneRefusal] = (),
+        outcome: Optional[CommitOutcome] = None,
+        rollback_failed: bool = False,
+    ) -> PruneResult:
+        return PruneResult(
+            source=source,
+            destination=destination,
+            applied=applied,
+            deletion_sha=deletion,
+            pre_deletion_sha=predecessor,
+            paths=tuple(named),
+            removed=tuple(removed),
+            refusals=tuple(refusals),
+            commit=outcome or CommitOutcome(),
+            rollback_failed=rollback_failed,
+        )
+
+    refusals: List[PruneRefusal] = []
+    source_repo = git_repository_of(source.root)
+    dest_repo = git_repository_of(destination.root)
+    if source_repo is None:
+        refusals.append(
+            PruneRefusal(PRUNE_NO_REPOSITORY, "source is not inside a git working tree")
+        )
+    if dest_repo is None:
+        refusals.append(
+            PruneRefusal(
+                PRUNE_NO_REPOSITORY, "destination is not inside a git working tree"
+            )
+        )
+    if refusals:
+        return _result(False, refusals=refusals)
+
+    normalized: List[str] = []
+    seen = set()
+    for raw in paths:
+        name = _normalize_named_path(raw)
+        if name is None:
+            report = raw if raw and all(32 <= ord(char) < 127 for char in raw) else ""
+            refusals.append(
+                PruneRefusal(
+                    PRUNE_PATH_INVALID,
+                    "path is not an exact runtime-root-relative POSIX path",
+                    path=report,
+                )
+            )
+            continue
+        if name in seen:
+            refusals.append(
+                PruneRefusal(PRUNE_PATH_DUPLICATE, "path was supplied more than once", path=name)
+            )
+            continue
+        seen.add(name)
+        normalized.append(name)
+    if not normalized and not refusals:
+        refusals.append(
+            PruneRefusal(PRUNE_PATH_INVALID, "every prune requires one or more --path")
+        )
+
+    head = _full_commit(source_repo, "HEAD")
+    deletion = _full_commit(source_repo, deletion_sha)
+    predecessor = _full_commit(source_repo, pre_deletion_sha)
+    if deletion is None or head is None or head != deletion:
+        refusals.append(
+            PruneRefusal(
+                PRUNE_HEAD_MISMATCH,
+                "source HEAD {head} is not deletion-sha {want}".format(
+                    head=head or "unresolved", want=deletion_sha
+                ),
+            )
+        )
+    if deletion is not None:
+        parents = _commit_parents(source_repo, deletion)
+        if len(parents) != 1:
+            refusals.append(
+                PruneRefusal(
+                    PRUNE_MERGE_COMMIT,
+                    "deletion-sha has {n} parent(s); merge commits are refused".format(
+                        n=len(parents)
+                    ),
+                )
+            )
+        elif predecessor is None or parents[0] != predecessor:
+            refusals.append(
+                PruneRefusal(
+                    PRUNE_WRONG_PARENT,
+                    "sole parent {got} is not pre-deletion-sha {want}".format(
+                        got=parents[0] if parents else "none",
+                        want=pre_deletion_sha,
+                    ),
+                )
+            )
+
+    planned: List[Tuple[str, str]] = []
+    if deletion is not None and predecessor is not None:
+        source_prefix = _runtime_repo_prefix(source, source_repo)
+        dest_prefix = _runtime_repo_prefix(destination, dest_repo)
+        for named in normalized:
+            if _is_source_repo_alias(named, source_prefix):
+                refusals.append(
+                    PruneRefusal(
+                        PRUNE_PATH_INVALID,
+                        "path is a source-repository prefix alias, not runtime-root-relative",
+                        path=named,
+                    )
+                )
+                continue
+            source_git_path = _join_git_path(source_prefix, named)
+            dest_git_path = _join_git_path(dest_prefix, named)
+            dest_file = destination.root / named
+            present = _object_type(source_repo, "{0}:{1}".format(deletion, source_git_path))
+            if present is not None:
+                refusals.append(
+                    PruneRefusal(
+                        PRUNE_SOURCE_STILL_PRESENT,
+                        "path still exists at deletion-sha as {0}".format(present),
+                        path=named,
+                    )
+                )
+                continue
+            pred_type = _object_type(
+                source_repo, "{0}:{1}".format(predecessor, source_git_path)
+            )
+            if pred_type is None:
+                refusals.append(
+                    PruneRefusal(
+                        PRUNE_PREDECESSOR_MISSING,
+                        "path is absent at pre-deletion-sha",
+                        path=named,
+                    )
+                )
+                continue
+            if pred_type != "blob":
+                refusals.append(
+                    PruneRefusal(
+                        PRUNE_PREDECESSOR_NOT_BLOB,
+                        "path is {0} at pre-deletion-sha, not a blob".format(pred_type),
+                        path=named,
+                    )
+                )
+                continue
+            want = _blob_bytes(
+                source_repo, "{0}:{1}".format(predecessor, source_git_path)
+            )
+            dest_code = _destination_state(dest_repo, dest_git_path, dest_file)
+            if dest_code is not None:
+                refusals.append(
+                    PruneRefusal(dest_code, "destination is not a tracked clean regular blob", path=named)
+                )
+                continue
+            got = _blob_bytes(dest_repo, "HEAD:{0}".format(dest_git_path))
+            if want is None or got is None or got != want:
+                refusals.append(
+                    PruneRefusal(
+                        PRUNE_DESTINATION_DIVERGED,
+                        "destination HEAD blob is not the predecessor blob",
+                        path=named,
+                    )
+                )
+                continue
+            planned.append((named, dest_git_path))
+
+    if apply and not commit:
+        refusals.append(
+            PruneRefusal(
+                PRUNE_COMMIT_REQUIRED,
+                "mutation requires --apply and --commit together",
+            )
+        )
+
+    named_paths = tuple(normalized)
+    if refusals:
+        return _result(
+            False,
+            deletion=deletion or deletion_sha,
+            predecessor=predecessor or pre_deletion_sha,
+            named=named_paths,
+            refusals=refusals,
+        )
+
+    if not apply:
+        outcome = CommitOutcome(reason=COMMIT_NOT_APPLIED) if commit else CommitOutcome()
+        return _result(
+            False,
+            deletion=deletion,
+            predecessor=predecessor,
+            named=named_paths,
+            outcome=outcome,
+        )
+    git_paths = [dest_git_path for _named, dest_git_path in planned]
+    specs = [_literal_pathspec(path) for path in git_paths]
+    message = _build_prune_commit_message(
+        destination, deletion, predecessor, named_paths
+    )
+    removed_names = [named for named, _git_path in planned]
+
+    def _mutation_failed(detail: str, path: str = "") -> PruneResult:
+        restored = _restore_destination_paths(dest_repo, git_paths)
+        rollback_failed = restored.returncode != 0
+        if rollback_failed:
+            detail = "{0}; rollback failed: {1}".format(
+                detail, (restored.stderr or restored.stdout).strip()
+            )
+        return _result(
+            False,
+            deletion=deletion,
+            predecessor=predecessor,
+            named=named_paths,
+            refusals=(PruneRefusal(COMMIT_FAILED, detail, path=path),),
+            outcome=CommitOutcome(
+                reason=COMMIT_FAILED,
+                repository=dest_repo,
+                detail=detail,
+                message=message,
+            ),
+            rollback_failed=rollback_failed,
+        )
+
+    removed = _git(dest_repo, "rm", "-q", "--", *specs)
+    if removed.returncode != 0:
+        return _mutation_failed((removed.stderr or removed.stdout).strip())
+    committed = _git(dest_repo, "commit", "-m", message, "--", *specs)
+    if committed.returncode != 0:
+        return _mutation_failed((committed.stderr or committed.stdout).strip())
+    new_head = _full_commit(dest_repo, "HEAD")
+    if new_head is None:
+        lookup = _git(dest_repo, "rev-parse", "--verify", "HEAD")
+        detail = "commit succeeded; HEAD lookup failed: {0}".format(
+            (lookup.stderr or lookup.stdout).strip()
+        )
+        return _result(
+            True,
+            deletion=deletion,
+            predecessor=predecessor,
+            named=named_paths,
+            removed=removed_names,
+            outcome=CommitOutcome(
+                reason=COMMIT_RECORDED,
+                repository=dest_repo,
+                staged=tuple(removed_names),
+                revision="",
+                message=message,
+                detail=detail,
+            ),
+        )
+    return _result(
+        True,
+        deletion=deletion,
+        predecessor=predecessor,
+        named=named_paths,
+        removed=removed_names,
+        outcome=CommitOutcome(
+            reason=COMMIT_RECORDED,
+            repository=dest_repo,
+            staged=tuple(removed_names),
+            revision=new_head,
+            message=message,
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="runtime_sync",
@@ -1452,6 +1979,36 @@ def _build_parser() -> argparse.ArgumentParser:
              "only the paths written and never pushing. Requires --apply. "
              "Refuses to copy anything at all if the destination holds "
              "uncommitted work in a file this mirror would overwrite.",
+    )
+
+    drop = sub.add_parser(
+        "prune",
+        help="remove destination paths proved deleted by a single-parent source commit",
+    )
+    drop.add_argument("source")
+    drop.add_argument("destination")
+    drop.add_argument("--deletion-sha", required=True)
+    drop.add_argument("--pre-deletion-sha", required=True)
+    drop.add_argument(
+        "--path",
+        action="append",
+        dest="paths",
+        required=True,
+        metavar="RELATIVE_PATH",
+        help="exact runtime-root-relative POSIX path to prune; repeatable. "
+             "Backslashes, doubled separators, dot components, and "
+             "source-repository prefix aliases are refused, not canonicalized",
+    )
+    drop.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the removal; without it the run is a plan and touches nothing",
+    )
+    drop.add_argument(
+        "--commit",
+        action="store_true",
+        help="record the removals in the destination git working tree. "
+             "Required with --apply. Never pushes.",
     )
     return parser
 
@@ -1548,7 +2105,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
-    destination = describe_copy(args.destination, pinned=args.pin)
+    destination = describe_copy(
+        args.destination, pinned=getattr(args, "pin", None) or []
+    )
     if not destination.root.is_dir():
         print("DESTINATION_MISSING {}".format(destination.root), file=sys.stderr)
         return 2
@@ -1557,6 +2116,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report = compare(source, destination)
         print(report.describe())
         return 0 if report.is_level else 1
+
+    if args.command == "prune":
+        result = prune(
+            source,
+            destination,
+            deletion_sha=args.deletion_sha,
+            pre_deletion_sha=args.pre_deletion_sha,
+            paths=args.paths,
+            apply=args.apply,
+            commit=args.commit,
+        )
+        print(result.describe())
+        return 0 if result.is_clean else 2
 
     result = mirror(
         source,

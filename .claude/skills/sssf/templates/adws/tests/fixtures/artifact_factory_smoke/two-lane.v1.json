@@ -1,0 +1,19 @@
+{
+  "schema_version": "maestro-plan.artifact-factory.v1",
+  "lanes": [
+    {
+      "id": "lane-a",
+      "needs": [],
+      "outputs": ["a.txt"],
+      "spec": {"goal": "emit a.txt"},
+      "acceptance": ["a.txt is written"]
+    },
+    {
+      "id": "lane-b",
+      "needs": ["lane-a"],
+      "outputs": ["b.txt"],
+      "spec": {"goal": "emit b.txt after a"},
+      "acceptance": ["b.txt is written"]
+    }
+  ]
+}

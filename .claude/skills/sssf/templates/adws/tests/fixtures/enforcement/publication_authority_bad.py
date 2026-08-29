@@ -1,4 +1,1 @@
-from adw_modules import coordinator_store
-from adw_modules import workspace_model
-from adw_modules import workspace_canonical
-from adw_modules import workspace_digest
+"""Coordinator/workspace_model authority deleted."""

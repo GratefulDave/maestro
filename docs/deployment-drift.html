@@ -27,6 +27,7 @@
       --mono: "Geist Mono", ui-monospace, monospace;
     }
     * { box-sizing: border-box; }
+    html { color-scheme: dark; background: var(--paper); }
     body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); line-height: 1.65; }
     a { color: var(--link); }
     a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -54,7 +55,10 @@
     tr:last-child td { border-bottom: 0; }
     .callout { margin: 1rem 0; padding: 1rem 1.15rem; border-left: 2px solid var(--accent); background: var(--accent-tint); color: var(--muted); border-radius: 0 8px 8px 0; }
     footer { margin-top: 4rem; padding-top: 1.2rem; border-top: 1px solid var(--rule); color: var(--soft); font: .72rem var(--mono); }
-    @media (max-width: 920px) { .shell { display: block; } .sidebar { position: relative; height: auto; } .sidebar nav { display: none; } }
+        .shell { max-width: 100%; }
+    main { min-width: 0; max-width: 100%; }
+    .table-wrap, pre { max-width: 100%; }
+    @media (max-width: 920px) { html, body, .shell { overflow-x: hidden; max-width: 100%; } .shell { display: block; } .sidebar { position: relative; height: auto; } .sidebar nav { display: none; } main { width: 100%; } .table-wrap, pre { max-width: 100%; overflow-x: auto; } }
   </style>
 </head>
 <body>
@@ -63,6 +67,7 @@
       <a class="brand" href="index.html"><span class="mark">M</span><span><strong>Maestro</strong><small>software factory</small></span></a>
       <nav>
         <p class="nav-label">Diagrams</p>
+        <a href="architecture/00-artifact-factory.html">Current factory</a>
         <a href="architecture/index.html">Gallery</a>
         <p class="nav-label">Authoring</p>
         <a href="plan-authoring.html">Plan authoring</a>

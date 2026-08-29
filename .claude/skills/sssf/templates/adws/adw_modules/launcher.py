@@ -18,7 +18,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from . import handoff_budget as hb
 from . import permissions
@@ -218,25 +228,6 @@ class HarnessCancelled(RuntimeError):
 
 class HarnessQuiescenceError(RuntimeError):
     """A harness-owned process group could not be proven absent."""
-
-
-class HandleOwnershipError(RuntimeError):
-    """A live Herdr actor could not be proven to own the persisted handle."""
-
-    def __init__(self, code: str, detail: str = "") -> None:
-        self.code = str(code)
-        self.detail = str(detail)
-        super().__init__(
-            "{}{}".format(self.code, ":" + self.detail if self.detail else "")
-        )
-
-
-class HandleAbsent(HandleOwnershipError):
-    """Herdr proved the persisted pane or actor id no longer exists."""
-
-
-class HandleAdoptionRefused(HandleOwnershipError):
-    """Herdr answered, but its typed identity disagreed with the ledger."""
 
 
 class _WorkspaceGone(RuntimeError):
@@ -459,74 +450,25 @@ class LaunchSpec:
     #: The authored plan name shown on the Herdr workspace. Runtime identity
     #: remains in `correlation_token`; it is never parsed for placement.
     workspace_label: str = ""
-    #: Durable lane identity used only as the tab-adoption key. A derived
-    #: reviewer receives its build lane's key rather than its derived node id.
+    #: Tab grouping key for panes of one lane. Not a session-adoption identity.
     lane_key: str = ""
     #: Authored lane name shown on the Herdr tab and actor pane labels.
     lane_label: str = ""
     #: This actor's role in the lane: `builder`, `reviewer`, or `tester`.
     pane_role: str = ""
-    #: Actor attempt/session generation shown as `aN`. Standalone author and
-    #: deliver panes leave it unset and retain their role-only label.
     attempt_no: Optional[int] = None
-    #: How many agent panes the caller expects this tab to hold. The tab's
-    #: column count is computed from it and then only ever grows, so a
-    #: declared size is what makes the grid exact: a node declaring 2 gets one
-    #: row of two, one declaring 4 gets 2x2. Left at 0 the launcher learns the
-    #: count as panes arrive, which is correct for 1, 2 and 3 panes and merely
-    #: wider than the table for 4 and 5.
+    #: How many agent panes the caller expects this tab to hold.
     pane_group_size: int = 0
-    #: Secondary escape hatch, default off. The operator's tool policy is the
-    #: omp profile (`--profile`). True appends
-    #: `permissions.route_capability_argv`; False passes no `--tools` /
-    #: `--disallowedTools`. Maestro does not editorialise about tools unless
-    #: asked.
     restrict_tools: bool = False
-    #: Called once with the `LaunchHandle` the instant the launcher holds this
-    #: attempt's durable identity — pane, actor name, and the session path
-    #: herdr reports as `agent_session` — and BEFORE the prompt-submission
-    #: proof runs.
-    #:
-    #: `store.mark_launched` used to be reachable only after `launch` returned,
-    #: which is 30s to 2 minutes after a real pane exists and a real actor owns
-    #: it. For that whole window the attempt row said `launched_at`, `pid` and
-    #: `session_path` were NULL: the watchdog's §7.6 signals stayed disarmed
-    #: because `AttemptRecord.armed` is `launched_at is not None`, the console
-    #: showed an attempt with no session to open, and a refusal inside the
-    #: submission path left behind a pane that no durable record named.
-    #:
-    #: The identity is available long before the proof is, so it is written
-    #: long before the proof is. Left `None` the launcher writes nothing, which
-    #: is correct for the launchers that have no ledger (route admission, the
-    #: plan author, the smoke tool).
+    #: Optional callback once launch holds pane/actor ids. Transport only.
     on_identity: Optional[Callable[["LaunchHandle"], None]] = None
 
 
-#: Direct Claude sessions must delegate substantial work rather than silently
-#: duplicating a spawned subagent's task in the parent, and must judge a
-#: teammate idle only on positive evidence. This is part of every Claude
-#: prompt, at the universal launch chokepoint rather than at individual
-#: scheduler call sites. The idle-evidence sentence is the agent-side twin of
-#: the runtime-side law: LIVE_WORKING_STATUSES (watchdog.py /
-#: finalization_window.py) excludes "idle" for the same reason -- silence,
-#: flat mtime, and idle_notification are heartbeats, not completion.
-#: The pane status that means "back at the composer, not doing anything" --
-#: and equally "between a tool result and the next message" and "blocked
-#: inside a tool call", which is why one sample of it decides nothing.
-#:
-#: Stated here rather than imported from `finalization_window`, which names
-#: the same string for the reviewer. That module reaches this one through
-#: `watchdog -> scheduler_types -> worktree`, so the dependency runs one way
-#: only. `test_step7_launcher` asserts the two stay equal, which is what keeps
-#: a restatement from becoming a divergence.
+#: Pane status meaning the composer is not currently producing a turn.
 AGENT_QUIESCENT_STATUS = "idle"
 
 #: How long `AGENT_QUIESCENT_STATUS` must hold, with no transcript record
 #: appearing, before `poll` reads it as a turn that stopped without declaring.
-#: B14's rule and the reviewer window's own number
-#: (`finalization_window.DEFAULT_QUIESCENCE_CONFIRM_S`), bound to it by the
-#: same test: two numbers for one clock is how a raised default comes to look
-#: like it did nothing.
 AGENT_QUIESCENCE_CONFIRM_S = 60.0
 
 
@@ -630,35 +572,6 @@ class LaunchHandle:
 
 
 @dataclass(frozen=True)
-class PersistedActorHandle:
-    """The durable identity required to reclaim one interactive actor.
-
-    Labels and prompt bytes are intentionally absent: both are display/content
-    and neither establishes that this process owns the pane.  Resume names the
-    Herdr pane, workspace, tab, and agent ids recorded at launch, then verifies
-    that exact placement and the worktree binding before restoring an in-memory
-    ``LaunchHandle``.
-    """
-
-    correlation_token: str
-    pane_id: str
-    agent_name: str
-    launched_cwd: Path
-    transcript_path: Optional[Path] = None
-    envelope_path: Optional[Path] = None
-    environment: Mapping[str, str] = field(default_factory=dict)
-    workspace_id: str = ""
-    tab_id: str = ""
-    lane_key: str = ""
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "launched_cwd", Path(self.launched_cwd))
-        object.__setattr__(
-            self, "environment", MappingProxyType(dict(self.environment))
-        )
-
-
-@dataclass(frozen=True)
 class PollResult:
     state: PollState
     exit_code: Optional[int] = None
@@ -669,7 +582,6 @@ class LauncherAdapter(Protocol):
     def launch(self, spec: LaunchSpec) -> LaunchHandle: ...
     def poll(self, handle: LaunchHandle) -> PollResult: ...
     def cancel(self, handle: LaunchHandle, deadline: float) -> None: ...
-    def reclaim(self, token: str) -> Tuple[LaunchHandle, ...]: ...
     def classify(self, exc: BaseException) -> ErrorClass: ...
     def provision(self, worktree: Path) -> None: ...
     def resubmit(
@@ -681,11 +593,6 @@ class LauncherAdapter(Protocol):
         expected_token: Optional[str] = None,
         timeout_s: float = 60.0,
     ) -> LaunchHandle: ...
-    def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle: ...
-    def retire_for_replacement(
-        self, persisted: PersistedActorHandle, deadline: float
-    ) -> None: ...
-    def close_actorless_pane(self, persisted: PersistedActorHandle) -> None: ...
     def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None: ...
 
 
@@ -1020,17 +927,8 @@ def _available_shell(payload: Mapping[str, object]) -> bool:
 def pane_liveness_pid(herdr_call: Callable[..., dict], pane_id: str) -> Optional[int]:
     """The pane's foreground process group, for asking whether it still exists.
 
-    §7.6 names three liveness signals and §16.3 item 17 records that one of
-    them, PROCESS_DEAD, cannot convict an agent attempt: `attempt.pid` was
-    only ever `handle.process_group`, which is absent for a herdr-spawned
-    agent, so `watchdog.py`'s `attempt.pid is not None` branch never ran and
-    TURN_TIMEOUT and NODE_TIMEOUT carried the whole burden alone (#20).
-
-    `herdr pane process-info` does report a group — the same payload
-    `_available_shell` already reads for its `shell_pid` / `pgid` /
-    `foreground_processes` triple. What it reports is the pane's *foreground*
-    group, which is the agent while the agent is running and the pane's own
-    shell when nothing is.
+    `herdr pane process-info` reports the pane's foreground group, which is
+    the agent while the agent is running and the pane's own shell otherwise.
 
     **This value is for `kill(pid, 0)` and nothing else.** It is deliberately
     not written to `LaunchHandle.process_group`, and the difference is the
@@ -1425,9 +1323,7 @@ def submit_agent_prompt(
         current = pane_revision(
             herdr_call,
             pane_id,
-            on_error=lambda exc: absorb(
-                "meter-read", ("pane", "get", pane_id), exc
-            ),
+            on_error=lambda exc: absorb("meter-read", ("pane", "get", pane_id), exc),
         )
         if current is not None:
             readings.append(current)
@@ -1475,9 +1371,10 @@ def submit_agent_prompt(
                 absorb("status-probe", ("agent", "get", agent_name), exc)
                 return False
             agent = _extract(payload, "agent")
-            if isinstance(agent, dict) and (
-                agent.get("agent_status") or agent.get("status")
-            ) == "working":
+            if (
+                isinstance(agent, dict)
+                and (agent.get("agent_status") or agent.get("status")) == "working"
+            ):
                 return True
         return False
 
@@ -1658,9 +1555,7 @@ def submit_agent_prompt(
             # lookup for a just-registered admission agent on EVERY round,
             # each failure was discarded, and the refusal then claimed the
             # composer had swallowed four Enters that were never delivered.
-            absorb(
-                "recovery-enter", ("agent", "send-keys", target, "enter"), exc
-            )
+            absorb("recovery-enter", ("agent", "send-keys", target, "enter"), exc)
             # `agent_not_found` is Herdr's typed statement that the
             # agent-scope verb cannot resolve this target at all, so pressing
             # it again through the registry can never deliver. `pane
@@ -1816,7 +1711,6 @@ def prompt_submission_marks(
         return total
 
 
-
 def _rising_submission_record(
     handle: LaunchHandle, prompt_path: Path
 ) -> Callable[[], bool]:
@@ -1842,9 +1736,7 @@ def _rising_submission_record(
 
     def clean_marks() -> int:
         aborted: List[BaseException] = []
-        count = prompt_submission_marks(
-            handle, prompt_path, on_error=aborted.append
-        )
+        count = prompt_submission_marks(handle, prompt_path, on_error=aborted.append)
         if aborted:
             # A transcript that does not exist yet has an EXACT count of
             # zero — nothing was partially read, because nothing was opened.
@@ -1906,9 +1798,7 @@ def wait_for_interactive_agent(
         except RuntimeError as exc:
             del probe_denial[:]
             probe_denial.append(
-                "{0}/{1}".format(
-                    type(exc).__name__, _swallowed_code(exc) or "no-code"
-                )
+                "{0}/{1}".format(type(exc).__name__, _swallowed_code(exc) or "no-code")
             )
             return False
         return settled(payload)
@@ -2918,9 +2808,7 @@ class HerdrLauncher:
                 # the budget; the node's liveness and quiescence machinery is
                 # what adjudicates a lane attempt.
                 refuse_unproven=False,
-                submission_recorded=_rising_submission_record(
-                    handle, spec.prompt_path
-                ),
+                submission_recorded=_rising_submission_record(handle, spec.prompt_path),
             )
 
             # The pane's foreground group is meaningful only after submission.
@@ -2962,29 +2850,32 @@ class HerdrLauncher:
         """
         token = str(handle.correlation_token or "")
         if not token or handle.agent_name != _agent_name(token):
-            raise HandleAdoptionRefused("HANDLE_TOKEN_MISMATCH", token)
+            raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, token)
         with self._handles_lock:
             if self._handles.get(token) is not handle:
-                raise HandleAdoptionRefused("HANDLE_NOT_OWNED", token)
+                raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, token)
         try:
             pane_payload = self._herdr(
                 "pane", "get", handle.pane_id, env=handle.environment
             )
         except HerdrCallError as exc:
             if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
-                raise HandleAbsent("PANE_ABSENT", handle.pane_id) from exc
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH, handle.pane_id
+                ) from exc
             raise
         pane = _extract(pane_payload, "pane")
         if (
             not isinstance(pane, dict)
             or str(pane.get("pane_id") or "") != handle.pane_id
         ):
-            raise HandleAdoptionRefused("PANE_ID_MISMATCH", handle.pane_id)
+            raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, handle.pane_id)
         cwd = pane.get("cwd")
         actual = Path(str(cwd)).resolve() if cwd else None
         if actual != handle.launched_cwd.resolve():
-            raise HandleAdoptionRefused(
-                "PANE_CWD_MISMATCH", "{}!={}".format(actual, handle.launched_cwd)
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "{}!={}".format(actual, handle.launched_cwd),
             )
         try:
             agent_payload = self._herdr(
@@ -2992,17 +2883,20 @@ class HerdrLauncher:
             )
         except HerdrCallError as exc:
             if exc.code == AGENT_NOT_FOUND:
-                raise HandleAbsent("AGENT_ABSENT", handle.agent_name) from exc
+                raise LaunchRefused(
+                    LaunchRefusal.BINDING_MISMATCH, handle.agent_name
+                ) from exc
             raise
         agent = _extract(agent_payload, "agent")
         if not isinstance(agent, dict):
-            raise HandleAbsent("AGENT_ABSENT", handle.agent_name)
+            raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, handle.agent_name)
         if str(agent.get("name") or "") != handle.agent_name:
-            raise HandleAdoptionRefused("AGENT_ID_MISMATCH", handle.agent_name)
+            raise LaunchRefused(LaunchRefusal.BINDING_MISMATCH, handle.agent_name)
         agent_pane = agent.get("pane_id")
         if agent_pane is not None and str(agent_pane) != handle.pane_id:
-            raise HandleAdoptionRefused(
-                "AGENT_PANE_MISMATCH", "{}!={}".format(agent_pane, handle.pane_id)
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "{}!={}".format(agent_pane, handle.pane_id),
             )
 
     def resubmit(
@@ -3022,13 +2916,13 @@ class HerdrLauncher:
         a sequence of visually similar replacement panes.
         """
         if expected_token is not None and handle.correlation_token != expected_token:
-            raise HandleAdoptionRefused(
-                "HANDLE_TOKEN_MISMATCH",
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
                 "{}!={}".format(handle.correlation_token, expected_token),
             )
         prompt = Path(prompt_path)
         if not prompt.is_file():
-            raise HandleAdoptionRefused("PROMPT_PATH_MISSING", str(prompt))
+            raise LaunchRefused(LaunchRefusal.PROMPT_UNMEASURED, str(prompt))
         if route:
             text = prompt.read_text(encoding="utf-8")
             prepared = prepare_route_prompt_text(route, text)
@@ -3066,299 +2960,6 @@ class HerdrLauncher:
         # and would convict this turn on the last one's silence.
         self._clear_quiescence(handle.correlation_token)
         return handle
-
-    def _prove_tab_contains_pane(
-        self,
-        workspace_id: str,
-        tab_id: str,
-        pane_id: str,
-        environment: Mapping[str, str],
-    ) -> None:
-        """Prove a pane's reported tab remains live without reading focus.
-
-        `pane get` already reported `tab_id` for this exact pane; `tab list`
-        proves that tab still exists in the same workspace.  Both facts are
-        required before an absent agent may cause replacement, because opening
-        a replacement in a freshly-created tab would silently split a lane.
-        """
-        try:
-            payload = self._herdr(
-                "tab", "list", "--workspace", workspace_id, env=environment
-            )
-        except HerdrCallError as exc:
-            if exc.code == "workspace_not_found":
-                self._invalidate_workspace_layout(workspace_id)
-                raise HandleAbsent("WORKSPACE_ABSENT", workspace_id) from exc
-            if exc.code == "tab_not_found":
-                raise HandleAdoptionRefused("TAB_ABSENT", tab_id) from exc
-            raise
-        tabs = _extract(payload, "tabs")
-        if not isinstance(tabs, list):
-            raise HandleAdoptionRefused("TAB_LIST_UNPROVEN", tab_id)
-        if any(
-            isinstance(tab, dict) and str(tab.get("tab_id") or "") == tab_id
-            for tab in tabs
-        ):
-            return
-        raise HandleAdoptionRefused("TAB_ABSENT", tab_id)
-
-    def restore_placement(
-        self,
-        *,
-        workspace_id: str,
-        lane_key: str,
-        tab_id: str,
-        pane_id: str,
-        environment: Mapping[str, str],
-    ) -> None:
-        """Restore a run/lane layout from a durable pane without adopting its actor.
-
-        Resume may need to launch a reviewer after the builder declaration has
-        completed.  The builder actor token is then no longer the attempt token,
-        so actor adoption is not the authority for locating the run's workspace.
-        The persisted Herdr pane and tab IDs are.  Validate both against Herdr
-        before caching them; a dead pane is typed absence, while mismatched IDs
-        are a refusal rather than permission to create a second workspace.
-        """
-        workspace_id = str(workspace_id or "")
-        lane_key = str(lane_key or "")
-        tab_id = str(tab_id or "")
-        pane_id = str(pane_id or "")
-        if not workspace_id or not lane_key or not tab_id or not pane_id:
-            raise HandleAdoptionRefused("PLACEMENT_ID_UNPROVEN", pane_id or tab_id)
-        if (
-            workspace_of(tab_id) != workspace_id
-            or workspace_of(pane_id) != workspace_id
-        ):
-            raise HandleAdoptionRefused(
-                "WORKSPACE_ID_MISMATCH",
-                "{}!={}".format(workspace_id, workspace_of(pane_id)),
-            )
-        try:
-            payload = self._herdr("pane", "get", pane_id, env=environment)
-        except HerdrCallError as exc:
-            if exc.code == "workspace_not_found":
-                self._invalidate_workspace_layout(workspace_id)
-                raise HandleAbsent("WORKSPACE_ABSENT", workspace_id) from exc
-            if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
-                raise HandleAbsent("PANE_ABSENT", pane_id) from exc
-            raise
-        pane = _extract(payload, "pane")
-        if not isinstance(pane, dict) or str(pane.get("pane_id") or "") != pane_id:
-            raise HandleAdoptionRefused("PANE_ID_MISMATCH", pane_id)
-        pane_workspace = str(pane.get("workspace_id") or workspace_of(pane_id))
-        pane_tab = str(pane.get("tab_id") or "")
-        if pane_workspace != workspace_id:
-            raise HandleAdoptionRefused(
-                "WORKSPACE_ID_MISMATCH",
-                "{}!={}".format(workspace_id, pane_workspace),
-            )
-        if pane_tab != tab_id:
-            raise HandleAdoptionRefused(
-                "TAB_ID_MISMATCH", "{}!={}".format(tab_id, pane_tab)
-            )
-        self._prove_tab_contains_pane(workspace_id, tab_id, pane_id, environment)
-        with self._handles_lock:
-            if self._workspace_id and self._workspace_id != workspace_id:
-                raise HandleAdoptionRefused(
-                    "WORKSPACE_ID_MISMATCH",
-                    "{}!={}".format(self._workspace_id, workspace_id),
-                )
-            self._workspace_id = workspace_id
-            layout = self._tabs.get(lane_key)
-            if layout is not None and layout.tab_id != tab_id:
-                raise HandleAdoptionRefused(
-                    "TAB_ID_MISMATCH", "{}!={}".format(layout.tab_id, tab_id)
-                )
-            if layout is None:
-                self._tabs[lane_key] = _TabLayout(
-                    tab_id=tab_id, panes=[pane_id], claimed=1
-                )
-
-    def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle:
-        """Restore a handle only when persisted Herdr ids still prove ownership."""
-        return self._adopt(persisted, allow_stale_placement=False)
-
-    def retire_for_replacement(
-        self, persisted: PersistedActorHandle, deadline: float
-    ) -> None:
-        """Close an owned actor whose durable placement belongs to an old run layout.
-
-        Replacement is legal only after the pane cwd and deterministic actor identity
-        still prove ownership.  Persisted workspace/tab mismatches are deliberately
-        ignored here because they are the reason this actor must be retired.
-        """
-        try:
-            handle = self._adopt(persisted, allow_stale_placement=True)
-        except HandleAbsent:
-            return
-        self.cancel(handle, deadline)
-
-    def close_actorless_pane(self, persisted: PersistedActorHandle) -> None:
-        """Close the pane left after adoption proved its actor record absent."""
-        if not self._reap_pane(persisted.pane_id, persisted.environment):
-            raise HarnessQuiescenceError(
-                "ACTORLESS_PANE_CLOSE_UNPROVEN:{}".format(persisted.pane_id)
-            )
-
-    def _adopt(
-        self,
-        persisted: PersistedActorHandle,
-        *,
-        allow_stale_placement: bool,
-    ) -> LaunchHandle:
-        """Validate one persisted actor, optionally outside the current run layout.
-
-        Absence is a distinct typed outcome that allows the durable lifecycle
-        to replace a generation. Transport/protocol failures and identity
-        mismatches stay refusals: neither is evidence that the old actor died.
-        """
-        token = str(persisted.correlation_token or "")
-        pane_id = str(persisted.pane_id or "")
-        agent_name = str(persisted.agent_name or "")
-        if (
-            not token
-            or not pane_id
-            or not agent_name
-            or agent_name != _agent_name(token)
-        ):
-            raise HandleAdoptionRefused("PERSISTED_IDENTITY_INVALID", token)
-        environment = MappingProxyType(dict(persisted.environment))
-        launched_cwd = Path(persisted.launched_cwd).resolve()
-        try:
-            pane_payload = self._herdr("pane", "get", pane_id, env=environment)
-        except HerdrCallError as exc:
-            if exc.code == "workspace_not_found":
-                workspace_id = persisted.workspace_id or workspace_of(pane_id)
-                self._invalidate_workspace_layout(workspace_id)
-                raise HandleAbsent("WORKSPACE_ABSENT", workspace_id) from exc
-            if exc.code in (AGENT_NOT_FOUND, "pane_not_found"):
-                raise HandleAbsent("PANE_ABSENT", pane_id) from exc
-            raise
-        pane = _extract(pane_payload, "pane")
-        if not isinstance(pane, dict) or str(pane.get("pane_id") or "") != pane_id:
-            raise HandleAdoptionRefused("PANE_ID_MISMATCH", pane_id)
-        cwd = pane.get("cwd")
-        actual = Path(str(cwd)).resolve() if cwd else None
-        if actual != launched_cwd:
-            raise HandleAdoptionRefused(
-                "PANE_CWD_MISMATCH", "{}!={}".format(actual, launched_cwd)
-            )
-        pane_workspace = str(pane.get("workspace_id") or "")
-        persisted_tab_id = str(persisted.tab_id or "")
-        pane_tab_id = str(pane.get("tab_id") or "")
-        if allow_stale_placement:
-            if not pane_tab_id:
-                raise HandleAdoptionRefused("TAB_ID_UNPROVEN", pane_id)
-            tab_id = pane_tab_id
-        elif persisted_tab_id:
-            if pane_tab_id != persisted_tab_id:
-                raise HandleAdoptionRefused(
-                    "TAB_ID_MISMATCH",
-                    "{}!={}".format(pane_tab_id, persisted_tab_id),
-                )
-            tab_id = persisted_tab_id
-        elif pane_tab_id:
-            # Legacy rows may have no tab id.  A direct pane response is the
-            # only recovery authority; workspace or focus never fills it in.
-            tab_id = pane_tab_id
-        else:
-            raise HandleAdoptionRefused("TAB_ID_UNPROVEN", pane_id)
-        lane_key = str(persisted.lane_key or "")
-        if not lane_key:
-            raise HandleAdoptionRefused("LANE_KEY_UNPROVEN", pane_id)
-        pane_id_workspace = workspace_of(pane_id)
-        tab_workspace = workspace_of(tab_id)
-        workspace_id = str(
-            (pane_workspace or pane_id_workspace)
-            if allow_stale_placement
-            else (persisted.workspace_id or pane_workspace or pane_id_workspace)
-        )
-        if (
-            not workspace_id
-            or workspace_id != pane_id_workspace
-            or workspace_id != tab_workspace
-            or (pane_workspace and pane_workspace != workspace_id)
-        ):
-            raise HandleAdoptionRefused(
-                "WORKSPACE_ID_MISMATCH",
-                "{}!={}".format(workspace_id, pane_workspace or pane_id_workspace),
-            )
-        self._prove_tab_contains_pane(workspace_id, tab_id, pane_id, environment)
-        candidate = LaunchHandle(
-            correlation_token=token,
-            pane_id=pane_id,
-            agent_name=agent_name,
-            launched_cwd=launched_cwd,
-            transcript_path=persisted.transcript_path,
-            envelope_path=persisted.envelope_path,
-            environment=environment,
-            workspace_id=workspace_id,
-            tab_id=tab_id,
-            lane_key=lane_key,
-        )
-        # The pane's ID/cwd are already proven.  Keep that verified placement
-        # even if Herdr then proves the actor absent, so a replacement opens
-        # in this lane's workspace/tab rather than creating a second workspace.
-        with self._handles_lock:
-            existing = self._handles.get(token)
-            if existing is not None and existing != candidate:
-                raise HandleAdoptionRefused("HANDLE_TOKEN_COLLISION", token)
-            if not allow_stale_placement:
-                if self._workspace_id and self._workspace_id != workspace_id:
-                    raise HandleAdoptionRefused(
-                        "WORKSPACE_ID_MISMATCH",
-                        "{}!={}".format(self._workspace_id, workspace_id),
-                    )
-                if not self._workspace_id:
-                    self._workspace_id = workspace_id
-                layout = self._tabs.get(lane_key)
-                if layout is None:
-                    self._tabs[lane_key] = _TabLayout(
-                        tab_id=tab_id, panes=[pane_id], claimed=1
-                    )
-                elif layout.tab_id != tab_id:
-                    raise HandleAdoptionRefused(
-                        "TAB_ID_MISMATCH",
-                        "{}!={}".format(layout.tab_id, tab_id),
-                    )
-                else:
-                    with layout.lock:
-                        if pane_id not in layout.panes:
-                            try:
-                                slot = layout.panes.index(None)
-                                layout.panes[slot] = pane_id
-                            except ValueError:
-                                slot = len(layout.panes)
-                                layout.panes.append(pane_id)
-                            layout.claimed = max(layout.claimed, slot + 1)
-                            layout.cols = max(
-                                layout.cols,
-                                grid_for(layout.claimed)[1],
-                            )
-        try:
-            agent_payload = self._herdr("agent", "get", agent_name, env=environment)
-        except HerdrCallError as exc:
-            if exc.code == AGENT_NOT_FOUND:
-                raise HandleAbsent("AGENT_ABSENT", agent_name) from exc
-            raise
-        agent = _extract(agent_payload, "agent")
-        if not isinstance(agent, dict):
-            raise HandleAbsent("AGENT_ABSENT", agent_name)
-        if str(agent.get("name") or "") != agent_name:
-            raise HandleAdoptionRefused("AGENT_ID_MISMATCH", agent_name)
-        agent_pane = agent.get("pane_id")
-        if agent_pane is not None and str(agent_pane) != pane_id:
-            raise HandleAdoptionRefused(
-                "AGENT_PANE_MISMATCH", "{}!={}".format(agent_pane, pane_id)
-            )
-        with self._handles_lock:
-            self._handles[token] = candidate
-            self._proven_absent.pop(token, None)
-            self._quiescent_since.pop(token, None)
-            if candidate.transcript_path is not None:
-                self._tailers[token] = TranscriptTailer(candidate.transcript_path)
-        return candidate
 
     def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None:
         """Wait for a completed turn to return to its retained composer.
@@ -3641,11 +3242,6 @@ class HerdrLauncher:
                 self._tailers.pop(token, None)
                 self._proven_absent[token] = handle
 
-    def reclaim(self, token: str) -> Tuple[LaunchHandle, ...]:
-        with self._handles_lock:
-            handle = self._handles.get(token)
-        return (handle,) if handle is not None else ()
-
     def agent_presence(self, token: str) -> Optional[bool]:
         """Whether Herdr still holds the deterministic agent for an attempt.
 
@@ -3701,37 +3297,13 @@ class FakeLauncher:
     ) -> LaunchHandle:
         del route, timeout_s
         if expected_token is not None and expected_token != handle.correlation_token:
-            raise HandleAdoptionRefused("HANDLE_TOKEN_MISMATCH")
+            raise LaunchRefused(LaunchRefusal.PROMPT_UNMEASURED)
         if self._handles.get(handle.correlation_token) is not handle:
-            raise HandleAdoptionRefused("HANDLE_NOT_OWNED")
+            raise LaunchRefused(LaunchRefusal.PROMPT_UNMEASURED)
         if not Path(prompt_path).is_file():
-            raise HandleAdoptionRefused("PROMPT_PATH_MISSING")
+            raise LaunchRefused(LaunchRefusal.PROMPT_UNMEASURED)
         self._states[handle.correlation_token] = PollResult(PollState.RUNNING)
         return handle
-
-    def adopt(self, persisted: PersistedActorHandle) -> LaunchHandle:
-        handle = self._handles.get(persisted.correlation_token)
-        if handle is None:
-            raise HandleAbsent("AGENT_ABSENT", persisted.agent_name)
-        if (
-            handle.pane_id != persisted.pane_id
-            or handle.agent_name != persisted.agent_name
-            or handle.launched_cwd != persisted.launched_cwd.resolve()
-        ):
-            raise HandleAdoptionRefused("PERSISTED_IDENTITY_INVALID")
-        return handle
-
-    def retire_for_replacement(
-        self, persisted: PersistedActorHandle, deadline: float
-    ) -> None:
-        handle = self.adopt(persisted)
-        self.cancel(handle, deadline)
-
-    def close_actorless_pane(self, persisted: PersistedActorHandle) -> None:
-        if persisted.correlation_token in self._handles:
-            raise HarnessQuiescenceError(
-                "ACTOR_STILL_PRESENT:{}".format(persisted.correlation_token)
-            )
 
     def complete(
         self, token: str, exit_code: int = 0, detail: str = "ENVELOPE_SUCCESS"
@@ -3760,10 +3332,6 @@ class FakeLauncher:
         self._states[handle.correlation_token] = PollResult(
             PollState.GONE, detail="CANCELLED"
         )
-
-    def reclaim(self, token: str) -> Tuple[LaunchHandle, ...]:
-        handle = self._handles.get(token)
-        return (handle,) if handle is not None else ()
 
     def classify(self, exc: BaseException) -> ErrorClass:
         return classify_error(exc)

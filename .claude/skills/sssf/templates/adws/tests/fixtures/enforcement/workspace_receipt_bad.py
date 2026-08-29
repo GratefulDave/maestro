@@ -1,1 +1,1 @@
-from adw_modules import coordinator
+"""Coordinator deleted."""

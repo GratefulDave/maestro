@@ -6,13 +6,13 @@ argument-hint: "[install | create adw | run adw | update config | ...]"
 
 # Super Simple Software Factory (SSSF)
 
-Reusable combination of **agents plus code**: deterministic Python ADW and Maestro scripts own sequencing, retries, and acceptance; OMP and Claude Code agents work inside bounded phases; typed JSON envelopes carry context between them; everything streams into SQLite for the polled visualizer. Agent proposes, code disposes.
+Reusable combination of **agents plus code**: sequential ADW scripts own phase order and acceptance; Maestro is a separate stamped nine-stage artifact factory (`adws/maestro.py run start|resume|amend|status`) whose durable authority is `lane_state.stage` plus immutable artifacts. OMP and Claude Code agents work inside bounded phases; typed JSON envelopes carry sequential-ADW context; everything streams into SQLite for the polled visualizer. Agent proposes, code disposes. Herdr/OMP are transport only.
 
 ## Startup
 
 Do not inventory the repository, scan ADW files, read runtime state, or print a dashboard at startup.
 
-If the factory is installed, it exposes ordinary ADW entrypoints and may expose `adws/maestro.py` for repository and workspace orchestration. Route only the engineer's explicit request through the table below. If a request requires the factory but `adws/` is absent, say that it is not installed and point to the install cookbook.
+If the factory is installed, Maestro's operator surface is only `uv run adws/maestro.py run start|resume|amend|status` from that stamped `adws/` copy. It is not coordinator or workspace authority. Sequential ADWs keep their own entrypoints. Route only the engineer's explicit request through the table below. If a request requires the factory but `adws/` is absent, say that it is not installed and point to the install cookbook.
 
 ## Orchestrator rules
 
@@ -56,4 +56,4 @@ Deep specs, when needed: [references/config.md](references/config.md) · [refere
 
 `coding_agent: omp` runs non-interactive `omp -p --mode json`; an optional `pm_profile` selects OMP profile mode, otherwise the configured provider/model and thinking level are passed explicitly. `coding_agent: claude_code` runs direct non-interactive Claude Code with an explicit model, effort, and tool allowlist. Both are implemented and validated before launch.
 
-Maestro is a separate stamped CLI: invoke it from the control-root as `uv run adws/maestro.py ...`; it is not a shell executable named `maestro`.
+Maestro is a separate stamped CLI: invoke it from the deployment copy as `uv run adws/maestro.py run start|resume|amend|status`. Template-source run creation refuses `RUN_REPOSITORY_MISMATCH`. It is not a shell executable named `maestro`. Durable stage is `lane_state.stage`; resume restarts the incomplete stage from the last immutable artifact. There is no retry/skip/abandon/cancel/bootstrap/plan subcommand.

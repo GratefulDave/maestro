@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **Maestro now runs one nine-stage artifact factory instead of overlapping
+  attempt, actor-generation, retry, recovery-marker, candidate, and review
+  authorities.** One mutable `lane_state.stage` advances only with immutable
+  typed artifacts. Objective plan compilation freezes the executable DAG;
+  private tests are authored, reviewed, and sealed before builders run;
+  accepted lane commits merge once into a run integration ref; final review and
+  publication use exact fingerprints and Git receipts. `run start`, `resume`,
+  `amend`, and `status` bind a product repository to an external
+  `runtime_state_root`; Herdr/OMP provide transport, not durable state.
 - **Cold-boot admission and prompt submission no longer key on the pane meter.**
   `pane send-text` / `send-keys` empty stdout is success (`{}`), not
   `PROTOCOL_INVALID_JSON`. Claude's revision never moves: proof is a rising

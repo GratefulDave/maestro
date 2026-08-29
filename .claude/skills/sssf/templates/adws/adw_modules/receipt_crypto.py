@@ -41,8 +41,13 @@ from __future__ import annotations
 import hashlib
 import secrets
 
+NO_BLOB = "NO_BLOB"
+NO_PRIOR_REF = "NO_PRIOR_REF"
+
 __all__ = [
     "KeyMaterialError",
+    "NO_BLOB",
+    "NO_PRIOR_REF",
     "SEED_SIZE",
     "PUBLIC_KEY_SIZE",
     "SIGNATURE_SIZE",
@@ -69,8 +74,8 @@ class KeyMaterialError(ValueError):
 
 # ── the curve (RFC 8032 §5.1) ───────────────────────────────────────────────
 
-_P = 2 ** 255 - 19
-_L = 2 ** 252 + 27742317777372353535851937790883648493
+_P = 2**255 - 19
+_L = 2**252 + 27742317777372353535851937790883648493
 
 
 def _modp_inv(x: int) -> int:
@@ -91,6 +96,7 @@ def _sha512_modq(data: bytes) -> int:
 
 # Points are extended homogeneous coordinates (X, Y, Z, T) with x = X/Z,
 # y = Y/Z and x*y = T/Z.
+
 
 def _point_add(P, Q):
     A = (P[1] - P[0]) * (Q[1] - Q[0]) % _P
@@ -162,15 +168,17 @@ def _point_decompress(data: bytes):
 def _secret_expand(seed: bytes):
     if len(seed) != SEED_SIZE:
         raise KeyMaterialError(
-            f"an Ed25519 seed is exactly {SEED_SIZE} bytes; got {len(seed)}")
+            f"an Ed25519 seed is exactly {SEED_SIZE} bytes; got {len(seed)}"
+        )
     h = _sha512(seed)
     a = int.from_bytes(h[:32], "little")
     a &= (1 << 254) - 8
-    a |= (1 << 254)
+    a |= 1 << 254
     return a, h[32:]
 
 
 # ── the public surface ───────────────────────────────────────────────────────
+
 
 def generate_seed() -> bytes:
     """A fresh finalizer signing key, from the OS CSPRNG."""
@@ -217,7 +225,8 @@ def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
     if len(public_key) != PUBLIC_KEY_SIZE:
         raise KeyMaterialError(
             f"an Ed25519 public key is exactly {PUBLIC_KEY_SIZE} bytes; "
-            f"got {len(public_key)}")
+            f"got {len(public_key)}"
+        )
     if len(signature) != SIGNATURE_SIZE:
         return False
     A = _point_decompress(public_key)

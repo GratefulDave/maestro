@@ -35,7 +35,7 @@
       color: var(--color-ink);
     }
 
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1200px; margin: 0 auto; overflow-x: auto; }
 
     a {
       color: var(--color-link);
@@ -229,14 +229,15 @@
 <body>
   <div class="container">
     <header class="header">
-      <p class="header-eyebrow">Maestro · Diagrams</p>
+      <p class="header-eyebrow">Current factory · historical gallery marked superseded</p>
       <h1>Architecture gallery</h1>
-      <p class="subtitle">One click from this catalog to every system, class, state, flow, and mindmap diagram.</p>
+      <p class="subtitle">Current diagrams are the shipped nine-stage contract: <code>lane_state.stage</code>, immutable artifacts, external runtime-state root, private test sealing, exactly-once integration, final review, receipt-backed publication, and four CLI verbs. The 18 older pages predate that cutover and are retained as historical evidence, not live authority.</p>
       <a class="home-link" href="../index.html">Maestro docs home</a>
     </header>
 
     <nav aria-label="Diagram groups">
       <ul class="toc">
+        <li><a href="#current">Current</a></li>
         <li><a href="#architecture">Architecture</a></li>
         <li><a href="#classes">Classes</a></li>
         <li><a href="#state">State</a></li>
@@ -246,9 +247,34 @@
       </ul>
     </nav>
 
-    <main>
+      <section class="group" id="current" aria-labelledby="current-heading">
+        <h2 id="current-heading">Current</h2>
+        <ul class="cards">
+          <li>
+            <a class="card" href="00-artifact-factory.html">
+              <p class="card-file">00-artifact-factory.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Nine-stage artifact factory</h3>
+              </div>
+              <p>Four-verb CLI, one durable stage field, sealed private tests, exactly-once integration, receipt-backed publication.</p>
+            </a>
+          </li>
+          <li>
+            <a class="card" href="00-lane-stage.html">
+              <p class="card-file">00-lane-stage.html</p>
+              <div class="card-header">
+                <span class="card-dot coral" aria-hidden="true"></span>
+                <h3>Lane stage machine</h3>
+              </div>
+              <p>The nine <code>lane_state.stage</code> values. <code>REVISE</code> is artifact data. Pause and amendment wait explicitly.</p>
+            </a>
+          </li>
+        </ul>
+      </section>
+
       <section class="group" id="architecture" aria-labelledby="architecture-heading">
-        <h2 id="architecture-heading">Architecture</h2>
+        <h2 id="architecture-heading">Architecture (historical)</h2>
         <ul class="cards">
           <li>
             <a class="card" href="01-system.html">
@@ -303,7 +329,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Plan model classes</h3>
               </div>
-              <p>Plan through PlanV5: test_visibility is authored on v5, not runnable; TestsNode, CodeNode, MergePolicy’s integration gate.</p>
+              <p>Historical PlanV5 / TestsNode / CodeNode diagram. Live execution is nine-stage lanes from an approved plan, not v5 test_visibility.</p>
             </a>
           </li>
           <li>
@@ -311,9 +337,9 @@
               <p class="card-file">11-classes-scheduler.html</p>
               <div class="card-header">
                 <span class="card-dot muted" aria-hidden="true"></span>
-                <h3>Scheduler lifecycle classes</h3>
+                <h3>Scheduler lifecycle classes (superseded)</h3>
               </div>
-              <p>LifecycleStore owns AttemptRecord, plan_versions for run amend, CandidateReview, ActorSession, and granted_extra_attempts.</p>
+              <p>Historical LifecycleStore / AttemptRecord / floored-retry UML. Not live. SVG unchanged.</p>
             </a>
           </li>
           <li>
@@ -347,9 +373,9 @@
               <p class="card-file">20-state-node.html</p>
               <div class="card-header">
                 <span class="card-dot ink" aria-hidden="true"></span>
-                <h3>NodeState machine</h3>
+                <h3>NodeState machine (superseded)</h3>
               </div>
-              <p>The six NodeStates from PENDING through MERGED, BLOCKED, skip, retry, and CANCELLED.</p>
+              <p>Historical six NodeStates with retry/skip/abandon. Not <code>lane_state.stage</code>. SVG unchanged.</p>
             </a>
           </li>
           <li>
@@ -357,9 +383,9 @@
               <p class="card-file">21-state-run.html</p>
               <div class="card-header">
                 <span class="card-dot muted" aria-hidden="true"></span>
-                <h3>Derived run state</h3>
+                <h3>Derived run state (superseded)</h3>
               </div>
-              <p>Predicate stack of derive_run_state, first match wins; not PENDING→RUNNING sequential.</p>
+              <p>Historical run outcome projected from NodeState. Not live stage.</p>
             </a>
           </li>
           <li>
@@ -367,9 +393,9 @@
               <p class="card-file">22-state-attempt.html</p>
               <div class="card-header">
                 <span class="card-dot soft" aria-hidden="true"></span>
-                <h3>Attempt retry class</h3>
+                <h3>Attempt retry class (superseded)</h3>
               </div>
-              <p>Attempt settle plus resume: leftover reclaim via worktree.stale_attempt_worktrees; resume_run clears lane_phase.</p>
+              <p>Historical attempt settle / LanePhase. Resume is stage restart from artifacts.</p>
             </a>
           </li>
         </ul>
@@ -383,9 +409,9 @@
               <p class="card-file">30-flow-run.html</p>
               <div class="card-header">
                 <span class="card-dot ink" aria-hidden="true"></span>
-                <h3>Run start flowchart</h3>
+                <h3>Run start flowchart (superseded)</h3>
               </div>
-              <p>Scheduler.run loop: ready_nodes, first-attempt falsify base, identical-stop, then _declare.</p>
+              <p>Historical Scheduler.run / first-attempt loop. Not FactoryScheduler stages.</p>
             </a>
           </li>
           <li>
@@ -393,9 +419,9 @@
               <p class="card-file">31-flow-plan.html</p>
               <div class="card-header">
                 <span class="card-dot muted" aria-hidden="true"></span>
-                <h3>Plan ship flowchart</h3>
+                <h3>Plan ship flowchart (superseded)</h3>
               </div>
-              <p>Plan ship: author, validate, finalize — a signed PASS receipt on validation alone.</p>
+              <p>Historical plan validate/finalize/ship. No live <code>plan gate|review|ship</code> verb.</p>
             </a>
           </li>
           <li>
@@ -403,9 +429,9 @@
               <p class="card-file">32-flow-escape.html</p>
               <div class="card-header">
                 <span class="card-dot soft" aria-hidden="true"></span>
-                <h3>Operator escape flowchart</h3>
+                <h3>Operator escape flowchart (superseded)</h3>
               </div>
-              <p>SEMANTIC_BUDGET_EXHAUSTED: bare resume floors spend and returns to frontier. Review-budget grant stays BLOCKED until absence-proven resume.</p>
+              <p>Historical retry/skip/abandon and review-budget grant. Not frozen CLI.</p>
             </a>
           </li>
           <li>
@@ -423,9 +449,9 @@
               <p class="card-file">34-flow-repair-chain.html</p>
               <div class="card-header">
                 <span class="card-dot coral" aria-hidden="true"></span>
-                <h3>Repair chain flowchart</h3>
+                <h3>Repair chain flowchart (superseded)</h3>
               </div>
-              <p>REJECTED tests/builder can repair; unserviceable blocks typed; witness `_pre_candidate_base`.</p>
+              <p>Historical SEMANTIC repair chain. Current path is reviewer <code>REVISE</code> on the same lane.</p>
             </a>
           </li>
           <li>
@@ -433,9 +459,9 @@
               <p class="card-file">35-flow-unreviewed.html</p>
               <div class="card-header">
                 <span class="card-dot muted" aria-hidden="true"></span>
-                <h3>Unread candidate flowchart</h3>
+                <h3>Unread candidate flowchart (superseded)</h3>
               </div>
-              <p>Unread candidate is reviewed, not rebuilt; worktree stands on the candidate so REJECT can repair; not a legal build base.</p>
+              <p>Historical unread-candidate repair. Candidates are immutable refs, not mutable branches.</p>
             </a>
           </li>
         </ul>
@@ -449,9 +475,9 @@
               <p class="card-file">50-sequence-attempt.html</p>
               <div class="card-header">
                 <span class="card-dot coral" aria-hidden="true"></span>
-                <h3>Attempt sequence</h3>
+                <h3>Attempt sequence (superseded)</h3>
               </div>
-              <p>Publish candidate SHA, then derived build::review PASS, then merge — identical-stop or SEMANTIC repair.</p>
+              <p>Historical attempt identity. Resume restarts the incomplete stage from the last immutable artifact.</p>
             </a>
           </li>
         </ul>
@@ -467,7 +493,7 @@
                 <span class="card-dot ink" aria-hidden="true"></span>
                 <h3>Runtime module tree</h3>
               </div>
-              <p>Plan (hidden_vault, gate_capture), Run (plan_amendment, finalization kernel, launcher as transport). v5 unrunnable; no composed hidden gate.</p>
+              <p>Module ownership. Hidden tests are sealed in the vault before build; launcher is transport only.</p>
             </a>
           </li>
           <li>
@@ -475,9 +501,9 @@
               <p class="card-file">41-mind-cli.html</p>
               <div class="card-header">
                 <span class="card-dot muted" aria-hidden="true"></span>
-                <h3>Verb groups (plan/run/workspace)</h3>
+                <h3>Verb groups (superseded)</h3>
               </div>
-              <p>Run group includes amend (own verb, not a resume flag) and test-strength; run start is focal.</p>
+              <p>Historical plan/run/workspace groups. Live verbs: <code>run start|resume|amend|status</code>.</p>
             </a>
           </li>
           <li>
@@ -485,9 +511,9 @@
               <p class="card-file">42-mind-cli-roots.html</p>
               <div class="card-header">
                 <span class="card-dot link" aria-hidden="true"></span>
-                <h3>All operator root verbs</h3>
+                <h3>All operator root verbs (superseded)</h3>
               </div>
-              <p>Nine root verbs; run amend is a run subverb, not a tenth root.</p>
+              <p>Historical bootstrap/plan/retry/skip/abandon roots. Not the frozen four-verb CLI.</p>
             </a>
           </li>
         </ul>
@@ -496,7 +522,7 @@
 
     <footer class="footer">
       <a href="../index.html">Maestro docs home</a>
-      <span>18 diagrams · Architecture gallery</span>
+      <span>2 current · 18 historical · Architecture gallery</span>
     </footer>
   </div>
 </body>

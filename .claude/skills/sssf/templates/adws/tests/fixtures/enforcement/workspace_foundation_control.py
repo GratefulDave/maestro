@@ -1,1 +1,1 @@
-from adw_modules import workspace_model
+"""workspace_model deleted."""

@@ -13,14 +13,9 @@ Measured cost of that inheritance, in the repository this was written against:
     $ .venv/bin/pytest --collect-only  -> 10 tests collected
 
 Same worktree, same argv, opposite outcomes. The damage is not that the gate
-goes red; it is *how* it goes red. `worktree._run_gate` parses counts by regex
-over the runner's output, a conftest `ImportError` prints no summary line, so
-`counts == {}`, `GateCounts.parse` returns `None`, `adjudicate_gate` stamps
-`RetryClass.ENVIRONMENTAL`, and the node re-runs an identically broken
-interpreter until `ENVIRONMENTAL_BUDGET_EXHAUSTED`. A permanently wrong
-interpreter presents as a transient fault and the operator is told a budget
-ran out when nothing was ever retryable — the same shape
-`LauncherFailure.DETERMINISTIC_REFUSAL` was added to kill on the launcher side.
+goes red; it is *how* it goes red. A conftest `ImportError` prints no summary
+line, so counts stay empty and a permanently wrong interpreter looks like a
+transient fault.
 
 Three rules hold this module together.
 
@@ -92,8 +87,7 @@ import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence,
-                    Tuple)
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 #: The collection flags each runner needs, without its binary. This is the old
 #: `plan_validate.COLLECT_ARGV` with `argv[0]` removed — the binary is what
@@ -134,10 +128,17 @@ EXECUTE_ARGS: Dict[str, Tuple[str, ...]] = {
 #: the plan's selectors on purpose — see the module docstring for why the
 #: gate's own exit code cannot answer this question.
 PROBE_ARGS: Dict[str, Tuple[str, ...]] = {
-    "pytest": ("-p", "no:cacheprovider", "-o", "addopts=", "--collect-only",
-               "-q", "-k", "maestro_runner_probe_no_match"),
-    "vitest": ("list", "--run", "--testNamePattern",
-               "maestro_runner_probe_no_match"),
+    "pytest": (
+        "-p",
+        "no:cacheprovider",
+        "-o",
+        "addopts=",
+        "--collect-only",
+        "-q",
+        "-k",
+        "maestro_runner_probe_no_match",
+    ),
+    "vitest": ("list", "--run", "--testNamePattern", "maestro_runner_probe_no_match"),
 }
 
 #: The exit code a capable runner returns from its probe. Measured, never
@@ -175,23 +176,25 @@ class Reason(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
-#: The one run-start refusal outcome. Not a fourth `RetryClass` — §7.5 closes
-#: that set at three and there is nothing to retry. Not a new `BlockReason` —
-#: a block reason describes a node that ran and stopped, and under this design
-#: no node ever starts. This is a run precondition, the same family as
-#: `INTEGRATION_BRANCH_CHECKED_OUT`: refuse at run start, launch nothing,
-#: write no attempt row, reach no classifier.
+#: Run-start refusal: the named runner cannot be used. Not a retry class and
+#: not a lane-stage wait. Refuse before any launch.
 RUNNER_UNUSABLE = "RUNNER_UNUSABLE"
 
 
 class RunnerUnusable(RuntimeError):
     """A gate runner that cannot be used, with the reason as a typed field."""
 
-    def __init__(self, runner: str, reason: Reason, cwd: str, *,
-                 candidates: Sequence[str] = (),
-                 resolved: Optional[str] = None,
-                 probe_exit: Optional[int] = None,
-                 detail: str = "") -> None:
+    def __init__(
+        self,
+        runner: str,
+        reason: Reason,
+        cwd: str,
+        *,
+        candidates: Sequence[str] = (),
+        resolved: Optional[str] = None,
+        probe_exit: Optional[int] = None,
+        detail: str = "",
+    ) -> None:
         self.runner = runner
         self.reason = reason
         self.cwd = cwd
@@ -203,17 +206,25 @@ class RunnerUnusable(RuntimeError):
 
     def _detail(self) -> str:
         if self.reason is Reason.AMBIGUOUS:
-            return ("two {0} candidates share a discovery rank: {1}; declare "
-                    "one under `runners:` in maestro.config.yaml".format(
-                        self.runner, ", ".join(self.candidates)))
+            return (
+                "two {0} candidates share a discovery rank: {1}; declare "
+                "one under `runners:` in maestro.config.yaml".format(
+                    self.runner, ", ".join(self.candidates)
+                )
+            )
         if self.reason is Reason.INCAPABLE:
-            return ("{0} resolved to {1}, which started and could not collect "
-                    "in {2} (probe exit {3}); it cannot import this "
-                    "repository's test prerequisites".format(
-                        self.runner, self.resolved, self.cwd, self.probe_exit))
-        return ("no usable {0} was found for {1}; candidates tried: {2}".format(
-            self.runner, self.cwd,
-            ", ".join(self.candidates) if self.candidates else "none"))
+            return (
+                "{0} resolved to {1}, which started and could not collect "
+                "in {2} (probe exit {3}); it cannot import this "
+                "repository's test prerequisites".format(
+                    self.runner, self.resolved, self.cwd, self.probe_exit
+                )
+            )
+        return "no usable {0} was found for {1}; candidates tried: {2}".format(
+            self.runner,
+            self.cwd,
+            ", ".join(self.candidates) if self.candidates else "none",
+        )
 
     def payload(self) -> Dict[str, Any]:
         """The refusal, as typed fields. Every one of them has a reader:
@@ -245,7 +256,7 @@ class ResolvedRunner:
     runner: str
     executable: str
     launcher_args: Tuple[str, ...] = ()
-    origin: str = "declared"          # "declared" | "discovered"
+    origin: str = "declared"  # "declared" | "discovered"
     probe_exit: int = -1
     version: str = ""
     cwd: str = "."
@@ -256,8 +267,7 @@ class ResolvedRunner:
 
     def collect_argv(self, gate: Any) -> Tuple[str, ...]:
         """The enumeration invocation for one gate. Never executes cases."""
-        return (self.argv_prefix + COLLECT_ARGS[self.runner]
-                + tuple(gate.argv))
+        return self.argv_prefix + COLLECT_ARGS[self.runner] + tuple(gate.argv)
 
     def execute_argv(self, argv: Sequence[str]) -> Tuple[str, ...]:
         """The execution invocation. `argv` is the gate's own argv tail: the
@@ -273,7 +283,7 @@ class ResolvedRunner:
         # An argv that already opens with the mode keeps exactly one copy of
         # it. The ingress strips `run` today, but a gate reaching here with it
         # still attached must execute, not fail on `vitest run run <paths>`.
-        if mode and tail[:len(mode)] == mode:
+        if mode and tail[: len(mode)] == mode:
             mode = ()
         return self.argv_prefix + mode + tail
 
@@ -290,18 +300,24 @@ class ResolvedRunner:
 
     def config_line(self) -> str:
         """The `runners:` entry that would make this resolution binding."""
-        return "  {0}: {1}".format(
-            self.runner, " ".join(self.argv_prefix))
+        return "  {0}: {1}".format(self.runner, " ".join(self.argv_prefix))
 
 
 # ── probing ─────────────────────────────────────────────────────────────────
 
-def _run(argv: Sequence[str], cwd: Path, env: Optional[Mapping[str, str]],
-         timeout_s: float) -> Tuple[int, str]:
+
+def _run(
+    argv: Sequence[str], cwd: Path, env: Optional[Mapping[str, str]], timeout_s: float
+) -> Tuple[int, str]:
     try:
         result = subprocess.run(
-            list(argv), cwd=str(cwd), env=dict(env) if env is not None else None,
-            capture_output=True, text=True, timeout=timeout_s)
+            list(argv),
+            cwd=str(cwd),
+            env=dict(env) if env is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
     except (OSError, subprocess.SubprocessError):
         # A probe that cannot be started is not capable, and the caller turns
         # that into a typed refusal. It is never an exception that escapes as
@@ -310,19 +326,23 @@ def _run(argv: Sequence[str], cwd: Path, env: Optional[Mapping[str, str]],
     return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
-def probe(runner: str, argv_prefix: Sequence[str], cwd: Path,
-          env: Optional[Mapping[str, str]] = None,
-          timeout_s: float = PROBE_TIMEOUT_S) -> int:
+def probe(
+    runner: str,
+    argv_prefix: Sequence[str],
+    cwd: Path,
+    env: Optional[Mapping[str, str]] = None,
+    timeout_s: float = PROBE_TIMEOUT_S,
+) -> int:
     """The probe's exit code, or `-1` when it could not be started."""
     args = PROBE_ARGS[runner]
     code, _ = _run(tuple(argv_prefix) + args, cwd, env, timeout_s)
     return code
 
 
-def _version(argv_prefix: Sequence[str], cwd: Path,
-             env: Optional[Mapping[str, str]]) -> str:
-    _code, output = _run(tuple(argv_prefix) + VERSION_ARGS, cwd, env,
-                         VERSION_TIMEOUT_S)
+def _version(
+    argv_prefix: Sequence[str], cwd: Path, env: Optional[Mapping[str, str]]
+) -> str:
+    _code, output = _run(tuple(argv_prefix) + VERSION_ARGS, cwd, env, VERSION_TIMEOUT_S)
     for line in output.splitlines():
         if line.strip():
             return line.strip()
@@ -339,6 +359,7 @@ def _measured(runner: str) -> bool:
 
 # ── discovery ───────────────────────────────────────────────────────────────
 
+
 def _rank_candidates(runner: str, repo: Path) -> List[List[Tuple[str, ...]]]:
     """Candidate invocations by falling precedence.
 
@@ -350,9 +371,11 @@ def _rank_candidates(runner: str, repo: Path) -> List[List[Tuple[str, ...]]]:
     ranks: List[List[Tuple[str, ...]]] = []
 
     local: List[Tuple[str, ...]] = []
-    for relative in (Path(".venv") / "bin" / runner,
-                     Path("venv") / "bin" / runner,
-                     Path("node_modules") / ".bin" / runner):
+    for relative in (
+        Path(".venv") / "bin" / runner,
+        Path("venv") / "bin" / runner,
+        Path("node_modules") / ".bin" / runner,
+    ):
         candidate = repo / relative
         if _is_executable(candidate):
             local.append((str(candidate),))
@@ -360,8 +383,7 @@ def _rank_candidates(runner: str, repo: Path) -> List[List[Tuple[str, ...]]]:
 
     for launcher in ("uv", "poetry"):
         found = shutil.which(launcher)
-        ranks.append([(str(Path(found).resolve()), "run", runner)]
-                     if found else [])
+        ranks.append([(str(Path(found).resolve()), "run", runner)] if found else [])
 
     on_path = shutil.which(runner)
     ranks.append([(str(Path(on_path).resolve()),)] if on_path else [])
@@ -382,8 +404,9 @@ def _anchor_declared(value: str, repo: Path) -> Optional[Tuple[str, ...]]:
         return None
     head, tail = tokens[0], tuple(tokens[1:])
     if "/" in head:
-        candidate = (repo / head).resolve() if not Path(head).is_absolute() \
-            else Path(head)
+        candidate = (
+            (repo / head).resolve() if not Path(head).is_absolute() else Path(head)
+        )
         return ((str(candidate),) + tail) if _is_executable(candidate) else None
     found = shutil.which(head)
     if found is None:
@@ -392,10 +415,15 @@ def _anchor_declared(value: str, repo: Path) -> Optional[Tuple[str, ...]]:
     return ((str(resolved),) + tail) if _is_executable(resolved) else None
 
 
-def resolve(runner: str, repo: Path, cwd: str = ".", *,
-            declared: Optional[str] = None,
-            env: Optional[Mapping[str, str]] = None,
-            timeout_s: float = PROBE_TIMEOUT_S) -> ResolvedRunner:
+def resolve(
+    runner: str,
+    repo: Path,
+    cwd: str = ".",
+    *,
+    declared: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+    timeout_s: float = PROBE_TIMEOUT_S,
+) -> ResolvedRunner:
     """The single producer. Raises `RunnerUnusable` rather than guessing.
 
     `cwd` is relative to `repo` and is where the probe runs, so capability is
@@ -407,36 +435,53 @@ def resolve(runner: str, repo: Path, cwd: str = ".", *,
         # No measured probe means capability cannot be established, and an
         # unproven runner is refused rather than trusted.
         raise RunnerUnusable(
-            runner, Reason.UNRESOLVED, cwd,
+            runner,
+            Reason.UNRESOLVED,
+            cwd,
             detail="{0} has no measured capability probe, so no invocation of "
-                   "it can be proven able to collect; add its PROBE_ARGS and "
-                   "CAPABLE_EXIT rows before declaring a {0} gate".format(
-                       runner))
+            "it can be proven able to collect; add its PROBE_ARGS and "
+            "CAPABLE_EXIT rows before declaring a {0} gate".format(runner),
+        )
     if not working.is_dir():
         raise RunnerUnusable(
-            runner, Reason.UNRESOLVED, cwd,
-            detail="the gate's working directory does not exist: {0}".format(
-                working))
+            runner,
+            Reason.UNRESOLVED,
+            cwd,
+            detail="the gate's working directory does not exist: {0}".format(working),
+        )
 
     if declared is not None:
         invocation = _anchor_declared(declared, repo)
         if invocation is None:
             raise RunnerUnusable(
-                runner, Reason.UNRESOLVED, cwd, candidates=(declared,),
+                runner,
+                Reason.UNRESOLVED,
+                cwd,
+                candidates=(declared,),
                 detail="runners.{0} is declared as {1!r}, which is not an "
-                       "executable file".format(runner, declared))
+                "executable file".format(runner, declared),
+            )
         exit_code = probe(runner, invocation, working, env, timeout_s)
         if exit_code != CAPABLE_EXIT[runner]:
             # No fallback to discovery. A declaration that silently falls back
             # to a guess is not a declaration.
             raise RunnerUnusable(
-                runner, Reason.INCAPABLE, cwd, candidates=(declared,),
-                resolved=invocation[0], probe_exit=exit_code)
+                runner,
+                Reason.INCAPABLE,
+                cwd,
+                candidates=(declared,),
+                resolved=invocation[0],
+                probe_exit=exit_code,
+            )
         return ResolvedRunner(
-            runner=runner, executable=invocation[0],
-            launcher_args=tuple(invocation[1:]), origin="declared",
+            runner=runner,
+            executable=invocation[0],
+            launcher_args=tuple(invocation[1:]),
+            origin="declared",
             probe_exit=exit_code,
-            version=_version(invocation, working, env), cwd=cwd)
+            version=_version(invocation, working, env),
+            cwd=cwd,
+        )
 
     tried: List[str] = []
     for candidates in _rank_candidates(runner, repo):
@@ -444,21 +489,29 @@ def resolve(runner: str, repo: Path, cwd: str = ".", *,
             continue
         if len(candidates) > 1:
             raise RunnerUnusable(
-                runner, Reason.AMBIGUOUS, cwd,
-                candidates=[" ".join(item) for item in candidates])
+                runner,
+                Reason.AMBIGUOUS,
+                cwd,
+                candidates=[" ".join(item) for item in candidates],
+            )
         invocation = candidates[0]
         tried.append(" ".join(invocation))
         exit_code = probe(runner, invocation, working, env, timeout_s)
         if exit_code == CAPABLE_EXIT[runner]:
             return ResolvedRunner(
-                runner=runner, executable=invocation[0],
-                launcher_args=tuple(invocation[1:]), origin="discovered",
+                runner=runner,
+                executable=invocation[0],
+                launcher_args=tuple(invocation[1:]),
+                origin="discovered",
                 probe_exit=exit_code,
-                version=_version(invocation, working, env), cwd=cwd)
+                version=_version(invocation, working, env),
+                cwd=cwd,
+            )
     raise RunnerUnusable(runner, Reason.UNRESOLVED, cwd, candidates=tried)
 
 
 # ── the run record ──────────────────────────────────────────────────────────
+
 
 def adoption_notice(resolved: Iterable[ResolvedRunner]) -> str:
     """The `runners:` block that would pin a discovered resolution.
@@ -471,8 +524,11 @@ def adoption_notice(resolved: Iterable[ResolvedRunner]) -> str:
     discovered = [item for item in resolved if item.origin == "discovered"]
     if not discovered:
         return ""
-    lines = ["maestro resolved these gate runners by discovery; declare them "
-             "in maestro.config.yaml to pin them:", "runners:"]
+    lines = [
+        "maestro resolved these gate runners by discovery; declare them "
+        "in maestro.config.yaml to pin them:",
+        "runners:",
+    ]
     lines.extend(sorted({item.config_line() for item in discovered}))
     return "\n".join(lines)
 
@@ -486,7 +542,10 @@ def write_record(path: Path, resolved: Iterable[ResolvedRunner]) -> None:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = sorted((item.record() for item in resolved),
-                     key=lambda row: (row["runner"], row["cwd"]))
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8")
+    payload = sorted(
+        (item.record() for item in resolved),
+        key=lambda row: (row["runner"], row["cwd"]),
+    )
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )

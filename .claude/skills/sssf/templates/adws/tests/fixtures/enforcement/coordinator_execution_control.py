@@ -1,2 +1,1 @@
-from concurrent.futures import ThreadPoolExecutor
-from adw_modules import coordinator_store
+"""Coordinator store deleted. Fixture no longer imports execution authority."""
