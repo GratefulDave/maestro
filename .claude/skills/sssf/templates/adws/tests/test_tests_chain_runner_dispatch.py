@@ -118,10 +118,25 @@ class _dispatch:
         return False
 
 
+class _NoLedger:
+    """The one thing the chain reads off `self`.
+
+    `_pre_candidate_base` asks the ledger which commit this lane
+    started from, because `attempt.base` is moved onto a published
+    candidate by every repair round. The subject here is which *runner*
+    collects, not which commit it collects at, so this answers with the
+    worktree's own base -- and says so, rather than letting a bare
+    `object()` decide by raising.
+    """
+
+    def _pre_candidate_base(self, _node, attempt):
+        return attempt.base
+
+
 def _prove(node, attempt, measured):
-    """Call the chain directly. It reads nothing off `self`."""
+    """Call the chain directly. It reads only the baseline off `self`."""
     return sch.Scheduler._prove_tests_red_at_parent(
-        object(), node, attempt, measured
+        _NoLedger(), node, attempt, measured
     )
 
 

@@ -3043,7 +3043,17 @@ class Scheduler:
             falsified = self._falsify_outputs(
                 node,
                 attempt,
-                basis.integration_head if basis is not None else attempt.base,
+                # A repair round already refuses `attempt.base` here and
+                # names the integration head instead, for the reason
+                # `_pre_candidate_base` states: the base has been moved onto
+                # a published candidate, so `paths_written_since` would see
+                # only the delta since this node's own previous output and
+                # revert almost nothing. The `basis is None` arm needs the
+                # same protection -- a retry continuing from an unreviewed
+                # candidate reaches it with `attempt.base` already moved.
+                basis.integration_head
+                if basis is not None
+                else self._pre_candidate_base(node, attempt),
             )
             self._require_running(record)
             if not falsified.verified:
@@ -3151,7 +3161,10 @@ class Scheduler:
         current = runner.collect(attempt.path, test_paths)
         try:
             parent = tc.collect_parent_nodeids(
-                attempt.path, attempt.base, test_paths, runner=runner
+                attempt.path,
+                self._pre_candidate_base(node, attempt),
+                test_paths,
+                runner=runner,
             )
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
@@ -3165,6 +3178,42 @@ class Scheduler:
         new = tc.new_nodeids(parent, current)
         parent_run = tc.run_cases_for(runner, attempt.path, new)
         return tc.adjudicate_parent_red(parent_run, len(new))
+
+    def _pre_candidate_base(
+        self, node: st.PlanNode, attempt: wt.AttemptWorktree
+    ) -> str:
+        """The commit this lane started from, before it published anything.
+
+        Two questions read it. A tests node's cases must be *red* here,
+        where the implementation does not exist. An agent node's declared
+        outputs must be reverted back to here for §7.4's falsification to
+        have a subject.
+
+        Deliberately NOT `attempt.base`. That field is documented as the
+        *mutable measurement* base and three separate paths move it onto an
+        already-published candidate: `prepare_descendant_candidate` on every
+        repair round, the sealed/unsealed repair recoveries, and a retry that
+        continues from a candidate no reviewer read. A candidate already
+        contains the tests, so collecting the parent there proves nothing
+        about them -- only cases added since the previous candidate are
+        counted new and run, every case already accepted is never re-proven,
+        and a tester that strengthens an assertion on an existing case adds
+        no nodeid and is refused `TESTS_NO_NEW_CASES` for doing the right
+        thing.
+
+        The falsifiability question is "are these cases red where the
+        implementation does not exist", and the only commit that answers it
+        is the one the lane started from, before it published anything. That
+        is the base of this node's earliest attempt: the ledger row is
+        written once by `start_attempt` and no candidate cycle rewrites it,
+        and no candidate can predate the first attempt. Integration moving
+        underneath does not weaken it -- an older commit is further from the
+        implementation, not nearer.
+        """
+        rows = self.deps.store.attempts_for(self.run_id, node.node_id)
+        if not rows:
+            return attempt.base
+        return min(rows, key=lambda row: row.attempt_no).base_sha
 
     def _tests_prerequisites(self, node: st.PlanNode) -> Tuple[st.PlanNode, ...]:
         """The tests nodes this implementation node is gated by.
@@ -3423,10 +3472,11 @@ class Scheduler:
                 retry_class=st.RetryClass.ENVIRONMENTAL,
                 refusal_code=tc.StrengthRefusal.RUNNER_UNSUPPORTED.value,
                 remedy=tc.StrengthRefusal.RUNNER_UNSUPPORTED.remedy)
+        falsifiability_base = self._pre_candidate_base(node, attempt)
         try:
             current = runner.collect(attempt.path, test_paths)
             parent = tc.collect_parent_nodeids(
-                attempt.path, attempt.base, test_paths, runner=runner)
+                attempt.path, falsifiability_base, test_paths, runner=runner)
         except tc.TestsGitReadFailed as exc:
             return vf.VerificationVerdict(
                 verified=False, failed_clause=3,
@@ -3459,7 +3509,11 @@ class Scheduler:
                         repo=Path(attempt.repo),
                         tree=attempt.path,
                         candidate_sha=output_sha,
-                        base_commit=base or attempt.base,
+                        # `attempt.base` is the mutable measurement base and
+                        # is an already-published candidate on every repair
+                        # round, which carries the tests the control exists
+                        # to remove. See `_pre_candidate_base`.
+                        base_commit=base or falsifiability_base,
                         nodeids=current,
                         scratch_root=Path(self.deps.scratch_root),
                         # The coverage run and a `baseline_absent` control are
