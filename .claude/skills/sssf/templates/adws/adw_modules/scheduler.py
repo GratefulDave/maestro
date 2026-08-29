@@ -2250,6 +2250,24 @@ class Scheduler:
                 else wt.integration_head(self.deps.repo, self.deps.integration_branch)
             )
             base = basis.base_sha if basis is not None else head
+            if basis is None:
+                # A published candidate outlives the attempt that produced it,
+                # and `publish_candidate` requires every later candidate to be
+                # a proven descendant of the last one. `_durable_repair_resume`
+                # supplies a basis only for a candidate a reviewer REJECTED; a
+                # candidate whose review never started -- an ENVIRONMENTAL
+                # retry taken between publication and the reviewer's first
+                # turn -- leaves none. Basing that retry on integration HEAD
+                # mints a sibling of the published candidate, and the descent
+                # assertion then refuses it on every attempt for the life of
+                # the run: the lane rebuilds forever and is never reviewed.
+                # The published candidate is the lane's real tip, so continue
+                # from it rather than from HEAD.
+                published = store.lane_candidates(
+                    self.run_id, node.node_id, limit=10_000
+                )
+                if published:
+                    base = published[-1].candidate_sha
 
             # §7.6 — the window opens BEFORE the worktree exists, so a hung
             # `git worktree add` is inside it rather than outside.
