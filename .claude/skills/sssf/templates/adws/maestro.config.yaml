@@ -7,16 +7,16 @@ role_routes:
     effort: high
   test-reviewer:
     route: omp
-    profile: openai-performance
+    profile: openai-perf-test
   builder:
     route: omp
-    profile: grok
+    profile: grok-build
   code-reviewer:
     route: omp
-    profile: openai-performance
+    profile: openai-perf-review
   integration-reviewer:
     route: omp
-    profile: openai-performance
+    profile: openai-perf-review
 executables:
   herdr: herdr
   omp: omp

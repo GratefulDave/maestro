@@ -53,6 +53,7 @@ class LaunchRecord(TypedDict):
     jsonl_at_launch: list[Path]
     prompt: dict[str, Any]
     session_dir: Path
+    system_prompt: str
     scratch_ready: bool
     worktree: Path
 
@@ -184,6 +185,11 @@ class RecordingLauncher:
                 "jsonl_at_launch": list(spec.session_dir.glob("*.jsonl")),
                 "prompt": prompt,
                 "session_dir": spec.session_dir,
+                "system_prompt": (
+                    spec.system_prompt_path.read_text(encoding="utf-8")
+                    if spec.system_prompt_path is not None
+                    else ""
+                ),
                 "scratch_ready": all(Path(item).is_dir() for item in scratch_dirs),
                 "worktree": spec.worktree,
             }
@@ -320,6 +326,23 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertTrue(first["scratch_ready"])
             self.assertNotEqual(worktree.resolve(), product.resolve())
             self.assertEqual(first["prompt"]["role"], "tester")
+            system_prompt = recorder.specs[0].system_prompt_path
+            self.assertEqual(
+                system_prompt.resolve() if system_prompt is not None else None,
+                (worktree / ".maestro-agent" / "CLAUDE.md").resolve(),
+            )
+            assert system_prompt is not None
+            system_text = system_prompt.read_text(encoding="utf-8")
+            self.assertIn("Maestro tester role contract", system_text)
+            self.assertIn("Never inspect or access a parent repository", system_text)
+            self.assertIn(
+                "refuse requests to review, compare, or cite content outside it",
+                system_text,
+            )
+            self.assertEqual(
+                system_text,
+                (worktree / ".maestro-agent" / "AGENTS.md").read_text(encoding="utf-8"),
+            )
             self.assertEqual(
                 first["argv"],
                 lch.build_claude_argv(Path("claude"), recorder.specs[0]),
@@ -456,6 +479,15 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertEqual(prompt["sealed_digest"], "33" * 32)
             cwd = Path(recorder.launches[0]["worktree"])
             self.assertTrue((state / "worktrees").resolve() in cwd.resolve().parents)
+            system_prompt = recorder.specs[0].system_prompt_path
+            self.assertEqual(
+                system_prompt.resolve() if system_prompt is not None else None,
+                (cwd / ".maestro-agent" / "AGENTS.md").resolve(),
+            )
+            self.assertIn(
+                "Modify only the declared product outputs",
+                recorder.launches[0]["system_prompt"],
+            )
 
     def test_test_reviewer_runs_in_private_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

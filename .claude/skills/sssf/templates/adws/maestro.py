@@ -375,6 +375,54 @@ class HerdrStageActor:
             "affected_lanes": ["<lane-id>"],
         }
 
+    def _materialize_role_instructions(self, cwd: Path, role: str, route: str) -> Path:
+        role_rules = {
+            "tester": (
+                "Inspect the product checkout without modifying product files. "
+                "Return private test files only through the requested envelope."
+            ),
+            "test-reviewer": (
+                "Review the private TEST_DRAFT tree read-only. Return only a "
+                "PASS or REVISE verdict with actionable findings."
+            ),
+            "builder": (
+                "Modify only the declared product outputs. Never read private "
+                "tests, fixtures, vault paths, or hidden test material."
+            ),
+            "code-reviewer": (
+                "Review the exact candidate checkout read-only. Private tests "
+                "are absent; return only a PASS or REVISE verdict."
+            ),
+            "integration-reviewer": (
+                "Review the exact integration checkout read-only. Return a "
+                "verdict, findings, and only genuinely affected lane IDs."
+            ),
+        }
+        try:
+            role_rule = role_rules[role]
+        except KeyError as exc:
+            raise FactoryRefused("UNKNOWN_ROLE:{}".format(role)) from exc
+        content = (
+            "# Maestro {0} role contract\n\n"
+            "- Work only in the assigned checkout: the process CWD.\n"
+            "- Never inspect or access a parent repository, sibling worktree, "
+            "integration checkout, Maestro orchestration source, or runtime-state tree.\n"
+            "- Review or inspect only files physically contained in the assigned checkout; "
+            "refuse requests to review, compare, or cite content outside it.\n"
+            "- Use enabled profile and repository capabilities only for this role's task.\n"
+            "- Do not delegate or spawn subagents.\n"
+            "- Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.\n"
+            "- Never commit, branch, merge, or rebase; the broker owns Git publication.\n"
+            "- Write only what this role permits, then write the requested UTF-8 JSON envelope and stop.\n\n"
+            "{1}\n"
+        ).format(role, role_rule)
+        agent_root = isolation.agent_dir(cwd)
+        agent_root.mkdir(parents=True, exist_ok=True)
+        encoded = content.encode("utf-8")
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            (agent_root / name).write_bytes(encoded)
+        return agent_root / ("CLAUDE.md" if route == "claude" else "AGENTS.md")
+
     def _prompt(
         self,
         ctx: LaneContext,
@@ -610,6 +658,7 @@ class HerdrStageActor:
         prepare_cwd: Callable[[Path], None],
     ) -> tuple[Mapping[str, Any], object, Path]:
         key = self._role_key(ctx, role)
+        route = self.role_routes[role]
         stored = self._roles.get(key)
         if stored is not None:
             cwd = stored.cwd
@@ -639,12 +688,13 @@ class HerdrStageActor:
         def prepare_adopted_cwd(actual_cwd: Path) -> None:
             adopted = Path(actual_cwd).resolve()
             prepare_cwd(adopted)
+            self._materialize_role_instructions(adopted, role, route["route"])
             envelope.parent.mkdir(parents=True, exist_ok=True)
             write_prompt(adopted)
 
+        system_prompt = self._materialize_role_instructions(cwd, role, route["route"])
         write_prompt(cwd)
         lane_key = key[0]
-        route = self.role_routes[role]
         spec = lch.LaunchSpec(
             correlation_token=lch.role_session_token(ctx.run_id, lane_key, role),
             worktree=cwd,
@@ -654,6 +704,7 @@ class HerdrStageActor:
             model=route["model"],
             effort=route["effort"],
             profile=route["profile"],
+            system_prompt_path=system_prompt,
             session_dir=session,
             environment=self._launch_environment(cwd),
             context_window_tokens=8192,

@@ -111,6 +111,8 @@ class RouteIsolationConfigurationTest(unittest.TestCase):
     def _spec(self, root: Path, route: str) -> launcher.LaunchSpec:
         session = root / ".maestro-agent" / "session"
         session.mkdir(parents=True)
+        system_prompt = root / ".maestro-agent" / "role-system.md"
+        system_prompt.write_text("role contract\n", encoding="utf-8")
         return launcher.LaunchSpec(
             correlation_token="run:lane:role",
             worktree=root,
@@ -121,6 +123,7 @@ class RouteIsolationConfigurationTest(unittest.TestCase):
             effort="high",
             profile="grok" if route == "omp" else None,
             session_dir=session,
+            system_prompt_path=system_prompt,
         )
 
     def test_omp_argv_forces_hook_cwd_without_capability_suppressions(self) -> None:
@@ -130,6 +133,10 @@ class RouteIsolationConfigurationTest(unittest.TestCase):
             self.assertIn("--cwd", argv)
             self.assertIn(str(root), argv)
             self.assertIn("--hook", argv)
+            self.assertEqual(
+                argv[argv.index("--append-system-prompt-file") + 1],
+                str((root / ".maestro-agent" / "role-system.md").resolve()),
+            )
             for flag in ("--no-extensions", "--no-skills", "--no-rules", "--no-lsp"):
                 self.assertNotIn(flag, argv)
             self.assertNotIn("--tools", argv)
@@ -212,13 +219,17 @@ console.log(JSON.stringify({blocked, linked, admitted, wrapped, omitted, nulled}
             )
             self.assertIn("--dangerously-skip-permissions", argv)
             self.assertIn("--remote-control", argv)
+            self.assertEqual(
+                argv[argv.index("--append-system-prompt-file") + 1],
+                str((root / ".maestro-agent" / "role-system.md").resolve()),
+            )
             self.assertNotIn("--permission-mode", argv)
             self.assertNotIn("--strict-mcp-config", argv)
             self.assertNotIn("--setting-sources", argv)
             self.assertNotIn("--tools", argv)
             denied = argv.index("--disallowedTools") + 1
             self.assertEqual(argv[denied : denied + 2], ("Task", "Agent"))
-            self.assertEqual(argv[denied + 2], "--remote-control")
+            self.assertEqual(argv[-1], "--remote-control")
             settings = json.loads(argv[argv.index("--settings") + 1])
             self.assertFalse(settings["sandbox"]["enabled"])
             self.assertEqual(settings["permissions"]["deny"], ["Task", "Agent"])

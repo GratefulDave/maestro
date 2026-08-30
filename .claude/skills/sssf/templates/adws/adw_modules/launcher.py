@@ -464,6 +464,10 @@ class LaunchSpec:
     effort: str
     profile: Optional[str]
     session_dir: Path
+    #: Role-owned instructions materialized inside the assigned checkout.
+    #: Launchers pass this file as an additive system prompt; the task prompt
+    #: remains the per-turn JSON at ``prompt_path``.
+    system_prompt_path: Optional[Path] = None
     environment: Mapping[str, str] = field(default_factory=dict)
     #: The target's published context window, in tokens, as measured by
     #: whoever owns the route's catalog. B13's size check is made against this
@@ -710,6 +714,10 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         str(isolation.omp_hook_path()),
         *permissions.route_capability_argv(spec.route),
     ]
+    if spec.system_prompt_path is not None:
+        argv.extend(
+            ("--append-system-prompt-file", str(spec.system_prompt_path.resolve()))
+        )
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
         argv.append("-c")
     return tuple(argv)
@@ -717,7 +725,7 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
 
 def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
     """Build a host-authenticated Claude session with container-wrapped Bash."""
-    return (
+    argv = [
         str(binary),
         "--model",
         spec.model,
@@ -727,8 +735,13 @@ def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         "--settings",
         isolation.claude_settings(spec.worktree),
         *permissions.route_capability_argv(spec.route),
-        "--remote-control",
-    )
+    ]
+    if spec.system_prompt_path is not None:
+        argv.extend(
+            ("--append-system-prompt-file", str(spec.system_prompt_path.resolve()))
+        )
+    argv.append("--remote-control")
+    return tuple(argv)
 
 
 class TranscriptTailer:
