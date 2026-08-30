@@ -1,0 +1,194 @@
+async:
+  enabled: true
+autoResume: false
+browser:
+  headless: true
+checkpoint:
+  enabled: true
+codexResets:
+  autoRedeem: 'yes'
+colorBlindMode: false
+commands:
+  enableClaudeProject: false
+  enableClaudeUser: false
+  enableOpencodeProject: false
+  enableOpencodeUser: false
+compaction:
+  idleEnabled: true
+  thresholdPercent: 70
+  methodOrder:
+  - snapcompact
+  - remote
+  - soft
+compatibility:
+  loadForeignConfig: false
+contextPromotion:
+  enabled: false
+cycleOrder:
+- smol
+- default
+- plan
+- slow
+defaultThinkingLevel: auto
+dev:
+  autoqaConsent: denied
+disabledExtensions:
+- extension-module:src
+- extension-module:pi-voice-stt
+- extension-module:semantic-search
+- extension-module:semantic-search.bundle
+disabledProviders:
+- claude
+- claude-plugins
+- codex
+- gemini
+- opencode
+display:
+  cacheMissMarker: true
+  shimmer: kitt
+  showTokenUsage: true
+enabledModels:
+- openai-codex/gpt-5.6-sol
+- openai-codex/gpt-5.6-terra
+- openai-codex/gpt-5.6-luna
+extensions:
+- /Users/davidandrews/.omp/agent/extensions/herdr-omp-agent-state.ts
+- ~/.omp/agent/extensions/pi-herdr/herdr.bundle.js
+followUpMode: all
+github:
+  enabled: true
+hideThinkingBlock: false
+images:
+  blockImages: false
+inlineToolDescriptors: 'on'
+marketplace:
+  autoUpdate: 'off'
+mcp:
+  enableProjectConfig: false
+memory:
+  backend: mnemopi
+mnemopi:
+  enhancedRecall: true
+  polyphonicRecall: true
+  proactiveLinking: true
+modelProviderOrder:
+- mtplx
+modelRoles:
+  adviser: openai-codex/gpt-5.6-sol:auto
+  advisor: openai-codex/gpt-5.6-sol:auto
+  commit: openai-codex/gpt-5.6-luna:auto
+  default: openai-codex/gpt-5.6-sol:auto
+  designer: openai-codex/gpt-5.6-sol:auto
+  plan: openai-codex/gpt-5.6-sol:auto
+  slow: openai-codex/gpt-5.6-sol:auto
+  smol: openai-codex/gpt-5.6-luna:auto
+  task: openai-codex/gpt-5.6-terra:auto
+  tiny: openai-codex/gpt-5.6-luna:auto
+  vision: openai-codex/gpt-5.6-terra:auto
+power:
+  sleepPrevention: system
+providers:
+  webSearchOrder:
+  - codex
+  - perplexity
+  - gemini
+  - anthropic
+  - xai
+  - zai
+  - exa
+  - tinyfish
+  - jina
+  - kagi
+  - tavily
+  - firecrawl
+  - brave
+  - kimi
+  - parallel
+  - synthetic
+  - searxng
+  - startpage
+  - duckduckgo
+  - ecosia
+  - google
+  - mojeek
+  - public
+searxng:
+  endpoint: http://127.0.0.1:8080
+setupVersion: 2
+shellMinimizer:
+  enabled: true
+  gainTelemetry: true
+skills:
+  customDirectories:
+  - /Users/davidandrews/PycharmProjects/the-library/skills
+  enableClaudeProject: false
+  enableClaudeUser: false
+  enableCodexUser: false
+  includeSkills:
+  - caveman
+  - caveman-help
+  - caveman-review
+  - caveman-compress
+  - cavecrew
+  - caveman-stats
+  - caveman-commit
+  - codebase-memory
+  - codebase-retrieval
+  - code-intel-impact
+  - code-intel-large-output
+  - code-intel-outline
+  - code-intel-symbols
+  - compact-json
+  - rehydrate
+  - context-mode
+  - handoff
+  - deep-interview
+  - library
+  - linear-cli
+  - herdr
+  - deepinit
+  - diagram-design
+statusLine:
+  preset: nerd
+  separator: powerline-thin
+  transparent: false
+symbolPreset: unicode
+task:
+  agentModelOverrides:
+    actor-coordinator: openai-codex/gpt-5.6-terra:auto
+    debugger-dap: openai-codex/gpt-5.6-sol:auto
+    deep-interviewer: openai-codex/gpt-5.6-sol:auto
+    designer: openai-codex/gpt-5.6-sol:auto
+    docs-steward: openai-codex/gpt-5.6-luna:auto
+    explore: openai-codex/gpt-5.6-luna:auto
+    frontend-qa-scout: openai-codex/gpt-5.6-luna:auto
+    incident-responder: openai-codex/gpt-5.6-terra:auto
+    init: openai-codex/gpt-5.6-luna:auto
+    librarian: openai-codex/gpt-5.6-luna:auto
+    migration-specialist: openai-codex/gpt-5.6-terra:auto
+    nextjs-specialist: openai-codex/gpt-5.6-terra:auto
+    plan: openai-codex/gpt-5.6-sol:auto
+    reviewer: openai-codex/gpt-5.6-terra:auto
+    scout: openai-codex/gpt-5.6-luna:auto
+    security-reviewer: openai-codex/gpt-5.6-sol:auto
+    sonic: openai-codex/gpt-5.6-luna:auto
+    task: openai-codex/gpt-5.6-terra:auto
+    tdd-specialist: openai-codex/gpt-5.6-terra:auto
+    tester: openai-codex/gpt-5.6-terra:auto
+    worktree-manager: openai-codex/gpt-5.6-terra:auto
+    writer: openai-codex/gpt-5.6-luna:auto
+  defaultModel: openai-codex/gpt-5.6-sol:auto
+  disabledAgents: []
+  eager: preferred
+  showResolvedModelBadge: true
+theme:
+  dark: dark-tokyo-night
+tools: {}
+treeFilterMode: default
+tui:
+  hyperlinks: always
+  textSizing: true
+  tight: true
+composer:
+  shape: box
+extendedContext: false
