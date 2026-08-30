@@ -1,18 +1,18 @@
 /**
- * The Maestro reader, against ledgers built from the runtime's OWN schema.
+ * The Maestro reader, against ledgers built from the prior legacy DAG schema.
  *
- * The fixture DDL is not copied here — it is extracted from
- * `templates/adws/adw_modules/lifecycle.py`'s `SCHEMA` literal at test time.
- * A copy would drift the moment the runtime added a column, and the drift
- * would show up as a silently empty dashboard rather than a failing test.
+ * Artifact-factory `SCHEMA` lives in lifecycle.py and is used only by
+ * `factoryLedger`. Mixing it into these fixtures emptied the dashboard
+ * reader and failed `bun test`.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 
-import { mkdtempSync, mkdirSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MaestroDb, discoverMaestroLedger, mergeProvenance } from "./maestroDb.ts";
+import { ArtifactFactoryDb } from "./artifactFactoryDb.ts";
 import { processStartEpoch } from "./attemptObservation.ts";
 
 import { probeKind, resolveSources } from "./sources.ts";
@@ -68,22 +68,52 @@ function runtimeSchema(): string {
 }
 
 function runtimeTableSchema(table: string): string {
-  const match = runtimeSchema().match(
+  const match = LEGACY_SCHEMA.match(
     new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\([\\s\\S]*?\\n\\);`),
   );
-  if (!match) throw new Error(`no ${table} table in runtime schema`);
+  if (!match) throw new Error(`no ${table} table in legacy schema`);
   return match[0];
 }
-
 let root: string;
 
-/** A ledger with the runtime's schema and whatever rows a case needs. */
+/** A ledger with the prior legacy Maestro schema and whatever rows a case needs. */
 function ledger(name: string, seed: (db: Database) => void): string {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "lifecycle.sqlite3");
   const db = new Database(path);
   db.exec("PRAGMA journal_mode=WAL");
+  db.exec(LEGACY_SCHEMA);
+  seed(db);
+  db.close();
+  return path;
+}
+
+/** Legacy Maestro DAG tables. Distinct from artifact-factory `SCHEMA`. */
+const LEGACY_SCHEMA = readFileSync(
+  join(import.meta.dir, "legacyMaestroSchema.sql"),
+  "utf8",
+);
+
+function legacyLedger(name: string, seed: (db: Database) => void = () => {}): string {
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "lifecycle.sqlite3");
+  const db = new Database(path);
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec(LEGACY_SCHEMA);
+  seed(db);
+  db.close();
+  return path;
+}
+
+function factoryLedger(name: string, seed: (db: Database) => void = () => {}): string {
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "lifecycle.sqlite3");
+  const db = new Database(path);
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec("PRAGMA foreign_keys=OFF");
   db.exec(runtimeSchema());
   seed(db);
   db.close();
@@ -893,7 +923,7 @@ describe("integration worktree", () => {
 });
 
 describe("source discovery", () => {
-  test("a repo's ledger is located from its maestro.config.yaml", () => {
+  test("legacy state_root config locates a MaestroDb ledger", () => {
     const repo = join(root, "repo");
     mkdirSync(join(repo, "adws"), { recursive: true });
     mkdirSync(join(repo, ".maestro", "plans"), { recursive: true });
@@ -901,49 +931,129 @@ describe("source discovery", () => {
       join(repo, "adws", "maestro.config.yaml"),
       "schema: maestro-config.v1\nplans_dir: .maestro/plans\nstate_root: ../repo-state\n",
     );
-    // Maestro appends the repository's own directory name under state_root.
     const stateDir = join(root, "repo-state", "repo");
     mkdirSync(stateDir, { recursive: true });
-    const db = new Database(join(stateDir, "lifecycle.sqlite3"));
-    db.exec(runtimeSchema());
-    db.close();
+    const path = join(stateDir, "lifecycle.sqlite3");
+    const seed = new Database(path);
+    seed.exec(LEGACY_SCHEMA);
+    insertRun(seed, "run-legacy");
+    seed.close();
 
     const found = discoverMaestroLedger(repo)!;
-    expect(found.db).toBe(join(stateDir, "lifecycle.sqlite3"));
+    expect(found.db).toBe(path);
     expect(found.plansDir).toBe(join(repo, ".maestro", "plans"));
+    expect(probeKind(path)).toBe("maestro");
+
+    const maestro = new MaestroDb(path, found.plansDir);
+    expect(maestro.runCount()).toBe(1);
+    maestro.close();
 
     const sources = resolveSources([], repo);
-    expect(sources.map((s) => [s.kind, s.id])).toEqual([["maestro", "maestro:repo"]]);
+    expect(sources.map((s) => [s.kind, s.id, s.info().schema_version])).toEqual([
+      ["maestro", "maestro:repo", "legacy-lifecycle"],
+    ]);
     for (const source of sources) source.close();
   });
 
-  test("two ledgers with the same directory name still get distinct ids", () => {
-    const first = ledger(join("dup", "alpha"), () => {});
-    const second = ledger(join("dup2", "alpha"), () => {});
-    const sources = resolveSources(["--db", first, "--db", second], root);
-    expect(sources.map((s) => s.id)).toEqual(["maestro:alpha", "maestro:alpha-2"]);
+  test("runtime_state_root config locates an artifact-factory ledger", () => {
+    const repo = join(root, "factory-repo");
+    mkdirSync(join(repo, "adws"), { recursive: true });
+    const stateDir = join(root, "maestro-artifact-factory", "fdadb");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(repo, "adws", "maestro.config.yaml"),
+      [
+        "schema: maestro-config.v1",
+        `runtime_state_root: ${stateDir}`,
+        "runner_profile: grok",
+        "",
+      ].join("\n"),
+    );
+    const path = factoryLedger(join("maestro-artifact-factory", "fdadb"), (db) => {
+      db.query("INSERT INTO ledger_meta (schema_version) VALUES ('artifact-factory.v1')").run();
+    });
+
+    const found = discoverMaestroLedger(repo)!;
+    expect(found.db).toBe(path);
+    expect(probeKind(path)).toBe("artifact-factory");
+
+    const factory = new ArtifactFactoryDb(path);
+    expect(factory.schemaVersion).toBe("artifact-factory.v1");
+    factory.close();
+
+    const sources = resolveSources([], repo);
+    expect(sources.map((s) => [s.kind, s.id, s.info().schema_version])).toEqual([
+      ["artifact-factory", "artifact-factory:fdadb", "artifact-factory.v1"],
+    ]);
     for (const source of sources) source.close();
   });
 
-  test("every factory Maestro has run is served with no arguments", () => {
-    const first = ledger("factory-one", (seed) => insertRun(seed, "run-one"));
-    const second = ledger("factory-two", (seed) => insertRun(seed, "run-two"));
+  test("same directory name stays deterministic within and across kinds", () => {
+    const first = legacyLedger(join("dup", "alpha"), (db) => insertRun(db, "run-a"));
+    const second = legacyLedger(join("dup2", "alpha"), (db) => insertRun(db, "run-b"));
+    const within = resolveSources(["--db", first, "--db", second], root);
+    expect(within.map((s) => [s.kind, s.id])).toEqual([
+      ["maestro", "maestro:alpha"],
+      ["maestro", "maestro:alpha-2"],
+    ]);
+    for (const source of within) source.close();
+
+    const legacy = legacyLedger(join("hist", "alpha"), (db) => insertRun(db, "legacy-run"));
+    const factory = factoryLedger(join("current", "alpha"), (db) => {
+      db.query("INSERT INTO ledger_meta (schema_version) VALUES ('artifact-factory.v1')").run();
+    });
+    const across = resolveSources(["--db", legacy, "--db", factory], root);
+    expect(across.map((s) => [s.kind, s.id])).toEqual([
+      ["maestro", "maestro:alpha"],
+      ["artifact-factory", "artifact-factory:alpha"],
+    ]);
+    for (const source of across) source.close();
+  });
+
+  test("registry serves legacy entries and config adds the factory ledger", () => {
+    const repo = join(root, "product-repo");
+    mkdirSync(join(repo, "adws"), { recursive: true });
+    const stateDir = join(root, "product-factory-state");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(repo, "adws", "maestro.config.yaml"),
+      [
+        "schema: maestro-config.v1",
+        `runtime_state_root: ${stateDir}`,
+        "runner_profile: grok",
+        "",
+      ].join("\n"),
+    );
+    const factoryPath = factoryLedger("product-factory-state", (db) => {
+      db.query("INSERT INTO ledger_meta (schema_version) VALUES ('artifact-factory.v1')").run();
+    });
+    const first = legacyLedger("factory-one", (db) => insertRun(db, "run-one"));
+    const second = legacyLedger("factory-two", (db) => insertRun(db, "run-two"));
     const registry = join(root, "registry.json");
     writeFileSync(
       registry,
       JSON.stringify({
         installations: [
-          { repository: join(root, "one"), database: first, plans_dir: null },
-          { repository: join(root, "two"), database: second, plans_dir: null },
+          { repository: join(root, "one"), database: first, plans_dir: null, state: join(root, "one-state") },
+          { repository: join(root, "two"), database: second, plans_dir: null, state: join(root, "two-state") },
+          {
+            repository: repo,
+            database: first,
+            plans_dir: join(repo, ".maestro", "plans"),
+            state: join(root, "legacy-state"),
+          },
         ],
       }),
     );
     const previous = process.env.MAESTRO_REGISTRY;
     process.env.MAESTRO_REGISTRY = registry;
     try {
-      // No --db, no MAESTRO_DB, and a cwd that is not a factory at all.
       const sources = resolveSources([], join(root, "elsewhere"));
-      expect(sources.map((s) => s.path)).toEqual([first, second]);
+      expect(sources.map((s) => s.path)).toEqual([first, second, factoryPath]);
+      expect(sources.filter((s) => s.kind === "maestro").map((s) => s.path)).toEqual([first, second]);
+      expect(sources.filter((s) => s.kind === "artifact-factory").map((s) => s.path)).toEqual([
+        factoryPath,
+      ]);
       for (const source of sources) source.close();
     } finally {
       if (previous === undefined) delete process.env.MAESTRO_REGISTRY;
@@ -965,11 +1075,12 @@ describe("source discovery", () => {
   });
 
   test("an unreadable database is skipped, never fatal", () => {
-    const good = ledger("survivor", (seed) => insertRun(seed, "run-ok"));
+    const good = legacyLedger("survivor", (seed) => insertRun(seed, "run-ok"));
     const junk = join(root, "survivor", "junk.db");
     writeFileSync(junk, "not sqlite");
     const sources = resolveSources(["--db", junk, "--db", good], root);
     expect(sources.map((s) => s.path)).toEqual([good]);
+    expect(sources.map((s) => s.kind)).toEqual(["maestro"]);
     for (const source of sources) source.close();
   });
 });

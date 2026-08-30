@@ -6,6 +6,7 @@ import { StatCard } from "@/components/StatCard";
 import { StatusPill } from "@/components/StatusPill";
 import { Timestamp } from "@/components/Timestamp";
 import { nodeNeedsAttention } from "@/lib/api";
+import { runningStat, sourceKindFromId } from "@/lib/runActivity";
 
 export const dynamic = "force-dynamic";
 
@@ -20,8 +21,7 @@ export default async function RunPage({
   const { run } = loaded;
   const blocked = run.nodes.filter((node) => nodeNeedsAttention(node)).length;
   const merged = run.nodes.filter((node) => node.state === "MERGED").length;
-  const running = run.nodes.flatMap((node) => node.attempts).filter((attempt) => attempt.running).length;
-
+  const activity = runningStat(run, sourceKindFromId(sourceId));
   return (
     <RunChrome run={run} runId={runId} sourceId={sourceId}>
       <SourceBanner
@@ -40,9 +40,9 @@ export default async function RunPage({
         <StatCard label="Nodes" value={run.nodes.length} detail="dag nodes" />
         <StatCard label="Merged" value={merged} detail="nodes" />
         <StatCard
-          label="Running"
-          value={running}
-          detail="attempts proven live or sitting in review"
+          label={activity.label}
+          value={activity.value}
+          detail={activity.detail}
         />
         <StatCard label="Needs attention" value={blocked} detail="nodes" />
       </div>

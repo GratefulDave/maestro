@@ -124,7 +124,10 @@ class ArtifactFactorySmokeHarnessTest(unittest.TestCase):
         loaded = json.loads(config.read_text(encoding="utf-8"))
         self.assertTrue(Path(loaded["runtime_state_root"]).is_absolute())
         self.assertEqual(loaded["runtime_state_root"], str(state))
-        self.assertEqual(loaded["runner_profile"], "grok-maestro")
+        self.assertEqual(
+            loaded["role_routes"]["builder"],
+            {"route": "omp", "profile": "grok-maestro"},
+        )
         self.assertEqual(
             loaded["route_receipts"]["omp"], str(state / "receipts" / "omp.json")
         )

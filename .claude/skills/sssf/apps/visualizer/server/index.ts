@@ -4,11 +4,11 @@
  * single write is POST /api/sessions/:adw_id/archive, which sets one review
  * flag on a tracer row.
  *
- * Two schemas are served, because two runtimes write two different ledgers:
- * the SSSF tracer's sessions/phases/events, and Maestro's DAG lifecycle store
- * (runs/dag_nodes/node_lifecycle/attempts). Each database is probed for the
- * tables it actually has, so neither runtime has to write the other's schema
- * to be visible here. See server/sources.ts for how a third one is added.
+ * Three schemas are served, because three runtimes write different ledgers:
+ * the SSSF tracer's sessions/phases/events, Maestro's legacy DAG store
+ * (runs/dag_nodes/node_lifecycle/attempts), and the artifact-factory ledger
+ * (runs/dag_lanes/lane_state/artifacts/transitions). Each database is probed
+ * for the tables it actually has. See server/sources.ts.
  *
  * There is no ingest endpoint and no websocket. The data path is
  * agents → sqlite → web ui, and the UI gets there by polling.
@@ -162,18 +162,20 @@ const server = Bun.serve({
     /** Every database this process serves, and which view each one needs. */
     "/api/sources": safely(() => json(sources.map((source) => source.info()))),
 
-    /** Maestro: the run index for one lifecycle ledger, newest run first. */
+    /** Run index for a maestro or artifact-factory ledger, newest first. */
     "/api/sources/:source_id/runs": safely((req) => {
       const source = sourceFor(req);
-      if (!source?.maestro) return notFound(`no maestro source ${param(req, "source_id")}`);
-      return json(source.maestro.runs());
+      const ledger = source?.maestro ?? source?.artifactFactory;
+      if (!ledger) return notFound(`no run source ${param(req, "source_id")}`);
+      return json(ledger.runs());
     }),
 
-    /** Maestro: one run whole — DAG shape, node lifecycle, attempts, verdicts. */
+    /** One run whole — mapped onto the existing reporting types. */
     "/api/sources/:source_id/runs/:run_id": safely((req) => {
       const source = sourceFor(req);
-      if (!source?.maestro) return notFound(`no maestro source ${param(req, "source_id")}`);
-      const detail = source.maestro.run(param(req, "run_id"));
+      const ledger = source?.maestro ?? source?.artifactFactory;
+      if (!ledger) return notFound(`no run source ${param(req, "source_id")}`);
+      const detail = ledger.run(param(req, "run_id"));
       return detail ? json(detail) : notFound(`no run ${param(req, "run_id")}`);
     }),
 
@@ -266,9 +268,9 @@ console.log(`[sssf] visualizer api  http://localhost:${server.port}`);
 for (const source of sources) {
   const info = source.info();
   console.log(
-    `[sssf] ${info.kind.padEnd(7)} ${info.path}  ` +
+    `[sssf] ${info.kind.padEnd(16)} ${info.path}  ` +
       `[journal_mode=${info.journal_mode}, ${info.count} ${
-        info.kind === "maestro" ? "runs" : "sessions"
+        info.kind === "sssf" ? "sessions" : "runs"
       }]`,
   );
 }

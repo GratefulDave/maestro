@@ -2,10 +2,18 @@ import { runHref } from "@/lib/href";
 import { isInFlight } from "@/lib/runVisibility";
 import type { MaestroNode, MaestroRunDetail } from "@/lib/types";
 
+export type RunHierarchyRole =
+  | "builder"
+  | "tester"
+  | "test-reviewer"
+  | "code-reviewer"
+  | "integration-reviewer"
+  | "reviewer";
+
 export interface RunHierarchyAgent {
   id: string;
   label: string;
-  role: "builder" | "tester" | "reviewer";
+  role: RunHierarchyRole;
   state: string;
   href: string;
 }
@@ -33,11 +41,72 @@ function attemptLabel(role: "builder" | "tester", node: MaestroNode): string {
   return node.attempt_no > 0 ? `${role}-a${node.attempt_no}` : role;
 }
 
+const FACTORY_ROLE_STAGES: ReadonlyArray<
+  readonly [RunHierarchyRole, string]
+> = [
+  ["tester", "WRITING_TESTS"],
+  ["test-reviewer", "REVIEWING_TESTS"],
+  ["builder", "BUILDING"],
+  ["code-reviewer", "REVIEWING_CODE"],
+  ["integration-reviewer", "READY_TO_MERGE"],
+];
+
+const FACTORY_STAGE_ORDER = [
+  "PLANNED",
+  "WRITING_TESTS",
+  "REVIEWING_TESTS",
+  "TESTS_SEALED",
+  "BUILDING",
+  "REVIEWING_CODE",
+  "READY_TO_MERGE",
+  "MERGED",
+];
+
+function factoryRoleState(roleStage: string, laneStage: string, runState: string): string {
+  if (roleStage === "READY_TO_MERGE") {
+    if (runState === "INTEGRATION_REVIEW_PENDING" || laneStage === "READY_TO_MERGE") {
+      return "ACTIVE";
+    }
+    if (runState === "PUBLISHABLE" || runState === "COMPLETE") return "COMPLETE";
+  }
+  if (roleStage === laneStage) return "ACTIVE";
+  const roleIndex = FACTORY_STAGE_ORDER.indexOf(roleStage);
+  const laneIndex = FACTORY_STAGE_ORDER.indexOf(laneStage);
+  return roleIndex >= 0 && laneIndex > roleIndex ? "COMPLETE" : "WAITING";
+}
+
+function projectArtifactFactoryHierarchy(
+  run: MaestroRunDetail,
+  sourceId: string,
+): RunHierarchy {
+  return {
+    label: run.plan_name ?? run.run_id,
+    is_live: isInFlight(run.state),
+    href: runHref(sourceId, run.run_id),
+    lanes: run.nodes.map((lane) => ({
+      id: lane.node_id,
+      label: lane.node_id,
+      state: lane.lane_phase ?? lane.state,
+      href: laneHref(sourceId, run.run_id, lane.node_id),
+      agents: FACTORY_ROLE_STAGES.map(([role, stage]) => ({
+        id: `${lane.node_id}:${role}`,
+        label: role,
+        role,
+        state: factoryRoleState(stage, lane.lane_phase ?? lane.state, run.state),
+        href: laneHref(sourceId, run.run_id, lane.node_id),
+      })),
+    })),
+  };
+}
+
 /** Project the persisted runtime hierarchy used by Herdr: plan → lane → actor. */
 export function projectRunHierarchy(
   run: MaestroRunDetail,
   sourceId: string,
 ): RunHierarchy {
+  if (run.schema_version === "artifact-factory.v1") {
+    return projectArtifactFactoryHierarchy(run, sourceId);
+  }
   const buildNodes = run.nodes.filter((node) => node.kind === "agent");
   const testNodes = run.nodes.filter((node) => node.kind === "tests");
   const reviewNodes = run.nodes.filter(

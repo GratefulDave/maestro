@@ -10,6 +10,7 @@ the vault and never return.
 from __future__ import annotations
 
 import os
+import shutil
 import re
 import stat
 import subprocess
@@ -285,17 +286,106 @@ def list_commit_blobs(vault: Path, commit: str) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
-def materialize_commit(repo: Path, sha: str, dest: Path) -> Path:
-    dest = Path(dest)
-    if dest.exists():
-        raise VaultError("refusing to adopt existing tree {0}".format(dest))
-    dest.mkdir(parents=True)
+def _archive_destination(root: Path, name: str) -> Path:
+    trimmed = name[:-1] if name.endswith("/") else name
+    parts = trimmed.split("/")
+    if not trimmed or any(part in ("", ".", "..") for part in parts):
+        raise VaultError("unsafe path in private-test archive: {0}".format(name))
+    candidate = root.joinpath(*parts)
+    try:
+        inside = os.path.commonpath(
+            (str(root.resolve()), str(candidate.resolve(strict=False)))
+        ) == str(root.resolve())
+    except ValueError:
+        inside = False
+    if not inside:
+        raise VaultError("unsafe path in private-test archive: {0}".format(name))
+    return candidate
+
+
+def _extract_archive(tar: tarfile.TarFile, dest: Path) -> None:
+    root = dest.resolve()
+    for member in tar:
+        target = _archive_destination(root, member.name)
+        if member.isdir():
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise VaultError(
+                    "archive directory conflicts with materialized path: {0}".format(
+                        member.name
+                    )
+                )
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            raise VaultError(
+                "duplicate path in private-test archive: {0}".format(member.name)
+            )
+        if member.isreg():
+            source = tar.extractfile(member)
+            if source is None:
+                raise VaultError(
+                    "private-test archive file has no payload: {0}".format(member.name)
+                )
+            with source, target.open("xb") as output:
+                shutil.copyfileobj(source, output)
+            target.chmod(member.mode & 0o777)
+            continue
+        if member.issym():
+            link_target = Path(member.linkname)
+            if link_target.is_absolute():
+                raise VaultError(
+                    "unsafe link in private-test archive: {0}".format(member.name)
+                )
+            resolved_link = (target.parent / link_target).resolve(strict=False)
+            try:
+                inside = os.path.commonpath(
+                    (str(root), str(resolved_link))
+                ) == str(root)
+            except ValueError:
+                inside = False
+            if not inside:
+                raise VaultError(
+                    "unsafe link in private-test archive: {0}".format(member.name)
+                )
+            target.symlink_to(member.linkname)
+            continue
+        raise VaultError(
+            "unsupported entry in private-test archive: {0}".format(member.name)
+        )
+
+
+def _extract_commit(repo: Path, sha: str, dest: Path) -> Path:
     archive = _git(repo, "archive", "--format=tar", sha, text=False)
     with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:") as tar:
-        tar.extractall(dest, filter="data")
+        _extract_archive(tar, dest)
     if (dest / ".git").exists():
         raise VaultError("materialized tree carried a .git directory")
     return dest.resolve()
+
+
+def materialize_commit(repo: Path, sha: str, dest: Path) -> Path:
+    """Extract a sealed tree into a new or pre-provisioned empty role cwd."""
+    dest = Path(dest)
+    if dest.exists():
+        if dest.is_symlink() or not dest.is_dir() or any(dest.iterdir()):
+            raise VaultError("refusing to adopt existing tree {0}".format(dest))
+    else:
+        dest.mkdir(parents=True)
+    return _extract_commit(repo, sha, dest)
+
+
+def refresh_materialized_commit(repo: Path, sha: str, dest: Path) -> Path:
+    """Replace one private tree without replacing its process-bound root inode."""
+    dest = Path(dest)
+    if dest.is_symlink() or not dest.is_dir():
+        raise VaultError("refusing to refresh non-directory tree {0}".format(dest))
+    for child in dest.iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+    return _extract_commit(repo, sha, dest)
 
 
 def copy_blobs_to_tree(vault: Path, dest: Path, files: Mapping[str, str]) -> None:

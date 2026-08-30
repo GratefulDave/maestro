@@ -327,7 +327,10 @@ code,
   background: var(--color-warn);
 }
 
-.agent-role-reviewer {
+.agent-role-reviewer,
+.agent-role-test-reviewer,
+.agent-role-code-reviewer,
+.agent-role-integration-reviewer {
   background: #a77bff;
 }
 

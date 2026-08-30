@@ -66,8 +66,9 @@ def snapshot(run) -> dict[str, str]:
         if len(fields) >= 3:
             path = fields[-1].strip()
             fingerprints[path] = f"{fields[0]},{fields[1]}"
-    for path in _git(["ls-files", "--others", "--exclude-standard"],
-                     run.repo_root).splitlines():
+    for path in _git(
+        ["ls-files", "--others", "--exclude-standard"], run.repo_root
+    ).splitlines():
         if path.strip():
             fingerprints[path.strip()] = "untracked"
     return fingerprints
@@ -75,8 +76,9 @@ def snapshot(run) -> dict[str, str]:
 
 def changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
     """Every path whose state differs — appeared, vanished, or was rewritten."""
-    return sorted({p for p in set(before) | set(after)
-                   if before.get(p) != after.get(p)})
+    return sorted(
+        {p for p in set(before) | set(after) if before.get(p) != after.get(p)}
+    )
 
 
 def _glob(pattern: str) -> re.Pattern:
@@ -105,7 +107,7 @@ def _glob(pattern: str) -> re.Pattern:
 
 
 def _matches(path: str, pattern: str) -> bool:
-    if pattern.endswith("/"):                      # directory prefix
+    if pattern.endswith("/"):  # directory prefix
         return path.startswith(pattern)
     if "*" in pattern or "?" in pattern:
         return _glob(pattern).fullmatch(path) is not None
@@ -134,10 +136,10 @@ def permitted(path: str, agent: AgentConfig, cfg: SSSFConfig) -> bool:
     if any(_matches(path, p) for p in always_writable(cfg)):
         return True
     if any(_matches(path, p) for p in (agent.writes or [])):
-        return True                      # naming a path is what unlocks a protected one
+        return True  # naming a path is what unlocks a protected one
     if any(_matches(path, p) for p in cfg.defaults.protected_files):
         return False
-    return agent.writes is None          # None = unrestricted, [] = no repo writes
+    return agent.writes is None  # None = unrestricted, [] = no repo writes
 
 
 def _roll_back(run, path: str, before: dict[str, str], after: dict[str, str]) -> str:
@@ -152,16 +154,23 @@ def _roll_back(run, path: str, before: dict[str, str], after: dict[str, str]) ->
         # Already dirty beforehand. If it is gone from the diff now, the agent
         # reverted an engineer's uncommitted work and the content is not ours
         # to reconstruct — say so loudly rather than pretend it was handled.
-        return "REVERTED-BY-AGENT (uncommitted work lost, cannot restore)" \
-            if path not in after else "left as-is (was already modified)"
+        return (
+            "REVERTED-BY-AGENT (uncommitted work lost, cannot restore)"
+            if path not in after
+            else "left as-is (was already modified)"
+        )
     if after.get(path) == "untracked":
         try:
             (Path(run.repo_root) / path).unlink()
             return "deleted"
         except OSError as error:
             return f"could not delete ({error})"
-    result = subprocess.run(["git", "checkout", "--", path],
-                            cwd=run.repo_root, capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", "checkout", "--", path],
+        cwd=run.repo_root,
+        capture_output=True,
+        text=True,
+    )
     return "rolled back" if result.returncode == 0 else "could not roll back"
 
 
@@ -182,12 +191,17 @@ def enforce(run, phase, agent: AgentConfig, before: dict[str, str]) -> list[str]
         return touched
 
     outcomes = {p: _roll_back(run, p, before, after) for p in breaches}
-    scope = ("read-only" if agent.writes == []
-             else f"limited to {agent.writes}" if agent.writes
-             else f"barred from {run.cfg.defaults.protected_files}")
+    scope = (
+        "read-only"
+        if agent.writes == []
+        else f"limited to {agent.writes}"
+        if agent.writes
+        else f"barred from {run.cfg.defaults.protected_files}"
+    )
     detail = "\n".join(f"  - {p} — {outcome}" for p, outcome in outcomes.items())
     raise PermissionBreach(
-        f"{agent.name} is {scope} but modified {len(breaches)} path(s):\n{detail}")
+        f"{agent.name} is {scope} but modified {len(breaches)} path(s):\n{detail}"
+    )
 
 
 # ── The capability axis: what an actor may INVOKE ──────────────────────────
@@ -221,43 +235,25 @@ def enforce(run, phase, agent: AgentConfig, before: dict[str, str]) -> list[str]
 # repository is the durable record either way. A delegated judgement cannot be
 # undone after the fact, because by the time anything could look, the only
 # surviving artifact is a signed receipt that says the right actor produced it.
-# So the capability is removed before the process starts rather than convicted
-# afterwards — the actor never holds the tool.
+# The capability is denied in launch argv where the client supports it and by
+# the mandatory pre-tool hook otherwise, before the delegated tool can run.
 #
 # **What this does and does not contain.** It is the same honest limit §9.6
 # draws around `--dangerously-skip-permissions`: this contains a *mistaken*
-# actor, not a hostile one. `bash` remains on every allowlist below, and an
+# actor, not a hostile one. `bash` remains available, container-wrapped, and an
 # actor determined to reach a second model can shell out to one. What it stops
 # is the ordinary case — the reviewer that reaches for the delegation tool
 # sitting in its schema because the tool is there.
 
 #: Per route, the tool names that let an actor hand its work to another model.
-#: omp's `task` spawns a sub-agent and `hub` starts and awaits named background
-#: jobs; both are in that binary's `BUILTIN_TOOL_NAMES`, so both are nameable
-#: in `--tools`. Claude's equivalents are `Task` and its current spelling
-#: `Agent`; both are named because a deny list that names only the retired
-#: spelling denies nothing.
+#: omp's `task` spawns a sub-agent, `hub` starts and awaits named background
+#: jobs, and `eval` exposes `agent()`; all three are in that binary's
+#: `BUILTIN_TOOL_NAMES`. Claude's equivalents are `Task` and its current
+#: spelling `Agent`; both are named because a deny list that names only the
+#: retired spelling denies nothing.
 DELEGATION_TOOLS: Dict[str, Tuple[str, ...]] = {
-    "omp": ("task", "hub"),
+    "omp": ("task", "hub", "eval"),
     "claude": ("Task", "Agent"),
-}
-
-#: Per route, the built-in tools a Maestro-launched actor may reach, before
-#: `DELEGATION_TOOLS` is subtracted. Only omp has one: `--tools` there is
-#: validated against the session's fully discovered registry, so an allowlist
-#: naming a tool the profile did not register is a startup error rather than a
-#: silent no-op — which makes an allowlist safe to state and a typo loud.
-#:
-#: The membership is measured, not guessed. Across the 39 reviewer sessions and
-#: 48 builder sessions of run-2a44d226e75a4be391a14f02b78a6d25 the tools
-#: actually invoked were, reviewer: hub, read, write, task, bash, grep, eval;
-#: builder: read, glob, write, grep, todo, bash, edit, eval. This set is the
-#: union of both minus the two delegation tools, so no actor loses a capability
-#: it was observed to use. `lsp` is deliberately absent: `--no-lsp` and a
-#: profile setting can both unregister it, and naming an unregistered tool
-#: fails the launch.
-ROUTE_TOOLS: Dict[str, Tuple[str, ...]] = {
-    "omp": ("read", "write", "edit", "bash", "grep", "glob", "todo", "eval"),
 }
 
 
@@ -266,50 +262,22 @@ def route_delegation_tools(route: str) -> Tuple[str, ...]:
     return DELEGATION_TOOLS.get(route, ())
 
 
-def route_tool_allowlist(route: str) -> Tuple[str, ...]:
-    """`route`'s permitted tools, with its delegation tools filtered out.
-
-    The subtraction happens here rather than in the table above, so adding a
-    delegation tool to `ROUTE_TOOLS` cannot quietly re-grant it. That is the
-    B15 shape applied to this module's own constants: the invariant is a
-    computation, not an agreement between two lists someone must keep level.
-
-    Empty means no allowlist is expressible for this route — either the route
-    is unknown, or its CLI has no enumerable built-in set worth stating. The
-    caller falls back to `route_delegation_tools` as a deny list.
-    """
-    denied = set(route_delegation_tools(route))
-    return tuple(t for t in ROUTE_TOOLS.get(route, ()) if t not in denied)
-
-
 def route_capability_argv(route: str) -> Tuple[str, ...]:
-    """The argv fragment that denies `route`'s actor the ability to delegate.
+    """Return Claude's explicit delegation denylist; OMP states none in argv.
 
-    Two shapes, because the two CLIs differ in what they can be told:
+    Role sessions load the host-authenticated profile plus repository
+    capabilities. Containment is a deny list, not a Bash-only `--tools`
+    hatch: Claude receives one variadic `--disallowedTools` argument for every
+    name in `route_delegation_tools`. OMP has no equivalent denylist flag here;
+    `workspace_isolation.check_tool_input` fail-closes `task`/`hub`/`eval`.
 
-    * **omp** takes an allowlist (`--tools read,write,...`), validated against
-      the session registry. Stating the whole permitted set is stronger than
-      naming what to remove: a tool that appears in a future omp release, or
-      one an extension registers, is absent by default rather than newly
-      reachable.
-    * **claude** takes a deny list (`--disallowedTools Task Agent`). Its
-      built-in set is not enumerable from here with the confidence omp's is,
-      and an allowlist that omitted a tool the plan author needs would break
-      the author lane rather than contain it. Naming the two delegation tools
-      is the change that is provably no wider than the defect.
-
-    An unknown route yields no flags. That is not a silent pass: an unknown
-    route never reaches an argv builder at all — `HerdrLauncher.launch` refuses
-    it `UNSUPPORTED_ROUTE` before this could matter — so the empty answer is
-    unreachable rather than permissive.
+    An unknown route yields no flags. That route is refused by
+    `HerdrLauncher.launch` before an argv builder can run.
     """
-    allowed = route_tool_allowlist(route)
-    if allowed:
-        return ("--tools", ",".join(allowed))
     denied = route_delegation_tools(route)
-    if denied:
-        return ("--disallowedTools", *denied)
-    return ()
+    if route != "claude" or not denied:
+        return ()
+    return ("--disallowedTools", *denied)
 
 
 def argv_denies_delegation(route: str, argv: Sequence[str]) -> bool:
@@ -320,10 +288,8 @@ def argv_denies_delegation(route: str, argv: Sequence[str]) -> bool:
     *stated in the argv*: an allowlist that names no delegation tool and does
     not grant `eval`, or a deny list that names every delegation tool.
 
-    `eval` is not in `DELEGATION_TOOLS` — that table drives the `--tools`
-    hatch, which this module does not expand. Granting `eval` is still not
-    denial: omp's eval sandbox exposes `agent()`. An argv that lists it
-    returns False.
+    Granting `eval` is still not denial: omp's eval sandbox exposes `agent()`.
+    An argv that lists it on `--tools` returns False.
     """
     denied = route_delegation_tools(route)
     if not denied:
@@ -338,6 +304,11 @@ def argv_denies_delegation(route: str, argv: Sequence[str]) -> bool:
                 return True
     for index, token in enumerate(tokens):
         if token in ("--disallowedTools", "--disallowed-tools"):
-            if set(denied) <= set(tokens[index + 1:]):
+            collected: set[str] = set()
+            for extra in tokens[index + 1 :]:
+                if extra.startswith("-"):
+                    break
+                collected.update(t.strip() for t in extra.split(",") if t.strip())
+            if set(denied) <= collected:
                 return True
     return False

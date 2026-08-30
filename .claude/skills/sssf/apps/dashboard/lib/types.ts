@@ -4,7 +4,9 @@
  * bun:sqlite or the Vue server.
  */
 
-export type SourceKind = "sssf" | "maestro";
+export type SourceKind = "sssf" | "maestro" | "artifact-factory";
+
+export type ReportingSchemaVersion = "legacy-lifecycle" | "artifact-factory.v1";
 
 export interface SourceInfo {
   id: string;
@@ -13,6 +15,7 @@ export interface SourceInfo {
   label: string;
   journal_mode: string;
   count: number;
+  schema_version?: ReportingSchemaVersion | string;
 }
 
 export type SourcesResponse = SourceInfo[];
@@ -154,6 +157,7 @@ export interface MaestroResult {
 
 export interface MaestroRunSummary {
   run_id: string;
+  schema_version?: ReportingSchemaVersion | string;
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;
@@ -183,6 +187,7 @@ export interface MaestroActorSession {
 
 export interface MaestroRunDetail {
   run_id: string;
+  schema_version?: ReportingSchemaVersion | string;
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;

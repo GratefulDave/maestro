@@ -109,7 +109,12 @@ def _install_deployment(product: Path, state: Path) -> Path:
     (adws / "maestro.config.yaml").write_text(
         "schema: maestro-config.v1\n"
         f"runtime_state_root: {state.resolve()}\n"
-        "runner_profile: grok-maestro\n",
+        "role_routes:\n"
+        "  tester: {route: omp, profile: grok-maestro}\n"
+        "  test-reviewer: {route: omp, profile: grok-maestro}\n"
+        "  builder: {route: omp, profile: grok-maestro}\n"
+        "  code-reviewer: {route: omp, profile: grok-maestro}\n"
+        "  integration-reviewer: {route: omp, profile: grok-maestro}\n",
         encoding="utf-8",
     )
     return maestro_file
@@ -136,11 +141,17 @@ class ResumeAmendStatusBindDeploymentTest(unittest.TestCase):
         self.state.mkdir(mode=0o700)
         _init_repo(self.product)
         _init_repo(self.other)
-        self.runtime = RuntimeStateRoot(self.state, overlap_paths=(self.product,))
+        self.runtime = RuntimeStateRoot(
+            self.state.resolve(), overlap_paths=(self.product,)
+        )
         self.runtime.ensure_layout()
         self.store = ArtifactStore(self.runtime.ledger_path())
+        self.plan = self.root / "plan.json"
+        self.plan.write_bytes(_plan_bytes())
         compiled = plan_compiler.compile_plan(
-            _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:bind"
+            _plan_bytes(),
+            plan_revision=1,
+            plan_artifact_ref=str(self.plan.resolve()),
         )
         self.target = gitpub.bind_target_worktree(self.product, "refs/heads/main")
         self.run_id = "run-bind"
@@ -151,8 +162,6 @@ class ResumeAmendStatusBindDeploymentTest(unittest.TestCase):
             runtime=self.runtime,
             target=self.target,
         )
-        self.plan = self.root / "plan.json"
-        self.plan.write_bytes(_plan_bytes())
         self.addCleanup(self.store.close)
         self.addCleanup(self.runtime.close)
         self.addCleanup(self.tmp.cleanup)
@@ -184,6 +193,31 @@ class ResumeAmendStatusBindDeploymentTest(unittest.TestCase):
                     code, payload = _outcome(list(argv))
                     self.assertEqual(code, 3)
                     self.assertEqual(payload["outcome"], "RUN_REPOSITORY_MISMATCH")
+
+    def test_existing_run_binding_reads_plan_ref_from_active_revision(self) -> None:
+        from unittest import mock
+
+        maestro_file = _install_deployment(self.product, self.state)
+        with (
+            mock.patch.object(
+                maestro, "_executing_maestro_file", return_value=maestro_file
+            ),
+            mock.patch.object(maestro, "register_installation") as register,
+        ):
+            _layout, runtime, store, row, _target = maestro._bind_existing_run(
+                self.run_id
+            )
+        try:
+            self.assertNotIn("plan_artifact_ref", row)
+            register.assert_called_once_with(
+                database=self.runtime.ledger_path(),
+                plans_dir=self.plan.resolve().parent,
+                repository=str(self.product.resolve()),
+                state=self.state.resolve(),
+            )
+        finally:
+            store.close()
+            runtime.close()
 
     def test_config_source_is_executing_deployment_not_target_worktree(self) -> None:
         publication = self.root / "publication"

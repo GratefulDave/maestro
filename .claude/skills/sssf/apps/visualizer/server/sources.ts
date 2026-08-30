@@ -20,6 +20,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
 import { SssfDb } from "./db.ts";
+import { ArtifactFactoryDb, ARTIFACT_FACTORY_TABLES } from "./artifactFactoryDb.ts";
 import { MAESTRO_TABLES, MaestroDb, discoverMaestroLedger, openLedgerReadonly } from "./maestroDb.ts";
 import type { SourceInfo, SourceKind } from "../shared/types.ts";
 
@@ -40,7 +41,7 @@ const DEFAULT_SSSF_RELATIVE = "adws/adw_data/sssf.db";
  */
 const REGISTRY_RELATIVE = ".maestro/registry.json";
 
-type RegistryEntry = { db: string; plansDir: string | null };
+type RegistryEntry = { db: string; plansDir: string | null; repository: string | null };
 
 /** Installations Maestro has recorded, newest first, unreadable ones dropped. */
 export function registeredInstallations(
@@ -61,16 +62,24 @@ export function registeredInstallations(
   if (!Array.isArray(raw)) return [];
   const entries: RegistryEntry[] = [];
   for (const item of raw) {
-    const db = (item as { database?: unknown })?.database;
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const db = record.database;
     if (typeof db !== "string" || !db) continue;
-    const plans = (item as { plans_dir?: unknown })?.plans_dir;
-    entries.push({ db, plansDir: typeof plans === "string" && plans ? plans : null });
+    const plans = record.plans_dir;
+    const repository = record.repository;
+    entries.push({
+      db,
+      plansDir: typeof plans === "string" && plans ? plans : null,
+      repository: typeof repository === "string" && repository ? repository : null,
+    });
   }
   return entries;
 }
 
 /** The tables that identify each schema. First full match wins. */
 const PROBES: { kind: SourceKind; tables: string[] }[] = [
+  { kind: "artifact-factory", tables: ARTIFACT_FACTORY_TABLES },
   { kind: "maestro", tables: MAESTRO_TABLES },
   { kind: "sssf", tables: ["sessions", "phases", "events"] },
 ];
@@ -116,6 +125,7 @@ export interface Source {
   readonly label: string;
   readonly sssf?: SssfDb;
   readonly maestro?: MaestroDb;
+  readonly artifactFactory?: ArtifactFactoryDb;
   info(): SourceInfo;
   close(): void;
 }
@@ -154,6 +164,26 @@ function makeSource(
       close: () => sssf.close(),
     };
   }
+  if (kind === "artifact-factory") {
+    const artifactFactory = new ArtifactFactoryDb(path, plansDir);
+    return {
+      id,
+      kind,
+      path,
+      label: base,
+      artifactFactory,
+      info: () => ({
+        id,
+        kind,
+        path,
+        label: base,
+        journal_mode: artifactFactory.journalMode,
+        count: artifactFactory.runCount(),
+        schema_version: artifactFactory.schemaVersion,
+      }),
+      close: () => artifactFactory.close(),
+    };
+  }
   const maestro = new MaestroDb(path, plansDir);
   return {
     id,
@@ -168,6 +198,7 @@ function makeSource(
       label: base,
       journal_mode: maestro.journalMode,
       count: maestro.runCount(),
+      schema_version: "legacy-lifecycle",
     }),
     close: () => maestro.close(),
   };
@@ -187,7 +218,12 @@ export function resolveSources(argv: string[] = Bun.argv, cwd = process.cwd()): 
   const add = (raw: string | undefined, plansDir: string | null = null) => {
     if (!raw) return;
     const path = isAbsolute(raw) ? raw : resolve(cwd, raw);
-    if (!requested.some((item) => item.path === path)) requested.push({ path, plansDir });
+    const existing = requested.find((item) => item.path === path);
+    if (existing) {
+      existing.plansDir ??= plansDir;
+      return;
+    }
+    requested.push({ path, plansDir });
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -204,7 +240,12 @@ export function resolveSources(argv: string[] = Bun.argv, cwd = process.cwd()): 
     if (discovered) add(discovered.db, discovered.plansDir);
     // The repo we are standing in comes first so it stays the landing view;
     // every other factory Maestro has run is added behind it as a tab.
-    for (const entry of registeredInstallations()) add(entry.db, entry.plansDir);
+    for (const entry of registeredInstallations()) {
+      add(entry.db, entry.plansDir);
+      if (!entry.repository) continue;
+      const fromRepo = discoverMaestroLedger(entry.repository);
+      if (fromRepo) add(fromRepo.db, fromRepo.plansDir ?? entry.plansDir);
+    }
   } else {
     // An explicitly-named Maestro ledger still gets its plan names when the
     // repo it belongs to is the one we are standing in.
@@ -218,11 +259,12 @@ export function resolveSources(argv: string[] = Bun.argv, cwd = process.cwd()): 
     }
   }
 
-  // A plans directory named once applies to every Maestro ledger that has not
-  // been given one — otherwise `--db <ledger>` silently loses plan names, since
-  // the ledger stores digests and only the plan files can name them.
+  // An operator-supplied plan directory is authoritative for every loaded
+  // ledger. Otherwise retain the first discovered source directory, while
+  // allowing registry metadata to fill an empty runtime-state fallback.
+  const configuredPlans = process.env.MAESTRO_PLANS ?? null;
   for (const item of requested) {
-    item.plansDir ??= process.env.MAESTRO_PLANS ?? null;
+    if (configuredPlans) item.plansDir = configuredPlans;
   }
 
   const taken = new Set<string>();
@@ -234,7 +276,7 @@ export function resolveSources(argv: string[] = Bun.argv, cwd = process.cwd()): 
     }
     const kind = probeKind(item.path);
     if (kind === null) {
-      console.warn(`[sssf] skipping ${item.path} — not an sssf or maestro database`);
+      console.warn(`[sssf] skipping ${item.path} — not a known run database`);
       continue;
     }
     try {

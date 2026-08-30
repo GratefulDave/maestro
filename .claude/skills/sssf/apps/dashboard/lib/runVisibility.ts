@@ -1,7 +1,7 @@
 import type { MaestroRunSummary } from "@/lib/types";
 
 export function isInFlight(state: string): boolean {
-  return ["RUNNING", "CANCELLING", "PENDING"].includes(state);
+  return ["RUNNING", "CANCELLING", "PENDING", "WAITING_FOR_USER"].includes(state);
 }
 
 export function needsAttention(run: MaestroRunSummary): boolean {

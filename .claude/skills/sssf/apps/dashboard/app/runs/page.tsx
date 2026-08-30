@@ -50,7 +50,9 @@ export default async function RunsPage({
   const filteredSource = sourceFilter
     ? sources.find((item) => item.id === sourceFilter)
     : null;
-  const notMaestro = Boolean(filteredSource && filteredSource.kind !== "maestro");
+  const notMaestro = Boolean(
+    filteredSource && filteredSource.kind !== "maestro" && filteredSource.kind !== "artifact-factory",
+  );
   const unknownSource = Boolean(sourceFilter && !filteredSource);
 
   return (

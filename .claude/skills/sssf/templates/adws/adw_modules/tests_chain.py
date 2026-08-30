@@ -80,9 +80,15 @@ def write_test_draft(
         vault_refs=(ref,),
         blob_ids=tuple(blob for _path, blob in private) + (commit,),
     )
-    pr.refuse_private_leak(
-        payload, tokens, allow=(request.input_digest, private_draft_digest, ref)
+    public_tokens = (
+        request.input_digest,
+        private_draft_digest,
+        ref,
+        *contract["acceptance_criteria"],
+        *contract["declared_outputs"],
+        *(Path(output).name for output in contract["declared_outputs"]),
     )
+    pr.refuse_private_leak(payload, tokens, allow=public_tokens)
     artifact = pr.make_lane_artifact(
         kind=st.ArtifactKind.TEST_DRAFT,
         request=request,
@@ -92,7 +98,7 @@ def write_test_draft(
     pr.refuse_private_leak(
         st.canonical_bytes(artifact.payload),
         tokens,
-        allow=(request.input_digest, private_draft_digest, ref),
+        allow=public_tokens,
     )
     return artifact
 
