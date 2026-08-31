@@ -259,6 +259,18 @@ describe("shouldHideBarrenRun", () => {
     expect(shouldHideBarrenRun(inFlightBarren, false)).toBe(false);
     expect(shouldHideBarrenRun(pendingBarren, false)).toBe(false);
     expect(shouldHideBarrenRun(cancellingBarren, false)).toBe(false);
+    expect(
+      shouldHideBarrenRun(
+        summary({
+          run_id: "waiting-zero",
+          state: "WAITING_FOR_USER",
+          scheduler_liveness: "unknown",
+          declared_outcome: null,
+          node_states: [{ node_id: "a", state: "WAITING_FOR_USER" }],
+        }),
+        false,
+      ),
+    ).toBe(false);
   });
 
   test("unknown liveness that still reads RUNNING is shown", () => {

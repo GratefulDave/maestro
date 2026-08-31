@@ -294,12 +294,15 @@ export type EnvelopesResponse = Envelope[];
 export type GatesResponse = GateResult[];
 
 // ── sources: one dashboard over several factory runtimes ─────────────────────
-// The SSSF tracer and Maestro's DAG runtime write different schemas, so the
-// server reads whichever it was pointed at and tells the UI which view to draw.
-// A new ADW adds a kind here and a view keyed on it; it never has to write a
-// second schema to be visible.
+// The SSSF tracer, the legacy Maestro DAG ledger, and the artifact-factory
+// ledger write different schemas. The server probes tables and names the
+// schema version on SourceInfo. Reporting adapters map onto the types below;
+// they never invent a second schema in the runtime.
 
-export type SourceKind = "sssf" | "maestro";
+export type SourceKind = "sssf" | "maestro" | "artifact-factory";
+
+/** Explicit reporting schema. Not a SQLite PRAGMA. */
+export type ReportingSchemaVersion = "legacy-lifecycle" | "artifact-factory.v1";
 
 export interface SourceInfo {
   /** Stable, URL-safe, and recognisable: "maestro:lexgenius". */
@@ -309,8 +312,10 @@ export interface SourceInfo {
   /** The database's directory name — what an operator calls this factory. */
   label: string;
   journal_mode: string;
-  /** Sessions for an sssf source, runs for a maestro one. */
+  /** Sessions for an sssf source, runs for a maestro or artifact-factory one. */
   count: number;
+  /** Present on run ledgers. Omitted for the tracer. */
+  schema_version?: ReportingSchemaVersion | string;
 }
 
 /** GET /api/sources */
@@ -603,6 +608,7 @@ export interface MaestroResult {
 /** GET /api/sources/:id/runs — the index, one row per run. */
 export interface MaestroRunSummary {
   run_id: string;
+  schema_version?: ReportingSchemaVersion | string;
   /** Stored `runs.plan_name` when present; else digest lookup; null if neither. */
   plan_name: string | null;
   plan_digest: string;
@@ -639,6 +645,7 @@ export interface MaestroActorSession {
 /** GET /api/sources/:id/runs/:run_id */
 export interface MaestroRunDetail {
   run_id: string;
+  schema_version?: ReportingSchemaVersion | string;
   plan_name: string | null;
   plan_digest: string;
   state: MaestroLiveState;

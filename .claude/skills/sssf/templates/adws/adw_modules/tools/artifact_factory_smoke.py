@@ -172,7 +172,16 @@ def write_deployment_config(
     payload: dict[str, Any] = {
         "schema": CONFIG_SCHEMA,
         "runtime_state_root": str(state),
-        "runner_profile": runner_profile,
+        "role_routes": {
+            role: {"route": "omp", "profile": runner_profile}
+            for role in (
+                "tester",
+                "test-reviewer",
+                "builder",
+                "code-reviewer",
+                "integration-reviewer",
+            )
+        },
         "executables": dict(executables),
         "route_receipts": dict(route_receipts),
         "route_verify_keys": list(route_verify_keys),

@@ -186,6 +186,28 @@ class PrivateReviewContract(unittest.TestCase):
         _git(self.repo, "update-ref", ref, sha)
         return sha, ref
 
+    def test_draft_allows_declared_private_test_path_in_public_contract(self):
+        contract = {
+            "acceptance_criteria": ["negative amounts are refused"],
+            "declared_outputs": [TEST_PATH],
+        }
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("declared-test-output"),
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TEST_PATH: TEST_SOURCE},
+            public_contract=contract,
+            worktrees_root=self.worktrees / "declared-test-output",
+        )
+
+        self.assertEqual(draft.payload["public_contract"], contract)
+        self.assertNotIn(SECRET_LITERAL, json.dumps(draft.payload))
+
     def test_author_reviewer_revise_then_pass_uses_distinct_inputs(self):
         first = self._draft(_digest("draft-1"))
         self.assertIs(first.kind, st.ArtifactKind.TEST_DRAFT)

@@ -12,7 +12,7 @@ Prove exactly two dependent lanes:
 4. each accepted lane merged exactly once into the integration branch
 5. dependent lane execution using the accepted integration artifact
 6. final integration review of all completed lanes before publication to main
-7. interrupted work restarting from its last immutable completed-stage artifact, not from a live agent or dirty worktree
+7. interrupted work restarting from its last immutable completed-stage artifact; a still-running role pane may reconnect as transport by proved identity, never from an unproved agent or dirty worktree
 8. a user amendment: a changed lane invalidates every former input and restarts its changed projection at `PLANNED`; policy-selected unchanged dependents revalidate
 
 No broader framework, general-purpose recovery system, compatibility layer, or speculative extension belongs in this slice.
@@ -26,7 +26,8 @@ No broader framework, general-purpose recovery system, compatibility layer, or s
 5. Accepted lane commits merge exactly once into one run-specific integration branch.
 6. A dependent lane starts from the integration commit containing every merged dependency.
 7. When every lane is `MERGED`, a final reviewer evaluates the integration commit with all sealed tests. `PASS` permits exactly-once receipt-backed publication of that SHA to `main`. `REVISE` waits for a user amendment.
-8. Process death restarts the current incomplete stage from its last immutable input.
+8. Process death restarts the current incomplete stage from its last immutable input. Role panes may reconnect as transport by proved identity. Unknown, mismatched, or dirty worktrees and unproved agents are refused.
+9. Every role process is hard-confined to its own role tree: exact file-tool allowlists, fail-closed path hooks, no `.git` access, no network, scrubbed credentials, checkout-local scratch, and an OS sandbox for every shell command. Access to sibling roles, target/publication trees, runtime state, vaults, or any other external path is a refusal. Missing confinement support is a launch refusal.
 
 ## Authoritative lane stage enum
 
@@ -48,9 +49,9 @@ The stage names the work that happens next. Completing a stage writes its immuta
 
 `REVISE` is artifact data, not a stage. Git commits and sealed digests identify immutable bytes; they do not independently encode workflow stage.
 
-Any new durable field, duplicated authority, speculative restart path, spend ceiling, actor generation, live-session adoption, dirty-worktree adoption, generic semantic gate, or second candidate identity requires both explicit user approval and a named acceptance scenario that cannot be satisfied without it. Absent both, reject or delete it.
+Any new durable field, duplicated authority, speculative restart path, spend ceiling, actor generation, unproved live-session adoption, dirty-worktree adoption, generic semantic gate, or second candidate identity requires both explicit user approval and a named acceptance scenario that cannot be satisfied without it. Absent both, reject or delete it.
 
-Resume means starting the next incomplete stage from the last accepted immutable artifact. Never resurrect an agent process, reconstruct a consumed marker, or preserve uncommitted worktree state.
+Resume means starting the next incomplete stage from the last accepted immutable artifact. Never resurrect a dead agent process, reconstruct a consumed marker, or preserve uncommitted worktree state as resume input. A still-running role pane may reconnect only by proved project/run/lane/role identity.
 
 ## Reviewer mandate
 
@@ -58,7 +59,7 @@ Reject:
 
 - undeclared durable state
 - duplicate representations of stage, attempt identity, candidate identity, review identity, or ownership
-- adoption of agents, panes, sessions, or dirty worktrees
+- unproved adoption of agents, panes, sessions, or dirty worktrees; durable `actor_sessions` or generations; pane occupancy as acceptance
 - abstractions not required by the two-lane slice
 - speculative failure handling without a named acceptance scenario
 - spend ceilings that prevent explicit user continuation
@@ -120,7 +121,7 @@ Do not implement or promise:
 - parallel state/phase enums
 - attempts as workflow authority
 - salvage, late-envelope continuation, marker consumption
-- live actor/pane/session/dirty-worktree adoption
+- unproved live actor/pane/session/dirty-worktree adoption
 - candidate/review/handoff tables as a second identity
 - actor generations
 - spend ceilings, floors, grants
@@ -129,7 +130,13 @@ Do not implement or promise:
 - compatibility writers or in-flight ledger migration
 - builder access to private tests
 
-Herdr and OMP are transport. Pane text is never stage authority.
+Herdr and OMP are transport. Pane text and idle status are never stage authority.
+
+## Transport topology
+
+One Herdr workspace per project+run; one tab per lane; exactly five sibling panes named `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`. All five role agents and their role-scoped working trees persist for the run. Separate reviewer panes return actionable redacted feedback to the existing implementation role agent. Idle after output is normal.
+
+Mutable role trees and pane/session memory are transport only. Scheduler restart first rediscovers by deterministic project/run/lane/role identity, typed Herdr workspace/tab/pane, and canonical role-scoped cwd, then live-checks the process and resubmits the current stage from its immutable input. Only confirmed death or typed `agent_not_found` permits recreation. Empty labels, legacy stage/attempt panes, malformed observations, unreachable Herdr, and mismatched placement refuse; never adopt or rename them as current role agents.
 
 ## Workspace
 

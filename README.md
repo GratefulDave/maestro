@@ -19,7 +19,7 @@ Rendered docs: [`docs/index.html`](docs/index.html). Current architecture diagra
 5. An accepted lane merges exactly once into the run's integration branch.
 6. A dependent lane starts from the integration commit that already contains every merged dependency.
 7. When every lane is merged, a final reviewer evaluates that integration commit with all sealed tests. `PASS` publishes that SHA to `main` exactly once, receipt-backed. `REVISE` waits for a user amendment.
-8. Process death restarts the current incomplete stage from its last immutable input. Live agents, panes, dirty worktrees, and processes are not adopted.
+8. Process death restarts the current incomplete stage from its last immutable input. A still-running role pane may reconnect as transport by proved identity. Unknown, mismatched, or dirty worktrees and unproved agents are refused.
 
 ---
 
@@ -42,6 +42,18 @@ WAITING_FOR_USER
 The stage names the work that happens next. Completing a stage writes its immutable artifact and the next stage atomically.
 
 `REVISE` is review-artifact data, not a tenth stage. Reviewers are stages of the lane, not extra DAG nodes.
+
+---
+
+## Monitoring topology
+
+One Herdr workspace per project+run (project identity plus run ID). One tab per lane. Every lane tab contains exactly five sibling panes named `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`. All five role agents persist for the run. Reviewer panes return actionable redacted feedback to the existing implementation role agent. Idle after output is normal and is not completion.
+
+Each role owns one stable role-scoped checkout or private tree and keeps its pane/session memory across review `REVISE` loops and scheduler restarts. The mutable role tree is transport scratch, never workflow authority; `lane_state.stage` plus immutable artifacts remain the only durable workflow authority.
+
+Role confinement is mandatory, not prompt guidance. OMP and Claude remain host processes so Herdr can display and control them and their existing OAuth profiles can authenticate normally. Both receive only the Bash tool. A fail-closed hook rewrites every model-issued command into a disposable OrbStack/Docker container with no network, a read-only container root, scrubbed credentials, hidden Git metadata, checkout-local scratch, and only that role tree mounted writable. The image contains project runtimes, not coders or OAuth material. Missing Docker, image, hook, or container support refuses launch.
+
+Scheduler restart first rediscovers the five stable agents by deterministic project/run/lane/role identity and typed Herdr workspace/tab/pane plus canonical role-scoped cwd. It live-checks the process and resubmits the current stage from its immutable input. Only a confirmed dead or `agent_not_found` role is recreated. Empty labels, legacy stage/attempt panes, malformed observations, unreachable Herdr, mismatched placement, and unproved agents are refused, never adopted or renamed as current roles.
 
 ---
 
@@ -100,7 +112,7 @@ Changed lanes restart at `PLANNED`. Unchanged dependents at `BUILDING`, `REVIEWI
 
 ### Crash
 
-Death before the stage transaction commits: recreate the current stage from its last immutable input. Death after commit: read the advanced stage. Do not resurrect agents, consume recovery markers, or keep uncommitted worktree state.
+Death before the stage transaction commits: recreate the current stage from its last immutable input. Death after commit: read the advanced stage. Do not resurrect a dead agent, consume recovery markers, or keep uncommitted worktree state as resume input. A still-running role pane may reconnect only by proved identity.
 
 ### Legacy ledgers
 
@@ -151,7 +163,7 @@ The visualizer at `.claude/skills/sssf/apps/visualizer/` remains a read-only SQL
 ## What this factory refuses
 
 - Second encodings of stage or identity (parallel state/phase enums, attempt numbers, candidate sequences, generations, pending causes).
-- Adoption of live actors, panes, sessions, or dirty worktrees.
+- Unproved adoption of agents, panes, sessions, or dirty worktrees; durable `actor_sessions` or actor generations; pane occupancy as acceptance.
 - Spend ceilings, floors, or grants that block explicit user continuation.
 - Escape verbs `retry`, `skip`, and `abandon`.
 - Generic semantic or produced-symbol reachability as a hard admission gate.

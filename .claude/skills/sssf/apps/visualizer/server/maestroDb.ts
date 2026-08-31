@@ -24,7 +24,7 @@
  */
 import { Database, constants } from "bun:sqlite";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   MaestroActorSession,
   MaestroAttempt,
@@ -997,17 +997,14 @@ function isResumable(row: RunRow, state: string): boolean {
 }
 
 /**
- * Locate a repository's lifecycle ledger from its `adws/maestro.config.yaml`.
+ * Locate a repository's lifecycle ledger from `adws/maestro.config.yaml`.
  *
- * The config states `state_root` relative to the repo, and Maestro appends the
- * repository's own directory name — so the ledger is
- * `<state_root>/<repo name>/lifecycle.sqlite3`. Deriving it means the operator
- * runs the visualizer from the repo, exactly as they run every other verb,
- * instead of pasting an absolute path into a flag.
+ * Artifact-factory deployments name an absolute `runtime_state_root`; the
+ * ledger is `{runtime_state_root}/lifecycle.sqlite3`. Legacy Maestro configs
+ * name `state_root` relative to the repo and append the repository directory:
+ * `{state_root}/{repo name}/lifecycle.sqlite3`.
  *
- * Only `state_root` and `plans_dir` are read, by line, because a YAML parser
- * is a dependency this process does not otherwise need and the two keys are
- * top-level scalars in a schema-versioned file.
+ * Only those scalars plus `plans_dir` are read, by line.
  */
 export function discoverMaestroLedger(
   repo: string,
@@ -1019,10 +1016,26 @@ export function discoverMaestroLedger(
     const match = text.match(new RegExp(`^\\s*"?${key}"?\\s*:\\s*"?([^"\\n#]+?)"?\\s*,?$`, "m"));
     return match ? (match[1] ?? "").trim() : null;
   };
+  const plans = scalar("plans_dir");
+  const runtimeRoot = scalar("runtime_state_root");
+  if (runtimeRoot) {
+    const root = isAbsolute(runtimeRoot) ? runtimeRoot : resolve(repo, runtimeRoot);
+    const db = resolve(root, "lifecycle.sqlite3");
+    if (existsSync(db)) {
+      const runtimePlans = resolve(root, "plans");
+      return {
+        db,
+        plansDir: plans
+          ? resolve(repo, plans)
+          : existsSync(runtimePlans) && readdirSync(runtimePlans).length > 0
+            ? runtimePlans
+            : null,
+      };
+    }
+  }
   const stateRoot = scalar("state_root");
   if (!stateRoot) return null;
   const db = resolve(repo, stateRoot, basename(resolve(repo)), "lifecycle.sqlite3");
   if (!existsSync(db)) return null;
-  const plans = scalar("plans_dir");
   return { db, plansDir: plans ? resolve(repo, plans) : null };
 }

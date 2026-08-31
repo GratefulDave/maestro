@@ -246,7 +246,7 @@
         </div>
         <div class="grid">
           <article class="card"><span class="tag">Plan</span><h3>Approved before execution</h3><p>Planning skills emit one executable plan. The compiler checks schema, DAG, ownership, and acceptance. No <code>plan gate|review|ship</code> or <code>bootstrap</code> verb.</p></article>
-          <article class="card"><span class="tag">Isolation</span><h3>Fresh worktree per stage</h3><p>Each incomplete stage starts from the immutable input commit. Never adopt a pane, process, or dirty tree.</p></article>
+          <article class="card"><span class="tag">Isolation</span><h3>Host agent, containerized Bash</h3><p>All five persistent role agents remain visible in Herdr and use existing host OAuth profiles, but receive only Bash. Every model-issued command runs in a disposable no-network OrbStack/Docker container with only that role tree mounted writable; coders, credentials, Git metadata, sibling trees, runtime state, and publication state stay outside.</p></article>
           <article class="card"><span class="tag">Acceptance</span><h3>Sealed tests, then merge once</h3><p>Private tests seal before building. Each accepted lane merges exactly once into the run integration ref. Publication is receipt-backed.</p></article>
           <article class="card"><span class="tag">Trace</span><h3>Stage plus artifacts</h3><p>SQLite under <code>runtime_state_root</code> stores <code>lane_state.stage</code> and immutable artifacts. Attempts and operator escapes are not authority.</p></article>
         </div>
@@ -264,7 +264,7 @@
           <div class="flow-step"><code>04</code><b>Merge</b><small>Exactly-once integration merge from the immutable candidate SHA.</small></div>
           <div class="flow-step"><code>05</code><b>Publish</b><small>Final review, then receipt-backed publication to <code>main</code>.</small></div>
         </div>
-        <div class="callout"><strong>Resume.</strong> Process death restarts the current incomplete stage from its last immutable input. <code>run amend</code> invalidates only the affected stage and transitive dependents. No retry/skip/abandon/cancel verb.</div>
+        <div class="callout"><strong>Resume.</strong> Process death restarts the current incomplete stage from its last immutable input. A still-running role pane may reconnect as transport by proved project/run/lane/role identity. <code>run amend</code> invalidates only the affected stage and transitive dependents. No retry/skip/abandon/cancel verb.</div>
       </section>
 
       <section id="components">
@@ -282,7 +282,7 @@
               <tr><td>hidden_vault.py / private_review.py</td><td>Private object storage, sealed test bundles, controlled review materialization, and redaction</td><td>Private-test boundary</td></tr>
               <tr><td>runtime_state.py</td><td>External state-root descriptor, product-repository identity, permissions, and overlap refusal</td><td>Runtime binding</td></tr>
               <tr><td>git_publication.py</td><td>Immutable candidate/integration/publication refs, compare-and-swap updates, and Git receipts</td><td>Repository mutation</td></tr>
-              <tr><td>launcher.py</td><td>Fresh Herdr panes, explicit Claude/OMP routes, process lifecycle, and transcripts</td><td>Transport only</td></tr>
+              <tr><td>launcher.py / workspace_isolation.py</td><td>Exact persistent role panes, strict Claude/OMP tool sets, fail-closed path hooks, scrubbed shell environments, and OS-level command confinement</td><td>Transport and role boundary</td></tr>
               <tr><td>route_admission.py</td><td>Signed launcher-route admission and exact profile/command binding</td><td>Runner capability</td></tr>
             </tbody>
           </table>
@@ -321,10 +321,10 @@
           <table>
             <thead><tr><th>Operation</th><th>Contract</th></tr></thead>
             <tbody>
-              <tr><td>launch(spec)</td><td>Allocate pane, bind exact worktree cwd, start explicit omp or Claude route, return correlation handle. OMP argv uses <code>--profile</code>.</td></tr>
-              <tr><td>poll(handle)</td><td>Report starting, running, exited, or gone. Herdr state is advisory; the last complete structured transcript envelope synthesizes terminal exit truth.</td></tr>
-              <tr><td>close(handle)</td><td>Transport only: close the pane and terminate a harness-owned process group. Not a Maestro operator <code>cancel</code> verb and not a lane stage.</td></tr>
-              <tr><td>reclaim(token)</td><td>Never adopt a pane, process, or dirty worktree as workflow state. Resume recreates the stage from its last immutable artifact.</td></tr>
+              <tr><td>launch(spec)</td><td>Place or reconnect one of the five exact role panes in the project+run workspace and lane tab. Keep the authenticated OMP or Claude process on the host, bind it to one stable role checkout or private tree, grant only Bash, and prove the container image and hook before launch. Every command enters a disposable no-network container; missing confinement refuses launch.</td></tr>
+              <tr><td>poll(handle)</td><td>Report starting, running, idle, exited, or gone. Idle after output is normal and is not completion. Herdr state is advisory; the last complete structured transcript envelope synthesizes terminal exit truth.</td></tr>
+              <tr><td>close(handle)</td><td>Transport only. Success leaves the role pane, process, working tree, and session available for later stages. Not a Maestro operator <code>cancel</code> verb and not a lane stage.</td></tr>
+              <tr><td>reclaim(token)</td><td>On scheduler restart, rediscover the five deterministic role identities first, live-check them, and resubmit the current stage from its immutable input. Recreate only confirmed dead or typed <code>agent_not_found</code> roles. Never adopt or rename legacy stage/attempt panes, malformed observations, unreachable Herdr, or mismatched placement as current roles.</td></tr>
               <tr><td>classify(error)</td><td>Map launch faults into fixed configuration, authentication, transient, protocol, or execution classes.</td></tr>
               <tr><td>provision(worktree)</td><td>Run ecosystem setup after worktree creation and before baseline or pre-gate measurement.</td></tr>
               <tr><td>wait_for_interactive_agent(name)</td><td>Block on <code>herdr agent wait &lt;name&gt; --until idle --timeout</code>, the documented readiness gate for coding agents. No undocumented status field is polled and no per-agent startup banner is scraped from the pane.</td></tr>
@@ -350,7 +350,7 @@
           <article class="card"><span class="tag">External state</span><h3>Never under the product worktree</h3><p>The ledger, vault, locks, receipts, artifacts, and ephemeral worktree roots live under the bound <code>runtime_state_root</code>, never under the repository being built.</p></article>
           <article class="card"><span class="tag">One repository</span><h3>Exact Git identity</h3><p>All stage worktrees, candidate refs, the run integration ref, final review, and target-main publication belong to the same bound Git common directory.</p></article>
           <article class="card"><span class="tag">Immutable lineage</span><h3>Refs identify bytes</h3><p>Candidate, integration, and publication SHAs are artifact inputs and receipt subjects. They never become a second stage or mutable recovery branch.</p></article>
-          <article class="card"><span class="tag">Refusal</span><h3>No inferred recovery</h3><p>Descriptor mismatch, missing receipts, external main movement, stale stage input, or wrong repository refuses explicitly. Resume does not adopt live processes or dirty worktrees.</p></article>
+          <article class="card"><span class="tag">Refusal</span><h3>No inferred recovery</h3><p>Descriptor mismatch, missing receipts, external main movement, stale stage input, or wrong repository refuses explicitly. Resume does not adopt unknown agents or dirty/out-of-scope worktrees. Proved live role transport may reconnect.</p></article>
         </div>
       </section>
 

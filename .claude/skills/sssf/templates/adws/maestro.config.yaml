@@ -1,6 +1,22 @@
 schema: maestro-config.v1
 runtime_state_root: /nonexistent/maestro-runtime-state
-runner_profile: grok-maestro
+role_routes:
+  tester:
+    route: claude
+    model: opus
+    effort: high
+  test-reviewer:
+    route: omp
+    profile: openai-perf-test
+  builder:
+    route: omp
+    profile: grok-build
+  code-reviewer:
+    route: omp
+    profile: openai-perf-review
+  integration-reviewer:
+    route: omp
+    profile: openai-perf-review
 executables:
   herdr: herdr
   omp: omp

@@ -18,12 +18,12 @@ Starting from Maestro’s current SSSF fork, design the smallest robust software
 
 1. accept planning work from **planf3**, **arch-review/brownfield**, and **prd-to-strav** and produce one internally consistent, mechanically executable, finalized plan;
 2. execute that plan as a two-lane dependency DAG: private test author → test review → seal → builder → code review; independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref; dependents start from that integration artifact; final review then receipt-backed publication to `main`;
-3. dispatch each incomplete stage from a fresh ephemeral worktree at the immutable input commit; never adopt a pane, process, dirty tree, or mutable candidate branch; crash resume restarts the current stage from its last immutable artifact;
+3. give every lane exactly five persistent role agents (`tester`, `test-reviewer`, `builder`, `code-reviewer`, `integration-reviewer`) in one Herdr lane tab; keep each role's stable working tree and pane/session memory across `REVISE` and scheduler restart; reconnect only by proved project/run/lane/role identity and role-scoped cwd; refuse legacy stage/attempt panes, malformed or unreachable observations, mismatched placement, dirty boundaries, and unproved agents; resubmit the current stage from its immutable input and recreate only confirmed dead or typed `agent_not_found` roles;
 4. launch agents in visible **Herdr** panes as transport only through an explicit launcher abstraction:
    - Claude directly;
    - OMP only with explicit `--profile`;
    - Kimi and Grok only through explicit configured routes;
-5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session correction, and SQLite trace for sequential ADWs; Maestro’s workflow authority is `lane_state.stage`, not envelopes, panes, or attempt rows.
+5. retain SSSF’s typed envelopes, deterministic gates, bounded same-session correction, and SQLite trace for sequential ADWs; Maestro’s workflow authority is `lane_state.stage`, not envelopes, panes, idle status, or attempt rows.
 
 The result must be an **expansion of SSSF**, not another Strav rewrite. Preserve SSSF’s understandable control plane. Add only the capabilities above and the minimum machinery needed to make them correct, durable, observable, and testable.
 
@@ -407,12 +407,13 @@ Choose one durable lifecycle authority: `lane_state.stage`. SQLite stores it; JS
 
 Specify:
 
-- clean immutable input commit;
-- fresh ephemeral worktree per incomplete stage; never adopt a prior pane, process, or dirty tree;
-- Herdr pane cwd exactly equal to that worktree when an agent is dispatched;
+- clean immutable stage input;
+- exactly one stable role-scoped checkout or private tree per persistent lane role; never treat a dirty tree or unproved pane/process as workflow authority;
+- private tester and test-reviewer trees never enter the product repository or its Git object database;
+- role pane cwd remains in its stable role scope across `REVISE` and scheduler restart;
 - allowed writes;
 - artifact digest and commit SHA binding;
-- dirty/unauthorized-write handling: discard the tree; resume from the last immutable artifact;
+- dirty/unauthorized-write handling: refuse boundary violations; resume from the last immutable artifact without replacing a proved role session;
 - cleanup;
 - deterministic merge-ready ordering despite nondeterministic finish order;
 - ancestry proof on the integration ref;
@@ -428,13 +429,13 @@ All agent nodes launch in visible Herdr panes. Herdr is transport/observability,
 
 Define one adapter contract covering:
 
-- allocate a fresh pane; never adopt a stale/closed/busy pane as workflow state;
-- bind pane cwd to the stage worktree;
+- one workspace per project+run, one tab per lane, exactly five sibling panes named `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`;
+- reconnect a proved live stable role agent and resubmit its current stage; never adopt or rename legacy stage/attempt, stale, closed, busy, malformed, unreachable, mismatched, or unproved panes as current roles;
+- bind every role pane cwd to its stable role-scoped checkout or private tree;
 - launch/readiness/stream/exit (transport cancel is not a Maestro operator verb);
-- session creation for the stage only; no live-session adoption on resume;
-- stale/closed/busy/mis-adopted pane detection as transport failure, not stage;
+- preserve all five role sessions for the run; reviewers return actionable redacted feedback to the existing implementation agent; idle after output is not completion;
 - typed normalized events as evidence only;
-- no durable pane/agent/attempt identity as workflow authority;
+- no durable pane/agent/attempt identity as workflow authority (`actor_sessions`/generations remain forbidden);
 - token/cost accounting as observation;
 - fake Herdr adapter for offline tests.
 

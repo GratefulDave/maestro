@@ -1,0 +1,191 @@
+async:
+  enabled: true
+autoResume: false
+browser:
+  headless: true
+checkpoint:
+  enabled: true
+codexResets:
+  autoRedeem: 'yes'
+colorBlindMode: false
+commands:
+  enableClaudeProject: false
+  enableClaudeUser: false
+  enableOpencodeProject: false
+  enableOpencodeUser: false
+compaction:
+  idleEnabled: true
+  thresholdPercent: 70
+  methodOrder:
+  - snapcompact
+  - remote
+  - soft
+compatibility:
+  loadForeignConfig: false
+contextPromotion:
+  enabled: false
+cycleOrder:
+- smol
+- default
+- plan
+- slow
+defaultThinkingLevel: auto
+dev:
+  autoqaConsent: denied
+disabledExtensions:
+- extension-module:src
+- extension-module:pi-voice-stt
+- extension-module:semantic-search
+- extension-module:semantic-search.bundle
+disabledProviders:
+- claude
+- claude-plugins
+- codex
+- gemini
+- opencode
+display:
+  cacheMissMarker: true
+  shimmer: kitt
+  showTokenUsage: true
+enabledModels:
+- xai-oauth/grok-4.6
+extensions:
+- /Users/davidandrews/.omp/agent/extensions/herdr-omp-agent-state.ts
+- /Users/davidandrews/.omp/agent/extensions/pi-herdr/herdr.bundle.js
+followUpMode: all
+github:
+  enabled: true
+hideThinkingBlock: false
+images:
+  blockImages: false
+inlineToolDescriptors: 'on'
+marketplace:
+  autoUpdate: 'off'
+mcp:
+  enableProjectConfig: false
+memory:
+  backend: mnemopi
+mnemopi:
+  enhancedRecall: true
+  polyphonicRecall: true
+  proactiveLinking: true
+modelProviderOrder:
+- xai-oauth
+modelRoles:
+  advisor: xai-oauth/grok-4.6:xhigh
+  commit: xai-oauth/grok-4.6:low
+  default: xai-oauth/grok-4.6:medium
+  designer: xai-oauth/grok-4.6:high
+  plan: xai-oauth/grok-4.6:xhigh
+  slow: xai-oauth/grok-4.6:medium
+  smol: xai-oauth/grok-4.6:low
+  task: xai-oauth/grok-4.6:inherit
+  tiny: xai-oauth/grok-4.6:low
+  vision: xai-oauth/grok-4.6:high
+power:
+  sleepPrevention: system
+providers:
+  webSearchOrder:
+  - codex
+  - perplexity
+  - gemini
+  - anthropic
+  - xai
+  - zai
+  - exa
+  - tinyfish
+  - jina
+  - kagi
+  - tavily
+  - firecrawl
+  - brave
+  - kimi
+  - parallel
+  - synthetic
+  - searxng
+  - startpage
+  - duckduckgo
+  - ecosia
+  - google
+  - mojeek
+  - public
+searxng:
+  endpoint: http://127.0.0.1:8080
+setupVersion: 2
+shellMinimizer:
+  enabled: true
+  gainTelemetry: true
+skills:
+  customDirectories:
+  - /Users/davidandrews/PycharmProjects/the-library/skills
+  enableClaudeProject: false
+  enableClaudeUser: false
+  enableCodexUser: false
+  includeSkills:
+  - caveman
+  - caveman-help
+  - caveman-review
+  - caveman-compress
+  - cavecrew
+  - caveman-stats
+  - caveman-commit
+  - codebase-memory
+  - codebase-retrieval
+  - code-intel-impact
+  - code-intel-large-output
+  - code-intel-outline
+  - code-intel-symbols
+  - compact-json
+  - rehydrate
+  - context-mode
+  - handoff
+  - deep-interview
+  - library
+  - linear-cli
+  - herdr
+  - deepinit
+  - diagram-design
+statusLine:
+  preset: nerd
+  separator: powerline-thin
+  transparent: false
+symbolPreset: unicode
+task:
+  agentModelOverrides:
+    actor-coordinator: xai-oauth/grok-4.6:medium
+    debugger-dap: xai-oauth/grok-4.6:medium
+    deep-interviewer: xai-oauth/grok-4.6:high
+    designer: xai-oauth/grok-4.6:medium
+    docs-steward: xai-oauth/grok-4.6:medium
+    explore: xai-oauth/grok-4.6:medium
+    frontend-qa-scout: xai-oauth/grok-4.6:medium
+    incident-responder: xai-oauth/grok-4.6:medium
+    init: xai-oauth/grok-4.6:medium
+    librarian: xai-oauth/grok-4.6:medium
+    migration-specialist: xai-oauth/grok-4.6:medium
+    nextjs-specialist: xai-oauth/grok-4.6:medium
+    plan: xai-oauth/grok-4.6:high
+    reviewer: xai-oauth/grok-4.6:medium
+    scout: xai-oauth/grok-4.6:medium
+    security-reviewer: xai-oauth/grok-4.6:medium
+    sonic: xai-oauth/grok-4.6:medium
+    task: xai-oauth/grok-4.6:medium
+    tdd-specialist: xai-oauth/grok-4.6:medium
+    tester: xai-oauth/grok-4.6:medium
+    worktree-manager: xai-oauth/grok-4.6:medium
+    writer: xai-oauth/grok-4.6:medium
+  defaultModel: xai-oauth/grok-4.6:medium
+  disabledAgents: []
+  eager: preferred
+  showResolvedModelBadge: true
+theme:
+  dark: dark-tokyo-night
+tools: {}
+treeFilterMode: default
+tui:
+  hyperlinks: always
+  textSizing: true
+  tight: true
+composer:
+  shape: claude
+extendedContext: false

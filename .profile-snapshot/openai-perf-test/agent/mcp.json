@@ -1,0 +1,41 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "context-mode": {
+      "_managed_by": "library",
+      "command": "/Users/davidandrews/.local/bin/context-mode-mcp"
+    },
+    "grep-app": {
+      "_managed_by": "library",
+      "type": "http",
+      "url": "https://mcp.grep.app"
+    },
+    "codemap": {
+      "_managed_by": "library",
+      "command": "node",
+      "args": [
+        "/Users/davidandrews/PycharmProjects/the-library/tools/codemap/server.mjs"
+      ]
+    },
+    "codebase-memory": {
+      "_managed_by": "library",
+      "command": "codebase-memory-mcp"
+    },
+    "ast-grep": {
+      "_managed_by": "library",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/ast-grep/ast-grep-mcp",
+        "--with",
+        "mcp<2",
+        "ast-grep-server"
+      ]
+    },
+    "context7": {
+      "_managed_by": "library",
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    }
+  }
+}

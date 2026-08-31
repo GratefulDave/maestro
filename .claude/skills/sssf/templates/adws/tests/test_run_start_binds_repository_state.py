@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import yaml
 
 import maestro
+
+
+def _role_routes() -> dict[str, dict[str, str]]:
+    return {
+        "tester": {"route": "claude", "model": "opus", "effort": "high"},
+        "test-reviewer": {"route": "omp", "profile": "openai-performance"},
+        "builder": {"route": "omp", "profile": "grok"},
+        "code-reviewer": {"route": "omp", "profile": "openai-performance"},
+        "integration-reviewer": {
+            "route": "omp",
+            "profile": "openai-performance",
+        },
+    }
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -39,7 +55,7 @@ def _install_deployment(product: Path, state: Path) -> Path:
             {
                 "schema": "maestro-config.v1",
                 "runtime_state_root": str(state.resolve()),
-                "runner_profile": "grok-maestro",
+                "role_routes": _role_routes(),
             },
             sort_keys=True,
         ),
@@ -175,6 +191,85 @@ class RunStartBindsRepositoryStateTest(unittest.TestCase):
         self.assertFalse(hasattr(args, "data_dir"))
         self.assertFalse(hasattr(args, "state_root"))
         self.assertFalse(hasattr(args, "reclaim"))
+
+    def test_start_prints_run_and_stage_before_scheduler_returns(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        stdout = StringIO()
+        result: list[int] = []
+        failure: list[BaseException] = []
+        runtime = mock.Mock()
+        runtime.path = Path("/runtime")
+        runtime.ledger_path.return_value = Path("/runtime/lifecycle.sqlite3")
+        store = mock.Mock()
+        target = SimpleNamespace(
+            target_repository_root="/product",
+            target_main_ref="refs/heads/main",
+        )
+        compiled = SimpleNamespace(lanes=(SimpleNamespace(lane_id="lane-a"),))
+
+        class BlockingScheduler:
+            def __init__(self, *_args: object, **kwargs: object) -> None:
+                self.stage_started = kwargs["stage_started"]
+                self.stage_completed = kwargs["stage_completed"]
+
+            def run(self) -> maestro.st.RunStatus:
+                self.stage_started("lane-a", maestro.st.LaneStage.WRITING_TESTS)
+                entered.set()
+                release.wait(5)
+                self.stage_completed(
+                    "lane-a",
+                    maestro.st.LaneStage.WRITING_TESTS,
+                    maestro.st.LaneStage.REVIEWING_TESTS,
+                )
+                return maestro.st.RunStatus.WAITING
+
+        args = argparse.Namespace(
+            plan="plan.json",
+            repo="/product",
+            main_ref="refs/heads/main",
+            run_id="run-live",
+        )
+
+        def invoke() -> None:
+            try:
+                result.append(maestro._run_start(args))
+            except BaseException as exc:
+                failure.append(exc)
+
+        with (
+            mock.patch("sys.stdout", stdout),
+            mock.patch.object(
+                maestro,
+                "_executing_maestro_file",
+                return_value=Path("/deploy/maestro.py"),
+            ),
+            mock.patch.object(maestro, "_load_deployment_config", return_value={}),
+            mock.patch.object(maestro, "require_deployment"),
+            mock.patch.object(maestro, "_open_runtime", return_value=runtime),
+            mock.patch.object(maestro, "_compile_plan", return_value=compiled),
+            mock.patch.object(
+                maestro.gitpub, "bind_target_worktree", return_value=target
+            ),
+            mock.patch.object(maestro, "_open_store", return_value=store),
+            mock.patch.object(maestro, "create_factory_run"),
+            mock.patch.object(maestro, "register_installation"),
+            mock.patch.object(maestro, "_actor_for", return_value=mock.Mock()),
+            mock.patch.object(maestro, "FactoryScheduler", BlockingScheduler),
+        ):
+            thread = threading.Thread(target=invoke)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            live = stdout.getvalue()
+            self.assertIn("run-live", live)
+            self.assertIn("lane-a", live)
+            self.assertIn("WRITING_TESTS", live)
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failure, [])
+        self.assertEqual(result, [0])
+        self.assertIn('"outcome": "STARTED"', stdout.getvalue())
 
 
 if __name__ == "__main__":

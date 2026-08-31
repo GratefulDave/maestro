@@ -62,7 +62,9 @@ const activeSource = computed(
  * page telling the operator to run an ADW they are not running.
  */
 const fallbackMaestro = computed(() =>
-  !tracerSource.value ? (sources.value.find((s) => s.kind === 'maestro') ?? null) : null,
+  !tracerSource.value
+    ? (sources.value.find((s) => s.kind === 'maestro' || s.kind === 'artifact-factory') ?? null)
+    : null,
 )
 
 /**

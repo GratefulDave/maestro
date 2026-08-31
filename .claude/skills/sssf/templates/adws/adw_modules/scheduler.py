@@ -8,10 +8,11 @@ import os
 import signal
 import subprocess
 import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Sequence
+from typing import Any, Optional, Protocol
 
 from . import code_review as cr
 from . import git_publication as gitpub
@@ -178,9 +179,7 @@ def ensure_run_integration_ref(
     return tip
 
 
-def _plan_artifact_ref_for(
-    store: ArtifactStore, run_id: str, plan_revision: int
-) -> str:
+def plan_artifact_ref_for(store: ArtifactStore, run_id: str, plan_revision: int) -> str:
     found = store.conn.execute(
         "SELECT plan_artifact_ref FROM plan_revisions "
         "WHERE run_id=? AND plan_revision=?",
@@ -241,7 +240,7 @@ def _explain_ahead_merge(
         lane=lane,
         plan_revision=row["plan_revision"],
         plan_digest=row["plan_digest"],
-        plan_artifact_ref=_plan_artifact_ref_for(store, run_id, row["plan_revision"]),
+        plan_artifact_ref=plan_artifact_ref_for(store, run_id, row["plan_revision"]),
         input_digest=digest,
         stage=st.LaneStage.READY_TO_MERGE,
         artifacts={"BUILDER_OUTPUT": builder, "CODE_REVIEW": review},
@@ -557,12 +556,19 @@ class FactoryScheduler:
         actor: StageActor,
         runtime: RuntimeStateRoot,
         target: gitpub.TargetBinding,
+        *,
+        stage_started: Optional[Callable[[str, st.LaneStage], None]] = None,
+        stage_completed: Optional[
+            Callable[[str, st.LaneStage, st.LaneStage], None]
+        ] = None,
     ) -> None:
         self.store = store
         self.run_id = run_id
         self.actor = actor
         self.runtime = runtime
         self.target = target
+        self.stage_started = stage_started
+        self.stage_completed = stage_completed
         row = run_row(store, run_id)
         runtime.revalidate(row["runtime_state_fingerprint"])
         gitpub.revalidate_binding(target)
@@ -888,6 +894,8 @@ class FactoryScheduler:
         stage = self.store.lane_stage(self.run_id, lane_id)
         digest, observed = self._pause_input(lane_id, stage)
         self._inflight = (lane_id, stage, digest, observed)
+        if self.stage_started is not None:
+            self.stage_started(lane_id, stage)
         try:
             if stage is st.LaneStage.READY_TO_MERGE:
                 self.locks.acquire(2)
@@ -895,22 +903,25 @@ class FactoryScheduler:
                     self._ready_to_merge(lane_id)
                 finally:
                     self.locks.release()
-                return
-            if stage is st.LaneStage.BUILDING:
+            elif stage is st.LaneStage.BUILDING:
                 self.locks.acquire(2)
                 try:
                     self._building(lane_id)
                 finally:
                     self.locks.release()
-                return
-            dispatch = {
-                st.LaneStage.PLANNED: self._planned,
-                st.LaneStage.WRITING_TESTS: self._writing_tests,
-                st.LaneStage.REVIEWING_TESTS: self._reviewing_tests,
-                st.LaneStage.TESTS_SEALED: self._tests_sealed,
-                st.LaneStage.REVIEWING_CODE: self._reviewing_code,
-            }
-            dispatch[stage](lane_id)
+            else:
+                dispatch = {
+                    st.LaneStage.PLANNED: self._planned,
+                    st.LaneStage.WRITING_TESTS: self._writing_tests,
+                    st.LaneStage.REVIEWING_TESTS: self._reviewing_tests,
+                    st.LaneStage.TESTS_SEALED: self._tests_sealed,
+                    st.LaneStage.REVIEWING_CODE: self._reviewing_code,
+                }
+                dispatch[stage](lane_id)
+            if self.stage_completed is not None:
+                self.stage_completed(
+                    lane_id, stage, self.store.lane_stage(self.run_id, lane_id)
+                )
         finally:
             self._inflight = None
 
@@ -924,7 +935,7 @@ class FactoryScheduler:
         return row, projection
 
     def _plan_artifact_ref(self, row: Mapping[str, Any]) -> str:
-        return _plan_artifact_ref_for(self.store, self.run_id, row["plan_revision"])
+        return plan_artifact_ref_for(self.store, self.run_id, row["plan_revision"])
 
     def _planned(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -1216,6 +1227,12 @@ class FactoryScheduler:
             code_review=code_review,
             base_invalidation=base_invalidation,
         )
+        artifacts: dict[str, ArtifactRecord] = {
+            "LANE_PLAN": plan,
+            "SEALED_TEST_BUNDLE": sealed,
+        }
+        if entry is st.BuildingEntryKind.CODE_REVISE and revise is not None:
+            artifacts["CODE_REVIEW"] = revise
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -1224,7 +1241,7 @@ class FactoryScheduler:
             plan_artifact_ref=self._plan_artifact_ref(row),
             input_digest=digest,
             stage=st.LaneStage.BUILDING,
-            artifacts={"LANE_PLAN": plan, "SEALED_TEST_BUNDLE": sealed},
+            artifacts=artifacts,
             builder_base_sha=builder_base,
             entry_kind=entry,
             public_contract=sealed.payload.get("public_contract"),

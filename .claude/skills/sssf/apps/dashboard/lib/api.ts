@@ -76,7 +76,9 @@ export function getRun(
 }
 
 export function maestroSources(sources: SourceInfo[]): SourceInfo[] {
-  return sources.filter((source) => source.kind === "maestro");
+  return sources.filter(
+    (source) => source.kind === "maestro" || source.kind === "artifact-factory",
+  );
 }
 
 export async function loadFleetSummaries(): Promise<
