@@ -246,7 +246,7 @@
         </div>
         <div class="grid">
           <article class="card"><span class="tag">Plan</span><h3>Approved before execution</h3><p>Planning skills emit one executable plan. The compiler checks schema, DAG, ownership, and acceptance. No <code>plan gate|review|ship</code> or <code>bootstrap</code> verb.</p></article>
-          <article class="card"><span class="tag">Isolation</span><h3>Host agent, containerized Bash</h3><p>All five persistent role agents remain visible in Herdr and use existing host OAuth profiles, but receive only Bash. Every model-issued command runs in a disposable no-network OrbStack/Docker container with only that role tree mounted writable; coders, credentials, Git metadata, sibling trees, runtime state, and publication state stay outside.</p></article>
+          <article class="card"><span class="tag">Isolation</span><h3>Persistent role worktrees</h3><p>All five persistent role agents remain visible in Herdr, use dedicated host-authenticated profiles, and start inside role-specific Git worktrees. Checkout-local role instructions limit each agent to its assigned tree while native repository tools remain available.</p></article>
           <article class="card"><span class="tag">Acceptance</span><h3>Sealed tests, then merge once</h3><p>Private tests seal before building. Each accepted lane merges exactly once into the run integration ref. Publication is receipt-backed.</p></article>
           <article class="card"><span class="tag">Trace</span><h3>Stage plus artifacts</h3><p>SQLite under <code>runtime_state_root</code> stores <code>lane_state.stage</code> and immutable artifacts. Attempts and operator escapes are not authority.</p></article>
         </div>
@@ -282,7 +282,7 @@
               <tr><td>hidden_vault.py / private_review.py</td><td>Private object storage, sealed test bundles, controlled review materialization, and redaction</td><td>Private-test boundary</td></tr>
               <tr><td>runtime_state.py</td><td>External state-root descriptor, product-repository identity, permissions, and overlap refusal</td><td>Runtime binding</td></tr>
               <tr><td>git_publication.py</td><td>Immutable candidate/integration/publication refs, compare-and-swap updates, and Git receipts</td><td>Repository mutation</td></tr>
-              <tr><td>launcher.py / workspace_isolation.py</td><td>Exact persistent role panes, strict Claude/OMP tool sets, fail-closed path hooks, scrubbed shell environments, and OS-level command confinement</td><td>Transport and role boundary</td></tr>
+              <tr><td>launcher.py / permissions.py</td><td>Exact persistent role panes, dedicated Claude/OMP profiles, checkout-local role instructions, scratch directories, and role-specific Git worktrees</td><td>Transport and role boundary</td></tr>
               <tr><td>route_admission.py</td><td>Signed launcher-route admission and exact profile/command binding</td><td>Runner capability</td></tr>
             </tbody>
           </table>
