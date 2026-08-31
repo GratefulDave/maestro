@@ -6,7 +6,7 @@ This document is the executable architecture. Runtime source must implement it d
 
 **Proven slice:** exactly two dependent lanes. No broader framework.
 
-**Diagrams:** current factory — [`docs/architecture/00-artifact-factory.html`](docs/architecture/00-artifact-factory.html); nine-stage machine — [`docs/architecture/00-lane-stage.html`](docs/architecture/00-lane-stage.html). The rest of [`docs/architecture/`](docs/architecture/index.html) is historical / superseded.
+**Diagrams:** current factory — [`docs/architecture/00-artifact-factory.html`](docs/architecture/00-artifact-factory.html); nine-stage machine — [`docs/architecture/00-lane-stage.html`](docs/architecture/00-lane-stage.html); persistent role topology — [`docs/architecture/00-role-topology.html`](docs/architecture/00-role-topology.html). The rest of [`docs/architecture/`](docs/architecture/index.html) is historical / superseded.
 
 ---
 

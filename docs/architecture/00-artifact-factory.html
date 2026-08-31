@@ -62,6 +62,7 @@
     }
     .lede a { color: var(--color-link); }
     .lede a:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+    .topology { margin-top: 1.5rem; }
     .figure { overflow-x: auto; }
     svg { width: 100%; height: auto; display: block; }
     @media (max-width: 720px) {
@@ -73,12 +74,12 @@
   <div class="frame">
     <p class="eyebrow">Current · Architecture</p>
     <h1>Nine-stage artifact factory</h1>
-    <p class="lede">Durable authority is one <code>lane_state.stage</code> field plus immutable artifacts under an external <code>runtime_state_root</code>. Herdr and OMP are transport only. Historical gallery diagrams are superseded. <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
+    <p class="lede">Durable authority is one <code>lane_state.stage</code> field plus immutable artifacts under an external <code>runtime_state_root</code>. Herdr and OMP are transport only: each project and run has one workspace, and every lane tab has the fixed five-role topology below. Historical gallery diagrams are superseded. <a href="00-role-topology.html">Persistent role topology</a> · <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
 
     <div class="figure">
     <svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-artifact-factory-title 00-artifact-factory-desc">
       <title id="00-artifact-factory-title">Nine-stage artifact factory</title>
-      <desc id="00-artifact-factory-desc">Operator four-verb CLI dispatches the factory scheduler, which CAS-updates lane_state.stage and appends immutable artifacts under an external runtime-state root; sealed tests stay in a private vault; accepted lanes merge exactly once into the integration ref; passing final review publishes a receipt to main.</desc>
+      <desc id="00-artifact-factory-desc">Operator four-verb CLI dispatches the factory scheduler, which CAS-updates lane_state.stage and appends immutable artifacts under an external runtime-state root. Each project and run has one Herdr workspace; each lane has one tab with persistent tester, test-reviewer, builder, code-reviewer, and integration-reviewer panes. Sealed tests stay in a private vault; accepted lanes merge exactly once into the integration ref; the integration-reviewer performs final review in a lane tab, and passing final review publishes a receipt to main.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -219,6 +220,7 @@
       <text x="40" y="624" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">runtime_state_root is external · Herdr/OMP transport never advances a lane · resume restarts the incomplete stage</text>
     </svg>
     </div>
+    <p class="lede topology"><strong>Persistent role topology.</strong> Every lane tab has exactly five sibling panes: <code>tester</code>, <code>test-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, and <code>integration-reviewer</code>. Stable identity is <code>(project, run, lane, role)</code>. Every role owns a stable role-scoped cwd and retains its pane/session context through its review or revision loop and scheduler restart. The tester and test-reviewer use distinct role-private trees; the builder's and code-reviewer's respective cwds are reused through <code>BUILDING</code> ↔ <code>REVIEWING_CODE</code>. Run-level final review and publication use the <code>integration-reviewer</code> within a lane tab—there is no integration tab. Rediscovery accepts only the exact role identity, label, and clean approved cwd. Only confirmed dead or <code>agent_not_found</code> roles may be recreated; live, unknown, malformed, mismatched, dirty, or unapproved observations are refused. Legacy stage- or attempt-named panes are never adopted or renamed. Pane state is transport, never workflow authority. <a href="00-role-topology.html">Persistent role topology diagram</a>.</p>
   </div>
 </body>
 </html>
