@@ -11,7 +11,7 @@ SCHEMA_VERSION = "maestro-plan.artifact-factory.v1"
 NO_PLAN_ARTIFACT_REF = "NO_PLAN_ARTIFACT_REF"
 
 PLAN_KEYS = frozenset({"schema_version", "lanes"})
-LANE_KEYS = frozenset({"id", "needs", "outputs", "spec", "acceptance"})
+LANE_KEYS = frozenset({"id", "needs", "outputs", "spec", "acceptance", "lane_kind"})
 
 
 class PlanParseError(ValueError):

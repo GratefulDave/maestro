@@ -17,8 +17,10 @@ import argparse
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Optional
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+SKILL_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_runtime_sync():
@@ -33,6 +35,7 @@ def _load_runtime_sync():
     module_path = TEMPLATES / "adws" / "tools" / "runtime_sync.py"
     spec = importlib.util.spec_from_file_location("runtime_sync", module_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules["runtime_sync"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -103,6 +106,30 @@ def stamp(src: Path, dest: Path, force: bool, stamped: list, skipped: list,
     stamped.append(str(dest))
 
 
+
+def dashboard_launcher_from_skill(skill_root: Optional[Path] = None) -> Path:
+    root = skill_root if skill_root is not None else SKILL_ROOT
+    return (root / "apps" / "dashboard" / "bin" / "maestro-dashboard").resolve()
+
+
+def apply_dashboard_stanza(config_path: Path, launcher: Path) -> None:
+    """Write the absolute launcher path into a freshly stamped config."""
+    text = config_path.read_text(encoding="utf-8")
+    if "\ndashboard:" in text or text.lstrip().startswith("dashboard:"):
+        return
+    stanza = (
+        "dashboard:\n"
+        "  enabled: true\n"
+        "  launcher: {0}\n"
+        "  api_port: 4600\n"
+        "  ui_port: 4317\n"
+        "  open: true\n"
+    ).format(launcher.resolve())
+    if text and not text.endswith("\n"):
+        text += "\n"
+    config_path.write_text(text + stanza, encoding="utf-8")
+
+
 def ensure_gitignore(root: Path, stamped: list) -> None:
     gitignore = root / ".gitignore"
     existing = gitignore.read_text().splitlines() if gitignore.exists() else []
@@ -153,6 +180,9 @@ def main() -> int:
               skipped, refused, newer)
         ensure_gitignore(root, stamped)
 
+    config_dest = root / "adws" / "maestro.config.yaml"
+    if str(config_dest) in stamped:
+        apply_dashboard_stanza(config_dest, dashboard_launcher_from_skill())
     print(f"sssf installed into {root}")
     print(f"  stamped: {len(stamped)} file(s)")
     for s in stamped:

@@ -32,7 +32,6 @@ from typing import (
 
 from . import handoff_budget as hb
 from . import permissions
-from . import workspace_isolation as isolation
 from .route_receipts import AdmittedRouteSet
 
 
@@ -100,9 +99,6 @@ class LaunchRefusal(Enum):
     #: before any pane is created because the profile belongs to the immutable
     #: launch spec and retrying cannot supply it.
     OMP_PROFILE_REQUIRED = ("OMP_PROFILE_REQUIRED", False, True)
-    #: The mandatory role container could not execute a probe. Refused before
-    #: any Herdr call; retrying without repairing the host cannot help.
-    ISOLATION_UNAVAILABLE = ("ISOLATION_UNAVAILABLE", False, True)
     #: The split returned without a pane id. §16.3 item 45 names this among
     #: the post-split refusals: herdr may hold a pane it did not report.
     NO_PANE = ("NO_PANE", None, False)
@@ -316,15 +312,42 @@ SCRATCH_ENV_KEYS: Tuple[str, ...] = (
     "npm_config_cache",
 )
 
-#: Isolation hook inputs. `herdr agent start` has no environment option; the
-#: pane shell only sees variables passed as `--env` at tab/pane create.
-ISOLATION_ENV_KEYS: Tuple[str, ...] = (
-    "MAESTRO_ROLE_ROOT",
-    "MAESTRO_ISOLATION_PYTHON",
-    "MAESTRO_ISOLATION_RUNNER",
-)
+#: Only §8.3 scratch redirects are forwarded into the pane shell. `herdr agent
+#: start` has no environment option; the pane inherits variables passed as
+#: `--env` at tab/pane create.
+PANE_ENV_KEYS: Tuple[str, ...] = SCRATCH_ENV_KEYS
 
-PANE_ENV_KEYS: Tuple[str, ...] = SCRATCH_ENV_KEYS + ISOLATION_ENV_KEYS
+ROLE_AGENT_DIR = ".maestro-agent"
+
+
+def role_agent_dir(root: str | Path) -> Path:
+    return Path(root).resolve() / ROLE_AGENT_DIR
+
+
+def role_result_path(root: str | Path, turn: int) -> Path:
+    return role_agent_dir(root) / "results" / "envelope-{}.json".format(turn)
+
+
+def role_prompt_path(root: str | Path, turn: int) -> Path:
+    return role_agent_dir(root) / "prompt-{}.json".format(turn)
+
+
+def scratch_environment(root: str | Path) -> Dict[str, str]:
+    """Create checkout-local scratch redirects for one role worktree."""
+    base = role_agent_dir(root) / "scratch"
+    redirects = {
+        "TMPDIR": str(base / "tmp"),
+        "PYTHONPYCACHEPREFIX": str(base / "pycache"),
+        "PYTEST_ADDOPTS": "-o cache_dir={}".format(base / "pytest_cache"),
+        "COVERAGE_FILE": str(base / "coverage"),
+        "RUFF_CACHE_DIR": str(base / "ruff"),
+        "npm_config_cache": str(base / "npm"),
+    }
+    for key in ("TMPDIR", "PYTHONPYCACHEPREFIX", "RUFF_CACHE_DIR", "npm_config_cache"):
+        Path(redirects[key]).mkdir(parents=True, exist_ok=True)
+    (base / "pytest_cache").mkdir(parents=True, exist_ok=True)
+    (role_agent_dir(root) / "results").mkdir(parents=True, exist_ok=True)
+    return redirects
 
 
 def pytest_worker_cap(concurrency: int, cpu_count: Optional[int] = None) -> int:
@@ -343,11 +366,9 @@ def pytest_worker_cap(concurrency: int, cpu_count: Optional[int] = None) -> int:
 
 
 def role_pane_environment(role_root: Path, base: Mapping[str, str]) -> Dict[str, str]:
-    """Bind scratch redirects and isolation root to one role checkout."""
-    root = Path(role_root).resolve()
+    """Bind scratch redirects to one role checkout."""
     env = dict(base)
-    env.update(isolation.scratch_environment(root))
-    env["MAESTRO_ROLE_ROOT"] = str(root)
+    env.update(scratch_environment(role_root))
     return env
 
 
@@ -379,12 +400,10 @@ def pane_env_flags(environment: Mapping[str, str]) -> Tuple[str, ...]:
     mapping, honoured the redirect in the same attempt — which is exactly the
     asymmetry that identifies the boundary.
 
-    Scratch redirects and the isolation hook inputs (`MAESTRO_ROLE_ROOT`,
-    `MAESTRO_ISOLATION_PYTHON`, `MAESTRO_ISOLATION_RUNNER`) must all be
-    forwarded. Absent isolation vars, the role hook treats every Bash call as
-    `MAESTRO_WORKTREE_BOUNDARY:missing path` (Claude) or configuration
-    missing (OMP). Each precreated role pane must receive its own checkout's
-    root and scratch paths; the launching role's mapping is not a substitute.
+    Only the redirection variables are forwarded. The rest of the launch
+    environment is the harness's own, and the pane already has the operator's.
+    Each precreated role pane must receive its own checkout's scratch paths;
+    the launching role's mapping is not a substitute.
 
     Missing variables are refused rather than skipped. §8.3's preference order
     is redirect, then suppress, then the write convicts, and a redirect that
@@ -699,24 +718,26 @@ def preflight_launch_prompt(spec: LaunchSpec) -> Optional[int]:
 
 
 def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
-    """Build an OMP role session with profile, repo capabilities, and worktree confinement."""
+    """Build omp's host-agent argv without the node prompt.
+
+    Recovered from 76861e2480afeaaba7b301ec14f055cc1f3911ed, then 1de318c
+    additive ``--append-system-prompt``. Tool policy is the configured
+    ``--profile``. Delegation is denied by that profile, not by a hook.
+    Native Read/Write/Edit/Bash/skills/MCP stay available because argv does
+    not pass a ``--tools`` allowlist or ``--hook``.
+    """
     if not spec.profile:
         raise ValueError("OMP_PROFILE_REQUIRED")
     argv = [
         str(binary),
         "--profile",
         spec.profile,
-        "--cwd",
-        str(spec.worktree.resolve()),
         "--session-dir",
         str(spec.session_dir),
-        "--hook",
-        str(isolation.omp_hook_path()),
-        *permissions.route_capability_argv(spec.route),
     ]
     if spec.system_prompt_path is not None:
         argv.extend(
-            ("--append-system-prompt-file", str(spec.system_prompt_path.resolve()))
+            ("--append-system-prompt", str(spec.system_prompt_path.resolve()))
         )
     if spec.session_dir.is_dir() and any(spec.session_dir.glob("*.jsonl")):
         argv.append("-c")
@@ -724,7 +745,11 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
 
 
 def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
-    """Build a host-authenticated Claude session with container-wrapped Bash."""
+    """Claude's host-agent argv from 76861e2 plus prompt-file and denylist.
+
+    ``--disallowedTools`` is the native CLI control that denies Task/Agent.
+    No ``--settings`` isolation hook and no container-wrapped Bash.
+    """
     argv = [
         str(binary),
         "--model",
@@ -732,8 +757,6 @@ def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
         "--effort",
         spec.effort,
         "--dangerously-skip-permissions",
-        "--settings",
-        isolation.claude_settings(spec.worktree),
         *permissions.route_capability_argv(spec.route),
     ]
     if spec.system_prompt_path is not None:
@@ -1373,11 +1396,16 @@ def submit_agent_prompt(
     admission keeps the default `True` -- see its call site for why its turn is
     bounded by construction.
 
-    Nothing about `refuse_unproven` weakens the two refusals that are *not*
-    claims about turn length: `AGENT_PROMPT_UNDELIVERED` (herdr accepted no
-    Enter at all, so nothing was ever pressed) and `AGENT_PROMPT_UNOBSERVED`
-    (every consultation of the proof channel raised) are statements about
-    herdr, they fail closed on both paths, and both still raise.
+    `AGENT_PROMPT_UNDELIVERED` (herdr accepted no Enter at all, so nothing
+    was ever pressed) still raises on both paths: that is not a claim about
+    turn length.
+
+    `AGENT_PROMPT_UNOBSERVED` (every consultation of the proof channel
+    raised) stays fail-closed on the bounded admission path
+    (`refuse_unproven=True`). The lane path cannot size a window over an
+    unbounded turn, so a dead proof channel there is offered-unproven:
+    absorbed probe failures stay diagnostic and the node's liveness and
+    quiescence machinery adjudicates.
 
     `monotonic` is injected for the same reason `sleep` is. The grace deadline
     below reads a clock, and a fake that cannot move that clock cannot express
@@ -1738,7 +1766,10 @@ def submit_agent_prompt(
             # Every consultation of the proof predicate raised, so nothing
             # was ever observed about the transcript. Claiming UNSUBMITTED
             # here would assert a fact about the composer that only the dead
-            # proof channel could have established.
+            # proof channel could have established. Admission fail-closes;
+            # the lane path already pressed Enter and hands off.
+            if not refuse_unproven:
+                return
             raise PromptSubmissionUnobservable(
                 "AGENT_PROMPT_UNOBSERVED:{0} after {1} submit attempts{2}".format(
                     target, rounds, summary
@@ -1958,12 +1989,6 @@ def wait_for_interactive_agent(
         return
     raise refusal()
 
-
-#: How long `launch` waits for Herdr to report the agent's transcript.
-#: Bounded at the prompt submission's own 60s. This runs only after the coder
-#: is ready and has been given its prompt, so a JSONL path or Claude session ID
-#: that cannot resolve within a minute is absent rather than merely early.
-TRANSCRIPT_PATH_TIMEOUT_S = 60.0
 
 
 def wait_for_agent_transcript(
@@ -3298,6 +3323,52 @@ class HerdrLauncher:
         self._forget_pane(pane_id)
         return True
 
+    def _bind_handle_transcript(
+        self, handle: LaunchHandle, transcript: Path
+    ) -> None:
+        """Attach a discovered transcript and its tailer to an owned handle."""
+        path = Path(transcript)
+        object.__setattr__(handle, "transcript_path", path)
+        with self._handles_lock:
+            self._tailers[handle.correlation_token] = TranscriptTailer(path)
+
+    def _runtime_submission_recorded(
+        self, handle: LaunchHandle, prompt_path: Path
+    ) -> Callable[[], bool]:
+        """Lane-path proof for one prompt offer.
+
+        A known transcript requires a rising prompt-path record so a previous
+        turn cannot stand in as this offer's proof. A missing transcript is
+        unproven False, never a refusal: query the owned agent, attach a
+        newly discovered path and tailer atomically, then check marks.
+        Herdr query failures propagate so `submit_agent_prompt` records them
+        as diagnostic proof-probe failures.
+        """
+        if handle.transcript_path is not None:
+            return _rising_submission_record(handle, prompt_path)
+
+        def recorded() -> bool:
+            if handle.transcript_path is None:
+                payload = self._herdr(
+                    "agent",
+                    "get",
+                    handle.agent_name,
+                    env=handle.environment,
+                    timeout=15.0,
+                )
+                found = _agent_transcript_path(
+                    _agent_record(payload),
+                    handle.launched_cwd,
+                    handle.environment,
+                )
+                if found is not None:
+                    self._bind_handle_transcript(handle, found)
+            if handle.transcript_path is None:
+                return False
+            return prompt_submission_marks(handle, prompt_path) > 0
+
+        return recorded
+
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         if not self.admitted_routes.admits(spec.route):
             raise LaunchRefused(LaunchRefusal.ROUTE_NOT_ADMITTED, spec.route)
@@ -3321,10 +3392,6 @@ class HerdrLauncher:
             raise LaunchRefused(LaunchRefusal.UNSUPPORTED_ROUTE, spec.route)
         worktree = spec.worktree.resolve()
         self.provision(worktree)
-        try:
-            isolation.preflight_sandbox(worktree)
-        except isolation.IsolationRefused as exc:
-            raise LaunchRefused(LaunchRefusal.ISOLATION_UNAVAILABLE, str(exc)) from exc
         environment = MappingProxyType(dict(spec.environment))
         # The pane shell is forked by the herdr server, not by the CLI process
         # below, so `env=` alone leaves the bracket's redirection outside the
@@ -3535,34 +3602,15 @@ class HerdrLauncher:
             # Enter typed by hand afterwards started the turn immediately.
             bootstrap = "@{0} ".format(spec.prompt_path.resolve())
 
-            # Claude remote-control sessions do not create their project JSONL
-            # until the first prompt is accepted. Waiting for that file before
-            # offering the prompt is therefore a circular dependency. Discover
-            # it through the proof predicate while the submission loop runs.
-            if transcript is None:
-
-                def submission_recorded() -> bool:
-                    nonlocal transcript
-                    payload = self._herdr(
-                        "agent", "get", name, env=environment, timeout=15.0
-                    )
-                    found = _agent_transcript_path(
-                        _agent_record(payload), bound_cwd, environment
-                    )
-                    if found is None:
-                        return False
-                    if transcript != found:
-                        transcript = found
-                        object.__setattr__(handle, "transcript_path", found)
-                        with self._handles_lock:
-                            self._tailers[spec.correlation_token] = TranscriptTailer(
-                                found
-                            )
-                    return prompt_submission_marks(handle, spec.prompt_path) > 0
-            else:
-                submission_recorded = _rising_submission_record(
-                    handle, spec.prompt_path
-                )
+            # Claude remote-control sessions, and some OMP Herdr records, do
+            # not expose a JSONL path until the first prompt is accepted —
+            # and some backends never expose one. Waiting for that file
+            # before or after offering is a circular refusal. Discover it
+            # through the proof predicate while the submission loop runs;
+            # missing stays unproven False.
+            submission_recorded = self._runtime_submission_recorded(
+                handle, spec.prompt_path
+            )
             # Durable pane identity is recorded before prompt delivery. A
             # Claude transcript may not exist yet; the callback must not turn
             # that route-owned file-creation order into an orphaned pane.
@@ -3582,23 +3630,6 @@ class HerdrLauncher:
                 refuse_unproven=False,
                 submission_recorded=submission_recorded,
             )
-            if transcript is None:
-                transcript = wait_for_agent_transcript(
-                    lambda *args, **kwargs: self._herdr(
-                        *args, env=environment, **kwargs
-                    ),
-                    name,
-                    TRANSCRIPT_PATH_TIMEOUT_S,
-                    launched_cwd=bound_cwd,
-                    environment=environment,
-                )
-                if transcript is None:
-                    raise PromptSubmissionUnobservable(
-                        "AGENT_PROMPT_UNOBSERVED:{0} no transcript".format(name)
-                    )
-                object.__setattr__(handle, "transcript_path", transcript)
-                with self._handles_lock:
-                    self._tailers[spec.correlation_token] = TranscriptTailer(transcript)
 
             # The pane's foreground group is meaningful only after submission.
             liveness_pid = pane_liveness_pid(
@@ -3723,26 +3754,6 @@ class HerdrLauncher:
             ),
             handle.agent_name,
         )
-        if handle.transcript_path is None:
-            recovered = wait_for_agent_transcript(
-                lambda *args, **kwargs: self._herdr(
-                    *args, env=handle.environment, **kwargs
-                ),
-                handle.agent_name,
-                0.0,
-                launched_cwd=handle.launched_cwd,
-                environment=handle.environment,
-            )
-            if recovered is not None:
-                object.__setattr__(handle, "transcript_path", recovered)
-                with self._handles_lock:
-                    self._tailers[handle.correlation_token] = TranscriptTailer(
-                        recovered
-                    )
-        if handle.transcript_path is None:
-            raise PromptSubmissionUnobservable(
-                "AGENT_PROMPT_UNOBSERVED:{0} no transcript".format(handle.agent_name)
-            )
         submit_agent_prompt(
             lambda *args, **kwargs: self._herdr(
                 *args, env=handle.environment, **kwargs
@@ -3757,7 +3768,9 @@ class HerdrLauncher:
             # A correction cycle is the same lane path as the first launch and
             # gets the same answer: offered, unproven, adjudicated downstream.
             refuse_unproven=False,
-            submission_recorded=_rising_submission_record(handle, prompt),
+            submission_recorded=self._runtime_submission_recorded(
+                handle, prompt
+            ),
         )
         # A new prompt is a new turn. Any confirmation window still open from
         # the previous one measures a pane that has since been handed work,
@@ -3969,7 +3982,7 @@ class HerdrLauncher:
         # envelope still outranks all of it: `_declared_result` ran at the top
         # of this method, so a turn that declares mid-window ends here as its
         # own declaration rather than as a stop.
-        if status == AGENT_QUIESCENT_STATUS and turns:
+        if status == AGENT_QUIESCENT_STATUS and (turns or tailer is None):
             if self._quiescence_confirmed(handle.correlation_token, turns):
                 return PollResult(PollState.EXITED, 1, "NO_ENVELOPE")
             return PollResult(PollState.RUNNING)
