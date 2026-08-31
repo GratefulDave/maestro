@@ -76,6 +76,16 @@ class _RunRefused(RuntimeError):
         return 3
 
 
+class CleanupRefused(RuntimeError):
+    """COMPLETE space cleanup failed after publication; panes/cwds remain."""
+
+    code = "CLEANUP_REFUSED"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 _ROLE_ROUTE_FIELDS = frozenset(("route", "model", "effort", "profile"))
 _DASHBOARD_FIELDS = frozenset(("enabled", "launcher", "api_port", "ui_port", "open"))
 
@@ -267,13 +277,19 @@ def _project_identity(target: gitpub.TargetBinding) -> str:
 
 class _RoleSession:
     def __init__(
-        self, handle: object, cwd: Path, attempt: Path, checkout: Path | None
+        self,
+        handle: object,
+        cwd: Path,
+        attempt: Path,
+        checkout: Path | None,
+        run_id: str = "",
     ) -> None:
         self.handle = handle
         self.cwd = cwd
         self.attempt = attempt
         self.checkout = checkout
         self.turns = 0
+        self.run_id = run_id
 
 
 def _precreated_role_cwd(dest: Path) -> bool:
@@ -469,6 +485,29 @@ class HerdrStageActor:
         if precreated:
             lch.scratch_environment(dest)
 
+    def _path_is_live_retained(self, path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        for stored in self._roles.values():
+            for candidate in (stored.cwd, stored.checkout):
+                if candidate is None:
+                    continue
+                try:
+                    live = candidate.resolve()
+                except OSError:
+                    continue
+                if (
+                    resolved == live
+                    or live in resolved.parents
+                    or resolved in live.parents
+                ):
+                    return True
+        return False
+
     def _safe_remove_attempt(self, attempt: Path, checkout: Path | None) -> None:
         try:
             resolved = attempt.resolve()
@@ -476,6 +515,10 @@ class HerdrStageActor:
             return
         root = self.worktrees.resolve()
         if root not in resolved.parents or resolved == root:
+            return
+        if self._path_is_live_retained(attempt) or self._path_is_live_retained(
+            checkout
+        ):
             return
         repo = Path(self.target.target_repository_root)
         if checkout is not None and checkout.exists():
@@ -689,7 +732,7 @@ class HerdrStageActor:
             except KeyError as exc:
                 raise FactoryRefused("LANE_SPEC_MISSING") from exc
         body.update(extra)
-        if role == "builder":
+        if role in ("builder", "code-reviewer"):
             for key in list(body):
                 if key in st.FORBIDDEN_PRIVATE_KEYS or key in (
                     "private_files",
@@ -819,14 +862,16 @@ class HerdrStageActor:
     def _role_key(self, ctx: LaneContext, role: str) -> tuple[str, str]:
         return (ctx.lane.lane_id, role)
 
-    def _role_dir(self, ctx: LaneContext, role: str) -> Path:
+    def _role_dir(self, ctx: LaneContext, role: str, *, create: bool = True) -> Path:
         path = self.worktrees / ctx.run_id / ctx.lane.lane_id / role
-        path.mkdir(parents=True, exist_ok=True)
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
         return path
 
     def _role_cwds(self, ctx: LaneContext) -> dict[str, Path]:
         return {
-            role: self._role_dir(ctx, role) / "checkout" for role in lch.LANE_PANE_ROLES
+            role: self._role_dir(ctx, role, create=False) / "checkout"
+            for role in lch.LANE_PANE_ROLES
         }
 
     def _revise_findings(self, ctx: LaneContext, artifact_key: str) -> list[Any] | None:
@@ -882,6 +927,21 @@ class HerdrStageActor:
                 raise FactoryRefused(outcome)
             time.sleep(0.1)
 
+    def _launch_failed(self, exc: lch.LaunchRefused) -> LaunchFailed:
+        return LaunchFailed(
+            "{}:{}".format(exc.refusal.value, exc.detail),
+            pane_created=bool(exc.pane_created),
+        )
+
+    def _retain_completed(self, handle: object, key: tuple[str, str]) -> None:
+        retain = getattr(self.launcher, "retain", None)
+        if retain is None:
+            return
+        try:
+            retain(handle)
+        except lch.LaunchRefused:
+            self._roles.pop(key, None)
+
     def _launch(
         self,
         ctx: LaneContext,
@@ -908,6 +968,7 @@ class HerdrStageActor:
             turn += 1
         if stored is not None:
             stored.turns = turn
+            stored.run_id = ctx.run_id
         session = attempt / "session"
         session.mkdir(exist_ok=True)
         envelope = lch.role_result_path(cwd, turn)
@@ -929,13 +990,39 @@ class HerdrStageActor:
             envelope.parent.mkdir(parents=True, exist_ok=True)
             write_prompt(adopted)
 
+        lane_id = ctx.lane.lane_id
+        token = lch.role_session_token(ctx.run_id, lane_id, role)
+        if stored is not None and stored.handle is not None:
+            prepare_cwd(cwd)
+            self._materialize_role_instructions(
+                cwd, role, route["route"], ctx.lane.lane_kind
+            )
+            write_prompt(cwd)
+            try:
+                handle = self.launcher.resubmit(
+                    stored.handle,
+                    prompt,
+                    route=route["route"],
+                    expected_token=token,
+                    envelope_path=envelope,
+                )
+            except lch.LaunchRefused as extra_exc:
+                raise self._launch_failed(extra_exc) from extra_exc
+            cwd_used = Path(getattr(handle, "launched_cwd", cwd))
+            payload = self._await_envelope(handle, envelope, role)
+            stored.handle = handle
+            stored.cwd = cwd_used
+            stored.turns = turn
+            stored.run_id = ctx.run_id
+            self._retain_completed(handle, key)
+            return payload, handle, cwd_used
+
         system_prompt = self._materialize_role_instructions(
             cwd, role, route["route"], ctx.lane.lane_kind
         )
         write_prompt(cwd)
-        lane_key = key[0]
         spec = lch.LaunchSpec(
-            correlation_token=lch.role_session_token(ctx.run_id, lane_key, role),
+            correlation_token=token,
             worktree=cwd,
             prompt_path=prompt,
             envelope_path=envelope,
@@ -951,10 +1038,11 @@ class HerdrStageActor:
                 if route_publishes_a_window(route["route"])
                 else None
             ),
-            lane_key=lane_key,
-            lane_label=lane_key,
+            lane_key=lane_id,
+            lane_label=lane_id,
             pane_role=role,
             run_id=ctx.run_id,
+            repository_fingerprint=self.target.target_repository_fingerprint,
             stage=ctx.stage.value,
             input_digest=ctx.input_digest,
             workspace_label=self._workspace_label(ctx),
@@ -964,21 +1052,14 @@ class HerdrStageActor:
         )
         try:
             handle = self.launcher.launch(spec)
-        except lch.LaunchRefused as exc:
-            raise LaunchFailed(
-                "{}:{}".format(exc.refusal.value, exc.detail),
-                pane_created=bool(exc.pane_created),
-            ) from exc
+        except lch.LaunchRefused as extra_exc:
+            raise self._launch_failed(extra_exc) from extra_exc
         cwd_used = Path(getattr(handle, "launched_cwd", cwd))
         payload = self._await_envelope(handle, envelope, role)
-        if stored is None:
-            bound = _RoleSession(handle, cwd_used, attempt, None)
-            bound.turns = turn
-            self._roles[key] = bound
-        else:
-            stored.handle = handle
-            stored.cwd = cwd_used
-            stored.turns = turn
+        bound = _RoleSession(handle, cwd_used, attempt, None, ctx.run_id)
+        bound.turns = turn
+        self._roles[key] = bound
+        self._retain_completed(handle, key)
         return payload, handle, cwd_used
 
     def _prepare(
@@ -1230,6 +1311,78 @@ class HerdrStageActor:
             "receipt_object": published_sha,
             "receipt_ref": st.publication_ref(ctx.run_id, fingerprint),
         }
+
+    def _session_run_id(self, stored: _RoleSession) -> str:
+        if stored.run_id:
+            return stored.run_id
+        token = str(getattr(stored.handle, "correlation_token", "") or "")
+        if ":" in token:
+            return token.split(":", 1)[0]
+        return ""
+
+    def _handle_space_absent(self, handle: object | None) -> bool:
+        if handle is None:
+            return True
+        cleaned = getattr(self.launcher, "_cleaned_absent", None)
+        pane_id = str(getattr(handle, "pane_id", "") or "")
+        workspace_id = str(getattr(handle, "workspace_id", "") or "")
+        parent = str(getattr(handle, "parent_workspace_id", "") or "")
+        child = str(getattr(handle, "child_workspace_id", "") or "")
+        if isinstance(cleaned, set):
+            if pane_id and pane_id in cleaned:
+                return True
+            if child and child in cleaned:
+                return True
+            if workspace_id and workspace_id in cleaned:
+                return True
+            if parent and parent in cleaned and pane_id in cleaned:
+                return True
+        poll = getattr(self.launcher, "poll", None)
+        if poll is None:
+            return False
+        try:
+            result = poll(handle)
+        except BaseException:
+            return False
+        return getattr(result, "state", None) is lch.PollState.GONE
+
+    def complete_run_spaces(self, run_id: str) -> None:
+        sessions = [
+            (key, stored)
+            for key, stored in list(self._roles.items())
+            if self._session_run_id(stored) == run_id
+        ]
+        handles = [
+            stored.handle for _, stored in sessions if stored.handle is not None
+        ]
+        complete = getattr(self.launcher, "complete_run", None)
+        if complete is None:
+            if handles:
+                raise CleanupRefused("COMPLETE_RUN_UNAVAILABLE")
+            return
+        refused: BaseException | None = None
+        if handles:
+            try:
+                complete(
+                    handles,
+                    project_identity=self.project_identity,
+                )
+            except lch.LaunchRefused as exc:
+                refused = exc
+            except BaseException as exc:
+                refused = exc
+        success = refused is None
+        for key, stored in sessions:
+            if success or self._handle_space_absent(stored.handle):
+                self._roles.pop(key, None)
+                self._safe_remove_attempt(stored.attempt, stored.checkout)
+        if refused is None:
+            return
+        if isinstance(refused, lch.LaunchRefused):
+            raise CleanupRefused(
+                "{}:{}".format(refused.refusal.code, refused.detail)
+            ) from refused
+        raise CleanupRefused(str(refused)) from refused
 
     def _review_payload(
         self, payload: Mapping[str, Any]
@@ -1602,6 +1755,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _RunRefused("RUNTIME_STATE_REFUSED", str(exc)).emit()
     except FactoryRefused as exc:
         return _RunRefused(exc.code, str(exc)).emit()
+    except CleanupRefused as exc:
+        return _RunRefused(exc.code, exc.detail).emit()
     except LaunchFailed as exc:
         return _RunRefused("LAUNCH_FAILED", exc.detail).emit()
     except gitpub.GitPublicationRefused as exc:

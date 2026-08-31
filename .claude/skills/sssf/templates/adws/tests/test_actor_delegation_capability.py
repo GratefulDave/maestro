@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict, cast
@@ -162,8 +162,13 @@ class RecordingLauncher:
         self.resubmits: list[dict[str, Any]] = []
         self.specs: list[lch.LaunchSpec] = []
         self.cancels: list[object] = []
+        self.retained: list[str] = []
+        self.completed: list[tuple[str, ...]] = []
         self.wait_idle = 0
         self._live: dict[tuple[str, str], SimpleNamespace] = {}
+        self._handles: dict[str, object] = {}
+        self._statuses: dict[str, str | None] = {}
+        self._states: dict[str, lch.PollResult] = {}
 
     def _write_worktree(self, worktree: Path) -> None:
         for rel, body in self.files.items():
@@ -237,6 +242,7 @@ class RecordingLauncher:
             lane_key=spec.lane_key,
             pane_role=spec.pane_role,
         )
+        self._handles[spec.correlation_token] = handle
         if key[1]:
             self._live[key] = handle
         return handle
@@ -268,13 +274,17 @@ class RecordingLauncher:
             }
         )
         dest = Path(envelope_path or handle.envelope_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps(self.envelope, sort_keys=True), encoding="utf-8")
         handle.envelope_path = dest
         self._write_worktree(worktree)
         return handle
 
-    def poll(self, handle: object) -> SimpleNamespace:
-        del handle
+    def poll(self, handle: object) -> object:
+        token = getattr(handle, "correlation_token", None)
+        stored = self._states.get(token) if token is not None else None
+        if stored is not None:
+            return stored
         return SimpleNamespace(state=lch.PollState.EXITED)
 
     def wait_for_idle(self, handle: object, timeout_s: float = 60.0) -> None:
@@ -285,6 +295,45 @@ class RecordingLauncher:
         del deadline
         self.cancels.append(handle)
 
+    def set_agent_status(self, token: str, status: str | None) -> None:
+        self._statuses[token] = status
+
+    def agent_status(self, handle: object) -> str | None:
+        return self._statuses.get(handle.correlation_token)
+
+    def retain(self, handle: object) -> None:
+        if self._handles.get(handle.correlation_token) is not handle:
+            raise lch.LaunchRefused(
+                lch.LaunchRefusal.BINDING_MISMATCH, handle.correlation_token
+            )
+        self.retained.append(handle.correlation_token)
+
+    def complete_run(
+        self,
+        handles: Sequence[object],
+        *,
+        project_identity: str = "",
+        timeout_s: float = 60.0,
+    ) -> None:
+        del project_identity, timeout_s
+        tokens = tuple(handle.correlation_token for handle in handles)
+        if tokens in self.completed:
+            return
+        for handle in handles:
+            if self._handles.get(handle.correlation_token) is not handle:
+                raise lch.LaunchRefused(
+                    lch.LaunchRefusal.BINDING_MISMATCH, handle.correlation_token
+                )
+            if self.agent_status(handle) not in (None, "idle"):
+                raise lch.LaunchRefused(
+                    lch.LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
+                    handle.correlation_token,
+                    pane_created=True,
+                )
+            self._states[handle.correlation_token] = lch.PollResult(
+                lch.PollState.GONE, detail="RUN_COMPLETE"
+            )
+        self.completed.append(tokens)
 
 class PersistentRoleDispatchTest(unittest.TestCase):
     def test_two_dispatches_retain_tester_session(self) -> None:
@@ -383,9 +432,11 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 first["argv"],
                 lch.build_claude_argv(Path("claude"), recorder.specs[0]),
             )
+            resubmit_handle = recorder.resubmits[0]["handle"]
+            self.assertEqual(resubmit_handle.pane_id, "p:lane-a:tester")
             self.assertEqual(
-                recorder.resubmits[0]["handle"].pane_id,
-                "p:lane-a:tester",
+                resubmit_handle.correlation_token,
+                recorder.specs[0].correlation_token,
             )
             self.assertEqual(
                 recorder.resubmits[0]["prompt"]["revise_findings"][0][
@@ -400,12 +451,25 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                     "run-1",
                 ),
             )
+            self.assertEqual(len(recorder.specs), 1)
             self.assertEqual(
-                [spec.envelope_path.name for spec in recorder.specs],
+                recorder.specs[0].envelope_path.name, "envelope-1.json"
+            )
+            self.assertEqual(
+                Path(resubmit_handle.envelope_path).name, "envelope-2.json"
+            )
+            self.assertEqual(
+                sorted(
+                    path.name
+                    for path in (worktree / ".maestro-agent" / "results").glob(
+                        "envelope-*.json"
+                    )
+                ),
                 ["envelope-1.json", "envelope-2.json"],
             )
             self.assertNotEqual(
-                recorder.specs[0].prompt_path, recorder.specs[1].prompt_path
+                recorder.specs[0].prompt_path,
+                worktree / ".maestro-agent" / "prompt-2.json",
             )
 
     def test_turn_prompt_files_live_inside_assigned_cwd(self) -> None:
@@ -470,7 +534,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             actor.write_tests(revise)
             resubmit_cwd = Path(recorder.resubmits[0]["worktree"]).resolve()
-            second = recorder.specs[1].prompt_path
+            second = resubmit_cwd / ".maestro-agent" / "prompt-2.json"
             _assert_prompt_under_agent_dir(self, second, resubmit_cwd, "prompt-2.json")
             self.assertEqual(cwd, resubmit_cwd)
             self.assertNotEqual(first.resolve(), second.resolve())
@@ -498,8 +562,14 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             envelope = root / "envelope.json"
             envelope.write_text("{not-json", encoding="utf-8")
+            handle = lch.LaunchHandle(
+                correlation_token="tok-malformed",
+                pane_id="p:malformed",
+                agent_name=lch.agent_name_for("tok-malformed"),
+                launched_cwd=root,
+            )
             with self.assertRaisesRegex(FactoryRefused, "STAGE_PAYLOAD_INVALID"):
-                actor._await_envelope(object(), envelope, "tester")
+                actor._await_envelope(handle, envelope, "tester")
 
     def test_collect_uncommitted_refuses_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -544,7 +614,12 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 target,
                 _ROLE_ROUTES,
             )
-            handle = SimpleNamespace(launched_cwd=str(checkout))
+            handle = lch.LaunchHandle(
+                correlation_token="tok-symlink",
+                pane_id="p:symlink",
+                agent_name=lch.agent_name_for("tok-symlink"),
+                launched_cwd=checkout,
+            )
             with self.assertRaisesRegex(FactoryRefused, "ROLE_OUTPUT_UNSAFE"):
                 actor._await_envelope(handle, envelope, "tester")
 
@@ -1056,7 +1131,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             )
             actor.review_tests(second_ctx)
             resubmit_cwd = Path(recorder.resubmits[0]["worktree"]).resolve()
-            second_prompt = recorder.specs[1].prompt_path
+            second_prompt = resubmit_cwd / ".maestro-agent" / "prompt-2.json"
             _assert_prompt_under_agent_dir(
                 self, second_prompt, resubmit_cwd, "prompt-2.json"
             )

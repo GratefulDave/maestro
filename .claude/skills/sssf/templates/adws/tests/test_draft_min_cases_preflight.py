@@ -185,6 +185,9 @@ class DraftActor:
         del ctx, fingerprint, expected_before, published_sha
         return {}
 
+    def complete_run_spaces(self, run_id: str) -> None:
+        del run_id
+
 
 class DraftMinCasesPreflightTests(unittest.TestCase):
     def setUp(self) -> None:

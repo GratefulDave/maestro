@@ -741,6 +741,9 @@ class _StartupActor:
         del ctx, fingerprint, expected_before, published_sha
         raise AssertionError("publish")
 
+    def complete_run_spaces(self, run_id: str) -> None:
+        del run_id
+
 
 class FactorySchedulerStartupRecoveryTest(unittest.TestCase):
     def _boot(self, run_id: str) -> tuple[Path, Path, str, str, RuntimeStateRoot, ArtifactStore, gitpub.TargetBinding]:
@@ -1164,6 +1167,9 @@ class WriterDefersForSiblingReviewTest(unittest.TestCase):
 
                 def publish(self, ctx, *, fingerprint, expected_before, published_sha):
                     raise AssertionError("publish")
+
+                def complete_run_spaces(self, run_id: str) -> None:
+                    del run_id
 
             actor = ObservingActor()
             scheduler = sch.FactoryScheduler(

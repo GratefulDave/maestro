@@ -660,6 +660,8 @@ class StageActor(Protocol):
         expected_before: str,
         published_sha: str,
     ) -> Mapping[str, Any]: ...
+    def complete_run_spaces(self, run_id: str) -> None: ...
+
 
 
 class OrderedLocks:
@@ -938,10 +940,16 @@ class FactoryScheduler:
             ensure_run_integration_ref(self.target, self.store, self.run_id)
             while True:
                 status = self.status()
-                if status in (st.RunStatus.COMPLETE, st.RunStatus.WAITING):
+                if status is st.RunStatus.COMPLETE:
+                    self._complete_run_spaces()
+                    return status
+                if status is st.RunStatus.WAITING:
                     return status
                 if status is st.RunStatus.PUBLISHABLE:
                     self._publish()
+                    if self.status() is st.RunStatus.COMPLETE:
+                        self._complete_run_spaces()
+                        return st.RunStatus.COMPLETE
                     continue
                 if status is st.RunStatus.INTEGRATION_REVIEW_PENDING:
                     self._final_review()
@@ -2098,7 +2106,7 @@ class FactoryScheduler:
             lanes = self.store.active_projection(self.run_id)
             ctx = LaneContext(
                 run_id=self.run_id,
-                lane=lanes[0],
+                lane=self._owner_lane(lanes),
                 plan_revision=row["plan_revision"],
                 plan_digest=row["plan_digest"],
                 plan_artifact_ref=self._plan_artifact_ref(row),
@@ -2142,6 +2150,22 @@ class FactoryScheduler:
         finally:
             self.locks.release()
 
+    def _owner_lane(
+        self, lanes: Sequence[st.LaneProjection]
+    ) -> st.LaneProjection:
+        if self._compiled is not None:
+            order = self._compiled.integration_order
+        else:
+            order = st.topological_integration_order(lanes)
+        if not order:
+            raise FactoryRefused("missing owner lane")
+        owner_id = order[-1]
+        for lane in lanes:
+            if lane.lane_id == owner_id:
+                return lane
+        raise FactoryRefused("missing owner lane {0}".format(owner_id))
+
+
     def _publish(self) -> None:
         self.locks.acquire(3)
         try:
@@ -2165,6 +2189,19 @@ class FactoryScheduler:
             _record_publication(self.store, self.run_id, fingerprint, payload)
         finally:
             self.locks.release()
+
+    def _complete_run_spaces(self) -> None:
+        if not _has_publication(self.store, self.run_id):
+            return
+        try:
+            self.actor.complete_run_spaces(self.run_id)
+        except Exception as extra:
+            if getattr(extra, "code", "") == "CLEANUP_REFUSED":
+                raise
+            raise FactoryRefused(
+                "complete_run_spaces:{0}".format(extra)
+            ) from extra
+
 
 
 def create_factory_run(
@@ -2334,3 +2371,5 @@ class LaunchFailed(RuntimeError):
         super().__init__(detail)
         self.pane_created = pane_created
         self.detail = detail
+
+

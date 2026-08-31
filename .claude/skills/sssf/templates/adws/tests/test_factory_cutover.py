@@ -150,6 +150,9 @@ class ScriptedActor:
             "receipt_ref": st.publication_ref(ctx.run_id, fingerprint),
         }
 
+    def complete_run_spaces(self, run_id: str) -> None:
+        del run_id
+
 
 class FactoryCutoverTests(unittest.TestCase):
     def setUp(self) -> None:
