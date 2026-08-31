@@ -76,44 +76,46 @@ describe("run hierarchy projection", () => {
     expect(hierarchy.is_live).toBe(true);
   });
 
-  test("projects the five persistent artifact-factory roles under every lane", () => {
+  test("projects typed lane roles and one run-level integration reviewer", () => {
     const run = {
       run_id: "run-factory",
       schema_version: "artifact-factory.v1",
-      plan_name: "fdadb-v2-wp6-geo-layer-r2.v1",
+      plan_name: "fdadb-v2-wp6-geo-layer-r2.v3",
       state: "RUNNING",
       nodes: [
-        node("lane-wp6-tests", null, "REVIEWING_TESTS", 0, [], "REVIEWING_TESTS"),
-        node("lane-wp6-build", null, "PLANNED", 0, ["lane-wp6-tests"], "PLANNED"),
+        node("lane-wp6-tests", "tests", "REVIEWING_TESTS", 0, [], "REVIEWING_TESTS"),
+        node(
+          "lane-wp6-build",
+          "build",
+          "PLANNED",
+          0,
+          ["lane-wp6-tests"],
+          "PLANNED",
+        ),
       ],
       actor_sessions: [],
     } as MaestroRunDetail;
 
-    const hierarchy = projectRunHierarchy(run, "maestro:FDAdb");
+    const hierarchy = projectRunHierarchy(run, "artifact-factory:FDAdb");
 
     expect(hierarchy.lanes.map((lane) => lane.label)).toEqual([
       "lane-wp6-tests",
       "lane-wp6-build",
     ]);
-    for (const lane of hierarchy.lanes) {
-      expect(lane.agents.map((agent) => agent.label)).toEqual([
-        "tester",
-        "test-reviewer",
-        "builder",
-        "code-reviewer",
-        "integration-reviewer",
-      ]);
-    }
-    expect(hierarchy.lanes[0]?.agents.map((agent) => agent.state)).toEqual([
-      "COMPLETE",
-      "ACTIVE",
-      "WAITING",
-      "WAITING",
-      "WAITING",
+    expect(hierarchy.lanes[0]?.agents.map(({ label, state }) => [label, state])).toEqual([
+      ["tester", "COMPLETE"],
+      ["test-reviewer", "ACTIVE"],
+    ]);
+    expect(hierarchy.lanes[1]?.agents.map(({ label, state }) => [label, state])).toEqual([
+      ["builder", "WAITING"],
+      ["code-reviewer", "WAITING"],
+    ]);
+    expect(hierarchy.agents.map(({ label, state }) => [label, state])).toEqual([
+      ["integration-reviewer", "WAITING"],
     ]);
   });
 
-  test("maps integration review to producer-valid ready and run-level gate states", () => {
+  test("activates integration review only at the run-level final gate", () => {
     const readyRun = {
       run_id: "run-ready",
       schema_version: "artifact-factory.v1",
@@ -128,17 +130,26 @@ describe("run hierarchy projection", () => {
       state: "INTEGRATION_REVIEW_PENDING",
       nodes: [node("lane-a", null, "MERGED", 0, [], "MERGED")],
     } as MaestroRunDetail;
+    const publishableRun = {
+      ...reviewRun,
+      run_id: "run-publishable",
+      state: "PUBLISHABLE",
+    } as MaestroRunDetail;
 
-    for (const run of [readyRun, reviewRun]) {
-      const [lane] = projectRunHierarchy(run, "artifact-factory:FDAdb").lanes;
-      expect(lane?.agents.map(({ label, state }) => [label, state])).toEqual([
-        ["tester", "COMPLETE"],
-        ["test-reviewer", "COMPLETE"],
-        ["builder", "COMPLETE"],
-        ["code-reviewer", "COMPLETE"],
-        ["integration-reviewer", "ACTIVE"],
-      ]);
-    }
+    const ready = projectRunHierarchy(readyRun, "artifact-factory:FDAdb");
+    expect(ready.lanes[0]?.agents.map(({ label, state }) => [label, state])).toEqual([
+      ["tester", "COMPLETE"],
+      ["test-reviewer", "COMPLETE"],
+      ["builder", "COMPLETE"],
+      ["code-reviewer", "COMPLETE"],
+    ]);
+    expect(ready.agents[0]?.state).toBe("WAITING");
+    expect(
+      projectRunHierarchy(reviewRun, "artifact-factory:FDAdb").agents[0]?.state,
+    ).toBe("ACTIVE");
+    expect(
+      projectRunHierarchy(publishableRun, "artifact-factory:FDAdb").agents[0]?.state,
+    ).toBe("COMPLETE");
   });
 
   test("falls back to build node state when a legacy row has no lane phase", () => {

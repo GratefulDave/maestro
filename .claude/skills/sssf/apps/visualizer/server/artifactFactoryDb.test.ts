@@ -403,6 +403,42 @@ describe("run/lane/stage/artifact mapping", () => {
     db.close();
   });
 
+  test("reports authored lane kinds without inventing one for legacy lanes", () => {
+    const path = factoryLedger("typed-lanes", (db) => {
+      insertFactoryRun(db, "run-typed", [
+        { id: "lane-tests", needs: [], stage: "MERGED" },
+        { id: "lane-build", needs: ["lane-tests"], stage: "BUILDING" },
+        { id: "lane-legacy", needs: [], stage: "PLANNED" },
+      ]);
+      insertLaneArtifact(db, {
+        id: "plan-tests",
+        runId: "run-typed",
+        laneId: "lane-tests",
+        sequence: 1,
+        stage: "PLANNED",
+        kind: "LANE_PLAN",
+        payload: { lane_kind: "tests" },
+      });
+      insertLaneArtifact(db, {
+        id: "plan-build",
+        runId: "run-typed",
+        laneId: "lane-build",
+        sequence: 1,
+        stage: "PLANNED",
+        kind: "LANE_PLAN",
+        payload: { lane_kind: "build" },
+      });
+    });
+
+    const db = new ArtifactFactoryDb(path);
+    expect(db.run("run-typed")!.nodes.map((node) => [node.node_id, node.kind])).toEqual([
+      ["lane-legacy", null],
+      ["lane-tests", "tests"],
+      ["lane-build", "build"],
+    ]);
+    db.close();
+  });
+
   test("projects final review and publication from run artifacts", () => {
     const pendingPath = factoryLedger("final-review-pending", (db) => {
       db.query("INSERT INTO ledger_meta (schema_version) VALUES ('artifact-factory.v1')").run();

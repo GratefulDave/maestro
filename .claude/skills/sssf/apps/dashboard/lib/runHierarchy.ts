@@ -30,6 +30,7 @@ export interface RunHierarchy {
   label: string;
   is_live: boolean;
   href: string;
+  agents: RunHierarchyAgent[];
   lanes: RunHierarchyLane[];
 }
 
@@ -41,14 +42,23 @@ function attemptLabel(role: "builder" | "tester", node: MaestroNode): string {
   return node.attempt_no > 0 ? `${role}-a${node.attempt_no}` : role;
 }
 
-const FACTORY_ROLE_STAGES: ReadonlyArray<
+const FACTORY_TEST_ROLE_STAGES: ReadonlyArray<
   readonly [RunHierarchyRole, string]
 > = [
   ["tester", "WRITING_TESTS"],
   ["test-reviewer", "REVIEWING_TESTS"],
+];
+
+const FACTORY_BUILD_ROLE_STAGES: ReadonlyArray<
+  readonly [RunHierarchyRole, string]
+> = [
   ["builder", "BUILDING"],
   ["code-reviewer", "REVIEWING_CODE"],
-  ["integration-reviewer", "READY_TO_MERGE"],
+];
+
+const FACTORY_LEGACY_ROLE_STAGES = [
+  ...FACTORY_TEST_ROLE_STAGES,
+  ...FACTORY_BUILD_ROLE_STAGES,
 ];
 
 const FACTORY_STAGE_ORDER = [
@@ -62,37 +72,55 @@ const FACTORY_STAGE_ORDER = [
   "MERGED",
 ];
 
-function factoryRoleState(roleStage: string, laneStage: string, runState: string): string {
-  if (roleStage === "READY_TO_MERGE") {
-    if (runState === "INTEGRATION_REVIEW_PENDING" || laneStage === "READY_TO_MERGE") {
-      return "ACTIVE";
-    }
-    if (runState === "PUBLISHABLE" || runState === "COMPLETE") return "COMPLETE";
-  }
+function factoryRoleState(roleStage: string, laneStage: string): string {
   if (roleStage === laneStage) return "ACTIVE";
   const roleIndex = FACTORY_STAGE_ORDER.indexOf(roleStage);
   const laneIndex = FACTORY_STAGE_ORDER.indexOf(laneStage);
   return roleIndex >= 0 && laneIndex > roleIndex ? "COMPLETE" : "WAITING";
 }
 
+function factoryLaneRoleStages(
+  kind: string | null,
+): ReadonlyArray<readonly [RunHierarchyRole, string]> {
+  if (kind === "tests") return FACTORY_TEST_ROLE_STAGES;
+  if (kind === "build") return FACTORY_BUILD_ROLE_STAGES;
+  return FACTORY_LEGACY_ROLE_STAGES;
+}
+
+function factoryFinalReviewState(runState: string): string {
+  if (runState === "INTEGRATION_REVIEW_PENDING") return "ACTIVE";
+  if (runState === "PUBLISHABLE" || runState === "COMPLETE") return "COMPLETE";
+  return "WAITING";
+}
+
 function projectArtifactFactoryHierarchy(
   run: MaestroRunDetail,
   sourceId: string,
 ): RunHierarchy {
+  const href = runHref(sourceId, run.run_id);
   return {
     label: run.plan_name ?? run.run_id,
     is_live: isInFlight(run.state),
-    href: runHref(sourceId, run.run_id),
+    href,
+    agents: [
+      {
+        id: `${run.run_id}:integration-reviewer`,
+        label: "integration-reviewer",
+        role: "integration-reviewer",
+        state: factoryFinalReviewState(run.state),
+        href,
+      },
+    ],
     lanes: run.nodes.map((lane) => ({
       id: lane.node_id,
       label: lane.node_id,
       state: lane.lane_phase ?? lane.state,
       href: laneHref(sourceId, run.run_id, lane.node_id),
-      agents: FACTORY_ROLE_STAGES.map(([role, stage]) => ({
+      agents: factoryLaneRoleStages(lane.kind).map(([role, stage]) => ({
         id: `${lane.node_id}:${role}`,
         label: role,
         role,
-        state: factoryRoleState(stage, lane.lane_phase ?? lane.state, run.state),
+        state: factoryRoleState(stage, lane.lane_phase ?? lane.state),
         href: laneHref(sourceId, run.run_id, lane.node_id),
       })),
     })),
@@ -229,5 +257,6 @@ export function projectRunHierarchy(
     is_live: isInFlight(run.state),
     href: runHref(sourceId, run.run_id),
     lanes,
+    agents: [],
   };
 }

@@ -278,6 +278,14 @@ code,
   padding-left: 12px;
 }
 
+.run-role-label {
+  margin-top: 12px;
+}
+
+.run-agent-nav-list {
+  margin-left: 4px;
+}
+
 .agent-nav-list::before {
   position: absolute;
   inset: 0 auto 5px 0;

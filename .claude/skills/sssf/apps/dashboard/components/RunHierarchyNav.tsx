@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import type { RunHierarchy } from "@/lib/runHierarchy";
+import type { RunHierarchy, RunHierarchyAgent } from "@/lib/runHierarchy";
 import { decodeRouteParam } from "@/lib/href";
 
 export const HIERARCHY_LIVE_REFRESH_MS = 3_000;
@@ -22,6 +22,30 @@ function runRoute(pathname: string): { sourceId: string; runId: string } | null 
   if (!match) return null;
   return { sourceId: match[1], runId: match[2] };
 }
+function AgentNavItem({
+  agent,
+  pathname,
+}: {
+  agent: RunHierarchyAgent;
+  pathname: string;
+}) {
+  const active = pathname === agent.href;
+  return (
+    <li>
+      <Link
+        aria-current={active ? "page" : undefined}
+        className={`agent-nav-link${active ? " agent-nav-link-active" : ""}`}
+        href={agent.href}
+        title={`${agent.id} · ${agent.state}`}
+      >
+        <span className={`agent-role agent-role-${agent.role}`} aria-hidden="true" />
+        <span>{agent.label}</span>
+        <small>{agent.state}</small>
+      </Link>
+    </li>
+  );
+}
+
 
 export function RunHierarchyNav({ pathname }: { pathname: string }) {
   const route = runRoute(pathname);
@@ -89,28 +113,24 @@ export function RunHierarchyNav({ pathname }: { pathname: string }) {
                 </span>
               </summary>
               <ul className="agent-nav-list">
-                {lane.agents.map((agent) => {
-                  const active = pathname === agent.href;
-                  return (
-                    <li key={agent.id}>
-                      <Link
-                        aria-current={active ? "page" : undefined}
-                        className={`agent-nav-link${active ? " agent-nav-link-active" : ""}`}
-                        href={agent.href}
-                        title={`${agent.id} · ${agent.state}`}
-                      >
-                        <span className={`agent-role agent-role-${agent.role}`} aria-hidden="true" />
-                        <span>{agent.label}</span>
-                        <small>{agent.state}</small>
-                      </Link>
-                    </li>
-                  );
-                })}
+                {lane.agents.map((agent) => (
+                  <AgentNavItem agent={agent} key={agent.id} pathname={pathname} />
+                ))}
               </ul>
             </details>
           </li>
         ))}
       </ul>
+      {hierarchy.agents.length > 0 ? (
+        <>
+          <p className="nav-label run-role-label">Run role</p>
+          <ul className="agent-nav-list run-agent-nav-list">
+            {hierarchy.agents.map((agent) => (
+              <AgentNavItem agent={agent} key={agent.id} pathname={pathname} />
+            ))}
+          </ul>
+        </>
+      ) : null}
     </section>
   );
 }
