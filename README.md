@@ -18,7 +18,7 @@ Rendered docs: [`docs/index.html`](docs/index.html). Current architecture diagra
 4. `REVISE` returns to the author or builder with actionable, redacted feedback. `PASS` advances the lane. If `CODE_REVIEW(REVISE)` exists and the next declared-output tree is byte-identical to the prior candidate, the factory refuses `NOOP_BUILDER_REVISION` before a new `BUILDER_OUTPUT`; the lane stays `BUILDING` and the review is retained.
 5. An accepted build or untyped lane merges exactly once into the run's integration branch. A typed tests lane is `MERGED` after seal; dependents use that current-revision sealed bundle as readiness. Build/untyped dependencies use the current-revision integration merge receipt.
 6. A dependent lane starts when every predecessor is `MERGED`.
-7. When every lane is merged, a final reviewer evaluates that integration commit with all sealed tests. `PASS` publishes that SHA to `main` exactly once, receipt-backed. `REVISE` waits for a user amendment.
+7. When every lane is merged, a final `integration-reviewer` launches lazily in the last topological integration-order lane's child workspace (not `lanes[0]`) and evaluates that integration commit with all sealed tests. `PASS` publishes that SHA to `main` exactly once, receipt-backed. `REVISE` retains every affected lane's role sessions and waits for a user amendment. Cleanup does not run on `MERGED`.
 8. Process death restarts the current incomplete stage from its last immutable input. A still-running role pane may reconnect as transport by proved identity. Unknown, mismatched, or dirty worktrees and unproved agents are refused.
 
 ---
@@ -45,15 +45,29 @@ The stage names the work that happens next. Completing a stage writes its immuta
 
 ---
 
-## Monitoring topology
+## Herdr runtime topology
 
-One Herdr workspace per project+run (project identity plus run ID). One tab per lane. Every lane tab contains exactly five sibling panes named `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`. All five role agents persist for the run. Reviewer panes return actionable redacted feedback to the existing implementation role agent. Idle after output is normal and is not completion.
+One parent run Space group per (repository identity, `run_id`). Display label is `<repository-basename>-<first-four-run-hash-characters>`: strip a leading `run-` before selecting the four-character suffix; preserve the repository basename's casing. The full `run_id` is runtime identity; the short form is display-only. Examples: FDAdb + `e892fe...` → `FDAdb-e892`; FDAdb + `run-9f20c17f...` → `FDAdb-9f20`.
 
-Each role owns one stable role-scoped checkout or private tree and keeps its pane/session memory across review `REVISE` loops and scheduler restarts. The mutable role tree is transport scratch, never workflow authority; `lane_state.stage` plus immutable artifacts remain the only durable workflow authority.
+One linked child worktree workspace per active lane, labelled the exact authored `lane_id` (for example `lane-wp6-tests`), created only when that lane first dispatches an agent. The Spaces sidebar hierarchy comes from Herdr's native worktree Space-group relationship:
+
+```text
+herdr workspace create ...
+herdr worktree open --workspace <parent-run-workspace-id> \
+  --path <approved-lane-role-worktree> --label <lane-id> --no-focus
+```
+
+Do not simulate this with ordinary tabs, Agent-view filters, display metadata alone, naming prefixes, or changes to `~/.config/herdr`.
+
+Role panes are created only when that role first starts. Live pane labels are exactly `tester`, `tester-reviewer`, `builder`, `code-reviewer`, or `integration-reviewer` — do not repeat the run or lane. The first role in a lane may use the child workspace's root pane; later roles split only inside that same child. Never split from `--current` or another lane's pane. All placement uses explicit parent, child, tab, or pane IDs and `--no-focus`. Concurrent first launches create exactly one parent and exactly one child per lane. No pane from one run may land in another run's parent or child workspace.
+
+Stable actor identity is `(repository identity, run_id, lane_id, role)`. A reviewer `REVISE` leaves both the originating role and reviewer panes open; the next correction resubmits to the existing session, pane, agent, transcript, and approved cwd with a fresh prompt and envelope. Each of tester, tester-reviewer, builder, and code-reviewer owns a distinct role-scoped worktree; builder and code-reviewer do not share a dirty checkout; private tester bytes never enter builder or code-reviewer paths or prompts. The mutable role tree is transport scratch, never workflow authority; `lane_state.stage` plus immutable artifacts remain the only durable workflow authority. Idle after output is normal and is not completion.
 
 Role confinement is mandatory, not prompt guidance. OMP and Claude remain host processes so Herdr can display and control them and their existing OAuth profiles can authenticate normally. Both receive only the Bash tool. A fail-closed hook rewrites every model-issued command into a disposable OrbStack/Docker container with no network, a read-only container root, scrubbed credentials, hidden Git metadata, checkout-local scratch, and only that role tree mounted writable. The image contains project runtimes, not coders or OAuth material. Missing Docker, image, hook, or container support refuses launch.
 
-Scheduler restart first rediscovers the five stable agents by deterministic project/run/lane/role identity and typed Herdr workspace/tab/pane plus canonical role-scoped cwd. It live-checks the process and resubmits the current stage from its immutable input. Only a confirmed dead or `agent_not_found` role is recreated. Empty labels, legacy stage/attempt panes, malformed observations, unreachable Herdr, mismatched placement, and unproved agents are refused, never adopted or renamed as current roles.
+Scheduler restart and amendment rediscover from Herdr report-metadata (Maestro-owned source: full `run_id`, canonical repository fingerprint, `lane_id` where applicable, role where applicable, parent run workspace ID for lane children) plus verified live IDs, parent relationship, pane cwd, agent ownership, stable agent name, and role label. Labels are display text, not adoption proof. Only a confirmed `pane_not_found`, `workspace_not_found`, or `agent_not_found` recreates the missing expected object. Duplicate, label-only, wrong-parent, wrong-cwd, wrong-agent, dirty, unknown, or malformed candidates refuse; never adopt or rename them as current roles. Transport identity stays out of `lane_state` and artifact identity. Amendment reuses the same parent and expected role sessions; new lanes create linked children lazily.
+
+Keep role panes open while the run is executing, waiting, integration-review pending, publishable, or blocked by review/amendment. Cleanup may begin only after successful `MAIN_PUBLICATION` and derived COMPLETE. For every role: prove idle, send `/rename <repository-basename>-<short-run>-<lane-id>-<role>` as composer text plus Enter, wait for exact `Session renamed to "<full-session-name>".`, then close child lane workspaces, then the parent if it has no retained run-level work, then remove cwd. Rename or close failure leaves that pane and cwd intact (for example `SESSION_RENAME_UNCONFIRMED`) without rolling back publication. Cleanup is idempotent.
 
 ---
 

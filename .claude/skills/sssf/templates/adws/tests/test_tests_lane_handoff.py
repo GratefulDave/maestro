@@ -211,6 +211,9 @@ class HandoffActor:
             "receipt_ref": st.publication_ref(ctx.run_id, fingerprint),
         }
 
+    def complete_run_spaces(self, run_id: str) -> None:
+        del run_id
+
 
 class NoopActor(HandoffActor):
     def __init__(self, repo: Path, worktrees: Path) -> None:

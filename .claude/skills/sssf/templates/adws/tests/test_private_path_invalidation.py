@@ -169,6 +169,9 @@ class CollisionActor:
             "receipt_ref": st.publication_ref(ctx.run_id, fingerprint),
         }
 
+    def complete_run_spaces(self, run_id: str) -> None:
+        del run_id
+
 
 class PrivatePathInvalidationTests(unittest.TestCase):
     def setUp(self) -> None:
