@@ -51,14 +51,20 @@ def _plan_bytes(*, a_goal: str = "emit a.txt") -> bytes:
                 "id": "lane-a",
                 "needs": [],
                 "outputs": ["a.txt"],
-                "spec": {"goal": a_goal},
+                "spec": {
+                    "goal": a_goal,
+                    "integration": {"integration_branch": "refs/heads/main"},
+                },
                 "acceptance": ["a.txt is written"],
             },
             {
                 "id": "lane-b",
                 "needs": ["lane-a"],
                 "outputs": ["b.txt"],
-                "spec": {"goal": "emit b.txt after a"},
+                "spec": {
+                    "goal": "emit b.txt after a",
+                    "integration": {"integration_branch": "refs/heads/main"},
+                },
                 "acceptance": ["b.txt is written"],
             },
         ],
@@ -571,7 +577,7 @@ class FactoryCutoverTests(unittest.TestCase):
             runtime=self.runtime,
             target=target,
         )
-        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.BUILDING)
+        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.TESTS_SEALED)
 
         class ResumeActor(ScriptedActor):
             def review_tests(self, ctx):
@@ -778,7 +784,7 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(record.kind, st.ArtifactKind.PLAN_AMENDMENT)
         self.assertFalse(sch._has_publication(self.store, run_id))
         self.assertEqual(self.store.lane_stage(run_id, "lane-a"), st.LaneStage.PLANNED)
-        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.BUILDING)
+        self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.TESTS_SEALED)
         follow = sch.FactoryScheduler(
             self.store,
             run_id,

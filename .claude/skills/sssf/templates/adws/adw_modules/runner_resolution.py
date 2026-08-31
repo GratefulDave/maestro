@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -549,3 +550,261 @@ def write_record(path: Path, resolved: Iterable[ResolvedRunner]) -> None:
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+
+
+#: How long a draft preflight may spend enumerating. Collection never runs
+#: bodies; this bound is only against a hung importer.
+COLLECT_TIMEOUT_S = 120.0
+
+#: Draft collect runs in a vault worktree: a git checkout of integration.
+#: Gitignored runtime deps are absent there. Resolving vitest from the
+#: product repo and listing in the vault is not enough — measured 2026-08-30
+#: against FDAdb integration (Vitest 3.2.7, bun.lock, alias `@` → `./src`):
+#: product cwd lists cases; vault cwd without `node_modules` exits 1 with
+#: `ERR_MODULE_NOT_FOUND: Cannot find package 'vitest'` while loading
+#: `vitest.config.ts`. Linking the product's `node_modules` into the collect
+#: tree is the repair. Private files stay in the vault.
+COLLECT_RUNTIME_DIRS: Tuple[str, ...] = ("node_modules",)
+COLLECT_DETAIL_CHARS = 1800
+COLLECT_DETAIL_LINES = 20
+COLLECT_DETAIL_LINE_CHARS = 220
+
+
+class CollectFailed(RuntimeError):
+    """Native collect/list did not enumerate. Fail closed; do not guess."""
+
+    def __init__(
+        self,
+        runner: str,
+        *,
+        returncode: Optional[int] = None,
+        detail: str = "",
+    ) -> None:
+        self.runner = runner
+        self.returncode = returncode
+        self.detail = detail or "{0} collect refused".format(runner)
+        super().__init__(self.detail)
+
+
+def prepare_collect_tree(runtime_root: Path, tree: Path) -> Tuple[Path, ...]:
+    """Expose `runtime_root`'s collect deps inside `tree`. Never copies tests."""
+    runtime_root = Path(runtime_root).resolve()
+    tree = Path(tree).resolve()
+    if runtime_root == tree:
+        return ()
+    linked: List[Path] = []
+    for name in COLLECT_RUNTIME_DIRS:
+        src = runtime_root / name
+        dest = tree / name
+        if not src.is_dir() or dest.exists() or dest.is_symlink():
+            continue
+        dest.symlink_to(src.resolve(), target_is_directory=True)
+        linked.append(dest)
+    return tuple(linked)
+
+
+def bounded_collect_output(
+    stdout: str,
+    stderr: str,
+    *,
+    hide: Sequence[str] = (),
+) -> str:
+    """Runner refuse text for humans. Caps size; drops code frames; not source."""
+    chunks: List[str] = []
+    for raw in (stderr, stdout):
+        text = _ANSI.sub("", raw or "")
+        if text.strip():
+            chunks.append(text)
+    blob = "\n".join(chunks)
+    for token in sorted((item for item in hide if item), key=len, reverse=True):
+        blob = blob.replace(token, "$tree")
+    lines: List[str] = []
+    for line in blob.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "│" in stripped:
+            continue
+        if set(stripped) <= set("^~"):
+            continue
+        if len(stripped) > COLLECT_DETAIL_LINE_CHARS:
+            stripped = stripped[:COLLECT_DETAIL_LINE_CHARS] + "…"
+        lines.append(stripped)
+        if len(lines) >= COLLECT_DETAIL_LINES:
+            break
+    out = "\n".join(lines)
+    if len(out) > COLLECT_DETAIL_CHARS:
+        out = out[:COLLECT_DETAIL_CHARS] + "…"
+    return out
+
+
+def _collect_refuse_detail(
+    runner: str,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    *,
+    hide: Sequence[str] = (),
+) -> str:
+    snippet = bounded_collect_output(stdout, stderr, hide=hide)
+    head = "{0} collect refused exit {1}".format(runner, returncode)
+    if not snippet:
+        return head
+    return "{0}: {1}".format(head, snippet)
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def collected_identifiers(stdout: str) -> Tuple[str, ...]:
+    """Case identifiers from native collect/list stdout. Never source regex.
+
+    pytest `--collect-only -q` prints `path::case` per collected item.
+    vitest `list --run` prints `path > title` (or `path::title`) per item.
+    Summary lines carry neither marker.
+    """
+    found: List[str] = []
+    for line in (stdout or "").splitlines():
+        token = _ANSI.sub("", line).strip()
+        if not token or token.startswith(("=", "-", "[")):
+            continue
+        if "::" in token or " > " in token:
+            found.append(token)
+    return tuple(found)
+
+
+def collect_cases(
+    resolved: ResolvedRunner,
+    gate: Any,
+    tree: Path,
+    *,
+    timeout_s: float = COLLECT_TIMEOUT_S,
+    env: Optional[Mapping[str, str]] = None,
+    runtime_root: Optional[Path] = None,
+) -> Tuple[str, ...]:
+    """Enumerate gate selectors on `tree`. Never executes case bodies."""
+    cwd = Path(tree) / str(getattr(gate, "cwd", None) or ".")
+    if not cwd.is_dir():
+        raise CollectFailed(
+            resolved.runner,
+            detail="the gate's working directory does not exist: {0}".format(cwd),
+        )
+    if runtime_root is not None:
+        try:
+            prepare_collect_tree(runtime_root, tree)
+        except OSError as extra:
+            raise CollectFailed(
+                resolved.runner,
+                detail="{0} could not link collect runtime from {1}".format(
+                    resolved.runner, runtime_root
+                ),
+            ) from extra
+    argv = resolved.collect_argv(gate)
+    merged = dict(os.environ)
+    if env is not None:
+        merged.update(env)
+    merged["PYTEST_ADDOPTS"] = ""
+    try:
+        result = subprocess.run(
+            list(argv),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=merged,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as extra:
+        raise CollectFailed(
+            resolved.runner,
+            detail="{0} did not finish collecting in {1}s".format(
+                resolved.runner, timeout_s
+            ),
+        ) from extra
+    except OSError as extra:
+        raise CollectFailed(
+            resolved.runner,
+            detail="{0} could not be run".format(resolved.runner),
+        ) from extra
+    capable = CAPABLE_EXIT.get(resolved.runner)
+    if result.returncode not in (0, capable):
+        hide = (str(cwd), str(cwd.resolve()), str(Path(tree)), str(Path(tree).resolve()))
+        raise CollectFailed(
+            resolved.runner,
+            returncode=result.returncode,
+            detail=_collect_refuse_detail(
+                resolved.runner,
+                result.returncode,
+                result.stdout or "",
+                result.stderr or "",
+                hide=hide,
+            ),
+        )
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    return collected_identifiers(output)
+
+
+EXECUTE_TIMEOUT_S = 120.0
+
+
+def execute_cases(
+    resolved: ResolvedRunner,
+    gate: Any,
+    tree: Path,
+    *,
+    timeout_s: float = EXECUTE_TIMEOUT_S,
+    env: Optional[Mapping[str, str]] = None,
+    runtime_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Run gate selectors on `tree`. Broker-owned; never guesses the binary."""
+    cwd = Path(tree) / str(getattr(gate, "cwd", None) or ".")
+    if not cwd.is_dir():
+        return {
+            "output": "the gate's working directory does not exist: {0}".format(cwd),
+            "returncode": -1,
+        }
+    if runtime_root is not None:
+        try:
+            prepare_collect_tree(runtime_root, tree)
+        except OSError as extra:
+            return {
+                "output": "{0} could not link execute runtime from {1}".format(
+                    resolved.runner, runtime_root
+                ),
+                "returncode": -1,
+            }
+    argv = resolved.execute_argv(tuple(getattr(gate, "argv", ()) or ()))
+    merged = dict(os.environ)
+    if env is not None:
+        merged.update(env)
+    merged["PYTEST_ADDOPTS"] = ""
+    merged["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    try:
+        result = subprocess.run(
+            list(argv),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=merged,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as extra:
+        del extra
+        return {
+            "output": "{0} did not finish executing in {1}s".format(
+                resolved.runner, timeout_s
+            ),
+            "returncode": -1,
+        }
+    except OSError as extra:
+        del extra
+        return {
+            "output": "{0} could not be run".format(resolved.runner),
+            "returncode": -1,
+        }
+    return {
+        "output": (result.stdout or "") + "\n" + (result.stderr or ""),
+        "returncode": result.returncode,
+    }
+

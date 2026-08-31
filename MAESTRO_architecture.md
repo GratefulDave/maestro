@@ -14,10 +14,10 @@ This document is the executable architecture. Runtime source must implement it d
 
 1. `deep-interview`, `arch-brownfield`, `planf3`, and `arch-review` produce one approved executable plan revision.
 2. The plan compiler validates only objective properties (§7).
-3. Every ready lane executes private test author → test review → test sealing → builder → code review.
+3. Untyped lanes execute the universal private test author → test review → test sealing → builder → code review lifecycle. An authored `lane_kind=tests` lane routes `PLANNED → WRITING_TESTS → REVIEWING_TESTS → TESTS_SEALED → MERGED` and emits `SEALED_TEST_BUNDLE` without builder, code review, or integration merge. An authored `lane_kind=build` lane routes `PLANNED → BUILDING → REVIEWING_CODE → READY_TO_MERGE → MERGED`, skipping test author and test reviewer. Absent `lane_kind` keeps the universal lifecycle.
 4. A reviewer `REVISE` verdict returns to the author or builder with actionable, redacted feedback. A `PASS` verdict advances the lane.
-5. Accepted lane commits merge exactly once into one run-specific integration branch.
-6. A dependent lane starts from the integration commit containing every merged dependency.
+5. Accepted **build** and untyped lane commits merge exactly once into one run-specific integration branch. A typed tests lane is `MERGED` after `SEALED_TEST_BUNDLE`; dependents treat that current-revision sealed bundle as readiness instead of an integration merge receipt.
+6. A dependent lane starts when every predecessor is `MERGED`. Tests-kind dependencies supply the current-revision `SEALED_TEST_BUNDLE`; build-kind and untyped dependencies supply the current-revision `INTEGRATION_MERGE` receipt.
 7. When every lane is `MERGED`, a final reviewer evaluates the integration commit with all sealed tests. `PASS` permits exactly-once publication of that reviewed SHA to `main`; `REVISE` waits for a user amendment.
 8. Process death restarts the current incomplete stage from its last immutable input. A still-running role pane may reconnect as transport by proved identity. Unknown, mismatched, or dirty worktrees and unproved agents are refused.
 9. Every authenticated OMP or Claude role process remains visible in its host Herdr pane and receives only Bash. A mandatory hook runs each model-issued shell command in a disposable OrbStack/Docker container with no network, a read-only container root, scrubbed credentials, checkout-local scratch directories, hidden Git metadata, and only that role's stable worktree or private tree mounted writable. Sibling role trees, the target repository, runtime state, vaults, host credentials, coder installations, and publication state are absent. Missing Docker, image, hook, or confinement refuses launch.
@@ -58,19 +58,21 @@ Every legal lane advance is one of these edges. Trigger, required immutable inpu
 
 | Current stage | Trigger | Required immutable input | Emitted artifact | Reviewer verdict | Next stage |
 |---|---|---|---|---|---|
-| `PLANNED` | materialize lane plan | approved plan artifact, active plan digest/revision, lane spec digest, ordered `needs`, ordered declared outputs | `LANE_PLAN` | none | `WRITING_TESTS` |
+| `PLANNED` | materialize lane plan | approved plan artifact, active plan digest/revision, lane spec digest, ordered `needs`, ordered declared outputs | `LANE_PLAN` | none | `WRITING_TESTS` (untyped or `lane_kind=tests`); `BUILDING` when authored `lane_kind=build` |
 | `PLANNED` | explicit pause | complete `PLANNED` input | `USER_WAIT` (`wait_reason=PAUSE`) | none | `WAITING_FOR_USER` |
-| `WRITING_TESTS` | test author completes | current `LANE_PLAN`; latest actionable `TEST_REVIEW(REVISE)` or `NO_TEST_REVIEW` | `TEST_DRAFT` (private draft digest/reference plus public behavioral contract) | none | `REVIEWING_TESTS` |
+| `WRITING_TESTS` | test author completes | current `LANE_PLAN`; latest actionable `TEST_REVIEW(REVISE)` or `NO_TEST_REVIEW`; latest `TEST_INVALIDATION` newer than the latest `TEST_DRAFT`, or `NO_TEST_INVALIDATION` | `TEST_DRAFT` (private draft digest/reference plus public behavioral contract) | none | `REVIEWING_TESTS` |
 | `WRITING_TESTS` | explicit pause | complete `WRITING_TESTS` input | `USER_WAIT` (`PAUSE`) | none | `WAITING_FOR_USER` |
 | `REVIEWING_TESTS` | test reviewer accepts | current `LANE_PLAN` and `TEST_DRAFT` | `TEST_REVIEW` | `PASS` | `TESTS_SEALED` |
 | `REVIEWING_TESTS` | test reviewer rejects | current `LANE_PLAN` and `TEST_DRAFT` | `TEST_REVIEW` (actionable findings) | `REVISE` | `WRITING_TESTS` |
 | `REVIEWING_TESTS` | explicit pause | complete `REVIEWING_TESTS` input | `USER_WAIT` (`PAUSE`) | none | `WAITING_FOR_USER` |
-| `TESTS_SEALED` | seal accepted tests | current `LANE_PLAN`, `TEST_DRAFT`, passing `TEST_REVIEW` | `SEALED_TEST_BUNDLE` (vault digest/reference; private bytes absent from run repo and builder input) | none | `BUILDING` |
+| `TESTS_SEALED` | seal accepted tests | current `LANE_PLAN`, `TEST_DRAFT`, passing `TEST_REVIEW` | `SEALED_TEST_BUNDLE` (vault digest/reference; private bytes absent from run repo and builder input) | none | `BUILDING` (untyped); `MERGED` when authored `lane_kind=tests` |
 | `TESTS_SEALED` | explicit pause | complete `TESTS_SEALED` input | `USER_WAIT` (`PAUSE`) | none | `WAITING_FOR_USER` |
 | `BUILDING` | builder completes | exact `BUILDING` variant fingerprint (§8.6) | `BUILDER_OUTPUT` bound to plan revision, base SHA, sealed-test digest, immutable candidate ref/SHA | none | `REVIEWING_CODE` |
+| `BUILDING` | `CODE_REVIEW(REVISE)` and next declared-output tree byte-identical to the prior candidate | current `CODE_REVIEW(REVISE)` plus prior `BUILDER_OUTPUT` | none; refuses `NOOP_BUILDER_REVISION` before a new `BUILDER_OUTPUT` | none | remains `BUILDING` (review retained, reviewer not relaunched) |
 | `BUILDING` | explicit pause | complete `BUILDING` input | `USER_WAIT` (`PAUSE`) | none | `WAITING_FOR_USER` |
 | `REVIEWING_CODE` | code reviewer accepts | current `LANE_PLAN`, `SEALED_TEST_BUNDLE`, `BUILDER_OUTPUT`; builder base SHA; candidate ref/SHA | `CODE_REVIEW` (private test results retained for the reviewer; public payload redacted) | `PASS` | `READY_TO_MERGE` |
 | `REVIEWING_CODE` | code reviewer rejects | same as accept | `CODE_REVIEW` (redacted actionable findings) | `REVISE` | `BUILDING` |
+| `REVIEWING_CODE` | private-path collision | current `LANE_PLAN`, `SEALED_TEST_BUNDLE`, `BUILDER_OUTPUT`; builder base SHA; candidate ref/SHA | `TEST_INVALIDATION` (redacted actionable reason; prior artifacts remain immutable history) | none | `WRITING_TESTS` |
 | `REVIEWING_CODE` | explicit pause | complete `REVIEWING_CODE` input | `USER_WAIT` (`PAUSE`) | none | `WAITING_FOR_USER` |
 | `READY_TO_MERGE` | integration merge | current `BUILDER_OUTPUT` and passing `CODE_REVIEW`; builder base SHA; candidate ref/SHA; integration HEAD observed for this decision | `INTEGRATION_MERGE` (`before_sha`, accepted candidate SHA, `after_sha`) | none | `MERGED` |
 | `READY_TO_MERGE` | stale zero-delta base | stale `BUILDER_OUTPUT` and passing `CODE_REVIEW`; stale base/candidate SHA; newly observed integration HEAD | `BASE_INVALIDATION` | none | `BUILDING` |
@@ -82,19 +84,24 @@ Every legal lane advance is one of these edges. Trigger, required immutable inpu
 | `WRITING_TESTS` | `apply_amendment` unchanged unstarted dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | remains `WRITING_TESTS` |
 | `REVIEWING_TESTS` | `apply_amendment` unchanged unstarted dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | remains `REVIEWING_TESTS` |
 | `TESTS_SEALED` | `apply_amendment` unchanged unstarted dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | remains `TESTS_SEALED` |
-| `BUILDING` | `apply_amendment` unchanged started dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
-| `REVIEWING_CODE` | `apply_amendment` unchanged started dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
-| `READY_TO_MERGE` | `apply_amendment` unchanged started dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
+| `BUILDING` | `apply_amendment` unchanged started authored `build` dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
+| `BUILDING` | `apply_amendment` unchanged started untyped dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `TESTS_SEALED` |
+| `REVIEWING_CODE` | `apply_amendment` unchanged started authored `build` dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
+| `REVIEWING_CODE` | `apply_amendment` unchanged started untyped dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `TESTS_SEALED` |
+| `READY_TO_MERGE` | `apply_amendment` unchanged started authored `build` dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
+| `READY_TO_MERGE` | `apply_amendment` unchanged started untyped dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `TESTS_SEALED` |
 | `MERGED` | `apply_amendment` changed projection | canonical `PLAN_AMENDMENT` with changed `spec_digest` (hence `lane_projection_digest`); `needs`/output changes refused because the lane is already merged | `PLAN_AMENDMENT`; new `LANE_PLAN` required before authoring | none | `PLANNED` |
-| `MERGED` | `apply_amendment` unchanged already-merged dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
+| `MERGED` | `apply_amendment` unchanged already-merged authored `build` dependent | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `BUILDING` |
+| `MERGED` | `apply_amendment` unchanged already-merged untyped or authored `tests` lane | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT` | none | `TESTS_SEALED` |
 | `WAITING_FOR_USER` | `run resume` after `PAUSE` | matching `USER_DECISION` over the recorded `USER_WAIT` | `USER_DECISION` | none | recorded `resume_stage` with recorded complete input |
 | `WAITING_FOR_USER` | `run amend` after `AMENDMENT_REQUIRED` | `PLAN_AMENDMENT` that changes `spec_digest` of every named lane (hence `lane_projection_digest`); named lanes are already `MERGED` so `needs`/output changes are refused | `PLAN_AMENDMENT` | none | `PLANNED` |
-| `WAITING_FOR_USER` | `apply_amendment` while independently `PAUSE`-waiting | canonical `PLAN_AMENDMENT` | replacement `USER_WAIT` plus amendment decision naming the invalidated input digest and policy-selected restart stage | none | remains `WAITING_FOR_USER` |
+| `WAITING_FOR_USER` | `apply_amendment` changed projection while independently `PAUSE`-waiting | canonical `PLAN_AMENDMENT` | `PLAN_AMENDMENT`; new `LANE_PLAN` required before authoring | none | `PLANNED` |
+| `WAITING_FOR_USER` | `apply_amendment` unchanged projection while independently `PAUSE`-waiting | canonical `PLAN_AMENDMENT` | replacement `USER_WAIT` plus amendment decision naming the invalidated input digest and policy-selected restart stage | none | remains `WAITING_FOR_USER` |
 | `WAITING_FOR_USER` | bare `run resume` after `AMENDMENT_REQUIRED` | none accepted | none | none | remains `WAITING_FOR_USER` |
 
-Normal test-review and code-review repairs do not require plan amendments. They loop directly to `WRITING_TESTS` or `BUILDING`.
+Normal test-review and code-review repairs do not require plan amendments. They loop directly to `WRITING_TESTS` or `BUILDING`. Private-path collision invalidation also loops to `WRITING_TESTS` without a plan amendment.
 
-`BASE_INVALIDATION` never pauses the lane.
+`BASE_INVALIDATION` and `TEST_INVALIDATION` never pause the lane.
 
 ---
 
@@ -117,7 +124,7 @@ A `REVISE` finding must not include:
 - expected literals
 - vault paths
 
-The builder receives the lane contract, architecture constraints, allowed paths, prior redacted review feedback, and the sealed digest. It does not receive private source or vault paths.
+The builder receives only its own product lane spec, public criteria, declared outputs, predecessor sealed-bundle ID and digest, architecture constraints, allowed paths, and prior redacted review feedback. It does not receive private source, vault paths, private manifests, or tests-lane declared paths. `REVIEWING_CODE` runs the predecessor sealed suite in scratch; that broker result is authoritative for the candidate.
 
 The adversarial reviewer of this factory itself must reject undeclared durable state, duplicate stage/identity representations, unproved live-process or dirty-worktree adoption, durable `actor_sessions` or actor generations, pane occupancy as acceptance, abstractions not required by the two-lane slice, speculative failure handling without a named acceptance scenario, budgets that prevent explicit user continuation, generic reachability or semantic heuristics used as hard workflow authority, private-test leakage, non-actionable feedback, plumbing-only tests, more than one merge of an accepted lane artifact, and scope expansion claimed as simplification.
 
@@ -137,17 +144,18 @@ A final-review `REVISE` appends `USER_WAIT` with `wait_reason=AMENDMENT_REQUIRED
 
 ### Changed versus unchanged lanes
 
-A changed lane is one whose canonical spec, ordered `needs`, or ordered declared outputs differ, and therefore whose `lane_projection_digest` changes. It restarts at `PLANNED`, invalidates every former input, and creates a new `LANE_PLAN` before test authoring. No input from a changed projection may be retained.
+A changed lane is one whose canonical spec, ordered `needs`, ordered declared outputs, or authored `lane_kind` differ, and therefore whose `lane_projection_digest` changes. Absent `lane_kind` keeps the legacy digest identity. It restarts at `PLANNED`, invalidates every former input, and creates a new `LANE_PLAN` before the typed or untyped next stage. No input from a changed projection may be retained. Changed-projection reset to `PLANNED` takes precedence over pause preservation.
 
 An unchanged transitive dependent whose implementation has not started (`PLANNED`, `WRITING_TESTS`, `REVIEWING_TESTS`, or `TESTS_SEALED`) keeps its current stage. Its spec/test artifacts remain valid. Its eventual builder reads the new integration HEAD.
 
-An unchanged transitive dependent at `BUILDING`, `REVIEWING_CODE`, or `READY_TO_MERGE` restarts at `BUILDING` from its accepted test bundle because its dependency base changed.
+An unchanged authored `build` dependent at `BUILDING`, `REVIEWING_CODE`, `READY_TO_MERGE`, or `MERGED` restarts at `BUILDING` because its dependency base changed. An unchanged untyped dependent at those stages resets to `TESTS_SEALED` so the scheduler re-emits a current-revision `SEALED_TEST_BUNDLE` and then continues `BUILDING`.
 
-An affected lane that was independently paused with `wait_reason=PAUSE` stays `WAITING_FOR_USER`. Amendment atomically appends a replacement `USER_WAIT` plus an amendment decision entry naming the invalidated input digest and policy-selected restart stage. Resume remains blocked until dependencies have re-merged, then derives the new complete immutable input fingerprint, appends `USER_DECISION`, and restores that restart stage. It never exact-replays the stale pre-amendment input or silently discards the pause. This rule does not apply to a final-review `AMENDMENT_REQUIRED` wait, which resolves only through the changed-projection `PLANNED` reset.
+An unchanged lane that was independently paused with `wait_reason=PAUSE` stays `WAITING_FOR_USER`. Amendment atomically appends a replacement `USER_WAIT` plus an amendment decision entry naming the invalidated input digest and policy-selected restart stage. Resume remains blocked until dependencies have re-merged, then derives the new complete immutable input fingerprint, appends `USER_DECISION`, and restores that restart stage. It never exact-replays the stale pre-amendment input or silently discards the pause. A changed paused lane resets to `PLANNED` instead. This rule does not apply to a final-review `AMENDMENT_REQUIRED` wait, which resolves only through the changed-projection `PLANNED` reset.
 
-An unchanged dependent already at `MERGED` is atomically reset to `BUILDING` by `apply_amendment`, in the same transaction that selects the new plan revision. It is durably nonterminal immediately, but the normal `needs` predicate prevents builder dispatch until every amended upstream dependency has re-merged. Its builder may then emit a measured-zero-delta `BUILDER_OUTPUT` whose candidate SHA equals the new integration base. Code review still runs. A passing no-change result advances through `READY_TO_MERGE` using an `INTEGRATION_MERGE` artifact with `before_sha == candidate_sha == after_sha` and `revalidated=true`; no dummy commit is created.
+An unchanged authored `build` dependent already at `MERGED` is atomically reset to `BUILDING` by `apply_amendment`, in the same transaction that selects the new plan revision. An unchanged authored `lane_kind=tests` lane, and an unchanged untyped lane already at `MERGED`, reset to `TESTS_SEALED` so the scheduler re-emits a current-revision `SEALED_TEST_BUNDLE`; typed tests then return `MERGED` before dependent builds start, untyped then continue `BUILDING`. A build lane is durably nonterminal immediately, but the normal `needs` predicate prevents builder dispatch until every amended upstream dependency has re-merged. Its builder may then emit a measured-zero-delta `BUILDER_OUTPUT` whose candidate SHA equals the new integration base. Code review still runs. A passing no-change result advances through `READY_TO_MERGE` using an `INTEGRATION_MERGE` artifact with `before_sha == candidate_sha == after_sha` and `revalidated=true`; no dummy commit is created.
 
 Every lane named by a final-review `REVISE` is a changed lane: after a valid pre-publication amendment it restarts at `PLANNED`, creates a revised `LANE_PLAN`, and later supersedes its prior integration content without rewriting history. There is no discretionary unchanged-projection reset for a final-review finding.
+
 
 ### Topology and publication immutability
 
@@ -178,6 +186,8 @@ No mutable `latest_outcome`, scheduler PID/host/claim, cancellation cause, revie
 The compiler admits a plan if and only if all of the following hold. It does not judge produced-symbol reachability, narrative quality, or other generic semantics.
 
 - Schema and required fields are present and well-typed.
+- Optional authored `lane_kind` is only `tests` or `build`. Absent `lane_kind` is the legacy universal lifecycle. `lane_projection_digest` includes `lane_kind` only when authored.
+- An authored `build` lane has exactly one direct `tests` dependency and may additionally depend on `build` lanes.
 - Every `needs` ID exists in the same plan.
 - The dependency graph is acyclic.
 - Declared outputs are exact normalized repository-relative POSIX file paths, never directories or globs.
@@ -237,7 +247,7 @@ The only mutable lane authority: `(run_id, lane_id)` primary key; `stage` constr
 
 Append-only. `artifact_id` is SHA-256 of the canonical immutable artifact envelope. Unique `(run_id, lane_id, sequence)`. Completion key `(run_id, lane_id, plan_revision, completed_stage, input_digest)` unique.
 
-Required kinds: `LANE_PLAN`, `TEST_DRAFT`, `TEST_REVIEW`, `SEALED_TEST_BUNDLE`, `BUILDER_OUTPUT`, `CODE_REVIEW`, `INTEGRATION_MERGE`, `BASE_INVALIDATION`, `USER_WAIT`, `USER_DECISION`.
+Required kinds: `LANE_PLAN`, `TEST_DRAFT`, `TEST_REVIEW`, `SEALED_TEST_BUNDLE`, `BUILDER_OUTPUT`, `CODE_REVIEW`, `INTEGRATION_MERGE`, `BASE_INVALIDATION`, `TEST_INVALIDATION`, `USER_WAIT`, `USER_DECISION`.
 
 Private bytes are never stored in SQLite or the run repository. Byte-identical replay returns the existing row. Different content for the same completion key is a hard refusal.
 
@@ -250,7 +260,7 @@ Every fingerprint is SHA-256 over UTF-8 canonical JSON with schema version `1`, 
 | Stage/event | Additional canonical input members |
 |---|---|
 | `PLANNED` | approved `plan_artifact_ref`, canonical `needs` ordered by lane ID, canonical declared outputs ordered by path |
-| `WRITING_TESTS` | current `LANE_PLAN` artifact ID and latest actionable `TEST_REVIEW(REVISE)` artifact ID, or `NO_TEST_REVIEW` on first entry |
+| `WRITING_TESTS` | current `LANE_PLAN` artifact ID and latest actionable `TEST_REVIEW(REVISE)` artifact ID, or `NO_TEST_REVIEW` on first entry; latest `TEST_INVALIDATION` artifact ID newer than the latest `TEST_DRAFT`, or `NO_TEST_INVALIDATION`; durable run integration tip (`integration_head`) |
 | `REVIEWING_TESTS` | current `LANE_PLAN` and `TEST_DRAFT` artifact IDs |
 | `TESTS_SEALED` | current `LANE_PLAN`, `TEST_DRAFT`, and passing `TEST_REVIEW` artifact IDs |
 | `BUILDING` | exact `entry_kind` plus the members below |
@@ -312,11 +322,15 @@ uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> -
 
 The executing runtime must be a deployment whose canonical Git common directory equals the `--repo` worktree's canonical Git common directory. `--repo` is the dedicated publication worktree, distinct from implementation-agent worktrees and from Maestro/the-library template trees. Invoking run creation from a template source refuses `RUN_REPOSITORY_MISMATCH`.
 
-`target_repository_root` is the canonical realpath of the exact non-bare publication worktree passed by `--repo`. Implementation agents never edit it. Run creation refuses unless its symbolic `HEAD` is the configured main ref. Recorded equalities: `integration_initial_sha == target_initial_main_sha == <resolved target_main_ref SHA>`.
+`target_repository_root` is the canonical realpath of the exact non-bare publication worktree passed by `--repo`. Implementation agents never edit it. Run creation refuses unless its symbolic `HEAD` is the configured main ref. Every lane spec must declare one consistent safe `spec.integration.integration_branch`. Run creation resolves that branch once and pins its SHA as `integration_initial_sha`. `target_initial_main_sha` remains the separately recorded publication-main SHA and may differ.
 
-The committed row owns integration ref `refs/maestro/integration/<run-id>`, created with `git update-ref` from zero to `integration_initial_sha`. An existing ref at any other SHA refuses `INTEGRATION_REF_COLLISION`.
+The committed row owns integration ref `refs/maestro/integration/<run-id>`, created with `git update-ref` from zero to `integration_initial_sha`. An existing ref at any other SHA refuses `INTEGRATION_REF_COLLISION`. Tester worktrees and writing-test input identity use the durable run integration tip. Builders never receive private tests.
+
+Scheduler start recovers a present `locks/legacy_integration_retarget.<run-id>.json` journal first: finish any Git/SQLite split of that retarget, restore the in-memory binding, hold lock 2, then unlink. Only then reconcile an orphaned integration merge, apply an ordinary plan-branch legacy-base correction, and ensure the run integration ref. The correction writes the journal, CAS-updates the integration ref, CAS-updates `runs.integration_initial_sha`, then unlinks. Unsafe rebase when any of `BUILDER_OUTPUT`, `CODE_REVIEW`, `INTEGRATION_MERGE`, `BASE_INVALIDATION`, `FINAL_INTEGRATION_REVIEW`, or `MAIN_PUBLICATION` exists refuses `LEGACY_INTEGRATION_REBASE_UNSAFE`. Correction while any lane is `REVIEWING_TESTS` is deferred. `TEST_REVIEW` including `REVISE` is not an unsafe kind; an active run may still migrate after that artifact.
 
 The deployment-owned `adws/maestro.config.yaml` requires one absolute `runtime_state_root`. The deployed CLI canonicalizes and opens that existing directory without following symlinks, requires mode `0700`, and refuses if it is inside or overlaps the target repository root, any target Git/worktree directory, or either template-source checkout. `runtime_state_fingerprint` is SHA-256 over canonical realpath, device, and inode and is bound into every run. Every start, resume, amend, status, and publication operation revalidates it before reading or mutating run state.
+
+New installations stamp `dashboard: {enabled, launcher absolute from the installed skill, api_port 4600, ui_port 4317, open}`. Old, missing, or invalid dashboard config warns and fails open. The launcher reuses only owned processes, never kills unknown port owners, ensures the Bun API `/api/sources` list contains the current canonical ledger plus Next `/runs` readiness, then opens `/runs`. API/UI logs and pid ownership live under user cache.
 
 The ledger (`lifecycle.sqlite3` plus WAL/SHM), immutable file artifacts, private vault, locks, receipts, plans copied for execution, and stable role-scoped working-tree roots live only under that runtime-state root.
 
@@ -336,10 +350,14 @@ If the scheduler process dies before the stage-specific durable boundary, resume
 
 Reuse `hidden_vault.py` and its object-database isolation.
 
-- Test author and test reviewer can access the private draft repository.
+Untyped private tester files are independent hidden meta-tests. They must not collide with declared builder/product outputs. An authored `lane_kind=tests` tester authors private acceptance files exactly at that lane's declared output paths; the returned private-file set must equal those outputs before `TEST_DRAFT`.
+
+- Test author and test reviewer can access the private draft repository. The test reviewer receives the tests lane spec and private overlay.
+- New `TEST_DRAFT` and `SEALED_TEST_BUNDLE` artifacts bind hidden files by `private-manifest.v1` digest without publishing paths. Legacy drafts without that marker safely filter to the declared-output fallback.
 - On `PASS`, seal the accepted bundle into the vault and record only digest/reference plus public behavioral contract.
-- Builder gets no private source or vault path.
-- Code reviewer receives the candidate commit and controlled vault access, runs private tests, and emits only verdict, public result summary, and redacted findings.
+- A typed builder gets predecessor bundle ID and digest plus its own product contract. It never receives private source, vault path, or tests-lane paths.
+- Code reviewer receives the candidate commit and controlled vault access, runs the predecessor sealed suite in scratch, and emits only verdict, public result summary, and redacted findings.
+- On an untyped lane, a candidate collision raises typed `PRIVATE_PATH_COLLISION`. `REVIEWING_CODE` durably emits `TEST_INVALIDATION`, atomically resets the lane to `WRITING_TESTS`, passes the redacted actionable reason to the persistent tester, and leaves prior artifacts as immutable history. Other `IsolationError` failures fail closed. Typed build review overlays the predecessor suite even when those paths exist in the candidate.
 - Private objects must be absent from the run repo, builder worktree, refs, rev-list, and fetch paths.
 
 ---
@@ -356,7 +374,7 @@ Final reviewer evaluates the exact integration HEAD against the active plan revi
 
 Publication is exactly-once and receipt-backed: immutable `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus `MAIN_PUBLICATION`. `main` reaching the same SHA without Maestro's receipt is external activity and refuses `PUBLICATION_EXTERNAL_MISMATCH`, never inferred as successful publication.
 
-A crash after Git mutation but before ledger commit is idempotently reconciled from exact SHA/receipt evidence without adopting process state.
+A crash after Git mutation but before ledger commit is idempotently reconciled from exact SHA/receipt evidence without adopting process state, including a present `locks/legacy_integration_retarget.<run-id>.json` journal.
 
 ---
 
@@ -372,10 +390,12 @@ uv run adws/maestro.py run status <run-id>
 
 ```
 
-- `run start` creates the run, initial plan revision, complete DAG projection, and initial `PLANNED` lane states in one transaction, then creates the integration ref from zero.
+- `run start` creates the run, initial plan revision, complete DAG projection, and initial `PLANNED` lane states in one transaction after pinning `integration_initial_sha` from the plan's declared integration branch, then creates the integration ref from zero to that SHA.
 - `run resume` continues the next incomplete stage from the last accepted immutable artifact. After an explicit `PAUSE`, it restores the recorded stage/input. After `AMENDMENT_REQUIRED`, it leaves the lane waiting.
 - `run amend <approved-plan> --run <run-id>` is the only verb that may apply a `PLAN_AMENDMENT`.
 - `run status` derives §6 from durable rows after revalidating `runtime_state_fingerprint`.
+
+`run start` after ledger registration and `run resume` after binding detach the configured Next.js dashboard launcher. The scheduler is never blocked. `run amend` and `run status` do not launch.
 
 An explicit pause records `USER_WAIT` as specified in §5. Publication after a passing final review is the runtime's exactly-once receipt step, not a second stage enum.
 
@@ -428,18 +448,20 @@ Every required scenario is proved by named transitions. A transition without a s
 | Required scenario | Proving transitions |
 |---|---|
 | Private test-author / test-reviewer revision loop | `PLANNED → WRITING_TESTS` (`LANE_PLAN`); `WRITING_TESTS → REVIEWING_TESTS` (`TEST_DRAFT`); `REVIEWING_TESTS` `REVISE` → `WRITING_TESTS`; `REVIEWING_TESTS` `PASS` → `TESTS_SEALED` |
-| Accepted tests are sealed and hidden from the implementation builder | `TESTS_SEALED → BUILDING` (`SEALED_TEST_BUNDLE`); builder input fingerprint contains the digest and public contract only; absence from run repo and builder worktree |
+| Accepted tests are sealed and hidden from implementation builders | Untyped `TESTS_SEALED → BUILDING`; authored `lane_kind=tests` `TESTS_SEALED → MERGED`; `SEALED_TEST_BUNDLE` contains vault digest/reference while private bytes stay absent from run repo and builder worktree; a typed build receives only the predecessor bundle ID/digest |
+| Private tester collision with a candidate product path invalidates the sealed tests | `REVIEWING_CODE` → `WRITING_TESTS` (`TEST_INVALIDATION`); redacted reason to the persistent tester; prior artifacts retained; other `IsolationError` fail closed |
 | Builder / code-reviewer revision loop with actionable redacted feedback | `BUILDING → REVIEWING_CODE` (`BUILDER_OUTPUT`); `REVIEWING_CODE` `REVISE` → `BUILDING` (`CODE_REVISE` input); `REVIEWING_CODE` `PASS` → `READY_TO_MERGE` |
-| Each accepted lane merges exactly once into the integration branch | `READY_TO_MERGE → MERGED` (`INTEGRATION_MERGE`); completion-key uniqueness; changing merge CAS; zero-delta revalidation creates no second commit |
-| Dependent lane execution uses the accepted integration artifact | `BUILDING` input selects, for each direct `needs` lane ordered by lane ID, that lane's highest-sequence `INTEGRATION_MERGE` that most recently completed its current `MERGED` state and whose `after_sha` is an ancestor of captured `builder_base_sha`; ready predicate requires `needs` `MERGED` |
+| Byte-identical builder revision after `CODE_REVIEW(REVISE)` is refused | lane stays `BUILDING`; `NOOP_BUILDER_REVISION` before a new `BUILDER_OUTPUT`; review retained; reviewer not relaunched |
+| Each accepted build or untyped lane merges exactly once into the integration branch | `READY_TO_MERGE → MERGED` (`INTEGRATION_MERGE`); completion-key uniqueness; changing merge CAS; zero-delta revalidation creates no second commit. An authored tests lane becomes `MERGED` at seal and emits no `INTEGRATION_MERGE` |
+| Dependent lane execution uses the typed predecessor receipt | A tests-kind dependency supplies its current-revision `SEALED_TEST_BUNDLE`; a build-kind or untyped dependency supplies its current-revision `INTEGRATION_MERGE`. The ready predicate also requires every `needs` lane to be `MERGED` |
 | All completed lanes receive final integration review before publication to main | derived status “integration review pending”; `complete_final_review`; `PASS` then `complete_publication`; `REVISE` → named lanes `WAITING_FOR_USER` |
 | Interrupted work resumes from its last immutable completed-stage artifact | death before `complete_stage` commit: rediscover the proved persistent role, live-check it, and resubmit the current stage from the last immutable input without replacing its role tree/session; confirmed dead or typed `agent_not_found`: recreate the role; death after commit: read advanced stage; refuse legacy stage/attempt, malformed, unreachable, mismatched, dirty-boundary, or unproved observations |
-| User amendment: a changed lane invalidates every former input and restarts its changed projection at `PLANNED`; `AMENDMENT_REQUIRED` named lanes are already `MERGED` and go `WAITING_FOR_USER` → `PLANNED` on `run amend` with changed `spec_digest`; unchanged unstarted dependents keep `PLANNED`/`WRITING_TESTS`/`REVIEWING_TESTS`/`TESTS_SEALED`; unchanged `BUILDING`/`REVIEWING_CODE`/`READY_TO_MERGE` and already-`MERGED` dependents revalidate from `BUILDING`; independently `PAUSE`-waiting lanes stay `WAITING_FOR_USER` | `apply_amendment` edges in §3 and policy in §5; `PAUSE` waits remain explicit; `AMENDMENT_REQUIRED` ignores bare resume |
+| User amendment: a changed lane invalidates every former input and restarts its changed projection at `PLANNED`; `AMENDMENT_REQUIRED` named lanes are already `MERGED` and go `WAITING_FOR_USER` → `PLANNED` on `run amend` with changed `spec_digest`; unchanged unstarted dependents keep `PLANNED`/`WRITING_TESTS`/`REVIEWING_TESTS`/`TESTS_SEALED`; unchanged authored `build` dependents at `BUILDING`/`REVIEWING_CODE`/`READY_TO_MERGE`/`MERGED` revalidate from `BUILDING`; unchanged untyped started/merged lanes and unchanged already-`MERGED` authored `tests` lanes reset to `TESTS_SEALED`; independently `PAUSE`-waiting lanes stay `WAITING_FOR_USER` | `apply_amendment` edges in §3 and policy in §5; `PAUSE` waits remain explicit; `AMENDMENT_REQUIRED` ignores bare resume |
 | Stale integration base on a zero-delta candidate does not publish a dummy commit | `READY_TO_MERGE` → `BUILDING` via `BASE_INVALIDATION` |
 | Legacy execution is refused | open ledger → `LEDGER_SCHEMA_UNSUPPORTED` |
 | Template-source run creation is refused | `run start` from Maestro/the-library/template tree → `RUN_REPOSITORY_MISMATCH` |
 
-Two-lane vertical slice: lane A has no `needs`; lane B `needs` A. Independent author/review/build of A may proceed while B waits on `MERGED`. B's first `BUILDING` input includes A's `INTEGRATION_MERGE`. Final review runs only after both are `MERGED`.
+Two-lane vertical slice: untyped lane A has no `needs`; lane B `needs` A. Independent author/review/build of A may proceed while B waits on `MERGED`. B's first `BUILDING` input includes A's `INTEGRATION_MERGE`. Final review runs only after both are `MERGED`. A typed tests→build pair: the tests lane is `MERGED` after `SEALED_TEST_BUNDLE`; the build lane's first `BUILDING` input includes that current-revision sealed bundle, not an `INTEGRATION_MERGE`.
 
 ---
 
@@ -458,5 +480,6 @@ Two-lane vertical slice: lane A has no `needs`; lane B `needs` A. Independent au
 | `adws/maestro.py` | deployment CLI |
 | `adws/maestro.config.yaml` | deployment config |
 | `skills/sssf/templates/adws/` | the-library mirror of the template |
+| `.claude/skills/sssf/apps/dashboard/bin/maestro-dashboard` | detached Next.js dashboard launcher (observability only) |
 
 Herdr and OMP are transport for agent dispatch. Pane text, process liveness, idle status, and session directories are not workflow authority.

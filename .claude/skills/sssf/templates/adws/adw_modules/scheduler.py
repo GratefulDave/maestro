@@ -5,22 +5,27 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Protocol
 
 from . import code_review as cr
 from . import git_publication as gitpub
+from . import hidden_vault as hv
 from . import private_review as prv
+from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
 from .lifecycle import AmendmentRefused, ArtifactRecord, ArtifactStore, RunAlreadyExists
 from .runtime_state import RuntimeStateRoot
+
 
 TEMPLATE_MARKERS = (
     "/.claude/skills/sssf/templates/adws",
@@ -38,6 +43,24 @@ class PublicationWorktreeLockRefused(st.KernelError):
 
 class FactoryRefused(st.KernelError):
     code = "FACTORY_REFUSED"
+
+
+class DraftMinCasesRefused(FactoryRefused):
+    code = "DRAFT_MIN_CASES"
+
+    def __init__(self, collected: int, min_cases: int) -> None:
+        self.collected = collected
+        self.min_cases = min_cases
+        super().__init__("collected {0}, min_cases {1}".format(collected, min_cases))
+
+
+class DraftCollectionRefused(FactoryRefused):
+    code = "DRAFT_COLLECTION_REFUSED"
+
+
+
+class TypedTestOutputsRefused(FactoryRefused):
+    code = "TYPED_TEST_OUTPUTS"
 
 
 def classify_executing_runtime(maestro_file: Path) -> str:
@@ -87,6 +110,7 @@ def _latest(
     *,
     verdict: st.ReviewerVerdict | None = None,
     plan_revision: int | None = None,
+    projection_digest: str | None = None,
 ) -> Optional[ArtifactRecord]:
     sql = (
         "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=? "
@@ -94,6 +118,11 @@ def _latest(
     )
     for row in store.conn.execute(sql, (run_id, lane_id, kind.value)):
         if plan_revision is not None and row["plan_revision"] != plan_revision:
+            continue
+        if (
+            projection_digest is not None
+            and row["lane_projection_digest"] != projection_digest
+        ):
             continue
         payload = _loads(row["payload_json"])
         if verdict is None or payload.get("verdict") == verdict.value:
@@ -110,6 +139,32 @@ def _latest(
                 payload=payload,
             )
     return None
+
+
+
+def _writing_tests_predecessors(
+    store: ArtifactStore, run_id: str, lane_id: str
+) -> tuple[Optional[ArtifactRecord], Optional[ArtifactRecord], str, str]:
+    review = _latest(
+        store,
+        run_id,
+        lane_id,
+        st.ArtifactKind.TEST_REVIEW,
+        verdict=st.ReviewerVerdict.REVISE,
+    )
+    invalidation = _latest(
+        store, run_id, lane_id, st.ArtifactKind.TEST_INVALIDATION
+    )
+    draft = _latest(store, run_id, lane_id, st.ArtifactKind.TEST_DRAFT)
+    review_id = review.artifact_id if review is not None else st.NO_TEST_REVIEW
+    invalidation_id = st.active_test_invalidation_id(
+        invalidation_id=invalidation.artifact_id if invalidation is not None else None,
+        invalidation_sequence=invalidation.sequence if invalidation is not None else None,
+        draft_sequence=draft.sequence if draft is not None else None,
+    )
+    active = invalidation if invalidation_id != st.NO_TEST_INVALIDATION else None
+    return review, active, review_id, invalidation_id
+
 
 
 def run_row(store: ArtifactStore, run_id: str) -> Mapping[str, Any]:
@@ -137,24 +192,21 @@ def binding_from_run(row: Mapping[str, Any]) -> st.RunBinding:
 
 
 def target_from_binding(binding: st.RunBinding) -> gitpub.TargetBinding:
-    return gitpub.bind_target_worktree(
-        binding.target_repository_root, binding.target_main_ref
+    return gitpub.restore_target_initial_main_sha(
+        gitpub.restore_integration_sha(
+            gitpub.bind_target_worktree(
+                binding.target_repository_root, binding.target_main_ref
+            ),
+            binding.integration_initial_sha,
+        ),
+        binding.target_initial_main_sha,
     )
 
 
 def integration_merge_payloads(
     store: ArtifactStore, run_id: str
 ) -> tuple[Mapping[str, Any], ...]:
-    rows = store.conn.execute(
-        "SELECT a.payload_json FROM lane_artifacts AS a "
-        "JOIN transitions AS t "
-        "ON t.run_id = a.run_id AND t.lane_id = a.lane_id "
-        "AND t.artifact_id = a.artifact_id AND t.reason = 'complete_stage' "
-        "WHERE a.run_id=? AND a.artifact_kind=? "
-        "ORDER BY t.id ASC",
-        (run_id, st.ArtifactKind.INTEGRATION_MERGE.value),
-    )
-    return tuple(_loads(row[0]) for row in rows)
+    return store.integration_merge_payloads(run_id)
 
 
 def durable_integration_tip(store: ArtifactStore, run_id: str) -> str:
@@ -177,6 +229,207 @@ def ensure_run_integration_ref(
     tip = durable_integration_tip(store, run_id)
     gitpub.ensure_integration_ref(target, run_id, expected_tip=tip)
     return tip
+
+
+UNSAFE_LEGACY_REBASE_KINDS = frozenset(
+    {
+        st.ArtifactKind.BUILDER_OUTPUT,
+        st.ArtifactKind.CODE_REVIEW,
+        st.ArtifactKind.INTEGRATION_MERGE,
+        st.ArtifactKind.BASE_INVALIDATION,
+        st.ArtifactKind.FINAL_INTEGRATION_REVIEW,
+        st.ArtifactKind.MAIN_PUBLICATION,
+    }
+)
+
+
+def recorded_artifact_kinds(
+    store: ArtifactStore, run_id: str
+) -> tuple[st.ArtifactKind, ...]:
+    kinds: list[st.ArtifactKind] = []
+    for row in store.conn.execute(
+        "SELECT artifact_kind FROM lane_artifacts WHERE run_id=?",
+        (run_id,),
+    ):
+        kinds.append(st.ArtifactKind(row[0]))
+    for row in store.conn.execute(
+        "SELECT artifact_kind FROM run_artifacts WHERE run_id=?",
+        (run_id,),
+    ):
+        kinds.append(st.ArtifactKind(row[0]))
+    return tuple(kinds)
+
+
+def legacy_integration_correction_decision(
+    *,
+    stored_sha: str,
+    declared_sha: str,
+    lane_stages: Sequence[st.LaneStage],
+    artifact_kinds: Sequence[st.ArtifactKind],
+) -> str:
+    stored = st.require_git_sha(stored_sha, name="stored_sha")
+    declared = st.require_git_sha(declared_sha, name="declared_sha")
+    if stored == declared:
+        return "noop"
+    if st.LaneStage.REVIEWING_TESTS in lane_stages:
+        return "defer"
+    if any(kind in UNSAFE_LEGACY_REBASE_KINDS for kind in artifact_kinds):
+        return "refuse"
+    return "migrate"
+
+
+def legacy_retarget_journal_path(runtime_state_root: str | Path, run_id: str) -> Path:
+    return (
+        Path(runtime_state_root)
+        / "locks"
+        / f"legacy_integration_retarget.{run_id}.json"
+    )
+
+
+def _legacy_retarget_journal_payload(
+    run_id: str, from_sha: str, to_sha: str
+) -> dict[str, str]:
+    return {
+        "from_sha": st.require_git_sha(from_sha, name="from_sha"),
+        "run_id": run_id,
+        "to_sha": st.require_git_sha(to_sha, name="to_sha"),
+    }
+
+
+def _write_legacy_retarget_journal(
+    row: Mapping[str, Any], from_sha: str, to_sha: str
+) -> Path:
+    path = legacy_retarget_journal_path(row["runtime_state_root"], row["run_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_bytes(
+        st.canonical_bytes(
+            _legacy_retarget_journal_payload(row["run_id"], from_sha, to_sha)
+        )
+    )
+    os.replace(tmp, path)
+    return path
+
+
+def _read_legacy_retarget_journal(row: Mapping[str, Any]) -> Mapping[str, str] | None:
+    path = legacy_retarget_journal_path(row["runtime_state_root"], row["run_id"])
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_bytes())
+    if not isinstance(payload, Mapping):
+        raise FactoryRefused("LEGACY_INTEGRATION_RETARGET_JOURNAL_INVALID")
+    return _legacy_retarget_journal_payload(
+        str(payload.get("run_id") or ""),
+        str(payload.get("from_sha") or ""),
+        str(payload.get("to_sha") or ""),
+    )
+
+
+def _clear_legacy_retarget_journal(row: Mapping[str, Any]) -> None:
+    path = legacy_retarget_journal_path(row["runtime_state_root"], row["run_id"])
+    if path.is_file():
+        path.unlink()
+
+
+def _finish_legacy_integration_retarget(
+    *,
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    from_sha: str,
+    to_sha: str,
+) -> gitpub.TargetBinding:
+    source = st.require_git_sha(from_sha, name="from_sha")
+    dest = st.require_git_sha(to_sha, name="to_sha")
+    current = target.git().read_ref(st.integration_ref(run_id))
+    if current is not None and current not in (source, dest):
+        raise gitpub.GitPublicationRefused(
+            "INTEGRATION_REF_COLLISION", f"{current}!={source}"
+        )
+    if current != dest:
+        gitpub.retarget_integration_ref(target, run_id, source, dest)
+    db_sha = str(run_row(store, run_id)["integration_initial_sha"])
+    if db_sha not in (source, dest):
+        raise FactoryRefused(f"{run_id}:integration_initial_sha")
+    if db_sha != dest:
+        store.retarget_integration_initial_sha(run_id, source, dest)
+    return gitpub.restore_integration_sha(target, dest)
+
+
+def recover_legacy_retarget_journal(
+    *,
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+) -> gitpub.TargetBinding:
+    row = run_row(store, run_id)
+    journal = _read_legacy_retarget_journal(row)
+    if journal is None:
+        return target
+    if journal["run_id"] != run_id:
+        raise FactoryRefused("LEGACY_INTEGRATION_RETARGET_JOURNAL_MISMATCH")
+    updated = _finish_legacy_integration_retarget(
+        store=store,
+        target=target,
+        run_id=run_id,
+        from_sha=journal["from_sha"],
+        to_sha=journal["to_sha"],
+    )
+    _clear_legacy_retarget_journal(row)
+    return updated
+
+
+def correct_legacy_integration_base(
+    *,
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    declared_sha: str,
+) -> gitpub.TargetBinding:
+    row = run_row(store, run_id)
+    stored = str(row["integration_initial_sha"])
+    declared = st.require_git_sha(declared_sha, name="declared_sha")
+    stages = tuple(
+        store.lane_stage(run_id, lane.lane_id)
+        for lane in store.active_projection(run_id)
+    )
+    kinds = recorded_artifact_kinds(store, run_id)
+    journal = _read_legacy_retarget_journal(row)
+    if journal is not None:
+        if journal["run_id"] != run_id or journal["to_sha"] != declared:
+            raise FactoryRefused("LEGACY_INTEGRATION_RETARGET_JOURNAL_MISMATCH")
+        return recover_legacy_retarget_journal(
+            store=store, target=target, run_id=run_id
+        )
+    action = legacy_integration_correction_decision(
+        stored_sha=stored,
+        declared_sha=declared,
+        lane_stages=stages,
+        artifact_kinds=kinds,
+    )
+    if action == "refuse":
+        raise FactoryRefused("LEGACY_INTEGRATION_REBASE_UNSAFE")
+    if action in ("noop", "defer"):
+        return target
+    _write_legacy_retarget_journal(row, stored, declared)
+    updated = _finish_legacy_integration_retarget(
+        store=store,
+        target=target,
+        run_id=run_id,
+        from_sha=stored,
+        to_sha=declared,
+    )
+    _clear_legacy_retarget_journal(row)
+    return updated
+
+
+
+
+def pin_target_from_plan(
+    target: gitpub.TargetBinding, compiled: st.CompiledPlan
+) -> gitpub.TargetBinding:
+    ref = gitpub.declared_integration_ref(gitpub.lane_specs_from_plan(compiled))
+    return gitpub.pin_integration_sha(target, ref)
 
 
 def plan_artifact_ref_for(store: ArtifactStore, run_id: str, plan_revision: int) -> str:
@@ -384,6 +637,7 @@ class LaneContext:
     entry_kind: st.BuildingEntryKind = st.BuildingEntryKind.INITIAL
     public_contract: Mapping[str, Any] | None = None
     sealed_digest: str = ""
+    draft_correction: Sequence[Mapping[str, str]] | None = None
 
 
 class StageActor(Protocol):
@@ -498,7 +752,9 @@ def _complete(
     ctx: LaneContext,
     artifact: st.LaneArtifact,
 ) -> ArtifactRecord:
-    next_stage = st.next_stage_for(ctx.stage, artifact.kind, artifact.verdict)
+    next_stage = st.next_stage_for(
+        ctx.stage, artifact.kind, artifact.verdict, lane_kind=ctx.lane.lane_kind
+    )
     return store.complete_stage(
         ctx.run_id,
         ctx.lane.lane_id,
@@ -546,6 +802,96 @@ def _record_as_lane_artifact(
     )
 
 
+def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
+    specs = getattr(actor, "lane_specs", None)
+    if not isinstance(specs, Mapping):
+        return None
+    spec = specs.get(lane_id)
+    if not isinstance(spec, Mapping) or "gate" not in spec:
+        return None
+    gate = spec["gate"]
+    if not isinstance(gate, Mapping):
+        raise DraftCollectionRefused("lane gate is not a mapping")
+    runner = gate.get("runner")
+    if runner not in rr.COLLECT_ARGS:
+        raise DraftCollectionRefused("unsupported runner")
+    min_cases = gate.get("min_cases")
+    if isinstance(min_cases, bool) or not isinstance(min_cases, int) or min_cases < 1:
+        raise DraftCollectionRefused("min_cases")
+    argv = gate.get("argv") or ()
+    if not isinstance(argv, (list, tuple)):
+        raise DraftCollectionRefused("argv")
+    cwd = gate.get("cwd") or "."
+    if not isinstance(cwd, str) or not cwd:
+        raise DraftCollectionRefused("cwd")
+    return SimpleNamespace(
+        runner=str(runner),
+        argv=tuple(str(item) for item in argv),
+        cwd=cwd,
+        min_cases=int(min_cases),
+    )
+
+
+def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleNamespace:
+    written = tuple(sorted({prv.normalize_repo_path(path) for path in files}))
+    flags = tuple(token for token in gate.argv if str(token).startswith("-"))
+    planned = tuple(
+        prv.normalize_repo_path(str(token))
+        for token in gate.argv
+        if not str(token).startswith("-")
+    )
+    selectors = planned if planned and set(planned) <= set(written) else written
+    return SimpleNamespace(
+        runner=gate.runner,
+        argv=flags + selectors,
+        cwd=gate.cwd,
+        min_cases=gate.min_cases,
+    )
+
+
+def _draft_min_cases_findings(
+    collected: int, min_cases: int
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": "native collect listed {0} cases".format(
+                    collected
+                ),
+                "required_behavior": "native collect must list at least {0} cases".format(
+                    min_cases
+                ),
+                "violated_requirement": "gate.min_cases",
+            },
+        )
+    )
+
+
+def _remove_collect_tree(dest: Path, vault: Path) -> None:
+    dest = Path(dest)
+    subprocess.run(
+        ["git", "-C", str(vault), "worktree", "remove", "--force", str(dest)],
+        capture_output=True,
+        check=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(vault), "worktree", "prune"],
+        capture_output=True,
+        check=False,
+    )
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+
+
+def _write_test_files(extra: Mapping[str, Any]) -> dict[str, str]:
+    files = extra.get("files") or extra.get("private_files") or {}
+    if not files:
+        raise FactoryRefused("write_tests produced no private files")
+    return dict(files)
+
+
+
 class FactoryScheduler:
     """Advance every ready lane one frozen stage at a time."""
 
@@ -561,6 +907,7 @@ class FactoryScheduler:
         stage_completed: Optional[
             Callable[[str, st.LaneStage, st.LaneStage], None]
         ] = None,
+        compiled: Optional[st.CompiledPlan] = None,
     ) -> None:
         self.store = store
         self.run_id = run_id
@@ -569,6 +916,10 @@ class FactoryScheduler:
         self.target = target
         self.stage_started = stage_started
         self.stage_completed = stage_completed
+        self._compiled = compiled
+        self._compiled_kinds = {
+            lane.lane_id: lane.lane_kind for lane in compiled.lanes
+        } if compiled is not None else {}
         row = run_row(store, run_id)
         runtime.revalidate(row["runtime_state_fingerprint"])
         gitpub.revalidate_binding(target)
@@ -581,7 +932,9 @@ class FactoryScheduler:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._handle_sigint)
         try:
+            self._recover_legacy_retarget_journal()
             self._resume_orphaned_integration_merge()
+            self._maybe_correct_legacy_integration_base()
             ensure_run_integration_ref(self.target, self.store, self.run_id)
             while True:
                 status = self.status()
@@ -597,6 +950,11 @@ class FactoryScheduler:
                 for lane_id in self.store.ready_lane_ids(self.run_id):
                     stage = self.store.lane_stage(self.run_id, lane_id)
                     if stage is st.LaneStage.READY_TO_MERGE:
+                        continue
+                    if (
+                        stage is st.LaneStage.WRITING_TESTS
+                        and self._legacy_correction_action() == "defer"
+                    ):
                         continue
                     self._advance(lane_id)
                     progressed = True
@@ -621,6 +979,16 @@ class FactoryScheduler:
         self._resume_orphaned_integration_merge()
         head = self._integration_head()
         return self.store.derive_run_status(self.run_id, head)
+
+
+    def _recover_legacy_retarget_journal(self) -> None:
+        self.locks.acquire(2)
+        try:
+            self.target = recover_legacy_retarget_journal(
+                store=self.store, target=self.target, run_id=self.run_id
+            )
+        finally:
+            self.locks.release()
 
     def _resume_orphaned_integration_merge(self) -> None:
         self.locks.acquire(2)
@@ -696,21 +1064,20 @@ class FactoryScheduler:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
             if plan is None:
                 raise FactoryRefused("missing LANE_PLAN")
-            review = _latest(
-                self.store,
-                self.run_id,
-                lane_id,
-                st.ArtifactKind.TEST_REVIEW,
-                verdict=st.ReviewerVerdict.REVISE,
+            _review, _invalidation, review_id, invalidation_id = (
+                _writing_tests_predecessors(self.store, self.run_id, lane_id)
             )
             return (
                 st.writing_tests_input_digest(
                     **common,
                     lane_plan_id=plan.artifact_id,
-                    test_review_id=review.artifact_id if review else st.NO_TEST_REVIEW,
+                    test_review_id=review_id,
+                    integration_head=self._integration_head(),
+                    test_invalidation_id=invalidation_id,
                 ),
                 {},
             )
+
         if stage is st.LaneStage.REVIEWING_TESTS:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
             draft = _latest(
@@ -751,10 +1118,8 @@ class FactoryScheduler:
             )
         if stage is st.LaneStage.BUILDING:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-            sealed = _latest(
-                self.store, self.run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
-            )
-            if plan is None or sealed is None:
+            sealed = self._sealed_for(lane)
+            if plan is None:
                 raise FactoryRefused("missing BUILDING inputs")
             revision = row["plan_revision"]
             revise = _latest(
@@ -781,16 +1146,11 @@ class FactoryScheduler:
             else:
                 entry = st.BuildingEntryKind.INITIAL
             builder_base = self._integration_head()
-            receipts = []
-            for dep in lane.needs:
-                merge = _latest(
-                    self.store, self.run_id, dep, st.ArtifactKind.INTEGRATION_MERGE
-                )
-                if merge is None:
-                    raise FactoryRefused(f"missing dependency merge {dep}")
-                receipts.append(merge)
+            receipts = self._dep_receipts(lane.needs)
             ids = [plan.artifact_id, sealed.artifact_id]
-            ids.extend(item.artifact_id for item in receipts)
+            ids.extend(
+                item.artifact_id for item in receipts if item.artifact_id not in ids
+            )
             prior_builder = st.NO_PRIOR_BUILDER
             code_review = st.NO_CODE_REVIEW
             base_invalidation = st.NO_BASE_INVALIDATION
@@ -844,9 +1204,7 @@ class FactoryScheduler:
             }
         if stage is st.LaneStage.REVIEWING_CODE:
             plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-            sealed = _latest(
-                self.store, self.run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
-            )
+            sealed = self._sealed_for(lane)
             builder = _latest(
                 self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
             )
@@ -892,6 +1250,8 @@ class FactoryScheduler:
 
     def _advance(self, lane_id: str) -> None:
         stage = self.store.lane_stage(self.run_id, lane_id)
+        if stage is st.LaneStage.WRITING_TESTS:
+            self._maybe_correct_legacy_integration_base()
         digest, observed = self._pause_input(lane_id, stage)
         self._inflight = (lane_id, stage, digest, observed)
         if self.stage_started is not None:
@@ -927,12 +1287,82 @@ class FactoryScheduler:
 
     def _common(self, lane_id: str) -> tuple[Mapping[str, Any], st.LaneProjection]:
         row = run_row(self.store, self.run_id)
-        projection = next(
-            lane
-            for lane in self.store.active_projection(self.run_id)
-            if lane.lane_id == lane_id
-        )
+        if self._compiled is not None:
+            projection = next(
+                lane for lane in self._compiled.lanes if lane.lane_id == lane_id
+            )
+        else:
+            projection = next(
+                lane
+                for lane in self.store.active_projection(self.run_id)
+                if lane.lane_id == lane_id
+            )
         return row, projection
+
+    def _lane_kind(self, lane_id: str) -> str | None:
+        if lane_id in self._compiled_kinds:
+            return self._compiled_kinds[lane_id]
+        return self.store._lane_kind(self.run_id, lane_id)
+
+    def _sealed_suite_gate(self, lane: st.LaneProjection) -> SimpleNamespace | None:
+        if lane.lane_kind == st.LANE_KIND_BUILD:
+            for dep in lane.needs:
+                if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                    return _lane_gate(self.actor, dep)
+            return None
+        return _lane_gate(self.actor, lane.lane_id)
+
+
+
+    def _current_tests_sealed(self, lane_id: str) -> ArtifactRecord | None:
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        return _latest(
+            self.store,
+            self.run_id,
+            lane_id,
+            st.ArtifactKind.SEALED_TEST_BUNDLE,
+            plan_revision=revision,
+        )
+
+
+    def _sealed_for(self, lane: st.LaneProjection) -> ArtifactRecord:
+        if lane.lane_kind == st.LANE_KIND_BUILD:
+            for dep in lane.needs:
+                if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                    sealed = self._current_tests_sealed(dep)
+                    if sealed is None:
+                        raise FactoryRefused(f"missing dependency sealed tests {dep}")
+                    return sealed
+            raise FactoryRefused("missing tests-lane sealed bundle")
+        sealed = self._current_tests_sealed(lane.lane_id)
+        if sealed is None:
+            raise FactoryRefused("missing BUILDING inputs")
+        return sealed
+
+    def _dep_receipts(self, needs: Sequence[str]) -> list[ArtifactRecord]:
+        receipts = []
+        revision = run_row(self.store, self.run_id)["plan_revision"]
+        for dep in needs:
+            if self._lane_kind(dep) == st.LANE_KIND_TESTS:
+                sealed = self._current_tests_sealed(dep)
+                if sealed is None:
+                    raise FactoryRefused(f"missing dependency sealed tests {dep}")
+                receipts.append(sealed)
+                continue
+            merge = _latest(
+                self.store,
+                self.run_id,
+                dep,
+                st.ArtifactKind.INTEGRATION_MERGE,
+                plan_revision=revision,
+            )
+            if merge is None:
+                raise FactoryRefused(f"missing dependency merge {dep}")
+            receipts.append(merge)
+        return receipts
+
+
+
 
     def _plan_artifact_ref(self, row: Mapping[str, Any]) -> str:
         return plan_artifact_ref_for(self.store, self.run_id, row["plan_revision"])
@@ -967,6 +1397,8 @@ class FactoryScheduler:
             "needs": list(lane.needs),
             "plan_artifact_ref": ctx.plan_artifact_ref,
         }
+        if lane.lane_kind is not None:
+            payload["lane_kind"] = lane.lane_kind
         artifact = prv.make_lane_artifact(
             kind=st.ArtifactKind.LANE_PLAN,
             request=_request(ctx),
@@ -975,19 +1407,50 @@ class FactoryScheduler:
         )
         _complete(self.store, ctx, artifact)
 
+    def _legacy_correction_action(self) -> str:
+        specs = getattr(self.actor, "lane_specs", None)
+        if not specs:
+            return "noop"
+        ref = gitpub.declared_integration_ref(specs)
+        declared = self.target.git().rev_parse(ref)
+        row = run_row(self.store, self.run_id)
+        stages = tuple(
+            self.store.lane_stage(self.run_id, lane.lane_id)
+            for lane in self.store.active_projection(self.run_id)
+        )
+        return legacy_integration_correction_decision(
+            stored_sha=str(row["integration_initial_sha"]),
+            declared_sha=declared,
+            lane_stages=stages,
+            artifact_kinds=recorded_artifact_kinds(self.store, self.run_id),
+        )
+
+    def _maybe_correct_legacy_integration_base(self) -> None:
+        specs = getattr(self.actor, "lane_specs", None)
+        if not specs:
+            return
+        ref = gitpub.declared_integration_ref(specs)
+        declared = self.target.git().rev_parse(ref)
+        self.locks.acquire(2)
+        try:
+            self.target = correct_legacy_integration_base(
+                store=self.store,
+                target=self.target,
+                run_id=self.run_id,
+                declared_sha=declared,
+            )
+        finally:
+            self.locks.release()
+
     def _writing_tests(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
         plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
         if plan is None:
             raise FactoryRefused("missing LANE_PLAN")
-        review = _latest(
-            self.store,
-            self.run_id,
-            lane_id,
-            st.ArtifactKind.TEST_REVIEW,
-            verdict=st.ReviewerVerdict.REVISE,
+        review, invalidation, review_id, invalidation_id = _writing_tests_predecessors(
+            self.store, self.run_id, lane_id
         )
-        review_id = review.artifact_id if review is not None else st.NO_TEST_REVIEW
+        tip = self._integration_head()
         digest = st.writing_tests_input_digest(
             run_id=self.run_id,
             lane_id=lane_id,
@@ -997,7 +1460,14 @@ class FactoryScheduler:
             projection_digest=lane.lane_projection_digest,
             lane_plan_id=plan.artifact_id,
             test_review_id=review_id,
+            integration_head=tip,
+            test_invalidation_id=invalidation_id,
         )
+        artifacts: dict[str, ArtifactRecord] = {"LANE_PLAN": plan}
+        if review is not None:
+            artifacts["TEST_REVIEW"] = review
+        if invalidation is not None:
+            artifacts["TEST_INVALIDATION"] = invalidation
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -1006,15 +1476,12 @@ class FactoryScheduler:
             plan_artifact_ref=self._plan_artifact_ref(row),
             input_digest=digest,
             stage=st.LaneStage.WRITING_TESTS,
-            artifacts={
-                "LANE_PLAN": plan,
-                **({"TEST_REVIEW": review} if review else {}),
-            },
+            artifacts=artifacts,
+            integration_head=tip,
         )
         extra = dict(self.actor.write_tests(ctx))
-        files = extra.get("files") or extra.get("private_files") or {}
-        if not files:
-            raise FactoryRefused("write_tests produced no private files")
+        files = self._require_draft_min_cases(ctx, _write_test_files(extra))
+        self._require_typed_test_outputs(lane, files)
         contract = prv.public_contract(
             acceptance_criteria=lane.public_acceptance,
             declared_outputs=lane.declared_outputs,
@@ -1031,8 +1498,82 @@ class FactoryScheduler:
         _complete(
             self.store,
             ctx,
-            _with_input_artifact_ids(artifact, [plan.artifact_id, review_id]),
+            _with_input_artifact_ids(
+                artifact, [plan.artifact_id, review_id, invalidation_id]
+            ),
         )
+
+    def _require_typed_test_outputs(
+        self, lane: st.LaneProjection, files: Mapping[str, str]
+    ) -> None:
+        if lane.lane_kind != st.LANE_KIND_TESTS:
+            return
+        returned = {prv.normalize_repo_path(path) for path in files}
+        declared = set(lane.declared_outputs)
+        if returned != declared:
+            raise TypedTestOutputsRefused(
+                "private files must equal declared outputs"
+            )
+
+
+    def _require_draft_min_cases(
+        self, ctx: LaneContext, files: Mapping[str, str]
+    ) -> dict[str, str]:
+        gate = _lane_gate(self.actor, ctx.lane.lane_id)
+        if gate is None:
+            return dict(files)
+        current = dict(files)
+        seen = st.digest_canonical(current)
+        collected = self._collect_private_draft(ctx, gate, current)
+        if collected >= gate.min_cases:
+            return current
+        correction = _draft_min_cases_findings(collected, gate.min_cases)
+        extra = dict(
+            self.actor.write_tests(replace(ctx, draft_correction=correction))
+        )
+        current = _write_test_files(extra)
+        if st.digest_canonical(current) == seen:
+            raise DraftMinCasesRefused(collected, gate.min_cases)
+        collected = self._collect_private_draft(ctx, gate, current)
+        if collected >= gate.min_cases:
+            return current
+        raise DraftMinCasesRefused(collected, gate.min_cases)
+
+    def _collect_private_draft(
+        self,
+        ctx: LaneContext,
+        gate: SimpleNamespace,
+        files: Mapping[str, str],
+    ) -> int:
+        run_repo = Path(self.target.target_repository_root)
+        vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
+        base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
+        dest = self.runtime.path / "worktrees" / "draft-collect-{0}-{1}-{2}".format(
+            ctx.lane.lane_id, ctx.input_digest[:12], os.urandom(4).hex()
+        )
+        hv.checkout_vault_worktree(vault, base, dest)
+        try:
+            prv.write_files(dest, files)
+            resolved = rr.resolve(gate.runner, run_repo, gate.cwd)
+            ids = rr.collect_cases(
+                resolved,
+                _collect_gate(gate, files),
+                dest,
+                runtime_root=run_repo,
+            )
+            return len(ids)
+        except (rr.CollectFailed, rr.RunnerUnusable) as extra:
+            detail = getattr(extra, "detail", None) or extra.__class__.__name__
+            tokens = prv.collect_private_tokens(
+                files=files,
+                extra=(str(dest), str(Path(dest).resolve())),
+                vault_path=vault,
+            )
+            raise DraftCollectionRefused(prv.redact_text(str(detail), tokens)) from extra
+        finally:
+            _remove_collect_tree(dest, vault)
+
+
 
     def _reviewing_tests(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -1135,10 +1676,8 @@ class FactoryScheduler:
     def _building(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
         plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-        sealed = _latest(
-            self.store, self.run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
-        )
-        if plan is None or sealed is None:
+        sealed = self._sealed_for(lane)
+        if plan is None:
             raise FactoryRefused("missing BUILDING inputs")
         revision = row["plan_revision"]
         revise = _latest(
@@ -1165,16 +1704,11 @@ class FactoryScheduler:
         else:
             entry = st.BuildingEntryKind.INITIAL
         builder_base = self._integration_head()
-        receipts = []
-        for dep in lane.needs:
-            merge = _latest(
-                self.store, self.run_id, dep, st.ArtifactKind.INTEGRATION_MERGE
-            )
-            if merge is None:
-                raise FactoryRefused(f"missing dependency merge {dep}")
-            receipts.append(merge)
+        receipts = self._dep_receipts(lane.needs)
         ids = [plan.artifact_id, sealed.artifact_id]
-        ids.extend(item.artifact_id for item in receipts)
+        ids.extend(
+            item.artifact_id for item in receipts if item.artifact_id not in ids
+        )
         prior_builder = st.NO_PRIOR_BUILDER
         code_review = st.NO_CODE_REVIEW
         base_invalidation = st.NO_BASE_INVALIDATION
@@ -1244,7 +1778,10 @@ class FactoryScheduler:
             artifacts=artifacts,
             builder_base_sha=builder_base,
             entry_kind=entry,
-            public_contract=sealed.payload.get("public_contract"),
+            public_contract=prv.public_contract(
+                acceptance_criteria=lane.public_acceptance,
+                declared_outputs=lane.declared_outputs,
+            ),
             sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
         )
         extra = dict(self.actor.build(ctx))
@@ -1289,9 +1826,7 @@ class FactoryScheduler:
     def _reviewing_code(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
         plan = _latest(self.store, self.run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-        sealed = _latest(
-            self.store, self.run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
-        )
+        sealed = self._sealed_for(lane)
         builder = _latest(
             self.store, self.run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
         )
@@ -1311,6 +1846,10 @@ class FactoryScheduler:
             candidate_ref=builder.payload["candidate_ref"],
             candidate_sha=builder.payload["candidate_sha"],
         )
+        product_contract = prv.public_contract(
+            acceptance_criteria=lane.public_acceptance,
+            declared_outputs=lane.declared_outputs,
+        )
         ctx = LaneContext(
             run_id=self.run_id,
             lane=lane,
@@ -1327,30 +1866,101 @@ class FactoryScheduler:
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_ref=builder.payload["candidate_ref"],
             candidate_sha=builder.payload["candidate_sha"],
+            public_contract=product_contract,
             sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
         )
+        ids = [plan.artifact_id, sealed.artifact_id, builder.artifact_id]
+        sealed_artifact = _record_as_lane_artifact(sealed, lane)
+        request = _request(ctx)
+        typed_build = lane.lane_kind == st.LANE_KIND_BUILD
+        if not typed_build:
+            try:
+                cr.detect_candidate_private_collisions(
+                    request=request,
+                    state_root=self.runtime.path,
+                    candidate_repo=Path(self.target.target_repository_root),
+                    candidate_sha=builder.payload["candidate_sha"],
+                    sealed_bundle=sealed_artifact,
+                    scratch_root=self.runtime.path / "worktrees",
+                )
+            except prv.PrivatePathCollisionError as exc:
+                self._complete_test_invalidation(
+                    ctx, ids, sealed_artifact, exc
+                )
+                return
         verdict, findings = self.actor.review_code(ctx)
         constraints = tuple(lane.public_acceptance) or ("produce declared outputs",)
-        artifact = cr.review_builder_output(
-            request=_request(ctx),
-            state_root=self.runtime.path,
-            candidate_repo=Path(self.target.target_repository_root),
-            candidate_sha=builder.payload["candidate_sha"],
-            candidate_ref=builder.payload["candidate_ref"],
-            builder_base_sha=builder.payload["builder_base_sha"],
-            sealed_bundle=_record_as_lane_artifact(sealed, lane),
-            verdict=verdict,
-            findings=findings,
-            scratch_root=self.runtime.path / "worktrees",
-            architecture_constraints=constraints,
-        )
+        try:
+            artifact = cr.review_builder_output(
+                request=request,
+                state_root=self.runtime.path,
+                candidate_repo=Path(self.target.target_repository_root),
+                candidate_sha=builder.payload["candidate_sha"],
+                candidate_ref=builder.payload["candidate_ref"],
+                builder_base_sha=builder.payload["builder_base_sha"],
+                sealed_bundle=sealed_artifact,
+                verdict=verdict,
+                findings=findings,
+                scratch_root=self.runtime.path / "worktrees",
+                architecture_constraints=constraints,
+                allow_candidate_paths=typed_build,
+                public_contract=product_contract,
+                gate=self._sealed_suite_gate(lane),
+                runtime_root=Path(self.target.target_repository_root),
+            )
+        except prv.PrivatePathCollisionError as exc:
+            self._complete_test_invalidation(
+                ctx, ids, sealed_artifact, exc
+            )
+            return
         _complete(
             self.store,
             ctx,
-            _with_input_artifact_ids(
-                artifact, [plan.artifact_id, sealed.artifact_id, builder.artifact_id]
+            _with_input_artifact_ids(artifact, ids),
+        )
+
+    def _complete_test_invalidation(
+        self,
+        ctx: LaneContext,
+        ids: Sequence[str],
+        sealed_bundle: st.LaneArtifact,
+        collision: prv.PrivatePathCollisionError,
+    ) -> None:
+        vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
+        files = tc.sealed_private_files(vault, sealed_bundle)
+        private_files = {
+            path: hv.cat_blob(vault, blob).decode("utf-8")
+            for path, blob in files.items()
+        }
+        tokens = prv.collect_private_tokens(
+            files=private_files,
+            vault_path=vault,
+            vault_refs=(sealed_bundle.artifact_ref,),
+            blob_ids=tuple(files.values()),
+        )
+        allow = prv.public_contract_allow(
+            sealed_bundle.payload["public_contract"],
+            extra=(
+                ctx.input_digest,
+                str(sealed_bundle.payload.get("sealed_digest") or ""),
             ),
         )
+        payload = cr.test_invalidation_payload(
+            input_digest=ctx.input_digest,
+            input_artifact_ids=ids,
+            collision=collision,
+            tokens=tokens,
+            allow=allow,
+        )
+        artifact = prv.make_lane_artifact(
+            kind=st.ArtifactKind.TEST_INVALIDATION,
+            request=_request(ctx),
+            payload=payload,
+            artifact_ref="test-invalidation:{0}".format(ctx.input_digest),
+        )
+        _complete(self.store, ctx, _with_input_artifact_ids(artifact, ids))
+
+
 
     def _ready_to_merge(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -1566,19 +2176,20 @@ def create_factory_run(
     target: gitpub.TargetBinding,
 ) -> st.RunBinding:
     runtime.ensure_layout()
+    pinned = pin_target_from_plan(target, compiled)
     binding = st.RunBinding(
         runtime_state_root=str(runtime.path),
         runtime_state_fingerprint=runtime.fingerprint,
         integration_ref=st.integration_ref(run_id),
-        integration_initial_sha=target.integration_initial_sha,
-        target_repository_root=target.target_repository_root,
-        target_git_common_dir=target.target_git_common_dir,
-        target_worktree_git_dir=target.target_worktree_git_dir,
-        target_object_format=target.target_object_format,
-        target_repository_fingerprint=target.target_repository_fingerprint,
-        target_sync_journal_fingerprint=target.target_sync_journal_fingerprint,
-        target_initial_main_sha=target.target_initial_main_sha,
-        target_main_ref=target.target_main_ref,
+        integration_initial_sha=pinned.integration_initial_sha,
+        target_repository_root=pinned.target_repository_root,
+        target_git_common_dir=pinned.target_git_common_dir,
+        target_worktree_git_dir=pinned.target_worktree_git_dir,
+        target_object_format=pinned.target_object_format,
+        target_repository_fingerprint=pinned.target_repository_fingerprint,
+        target_sync_journal_fingerprint=pinned.target_sync_journal_fingerprint,
+        target_initial_main_sha=pinned.target_initial_main_sha,
+        target_main_ref=pinned.target_main_ref,
     )
     try:
         store.create_run(run_id, compiled, binding)
@@ -1586,7 +2197,7 @@ def create_factory_run(
         existing = binding_from_run(run_row(store, run_id))
         if existing != binding:
             raise
-    ensure_run_integration_ref(target, store, run_id)
+    ensure_run_integration_ref(pinned, store, run_id)
     return binding
 
 
@@ -1612,7 +2223,12 @@ def amendment_resets(
             wait_row = _latest(store, run_id, lane.lane_id, st.ArtifactKind.USER_WAIT)
             if wait_row is not None:
                 wait = st.WaitReason(wait_row.payload["wait_reason"])
-        target = st.amendment_reset_stage(current, changed=changed, wait_reason=wait)
+        target = st.amendment_reset_stage(
+            current,
+            changed=changed,
+            wait_reason=wait,
+            lane_kind=lane.lane_kind,
+        )
         resets.append(st.LaneReset(lane.lane_id, current, target))
     del row
     return tuple(sorted(resets, key=lambda item: item.lane_id))
@@ -1666,6 +2282,11 @@ def apply_factory_amendment(
             "prior_plan_revision": row["plan_revision"],
             "projection": [
                 {
+                    **(
+                        {"lane_kind": lane.lane_kind}
+                        if lane.lane_kind is not None
+                        else {}
+                    ),
                     "declared_outputs": list(lane.declared_outputs),
                     "lane_id": lane.lane_id,
                     "lane_projection_digest": lane.lane_projection_digest,

@@ -9,14 +9,70 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from . import git_publication as gitpub
 from . import scheduler_types as st
 from .utils import now_iso
 
 LANE_STAGE_CHECK = ", ".join(f"'{stage.value}'" for stage in st.LaneStage)
 LANE_KIND_CHECK = ", ".join(f"'{kind.value}'" for kind in st.LANE_ARTIFACT_KINDS)
 RUN_KIND_CHECK = ", ".join(f"'{kind.value}'" for kind in st.RUN_ARTIFACT_KINDS)
+V1_LANE_ARTIFACT_KINDS = (
+    "LANE_PLAN",
+    "TEST_DRAFT",
+    "TEST_REVIEW",
+    "SEALED_TEST_BUNDLE",
+    "BUILDER_OUTPUT",
+    "CODE_REVIEW",
+    "INTEGRATION_MERGE",
+    "BASE_INVALIDATION",
+    "USER_WAIT",
+    "USER_DECISION",
+)
+V1_LANE_KIND_CHECK = ", ".join(f"'{kind}'" for kind in V1_LANE_ARTIFACT_KINDS)
+LANE_ARTIFACT_COLUMNS = (
+    "artifact_id",
+    "run_id",
+    "lane_id",
+    "sequence",
+    "completed_stage",
+    "artifact_kind",
+    "plan_revision",
+    "spec_digest",
+    "lane_projection_digest",
+    "input_digest",
+    "output_digest",
+    "artifact_ref",
+    "payload_json",
+    "created_at",
+)
+_LANE_ARTIFACTS_V1_BACKUP = "lane_artifacts__v1_backup"
 
-SCHEMA = f"""
+
+def _lane_artifacts_ddl(kind_check: str) -> str:
+    return f"""CREATE TABLE lane_artifacts (
+  artifact_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  completed_stage TEXT NOT NULL,
+  artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ({kind_check})),
+  plan_revision INTEGER NOT NULL,
+  spec_digest TEXT NOT NULL,
+  lane_projection_digest TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  output_digest TEXT NOT NULL,
+  artifact_ref TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (run_id, lane_id, sequence),
+  UNIQUE (run_id, lane_id, plan_revision, completed_stage, input_digest),
+  FOREIGN KEY (run_id, plan_revision)
+    REFERENCES plan_revisions(run_id, plan_revision) DEFERRABLE INITIALLY DEFERRED
+)"""
+
+
+def _schema_script(lane_kind_check: str) -> str:
+    return f"""
 CREATE TABLE ledger_meta (
   schema_version TEXT PRIMARY KEY
 );
@@ -81,26 +137,7 @@ CREATE TABLE lane_state (
   PRIMARY KEY (run_id, lane_id),
   FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
-CREATE TABLE lane_artifacts (
-  artifact_id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  lane_id TEXT NOT NULL,
-  sequence INTEGER NOT NULL,
-  completed_stage TEXT NOT NULL,
-  artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ({LANE_KIND_CHECK})),
-  plan_revision INTEGER NOT NULL,
-  spec_digest TEXT NOT NULL,
-  lane_projection_digest TEXT NOT NULL,
-  input_digest TEXT NOT NULL,
-  output_digest TEXT NOT NULL,
-  artifact_ref TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE (run_id, lane_id, sequence),
-  UNIQUE (run_id, lane_id, plan_revision, completed_stage, input_digest),
-  FOREIGN KEY (run_id, plan_revision)
-    REFERENCES plan_revisions(run_id, plan_revision) DEFERRABLE INITIALLY DEFERRED
-);
+{_lane_artifacts_ddl(lane_kind_check)};
 CREATE TABLE run_artifacts (
   artifact_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL,
@@ -129,6 +166,12 @@ CREATE TABLE transitions (
   created_at TEXT NOT NULL
 );
 """
+
+
+LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(LANE_KIND_CHECK)
+V1_LANE_ARTIFACTS_SQL = _lane_artifacts_ddl(V1_LANE_KIND_CHECK)
+SCHEMA = _schema_script(LANE_KIND_CHECK)
+V1_SCHEMA = _schema_script(V1_LANE_KIND_CHECK)
 
 
 class ArtifactStoreError(st.KernelError):
@@ -206,6 +249,20 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+def _normalize_sql(sql: str) -> str:
+    return " ".join(sql.strip().rstrip(";").split())
+
+
+def _table_create_sql(conn: sqlite3.Connection, name: str) -> str | None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])
+
+
 def _dumps(value: Any) -> str:
     return st.canonical_bytes(value).decode("utf-8")
 
@@ -238,16 +295,99 @@ class ArtifactStore:
             )
             return
         if "ledger_meta" not in names:
-            self.conn.close()
-            raise LedgerSchemaUnsupported(
-                "preserve the ledger read-only and start a new run/database"
+            self._refuse_schema()
+        versions = [
+            row[0]
+            for row in self.conn.execute("SELECT schema_version FROM ledger_meta")
+        ]
+        if len(versions) != 1:
+            self._refuse_schema()
+        version = versions[0]
+        if version == st.LEDGER_SCHEMA_VERSION:
+            return
+        if version == st.LEDGER_SCHEMA_VERSION_V1:
+            self._migrate_v1_to_v2()
+            return
+        self._refuse_schema()
+
+    def _refuse_schema(self) -> None:
+        self.conn.close()
+        raise LedgerSchemaUnsupported(
+            "preserve the ledger read-only and start a new run/database"
+        )
+
+    def _require_supported_v1_lane_artifacts(self) -> None:
+        names = _tables(self.conn)
+        if "lane_artifacts" not in names or _LANE_ARTIFACTS_V1_BACKUP in names:
+            self._refuse_schema()
+        sql = _table_create_sql(self.conn, "lane_artifacts")
+        if sql is None or _normalize_sql(sql) != _normalize_sql(V1_LANE_ARTIFACTS_SQL):
+            self._refuse_schema()
+        cols = tuple(
+            row[1] for row in self.conn.execute("PRAGMA table_info(lane_artifacts)")
+        )
+        if cols != LANE_ARTIFACT_COLUMNS:
+            self._refuse_schema()
+        extra_indexes = list(
+            self.conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='lane_artifacts' AND sql IS NOT NULL"
             )
-        row = self.conn.execute("SELECT schema_version FROM ledger_meta").fetchone()
-        if row is None or row[0] != st.LEDGER_SCHEMA_VERSION:
-            self.conn.close()
-            raise LedgerSchemaUnsupported(
-                "preserve the ledger read-only and start a new run/database"
+        )
+        if extra_indexes:
+            self._refuse_schema()
+
+    def _rebuild_lane_artifacts_current_check(self) -> None:
+        cols = ", ".join(LANE_ARTIFACT_COLUMNS)
+        self.conn.execute(
+            f"ALTER TABLE lane_artifacts RENAME TO {_LANE_ARTIFACTS_V1_BACKUP}"
+        )
+        self.conn.execute(LANE_ARTIFACTS_SQL)
+        self.conn.execute(
+            f"INSERT INTO lane_artifacts ({cols}) "
+            f"SELECT {cols} FROM {_LANE_ARTIFACTS_V1_BACKUP}"
+        )
+        self.conn.execute(f"DROP TABLE {_LANE_ARTIFACTS_V1_BACKUP}")
+
+    def _require_post_migration_integrity(self) -> None:
+        fk_violations = list(self.conn.execute("PRAGMA foreign_key_check"))
+        if fk_violations:
+            raise ArtifactStoreError("foreign_key_check")
+        integrity = self.conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise ArtifactStoreError("integrity_check")
+        sql = _table_create_sql(self.conn, "lane_artifacts")
+        if sql is None or _normalize_sql(sql) != _normalize_sql(LANE_ARTIFACTS_SQL):
+            raise ArtifactStoreError("lane_artifacts ddl")
+        version = self.conn.execute(
+            "SELECT schema_version FROM ledger_meta"
+        ).fetchone()
+        if version is None or version[0] != st.LEDGER_SCHEMA_VERSION:
+            raise ArtifactStoreError("schema_version")
+
+    def _migrate_v1_to_v2(self) -> None:
+        self._require_supported_v1_lane_artifacts()
+        self._begin()
+        try:
+            self._rebuild_lane_artifacts_current_check()
+            cursor = self.conn.execute(
+                "UPDATE ledger_meta SET schema_version=? WHERE schema_version=?",
+                (st.LEDGER_SCHEMA_VERSION, st.LEDGER_SCHEMA_VERSION_V1),
             )
+            if cursor.rowcount != 1:
+                raise ArtifactStoreError("ledger_meta schema_version stamp")
+            self._require_post_migration_integrity()
+            self.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
+            raise
 
     def close(self) -> None:
         self.conn.close()
@@ -354,6 +494,8 @@ class ArtifactStore:
         kind: st.ArtifactKind | None = None,
         *,
         verdict: st.ReviewerVerdict | None = None,
+        plan_revision: int | None = None,
+        projection_digest: str | None = None,
     ) -> Optional[sqlite3.Row]:
         sql = "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=?"
         params: list[Any] = [run_id, lane_id]
@@ -362,12 +504,36 @@ class ArtifactStore:
             params.append(kind.value)
         sql += " ORDER BY sequence DESC"
         for row in self.conn.execute(sql, params):
+            if plan_revision is not None and row["plan_revision"] != plan_revision:
+                continue
+            if (
+                projection_digest is not None
+                and row["lane_projection_digest"] != projection_digest
+            ):
+                continue
             if verdict is None:
                 return row
             payload = _loads(row["payload_json"])
             if payload.get("verdict") == verdict.value:
                 return row
         return None
+
+
+
+    def integration_merge_payloads(
+        self, run_id: str
+    ) -> tuple[Mapping[str, Any], ...]:
+        rows = self.conn.execute(
+            "SELECT a.payload_json FROM lane_artifacts AS a "
+            "JOIN transitions AS t "
+            "ON t.run_id = a.run_id AND t.lane_id = a.lane_id "
+            "AND t.artifact_id = a.artifact_id AND t.reason = 'complete_stage' "
+            "WHERE a.run_id=? AND a.artifact_kind=? "
+            "ORDER BY t.id ASC",
+            (run_id, st.ArtifactKind.INTEGRATION_MERGE.value),
+        )
+        return tuple(_loads(row[0]) for row in rows)
+
 
     def _artifact_by_id(self, artifact_id: str) -> sqlite3.Row:
         row = self.conn.execute(
@@ -460,20 +626,112 @@ class ArtifactStore:
     def _outputs(self, projection: sqlite3.Row) -> tuple[str, ...]:
         return tuple(_loads(projection["declared_outputs_json"]))
 
+    def _kind_matching_digest(self, row: sqlite3.Row) -> str | None:
+        needs = tuple(_loads(row["needs_json"]))
+        outputs = tuple(_loads(row["declared_outputs_json"]))
+        for kind in (None, st.LANE_KIND_TESTS, st.LANE_KIND_BUILD):
+            if (
+                st.lane_projection_digest(
+                    row["spec_digest"], needs, outputs, lane_kind=kind
+                )
+                == row["lane_projection_digest"]
+            ):
+                return kind
+        raise st.CanonicalIdentityError("lane_projection_digest mismatch")
+
+    def _lane_kind_from_amendment(
+        self, run_id: str, lane_id: str, plan_revision: int
+    ) -> str | None:
+        payload = self._amendment_payload(run_id, plan_revision)
+        if not payload:
+            return None
+        for entry in payload.get("projection") or ():
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("lane_id") != lane_id:
+                continue
+            if "lane_kind" in entry:
+                return st.normalize_lane_kind(entry.get("lane_kind"))
+        return None
+
+    def _lane_kind(
+        self,
+        run_id: str,
+        lane_id: str,
+        artifact: st.LaneArtifact | None = None,
+    ) -> str | None:
+        if artifact is not None and artifact.kind is st.ArtifactKind.LANE_PLAN:
+            return st.normalize_lane_kind(artifact.payload.get("lane_kind"))
+        run = self._run(run_id)
+        revision = run["plan_revision"]
+        plan = self._latest_lane_artifact(
+            run_id,
+            lane_id,
+            st.ArtifactKind.LANE_PLAN,
+            plan_revision=revision,
+        )
+        if plan is not None:
+            return st.normalize_lane_kind(_loads(plan["payload_json"]).get("lane_kind"))
+        kind = self._lane_kind_from_amendment(run_id, lane_id, revision)
+        if kind is not None:
+            return kind
+        try:
+            return self._kind_matching_digest(
+                self._projection(run_id, revision, lane_id)
+            )
+        except UnknownLane:
+            return None
+
+    def _current_sealed_bundle(
+        self, run_id: str, lane_id: str
+    ) -> sqlite3.Row | None:
+        revision = self._run(run_id)["plan_revision"]
+        return self._latest_lane_artifact(
+            run_id,
+            lane_id,
+            st.ArtifactKind.SEALED_TEST_BUNDLE,
+            plan_revision=revision,
+        )
+
+
+    def _sealed_bundle(self, run_id: str, lane_id: str) -> sqlite3.Row | None:
+        revision = self._run(run_id)["plan_revision"]
+        if self._lane_kind(run_id, lane_id) == st.LANE_KIND_BUILD:
+            needs = self._needs(self._projection(run_id, revision, lane_id))
+            for dep in needs:
+                if self._lane_kind(run_id, dep) == st.LANE_KIND_TESTS:
+                    return self._current_sealed_bundle(run_id, dep)
+            return None
+        return self._current_sealed_bundle(run_id, lane_id)
+
     def _dependency_receipts(
         self, run_id: str, needs: Sequence[str]
     ) -> list[sqlite3.Row]:
         receipts = []
+        revision = self._run(run_id)["plan_revision"]
         for dep in needs:
             if self.lane_stage(run_id, dep) is not st.LaneStage.MERGED:
                 raise st.IllegalStageEdge(f"needs {dep} is not MERGED")
-            row = self._latest_lane_artifact(
-                run_id, dep, st.ArtifactKind.INTEGRATION_MERGE
-            )
-            if row is None:
-                raise st.IllegalStageEdge(f"needs {dep} has no INTEGRATION_MERGE")
+            if self._lane_kind(run_id, dep) == st.LANE_KIND_TESTS:
+                row = self._current_sealed_bundle(run_id, dep)
+                if row is None:
+                    raise st.IllegalStageEdge(
+                        f"needs {dep} has no SEALED_TEST_BUNDLE"
+                    )
+            else:
+                row = self._latest_lane_artifact(
+                    run_id,
+                    dep,
+                    st.ArtifactKind.INTEGRATION_MERGE,
+                    plan_revision=revision,
+                )
+                if row is None:
+                    raise st.IllegalStageEdge(f"needs {dep} has no INTEGRATION_MERGE")
             receipts.append(row)
         return receipts
+
+
+
 
     def _reconstruct_stage_digest(
         self,
@@ -522,11 +780,32 @@ class ArtifactStore:
             review_id = (
                 review["artifact_id"] if review is not None else st.NO_TEST_REVIEW
             )
+            invalidation = self._latest_lane_artifact(
+                run_id, lane_id, st.ArtifactKind.TEST_INVALIDATION
+            )
+            draft = self._latest_lane_artifact(
+                run_id, lane_id, st.ArtifactKind.TEST_DRAFT
+            )
+            invalidation_id = st.active_test_invalidation_id(
+                invalidation_id=(
+                    invalidation["artifact_id"] if invalidation is not None else None
+                ),
+                invalidation_sequence=(
+                    int(invalidation["sequence"]) if invalidation is not None else None
+                ),
+                draft_sequence=int(draft["sequence"]) if draft is not None else None,
+            )
+            merges = self.integration_merge_payloads(run_id)
             return st.writing_tests_input_digest(
                 **common,
                 lane_plan_id=plan["artifact_id"],
                 test_review_id=review_id,
+                integration_head=gitpub.durable_integration_tip(
+                    run["integration_initial_sha"], merges
+                ),
+                test_invalidation_id=invalidation_id,
             )
+
         if stage is st.LaneStage.REVIEWING_TESTS:
             plan = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.LANE_PLAN
@@ -568,9 +847,7 @@ class ArtifactStore:
             plan = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.LANE_PLAN
             )
-            sealed = self._latest_lane_artifact(
-                run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
-            )
+            sealed = self._sealed_bundle(run_id, lane_id)
             builder = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
             )
@@ -628,9 +905,7 @@ class ArtifactStore:
         run_id = run["run_id"]
         lane_id = projection["lane_id"]
         plan = self._latest_lane_artifact(run_id, lane_id, st.ArtifactKind.LANE_PLAN)
-        sealed = self._latest_lane_artifact(
-            run_id, lane_id, st.ArtifactKind.SEALED_TEST_BUNDLE
-        )
+        sealed = self._sealed_bundle(run_id, lane_id)
         if plan is None or sealed is None:
             raise StaleStageInput("missing BUILDING plan/sealed bundle")
         receipts = self._dependency_receipts(run_id, self._needs(projection))
@@ -639,7 +914,11 @@ class ArtifactStore:
             payload["builder_base_sha"], name="builder_base_sha"
         )
         ids = [plan["artifact_id"], sealed["artifact_id"]]
-        ids.extend(row["artifact_id"] for row in receipts)
+        ids.extend(
+            row["artifact_id"]
+            for row in receipts
+            if row["artifact_id"] not in ids
+        )
         if entry is st.BuildingEntryKind.INITIAL:
             prior_builder = st.NO_PRIOR_BUILDER
             code_review = st.NO_CODE_REVIEW
@@ -900,6 +1179,7 @@ class ArtifactStore:
                 ),
             )
 
+
     @serialized
     def create_run(
         self,
@@ -982,6 +1262,35 @@ class ArtifactStore:
             self.conn.execute("ROLLBACK")
             raise
 
+    @serialized
+    def retarget_integration_initial_sha(
+        self, run_id: str, expected_sha: str, new_sha: str
+    ) -> None:
+        now = now_iso()
+        self._begin()
+        try:
+            cursor = self.conn.execute(
+                "UPDATE runs SET integration_initial_sha=?, updated_at=? "
+                "WHERE run_id=? AND integration_initial_sha=?",
+                (new_sha, now, run_id, expected_sha),
+            )
+            if cursor.rowcount != 1:
+                raise StageCasConflict(f"{run_id}:integration_initial_sha")
+            self._audit(
+                run_id=run_id,
+                lane_id=None,
+                from_stage=None,
+                to_stage=None,
+                artifact_id=None,
+                reason="legacy_integration_retarget",
+                now=now,
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+
     def _validate_projection_match(
         self, artifact: st.LaneArtifact, projection: sqlite3.Row
     ) -> None:
@@ -1059,7 +1368,10 @@ class ArtifactStore:
                     artifact_ids=list(artifact.payload.get("input_artifact_ids") or []),
                 )
             legal_next = st.next_stage_for(
-                expected_stage, artifact.kind, artifact.verdict
+                expected_stage,
+                artifact.kind,
+                artifact.verdict,
+                lane_kind=self._lane_kind(run_id, lane_id, artifact),
             )
             if legal_next is not next_stage:
                 raise st.IllegalStageEdge(f"{expected_stage.value}->{next_stage.value}")
@@ -1328,9 +1640,7 @@ class ArtifactStore:
             plan = self._latest_lane_artifact(
                 run["run_id"], lane["lane_id"], st.ArtifactKind.LANE_PLAN
             )
-            sealed = self._latest_lane_artifact(
-                run["run_id"], lane["lane_id"], st.ArtifactKind.SEALED_TEST_BUNDLE
-            )
+            sealed = self._sealed_bundle(run["run_id"], lane["lane_id"])
             if plan is None or sealed is None:
                 raise st.IllegalStageEdge("final review missing contracts")
             rows.append(
@@ -1559,7 +1869,6 @@ class ArtifactStore:
                 if old is None:
                     changed[lane_id] = True
                     continue
-                spec_changed = old["spec_digest"] != new_lane.spec_digest
                 topology_changed = _loads(old["needs_json"]) != list(
                     new_lane.needs
                 ) or _loads(old["declared_outputs_json"]) != list(
@@ -1577,7 +1886,9 @@ class ArtifactStore:
                 )
                 if merged_for_topology and topology_changed:
                     raise AmendmentRefused("merged needs/output changes are refused")
-                changed[lane_id] = spec_changed or topology_changed
+                changed[lane_id] = (
+                    old["lane_projection_digest"] != new_lane.lane_projection_digest
+                )
             for lane_id in named:
                 new_lane = new_lanes.get(lane_id)
                 old = old_lanes.get(lane_id)
@@ -1603,7 +1914,10 @@ class ArtifactStore:
                     else None
                 )
                 target = st.amendment_reset_stage(
-                    current, changed=changed[lane_id], wait_reason=wait_reason
+                    current,
+                    changed=changed[lane_id],
+                    wait_reason=wait_reason,
+                    lane_kind=new_lane.lane_kind,
                 )
                 computed.append(st.LaneReset(lane_id, current, target))
             computed_sorted = tuple(sorted(computed, key=lambda item: item.lane_id))
@@ -1915,9 +2229,11 @@ class ArtifactStore:
                     declared_outputs=tuple(_loads(row["declared_outputs_json"])),
                     lane_projection_digest=row["lane_projection_digest"],
                     public_acceptance=tuple(_loads(row["public_acceptance_json"])),
+                    lane_kind=self._kind_matching_digest(row),
                 )
             )
         return tuple(lanes)
+
 
     def get_lane_artifact(self, artifact_id: str) -> ArtifactRecord:
         row = self.conn.execute(
