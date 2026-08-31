@@ -68,6 +68,7 @@ def _lane_projections(
         needs = tuple(sorted(str(item) for item in raw["needs"]))
         outputs = tuple(sorted(_required_output(item) for item in raw["outputs"]))
         spec_digest = digest_canonical(raw["spec"])
+        lane_kind = raw.get("lane_kind")
         compiled.append(
             LaneProjection(
                 lane_id=raw["id"],
@@ -75,9 +76,10 @@ def _lane_projections(
                 spec_digest=spec_digest,
                 declared_outputs=outputs,
                 lane_projection_digest=lane_projection_digest(
-                    spec_digest, needs, outputs
+                    spec_digest, needs, outputs, lane_kind=lane_kind
                 ),
                 public_acceptance=tuple(str(item) for item in raw["acceptance"]),
+                lane_kind=lane_kind,
             )
         )
     return tuple(sorted(compiled, key=lambda lane: lane.lane_id))
@@ -98,6 +100,11 @@ def _canonical_document(
     return {
         "lanes": [
             {
+                **(
+                    {"lane_kind": lane.lane_kind}
+                    if lane.lane_kind is not None
+                    else {}
+                ),
                 "acceptance": list(lane.public_acceptance),
                 "id": lane.lane_id,
                 "needs": list(lane.needs),

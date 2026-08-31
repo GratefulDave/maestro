@@ -20,6 +20,7 @@ OUTPUT_PATH_INVALID = "OUTPUT_PATH_INVALID"
 OUTPUT_OWNERSHIP_CONFLICT = "OUTPUT_OWNERSHIP_CONFLICT"
 ACCEPTANCE_MISSING = "ACCEPTANCE_MISSING"
 REVIEW_NODE_FORBIDDEN = "REVIEW_NODE_FORBIDDEN"
+BUILD_LANE_NEEDS = "BUILD_LANE_NEEDS"
 
 
 def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
@@ -51,6 +52,7 @@ def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
 
     ids: List[str] = []
     seen = set()
+    kinds: dict[str, Optional[str]] = {}
     parsed: List[Tuple[int, str, Sequence[Any], Sequence[Any], Any, Sequence[Any]]] = []
     for index, raw in enumerate(lanes):
         pointer = "/lanes/{0}".format(index)
@@ -124,6 +126,18 @@ def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
                 )
             )
             acceptance = []
+        if "lane_kind" in raw and raw.get("lane_kind") not in ("tests", "build"):
+            refusals.append(
+                PlanRefusal(
+                    SCHEMA_INVALID,
+                    pointer + "/lane_kind",
+                    "lane_kind must be tests or build",
+                )
+            )
+        if raw.get("lane_kind") in ("tests", "build"):
+            kinds[lane_id] = str(raw["lane_kind"])
+        else:
+            kinds[lane_id] = None
         parsed.append((index, lane_id, needs, outputs, spec, acceptance))
 
     id_set = set(ids)
@@ -154,6 +168,7 @@ def validate_objective_plan(data: Mapping[str, Any]) -> Tuple[PlanRefusal, ...]:
         _validate_acceptance(pointer, acceptance, refusals)
 
     _validate_ownership(parsed, refusals)
+    _validate_build_lane_needs(parsed, kinds, refusals)
     if not any(item.code == GRAPH_CYCLE for item in refusals):
         refusals.extend(_cycles(parsed))
     return tuple(refusals)
@@ -240,6 +255,47 @@ def _validate_ownership(
                         ),
                     )
                 )
+
+
+def _validate_build_lane_needs(
+    parsed: Sequence[Tuple[int, str, Sequence[Any], Sequence[Any], Any, Sequence[Any]]],
+    kinds: Mapping[str, str | None],
+    refusals: List[PlanRefusal],
+) -> None:
+    for index, lane_id, needs, _outputs, _spec, _acceptance in parsed:
+        if kinds.get(lane_id) != "build":
+            continue
+        pointer = "/lanes/{0}".format(index)
+        test_indexes = [
+            need_index
+            for need_index, need in enumerate(needs)
+            if isinstance(need, str) and kinds.get(need) == "tests"
+        ]
+        if len(test_indexes) != 1:
+            if len(test_indexes) > 1:
+                need_ptr = pointer + "/needs/{0}".format(test_indexes[1])
+            else:
+                need_ptr = pointer + "/needs"
+            refusals.append(
+                PlanRefusal(
+                    BUILD_LANE_NEEDS,
+                    need_ptr,
+                    "build lane must have exactly one tests dependency",
+                )
+            )
+        for need_index, need in enumerate(needs):
+            if not isinstance(need, str) or not need:
+                continue
+            dep_kind = kinds.get(need)
+            if dep_kind == "tests" or dep_kind == "build":
+                continue
+            refusals.append(
+                PlanRefusal(
+                    BUILD_LANE_NEEDS,
+                    pointer + "/needs/{0}".format(need_index),
+                    "build lane extra needs must be build lanes",
+                )
+            )
 
 
 def _cycles(

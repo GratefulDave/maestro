@@ -29,8 +29,9 @@ def _lane(
     outputs=None,
     spec=None,
     acceptance=None,
+    lane_kind=None,
 ) -> dict:
-    return {
+    payload = {
         "id": lane_id,
         "needs": list(needs),
         "outputs": list(
@@ -43,6 +44,9 @@ def _lane(
             else ["{0} produces its declared file".format(lane_id)]
         ),
     }
+    if lane_kind is not None:
+        payload["lane_kind"] = lane_kind
+    return payload
 
 
 def _plan(*lanes: dict, **extra) -> dict:
@@ -248,6 +252,109 @@ class ObjectiveCompilerTests(unittest.TestCase):
             _dump(_plan(_lane("lane-z"), _lane("lane-m"), _lane("lane-a")))
         )
         self.assertEqual(("lane-a", "lane-m", "lane-z"), compiled.integration_order)
+
+    def test_absent_lane_kind_keeps_unified_projection_digest(self):
+        compiled = compile_plan(_dump(_plan(_lane("lane-a"))))
+        lane = _lane_of(compiled, "lane-a")
+        self.assertIsNone(lane.lane_kind)
+        self.assertEqual(
+            lane.lane_projection_digest,
+            lane_projection_digest(lane.spec_digest, lane.needs, lane.declared_outputs),
+        )
+
+    def test_authored_lane_kind_changes_projection_digest(self):
+        unified = compile_plan(_dump(_plan(_lane("lane-a"))))
+        tests = compile_plan(_dump(_plan(_lane("lane-a", lane_kind="tests"))))
+        tests_lane = _lane_of(tests, "lane-a")
+        self.assertEqual(tests_lane.lane_kind, "tests")
+        self.assertEqual(
+            tests_lane.lane_projection_digest,
+            lane_projection_digest(
+                tests_lane.spec_digest,
+                tests_lane.needs,
+                tests_lane.declared_outputs,
+                lane_kind="tests",
+            ),
+        )
+        self.assertNotEqual(
+            _lane_of(unified, "lane-a").lane_projection_digest,
+            tests_lane.lane_projection_digest,
+        )
+        self.assertNotEqual(unified.plan_digest, tests.plan_digest)
+
+    def test_unknown_lane_kind_is_refused(self):
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(_dump(_plan(_lane("lane-a", lane_kind="review"))))
+        self.assertIn(pv.SCHEMA_INVALID, _codes(caught.exception))
+
+    def test_build_lane_requires_exactly_one_tests_dependency(self):
+        ok = compile_plan(
+            _dump(
+                _plan(
+                    _lane("lane-tests", lane_kind="tests"),
+                    _lane("lane-build", needs=("lane-tests",), lane_kind="build"),
+                )
+            )
+        )
+        self.assertEqual(_lane_of(ok, "lane-build").lane_kind, "build")
+        with self.assertRaises(PlanCompileError) as missing:
+            compile_plan(_dump(_plan(_lane("lane-build", lane_kind="build"))))
+        self.assertIn(pv.BUILD_LANE_NEEDS, _codes(missing.exception))
+        self.assertEqual(missing.exception.refusals[0].pointer, "/lanes/0/needs")
+        with self.assertRaises(PlanCompileError) as extra:
+            compile_plan(
+                _dump(
+                    _plan(
+                        _lane("lane-t1", lane_kind="tests"),
+                        _lane("lane-t2", lane_kind="tests", outputs=["src/t2.py"]),
+                        _lane(
+                            "lane-build",
+                            needs=("lane-t1", "lane-t2"),
+                            lane_kind="build",
+                        ),
+                    )
+                )
+            )
+        self.assertIn(pv.BUILD_LANE_NEEDS, _codes(extra.exception))
+        self.assertEqual(extra.exception.refusals[0].pointer, "/lanes/2/needs/1")
+
+    def test_build_lane_may_also_depend_on_build_not_untyped(self):
+        compile_plan(
+            _dump(
+                _plan(
+                    _lane("lane-tests", lane_kind="tests"),
+                    _lane(
+                        "lane-lib",
+                        needs=("lane-tests",),
+                        outputs=["src/lib.py"],
+                        lane_kind="build",
+                    ),
+                    _lane(
+                        "lane-app",
+                        needs=("lane-tests", "lane-lib"),
+                        outputs=["src/app.py"],
+                        lane_kind="build",
+                    ),
+                )
+            )
+        )
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(
+                _dump(
+                    _plan(
+                        _lane("lane-tests", lane_kind="tests"),
+                        _lane("lane-legacy"),
+                        _lane(
+                            "lane-build",
+                            needs=("lane-tests", "lane-legacy"),
+                            lane_kind="build",
+                        ),
+                    )
+                )
+            )
+        self.assertIn(pv.BUILD_LANE_NEEDS, _codes(caught.exception))
+        self.assertEqual(caught.exception.refusals[0].pointer, "/lanes/2/needs/1")
+
 
 
 if __name__ == "__main__":

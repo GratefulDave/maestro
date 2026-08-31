@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import hashlib
 import sqlite3
 import sys
@@ -15,14 +16,19 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import scheduler_types as st  # noqa: E402
+from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules.lifecycle import (  # noqa: E402
     AmendmentRefused,
     ArtifactCollision,
     ArtifactStore,
+    LANE_ARTIFACT_COLUMNS,
+    LANE_ARTIFACTS_SQL,
     LedgerSchemaUnsupported,
     ResumeBlocked,
     StageCasConflict,
     StaleStageInput,
+    V1_LANE_ARTIFACTS_SQL,
+    V1_SCHEMA,
 )
 
 
@@ -216,6 +222,7 @@ class ArtifactStoreTests(unittest.TestCase):
             projection_digest=projection.lane_projection_digest,
             lane_plan_id=plan_id,
             test_review_id=review_id,
+            integration_head=sch.durable_integration_tip(self.store, RUN_ID),
         )
         record = self.store.complete_stage(
             RUN_ID,
@@ -672,6 +679,7 @@ class ArtifactStoreTests(unittest.TestCase):
             row[1] for row in self.store.conn.execute("PRAGMA table_info(dag_lanes)")
         }
         self.assertIn("public_acceptance_json", dag_columns)
+        self.assertNotIn("lane_kind", dag_columns)
 
     def test_public_acceptance_round_trips_through_active_projection(self) -> None:
         reconstructed = self.store.active_projection(RUN_ID)
@@ -1158,7 +1166,7 @@ class ArtifactStoreTests(unittest.TestCase):
         amended = make_plan(changed_a, self.lane_b, revision=2, stamp="named-spec")
         resets = (
             st.LaneReset("A", st.LaneStage.WAITING_FOR_USER, st.LaneStage.PLANNED),
-            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.BUILDING),
+            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.TESTS_SEALED),
         )
         self.store.apply_amendment(
             RUN_ID,
@@ -1174,7 +1182,7 @@ class ArtifactStoreTests(unittest.TestCase):
             resets,
         )
         self.assertEqual(self.store.lane_stage(RUN_ID, "A"), st.LaneStage.PLANNED)
-        self.assertEqual(self.store.lane_stage(RUN_ID, "B"), st.LaneStage.BUILDING)
+        self.assertEqual(self.store.lane_stage(RUN_ID, "B"), st.LaneStage.TESTS_SEALED)
         reconstructed = {
             lane.lane_id: lane for lane in self.store.active_projection(RUN_ID)
         }
@@ -1565,6 +1573,313 @@ class ArtifactStoreTests(unittest.TestCase):
     def test_resume_without_wait_is_blocked(self) -> None:
         with self.assertRaises(ResumeBlocked):
             self.store.resume_lane(RUN_ID, "A")
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(sql.strip().rstrip(";").split())
+
+
+def _schema_version(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT schema_version FROM ledger_meta").fetchone()
+    return None if row is None else row[0]
+
+
+def _lane_artifact_rows(conn: sqlite3.Connection) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM lane_artifacts ORDER BY run_id, lane_id, sequence, artifact_id"
+        )
+    ]
+
+
+def _copy_into_v1(src_conn: sqlite3.Connection, dest_path: Path) -> None:
+    dest = sqlite3.connect(dest_path, isolation_level=None)
+    try:
+        dest.executescript(V1_SCHEMA)
+        dest.execute(
+            "INSERT INTO ledger_meta(schema_version) VALUES (?)",
+            (st.LEDGER_SCHEMA_VERSION_V1,),
+        )
+        dest.execute("PRAGMA foreign_keys=ON")
+        dest.execute("PRAGMA defer_foreign_keys=ON")
+        dest.execute("BEGIN")
+        for table in (
+            "plan_revisions",
+            "runs",
+            "dag_lanes",
+            "lane_state",
+            "lane_artifacts",
+            "run_artifacts",
+            "transitions",
+        ):
+            rows = [tuple(row) for row in src_conn.execute(f"SELECT * FROM {table}")]
+            if not rows:
+                continue
+            placeholders = ",".join("?" * len(rows[0]))
+            dest.executemany(f"INSERT INTO {table} VALUES ({placeholders})", rows)
+        dest.execute("COMMIT")
+    except Exception:
+        try:
+            dest.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        dest.close()
+
+
+class LedgerSchemaMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._fx = ArtifactStoreTests()
+        self._fx.setUp()
+        self.addCleanup(self._fx.tearDown)
+        self.store = self._fx.store
+        self.lane_a = self._fx.lane_a
+        self._tmp = self._fx._tmp
+
+    def _advance_a_to_reviewing_code(self) -> None:
+        self._fx._to_sealed(self.lane_a)
+        self._fx._build(
+            self.lane_a,
+            entry=st.BuildingEntryKind.INITIAL,
+            base=self.store._run(RUN_ID)["integration_initial_sha"],
+            stamp="cand-1",
+        )
+
+    def _complete_test_invalidation(self, store: ArtifactStore) -> None:
+        run = store._run(RUN_ID)
+        plan = store._latest_lane_artifact(RUN_ID, "A", st.ArtifactKind.LANE_PLAN)
+        sealed = store._latest_lane_artifact(
+            RUN_ID, "A", st.ArtifactKind.SEALED_TEST_BUNDLE
+        )
+        builder = store._latest_lane_artifact(
+            RUN_ID, "A", st.ArtifactKind.BUILDER_OUTPUT
+        )
+        assert plan is not None and sealed is not None and builder is not None
+        loaded = json.loads(builder["payload_json"])
+        digest = st.reviewing_code_input_digest(
+            run_id=RUN_ID,
+            lane_id="A",
+            plan_revision=run["plan_revision"],
+            plan_digest=run["plan_digest"],
+            spec_digest=self.lane_a.spec_digest,
+            projection_digest=self.lane_a.lane_projection_digest,
+            lane_plan_id=plan["artifact_id"],
+            sealed_bundle_id=sealed["artifact_id"],
+            builder_output_id=builder["artifact_id"],
+            builder_base_sha=loaded["builder_base_sha"],
+            candidate_ref=loaded["candidate_ref"],
+            candidate_sha=loaded["candidate_sha"],
+        )
+        payload = {
+            "code": "PRIVATE_PATH_COLLISION",
+            "input_artifact_ids": [
+                plan["artifact_id"],
+                sealed["artifact_id"],
+                builder["artifact_id"],
+            ],
+            "kind": st.ArtifactKind.TEST_INVALIDATION.value,
+            "reason": {
+                "implementation_area": "private test suite",
+                "observed_behavior": (
+                    "sealed private path collides with candidate: A.py"
+                ),
+                "required_behavior": "private tests must be hidden",
+                "violated_requirement": "private tester paths must not collide",
+            },
+            "schema_version": st.CANONICAL_SCHEMA_VERSION,
+        }
+        record = store.complete_stage(
+            RUN_ID,
+            "A",
+            st.LaneStage.REVIEWING_CODE,
+            digest,
+            lane_artifact(
+                st.ArtifactKind.TEST_INVALIDATION,
+                self.lane_a,
+                digest,
+                payload,
+                revision=run["plan_revision"],
+            ),
+            st.LaneStage.WRITING_TESTS,
+        )
+        self.assertFalse(record.replayed)
+        self.assertEqual(store.lane_stage(RUN_ID, "A"), st.LaneStage.WRITING_TESTS)
+
+    def test_v1_ledger_migrates_to_v2_preserving_rows_then_accepts_test_invalidation(
+        self,
+    ) -> None:
+        self._advance_a_to_reviewing_code()
+        before = _lane_artifact_rows(self.store.conn)
+        self.assertGreaterEqual(len(before), 5)
+        dest = Path(self._tmp.name) / "v1.sqlite3"
+        _copy_into_v1(self.store.conn, dest)
+        probe = sqlite3.connect(dest)
+        try:
+            self.assertEqual(_schema_version(probe), st.LEDGER_SCHEMA_VERSION_V1)
+            sql = probe.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+            ).fetchone()[0]
+            self.assertEqual(_normalize_sql(sql), _normalize_sql(V1_LANE_ARTIFACTS_SQL))
+            self.assertNotIn("TEST_INVALIDATION", sql)
+            self.assertEqual(_lane_artifact_rows(probe), before)
+            with self.assertRaises(sqlite3.IntegrityError):
+                probe.execute(
+                    "INSERT INTO lane_artifacts("
+                    + ",".join(LANE_ARTIFACT_COLUMNS)
+                    + ") VALUES ("
+                    + ",".join("?" * len(LANE_ARTIFACT_COLUMNS))
+                    + ")",
+                    (
+                        "ab" * 32,
+                        RUN_ID,
+                        "A",
+                        999,
+                        "REVIEWING_CODE",
+                        "TEST_INVALIDATION",
+                        1,
+                        self.lane_a.spec_digest,
+                        self.lane_a.lane_projection_digest,
+                        "cd" * 32,
+                        "ef" * 32,
+                        "ref",
+                        "{}",
+                        "2020-01-01T00:00:00Z",
+                    ),
+                )
+        finally:
+            probe.close()
+
+        migrated = ArtifactStore(dest)
+        self.addCleanup(migrated.close)
+        self.assertEqual(st.LEDGER_SCHEMA_VERSION, "artifact-factory.v2")
+        self.assertEqual(_schema_version(migrated.conn), st.LEDGER_SCHEMA_VERSION)
+        after_sql = migrated.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+        ).fetchone()[0]
+        self.assertIn("TEST_INVALIDATION", after_sql)
+        self.assertEqual(
+            _normalize_sql(after_sql), _normalize_sql(LANE_ARTIFACTS_SQL)
+        )
+        self.assertEqual(_lane_artifact_rows(migrated.conn), before)
+        self.assertEqual(list(migrated.conn.execute("PRAGMA foreign_key_check")), [])
+        self.assertEqual(
+            migrated.conn.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+        )
+        self._complete_test_invalidation(migrated)
+        invalidations = list(
+            migrated.conn.execute(
+                "SELECT artifact_kind FROM lane_artifacts "
+                "WHERE artifact_kind='TEST_INVALIDATION'"
+            )
+        )
+        self.assertEqual(len(invalidations), 1)
+
+    def test_migrated_v2_reopen_is_idempotent(self) -> None:
+        self._advance_a_to_reviewing_code()
+        dest = Path(self._tmp.name) / "v1-idempotent.sqlite3"
+        _copy_into_v1(self.store.conn, dest)
+        first = ArtifactStore(dest)
+        sql1 = first.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+        ).fetchone()[0]
+        rows1 = _lane_artifact_rows(first.conn)
+        version1 = _schema_version(first.conn)
+        first.close()
+        second = ArtifactStore(dest)
+        self.addCleanup(second.close)
+        sql2 = second.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+        ).fetchone()[0]
+        self.assertEqual(sql2, sql1)
+        self.assertEqual(_lane_artifact_rows(second.conn), rows1)
+        self.assertEqual(_schema_version(second.conn), version1)
+        self.assertEqual(version1, st.LEDGER_SCHEMA_VERSION)
+
+    def test_malformed_v1_shape_is_refused_unmodified(self) -> None:
+        dest = Path(self._tmp.name) / "bad-v1.sqlite3"
+        conn = sqlite3.connect(dest)
+        conn.executescript(V1_SCHEMA)
+        conn.execute(
+            "INSERT INTO ledger_meta(schema_version) VALUES (?)",
+            (st.LEDGER_SCHEMA_VERSION_V1,),
+        )
+        conn.execute("ALTER TABLE lane_artifacts ADD COLUMN extra TEXT")
+        conn.commit()
+        sql_before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+        ).fetchone()[0]
+        version_before = _schema_version(conn)
+        conn.close()
+        with self.assertRaises(LedgerSchemaUnsupported):
+            ArtifactStore(dest)
+        probe = sqlite3.connect(dest)
+        try:
+            self.assertEqual(_schema_version(probe), version_before)
+            sql_after = probe.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+            ).fetchone()[0]
+            self.assertEqual(sql_after, sql_before)
+            self.assertIn("extra", sql_after)
+        finally:
+            probe.close()
+
+    def test_unknown_schema_version_is_refused(self) -> None:
+        dest = Path(self._tmp.name) / "v9.sqlite3"
+        conn = sqlite3.connect(dest)
+        conn.executescript(V1_SCHEMA)
+        conn.execute(
+            "INSERT INTO ledger_meta(schema_version) VALUES (?)",
+            ("artifact-factory.v9",),
+        )
+        conn.commit()
+        conn.close()
+        with self.assertRaises(LedgerSchemaUnsupported) as raised:
+            ArtifactStore(dest)
+        self.assertIn("LEDGER_SCHEMA_UNSUPPORTED", str(raised.exception))
+
+    def test_v1_migration_failure_rolls_back(self) -> None:
+        self._advance_a_to_reviewing_code()
+        dest = Path(self._tmp.name) / "v1-rollback.sqlite3"
+        _copy_into_v1(self.store.conn, dest)
+        probe = sqlite3.connect(dest)
+        sql_before = probe.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+        ).fetchone()[0]
+        rows_before = _lane_artifact_rows(probe)
+        probe.close()
+
+        class ExplodingStore(ArtifactStore):
+            def _rebuild_lane_artifacts_current_check(self) -> None:
+                self.conn.execute(
+                    "ALTER TABLE lane_artifacts RENAME TO lane_artifacts__v1_backup"
+                )
+                raise sqlite3.DatabaseError("injected migration failure")
+
+        with self.assertRaisesRegex(
+            sqlite3.DatabaseError, "injected migration failure"
+        ):
+            ExplodingStore(dest)
+        probe = sqlite3.connect(dest)
+        try:
+            self.assertEqual(_schema_version(probe), st.LEDGER_SCHEMA_VERSION_V1)
+            sql_after = probe.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='lane_artifacts'"
+            ).fetchone()[0]
+            self.assertEqual(sql_after, sql_before)
+            self.assertEqual(_lane_artifact_rows(probe), rows_before)
+            names = {
+                row[0]
+                for row in probe.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+                if not str(row[0]).startswith("sqlite_")
+            }
+            self.assertIn("lane_artifacts", names)
+            self.assertNotIn("lane_artifacts__v1_backup", names)
+        finally:
+            probe.close()
 
 
 if __name__ == "__main__":

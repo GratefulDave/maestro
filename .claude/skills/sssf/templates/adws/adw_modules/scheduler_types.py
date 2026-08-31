@@ -10,15 +10,18 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 
 CANONICAL_SCHEMA_VERSION = 1
-LEDGER_SCHEMA_VERSION = "artifact-factory.v1"
+LEDGER_SCHEMA_VERSION_V1 = "artifact-factory.v1"
+LEDGER_SCHEMA_VERSION = "artifact-factory.v2"
 
 NO_TEST_REVIEW = "NO_TEST_REVIEW"
 NO_PRIOR_BUILDER = "NO_PRIOR_BUILDER"
 NO_CODE_REVIEW = "NO_CODE_REVIEW"
 NO_BASE_INVALIDATION = "NO_BASE_INVALIDATION"
+NO_TEST_INVALIDATION = "NO_TEST_INVALIDATION"
 NO_CODE_REVIEW_REVISE = "NO_CODE_REVIEW_REVISE"
 NO_FINAL_REVIEW = "NO_FINAL_REVIEW"
 NO_PREDECESSOR = "NO_PREDECESSOR"
+
 
 FORBIDDEN_PRIVATE_KEYS = frozenset(
     {
@@ -69,6 +72,7 @@ class ArtifactKind(str, Enum):
     CODE_REVIEW = "CODE_REVIEW"
     INTEGRATION_MERGE = "INTEGRATION_MERGE"
     BASE_INVALIDATION = "BASE_INVALIDATION"
+    TEST_INVALIDATION = "TEST_INVALIDATION"
     USER_WAIT = "USER_WAIT"
     USER_DECISION = "USER_DECISION"
     FINAL_INTEGRATION_REVIEW = "FINAL_INTEGRATION_REVIEW"
@@ -125,9 +129,11 @@ LANE_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.CODE_REVIEW,
     ArtifactKind.INTEGRATION_MERGE,
     ArtifactKind.BASE_INVALIDATION,
+    ArtifactKind.TEST_INVALIDATION,
     ArtifactKind.USER_WAIT,
     ArtifactKind.USER_DECISION,
 )
+
 RUN_ARTIFACT_KINDS: Tuple[ArtifactKind, ...] = (
     ArtifactKind.FINAL_INTEGRATION_REVIEW,
     ArtifactKind.MAIN_PUBLICATION,
@@ -222,15 +228,32 @@ def lane_projection_digest(
     spec_digest: str,
     needs: Sequence[str],
     declared_outputs: Sequence[str],
+    lane_kind: Optional[str] = None,
 ) -> str:
-    return digest_canonical(
-        {
-            "declared_outputs": list(declared_outputs),
-            "needs": list(needs),
-            "schema_version": CANONICAL_SCHEMA_VERSION,
-            "spec_digest": spec_digest,
-        }
-    )
+    payload = {
+        "declared_outputs": list(declared_outputs),
+        "needs": list(needs),
+        "schema_version": CANONICAL_SCHEMA_VERSION,
+        "spec_digest": spec_digest,
+    }
+    kind = normalize_lane_kind(lane_kind)
+    if kind is not None:
+        payload["lane_kind"] = kind
+    return digest_canonical(payload)
+
+
+
+LANE_KIND_TESTS = "tests"
+LANE_KIND_BUILD = "build"
+_LANE_KINDS = frozenset({LANE_KIND_TESTS, LANE_KIND_BUILD})
+
+
+def normalize_lane_kind(raw: Any) -> Optional[str]:
+    if raw is None or raw == "":
+        return None
+    if raw in _LANE_KINDS:
+        return str(raw)
+    raise CanonicalIdentityError("lane_kind")
 
 
 def lane_input_digest(members: Mapping[str, Any]) -> str:
@@ -292,10 +315,15 @@ def writing_tests_input_digest(
     projection_digest: str,
     lane_plan_id: str,
     test_review_id: str,
+    integration_head: str,
+    test_invalidation_id: str = NO_TEST_INVALIDATION,
 ) -> str:
+    head = require_git_sha(integration_head, name="integration_head")
+    invalidation = test_invalidation_id or NO_TEST_INVALIDATION
     return lane_input_digest(
         {
-            "input_artifact_ids": [lane_plan_id, test_review_id],
+            "input_artifact_ids": [lane_plan_id, test_review_id, invalidation],
+            "integration_head": head,
             "lane_id": lane_id,
             "lane_projection_digest": projection_digest,
             "plan_digest": plan_digest,
@@ -304,8 +332,23 @@ def writing_tests_input_digest(
             "schema_version": CANONICAL_SCHEMA_VERSION,
             "spec_digest": spec_digest,
             "stage": LaneStage.WRITING_TESTS.value,
+            "test_invalidation": invalidation,
         }
     )
+
+
+def active_test_invalidation_id(
+    *,
+    invalidation_id: str | None,
+    invalidation_sequence: int | None,
+    draft_sequence: int | None,
+) -> str:
+    if not invalidation_id or invalidation_sequence is None:
+        return NO_TEST_INVALIDATION
+    if draft_sequence is not None and invalidation_sequence <= draft_sequence:
+        return NO_TEST_INVALIDATION
+    return invalidation_id
+
 
 
 def reviewing_tests_input_digest(
@@ -589,20 +632,28 @@ def amendment_reset_stage(
     *,
     changed: bool,
     wait_reason: Optional[WaitReason],
+    lane_kind: Optional[str] = None,
 ) -> LaneStage:
-    if wait_reason is WaitReason.PAUSE:
-        return LaneStage.WAITING_FOR_USER
     if wait_reason is WaitReason.AMENDMENT_REQUIRED:
         if not changed:
             raise IllegalStageEdge("AMENDMENT_DOES_NOT_ADDRESS_REVIEW")
         return LaneStage.PLANNED
     if changed:
         return LaneStage.PLANNED
+    if wait_reason is WaitReason.PAUSE:
+        return LaneStage.WAITING_FOR_USER
     if current in UNSTARTED_STAGES:
         return current
+    kind = normalize_lane_kind(lane_kind)
+    if kind == LANE_KIND_BUILD:
+        if current in STARTED_IMPLEMENTATION_STAGES or current is LaneStage.MERGED:
+            return LaneStage.BUILDING
+        raise IllegalStageEdge(f"no amendment reset for {current.value}")
     if current in STARTED_IMPLEMENTATION_STAGES or current is LaneStage.MERGED:
-        return LaneStage.BUILDING
+        return LaneStage.TESTS_SEALED
     raise IllegalStageEdge(f"no amendment reset for {current.value}")
+
+
 
 
 def candidate_ref(run_id: str, lane_id: str, input_digest: str) -> str:
@@ -625,6 +676,7 @@ class LaneProjection:
     declared_outputs: Tuple[str, ...]
     lane_projection_digest: str
     public_acceptance: Tuple[str, ...] = ()
+    lane_kind: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.lane_id:
@@ -634,8 +686,10 @@ class LaneProjection:
             raise CanonicalIdentityError("needs must be ordered by lane ID")
         if tuple(self.declared_outputs) != tuple(sorted(self.declared_outputs)):
             raise CanonicalIdentityError("declared outputs must be ordered by path")
+        kind = normalize_lane_kind(self.lane_kind)
+        object.__setattr__(self, "lane_kind", kind)
         expected = lane_projection_digest(
-            self.spec_digest, self.needs, self.declared_outputs
+            self.spec_digest, self.needs, self.declared_outputs, lane_kind=kind
         )
         if self.lane_projection_digest != expected:
             raise CanonicalIdentityError("lane_projection_digest mismatch")
@@ -695,16 +749,12 @@ class RunBinding:
             self.target_sync_journal_fingerprint,
             name="target_sync_journal_fingerprint",
         )
-        initial = require_git_sha(
+        require_git_sha(
             self.integration_initial_sha, name="integration_initial_sha"
         )
-        main = require_git_sha(
+        require_git_sha(
             self.target_initial_main_sha, name="target_initial_main_sha"
         )
-        if initial != main:
-            raise CanonicalIdentityError(
-                "integration_initial_sha != target_initial_main_sha"
-            )
         if not self.integration_ref.startswith("refs/maestro/integration/"):
             raise CanonicalIdentityError("integration_ref name")
         if not self.target_main_ref.startswith("refs/"):
@@ -848,6 +898,12 @@ COMPLETE_STAGE_EDGES: Tuple[StageEdge, ...] = (
         LaneStage.BUILDING,
     ),
     StageEdge(
+        LaneStage.REVIEWING_CODE,
+        ArtifactKind.TEST_INVALIDATION,
+        None,
+        LaneStage.WRITING_TESTS,
+    ),
+    StageEdge(
         LaneStage.READY_TO_MERGE,
         ArtifactKind.INTEGRATION_MERGE,
         None,
@@ -859,12 +915,31 @@ COMPLETE_STAGE_EDGES: Tuple[StageEdge, ...] = (
         None,
         LaneStage.BUILDING,
     ),
+
 )
 
 
 def next_stage_for(
-    current: LaneStage, kind: ArtifactKind, verdict: Optional[ReviewerVerdict]
+    current: LaneStage,
+    kind: ArtifactKind,
+    verdict: Optional[ReviewerVerdict],
+    lane_kind: Optional[str] = None,
 ) -> LaneStage:
+    normalized = normalize_lane_kind(lane_kind)
+    if (
+        normalized == LANE_KIND_TESTS
+        and current is LaneStage.TESTS_SEALED
+        and kind is ArtifactKind.SEALED_TEST_BUNDLE
+        and verdict is None
+    ):
+        return LaneStage.MERGED
+    if (
+        normalized == LANE_KIND_BUILD
+        and current is LaneStage.PLANNED
+        and kind is ArtifactKind.LANE_PLAN
+        and verdict is None
+    ):
+        return LaneStage.BUILDING
     for edge in COMPLETE_STAGE_EDGES:
         if edge.current is current and edge.kind is kind and edge.verdict is verdict:
             return edge.next_stage
@@ -884,8 +959,11 @@ def completed_stage_for(kind: ArtifactKind, payload: Mapping[str, Any]) -> LaneS
         return LaneStage.BUILDING
     if kind is ArtifactKind.CODE_REVIEW:
         return LaneStage.REVIEWING_CODE
+    if kind is ArtifactKind.TEST_INVALIDATION:
+        return LaneStage.REVIEWING_CODE
     if kind in (ArtifactKind.INTEGRATION_MERGE, ArtifactKind.BASE_INVALIDATION):
         return LaneStage.READY_TO_MERGE
+
     if kind is ArtifactKind.USER_WAIT:
         return LaneStage(payload["resume_stage"])
     if kind is ArtifactKind.USER_DECISION:

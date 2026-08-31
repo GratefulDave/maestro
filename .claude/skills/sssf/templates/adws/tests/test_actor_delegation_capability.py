@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypedDict, cast
 from unittest import mock
+
+import yaml
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
@@ -41,6 +44,13 @@ _ROLE_ROUTES: Mapping[str, Mapping[str, str]] = {
         "profile": "openai-performance",
     },
 }
+
+
+def _template_role_routes() -> Mapping[str, Mapping[str, str]]:
+    loaded = yaml.safe_load(
+        (ADWS / "maestro.config.yaml").read_text(encoding="utf-8")
+    )
+    return maestro._canonical_role_routes(loaded["role_routes"])
 
 
 class LaunchRecord(TypedDict):
@@ -73,18 +83,26 @@ def _init_repo(path: Path) -> str:
     return _git(path, "rev-parse", "HEAD")
 
 
-def _lane() -> LaneProjection:
+def _lane(
+    *,
+    lane_id: str = "lane-a",
+    needs: tuple[str, ...] = (),
+    outputs: tuple[str, ...] = ("a.txt",),
+    lane_kind: str | None = None,
+) -> LaneProjection:
     spec_digest = "ab" * 32
-    needs: tuple[str, ...] = ()
-    outputs = ("a.txt",)
     return LaneProjection(
-        lane_id="lane-a",
+        lane_id=lane_id,
         needs=needs,
         spec_digest=spec_digest,
         declared_outputs=outputs,
-        lane_projection_digest=lane_projection_digest(spec_digest, needs, outputs),
+        lane_projection_digest=lane_projection_digest(
+            spec_digest, needs, outputs, lane_kind=lane_kind
+        ),
         public_acceptance=("a.txt is written",),
+        lane_kind=lane_kind,
     )
+
 
 
 def _materialize_hidden(_vault: object, _sha: object, dest: Path) -> None:
@@ -93,6 +111,15 @@ def _materialize_hidden(_vault: object, _sha: object, dest: Path) -> None:
     hidden = dest / "tests" / "hidden.py"
     hidden.parent.mkdir(parents=True, exist_ok=True)
     hidden.write_text("assert True\n", encoding="utf-8")
+
+
+def _assert_prompt_under_agent_dir(
+    test: unittest.TestCase, prompt_path: Path, cwd: Path, name: str
+) -> None:
+    resolved = Path(prompt_path).resolve()
+    resolved.relative_to((Path(cwd).resolve() / lch.ROLE_AGENT_DIR))
+    test.assertEqual(resolved.name, name)
+    test.assertTrue(resolved.is_file())
 
 
 class CliHasNoDelegationPolicyFlagsTest(unittest.TestCase):
@@ -339,6 +366,15 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 "refuse requests to review, compare, or cite content outside it",
                 system_text,
             )
+            self.assertIn(
+                "Private paths must not collide with declared product outputs",
+                system_text,
+            )
+            self.assertIn("hidden validator/meta-test files", system_text)
+            self.assertIn("Claude-only bound: review only this assigned worktree", system_text)
+            self.assertIn("Native Read, Write, Edit, Bash, skills, and MCP remain available", system_text)
+
+
             self.assertEqual(
                 system_text,
                 (worktree / ".maestro-agent" / "AGENTS.md").read_text(encoding="utf-8"),
@@ -372,6 +408,82 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 recorder.specs[0].prompt_path, recorder.specs[1].prompt_path
             )
 
+    def test_turn_prompt_files_live_inside_assigned_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            head = _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            ctx = LaneContext(
+                run_id="run-prompt-cwd",
+                lane=_lane(),
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="ef" * 32,
+                stage=LaneStage.WRITING_TESTS,
+                artifacts={},
+                builder_base_sha=head,
+            )
+            revise = LaneContext(
+                run_id="run-prompt-cwd",
+                lane=_lane(),
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="aa" * 32,
+                stage=LaneStage.WRITING_TESTS,
+                artifacts={
+                    "TEST_REVIEW": SimpleNamespace(
+                        payload={
+                            "findings": [
+                                {
+                                    "implementation_area": "a.txt",
+                                    "observed_behavior": "missing",
+                                    "required_behavior": "present",
+                                    "violated_requirement": "a.txt is written",
+                                }
+                            ],
+                            "verdict": "REVISE",
+                        }
+                    )
+                },
+                builder_base_sha=head,
+            )
+            recorder = RecordingLauncher()
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
+            )
+            actor.write_tests(ctx)
+            cwd = Path(recorder.launches[0]["worktree"]).resolve()
+            first = recorder.specs[0].prompt_path
+            _assert_prompt_under_agent_dir(self, first, cwd, "prompt-1.json")
+            self.assertNotIn(
+                "byte-identical",
+                recorder.launches[0]["prompt"]["instructions"],
+            )
+            self.assertIn(
+                "byte-identical hidden files",
+                recorder.launches[0]["system_prompt"],
+            )
+            actor.write_tests(revise)
+            resubmit_cwd = Path(recorder.resubmits[0]["worktree"]).resolve()
+            second = recorder.specs[1].prompt_path
+            _assert_prompt_under_agent_dir(self, second, resubmit_cwd, "prompt-2.json")
+            self.assertEqual(cwd, resubmit_cwd)
+            self.assertNotEqual(first.resolve(), second.resolve())
+            self.assertIn(
+                "Apply revise_findings to hidden validators",
+                recorder.resubmits[0]["prompt"]["instructions"],
+            )
+            self.assertIn(
+                "byte-identical hidden files",
+                recorder.resubmits[0]["prompt"]["instructions"],
+            )
+
+
     def test_malformed_terminal_envelope_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -388,6 +500,54 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             envelope.write_text("{not-json", encoding="utf-8")
             with self.assertRaisesRegex(FactoryRefused, "STAGE_PAYLOAD_INVALID"):
                 actor._await_envelope(object(), envelope, "tester")
+
+    def test_collect_uncommitted_refuses_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            secret = root / "host-secret.txt"
+            secret.write_text("VAULT_BYTES\n", encoding="utf-8")
+            _init_repo(checkout)
+            leak = checkout / "leaked.txt"
+            leak.symlink_to(secret)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, RecordingLauncher()),
+                state,
+                target,
+                _ROLE_ROUTES,
+            )
+            with self.assertRaisesRegex(FactoryRefused, "ROLE_OUTPUT_UNSAFE"):
+                actor._collect_uncommitted(checkout)
+
+    def test_await_envelope_refuses_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            secret = root / "host-secret.json"
+            secret.write_text('{"success": true, "secret": "VAULT_BYTES"}', encoding="utf-8")
+            envelope = checkout / "envelope.json"
+            envelope.symlink_to(secret)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, RecordingLauncher()),
+                state,
+                target,
+                _ROLE_ROUTES,
+            )
+            handle = SimpleNamespace(launched_cwd=str(checkout))
+            with self.assertRaisesRegex(FactoryRefused, "ROLE_OUTPUT_UNSAFE"):
+                actor._await_envelope(handle, envelope, "tester")
+
 
     def test_tester_prompt_names_envelope_and_keeps_private_files_off_product(
         self,
@@ -411,8 +571,16 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 builder_base_sha=head,
             )
             recorder = RecordingLauncher(files={"tests/hidden.py": "assert False\n"})
+            lane_spec = {
+                "instruction": "Write tests against the existing public module.",
+                "reads": ["src/lib/seo/entity.ts"],
+            }
             actor = maestro.HerdrStageActor(
-                cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
+                cast(lch.LauncherAdapter, recorder),
+                state,
+                target,
+                _ROLE_ROUTES,
+                lane_specs={"lane-a": lane_spec},
             )
             extra = actor.write_tests(ctx)
             self.assertEqual(set(extra), {"private_files"})
@@ -423,10 +591,14 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertTrue(Path(prompt["envelope_path"]).is_absolute())
             self.assertIn("envelope_schema", prompt)
             self.assertEqual(prompt["role"], "tester")
+            self.assertEqual(prompt["lane_spec"], lane_spec)
             self.assertIn("Do not git commit", prompt["instructions"])
             self.assertIn("Do not delegate", prompt["instructions"])
             self.assertIn("Create UTF-8 JSON", prompt["instructions"])
+            self.assertIn("hidden meta-tests", prompt["instructions"])
+            self.assertIn("never declared_outputs", prompt["instructions"])
             self.assertNotIn("Only sandboxed Bash", prompt["instructions"])
+
 
     def test_builder_prompt_omits_private_bytes_and_commits_declared_outputs(
         self,
@@ -471,6 +643,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             prompt = recorder.launches[0]["prompt"]
             self.assertEqual(prompt["role"], "builder")
             self.assertNotIn("private_files", prompt)
+            self.assertNotIn("private_draft_overlay", prompt)
             self.assertNotIn("vault_path", prompt)
             dumped = json.dumps(prompt, sort_keys=True)
             self.assertNotIn("tests/hidden.py", dumped)
@@ -488,6 +661,101 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 "Modify only the declared product outputs",
                 recorder.launches[0]["system_prompt"],
             )
+
+    def test_typed_build_prompts_omit_gate_and_private_path(self) -> None:
+        private_path = "src/lib/seo/geo-entity-page.test.ts"
+        product_spec = {
+            "effects": [
+                {"disposition": "none", "effect": "canonical_object_write"}
+            ],
+            "goal": "implement product.py",
+            "instruction": "Populate the FAQ block",
+            "integration": {"integration_branch": "refs/heads/main"},
+        }
+        build_spec = dict(product_spec)
+        build_spec["gate"] = {
+            "argv": [private_path],
+            "cwd": ".",
+            "min_cases": 9,
+            "runner": "vitest",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            head = _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            lane = _lane(lane_kind="build", outputs=("product.py",))
+            sealed = SimpleNamespace(artifact_id="bundle-abc")
+            ctx = LaneContext(
+                run_id="run-typed-build",
+                lane=lane,
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="22" * 32,
+                stage=LaneStage.BUILDING,
+                artifacts={"SEALED_TEST_BUNDLE": sealed},
+                builder_base_sha=head,
+                public_contract={
+                    "acceptance_criteria": ["product.py is written"],
+                    "declared_outputs": ["product.py"],
+                },
+                sealed_digest="33" * 32,
+            )
+            recorder = RecordingLauncher(
+                files={"product.py": "ok\n"},
+                envelope={"candidate_sha": head, "changed": False},
+            )
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, recorder),
+                state,
+                target,
+                _ROLE_ROUTES,
+                lane_specs={"lane-a": build_spec},
+            )
+            actor.build(ctx)
+            prompt = recorder.launches[0]["prompt"]
+            self.assertEqual(prompt["role"], "builder")
+            self.assertEqual(prompt["lane_spec"], product_spec)
+            self.assertNotIn("gate", prompt)
+            self.assertNotIn("gate", prompt["lane_spec"])
+            dumped = json.dumps(prompt, sort_keys=True)
+            self.assertNotIn(private_path, dumped)
+            self.assertEqual(prompt["declared_outputs"], ["product.py"])
+            self.assertEqual(prompt["sealed_digest"], "33" * 32)
+            self.assertEqual(prompt["predecessor_bundle_id"], "bundle-abc")
+            self.assertEqual(prompt["predecessor_bundle_digest"], "33" * 32)
+            review_ctx = LaneContext(
+                run_id="run-typed-build",
+                lane=lane,
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="55" * 32,
+                stage=LaneStage.REVIEWING_CODE,
+                artifacts={"SEALED_TEST_BUNDLE": sealed},
+                builder_base_sha=head,
+                candidate_sha=head,
+                public_contract=ctx.public_contract,
+                sealed_digest="33" * 32,
+            )
+            reviewer = RecordingLauncher(
+                envelope={"verdict": "PASS", "findings": []}
+            )
+            review_actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, reviewer),
+                state,
+                target,
+                _ROLE_ROUTES,
+                lane_specs={"lane-a": build_spec},
+            )
+            review_actor.review_code(review_ctx)
+            review_prompt = reviewer.launches[0]["prompt"]
+            self.assertEqual(review_prompt["role"], "code-reviewer")
+            self.assertEqual(review_prompt["lane_spec"], product_spec)
+            self.assertNotIn(private_path, json.dumps(review_prompt, sort_keys=True))
 
     def test_test_reviewer_runs_in_private_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -514,7 +782,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 files={"tests/hidden.py": "assert True\n"},
                 public_contract={
                     "acceptance_criteria": ["a.txt is written"],
-                    "declared_outputs": ["a.txt"],
+                    "declared_outputs": ["tests/hidden.py"],
                 },
                 worktrees_root=state / "worktrees",
             )
@@ -596,7 +864,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 files=extra["private_files"],
                 public_contract={
                     "acceptance_criteria": ["a.txt is written"],
-                    "declared_outputs": ["a.txt"],
+                    "declared_outputs": ["tests/hidden.py"],
                 },
                 worktrees_root=state / "worktrees",
             )
@@ -634,7 +902,7 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             lane = _lane()
             contract = {
                 "acceptance_criteria": ["a.txt is written"],
-                "declared_outputs": ["a.txt"],
+                "declared_outputs": ["tests/hidden.py"],
             }
 
             def draft(input_digest: str, body: str) -> object:
@@ -695,6 +963,113 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 recorder.resubmits[0]["prompt"]["working_directory"],
                 str(cwd.resolve()),
             )
+
+    def test_test_reviewer_prompt_scopes_private_overlay_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(product)
+            public_test = product / "src" / "lib" / "seo" / "geo-entity-page.test.ts"
+            public_test.parent.mkdir(parents=True)
+            public_test.write_text("eight public cases\n", encoding="utf-8")
+            _git(product, "add", "src/lib/seo/geo-entity-page.test.ts")
+            _git(product, "commit", "-m", "public tests")
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            lane = _lane()
+            contract = {
+                "acceptance_criteria": ["a.txt is written"],
+                "declared_outputs": ["a.txt"],
+            }
+            overlay = "src/lib/seo/geo-entity-page.hidden.test.ts"
+
+            def draft(input_digest: str, body: str) -> object:
+                return tchain.write_test_draft(
+                    request=prv.VaultLaneRequest(
+                        run_id="run-overlay-scope",
+                        lane_id=lane.lane_id,
+                        plan_revision=1,
+                        spec_digest=lane.spec_digest,
+                        lane_projection_digest=lane.lane_projection_digest,
+                        input_digest=input_digest,
+                    ),
+                    state_root=state,
+                    run_repo=product,
+                    integration_ref="refs/heads/main",
+                    files={overlay: body},
+                    public_contract=contract,
+                    worktrees_root=state / "worktrees",
+                )
+
+            first_draft = draft("10" * 32, "assert False\n")
+            second_draft = draft("20" * 32, "assert False\n# revised\n")
+            first_ctx = LaneContext(
+                run_id="run-overlay-scope",
+                lane=lane,
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="30" * 32,
+                stage=LaneStage.REVIEWING_TESTS,
+                artifacts={"TEST_DRAFT": first_draft},  # type: ignore[dict-item]
+                public_contract=contract,
+            )
+            second_ctx = LaneContext(
+                run_id="run-overlay-scope",
+                lane=lane,
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="40" * 32,
+                stage=LaneStage.REVIEWING_TESTS,
+                artifacts={"TEST_DRAFT": second_draft},  # type: ignore[dict-item]
+                public_contract=contract,
+            )
+            recorder = RecordingLauncher(envelope={"verdict": "PASS", "findings": []})
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
+            )
+            actor.review_tests(first_ctx)
+            cwd = Path(recorder.launches[0]["worktree"]).resolve()
+            first_prompt = recorder.specs[0].prompt_path
+            _assert_prompt_under_agent_dir(self, first_prompt, cwd, "prompt-1.json")
+            prompt = recorder.launches[0]["prompt"]
+            self.assertEqual(prompt["private_draft_overlay"], [overlay])
+            self.assertNotIn(
+                "src/lib/seo/geo-entity-page.test.ts",
+                prompt["private_draft_overlay"],
+            )
+            self.assertNotIn("seed.txt", prompt["private_draft_overlay"])
+            self.assertNotIn("a.txt", prompt["private_draft_overlay"])
+            self.assertIn("private_draft_overlay", prompt["instructions"])
+            self.assertIn("out of scope", prompt["instructions"])
+            self.assertIn("red-at-base", prompt["instructions"])
+            self.assertIn(
+                "do not demand edits to declared product outputs",
+                prompt["instructions"],
+            )
+            self.assertIn("red-at-base", recorder.launches[0]["system_prompt"])
+            self.assertIn(
+                "private_draft_overlay files listed in the per-turn JSON",
+                recorder.launches[0]["system_prompt"],
+            )
+            actor.review_tests(second_ctx)
+            resubmit_cwd = Path(recorder.resubmits[0]["worktree"]).resolve()
+            second_prompt = recorder.specs[1].prompt_path
+            _assert_prompt_under_agent_dir(
+                self, second_prompt, resubmit_cwd, "prompt-2.json"
+            )
+            self.assertEqual(cwd, resubmit_cwd)
+            self.assertEqual(
+                recorder.resubmits[0]["prompt"]["private_draft_overlay"],
+                [overlay],
+            )
+            self.assertIn(
+                "red-at-base",
+                recorder.resubmits[0]["prompt"]["instructions"],
+            )
+
 
     def test_cold_builder_reconnect_rebases_outputs_before_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -988,7 +1363,7 @@ class RoleRouteBindingTest(unittest.TestCase):
             )
             recorder = RecordingLauncher(envelope={"verdict": "PASS", "findings": []})
             actor = maestro.HerdrStageActor(
-                cast(lch.LauncherAdapter, recorder), state, target, _ROLE_ROUTES
+                cast(lch.LauncherAdapter, recorder), state, target, _template_role_routes()
             )
             for role in lch.LANE_PANE_ROLES:
                 actor._launch(
@@ -1022,6 +1397,147 @@ class RoleRouteBindingTest(unittest.TestCase):
                     ),
                 },
             )
+
+    def test_template_config_routes_omp_roles_to_shared_base_profiles(self) -> None:
+        routes = _template_role_routes()
+        self.assertEqual(routes["tester"]["route"], "claude")
+        self.assertEqual(routes["tester"]["model"], "opus")
+        self.assertEqual(routes["tester"]["effort"], "high")
+        self.assertEqual(routes["tester"]["profile"], "")
+        self.assertEqual(routes["builder"]["profile"], "grok")
+        for role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
+            self.assertEqual(routes[role]["route"], "omp")
+            self.assertEqual(routes[role]["model"], "")
+            self.assertEqual(routes[role]["effort"], "")
+            self.assertEqual(routes[role]["profile"], "openai-performance")
+        self.assertEqual(routes["builder"]["route"], "omp")
+        raw = (ADWS / "maestro.config.yaml").read_text(encoding="utf-8")
+        for obsolete in (
+            "grok-test",
+            "grok-build",
+            "grok-review",
+            "openai-perf-test",
+            "openai-perf-build",
+            "openai-perf-review",
+        ):
+            self.assertNotIn(obsolete, raw)
+
+    def test_omp_reviewer_agents_prompts_differ_and_use_shared_openai_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            product = root / "product"
+            head = _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            ctx = LaneContext(
+                run_id="run-reviewer-prompts",
+                lane=_lane(),
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="13" * 32,
+                stage=LaneStage.REVIEWING_TESTS,
+                artifacts={},
+                builder_base_sha=head,
+            )
+            recorder = RecordingLauncher(envelope={"verdict": "PASS", "findings": []})
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, recorder),
+                state,
+                target,
+                _template_role_routes(),
+            )
+            for role in ("test-reviewer", "code-reviewer"):
+                cwd = root / role
+                cwd.mkdir()
+                actor._launch(
+                    ctx,
+                    role,
+                    cwd,
+                    {},
+                    prepare_cwd=lambda path: None,
+                )
+            by_role = {
+                str(spec.pane_role): (spec, launch)
+                for spec, launch in zip(recorder.specs, recorder.launches)
+            }
+            test_text = by_role["test-reviewer"][1]["system_prompt"]
+            code_text = by_role["code-reviewer"][1]["system_prompt"]
+            self.assertNotEqual(test_text, code_text)
+            shared = (
+                "Work only in the assigned checkout: the process CWD.",
+                "Never commit, branch, merge, or rebase; the broker owns Git publication.",
+                "Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.",
+            )
+            for blob in (test_text, code_text):
+                for phrase in shared:
+                    self.assertIn(phrase, blob)
+            self.assertIn("Maestro test-reviewer role contract", test_text)
+            self.assertIn("## Test-reviewer obligations", test_text)
+            self.assertIn(
+                "private TEST_DRAFT tests against lane-plan obligations",
+                test_text,
+            )
+            self.assertIn("behavior coverage", test_text)
+            self.assertIn("satisfiability/non-vacuity", test_text)
+            self.assertIn("deterministic isolation", test_text)
+            self.assertIn("actionable findings for the tester", test_text)
+            self.assertIn(
+                "Never review or prescribe product implementation",
+                test_text,
+            )
+            self.assertIn(
+                "Never expose private tests to builder or product outputs",
+                test_text,
+            )
+            self.assertNotIn("actionable findings for the builder", test_text)
+            self.assertNotIn("product candidate", test_text)
+            self.assertIn("Maestro code-reviewer role contract", code_text)
+            self.assertIn("## Code-reviewer obligations", code_text)
+            self.assertIn(
+                "exact product candidate and declared outputs against the lane plan",
+                code_text,
+            )
+            self.assertIn("implementation correctness", code_text)
+            self.assertIn("regressions", code_text)
+            self.assertIn("security", code_text)
+            self.assertIn("maintainability", code_text)
+            self.assertIn("actionable findings for the builder", code_text)
+            self.assertIn("each resolvable by editing declared outputs only", code_text)
+            self.assertIn("Never prescribe changes to files outside", code_text)
+            self.assertIn("external test contradicts the lane's public contract", code_text)
+            self.assertIn(
+                "Private tests are absent and must not be inferred, requested, or cited",
+                code_text,
+            )
+            self.assertNotIn("TEST_DRAFT", code_text)
+            self.assertNotIn("actionable findings for the tester", code_text)
+            for role in ("test-reviewer", "code-reviewer"):
+                spec, launch = by_role[role]
+                argv = launch["argv"]
+                cwd = Path(launch["worktree"])
+                agents = (cwd / ".maestro-agent" / "AGENTS.md").resolve()
+                self.assertEqual(spec.route, "omp")
+                self.assertEqual(spec.profile, "openai-performance")
+                self.assertEqual(argv[0], "omp")
+                self.assertEqual(
+                    argv[argv.index("--profile") + 1],
+                    "openai-performance",
+                )
+                self.assertEqual(
+                    argv[argv.index("--append-system-prompt") + 1],
+                    str(agents),
+                )
+                self.assertNotIn("--append-system-prompt-file", argv)
+                self.assertEqual(
+                    spec.system_prompt_path.resolve()
+                    if spec.system_prompt_path is not None
+                    else None,
+                    agents,
+                )
 
 
 if __name__ == "__main__":

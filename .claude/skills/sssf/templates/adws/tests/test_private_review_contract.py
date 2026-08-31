@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ADWS = Path(__file__).resolve().parents[1]
@@ -46,7 +47,7 @@ def {selector}():
 )
 CONTRACT = {
     "acceptance_criteria": ["negative amounts are refused"],
-    "declared_outputs": ["refund.py"],
+    "declared_outputs": [TEST_PATH],
 }
 CONSTRAINTS = ("change only declared outputs",)
 
@@ -208,6 +209,117 @@ class PrivateReviewContract(unittest.TestCase):
         self.assertEqual(draft.payload["public_contract"], contract)
         self.assertNotIn(SECRET_LITERAL, json.dumps(draft.payload))
 
+    def test_draft_allows_public_contract_phrases_in_private_source(self):
+        source = """\
+def test_public_contract_terms():
+    assert "FAQ block"
+    assert "indexation threshold"
+"""
+        contract = {
+            "acceptance_criteria": [
+                "Nine cases cover the FAQ block and the indexation threshold."
+            ],
+            "declared_outputs": [TEST_PATH],
+        }
+
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("public-contract-phrases"),
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TEST_PATH: source},
+            public_contract=contract,
+            worktrees_root=self.worktrees / "public-contract-phrases",
+        )
+
+        self.assertEqual(draft.payload["public_contract"], contract)
+
+    def test_draft_commit_excludes_agent_runtime_files(self):
+        original_write_files = pr.write_files
+
+        def write_files_with_runtime_state(dest, files):
+            written = original_write_files(dest, files)
+            runtime_file = Path(dest) / ".omc" / "state" / "session.json"
+            runtime_file.parent.mkdir(parents=True)
+            runtime_file.write_text('{"private":"agent state"}', encoding="utf-8")
+            return written
+
+        with mock.patch.object(
+            pr, "write_files", side_effect=write_files_with_runtime_state
+        ):
+            draft = self._draft(_digest("runtime-state-exclusion"))
+
+        vault = hv.vault_path(self.state, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        committed = {path for path, _blob in hv.list_commit_blobs(vault, commit)}
+        self.assertIn(TEST_PATH, committed)
+        self.assertNotIn(".omc/state/session.json", committed)
+
+    def test_commit_all_paths_excludes_prestaged_files(self):
+        vault = hv.ensure_vault(self.state, self.run_id)
+        base = hv.seed(vault, self.repo, INTEGRATION_REF)
+        dest = self.worktrees / "commit-pathspec"
+        hv.checkout_vault_worktree(vault, base, dest)
+        (dest / "keep.py").write_text("keep\n", encoding="utf-8")
+        (dest / "extra.py").write_text("extra\n", encoding="utf-8")
+        _git(dest, "add", "extra.py")
+        sha = hv.commit_all(dest, "only keep", paths=["keep.py"])
+        committed = {path for path, _blob in hv.list_commit_blobs(vault, sha)}
+        self.assertIn("keep.py", committed)
+        self.assertNotIn("extra.py", committed)
+
+    def test_draft_allows_private_files_independent_of_declared_outputs(self):
+        product = {
+            "acceptance_criteria": ["negative amounts are refused"],
+            "declared_outputs": ["refund.py"],
+        }
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("independent-envelope"),
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TEST_PATH: TEST_SOURCE, "tests/meta_hidden.py": "assert True\n"},
+            public_contract=product,
+            worktrees_root=self.worktrees / "independent-envelope",
+        )
+        self.assertEqual(
+            draft.payload["private_manifest_schema"], tc.PRIVATE_MANIFEST_SCHEMA
+        )
+        vault = hv.vault_path(self.state, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        selected = {
+            path
+            for path, _blob in tc._select_private_blobs(vault, commit, draft.payload)
+        }
+        self.assertEqual(selected, {TEST_PATH, "tests/meta_hidden.py"})
+        self.assertNotIn("refund.py", selected)
+
+
+    def test_draft_refuses_empty_envelope(self):
+        with self.assertRaises(pr.PrivateReviewError) as raised:
+            tc.write_test_draft(
+                request=_request(
+                    run_id=self.run_id,
+                    lane_id=self.lane_id,
+                    input_digest=_digest("empty-envelope"),
+                ),
+                state_root=self.state,
+                run_repo=self.repo,
+                integration_ref=INTEGRATION_REF,
+                files={},
+                public_contract=CONTRACT,
+                worktrees_root=self.worktrees / "empty-envelope",
+            )
+        self.assertIn("empty", str(raised.exception))
+
     def test_author_reviewer_revise_then_pass_uses_distinct_inputs(self):
         first = self._draft(_digest("draft-1"))
         self.assertIs(first.kind, st.ArtifactKind.TEST_DRAFT)
@@ -218,8 +330,16 @@ class PrivateReviewContract(unittest.TestCase):
                 "input_digest",
                 "private_draft_digest",
                 "private_draft_ref",
+                "private_manifest_digest",
+                "private_manifest_schema",
                 "public_contract",
             },
+        )
+        self.assertEqual(
+            first.payload["private_manifest_schema"], tc.PRIVATE_MANIFEST_SCHEMA
+        )
+        self.assertEqual(
+            first.payload["private_manifest_digest"], first.payload["private_draft_digest"]
         )
         self.assertEqual(first.payload["input_artifact_ids"], [])
         self.assertEqual(first.payload["input_digest"], first.input_digest)
@@ -229,6 +349,7 @@ class PrivateReviewContract(unittest.TestCase):
             st.ReviewerVerdict.REVISE,
             (_finding(observed_behavior=SECRET_LITERAL + " still happens"),),
         )
+
         self.assertIs(revise.kind, st.ArtifactKind.TEST_REVIEW)
         self.assertIs(revise.verdict, st.ReviewerVerdict.REVISE)
         self.assertEqual(revise.payload["verdict"], st.ReviewerVerdict.REVISE.value)
@@ -251,7 +372,8 @@ class PrivateReviewContract(unittest.TestCase):
         )
         self.assertNotIn(SECRET_LITERAL, blob)
         self.assertNotIn(SECRET_SELECTOR, blob)
-        self.assertNotIn(TEST_PATH, blob)
+        self.assertNotIn(TEST_PATH, json.dumps(revise.payload) + json.dumps(passed.payload))
+        self.assertIn(TEST_PATH, first.payload["public_contract"]["declared_outputs"])
 
     def test_seal_hides_private_objects_from_run_repo_and_builder(self):
         draft = self._draft(_digest("draft-1"))
@@ -287,7 +409,7 @@ class PrivateReviewContract(unittest.TestCase):
         self.assertNotIn(SECRET_LITERAL, view_text)
         self.assertNotIn(SECRET_SELECTOR, view_text)
         self.assertNotIn(SECRET_FIXTURE, view_text)
-        self.assertNotIn(TEST_PATH, view_text)
+        self.assertIn(TEST_PATH, view_text)
         self.assertNotIn(str(vault.resolve()), view_text)
         self.assertNotIn("refs/maestro/sealed/", view_text)
         self.assertNotIn("refs/maestro/drafts/", view_text)
@@ -302,6 +424,121 @@ class PrivateReviewContract(unittest.TestCase):
         )
         with self.assertRaises(pr.PrivateReviewError):
             self._seal(draft, revise, self._builder())
+
+    def test_seal_allows_declared_private_test_path_in_public_contract(self):
+        draft = self._draft(_digest("seal-declared-path"))
+        passed = self._review(
+            draft, _digest("seal-declared-review"), st.ReviewerVerdict.PASS
+        )
+        sealed = self._seal(draft, passed, self._builder())
+        public = json.dumps(sealed.payload)
+        self.assertEqual(
+            sealed.payload["public_contract"]["declared_outputs"], [TEST_PATH]
+        )
+        self.assertIn(Path(TEST_PATH).name, public)
+        self.assertNotIn(SECRET_LITERAL, public)
+        self.assertNotIn(SECRET_SELECTOR, public)
+
+    def test_polluted_draft_seals_and_runs_only_declared_outputs(self):
+        digest = _digest("polluted-draft")
+        request = _request(
+            run_id=self.run_id, lane_id=self.lane_id, input_digest=digest
+        )
+        contract = pr.public_contract(
+            acceptance_criteria=CONTRACT["acceptance_criteria"],
+            declared_outputs=[TEST_PATH],
+        )
+        vault = hv.ensure_vault(self.state, self.run_id)
+        base = hv.seed(vault, self.repo, INTEGRATION_REF)
+        dest = self.worktrees / "polluted"
+        hv.checkout_vault_worktree(vault, base, dest)
+        pr.write_files(dest, {TEST_PATH: TEST_SOURCE})
+        omc = dest / ".omc" / "state.json"
+        omc.parent.mkdir(parents=True)
+        omc.write_text('{"agent":"state"}', encoding="utf-8")
+        (dest / ".cbmignore").write_text("*\n", encoding="utf-8")
+        (dest / "bun.lock").write_text("{}\n", encoding="utf-8")
+        commit = hv.commit_all(dest, "polluted draft")
+        ref = hv.draft_ref(request.run_id, request.lane_id, request.input_digest)
+        hv.update_immutable_ref(vault, ref, commit)
+        committed = {path for path, _blob in hv.list_commit_blobs(vault, commit)}
+        self.assertIn(TEST_PATH, committed)
+        self.assertIn(".omc/state.json", committed)
+        self.assertIn(".cbmignore", committed)
+        self.assertIn("bun.lock", committed)
+        extra_blobs = [
+            blob
+            for path, blob in hv.list_commit_blobs(vault, commit)
+            if path != TEST_PATH
+            and dict(hv.list_commit_blobs(vault, base)).get(path) != blob
+        ]
+        draft = pr.make_lane_artifact(
+            kind=st.ArtifactKind.TEST_DRAFT,
+            request=request,
+            payload={
+                "input_artifact_ids": [],
+                "input_digest": digest,
+                "private_draft_digest": "ab" * 32,
+                "private_draft_ref": ref,
+                "public_contract": contract,
+            },
+            artifact_ref=ref,
+        )
+        passed = self._review(
+            draft, _digest("polluted-review"), st.ReviewerVerdict.PASS
+        )
+        sealed = self._seal(draft, passed, self._builder())
+        files = tc.sealed_private_files(vault, sealed)
+        self.assertEqual(set(files), {TEST_PATH})
+        public = json.dumps(sealed.payload)
+        for blob in extra_blobs:
+            self.assertNotIn(blob, public)
+        tree = self.root / "polluted-run"
+        tree.mkdir()
+        (tree / "refund.py").write_text(FIXED)
+        hv.copy_blobs_to_tree(vault, tree, files)
+        self.assertTrue((tree / TEST_PATH).is_file())
+        self.assertFalse((tree / ".omc").exists())
+        self.assertFalse((tree / ".cbmignore").exists())
+        self.assertFalse((tree / "bun.lock").exists())
+        self.assertEqual(tuple(files), (TEST_PATH,))
+
+    def test_seal_retry_with_existing_same_target_ref_is_idempotent(self):
+        draft = self._draft(_digest("seal-retry-draft"))
+        passed = self._review(
+            draft, _digest("seal-retry-review"), st.ReviewerVerdict.PASS
+        )
+        builder = self._builder()
+        request = _request(
+            run_id=self.run_id,
+            lane_id=self.lane_id,
+            input_digest=_digest("seal-" + draft.input_digest),
+        )
+        vault = hv.vault_path(self.state, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        sealed_name = hv.sealed_ref(
+            request.run_id, request.lane_id, request.input_digest
+        )
+        hv.update_immutable_ref(vault, sealed_name, commit)
+        first = tc.seal_accepted_tests(
+            request=request,
+            state_root=self.state,
+            run_repo=self.repo,
+            builder_worktree=builder,
+            test_draft=draft,
+            test_review=passed,
+        )
+        second = tc.seal_accepted_tests(
+            request=request,
+            state_root=self.state,
+            run_repo=self.repo,
+            builder_worktree=builder,
+            test_draft=draft,
+            test_review=passed,
+        )
+        self.assertEqual(first.payload, second.payload)
+        self.assertEqual(first.artifact_ref, sealed_name)
+        self.assertEqual(hv.rev_parse(vault, sealed_name), commit)
 
     def test_code_review_revise_then_pass_with_real_runner(self):
         draft = self._draft(_digest("draft-1"))
@@ -391,11 +628,110 @@ class PrivateReviewContract(unittest.TestCase):
             scratch_root=self.root / "scratch-2",
             architecture_constraints=CONSTRAINTS,
         )
+
         self.assertIs(accepted.verdict, st.ReviewerVerdict.PASS)
         self.assertGreater(accepted.payload["public_result_summary"]["passed"], 0)
         self.assertEqual(accepted.payload["public_result_summary"]["failed"], 0)
         self.assertNotEqual(revise.input_digest, accepted.input_digest)
         self.assertFalse((self.root / "scratch-2" / ".git").exists())
+
+
+    def test_code_review_refuses_sealed_path_colliding_with_candidate(self):
+        product_path = "refund.py"
+        contract = {
+            "acceptance_criteria": ["negative amounts are refused"],
+            "declared_outputs": [TEST_PATH, product_path],
+        }
+        digest = _digest("collide-draft")
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=digest,
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TEST_PATH: TEST_SOURCE, product_path: FIXED},
+            public_contract=contract,
+            worktrees_root=self.worktrees / "collide-draft",
+        )
+        passed = self._review(
+            draft, _digest("collide-review"), st.ReviewerVerdict.PASS
+        )
+        sealed = self._seal(draft, passed, self._builder())
+        vault = hv.vault_path(self.state, self.run_id)
+        files = tc.sealed_private_files(vault, sealed)
+        self.assertEqual(set(files), {TEST_PATH, product_path})
+        base = _git(self.repo, "rev-parse", "HEAD")
+        bad_sha, bad_ref = self._candidate(PRODUCT)
+        review_digest = _digest("collide-code-review")
+        scratch = self.root / "scratch-collide"
+        with mock.patch.object(tc, "run_private_suite") as runner:
+            with self.assertRaises(pr.PrivatePathCollisionError) as ctx:
+                cr.review_builder_output(
+                    request=_request(
+                        run_id=self.run_id,
+                        lane_id=self.lane_id,
+                        input_digest=review_digest,
+                    ),
+                    state_root=self.state,
+                    candidate_repo=self.repo,
+                    candidate_sha=bad_sha,
+                    candidate_ref=bad_ref,
+                    builder_base_sha=base,
+                    sealed_bundle=sealed,
+                    verdict=st.ReviewerVerdict.PASS,
+                    scratch_root=scratch,
+                    architecture_constraints=CONSTRAINTS,
+                )
+            runner.assert_not_called()
+        self.assertIsInstance(ctx.exception, pr.IsolationError)
+        self.assertEqual(ctx.exception.code, "PRIVATE_PATH_COLLISION")
+        self.assertEqual(ctx.exception.path, product_path)
+        message = str(ctx.exception)
+        self.assertIn("collides with candidate", message)
+        self.assertIn(product_path, message)
+        self.assertNotIn(SECRET_LITERAL, message)
+        self.assertNotIn(FIXED, message)
+        dest = scratch / "review-{0}-{1}".format(self.lane_id, review_digest[:12])
+        self.assertEqual((dest / product_path).read_text(), PRODUCT)
+        self.assertFalse((dest / TEST_PATH).exists())
+
+
+    def test_code_review_copies_absent_private_tests_and_runs_them(self):
+        draft = self._draft(_digest("absent-path-draft"))
+        passed = self._review(
+            draft, _digest("absent-path-review"), st.ReviewerVerdict.PASS
+        )
+        sealed = self._seal(draft, passed, self._builder())
+        base = _git(self.repo, "rev-parse", "HEAD")
+        good_sha, good_ref = self._candidate(FIXED)
+        review_digest = _digest("absent-path-code-review")
+        scratch = self.root / "scratch-absent"
+        accepted = cr.review_builder_output(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=review_digest,
+            ),
+            state_root=self.state,
+            candidate_repo=self.repo,
+            candidate_sha=good_sha,
+            candidate_ref=good_ref,
+            builder_base_sha=base,
+            sealed_bundle=sealed,
+            verdict=st.ReviewerVerdict.PASS,
+            scratch_root=scratch,
+            architecture_constraints=CONSTRAINTS,
+        )
+        self.assertIs(accepted.verdict, st.ReviewerVerdict.PASS)
+        self.assertGreater(accepted.payload["public_result_summary"]["passed"], 0)
+        self.assertEqual(accepted.payload["public_result_summary"]["failed"], 0)
+        dest = scratch / "review-{0}-{1}".format(self.lane_id, review_digest[:12])
+        self.assertTrue((dest / TEST_PATH).is_file())
+        self.assertEqual((dest / "refund.py").read_text(), FIXED)
+        self.assertNotEqual((dest / TEST_PATH).read_text(), FIXED)
 
     def test_same_inputs_yield_identical_canonical_bytes(self):
         first = self._draft(_digest("draft-1"))
@@ -430,6 +766,117 @@ class PrivateReviewContract(unittest.TestCase):
         self.assertEqual(list(self.root.rglob("*.sqlite3")), [])
         self.assertFalse((self.state / "lifecycle.sqlite3").exists())
 
+
+    def _install_fake_vitest(self) -> Path:
+        binary = self.repo / "node_modules" / ".bin" / "vitest"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text(
+            "#!{python}\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "stamp = Path(__file__).with_name('vitest.calls')\n"
+            "prior = stamp.read_text() if stamp.exists() else ''\n"
+            "stamp.write_text(prior + ' '.join(sys.argv[1:]) + '\\n')\n"
+            "args = sys.argv[1:]\n"
+            "if '--version' in args:\n"
+            "    print('vitest/3.2.7')\n"
+            "    raise SystemExit(0)\n"
+            "if 'list' in args:\n"
+            "    print('suite.test.ts > ok')\n"
+            "    raise SystemExit(0)\n"
+            "if 'run' in args:\n"
+            "    fail = Path(__file__).with_name('vitest.fail').exists()\n"
+            "    if fail:\n"
+            "        print(' Test Files  1 failed (1)')\n"
+            "        print('      Tests  1 failed | 0 passed (1)')\n"
+            "        raise SystemExit(1)\n"
+            "    print(' Test Files  1 passed (1)')\n"
+            "    print('      Tests  1 passed (1)')\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(1)\n".format(python=sys.executable),
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        return binary
+
+    def test_code_review_runs_vitest_gate_not_pytest(self):
+        suite_path = "suite.test.ts"
+        contract = {
+            "acceptance_criteria": ["typed suite binds the candidate"],
+            "declared_outputs": [suite_path],
+        }
+        digest = _digest("vitest-draft")
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=digest,
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={suite_path: "test('ok', () => {})\n"},
+            public_contract=contract,
+            worktrees_root=self.worktrees / "vitest-draft",
+        )
+        passed = self._review(draft, _digest("vitest-review"), st.ReviewerVerdict.PASS)
+        sealed = self._seal(draft, passed, self._builder())
+        binary = self._install_fake_vitest()
+        stamp = binary.with_name("vitest.calls")
+        base = _git(self.repo, "rev-parse", "HEAD")
+        sha, ref = self._candidate(FIXED)
+        gate = {
+            "runner": "vitest",
+            "argv": [suite_path],
+            "cwd": ".",
+            "min_cases": 1,
+        }
+        accepted = cr.review_builder_output(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("vitest-code-review"),
+            ),
+            state_root=self.state,
+            candidate_repo=self.repo,
+            candidate_sha=sha,
+            candidate_ref=ref,
+            builder_base_sha=base,
+            sealed_bundle=sealed,
+            verdict=st.ReviewerVerdict.PASS,
+            scratch_root=self.root / "scratch-vitest",
+            architecture_constraints=CONSTRAINTS,
+            gate=gate,
+            runtime_root=self.repo,
+        )
+        self.assertIs(accepted.verdict, st.ReviewerVerdict.PASS)
+        self.assertGreaterEqual(accepted.payload["public_result_summary"]["passed"], 1)
+        self.assertEqual(accepted.payload["public_result_summary"]["failed"], 0)
+        calls = stamp.read_text(encoding="utf-8")
+        self.assertIn("run", calls)
+        self.assertIn(suite_path, calls)
+        self.assertNotIn("pytest", calls)
+        binary.with_name("vitest.fail").write_text("1", encoding="utf-8")
+        demoted = cr.review_builder_output(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("vitest-code-review-red"),
+            ),
+            state_root=self.state,
+            candidate_repo=self.repo,
+            candidate_sha=sha,
+            candidate_ref=ref,
+            builder_base_sha=base,
+            sealed_bundle=sealed,
+            verdict=st.ReviewerVerdict.PASS,
+            scratch_root=self.root / "scratch-vitest-red",
+            architecture_constraints=CONSTRAINTS,
+            gate=gate,
+            runtime_root=self.repo,
+        )
+        self.assertIs(demoted.verdict, st.ReviewerVerdict.REVISE)
+        self.assertGreater(demoted.payload["public_result_summary"]["failed"], 0)
 
 if __name__ == "__main__":
     unittest.main()

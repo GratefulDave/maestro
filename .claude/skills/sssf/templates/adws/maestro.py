@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -24,12 +26,17 @@ import yaml
 from adw_modules import factory_console as fconsole
 from adw_modules import git_publication as gitpub
 from adw_modules import hidden_vault as hv
+from adw_modules.handoff_budget import (
+    OMP_CONTEXT_WINDOW_TOKENS,
+    route_publishes_a_window,
+)
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import scheduler_types as st
-from adw_modules import workspace_isolation as isolation
+from adw_modules import tests_chain as tchain
 from adw_modules.lifecycle import ArtifactStore, LedgerSchemaUnsupported
 from adw_modules.reporting_registry import register_installation
+from adw_modules.dashboard_autoload import maybe_autoload_dashboard
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
 from adw_modules.runtime_state import RuntimeStateRefused, RuntimeStateRoot
 from adw_modules.scheduler import (
@@ -40,10 +47,12 @@ from adw_modules.scheduler import (
     RunRepositoryMismatch,
     StageActor,
     apply_factory_amendment,
+    binding_from_run,
     create_factory_run,
     plan_artifact_ref_for,
     require_deployment,
     run_row,
+    target_from_binding,
 )
 
 _MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
@@ -68,6 +77,8 @@ class _RunRefused(RuntimeError):
 
 
 _ROLE_ROUTE_FIELDS = frozenset(("route", "model", "effort", "profile"))
+_DASHBOARD_FIELDS = frozenset(("enabled", "launcher", "api_port", "ui_port", "open"))
+
 
 
 def _config_string(value: object, label: str) -> str:
@@ -155,6 +166,49 @@ def _canonical_role_routes(
         )
     return MappingProxyType(canonical)
 
+def _config_port(value: object, label: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _MaestroConfigurationError(label + " must be an integer port")
+    if not 1 <= value <= 65535:
+        raise _MaestroConfigurationError(label + " must be an integer port")
+    return value
+
+
+def _canonical_dashboard(value: object) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise _MaestroConfigurationError("dashboard must be a mapping")
+    extras = frozenset(value) - _DASHBOARD_FIELDS
+    if extras:
+        raise _MaestroConfigurationError(
+            "dashboard has unsupported fields: " + ", ".join(sorted(extras))
+        )
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise _MaestroConfigurationError("dashboard.enabled must be a boolean")
+    launcher = value.get("launcher")
+    if launcher is not None:
+        launcher = _config_string(launcher, "dashboard.launcher")
+    open_browser = value.get("open", True)
+    if not isinstance(open_browser, bool):
+        raise _MaestroConfigurationError("dashboard.open must be a boolean")
+    return MappingProxyType(
+        {
+            "enabled": enabled,
+            "launcher": launcher,
+            "api_port": _config_port(
+                value.get("api_port"), "dashboard.api_port", 4600
+            ),
+            "ui_port": _config_port(
+                value.get("ui_port"), "dashboard.ui_port", 4317
+            ),
+            "open": open_browser,
+        }
+    )
+
 
 def _executing_maestro_file() -> Path:
     return Path(__file__)
@@ -182,6 +236,7 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["provision_argv"] = _config_argv(
         loaded.get("provision_argv"), "provision_argv"
     )
+    loaded["dashboard"] = _canonical_dashboard(loaded.get("dashboard"))
     loaded["repo"] = repo.resolve()
     return loaded
 
@@ -226,11 +281,66 @@ def _precreated_role_cwd(dest: Path) -> bool:
     try:
         if dest.is_symlink() or not dest.is_dir():
             return False
-        return {child.name for child in dest.iterdir()} <= {
-            isolation.agent_dir(dest).name
-        }
+        return {child.name for child in dest.iterdir()} <= {lch.ROLE_AGENT_DIR}
     except OSError:
         return False
+
+
+def _relative_under(root: Path, path: Path) -> str:
+    root = Path(root).resolve()
+    candidate = Path(path)
+    if candidate.is_absolute():
+        located = candidate.parent.resolve() / candidate.name
+        try:
+            relative = located.relative_to(root)
+        except ValueError as exc:
+            raise FactoryRefused("ROLE_OUTPUT_UNSAFE:outside checkout") from exc
+    else:
+        relative = candidate
+    parts = relative.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise FactoryRefused("ROLE_OUTPUT_UNSAFE:path")
+    return str(relative).replace("\\", "/")
+
+
+
+def _read_regular_text_under(root: Path, path: Path) -> str:
+    """Read a regular file under `root`. Never follow symlinks."""
+    relative = _relative_under(root, path)
+    dir_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(Path(root).resolve()), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        parts = Path(relative).parts
+        for index, name in enumerate(parts):
+            last = index == len(parts) - 1
+            try:
+                nxt = os.open(name, file_flags if last else dir_flags, dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise FileNotFoundError(path) from exc
+                raise FactoryRefused("ROLE_OUTPUT_UNSAFE:{0}".format(relative)) from exc
+            os.close(fd)
+            fd = nxt
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise FactoryRefused("ROLE_OUTPUT_UNSAFE:{0}".format(relative))
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        os.close(fd)
 
 
 def _clear_precreated_role_cwd(dest: Path) -> bool:
@@ -254,12 +364,19 @@ class HerdrStageActor:
         state_root: Path,
         target: gitpub.TargetBinding,
         role_routes: Mapping[str, Mapping[str, str]],
+        lane_specs: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         self.launcher = launcher
         self.state_root = Path(state_root)
         self.worktrees = self.state_root / "worktrees"
         self.target = target
         self.role_routes = _canonical_role_routes(role_routes)
+        self.lane_specs = MappingProxyType(
+            {
+                str(lane_id): MappingProxyType(dict(spec))
+                for lane_id, spec in (lane_specs or {}).items()
+            }
+        )
         self.project_identity = _project_identity(target)
         self._roles: dict[tuple[str, str], _RoleSession] = {}
 
@@ -270,11 +387,26 @@ class HerdrStageActor:
         except ValueError:
             return
         try:
-            isolation.validate_git_marker(
-                resolved, Path(self.target.target_git_common_dir)
+            marker = (resolved / ".git").read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise FactoryRefused("ROLE_GIT_BINDING_REFUSED:{}".format(exc)) from exc
+        prefix = "gitdir:"
+        if not marker.startswith(prefix):
+            raise FactoryRefused("ROLE_GIT_BINDING_REFUSED:ROLE_GIT_BINDING_INVALID")
+        raw = marker[len(prefix) :].strip()
+        gitdir = Path(raw)
+        if not gitdir.is_absolute():
+            gitdir = resolved / gitdir
+        try:
+            relative = gitdir.resolve().relative_to(
+                Path(self.target.target_git_common_dir).resolve()
             )
-        except (isolation.IsolationRefused, OSError, UnicodeError) as exc:
-            raise FactoryRefused(f"ROLE_GIT_BINDING_REFUSED:{exc}") from exc
+        except ValueError as extra:
+            raise FactoryRefused(
+                "ROLE_GIT_BINDING_REFUSED:ROLE_GIT_BINDING_MISMATCH"
+            ) from extra
+        if len(relative.parts) < 2 or relative.parts[0] != "worktrees":
+            raise FactoryRefused("ROLE_GIT_BINDING_REFUSED:ROLE_GIT_BINDING_MISMATCH")
 
     def _git(self, repo: Path, *args: str, check: bool = True) -> str:
         self._validate_role_git(repo)
@@ -309,6 +441,8 @@ class HerdrStageActor:
         return result.stdout
 
     def _base_sha(self, ctx: LaneContext, role: str, integration_sha: str = "") -> str:
+        if role == "tester":
+            return ctx.integration_head or self.target.integration_initial_sha
         if role == "code-reviewer" and ctx.candidate_sha:
             return ctx.candidate_sha
         if role == "integration-reviewer" and integration_sha:
@@ -333,7 +467,7 @@ class HerdrStageActor:
             stderr=subprocess.DEVNULL,
         )
         if precreated:
-            isolation.scratch_environment(dest)
+            lch.scratch_environment(dest)
 
     def _safe_remove_attempt(self, attempt: Path, checkout: Path | None) -> None:
         try:
@@ -375,23 +509,59 @@ class HerdrStageActor:
             "affected_lanes": ["<lane-id>"],
         }
 
-    def _materialize_role_instructions(self, cwd: Path, role: str, route: str) -> Path:
-        role_rules = {
-            "tester": (
+    def _materialize_role_instructions(
+        self, cwd: Path, role: str, route: str, lane_kind: str | None = None
+    ) -> Path:
+        if role == "tester" and lane_kind == st.LANE_KIND_TESTS:
+            tester_rule = (
                 "Inspect the product checkout without modifying product files. "
-                "Return private test files only through the requested envelope."
-            ),
+                "Return private acceptance files only through the requested envelope. "
+                "Author files exactly at declared_outputs. Returned private_files "
+                "paths must equal declared_outputs. On correction turns, apply "
+                "revise_findings to those declared files; do not claim a finding "
+                "is fixed by resubmitting byte-identical files."
+            )
+        else:
+            tester_rule = (
+                "Inspect the product checkout without modifying product files. "
+                "Return private test files only through the requested envelope. "
+                "Private paths must not collide with declared product outputs. "
+                "Write hidden validator/meta-test files that exercise builder "
+                "outputs; never replace those outputs. On correction turns, "
+                "apply revise_findings to hidden validators; do not claim a "
+                "finding is fixed by resubmitting byte-identical hidden files."
+            )
+        role_rules = {
+            "tester": tester_rule,
+
             "test-reviewer": (
-                "Review the private TEST_DRAFT tree read-only. Return only a "
-                "PASS or REVISE verdict with actionable findings."
+                "## Test-reviewer obligations\n"
+                "Review private TEST_DRAFT tests against lane-plan obligations. "
+                "Check behavior coverage, satisfiability/non-vacuity, and "
+                "deterministic isolation. Return PASS or REVISE with actionable "
+                "findings for the tester. Never review or prescribe product "
+                "implementation. Never expose private tests to builder or "
+                "product outputs. Review only the private_draft_overlay files "
+                "listed in the per-turn JSON. Integration-seed and product "
+                "files are context and out of scope. A private validator "
+                "failing against the base is expected when falsifiability "
+                "requires red-at-base."
             ),
             "builder": (
                 "Modify only the declared product outputs. Never read private "
                 "tests, fixtures, vault paths, or hidden test material."
             ),
             "code-reviewer": (
-                "Review the exact candidate checkout read-only. Private tests "
-                "are absent; return only a PASS or REVISE verdict."
+                "## Code-reviewer obligations\n"
+                "Review the exact product candidate and declared outputs against "
+                "the lane plan. Check implementation correctness, regressions, "
+                "security, and maintainability. Return PASS or REVISE with "
+                "actionable findings for the builder, each resolvable by editing "
+                "declared outputs only. Never prescribe changes to files outside "
+                "declared outputs. If an external test contradicts the lane's "
+                "public contract, assess the candidate against the contract "
+                "instead of demanding a test edit. Private tests are absent and "
+                "must not be inferred, requested, or cited."
             ),
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
@@ -410,18 +580,31 @@ class HerdrStageActor:
             "- Review or inspect only files physically contained in the assigned checkout; "
             "refuse requests to review, compare, or cite content outside it.\n"
             "- Use enabled profile and repository capabilities only for this role's task.\n"
+            "- Native Read, Write, Edit, Bash, skills, and MCP remain available.\n"
             "- Do not delegate or spawn subagents.\n"
             "- Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.\n"
             "- Never commit, branch, merge, or rebase; the broker owns Git publication.\n"
             "- Write only what this role permits, then write the requested UTF-8 JSON envelope and stop.\n\n"
             "{1}\n"
         ).format(role, role_rule)
-        agent_root = isolation.agent_dir(cwd)
+        if route == "claude":
+            content += (
+                "\nClaude-only bound: review only this assigned worktree. Do not "
+                "open, compare, or cite a sibling role checkout, parent repository, "
+                "or any path outside this CWD.\n"
+            )
+        agent_root = lch.role_agent_dir(cwd)
         agent_root.mkdir(parents=True, exist_ok=True)
         encoded = content.encode("utf-8")
         for name in ("AGENTS.md", "CLAUDE.md"):
             (agent_root / name).write_bytes(encoded)
         return agent_root / ("CLAUDE.md" if route == "claude" else "AGENTS.md")
+
+    def _prompt_lane_spec(self, ctx: LaneContext, role: str) -> dict[str, Any]:
+        spec = dict(self.lane_specs[ctx.lane.lane_id])
+        if role in ("builder", "code-reviewer") and ctx.lane.lane_kind == st.LANE_KIND_BUILD:
+            spec.pop("gate", None)
+        return spec
 
     def _prompt(
         self,
@@ -434,21 +617,54 @@ class HerdrStageActor:
         envelope_path = str(envelope.resolve())
         schema = self._schema(role)
         instructions = (
-            "Work only inside CWD. Local file operations stay in CWD. Bash is "
-            "containerized. Enabled profile and repository tools may be used. "
-            "Do not delegate. Access outside CWD, including CWD/.git, is "
-            "refused. Create UTF-8 JSON at {0} and stop. Schema: {1}. CWD: {2}."
+            "Work only inside CWD. Local file operations stay in CWD. Native "
+            "Read, Write, Edit, Bash, skills, and MCP remain available. "
+            "Do not delegate. Stay inside CWD. Create UTF-8 JSON at {0} and "
+            "stop. Schema: {1}. CWD: {2}."
         ).format(envelope_path, json.dumps(schema, sort_keys=True), cwd.resolve())
 
         if role == "tester":
-            instructions += " Create private tests here. Do not git commit. Do not write the product repo."
+            if ctx.lane.lane_kind == st.LANE_KIND_TESTS:
+                instructions += (
+                    " Author private acceptance files exactly at "
+                    "declared_outputs. Returned private_files paths must equal "
+                    "declared_outputs. Do not git commit. Do not write the "
+                    "product repo."
+                )
+                if extra.get("revise_findings"):
+                    instructions += (
+                        " Apply revise_findings to those declared files. Do not "
+                        "claim a finding is fixed by resubmitting byte-identical "
+                        "files."
+                    )
+            else:
+                instructions += (
+                    " Create private tests here. Do not git commit. Do not write "
+                    "the product repo. Private paths must be hidden meta-tests, "
+                    "never declared_outputs."
+                )
+                if extra.get("revise_findings"):
+                    instructions += (
+                        " Apply revise_findings to hidden validators. Do not claim "
+                        "a finding is fixed by resubmitting byte-identical hidden "
+                        "files."
+                    )
         elif role == "test-reviewer":
-            instructions += " Inspect this private TEST_DRAFT tree. Return PASS or REVISE findings. No leaked literals."
+            instructions += (
+                " Review only the private TEST_DRAFT overlay files listed in "
+                "private_draft_overlay. Integration-seed and product files in "
+                "this checkout are context and out of scope. A private "
+                "validator failing against the base is expected when "
+                "falsifiability requires red-at-base; do not demand edits to "
+                "declared product outputs. Return PASS or REVISE findings. "
+                "No leaked literals."
+            )
         elif role == "builder":
             instructions += " Edit only declared_outputs. Do not git commit; the broker commits those files. No private tests, fixtures, or vault paths."
         elif role == "code-reviewer":
             instructions += (
-                " Inspect this candidate product checkout. Private tests are absent."
+                " Inspect this candidate product checkout. Findings must be "
+                "resolvable within declared_outputs. Private tests are absent."
             )
         elif role == "integration-reviewer":
             instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
@@ -467,11 +683,17 @@ class HerdrStageActor:
             "stage": ctx.stage.value,
             "working_directory": str(cwd.resolve()),
         }
+        if self.lane_specs:
+            try:
+                body["lane_spec"] = self._prompt_lane_spec(ctx, role)
+            except KeyError as exc:
+                raise FactoryRefused("LANE_SPEC_MISSING") from exc
         body.update(extra)
         if role == "builder":
             for key in list(body):
                 if key in st.FORBIDDEN_PRIVATE_KEYS or key in (
                     "private_files",
+                    "private_draft_overlay",
                     "vault_path",
                     "vault_ref",
                 ):
@@ -491,18 +713,32 @@ class HerdrStageActor:
             if not rel or rel == ".maestro-agent" or rel.startswith(".maestro-agent/"):
                 continue
             try:
-                content = isolation.read_text_beneath(checkout, checkout / rel)
+                content = _read_regular_text_under(checkout, checkout / rel)
             except FileNotFoundError:
                 continue
-            except (isolation.IsolationRefused, OSError, UnicodeError) as exc:
+            except (OSError, UnicodeError) as exc:
                 raise FactoryRefused(f"ROLE_OUTPUT_UNSAFE:{rel}") from exc
             files[rel.replace("\\", "/")] = content
         return files
 
+
     def _commit_declared(
         self, checkout: Path, outputs: Sequence[str], base: str
     ) -> tuple[str, bool]:
-        pathspec = tuple(str(item) for item in outputs)
+        requested = tuple(str(item) for item in outputs)
+        pathspec: tuple[str, ...] = ()
+        if requested:
+            listed = self._git(
+                checkout,
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                *requested,
+            )
+            pathspec = tuple(item for item in listed.split("\0") if item)
         if pathspec:
             self._git(checkout, "add", "-A", "--", *pathspec)
             patch = self._git_bytes(
@@ -517,7 +753,7 @@ class HerdrStageActor:
         else:
             patch = b""
         self._git(checkout, "reset", "--hard", base)
-        self._git(checkout, "clean", "-fdx")
+        self._clean_checkout(checkout)
         if not patch:
             return base, False
         self._git_bytes(
@@ -533,11 +769,14 @@ class HerdrStageActor:
         self._git(checkout, "commit", "-m", "declared outputs")
         return self._git(checkout, "rev-parse", "HEAD"), True
 
+    def _clean_checkout(self, checkout: Path) -> None:
+        self._git(checkout, "clean", "-fdx", "-e", lch.ROLE_AGENT_DIR)
+
     def _refresh_git_checkout(self, checkout: Path, sha: str) -> None:
         if not (checkout / ".git").exists():
             raise FactoryRefused("ROLE_CHECKOUT_MISSING")
         self._git(checkout, "reset", "--hard", sha)
-        self._git(checkout, "clean", "-fdx")
+        self._clean_checkout(checkout)
 
     def _refresh_builder_checkout(
         self, checkout: Path, outputs: Sequence[str], base: str
@@ -548,9 +787,10 @@ class HerdrStageActor:
         parent = self._git(checkout, "rev-parse", "HEAD^", check=False)
         dirty = bool(self._git(checkout, "status", "--porcelain"))
         if not dirty and (head == base or parent == base):
-            self._git(checkout, "clean", "-fdx")
+            self._clean_checkout(checkout)
             return
         self._commit_declared(checkout, outputs, base)
+
 
     def _refresh_private_tree(self, ctx: LaneContext, cwd: Path) -> None:
         draft = ctx.artifacts.get("TEST_DRAFT")
@@ -563,16 +803,11 @@ class HerdrStageActor:
 
     @staticmethod
     def _launch_environment(cwd: Path) -> dict[str, str]:
-        redirects = isolation.scratch_environment(cwd)
+        redirects = lch.scratch_environment(cwd)
         if set(redirects) != set(lch.SCRATCH_ENV_KEYS):
             raise FactoryRefused("SCRATCH_ENV_CONTRACT_MISMATCH")
         environment = dict(os.environ)
         environment.update(redirects)
-        environment["MAESTRO_ROLE_ROOT"] = str(cwd.resolve())
-        environment["MAESTRO_ISOLATION_PYTHON"] = sys.executable
-        environment["MAESTRO_ISOLATION_RUNNER"] = str(
-            Path(isolation.__file__).resolve()
-        )
         return environment
 
     def _workspace_label(self, ctx: LaneContext) -> str:
@@ -617,22 +852,21 @@ class HerdrStageActor:
     def _await_envelope(
         self, handle: object, envelope: Path, role: str
     ) -> Mapping[str, Any]:
+        bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
         while True:
             envelope_exists = False
             try:
-                raw = isolation.read_text_beneath(envelope.parents[2], envelope)
+                raw = _read_regular_text_under(bound, envelope)
                 envelope_exists = True
                 payload = json.loads(raw)
             except FileNotFoundError:
                 payload = None
-            except (
-                isolation.IsolationRefused,
-                OSError,
-                UnicodeError,
-                ValueError,
-            ):
+            except FactoryRefused:
+                raise
+            except (OSError, UnicodeError, ValueError):
                 envelope_exists = True
                 payload = None
+
             if isinstance(payload, dict) and self._payload_ok(role, payload):
                 wait = getattr(self.launcher, "wait_for_idle", None)
                 if wait is not None:
@@ -668,19 +902,20 @@ class HerdrStageActor:
             attempt = cwd if cwd.name != "checkout" else cwd.parent
             turn = 1
         while (
-            isolation.result_path(cwd, turn).exists()
-            or (attempt / "prompt-{}.json".format(turn)).exists()
+            lch.role_result_path(cwd, turn).exists()
+            or lch.role_prompt_path(cwd, turn).exists()
         ):
             turn += 1
         if stored is not None:
             stored.turns = turn
         session = attempt / "session"
         session.mkdir(exist_ok=True)
-        envelope = isolation.result_path(cwd, turn)
+        envelope = lch.role_result_path(cwd, turn)
         envelope.parent.mkdir(parents=True, exist_ok=True)
-        prompt = attempt / "prompt-{}.json".format(turn)
+        prompt = lch.role_prompt_path(cwd, turn)
 
         def write_prompt(actual_cwd: Path) -> None:
+            prompt.parent.mkdir(parents=True, exist_ok=True)
             prompt.write_bytes(
                 st.canonical_bytes(self._prompt(ctx, role, envelope, actual_cwd, extra))
             )
@@ -688,11 +923,15 @@ class HerdrStageActor:
         def prepare_adopted_cwd(actual_cwd: Path) -> None:
             adopted = Path(actual_cwd).resolve()
             prepare_cwd(adopted)
-            self._materialize_role_instructions(adopted, role, route["route"])
+            self._materialize_role_instructions(
+                adopted, role, route["route"], ctx.lane.lane_kind
+            )
             envelope.parent.mkdir(parents=True, exist_ok=True)
             write_prompt(adopted)
 
-        system_prompt = self._materialize_role_instructions(cwd, role, route["route"])
+        system_prompt = self._materialize_role_instructions(
+            cwd, role, route["route"], ctx.lane.lane_kind
+        )
         write_prompt(cwd)
         lane_key = key[0]
         spec = lch.LaunchSpec(
@@ -707,7 +946,11 @@ class HerdrStageActor:
             system_prompt_path=system_prompt,
             session_dir=session,
             environment=self._launch_environment(cwd),
-            context_window_tokens=8192,
+            context_window_tokens=(
+                OMP_CONTEXT_WINDOW_TOKENS
+                if route_publishes_a_window(route["route"])
+                else None
+            ),
             lane_key=lane_key,
             lane_label=lane_key,
             pane_role=role,
@@ -751,6 +994,8 @@ class HerdrStageActor:
         ):
             if private_tree:
                 return attempt, None
+            if sha and role == "tester":
+                self._refresh_git_checkout(cwd, sha)
             return attempt, cwd
         if private_tree:
             draft = ctx.artifacts.get("TEST_DRAFT")
@@ -760,7 +1005,7 @@ class HerdrStageActor:
             if precreated:
                 _clear_precreated_role_cwd(cwd)
             hv.materialize_commit(vault, hv.rev_parse(vault, draft.artifact_ref), cwd)
-            isolation.scratch_environment(cwd)
+            lch.scratch_environment(cwd)
             return attempt, None
         if not sha:
             raise FactoryRefused("missing checkout sha")
@@ -791,6 +1036,11 @@ class HerdrStageActor:
         sha = self._base_sha(ctx, "tester")
         key = self._role_key(ctx, "tester")
         stored = self._roles.get(key)
+
+        def prepare(path: Path) -> None:
+            if (path / ".git").exists():
+                self._refresh_git_checkout(path, sha)
+
         if stored is None:
             attempt, checkout = self._prepare(
                 ctx, "tester", sha=sha, private_tree=False
@@ -798,19 +1048,34 @@ class HerdrStageActor:
             cwd = checkout or attempt / "checkout"
         else:
             attempt, checkout, cwd = stored.attempt, stored.checkout, stored.cwd
+        if (cwd / ".git").exists():
+            self._refresh_git_checkout(cwd, sha)
         extra: dict[str, Any] = {
             "declared_outputs": list(ctx.lane.declared_outputs),
             "public_acceptance": list(ctx.lane.public_acceptance),
         }
-        findings = self._revise_findings(ctx, "TEST_REVIEW")
-        if findings is not None:
+        findings = list(ctx.draft_correction or ())
+        if not findings:
+            review_findings = self._revise_findings(ctx, "TEST_REVIEW")
+            if review_findings is not None:
+                findings = review_findings
+        if findings:
             extra["revise_findings"] = findings
+        invalidation = ctx.artifacts.get("TEST_INVALIDATION")
+        if invalidation is not None:
+            payload = getattr(invalidation, "payload", None) or {}
+            extra["test_invalidation"] = {
+                "artifact_id": getattr(invalidation, "artifact_id", ""),
+                "code": payload.get("code") if isinstance(payload, Mapping) else None,
+                "reason": payload.get("reason") if isinstance(payload, Mapping) else None,
+            }
+
         payload, _handle, cwd_used = self._launch(
             ctx,
             "tester",
             cwd,
             extra,
-            prepare_cwd=lambda path: None,
+            prepare_cwd=prepare,
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         files = dict(payload.get("private_files") or {})
@@ -831,11 +1096,21 @@ class HerdrStageActor:
         else:
             attempt, checkout = stored.attempt, None
             cwd = stored.cwd
+        draft = ctx.artifacts.get("TEST_DRAFT")
+        if draft is None:
+            raise FactoryRefused("missing TEST_DRAFT")
+        vault = hv.ensure_vault(self.state_root, ctx.run_id)
+        extra = {
+            "public_contract": ctx.public_contract,
+            "private_draft_overlay": list(
+                tchain.private_draft_overlay_paths(vault, draft)
+            ),
+        }
         payload, _handle, cwd_used = self._launch(
             ctx,
             "test-reviewer",
             cwd,
-            {"public_contract": ctx.public_contract},
+            extra,
             prepare_cwd=lambda path: self._refresh_private_tree(ctx, path),
         )
         self._bind_checkout(key, attempt, checkout, cwd_used)
@@ -849,6 +1124,10 @@ class HerdrStageActor:
             "public_contract": ctx.public_contract,
             "sealed_digest": ctx.sealed_digest,
         }
+        sealed = ctx.artifacts.get("SEALED_TEST_BUNDLE")
+        if sealed is not None:
+            extra["predecessor_bundle_id"] = sealed.artifact_id
+            extra["predecessor_bundle_digest"] = ctx.sealed_digest
         findings = self._revise_findings(ctx, "CODE_REVIEW")
         if findings is not None:
             extra["revise_findings"] = findings
@@ -967,6 +1246,7 @@ def _actor_for(
     layout: Mapping[str, Any],
     target: gitpub.TargetBinding,
     run_id: str,
+    compiled: st.CompiledPlan,
 ) -> StageActor:
     executables = layout.get("executables") or {}
     if not isinstance(executables, dict):
@@ -994,7 +1274,13 @@ def _actor_for(
         provision_argv=layout.get("provision_argv") or (),
         workspace_label=lch.workspace_label_for(_project_identity(target), run_id),
     )
-    return HerdrStageActor(launcher, runtime.path, target, role_routes)
+    plan = json.loads(compiled.plan_bytes)
+    lane_specs = {
+        str(lane["id"]): st.json_ready(lane["spec"]) for lane in plan["lanes"]
+    }
+    return HerdrStageActor(
+        launcher, runtime.path, target, role_routes, lane_specs=lane_specs
+    )
 
 
 def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
@@ -1026,18 +1312,24 @@ def _run_start(args: argparse.Namespace) -> int:
         store = _open_store(runtime)
         run_id = args.run_id or uuid.uuid4().hex
         try:
-            create_factory_run(
+            binding = create_factory_run(
                 store=store,
                 run_id=run_id,
                 compiled=compiled,
                 runtime=runtime,
                 target=target,
             )
+            target = target_from_binding(binding)
             register_installation(
                 database=runtime.ledger_path(),
                 plans_dir=plan_path.resolve().parent,
                 repository=repo,
                 state=runtime.path,
+            )
+            maybe_autoload_dashboard(
+                layout,
+                repository=repo,
+                ledger=runtime.ledger_path(),
             )
             console = fconsole.FactoryConsole()
             console.opened(
@@ -1050,11 +1342,12 @@ def _run_start(args: argparse.Namespace) -> int:
             scheduler = FactoryScheduler(
                 store,
                 run_id,
-                _actor_for(runtime, layout, target, run_id),
+                _actor_for(runtime, layout, target, run_id, compiled),
                 runtime,
                 target,
                 stage_started=console.stage_started,
                 stage_completed=console.stage_completed,
+                compiled=compiled,
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -1079,6 +1372,7 @@ def _bind_existing_run(
     ArtifactStore,
     Mapping[str, Any],
     gitpub.TargetBinding,
+    st.CompiledPlan,
 ]:
     maestro_file = _executing_maestro_file()
     layout = _load_deployment_config(maestro_file)
@@ -1090,10 +1384,15 @@ def _bind_existing_run(
         row = run_row(store, run_id)
         require_deployment(maestro_file, Path(row["target_repository_root"]))
         runtime.revalidate(row["runtime_state_fingerprint"])
-        target = gitpub.bind_target_worktree(
-            row["target_repository_root"], row["target_main_ref"]
-        )
+        target = target_from_binding(binding_from_run(row))
         plan_ref = Path(plan_artifact_ref_for(store, run_id, int(row["plan_revision"])))
+        compiled = _compile_plan(
+            plan_ref,
+            revision=int(row["plan_revision"]),
+            ref=str(plan_ref),
+        )
+        if compiled.plan_digest != row["plan_digest"]:
+            raise FactoryRefused("PLAN_ARTIFACT_MISMATCH")
         register_installation(
             database=runtime.ledger_path(),
             plans_dir=plan_ref.resolve().parent,
@@ -1104,12 +1403,17 @@ def _bind_existing_run(
         store.close()
         runtime.close()
         raise
-    return layout, runtime, store, row, target
+    return layout, runtime, store, row, target, compiled
 
 
 def _run_resume(args: argparse.Namespace) -> int:
     run_id = args.run_id
-    layout, runtime, store, row, target = _bind_existing_run(run_id)
+    layout, runtime, store, row, target, compiled = _bind_existing_run(run_id)
+    maybe_autoload_dashboard(
+        layout,
+        repository=Path(row["target_repository_root"]),
+        ledger=runtime.ledger_path(),
+    )
     try:
         try:
             console = fconsole.FactoryConsole()
@@ -1123,11 +1427,12 @@ def _run_resume(args: argparse.Namespace) -> int:
             scheduler = FactoryScheduler(
                 store,
                 run_id,
-                _actor_for(runtime, layout, target, run_id),
+                _actor_for(runtime, layout, target, run_id, compiled),
                 runtime,
                 target,
                 stage_started=console.stage_started,
                 stage_completed=console.stage_completed,
+                compiled=compiled,
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -1147,7 +1452,7 @@ def _run_resume(args: argparse.Namespace) -> int:
 
 def _run_amend(args: argparse.Namespace) -> int:
     run_id = args.run_id
-    layout, runtime, store, row, target = _bind_existing_run(run_id)
+    layout, runtime, store, row, target, _previous = _bind_existing_run(run_id)
     try:
         try:
             compiled = _compile_plan(
@@ -1173,11 +1478,12 @@ def _run_amend(args: argparse.Namespace) -> int:
             scheduler = FactoryScheduler(
                 store,
                 run_id,
-                _actor_for(runtime, layout, target, run_id),
+                _actor_for(runtime, layout, target, run_id, compiled),
                 runtime,
                 target,
                 stage_started=console.stage_started,
                 stage_completed=console.stage_completed,
+                compiled=compiled,
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -1196,16 +1502,17 @@ def _run_amend(args: argparse.Namespace) -> int:
 
 def _run_status(args: argparse.Namespace) -> int:
     run_id = args.run_id
-    layout, runtime, store, _row, target = _bind_existing_run(run_id)
+    layout, runtime, store, _row, target, compiled = _bind_existing_run(run_id)
     try:
         try:
             gitpub.revalidate_binding(target)
             scheduler = FactoryScheduler(
                 store,
                 run_id,
-                _actor_for(runtime, layout, target, run_id),
+                _actor_for(runtime, layout, target, run_id, compiled),
                 runtime,
                 target,
+                compiled=compiled,
             )
             status = scheduler.status()
             stages = {
