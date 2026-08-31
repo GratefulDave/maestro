@@ -81,6 +81,7 @@ interface FactoryRunRow {
 
 interface FactoryLaneRow {
   lane_id: string;
+  lane_kind: string | null;
   needs_json: string;
   declared_outputs_json: string;
   stage: string;
@@ -301,7 +302,16 @@ export class ArtifactFactoryDb {
   private laneRows(runId: string, planRevision: number): FactoryLaneRow[] {
     return this.freshDb()
       .query<FactoryLaneRow, [string, number]>(
-        `SELECT d.lane_id, d.needs_json, d.declared_outputs_json, s.stage, s.updated_at
+        `SELECT d.lane_id,
+                (SELECT json_extract(a.payload_json, '$.lane_kind')
+                   FROM lane_artifacts a
+                  WHERE a.run_id = d.run_id
+                    AND a.lane_id = d.lane_id
+                    AND a.plan_revision = d.plan_revision
+                    AND a.artifact_kind = 'LANE_PLAN'
+                  ORDER BY a.sequence DESC
+                  LIMIT 1) AS lane_kind,
+                d.needs_json, d.declared_outputs_json, s.stage, s.updated_at
            FROM dag_lanes d
            JOIN lane_state s ON s.run_id = d.run_id AND s.lane_id = d.lane_id
           WHERE d.run_id = ? AND d.plan_revision = ?
@@ -316,7 +326,7 @@ export class ArtifactFactoryDb {
     return lanes
       .map((lane) => ({
         node_id: lane.lane_id,
-        kind: null,
+        kind: lane.lane_kind,
         depth: depths.get(lane.lane_id) ?? 0,
         needs: parseStringList(lane.needs_json),
         outputs: parseStringList(lane.declared_outputs_json),
