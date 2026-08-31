@@ -38,6 +38,7 @@ PLAN_RELATIVE = Path(".maestro/plans/two-lane.v1.json")
 SEED_RELATIVE = Path("public/seed.txt")
 CONFIG_RELATIVE = Path("adws") / "maestro.config.yaml"
 CONFIG_SCHEMA = "maestro-config.v1"
+SSSF_ROOT = ADWS_ROOT.parents[1]
 RUNTIME_MODE = 0o700
 
 PRODUCT_ALLOWED_PREFIXES = (
@@ -185,6 +186,15 @@ def write_deployment_config(
         "executables": dict(executables),
         "route_receipts": dict(route_receipts),
         "route_verify_keys": list(route_verify_keys),
+        "dashboard": {
+            "enabled": True,
+            "launcher": str(
+                (SSSF_ROOT / "apps" / "dashboard" / "bin" / "maestro-dashboard").resolve()
+            ),
+            "api_port": 4600,
+            "ui_port": 4317,
+            "open": True,
+        },
     }
     path = product / CONFIG_RELATIVE
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -131,6 +131,13 @@ class ArtifactFactorySmokeHarnessTest(unittest.TestCase):
         self.assertEqual(
             loaded["route_receipts"]["omp"], str(state / "receipts" / "omp.json")
         )
+        launcher = Path(loaded["dashboard"]["launcher"])
+        self.assertTrue(launcher.is_absolute())
+        self.assertEqual(launcher.name, "maestro-dashboard")
+        self.assertTrue(loaded["dashboard"]["enabled"])
+        self.assertEqual(loaded["dashboard"]["api_port"], 4600)
+        self.assertEqual(loaded["dashboard"]["ui_port"], 4317)
+        self.assertTrue(loaded["dashboard"]["open"])
 
     def test_private_leak_scans_only_objects_added_after_factory_baseline(self) -> None:
         product = smoke.init_product(self.root / "product")
