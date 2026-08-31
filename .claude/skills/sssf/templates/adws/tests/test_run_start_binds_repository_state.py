@@ -252,7 +252,8 @@ class RunStartBindsRepositoryStateTest(unittest.TestCase):
                 maestro.gitpub, "bind_target_worktree", return_value=target
             ),
             mock.patch.object(maestro, "_open_store", return_value=store),
-            mock.patch.object(maestro, "create_factory_run"),
+            mock.patch.object(maestro, "create_factory_run", return_value=target),
+            mock.patch.object(maestro, "target_from_binding", return_value=target),
             mock.patch.object(maestro, "register_installation"),
             mock.patch.object(maestro, "_actor_for", return_value=mock.Mock()),
             mock.patch.object(maestro, "FactoryScheduler", BlockingScheduler),

@@ -9,6 +9,8 @@ BYTES_PER_TOKEN = 3.0
 
 #: Share of the published context window a prompt may occupy.
 HANDOFF_CONTEXT_FRACTION = 0.5
+#: Named OMP catalog minimum. LaunchSpec uses this for omp; claude stays unmeasured.
+OMP_CONTEXT_WINDOW_TOKENS = 262144
 
 #: Routes that publish a measurable context window.
 ROUTES_PUBLISHING_A_WINDOW: Tuple[str, ...] = ("omp",)

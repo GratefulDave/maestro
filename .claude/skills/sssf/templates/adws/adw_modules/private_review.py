@@ -31,6 +31,21 @@ class PrivateLeakError(PrivateReviewError):
 class IsolationError(PrivateReviewError):
     """Private objects were reachable from a run or builder repository."""
 
+    code = "ISOLATION"
+
+
+class PrivatePathCollisionError(IsolationError):
+    """A sealed private path would replace a candidate file."""
+
+    code = "PRIVATE_PATH_COLLISION"
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(
+            "sealed private path collides with candidate: {0}".format(path)
+        )
+
+
 
 @dataclass(frozen=True)
 class VaultLaneRequest:
@@ -99,6 +114,24 @@ def public_contract(
         "acceptance_criteria": list(criteria),
         "declared_outputs": list(outputs),
     }
+
+
+def public_contract_allow(
+    contract: Mapping[str, object], extra: Iterable[str] = ()
+) -> tuple[str, ...]:
+    """Declared public-contract bytes plus caller extras. Not leak tokens."""
+    outputs = tuple(
+        normalize_repo_path(item)
+        for item in as_str_tuple(contract["declared_outputs"], "declared_outputs")
+    )
+    criteria = as_str_tuple(
+        contract["acceptance_criteria"], "acceptance_criteria"
+    )
+    allowed = [item for item in extra if item]
+    allowed.extend(criteria)
+    allowed.extend(outputs)
+    allowed.extend(posixpath.basename(path) for path in outputs)
+    return tuple(allowed)
 
 
 def normalize_repo_path(path: str) -> str:
@@ -198,7 +231,7 @@ def actionable_findings(
 def refuse_private_leak(
     obj: object, tokens: Sequence[str], *, allow: Iterable[str] = ()
 ) -> None:
-    allowed = frozenset(allow)
+    allowed = tuple(str(item) for item in allow if item)
     if isinstance(obj, (bytes, bytearray)):
         blob = bytes(obj).decode("utf-8")
     elif isinstance(obj, str):
@@ -206,7 +239,7 @@ def refuse_private_leak(
     else:
         blob = st.canonical_bytes(obj).decode("utf-8")
     for token in tokens:
-        if not token or token in allowed:
+        if not token or any(token in public for public in allowed):
             continue
         if token in blob:
             raise PrivateLeakError("public payload leaked private token")

@@ -39,14 +39,20 @@ def _plan_bytes() -> bytes:
                 "id": "lane-a",
                 "needs": [],
                 "outputs": ["a.txt"],
-                "spec": {"goal": "emit a.txt"},
+                "spec": {
+                    "goal": "emit a.txt",
+                    "integration": {"integration_branch": "refs/heads/main"},
+                },
                 "acceptance": ["a.txt is written"],
             },
             {
                 "id": "lane-b",
                 "needs": ["lane-a"],
                 "outputs": ["b.txt"],
-                "spec": {"goal": "emit b.txt after a"},
+                "spec": {
+                    "goal": "emit b.txt after a",
+                    "integration": {"integration_branch": "refs/heads/main"},
+                },
                 "acceptance": ["b.txt is written"],
             },
         ],
@@ -204,7 +210,7 @@ class ResumeAmendStatusBindDeploymentTest(unittest.TestCase):
             ),
             mock.patch.object(maestro, "register_installation") as register,
         ):
-            _layout, runtime, store, row, _target = maestro._bind_existing_run(
+            _layout, runtime, store, row, _target, _compiled = maestro._bind_existing_run(
                 self.run_id
             )
         try:

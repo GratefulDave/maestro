@@ -236,11 +236,11 @@ def enforce(run, phase, agent: AgentConfig, before: dict[str, str]) -> list[str]
 # undone after the fact, because by the time anything could look, the only
 # surviving artifact is a signed receipt that says the right actor produced it.
 # The capability is denied in launch argv where the client supports it and by
-# the mandatory pre-tool hook otherwise, before the delegated tool can run.
+# the configured OMP profile otherwise, before the delegated tool can run.
 #
 # **What this does and does not contain.** It is the same honest limit §9.6
 # draws around `--dangerously-skip-permissions`: this contains a *mistaken*
-# actor, not a hostile one. `bash` remains available, container-wrapped, and an
+# actor, not a hostile one. `bash` remains available as a native host tool, and an
 # actor determined to reach a second model can shell out to one. What it stops
 # is the ordinary case — the reviewer that reaches for the delegation tool
 # sitting in its schema because the tool is there.
@@ -266,10 +266,10 @@ def route_capability_argv(route: str) -> Tuple[str, ...]:
     """Return Claude's explicit delegation denylist; OMP states none in argv.
 
     Role sessions load the host-authenticated profile plus repository
-    capabilities. Containment is a deny list, not a Bash-only `--tools`
-    hatch: Claude receives one variadic `--disallowedTools` argument for every
+    capabilities. Containment is a deny list, not a Bash-only ``--tools``
+    hatch: Claude receives one variadic ``--disallowedTools`` argument for every
     name in `route_delegation_tools`. OMP has no equivalent denylist flag here;
-    `workspace_isolation.check_tool_input` fail-closes `task`/`hub`/`eval`.
+    the named role profile omits `task`/`hub`/`eval`.
 
     An unknown route yields no flags. That route is refused by
     `HerdrLauncher.launch` before an argv builder can run.

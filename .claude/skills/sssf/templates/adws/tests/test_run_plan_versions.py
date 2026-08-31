@@ -38,7 +38,10 @@ def _plan(*, goal: str = "emit a.txt") -> bytes:
                 "id": "lane-a",
                 "needs": [],
                 "outputs": ["a.txt"],
-                "spec": {"goal": goal},
+                "spec": {
+                    "goal": goal,
+                    "integration": {"integration_branch": "refs/heads/main"},
+                },
                 "acceptance": ["a.txt is written"],
             }
         ],

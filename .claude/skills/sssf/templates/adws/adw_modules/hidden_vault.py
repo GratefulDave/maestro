@@ -224,14 +224,35 @@ def checkout_vault_worktree(vault: Path, base_sha: str, dest: Path) -> Path:
     return dest.resolve()
 
 
-def commit_all(worktree: Path, message: str) -> str:
+def commit_all(
+    worktree: Path, message: str, *, paths: Sequence[str] | None = None
+) -> str:
     _git(worktree, "config", "user.email", "maestro-private-review@invalid")
     _git(worktree, "config", "user.name", "maestro-private-review")
-    _git(worktree, "add", "-A")
-    status = _git(worktree, "status", "--porcelain")
-    if not status.stdout.strip():
+    if paths is None:
+        _git(worktree, "add", "-A")
+        changed = bool(_git(worktree, "status", "--porcelain").stdout.strip())
+        if not changed:
+            raise VaultError("test draft produced no changes")
+        _git(worktree, "commit", "-qm", message)
+        return _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    pathspec = tuple(paths)
+    if not pathspec:
+        raise VaultError("test draft produced no declared files")
+    _git(worktree, "add", "-A", "--", *pathspec)
+    changed = bool(
+        _git(
+            worktree,
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            *pathspec,
+        ).stdout.strip()
+    )
+    if not changed:
         raise VaultError("test draft produced no changes")
-    _git(worktree, "commit", "-qm", message)
+    _git(worktree, "commit", "-q", "--only", "-m", message, "--", *pathspec)
     return _git(worktree, "rev-parse", "HEAD").stdout.strip()
 
 

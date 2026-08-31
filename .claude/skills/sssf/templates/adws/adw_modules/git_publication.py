@@ -6,15 +6,15 @@ Stage-store wraps these payloads in the frozen artifact envelope.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal
-
 from . import scheduler_types as st
 from . import workspace_receipt as wr
 from .git_helper import BoundGit, GitError, require_oid, zero_oid
@@ -245,6 +245,78 @@ def bind_target_worktree(repo: str | Path, main_ref: str) -> TargetBinding:
     )
 
 
+def lane_specs_from_plan(compiled: st.CompiledPlan) -> dict[str, Mapping[str, Any]]:
+    data = json.loads(bytes(compiled.plan_bytes).decode("utf-8"))
+    lanes = data.get("lanes")
+    if not isinstance(lanes, list) or not lanes:
+        raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", "no lanes")
+    specs: dict[str, Mapping[str, Any]] = {}
+    for lane in lanes:
+        if not isinstance(lane, Mapping):
+            raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", "lane")
+        lane_id = lane.get("id")
+        spec = lane.get("spec")
+        if not isinstance(lane_id, str) or not lane_id or not isinstance(spec, Mapping):
+            raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", str(lane_id))
+        specs[lane_id] = spec
+    return specs
+
+
+def normalize_integration_ref(raw: object) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", repr(raw))
+    value = raw.strip()
+    if value.startswith("-") or ".." in value or value.endswith("/") or "//" in value:
+        raise GitPublicationRefused("UNSAFE_INTEGRATION_REF", value)
+    if value.startswith("refs/"):
+        return _require_ref_name(value)
+    return _require_ref_name("refs/heads/" + value)
+
+
+def declared_integration_ref(lane_specs: Mapping[str, Mapping[str, Any]]) -> str:
+    if not lane_specs:
+        raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", "no lanes")
+    found: list[str] = []
+    for lane_id, spec in sorted(lane_specs.items()):
+        if not isinstance(spec, Mapping):
+            raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", lane_id)
+        integration = spec.get("integration")
+        if not isinstance(integration, Mapping):
+            raise GitPublicationRefused("UNDECLARED_INTEGRATION_REF", lane_id)
+        found.append(normalize_integration_ref(integration.get("integration_branch")))
+    unique = set(found)
+    if len(unique) != 1:
+        raise GitPublicationRefused(
+            "INCONSISTENT_INTEGRATION_REF", ",".join(sorted(unique))
+        )
+    return found[0]
+
+
+def pin_integration_sha(binding: TargetBinding, integration_ref: str) -> TargetBinding:
+    ref = normalize_integration_ref(integration_ref)
+    try:
+        sha = binding.git().rev_parse(ref)
+    except GitError as exc:
+        raise GitPublicationRefused(exc.code, exc.detail) from exc
+    if sha == binding.integration_initial_sha:
+        return binding
+    return replace(binding, integration_initial_sha=sha)
+
+
+def restore_integration_sha(binding: TargetBinding, sha: str) -> TargetBinding:
+    oid = require_oid(sha, object_format=binding.target_object_format)
+    if oid == binding.integration_initial_sha:
+        return binding
+    return replace(binding, integration_initial_sha=oid)
+
+
+def restore_target_initial_main_sha(binding: TargetBinding, sha: str) -> TargetBinding:
+    oid = require_oid(sha, object_format=binding.target_object_format)
+    if oid == binding.target_initial_main_sha:
+        return binding
+    return replace(binding, target_initial_main_sha=oid)
+
+
 def ensure_integration_ref(
     binding: TargetBinding, run_id: str, expected_tip: str
 ) -> dict[str, Any]:
@@ -267,6 +339,38 @@ def ensure_integration_ref(
     if current != expected:
         raise GitPublicationRefused(
             "INTEGRATION_REF_COLLISION", f"{current}!={expected}"
+        )
+    return {
+        "integration_ref": ref,
+        "sha": current,
+        "schema_version": st.CANONICAL_SCHEMA_VERSION,
+    }
+
+
+def retarget_integration_ref(
+    binding: TargetBinding, run_id: str, from_sha: str, to_sha: str
+) -> dict[str, Any]:
+    revalidate_binding(binding)
+    ref = integration_ref_name(run_id)
+    git = binding.git()
+    source = require_oid(from_sha, object_format=binding.target_object_format)
+    dest = require_oid(to_sha, object_format=binding.target_object_format)
+    current = git.read_ref(ref)
+    zero = zero_oid(binding.target_object_format)
+    if current is None:
+        git.update_ref(ref, dest, zero)
+    elif current == dest:
+        pass
+    elif current != source:
+        raise GitPublicationRefused(
+            "INTEGRATION_REF_COLLISION", f"{current}!={source}"
+        )
+    else:
+        git.update_ref(ref, dest, source)
+    current = git.read_ref(ref)
+    if current != dest:
+        raise GitPublicationRefused(
+            "INTEGRATION_REF_COLLISION", f"{current}!={dest}"
         )
     return {
         "integration_ref": ref,

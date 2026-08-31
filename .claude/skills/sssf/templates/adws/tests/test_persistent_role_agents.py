@@ -71,13 +71,7 @@ def _env_from_herdr_args(args: tuple[str, ...]) -> dict[str, str]:
 
 
 def _role_environment(root: Path) -> dict[str, str]:
-    return lch.role_pane_environment(
-        root,
-        {
-            "MAESTRO_ISOLATION_PYTHON": sys.executable,
-            "MAESTRO_ISOLATION_RUNNER": "/tmp/workspace_isolation.py",
-        },
-    )
+    return lch.role_pane_environment(root, {})
 
 
 class WorkspaceLabelTest(unittest.TestCase):
@@ -245,9 +239,10 @@ class WorkspaceAdoptTest(unittest.TestCase):
         self.assertEqual(pane_id, layout.role_panes["builder"])
         self.assertEqual(len(split_calls), 4)
         for args, role in zip(split_calls, lch.LANE_PANE_ROLES[1:]):
-            self.assertEqual(
-                _env_from_herdr_args(args)["MAESTRO_ROLE_ROOT"],
-                str(role_cwds[role].resolve()),
+            self.assertTrue(
+                _env_from_herdr_args(args)["TMPDIR"].startswith(
+                    str(role_cwds[role].resolve())
+                )
             )
 
     def test_reconnect_live_agent_does_not_create_workspace(self) -> None:
@@ -1265,13 +1260,7 @@ class FivePaneTopologyTest(unittest.TestCase):
             role_cwds = {role: root / role / "checkout" for role in lch.LANE_PANE_ROLES}
             for path in role_cwds.values():
                 path.mkdir(parents=True)
-            builder_env = lch.role_pane_environment(
-                role_cwds["builder"],
-                {
-                    "MAESTRO_ISOLATION_PYTHON": "/usr/bin/python3",
-                    "MAESTRO_ISOLATION_RUNNER": "/tmp/workspace_isolation.py",
-                },
-            )
+            builder_env = lch.role_pane_environment(role_cwds["builder"], {})
             spec = lch.LaunchSpec(
                 correlation_token=lch.role_session_token("run-1", "lane-a", "builder"),
                 worktree=role_cwds["builder"],
@@ -1299,8 +1288,8 @@ class FivePaneTopologyTest(unittest.TestCase):
             tab_create = next(args for args in calls if args[:2] == ("tab", "create"))
             tester_root = str(role_cwds["tester"].resolve())
             self.assertEqual(tab_create[tab_create.index("--cwd") + 1], tester_root)
-            self.assertEqual(
-                _env_from_herdr_args(tab_create)["MAESTRO_ROLE_ROOT"], tester_root
+            self.assertTrue(
+                _env_from_herdr_args(tab_create)["TMPDIR"].startswith(tester_root)
             )
             splits = [args for args in calls if args[:2] == ("pane", "split")]
             self.assertEqual(len(splits), 4)
@@ -1308,12 +1297,9 @@ class FivePaneTopologyTest(unittest.TestCase):
                 expected = str(role_cwds[role].resolve())
                 self.assertEqual(args[args.index("--cwd") + 1], expected)
                 env = _env_from_herdr_args(args)
-                self.assertEqual(env["MAESTRO_ROLE_ROOT"], expected)
                 self.assertTrue(env["TMPDIR"].startswith(expected))
                 if role != "builder":
-                    self.assertNotEqual(
-                        env["MAESTRO_ROLE_ROOT"], builder_env["MAESTRO_ROLE_ROOT"]
-                    )
+                    self.assertNotEqual(env["TMPDIR"], builder_env["TMPDIR"])
 
     def test_failed_role_label_reaps_new_shell(self) -> None:
         launcher = _bare_launcher("product run-1")
@@ -1506,6 +1492,394 @@ class RestartRediscoverTest(unittest.TestCase):
             self.assertFalse(raised.exception.pane_created)
             self.assertFalse(any(call[:2] == ("workspace", "create") for call in calls))
             self.assertFalse(any(call[:2] == ("agent", "start") for call in calls))
+
+
+class NoTranscriptLaneOfferTest(unittest.TestCase):
+    def _omp_spec(
+        self, root: Path, worktree: Path, prompt: Path, *, role: str = "tester"
+    ) -> lch.LaunchSpec:
+        return lch.LaunchSpec(
+            correlation_token=lch.role_session_token("run-1", "lane-a", role),
+            worktree=worktree,
+            prompt_path=prompt,
+            envelope_path=root / "envelope.json",
+            route="omp",
+            model="",
+            effort="",
+            profile="grok-maestro",
+            session_dir=root / "session",
+            lane_key="lane-a",
+            pane_role=role,
+            workspace_label="product run-1",
+        )
+
+    def _launch_omp(self, launcher: lch.HerdrLauncher, spec: lch.LaunchSpec, submit):
+        layout = lch._TabLayout(tab_id="w9:t1", panes=["w9:p4"], claimed=5)
+        with (
+            mock.patch.object(lch, "prepare_route_prompt"),
+            mock.patch.object(lch, "preflight_launch_prompt"),
+            mock.patch.object(lch, "build_omp_argv", return_value=("omp",)),
+            mock.patch.object(lch, "pane_env_flags", return_value=()),
+            mock.patch.object(launcher, "_existing_role_handle", return_value=None),
+            mock.patch.object(launcher, "_reconnect_live_agent", return_value=None),
+            mock.patch.object(launcher, "provision"),
+            mock.patch.object(
+                launcher, "_acquire_pane", return_value=("w9:p4", layout, True)
+            ),
+            mock.patch.object(launcher, "_label_pane"),
+            mock.patch.object(lch, "_wait_for_available_shell"),
+            mock.patch.object(
+                lch, "_start_agent_when_free", side_effect=lambda start, **kwargs: start()
+            ),
+            mock.patch.object(lch, "wait_for_interactive_agent"),
+            mock.patch.object(lch, "submit_agent_prompt", side_effect=submit),
+            mock.patch.object(
+                lch,
+                "wait_for_agent_transcript",
+                side_effect=AssertionError("lane must not wait for transcript"),
+            ),
+            mock.patch.object(lch, "pane_liveness_pid", return_value=None),
+        ):
+            return launcher.launch(spec)
+
+    def test_omp_launch_without_transcript_returns_handle_then_envelope(self) -> None:
+        launcher = _bare_launcher("product run-1")
+        launcher.admitted_routes = type(
+            "Routes", (), {"admits": lambda self, route: route == "omp"}
+        )()
+        offers: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "checkout"
+            worktree.mkdir()
+            prompt = root / "prompt.json"
+            prompt.write_text("{}", encoding="utf-8")
+            spec = self._omp_spec(root, worktree, prompt)
+
+            def fake_herdr(*args: str, **kwargs: object) -> dict:
+                del kwargs
+                if args[:2] == ("pane", "get"):
+                    return {
+                        "result": {
+                            "pane": {
+                                "pane_id": "w9:p4",
+                                "tab_id": "w9:t1",
+                                "cwd": str(worktree),
+                                "label": "tester",
+                            }
+                        }
+                    }
+                if args[:2] in (("agent", "start"), ("agent", "get")):
+                    return {
+                        "result": {
+                            "agent": {
+                                "pane_id": "w9:p4",
+                                "agent_status": "idle",
+                            }
+                        }
+                    }
+                raise AssertionError(args)
+
+            def submit(
+                _herdr: object,
+                pane_id: str,
+                text: str,
+                name: str,
+                **kwargs: object,
+            ) -> None:
+                offers.append(
+                    {
+                        "pane_id": pane_id,
+                        "text": text,
+                        "name": name,
+                        "refuse_unproven": kwargs.get("refuse_unproven"),
+                        "working_proves": kwargs.get("working_proves"),
+                    }
+                )
+                recorded = kwargs["submission_recorded"]
+                self.assertTrue(callable(recorded))
+                self.assertFalse(recorded())
+
+            launcher._herdr = fake_herdr  # type: ignore[method-assign]
+            handle = self._launch_omp(launcher, spec, submit)
+            self.assertIsNone(handle.transcript_path)
+            self.assertEqual(handle.pane_id, "w9:p4")
+            self.assertEqual(handle.agent_name, lch.agent_name_for(spec.correlation_token))
+            self.assertEqual(handle.correlation_token, spec.correlation_token)
+            self.assertEqual(len(offers), 1)
+            self.assertEqual(offers[0]["refuse_unproven"], False)
+            self.assertEqual(offers[0]["working_proves"], True)
+            self.assertEqual(
+                offers[0]["text"], "@{0} ".format(prompt.resolve())
+            )
+            self.assertNotIn(handle.correlation_token, launcher._tailers)
+            spec.envelope_path.write_text('{"success": true}', encoding="utf-8")
+            result = launcher.poll(handle)
+            self.assertEqual(result.state, lch.PollState.EXITED)
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.detail, "ENVELOPE_SUCCESS")
+
+    def test_adopted_resubmit_without_transcript_offers_once(self) -> None:
+        launcher = _bare_launcher("product run-1")
+        launcher.admitted_routes = type(
+            "Routes", (), {"admits": lambda self, route: route == "omp"}
+        )()
+        offers: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "checkout"
+            worktree.mkdir()
+            prompt = root / "prompt.json"
+            prompt.write_text("{}", encoding="utf-8")
+            spec = self._omp_spec(root, worktree, prompt, role="builder")
+            handle = lch.LaunchHandle(
+                spec.correlation_token,
+                "w9:p4",
+                lch.agent_name_for(spec.correlation_token),
+                worktree,
+                envelope_path=spec.envelope_path,
+                workspace_id="w9",
+                tab_id="w9:t1",
+                lane_key="lane-a",
+            )
+            launcher._handles[spec.correlation_token] = handle
+            launcher._role_handles[("lane-a", "builder")] = handle
+
+            def fake_herdr(*args: str, **kwargs: object) -> dict:
+                del kwargs
+                if args[:2] == ("agent", "get"):
+                    return {
+                        "result": {
+                            "agent": {
+                                "name": handle.agent_name,
+                                "pane_id": "w9:p4",
+                                "agent_status": "idle",
+                            }
+                        }
+                    }
+                if args[:2] == ("pane", "get"):
+                    return {
+                        "result": {
+                            "pane": {
+                                "pane_id": "w9:p4",
+                                "tab_id": "w9:t1",
+                                "workspace_id": "w9",
+                                "cwd": str(worktree),
+                                "label": "builder",
+                            }
+                        }
+                    }
+                placed = _placement_lists(args)
+                if placed is not None:
+                    return placed
+                raise AssertionError(args)
+
+            def submit(
+                _herdr: object,
+                pane_id: str,
+                text: str,
+                name: str,
+                **kwargs: object,
+            ) -> None:
+                del _herdr, text
+                offers.append(pane_id)
+                self.assertEqual(name, handle.agent_name)
+                self.assertFalse(kwargs.get("refuse_unproven"))
+                self.assertTrue(kwargs.get("working_proves"))
+                self.assertFalse(kwargs["submission_recorded"]())
+
+            launcher._herdr = fake_herdr  # type: ignore[method-assign]
+            with (
+                mock.patch.object(lch, "prepare_route_prompt"),
+                mock.patch.object(lch, "preflight_launch_prompt"),
+                mock.patch.object(lch, "build_omp_argv", return_value=("omp",)),
+                mock.patch.object(lch, "pane_env_flags", return_value=()),
+                mock.patch.object(launcher, "provision"),
+                mock.patch.object(lch, "wait_for_interactive_agent"),
+                mock.patch.object(lch, "submit_agent_prompt", side_effect=submit),
+                mock.patch.object(
+                    lch,
+                    "wait_for_agent_transcript",
+                    side_effect=AssertionError("resubmit must not wait for transcript"),
+                ),
+            ):
+                adopted = launcher.launch(spec)
+            self.assertIs(adopted, handle)
+            self.assertEqual(adopted.pane_id, "w9:p4")
+            self.assertEqual(adopted.agent_name, handle.agent_name)
+            self.assertEqual(adopted.correlation_token, spec.correlation_token)
+            self.assertIsNone(adopted.transcript_path)
+            self.assertEqual(offers, ["w9:p4"])
+            self.assertEqual(
+                launcher._role_handles[("lane-a", "builder")].pane_id, "w9:p4"
+            )
+
+    def test_transcript_appearing_during_proof_attaches_tailer(self) -> None:
+        launcher = _bare_launcher("product run-1")
+        launcher.admitted_routes = type(
+            "Routes", (), {"admits": lambda self, route: route == "omp"}
+        )()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "checkout"
+            worktree.mkdir()
+            prompt = root / "prompt.json"
+            prompt.write_text("{}", encoding="utf-8")
+            transcript = root / "session.jsonl"
+            revealed = {"on": False}
+            spec = self._omp_spec(root, worktree, prompt)
+
+            def fake_herdr(*args: str, **kwargs: object) -> dict:
+                del kwargs
+                if args[:2] == ("pane", "get"):
+                    return {
+                        "result": {
+                            "pane": {
+                                "pane_id": "w9:p4",
+                                "tab_id": "w9:t1",
+                                "cwd": str(worktree),
+                                "label": "tester",
+                            }
+                        }
+                    }
+                if args[:2] in (("agent", "start"), ("agent", "get")):
+                    agent: dict[str, object] = {
+                        "pane_id": "w9:p4",
+                        "agent_status": "idle",
+                    }
+                    if revealed["on"]:
+                        agent["agent_session"] = {
+                            "kind": "path",
+                            "value": str(transcript),
+                        }
+                    return {"result": {"agent": agent}}
+                raise AssertionError(args)
+
+            def submit(
+                _herdr: object,
+                _pane_id: str,
+                _text: str,
+                _name: str,
+                **kwargs: object,
+            ) -> None:
+                recorded = kwargs["submission_recorded"]
+                self.assertFalse(recorded())
+                transcript.write_text(
+                    "@" + str(prompt.resolve()) + "\n", encoding="utf-8"
+                )
+                revealed["on"] = True
+                self.assertTrue(recorded())
+
+            launcher._herdr = fake_herdr  # type: ignore[method-assign]
+            handle = self._launch_omp(launcher, spec, submit)
+            self.assertEqual(handle.transcript_path, transcript)
+            tailer = launcher._tailers.get(handle.correlation_token)
+            self.assertIsNotNone(tailer)
+            assert tailer is not None
+            self.assertEqual(tailer.path, transcript)
+
+    def test_agent_get_proof_failure_lane_offer_nonterminal(self) -> None:
+        def herdr(*args: str, **kwargs: object) -> dict:
+            del kwargs
+            if args[:2] == ("pane", "get"):
+                return {"result": {"pane": {"pane_id": "w9:p1", "revision": 1}}}
+            if args[:2] in (("pane", "send-text"), ("pane", "send-keys")):
+                return {}
+            if args[:2] == ("agent", "send-keys"):
+                return {}
+            if args[:2] == ("agent", "wait"):
+                raise lch.HerdrCallError("wait timeout", code="timeout")
+            raise AssertionError(args)
+
+        def recorded() -> bool:
+            raise lch.HerdrCallError("lookup failed", code="transport")
+
+        clock = [0.0]
+
+        def mono() -> float:
+            clock[0] += 100.0
+            return clock[0]
+
+        lch.submit_agent_prompt(
+            herdr,
+            "w9:p1",
+            "@/tmp/prompt ",
+            "maestro-x",
+            timeout_s=5.1,
+            attempts=1,
+            sleep=lambda _s: None,
+            monotonic=mono,
+            refuse_unproven=False,
+            working_proves=True,
+            submission_recorded=recorded,
+        )
+        with self.assertRaises(lch.PromptSubmissionUnobservable) as raised:
+            lch.submit_agent_prompt(
+                herdr,
+                "w9:p1",
+                "@/tmp/prompt ",
+                "maestro-x",
+                timeout_s=5.1,
+                attempts=1,
+                sleep=lambda _s: None,
+                monotonic=mono,
+                refuse_unproven=True,
+                working_proves=True,
+                submission_recorded=recorded,
+            )
+        self.assertIn("AGENT_PROMPT_UNOBSERVED", str(raised.exception))
+        self.assertTrue(
+            any(item.phase == "proof-probe" for item in raised.exception.failures)
+        )
+        self.assertTrue(
+            any(item.code == "transport" for item in raised.exception.failures)
+        )
+
+    def test_missing_transcript_idle_reaches_no_envelope(self) -> None:
+        launcher = _bare_launcher("product run-1")
+        token = lch.role_session_token("run-1", "lane-a", "tester")
+        handle = lch.LaunchHandle(
+            token,
+            "w9:p1",
+            lch.agent_name_for(token),
+            Path("/tmp"),
+            envelope_path=Path("/tmp/missing-envelope.json"),
+        )
+        launcher._herdr = (  # type: ignore[method-assign]
+            lambda *args, **kwargs: {
+                "result": {"pane_id": "w9:p1", "agent_status": "idle"}
+            }
+        )
+        clock = {"now": 1000.0}
+        with mock.patch.object(lch.time, "monotonic", side_effect=lambda: clock["now"]):
+            first = launcher.poll(handle)
+            self.assertEqual(first.state, lch.PollState.RUNNING)
+            clock["now"] += 61.0
+            second = launcher.poll(handle)
+        self.assertEqual(second.state, lch.PollState.EXITED)
+        self.assertEqual(second.exit_code, 1)
+        self.assertEqual(second.detail, "NO_ENVELOPE")
+
+    def test_route_admission_still_requires_transcript(self) -> None:
+        from adw_modules import route_admission as ra
+
+        with mock.patch.object(lch, "wait_for_agent_transcript", return_value=None):
+            with self.assertRaises(ra.AdmissionError) as raised:
+                ra._prompt_turn(
+                    lambda *args, **kwargs: {},
+                    {
+                        "pane_id": "w9:p1",
+                        "name": "admit-omp",
+                        "transcript": "",
+                    },
+                    "Reply with exactly MARK",
+                    "1000",
+                    "MARK",
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "AGENT_PROMPT_UNOBSERVED:admit-omp no transcript",
+        )
 
 
 if __name__ == "__main__":
