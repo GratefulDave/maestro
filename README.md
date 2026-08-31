@@ -14,12 +14,12 @@ Rendered docs: [`docs/index.html`](docs/index.html). Current architecture diagra
 
 1. `deep-interview`, `arch-brownfield`, `planf3`, and `arch-review` produce one approved executable plan revision.
 2. The plan compiler checks only objective properties (schema, DAG, ownership, acceptance, integration order).
-3. Every ready lane runs private test author → test review → test sealing → builder → code review.
-4. `REVISE` returns to the author or builder with actionable, redacted feedback. `PASS` advances the lane.
+3. Every ready lane uses its persistent `tester` → `test-reviewer` → `builder` → `code-reviewer` roles for private test authoring, test review, sealing, implementation, and code review.
+4. `REVISE` returns to the tester or builder with actionable, redacted feedback. `PASS` advances the lane.
 5. An accepted lane merges exactly once into the run's integration branch.
 6. A dependent lane starts from the integration commit that already contains every merged dependency.
-7. When every lane is merged, a final reviewer evaluates that integration commit with all sealed tests. `PASS` publishes that SHA to `main` exactly once, receipt-backed. `REVISE` waits for a user amendment.
-8. Process death restarts the current incomplete stage from its last immutable input. Live agents, panes, dirty worktrees, and processes are not adopted.
+7. When every lane is merged, the `integration-reviewer` evaluates that integration commit with all sealed tests from within a lane tab; there is no separate integration tab. `PASS` publishes that SHA to `main` exactly once, receipt-backed. `REVISE` waits for a user amendment.
+8. Scheduler restart re-discovers the expected persistent role set and restarts an incomplete stage from its last immutable input. It never treats transport observations as workflow authority.
 
 ---
 
@@ -42,6 +42,12 @@ WAITING_FOR_USER
 The stage names the work that happens next. Completing a stage writes its immutable artifact and the next stage atomically.
 
 `REVISE` is review-artifact data, not a tenth stage. Reviewers are stages of the lane, not extra DAG nodes.
+
+## Herdr runtime topology
+
+Each project and run has one Herdr workspace, and each lane has one tab containing exactly five sibling panes with these exact role labels: `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`. A role's stable identity is `(project, run, lane, role)` and it owns one stable role-scoped cwd. The tester and test-reviewer use distinct role-private trees; the builder's and code-reviewer's respective role-scoped cwds persist through every `BUILDING` ↔ `REVIEWING_CODE` revision loop. Each role retains its pane and session context across its loop and scheduler restart.
+
+Herdr is transport, not workflow authority: durable `lane_state.stage` and immutable artifacts decide work. Rediscovery accepts only the exact expected role identity, label, and clean approved cwd. A role may be recreated only after a confirmed dead or `agent_not_found` observation; live, unknown, malformed, mismatched, dirty, or unapproved observations are refused. Legacy stage- or attempt-named panes are never adopted or renamed.
 
 ---
 
@@ -81,7 +87,7 @@ uv run adws/maestro.py run status <run-id>
 
 `adws/maestro.config.yaml` must declare one absolute `runtime_state_root` directory, mode `0700`, outside the target repository and both template checkouts. `runtime_state_fingerprint` is SHA-256 over canonical realpath, device, and inode. Every start, resume, amend, status, and publication revalidates that fingerprint.
 
-`--repo` is the dedicated non-bare publication worktree, distinct from implementation-agent worktrees and from Maestro/the-library template trees. Implementation agents never edit it. `HEAD` must be the configured main ref at start. Recorded equalities: `integration_initial_sha == target_initial_main_sha == <resolved target_main_ref SHA>`.
+`--repo` is the dedicated non-bare publication worktree, distinct from stable role-scoped implementation cwds and from Maestro/the-library template trees. Implementation roles never edit it. `HEAD` must be the configured main ref at start. Recorded equalities: `integration_initial_sha == target_initial_main_sha == <resolved target_main_ref SHA>`.
 
 Immutable Git identities (not stage):
 
@@ -100,7 +106,7 @@ Changed lanes restart at `PLANNED`. Unchanged dependents at `BUILDING`, `REVIEWI
 
 ### Crash
 
-Death before the stage transaction commits: recreate the current stage from its last immutable input. Death after commit: read the advanced stage. Do not resurrect agents, consume recovery markers, or keep uncommitted worktree state.
+Death before the stage transaction commits restarts the current stage from its last immutable input; death after commit reads the advanced stage. The scheduler re-discovers only the expected persistent role panes and their clean approved role-scoped cwds; it neither treats them as workflow authority nor adopts arbitrary live agents, legacy panes, or dirty worktrees.
 
 ### Legacy ledgers
 
@@ -110,7 +116,7 @@ Opening a previous-schema ledger for execution fails with `LEDGER_SCHEMA_UNSUPPO
 
 ## Private tests
 
-Test author and test reviewer share a private draft. On `PASS`, the bundle is sealed into the vault. The builder sees the public contract and sealed digest only — not private source, fixtures, selectors, expected literals, or vault paths. Code review may run the sealed tests and must redact findings before they return to the builder.
+The tester and test-reviewer use distinct role-private trees and may share the private draft through the vault boundary. On `PASS`, the bundle is sealed into the vault. The builder sees the public contract and sealed digest only — not private source, fixtures, selectors, expected literals, or vault paths. Code review may run the sealed tests and must redact findings before they return to the builder.
 
 ---
 
@@ -151,7 +157,7 @@ The visualizer at `.claude/skills/sssf/apps/visualizer/` remains a read-only SQL
 ## What this factory refuses
 
 - Second encodings of stage or identity (parallel state/phase enums, attempt numbers, candidate sequences, generations, pending causes).
-- Adoption of live actors, panes, sessions, or dirty worktrees.
+- Adoption or renaming of live agents, panes, sessions, or dirty worktrees outside the exact persistent five-role topology.
 - Spend ceilings, floors, or grants that block explicit user continuation.
 - Escape verbs `retry`, `skip`, and `abandon`.
 - Generic semantic or produced-symbol reachability as a hard admission gate.
@@ -159,7 +165,7 @@ The visualizer at `.claude/skills/sssf/apps/visualizer/` remains a read-only SQL
 - Guessed migration of in-flight legacy ledgers.
 - Builder access to private test bytes.
 
-Transport details (Herdr pane ids, OMP profiles, process exits) may be logged. They cannot advance a lane.
+Transport details (Herdr pane ids, OMP profiles, process exits) may be logged and used only to rediscover or refuse the fixed role topology. They cannot advance a lane.
 
 ---
 

@@ -12,7 +12,7 @@ Prove exactly two dependent lanes:
 4. each accepted lane merged exactly once into the integration branch
 5. dependent lane execution using the accepted integration artifact
 6. final integration review of all completed lanes before publication to main
-7. interrupted work restarting from its last immutable completed-stage artifact, not from a live agent or dirty worktree
+7. interrupted work restarting from its last immutable completed-stage artifact while the scheduler re-discovers only its expected persistent role context
 8. a user amendment: a changed lane invalidates every former input and restarts its changed projection at `PLANNED`; policy-selected unchanged dependents revalidate
 
 No broader framework, general-purpose recovery system, compatibility layer, or speculative extension belongs in this slice.
@@ -21,12 +21,12 @@ No broader framework, general-purpose recovery system, compatibility layer, or s
 
 1. `deep-interview`, `arch-brownfield`, `planf3`, and `arch-review` produce one approved executable plan revision.
 2. The plan compiler validates only objective properties: schema, DAG acyclicity, existing dependencies, declared outputs, non-conflicting file ownership, public acceptance criteria, and deterministic integration order.
-3. Every ready lane executes private test author → test review → test sealing → builder → code review.
-4. Reviewer `REVISE` returns to the author or builder with actionable, redacted feedback. `PASS` advances the lane.
+3. Every ready lane uses its persistent `tester` → `test-reviewer` → `builder` → `code-reviewer` roles for private test authoring, test review, sealing, implementation, and code review.
+4. Reviewer `REVISE` returns to the tester or builder with actionable, redacted feedback. `PASS` advances the lane.
 5. Accepted lane commits merge exactly once into one run-specific integration branch.
 6. A dependent lane starts from the integration commit containing every merged dependency.
-7. When every lane is `MERGED`, a final reviewer evaluates the integration commit with all sealed tests. `PASS` permits exactly-once receipt-backed publication of that SHA to `main`. `REVISE` waits for a user amendment.
-8. Process death restarts the current incomplete stage from its last immutable input.
+7. When every lane is `MERGED`, the `integration-reviewer` evaluates the integration commit with all sealed tests from within a lane tab; there is no separate integration tab. `PASS` permits exactly-once receipt-backed publication of that SHA to `main`. `REVISE` waits for a user amendment.
+8. Scheduler restart re-discovers the expected persistent role set and restarts the current incomplete stage from its last immutable input. Transport observations never become workflow authority.
 
 ## Authoritative lane stage enum
 
@@ -48,9 +48,13 @@ The stage names the work that happens next. Completing a stage writes its immuta
 
 `REVISE` is artifact data, not a stage. Git commits and sealed digests identify immutable bytes; they do not independently encode workflow stage.
 
-Any new durable field, duplicated authority, speculative restart path, spend ceiling, actor generation, live-session adoption, dirty-worktree adoption, generic semantic gate, or second candidate identity requires both explicit user approval and a named acceptance scenario that cannot be satisfied without it. Absent both, reject or delete it.
+Any new durable field, duplicated authority, speculative restart path, spend ceiling, actor generation, arbitrary live-session adoption, dirty-worktree adoption, generic semantic gate, or second candidate identity requires both explicit user approval and a named acceptance scenario that cannot be satisfied without it. Absent both, reject or delete it.
 
-Resume means starting the next incomplete stage from the last accepted immutable artifact. Never resurrect an agent process, reconstruct a consumed marker, or preserve uncommitted worktree state.
+Each project and run has one Herdr workspace; each lane has one tab with exactly five sibling panes labeled `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`. Stable role identity is `(project, run, lane, role)`, and each role owns a stable role-scoped cwd. Tester and test-reviewer trees are distinct and private. The builder's and code-reviewer's respective cwds persist through every `BUILDING` ↔ `REVIEWING_CODE` loop; every role retains pane/session context across its loop and scheduler restart. Final review/publication use the `integration-reviewer` in a lane tab, never a separate integration tab.
+
+Rediscovery accepts only the exact role identity, label, and clean approved cwd. Confirmed dead or `agent_not_found` roles may be recreated; live, unknown, malformed, mismatched, dirty, or unapproved observations are refused. Legacy stage- or attempt-named panes are never adopted or renamed. Herdr is transport; durable `lane_state.stage` and immutable artifacts remain workflow authority.
+
+Resume restarts the next incomplete stage from the last accepted immutable artifact. It retains no arbitrary live process or uncommitted worktree state.
 
 ## Reviewer mandate
 
@@ -58,7 +62,7 @@ Reject:
 
 - undeclared durable state
 - duplicate representations of stage, attempt identity, candidate identity, review identity, or ownership
-- adoption of agents, panes, sessions, or dirty worktrees
+- adoption or renaming of agents, panes, sessions, or dirty worktrees outside the exact persistent five-role topology
 - abstractions not required by the two-lane slice
 - speculative failure handling without a named acceptance scenario
 - spend ceilings that prevent explicit user continuation
@@ -80,7 +84,7 @@ Reject:
 
 ## Operator commands
 
-Execute only from a stamped deployment (`adws/maestro.py`) whose canonical Git common directory equals the `--repo` worktree's canonical Git common directory. `--repo` is the dedicated publication worktree, distinct from implementation-agent worktrees and from this Maestro checkout, the-library, or any other template tree. Never invoke `run start` from a template checkout:
+Execute only from a stamped deployment (`adws/maestro.py`) whose canonical Git common directory equals the `--repo` worktree's canonical Git common directory. `--repo` is the dedicated publication worktree, distinct from stable role-scoped implementation cwds and from this Maestro checkout, the-library, or any other template tree. Never invoke `run start` from a template checkout:
 
 ```text
 uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>
@@ -120,16 +124,15 @@ Do not implement or promise:
 - parallel state/phase enums
 - attempts as workflow authority
 - salvage, late-envelope continuation, marker consumption
-- live actor/pane/session/dirty-worktree adoption
-- candidate/review/handoff tables as a second identity
-- actor generations
+- arbitrary live actor/pane/session/dirty-worktree adoption outside the fixed role topology
+- role generations as workflow authority
 - spend ceilings, floors, grants
 - `retry`, `skip`, `abandon`
 - synthetic review DAG nodes
 - compatibility writers or in-flight ledger migration
 - builder access to private tests
 
-Herdr and OMP are transport. Pane text is never stage authority.
+Herdr and OMP are transport. Pane text and process liveness are never stage authority.
 
 ## Workspace
 

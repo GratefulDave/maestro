@@ -1,6 +1,6 @@
 # Fable Goal: Build Maestro from the SSSF Fork
 
-**Shipped execution (current):** this file is the 2026-08-13 architecture-session brief. Live Maestro is the nine-stage artifact factory in `MAESTRO_architecture.md`. Operator verbs are only `run start`, `run resume`, `run amend`, and `run status`. Durable authority is `lane_state.stage` plus immutable artifacts under an external `runtime_state_root`. Candidate, integration, and publication Git refs are immutable; publication is receipt-backed. Herdr and OMP are transport. Do not treat attempt identities, retry/skip/abandon/cancel/bootstrap/plan subcommands, synthetic review nodes, recovery markers, actor generations, or mutable candidate branches as live workflow authority. The Strav inventory below remains historical evidence.
+**Shipped execution (current):** this file is the 2026-08-13 architecture-session brief. Live Maestro is the nine-stage artifact factory in `MAESTRO_architecture.md`. Operator verbs are only `run start`, `run resume`, `run amend`, and `run status`. Durable authority is `lane_state.stage` plus immutable artifacts under an external `runtime_state_root`. Candidate, integration, and publication Git refs are immutable; publication is receipt-backed. Herdr and OMP are transport: one workspace per project and run, one tab per lane, and exactly the persistent `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer` sibling panes in each lane tab. Their stable identity is `(project, run, lane, role)`; durable artifacts and stage, not panes, remain workflow authority. Do not treat attempt identities, retry/skip/abandon/cancel/bootstrap/plan subcommands, synthetic review nodes, recovery markers, actor generations, or mutable candidate branches as live workflow authority. The Strav inventory below remains historical evidence.
 
 You are the Fable team lead and principal architect for **Maestro**, the existing fork of `disler/super-simple-software-factory` (SSSF).
 
@@ -17,9 +17,9 @@ You are the Fable team lead and principal architect for **Maestro**, the existin
 Starting from Maestro’s current SSSF fork, design the smallest robust software factory that can:
 
 1. accept planning work from **planf3**, **arch-review/brownfield**, and **prd-to-strav** and produce one internally consistent, mechanically executable, finalized plan;
-2. execute that plan as a two-lane dependency DAG: private test author → test review → seal → builder → code review; independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref; dependents start from that integration artifact; final review then receipt-backed publication to `main`;
-3. dispatch each incomplete stage from a fresh ephemeral worktree at the immutable input commit; never adopt a pane, process, dirty tree, or mutable candidate branch; crash resume restarts the current stage from its last immutable artifact;
-4. launch agents in visible **Herdr** panes as transport only through an explicit launcher abstraction:
+2. execute that plan as a two-lane dependency DAG: persistent tester → test-reviewer → builder → code-reviewer roles perform private test authoring, review, sealing, implementation, and code review; independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref; dependents start from that integration artifact; the `integration-reviewer` in a lane tab performs final review before receipt-backed publication to `main`;
+3. restart incomplete work from immutable stage input while re-discovering its fixed role-scoped cwd and pane/session context: never adopt an arbitrary pane, process, dirty tree, mutable candidate branch, or legacy stage/attempt pane;
+4. launch agents in visible persistent **Herdr** role panes as transport only through an explicit launcher abstraction:
    - Claude directly;
    - OMP only with explicit `--profile`;
    - Kimi and Grok only through explicit configured routes;
@@ -93,12 +93,12 @@ Minimum roles:
    - define how planf3, arch-review/brownfield, and prd-to-strav converge on one canonical executable plan;
    - eliminate parallel planning authorities and post-validation semantic surprises.
 
-4. **Opus — DAG/worktree/integration architect**
-   - define ready-set scheduling, parallel safety, nine-stage `lane_state.stage` authority, crash as stage restart from the last immutable artifact, ephemeral worktree ownership, immutable candidate/integration/publication refs, deterministic merge, conflicts, and receipt-backed publication.
+4. **Opus — DAG/role-cwd/integration architect**
+   - define ready-set scheduling, parallel safety, nine-stage `lane_state.stage` authority, crash as stage restart from the last immutable artifact, stable role-scoped cwd ownership, immutable candidate/integration/publication refs, deterministic merge, conflicts, and receipt-backed publication.
 
 5. **Sonnet — Herdr/launcher architect**
    - source-verify Herdr and launcher behavior;
-   - define route validation, exact argv, pane/worktree binding, session/resume, output normalization, credentials, failures, and trace events for Claude, OMP, Kimi, and Grok. Herdr remains transport, not workflow authority.
+   - define route validation, exact argv, pane/role-cwd binding, scheduler rediscovery, output normalization, credentials, failures, and trace events for Claude, OMP, Kimi, and Grok. Herdr remains transport, not workflow authority.
 
 6. **Fable — simplicity/adversarial reviewer**
    - attack every proposed component for duplicate authority, hidden state, unnecessary cryptography, retry-as-authority, nondeterminism, and operator burden;
@@ -288,7 +288,7 @@ This inventory is context, not a solution. Expand it from `git log --all`, specs
 - Claude kickoff text/Enter was dropped during TUI transition.
 - `/team` injection was best-effort rather than capability-checked.
 - panes were stale, busy, closed, or mis-adopted.
-- pane cwd diverged from lane worktree.
+- pane cwd diverged from its stable role-scoped cwd.
 - Herdr CLI drift was swallowed as “no pane.”
 - producer vendor/route facts were lost on resume.
 - route, launcher, model, profile, and vendor independence were conflated.
@@ -403,17 +403,18 @@ Independent ready lanes must overlap in execution. A plan DAG serviced by one se
 
 Choose one durable lifecycle authority: `lane_state.stage`. SQLite stores it; JSONL, envelopes, process/pane state, worktree files, and UI cannot compete. Define transaction, crash, and replay as stage-boundary commits.
 
-## C. Per-node worktrees and deterministic merge
+## C. Role-scoped worktrees and deterministic merge
 
 Specify:
 
 - clean immutable input commit;
-- fresh ephemeral worktree per incomplete stage; never adopt a prior pane, process, or dirty tree;
-- Herdr pane cwd exactly equal to that worktree when an agent is dispatched;
+- one stable role-scoped cwd per `(project, run, lane, role)`, never a fresh worktree for each dispatch or review generation;
+- tester and test-reviewer use distinct role-private trees; builder and code-reviewer retain their respective cwds throughout each `BUILDING` ↔ `REVIEWING_CODE` loop;
+- Herdr pane cwd exactly equals the owning role-scoped cwd, and that role retains its pane/session context across its loop and scheduler restart;
 - allowed writes;
 - artifact digest and commit SHA binding;
-- dirty/unauthorized-write handling: discard the tree; resume from the last immutable artifact;
-- cleanup;
+- dirty, unknown, malformed, mismatched, live, or unapproved observations refuse dispatch; only confirmed dead or `agent_not_found` roles may be recreated;
+- legacy stage/attempt panes are never adopted or renamed;
 - deterministic merge-ready ordering despite nondeterministic finish order;
 - ancestry proof on the integration ref;
 - merge conflict refuses without moving the ref;
@@ -424,15 +425,16 @@ Never merge a mutable candidate branch. Candidates are immutable refs/SHAs on `B
 
 ## D. Herdr and launcher abstraction
 
-All agent nodes launch in visible Herdr panes. Herdr is transport/observability, never lifecycle authority.
+All agent roles occupy visible persistent Herdr panes. Herdr is transport/observability, never lifecycle authority.
 
 Define one adapter contract covering:
 
-- allocate a fresh pane; never adopt a stale/closed/busy pane as workflow state;
-- bind pane cwd to the stage worktree;
+- one workspace per project/run, one tab per lane, and exactly five sibling panes bearing the exact labels `tester`, `test-reviewer`, `builder`, `code-reviewer`, and `integration-reviewer`;
+- exact `(project, run, lane, role)` identity, role-scoped cwd binding, and retained pane/session context;
 - launch/readiness/stream/exit (transport cancel is not a Maestro operator verb);
-- session creation for the stage only; no live-session adoption on resume;
-- stale/closed/busy/mis-adopted pane detection as transport failure, not stage;
+- scheduler-restart rediscovery only when the expected role, exact label, and clean approved cwd match;
+- recreation only after confirmed dead or `agent_not_found`; refusal for live, unknown, malformed, mismatched, dirty, or unapproved observations;
+- never adopt or rename a legacy stage/attempt pane;
 - typed normalized events as evidence only;
 - no durable pane/agent/attempt identity as workflow authority;
 - token/cost accounting as observation;
@@ -521,16 +523,16 @@ The architecture and implementation plan must prove this using fake Herdr/launch
 7. identical inputs reproduce identical canonical bytes/digest;
 8. one fake independent PASS publishes exactly one runnable identity;
 9. replay performs no second review/publication;
-10. scheduler starts the two independent ready lanes concurrently in separate ephemeral worktrees and visible fake Herdr panes;
-11. pane cwd matches each worktree;
+10. scheduler starts the two independent ready lanes concurrently in their persistent role-scoped cwds and visible fake Herdr role panes;
+11. every pane cwd matches its owning role-scoped cwd;
 12. at least two launcher kinds execute; full matrix covers Claude, OMP, Kimi, Grok;
 13. dependent cannot start before every `needs` lane is `MERGED`;
-14. each success binds immutable artifacts, `lane_state.stage`, worktree input commit, and Git SHA — not an attempt identity;
+14. each success binds immutable artifacts, `lane_state.stage`, role-cwd input commit, and Git SHA — not an attempt identity;
 15. gates reject missing/wrong output, zero/skipped tests, unrelated tests, and unauthorized writes;
 16. accepted lanes merge exactly once into the run integration ref with ancestry proof;
 17. merge conflict refuses without moving the ref;
 18. post-merge acceptance proves nonzero real checks;
-19. after process death, resume reconstructs the incomplete stage from the last immutable artifact, not from pane or dirty-tree state;
+19. after process death, resume reconstructs the incomplete stage from the last immutable artifact and re-discovers only the expected persistent role context; pane state and dirty trees are never workflow authority.
 20. publication is receipt-backed after passing final review; `main` at the same SHA without a receipt is refused.
 
 # Required negatives and anti-inert cases
@@ -540,7 +542,7 @@ At minimum:
 - DAG cycle, missing dependency, duplicate output owner;
 - future output declared current, or current fact disguised as future output;
 - nonexistent/unrelated selector; zero/skipped/unparseable execution;
-- concurrent lanes share a worktree;
+- concurrent lanes share a role-scoped cwd;
 - pane cwd mismatch; stale/closed/busy/mis-adopted pane treated as stage;
 - pane text falsely says “done” without an accepted artifact/stage commit;
 - stale prior-stage result treated as current input;
@@ -555,7 +557,7 @@ At minimum:
 - same-identity replay; changed bytes with stale receipt;
 - key rotation with unchanged plan;
 - crash during a stage; crash between completion and the durable stage commit;
-- remove scheduler edge, gate invocation, publication wiring, ancestry guard, profile propagation, pane/worktree binding, or one SQLite stage/artifact write.
+- remove scheduler edge, gate invocation, publication wiring, ancestry guard, profile propagation, pane/role-cwd binding, or one SQLite stage/artifact write.
 
 For every mutation name the deterministic diagnostic/state/test that goes red and one unrelated control that remains green.
 
