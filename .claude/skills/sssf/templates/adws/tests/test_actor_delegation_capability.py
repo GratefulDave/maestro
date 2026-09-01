@@ -594,6 +594,93 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             with self.assertRaisesRegex(FactoryRefused, "ROLE_OUTPUT_UNSAFE"):
                 actor._collect_uncommitted(checkout)
 
+    def test_collect_uncommitted_ignores_only_regular_generated_outputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            _init_repo(checkout)
+            cache = checkout / "tests" / "architecture" / "__pycache__"
+            cache.mkdir(parents=True)
+            (cache / "test_wp7.cpython-312-pytest.pyc").write_bytes(b"\0\xff")
+            pytest_cache = checkout / ".pytest_cache" / "v" / "cache"
+            pytest_cache.mkdir(parents=True)
+            (pytest_cache / "nodeids").write_text("[]", encoding="utf-8")
+            (checkout / ".coverage").write_bytes(b"\0coverage")
+            kept = checkout / "tests" / "architecture" / "test_wp7.py"
+            kept.write_text("def test_contract():\n    pass\n", encoding="utf-8")
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, RecordingLauncher()),
+                state,
+                target,
+                _ROLE_ROUTES,
+            )
+
+            self.assertEqual(
+                actor._collect_uncommitted(checkout),
+                {
+                    "tests/architecture/test_wp7.py": (
+                        "def test_contract():\n    pass\n"
+                    )
+                },
+            )
+
+    def test_collect_uncommitted_refuses_non_generated_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            _init_repo(checkout)
+            (checkout / "role-output.bin").write_bytes(b"\0\xff")
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, RecordingLauncher()),
+                state,
+                target,
+                _ROLE_ROUTES,
+            )
+
+            with self.assertRaisesRegex(
+                FactoryRefused, "ROLE_OUTPUT_UNSAFE:role-output.bin"
+            ):
+                actor._collect_uncommitted(checkout)
+
+    def test_collect_uncommitted_refuses_generated_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            _init_repo(checkout)
+            cache = checkout / "__pycache__"
+            cache.mkdir()
+            secret = root / "host-secret.pyc"
+            secret.write_bytes(b"\0secret")
+            (cache / "escape.pyc").symlink_to(secret)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, RecordingLauncher()),
+                state,
+                target,
+                _ROLE_ROUTES,
+            )
+
+            with self.assertRaisesRegex(
+                FactoryRefused, "ROLE_OUTPUT_UNSAFE:__pycache__/escape.pyc"
+            ):
+                actor._collect_uncommitted(checkout)
+
     def test_await_envelope_refuses_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

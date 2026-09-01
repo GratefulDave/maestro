@@ -6,6 +6,7 @@ LaneArtifact, ArtifactKind, ReviewerVerdict, canonical_bytes, digest_bytes.
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 from dataclasses import dataclass
@@ -228,6 +229,32 @@ def actionable_findings(
     return st.require_revise_findings(redact_findings(checked, tokens))
 
 
+def _json_string_values(obj: object) -> tuple[str, ...]:
+    """String values of a JSON document. Keys are schema, not secrets."""
+    found: list[str] = []
+
+    def walk(item: object) -> None:
+        if isinstance(item, str):
+            found.append(item)
+        elif isinstance(item, dict):
+            for value in item.values():
+                walk(value)
+        elif isinstance(item, (list, tuple)):
+            for value in item:
+                walk(value)
+
+    walk(obj)
+    return tuple(found)
+
+
+def _leak_haystack(blob: str) -> str:
+    try:
+        parsed = json.loads(blob)
+    except json.JSONDecodeError:
+        return blob
+    return "\n".join(_json_string_values(parsed))
+
+
 def refuse_private_leak(
     obj: object, tokens: Sequence[str], *, allow: Iterable[str] = ()
 ) -> None:
@@ -238,10 +265,11 @@ def refuse_private_leak(
         blob = obj
     else:
         blob = st.canonical_bytes(obj).decode("utf-8")
+    haystack = _leak_haystack(blob)
     for token in tokens:
         if not token or any(token in public for public in allowed):
             continue
-        if token in blob:
+        if token in haystack:
             raise PrivateLeakError("public payload leaked private token")
 
 

@@ -238,6 +238,37 @@ def test_public_contract_terms():
 
         self.assertEqual(draft.payload["public_contract"], contract)
 
+    def test_draft_allows_json_key_substring_quoted_in_private_source(self):
+        source = '''\
+def test_producer_artifact_pin():
+    assert contract["producer"]["artifact"] == pinned["path"]
+'''
+        contract = {
+            "acceptance_criteria": ["producer pin stays on the declared path"],
+            "declared_outputs": [TEST_PATH],
+        }
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("json-key-substring"),
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TEST_PATH: source},
+            public_contract=contract,
+            worktrees_root=self.worktrees / "json-key-substring",
+        )
+        self.assertEqual(draft.payload["public_contract"], contract)
+
+    def test_refuse_private_leak_still_catches_secret_in_json_value(self):
+        with self.assertRaises(pr.PrivateLeakError):
+            pr.refuse_private_leak(
+                {"input_artifact_ids": [], "note": SECRET_LITERAL},
+                (SECRET_LITERAL,),
+            )
+
     def test_draft_commit_excludes_agent_runtime_files(self):
         original_write_files = pr.write_files
 

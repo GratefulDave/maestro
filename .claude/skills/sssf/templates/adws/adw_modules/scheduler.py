@@ -174,6 +174,23 @@ def run_row(store: ArtifactStore, run_id: str) -> Mapping[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def runs_for_target(
+    store: ArtifactStore, *, repository_fingerprint: str, main_ref: str
+) -> tuple[Mapping[str, Any], ...]:
+    """Every run bound to one target repository identity and main ref.
+
+    The durable half of deterministic run selection: the caller narrows these
+    rows further by plan artifact ref / compiled digest and by derived status.
+    Ordered by creation so a refusal names the same ids in the same order.
+    """
+    rows = store.conn.execute(
+        "SELECT * FROM runs WHERE target_repository_fingerprint=? "
+        "AND target_main_ref=? ORDER BY created_at, run_id",
+        (repository_fingerprint, main_ref),
+    ).fetchall()
+    return tuple({key: row[key] for key in row.keys()} for row in rows)
+
+
 def binding_from_run(row: Mapping[str, Any]) -> st.RunBinding:
     return st.RunBinding(
         runtime_state_root=row["runtime_state_root"],

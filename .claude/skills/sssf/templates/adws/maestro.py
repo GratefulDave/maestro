@@ -34,7 +34,11 @@ from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import scheduler_types as st
 from adw_modules import tests_chain as tchain
-from adw_modules.lifecycle import ArtifactStore, LedgerSchemaUnsupported
+from adw_modules.lifecycle import (
+    ArtifactStore,
+    LedgerSchemaUnsupported,
+    RunAlreadyExists,
+)
 from adw_modules.reporting_registry import register_installation
 from adw_modules.dashboard_autoload import maybe_autoload_dashboard
 from adw_modules.route_receipts import load_admitted_routes, load_public_key
@@ -44,16 +48,20 @@ from adw_modules.scheduler import (
     FactoryScheduler,
     LaneContext,
     LaunchFailed,
+    OrderedLocks,
     RunRepositoryMismatch,
     StageActor,
     apply_factory_amendment,
     binding_from_run,
     create_factory_run,
+    durable_integration_tip,
     plan_artifact_ref_for,
     require_deployment,
     run_row,
+    runs_for_target,
     target_from_binding,
 )
+from adw_modules.plan_model import PlanCompileError
 
 _MAESTRO_CONFIG_FILE = Path("adws") / "maestro.config.yaml"
 _MAESTRO_SCHEMA = "maestro-config.v1"
@@ -319,17 +327,43 @@ def _relative_under(root: Path, path: Path) -> str:
     return str(relative).replace("\\", "/")
 
 
+_GENERATED_ROLE_DIRS = frozenset(
+    ("__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache")
+)
+_GENERATED_ROLE_SUFFIXES = (".pyc", ".pyo", ".pyd")
 
-def _read_regular_text_under(root: Path, path: Path) -> str:
-    """Read a regular file under `root`. Never follow symlinks."""
-    relative = _relative_under(root, path)
-    dir_flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0)
+
+def _generated_role_output(relative: str) -> bool:
+    parts = Path(relative.replace("\\", "/")).parts
+    if any(part in _GENERATED_ROLE_DIRS for part in parts):
+        return True
+    name = parts[-1]
+    return (
+        name.endswith(_GENERATED_ROLE_SUFFIXES)
+        or name == ".coverage"
+        or name.startswith(".coverage.")
     )
-    file_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _role_agent_scratch(relative: str) -> bool:
+    """Pane scratch belongs to the harness, not to any role's output."""
+    parts = Path(relative.replace("\\", "/")).parts
+    return bool(parts) and parts[0] == lch.ROLE_AGENT_DIR
+
+
+def _open_regular_under(root: Path, path: Path) -> tuple[str, int]:
+    """Open a regular file under `root` without ever following a symlink.
+
+    Returns `(relative, fd)`; the caller owns the descriptor. Refuses a path
+    that escapes `root`, that traverses or ends in a symlink, or whose final
+    component is not a regular file. `O_NONBLOCK` keeps a FIFO from blocking
+    the open, so a non-regular path refuses instead of hanging collection.
+    """
+    relative = _relative_under(root, path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow | nonblock
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | nonblock
     fd = os.open(str(Path(root).resolve()), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         parts = Path(relative).parts
@@ -345,18 +379,52 @@ def _read_regular_text_under(root: Path, path: Path) -> str:
                 raise FactoryRefused("ROLE_OUTPUT_UNSAFE:{0}".format(relative)) from exc
             os.close(fd)
             fd = nxt
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise FactoryRefused("ROLE_OUTPUT_UNSAFE:{0}".format(relative))
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    return relative, fd
+
+
+def _drain_fd(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _role_output_disposition(root: Path, path: Path) -> tuple[str, bytes | None]:
+    """The one generated-output policy every role-output path applies.
+
+    Containment, no-follow and regular-file are proven *before* a path may be
+    ignored, so a generated-looking symlink or non-regular path still refuses.
+    Returns `(relative, None)` for known generated output every role drops, or
+    `(relative, bytes)` for output the role keeps.
+    """
+    relative, fd = _open_regular_under(root, path)
+    try:
+        if _generated_role_output(relative):
+            return relative, None
+        return relative, _drain_fd(fd)
     finally:
         os.close(fd)
+
+
+def _read_regular_bytes_under(root: Path, path: Path) -> tuple[str, bytes]:
+    """Read a regular file under `root`. Never follow symlinks."""
+    relative, fd = _open_regular_under(root, path)
+    try:
+        return relative, _drain_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_regular_text_under(root: Path, path: Path) -> str:
+    return _read_regular_bytes_under(root, path)[1].decode("utf-8")
 
 
 def _clear_precreated_role_cwd(dest: Path) -> bool:
@@ -746,24 +814,73 @@ class HerdrStageActor:
                 raise FactoryRefused("PRIVATE_TEST_LEAK")
         return st.json_ready(body)
 
+    def _deleted_tracked(self, checkout: Path, *pathspec: str) -> frozenset[str]:
+        listed = self._git(
+            checkout, "ls-files", "-z", "--deleted", "--", *pathspec, check=False
+        )
+        return frozenset(item for item in listed.split("\0") if item)
+
     def _collect_uncommitted(self, checkout: Path) -> dict[str, str]:
         listed = self._git(
             checkout, "ls-files", "-o", "-m", "--exclude-standard", check=False
         )
+        deleted = self._deleted_tracked(checkout)
         files: dict[str, str] = {}
         for rel in listed.splitlines():
             rel = rel.strip()
-            if not rel or rel == ".maestro-agent" or rel.startswith(".maestro-agent/"):
+            if not rel or _role_agent_scratch(rel):
                 continue
+            if rel in deleted:
+                # A deletion is real role output that a path->content draft
+                # cannot carry. Refuse rather than lose it silently.
+                raise FactoryRefused(f"ROLE_OUTPUT_DELETED:{rel}")
             try:
-                content = _read_regular_text_under(checkout, checkout / rel)
+                relative, payload = _role_output_disposition(checkout, checkout / rel)
             except FileNotFoundError:
                 continue
-            except (OSError, UnicodeError) as exc:
+            except OSError as exc:
                 raise FactoryRefused(f"ROLE_OUTPUT_UNSAFE:{rel}") from exc
-            files[rel.replace("\\", "/")] = content
+            if payload is None:
+                continue
+            try:
+                content = payload.decode("utf-8")
+            except UnicodeError as exc:
+                raise FactoryRefused(f"ROLE_OUTPUT_UNSAFE:{rel}") from exc
+            files[relative] = content
         return files
 
+
+    def _safe_role_pathspec(
+        self,
+        checkout: Path,
+        listed: Sequence[str],
+        deleted: frozenset[str],
+    ) -> tuple[str, ...]:
+        """Apply the shared role-output policy to a builder pathspec.
+
+        A deleted tracked path stays in the pathspec so `git add -A` records
+        the deletion. Known generated output is dropped only after the same
+        containment, no-follow and regular-file proof the tester collection
+        path makes, so a generated-looking symlink, a FIFO, a directory or an
+        escaping path refuses before any candidate commit exists.
+        """
+        kept: list[str] = []
+        for rel in listed:
+            if not rel or _role_agent_scratch(rel):
+                continue
+            if rel in deleted:
+                kept.append(rel)
+                continue
+            try:
+                _relative, payload = _role_output_disposition(checkout, checkout / rel)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise FactoryRefused(f"ROLE_OUTPUT_UNSAFE:{rel}") from exc
+            if payload is None:
+                continue
+            kept.append(rel)
+        return tuple(kept)
 
     def _commit_declared(
         self, checkout: Path, outputs: Sequence[str], base: str
@@ -781,7 +898,11 @@ class HerdrStageActor:
                 "--",
                 *requested,
             )
-            pathspec = tuple(item for item in listed.split("\0") if item)
+            pathspec = self._safe_role_pathspec(
+                checkout,
+                tuple(item for item in listed.split("\0") if item),
+                self._deleted_tracked(checkout, *requested),
+            )
         if pathspec:
             self._git(checkout, "add", "-A", "--", *pathspec)
             patch = self._git_bytes(
@@ -929,7 +1050,7 @@ class HerdrStageActor:
 
     def _launch_failed(self, exc: lch.LaunchRefused) -> LaunchFailed:
         return LaunchFailed(
-            "{}:{}".format(exc.refusal.value, exc.detail),
+            "{}:{}".format(exc.refusal.code, exc.detail),
             pane_created=bool(exc.pane_created),
         )
 
@@ -1043,6 +1164,7 @@ class HerdrStageActor:
             pane_role=role,
             run_id=ctx.run_id,
             repository_fingerprint=self.target.target_repository_fingerprint,
+            repository_root=Path(self.target.target_repository_root),
             stage=ctx.stage.value,
             input_digest=ctx.input_digest,
             workspace_label=self._workspace_label(ctx),
@@ -1437,8 +1559,210 @@ def _actor_for(
 
 
 def _compile_plan(path: Path, *, revision: int, ref: str) -> st.CompiledPlan:
+    """Read and compile one plan artifact.
+
+    Reading it is the only place a missing or unreadable *plan file* is a
+    configuration fact, so the mapping belongs here rather than in `main`:
+    every other `FileNotFoundError` a run can raise -- a missing `git`, `omp`
+    or `claude` executable, a role checkout removed mid-turn, a vault path
+    gone -- is a failure of the run, not of its configuration, and must not
+    be relabelled.
+    """
+    try:
+        stored = path.read_bytes()
+    except OSError as exc:
+        raise _MaestroConfigurationError(
+            "cannot read plan artifact {0}: {1}".format(path, exc)
+        ) from exc
     return plan_compiler.compile_plan(
-        path.read_bytes(), plan_revision=revision, plan_artifact_ref=ref
+        stored, plan_revision=revision, plan_artifact_ref=ref
+    )
+
+
+_PLANS_RELATIVE = Path(".maestro") / "plans"
+_PLAN_ARTIFACT_NAME = "maestro-plan.v1"
+
+
+def _repository_from_cwd(cwd: Path | None = None) -> Path:
+    """The primary worktree the operator is standing in, or a typed refusal.
+
+    A linked worktree shares its Git common directory with the repository's
+    primary working tree, so `git_primary_workdir` answers the *primary* path
+    for either one. Equality with the discovered top level is therefore the
+    proof, and a linked lane checkout refuses instead of silently binding the
+    repository some other checkout happens to own.
+    """
+    here = (Path.cwd() if cwd is None else Path(cwd)).resolve()
+    try:
+        # `BoundGit` so discovery runs under the same cleaned environment as
+        # every other Git call: an ambient GIT_DIR must not decide which
+        # repository the operator is standing in.
+        top = gitpub.BoundGit(here).text("rev-parse", "--show-toplevel")
+    except gitpub.GitError as exc:
+        raise _MaestroConfigurationError(
+            "not inside a Git working tree: {0}".format(here)
+        ) from exc
+    if not top:
+        raise _MaestroConfigurationError(
+            "not inside a Git working tree: {0}".format(here)
+        )
+    root = Path(top).resolve()
+    git = gitpub.BoundGit(root)
+    try:
+        if git.is_bare():
+            raise _MaestroConfigurationError(
+                "bare repository has no working tree: {0}".format(root)
+            )
+        git_dir = git.git_dir().resolve()
+        common = git.git_common_dir().resolve()
+    except gitpub.GitError as exc:
+        raise gitpub.GitPublicationRefused(exc.code, exc.detail) from exc
+    if git_dir != common or lch.git_primary_workdir(root) != root:
+        raise _MaestroConfigurationError(
+            "not the repository's primary worktree: {0}".format(root)
+        )
+    return root
+
+
+def _main_ref_from_head(repo: Path) -> str:
+    """The checked-out branch as its full ref. Detached HEAD refuses."""
+    try:
+        return gitpub.BoundGit(Path(repo)).symbolic_head()
+    except gitpub.GitError as exc:
+        raise gitpub.GitPublicationRefused(exc.code, exc.detail) from exc
+
+
+def _worktree_git_dir(repo: Path) -> str:
+    try:
+        return str(gitpub.BoundGit(Path(repo)).git_dir())
+    except gitpub.GitError as exc:
+        raise gitpub.GitPublicationRefused(exc.code, exc.detail) from exc
+
+
+def _plan_artifact_for(repo: Path, name: str) -> Path:
+    """The one installed artifact for an exact plan name.
+
+    `<repo>/.maestro/plans/<name>/maestro-plan.v1` and nothing else: no
+    recursive search, no fuzzy match, and no path that leaves the plans
+    directory once symlinks are resolved.
+    """
+    plans = (Path(repo) / _PLANS_RELATIVE).resolve()
+    if (
+        not name
+        or name != name.strip()
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+    ):
+        raise _MaestroConfigurationError(
+            "plan name must be one installed plan directory name: {0!r}".format(name)
+        )
+    candidate = plans / name / _PLAN_ARTIFACT_NAME
+    resolved = candidate.resolve()
+    if plans not in resolved.parents:
+        raise _MaestroConfigurationError(
+            "plan artifact escapes {0}: {1}".format(plans, resolved)
+        )
+    if not resolved.is_file():
+        raise _MaestroConfigurationError("no plan artifact at {0}".format(candidate))
+    return resolved
+
+
+def _matching_runs(
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    compiled: st.CompiledPlan,
+    plan_artifact_ref: str,
+) -> Tuple[str, ...]:
+    """Nonterminal runs of this plan against this repository identity.
+
+    Deterministic from persisted facts only: the target fingerprint and main
+    ref narrow the rows, the active revision's plan artifact ref or the
+    compiled digest identifies the plan, and the derived run status drops a
+    run that has already published.
+    """
+    found: list[str] = []
+    for row in runs_for_target(
+        store,
+        repository_fingerprint=target.target_repository_fingerprint,
+        main_ref=target.target_main_ref,
+    ):
+        run_id = str(row["run_id"])
+        revision = int(row["plan_revision"])
+        ref = plan_artifact_ref_for(store, run_id, revision)
+        if ref != plan_artifact_ref and row["plan_digest"] != compiled.plan_digest:
+            continue
+        status = store.derive_run_status(run_id, durable_integration_tip(store, run_id))
+        if status is st.RunStatus.COMPLETE:
+            continue
+        found.append(run_id)
+    return tuple(found)
+
+
+def _run_plan(args: argparse.Namespace) -> int:
+    """The single-entry operator invocation: a plan name and nothing else.
+
+    Repository, main ref, plan artifact, runtime and run identity are all
+    inferred here; the decision is then normalised into the existing
+    `_run_start` / `_run_resume`, which stay the only paths that build a
+    scheduler. Lookup and creation happen under the existing level-1 run lock
+    so two simultaneous first invocations cannot both create a run; the lock
+    is released before the scheduler runs, which re-acquires it itself.
+    """
+    maestro_file = _executing_maestro_file()
+    repo = _repository_from_cwd()
+    main_ref = _main_ref_from_head(repo)
+    plan_path = _plan_artifact_for(repo, str(args.plan_name))
+    layout = _load_deployment_config(maestro_file)
+    require_deployment(maestro_file, repo)
+    runtime = _open_runtime(layout, repo)
+    resume_id = ""
+    start_id = ""
+    try:
+        runtime.ensure_layout()
+        # Binding the target takes a non-blocking exclusive lock on the
+        # worktree Git directory, so it belongs *inside* the level-1 run lock
+        # too: outside it, two simultaneous first invocations collide there
+        # and one refuses before it can discover the other's run.
+        locks = OrderedLocks(runtime, _worktree_git_dir(repo))
+        locks.acquire(1)
+        try:
+            compiled = _compile_plan(plan_path, revision=1, ref=str(plan_path))
+            target = gitpub.bind_target_worktree(repo, main_ref)
+            store = _open_store(runtime)
+            try:
+                matches = _matching_runs(store, target, compiled, str(plan_path))
+                if len(matches) > 1:
+                    raise FactoryRefused(
+                        "AMBIGUOUS_NONTERMINAL_RUNS:{0}".format(",".join(matches))
+                    )
+                if matches:
+                    resume_id = matches[0]
+                else:
+                    start_id = uuid.uuid4().hex
+                    create_factory_run(
+                        store=store,
+                        run_id=start_id,
+                        compiled=compiled,
+                        runtime=runtime,
+                        target=target,
+                    )
+            finally:
+                store.close()
+        finally:
+            locks.release()
+    finally:
+        runtime.close()
+    if resume_id:
+        return _run_resume(argparse.Namespace(run_id=resume_id))
+    return _run_start(
+        argparse.Namespace(
+            plan=str(plan_path),
+            repo=str(repo),
+            main_ref=main_ref,
+            run_id=start_id,
+        )
     )
 
 
@@ -1692,7 +2016,11 @@ def _run_status(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="maestro")
-    root = parser.add_subparsers(dest="command", required=True)
+    # The single-entry operator invocation. It is an option on the root
+    # parser, not a verb, so the frozen verb surface is unchanged.
+    parser.add_argument("--plan", dest="plan_name", metavar="PLAN")
+    parser.set_defaults(handler=None)
+    root = parser.add_subparsers(dest="command", required=False)
 
     run = root.add_parser("run")
     run_sub = run.add_subparsers(dest="run_command", required=True)
@@ -1742,11 +2070,23 @@ def parser_verbs(parser: argparse.ArgumentParser) -> Tuple[str, ...]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     raw = tuple(sys.argv[1:] if argv is None else argv)
-    args = build_parser().parse_args(list(raw))
+    parser = build_parser()
+    args = parser.parse_args(list(raw))
+    plan_name = getattr(args, "plan_name", None)
+    if args.command is None:
+        if plan_name is None:
+            parser.error("--plan <plan-name> or a run verb is required")
+        handler: Callable[[argparse.Namespace], int] = _run_plan
+    else:
+        if plan_name is not None:
+            parser.error("--plan is the whole invocation; it takes no verb")
+        handler = args.handler
     try:
-        return int(args.handler(args))
+        return int(handler(args))
     except _RunRefused as exc:
         return exc.emit()
+    except PlanCompileError as exc:
+        return _RunRefused("PLAN_COMPILE_REFUSED", str(exc)).emit()
     except RunRepositoryMismatch as exc:
         return _RunRefused("RUN_REPOSITORY_MISMATCH", str(exc)).emit()
     except LedgerSchemaUnsupported as exc:
@@ -1758,8 +2098,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except CleanupRefused as exc:
         return _RunRefused(exc.code, exc.detail).emit()
     except LaunchFailed as exc:
-        return _RunRefused("LAUNCH_FAILED", exc.detail).emit()
+        # The launcher's `pane_created` is the operator's only signal that a
+        # role pane survived the refusal and is theirs to close; a launch that
+        # refused before any pane existed leaves nothing behind.
+        detail = exc.detail + (":pane_retained" if exc.pane_created else "")
+        return _RunRefused("LAUNCH_FAILED", detail).emit()
     except gitpub.GitPublicationRefused as exc:
+        return _RunRefused(exc.code, str(exc)).emit()
+    except RunAlreadyExists as exc:
+        # `_run_plan` created the run under the run lock and `_run_start`
+        # re-binds the target before creating it again; if the main ref moved
+        # in that window the second binding differs and `create_factory_run`
+        # re-raises. The ledger already holds the run, so the next invocation
+        # resumes it -- the operator gets the typed code, not a traceback.
         return _RunRefused(exc.code, str(exc)).emit()
     except _MaestroConfigurationError as exc:
         return _RunRefused("RUN_CONFIGURATION_REQUIRED", str(exc)).emit()
