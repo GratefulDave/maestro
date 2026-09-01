@@ -2119,6 +2119,46 @@ class FactoryScheduler:
         )
         _complete(self.store, ctx, artifact)
 
+    def _run_gate_lanes(
+        self, lanes: Sequence[st.LaneProjection]
+    ) -> tuple[st.LaneProjection, ...]:
+        """Tests lanes no build lane consumes. Their suites gate the run, not a lane."""
+        consumed = {
+            need
+            for lane in lanes
+            if lane.lane_kind == st.LANE_KIND_BUILD
+            for need in lane.needs
+        }
+        return tuple(
+            lane
+            for lane in lanes
+            if lane.lane_kind == st.LANE_KIND_TESTS and lane.lane_id not in consumed
+        )
+
+    def _failed_run_gates(
+        self, lanes: Sequence[st.LaneProjection], head: str, fingerprint: str
+    ) -> tuple[str, ...]:
+        failures = []
+        for lane in self._run_gate_lanes(lanes):
+            sealed = self._current_tests_sealed(lane.lane_id)
+            if sealed is None:
+                continue
+            result = cr.run_integration_gate(
+                run_id=self.run_id,
+                lane_id=lane.lane_id,
+                input_digest=fingerprint,
+                state_root=self.runtime.path,
+                integration_repo=Path(self.target.target_repository_root),
+                integration_sha=head,
+                sealed_bundle=_record_as_lane_artifact(sealed, lane),
+                scratch_root=self.runtime.path / "worktrees",
+                gate=self._sealed_suite_gate(lane),
+                runtime_root=Path(self.target.target_repository_root),
+            )
+            if result["failed"]:
+                failures.append(lane.lane_id)
+        return tuple(failures)
+
     def _final_review(self) -> None:
         self.locks.acquire(2)
         try:
@@ -2138,9 +2178,19 @@ class FactoryScheduler:
                 integration_head=head,
             )
             observed_main = self.target.git().rev_parse(row["target_main_ref"])
-            verdict, findings, affected = self.actor.review_integration(
-                ctx, lanes, head
-            )
+            gate_failures = self._failed_run_gates(lanes, head, fingerprint)
+            if gate_failures:
+                verdict = st.ReviewerVerdict.REVISE
+                findings = (cr._INTEGRATION_GATE_REVISE,)
+                affected = tuple(
+                    lane.lane_id
+                    for lane in lanes
+                    if lane.lane_kind == st.LANE_KIND_BUILD
+                )
+            else:
+                verdict, findings, affected = self.actor.review_integration(
+                    ctx, lanes, head
+                )
             checked = prv.actionable_findings(verdict, findings)
             payload = {
                 "affected_lanes": list(affected)
