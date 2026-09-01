@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Plan model · UML class diagram</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,12 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;
-      --color-paper-2: #393e53;
-      --color-ink:     #f5f5f5;
-      --color-muted:   #bfc0c0;
-      --color-soft:    #8e98ac;
-      --color-accent:  #f08a59;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -70,181 +65,181 @@
       <desc id="10-classes-plan-desc">Class diagram of plan_model.py: Plan and PlanV5; TestsNodeV5 declares test_visibility merged or hidden; PlanNode carries that projection. v5 is excluded from _RUNNABLE_PLAN_SCHEMA_VERSIONS so run start refuses it. Gate min_cases is floored by plan_validate._gate_floor_supplied. HiddenGateReceipt is not built.</desc>
       <defs>
         <marker id="plan-uml-triangle" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+          <polygon points="0 0, 16 6, 0 12" fill="#000000" stroke="#f8f8f8" stroke-width="1"/>
         </marker>
         <marker id="plan-uml-triangle-accent" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f08a59" stroke-width="1"/>
+          <polygon points="0 0, 16 6, 0 12" fill="#000000" stroke="#ff6b35" stroke-width="1"/>
         </marker>
         <marker id="plan-uml-diamond-filled" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f5f5f5"/>
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f8f8f8"/>
         </marker>
         <marker id="plan-uml-diamond-hollow" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#000000" stroke="#f8f8f8" stroke-width="1"/>
         </marker>
         <marker id="plan-uml-open" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
-          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#bfc0c0" stroke-width="1"/>
+          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#c4c4c4" stroke-width="1"/>
         </marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Relationships (drawn before boxes) -->
       <!-- PlanV5 extends Plan (focal inbound) -->
-      <line x1="208" y1="280" x2="208" y2="244" stroke="#f08a59" stroke-width="1" marker-end="url(#plan-uml-triangle-accent)"/>
+      <line x1="208" y1="280" x2="208" y2="244" stroke="#ff6b35" stroke-width="1" marker-end="url(#plan-uml-triangle-accent)"/>
       <!-- Plan uses PlanNode (to_plan_nodes) -->
-      <line x1="368" y1="136" x2="432" y2="136" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#plan-uml-open)"/>
+      <line x1="368" y1="136" x2="432" y2="136" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#plan-uml-open)"/>
       <!-- Plan owns MergePolicy, routed left of PlanV5 -->
-      <path d="M 48,160 H 36 Q 28,160 28,168 V 480 Q 28,488 36,488 H 48" fill="none" stroke="#bfc0c0" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <path d="M 48,160 H 36 Q 28,160 28,168 V 480 Q 28,488 36,488 H 48" fill="none" stroke="#c4c4c4" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
       <!-- PlanV5 owns TestsNodeV5 -->
-      <line x1="368" y1="334" x2="432" y2="334" stroke="#bfc0c0" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <line x1="368" y1="334" x2="432" y2="334" stroke="#c4c4c4" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
       <!-- PlanV5 owns AgentNode, routed above TestsNodeV5 -->
-      <path d="M 368,300 H 380 Q 388,300 388,292 V 256 Q 388,248 396,248 H 1044 Q 1052,248 1052,256 V 280" fill="none" stroke="#bfc0c0" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <path d="M 368,300 H 380 Q 388,300 388,292 V 256 Q 388,248 396,248 H 1044 Q 1052,248 1052,256 V 280" fill="none" stroke="#c4c4c4" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
       <!-- TestsNodeV5 owns Gate -->
-      <line x1="624" y1="428" x2="624" y2="480" stroke="#bfc0c0" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <line x1="624" y1="428" x2="624" y2="480" stroke="#c4c4c4" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
       <!-- AgentNode owns Gate -->
-      <path d="M 1052,428 V 536 Q 1052,544 1044,544 H 816" fill="none" stroke="#bfc0c0" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <path d="M 1052,428 V 536 Q 1052,544 1044,544 H 816" fill="none" stroke="#c4c4c4" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
       <!-- MergePolicy owns integration Gate -->
-      <line x1="368" y1="492" x2="432" y2="492" stroke="#bfc0c0" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <line x1="368" y1="492" x2="432" y2="492" stroke="#c4c4c4" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
 
       <!-- Relationship labels -->
-      <rect x="372" y="116" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="400" y="126" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PROJECT</text>
-      <rect x="176" y="252" width="64" height="12" rx="2" fill="#2d3142"/>
-      <text x="208" y="262" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EXTENDS</text>
-      <rect x="372" y="314" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="400" y="324" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TESTS</text>
-      <rect x="632" y="228" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="660" y="238" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">V5NODE</text>
-      <rect x="632" y="444" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="652" y="454" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GATE</text>
-      <rect x="900" y="524" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="920" y="534" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GATE</text>
-      <rect x="376" y="472" width="48" height="12" rx="2" fill="#2d3142"/>
-      <text x="400" y="482" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">INTEG</text>
+      <rect x="372" y="116" width="56" height="12" rx="2" fill="#000000"/>
+      <text x="400" y="126" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PROJECT</text>
+      <rect x="176" y="252" width="64" height="12" rx="2" fill="#000000"/>
+      <text x="208" y="262" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EXTENDS</text>
+      <rect x="372" y="314" width="56" height="12" rx="2" fill="#000000"/>
+      <text x="400" y="324" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TESTS</text>
+      <rect x="632" y="228" width="56" height="12" rx="2" fill="#000000"/>
+      <text x="660" y="238" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">V5NODE</text>
+      <rect x="632" y="444" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="652" y="454" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GATE</text>
+      <rect x="900" y="524" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="920" y="534" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GATE</text>
+      <rect x="376" y="472" width="48" height="12" rx="2" fill="#000000"/>
+      <text x="400" y="482" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">INTEG</text>
 
       <!-- Multiplicities -->
-      <rect x="368" y="336" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="374" y="346" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="400" y="336" width="28" height="12" rx="2" fill="#2d3142"/>
-      <text x="414" y="346" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">0..*</text>
-      <rect x="616" y="432" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="622" y="442" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="616" y="464" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="622" y="474" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="1040" y="432" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="1046" y="442" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="820" y="524" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="826" y="534" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="36" y="148" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="42" y="158" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="36" y="448" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="42" y="458" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="372" y="492" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="378" y="502" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="416" y="492" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="422" y="502" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="372" y="288" width="12" height="12" rx="2" fill="#2d3142"/>
-      <text x="378" y="298" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
-      <rect x="1040" y="264" width="28" height="12" rx="2" fill="#2d3142"/>
-      <text x="1054" y="274" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">0..*</text>
+      <rect x="368" y="336" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="374" y="346" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="400" y="336" width="28" height="12" rx="2" fill="#000000"/>
+      <text x="414" y="346" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">0..*</text>
+      <rect x="616" y="432" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="622" y="442" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="616" y="464" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="622" y="474" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="1040" y="432" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="1046" y="442" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="820" y="524" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="826" y="534" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="36" y="148" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="42" y="158" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="36" y="448" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="42" y="458" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="372" y="492" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="378" y="502" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="416" y="492" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="422" y="502" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="372" y="288" width="12" height="12" rx="2" fill="#000000"/>
+      <text x="378" y="298" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">1</text>
+      <rect x="1040" y="264" width="28" height="12" rx="2" fill="#000000"/>
+      <text x="1054" y="274" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" font-weight="600">0..*</text>
 
       <!-- Class: Plan -->
-      <rect x="48" y="48" width="320" height="196" rx="6" fill="#2d3142"/>
-      <rect x="48" y="48" width="320" height="196" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="48" y1="88" x2="368" y2="88" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <line x1="48" y1="176" x2="368" y2="176" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="208" y="72" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan</text>
-      <text x="64" y="108" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: maestro-plan.v1</text>
-      <text x="64" y="128" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ plan_id: str</text>
-      <text x="64" y="148" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Tuple[Node, ...]</text>
-      <text x="64" y="168" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ merge_policy: MergePolicy</text>
-      <text x="64" y="196" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ to_plan_nodes(): Tuple[PlanNode, ...]</text>
-      <text x="64" y="216" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ node_depths(): Dict[str, int]</text>
+      <rect x="48" y="48" width="320" height="196" rx="6" fill="#000000"/>
+      <rect x="48" y="48" width="320" height="196" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="48" y1="88" x2="368" y2="88" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <line x1="48" y1="176" x2="368" y2="176" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="208" y="72" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan</text>
+      <text x="64" y="108" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: maestro-plan.v1</text>
+      <text x="64" y="128" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ plan_id: str</text>
+      <text x="64" y="148" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Tuple[Node, ...]</text>
+      <text x="64" y="168" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ merge_policy: MergePolicy</text>
+      <text x="64" y="196" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ to_plan_nodes(): Tuple[PlanNode, ...]</text>
+      <text x="64" y="216" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ node_depths(): Dict[str, int]</text>
 
       <!-- Class: PlanV5 (focal) -->
-      <rect x="48" y="280" width="320" height="108" rx="6" fill="#2d3142"/>
-      <rect x="48" y="280" width="320" height="108" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="48" y="280" width="320" height="40" rx="6" fill="rgba(240,138,89,0.10)"/>
-      <rect x="48" y="312" width="320" height="8" fill="rgba(240,138,89,0.10)"/>
-      <line x1="48" y1="320" x2="368" y2="320" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
-      <text x="208" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PlanV5</text>
-      <text x="64" y="340" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: maestro-plan.v5</text>
-      <text x="64" y="360" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Tuple[V5Node, ...]</text>
-      <text x="64" y="376" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">not in _RUNNABLE_PLAN_SCHEMA_VERSIONS</text>
+      <rect x="48" y="280" width="320" height="108" rx="6" fill="#000000"/>
+      <rect x="48" y="280" width="320" height="108" rx="6" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="48" y="280" width="320" height="40" rx="6" fill="rgba(255,107,53,0.20)"/>
+      <rect x="48" y="312" width="320" height="8" fill="rgba(255,107,53,0.20)"/>
+      <line x1="48" y1="320" x2="368" y2="320" stroke="rgba(255,107,53,0.45)" stroke-width="1"/>
+      <text x="208" y="304" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PlanV5</text>
+      <text x="64" y="340" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: maestro-plan.v5</text>
+      <text x="64" y="360" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Tuple[V5Node, ...]</text>
+      <text x="64" y="376" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">not in _RUNNABLE_PLAN_SCHEMA_VERSIONS</text>
 
       <!-- Class: MergePolicy -->
-      <rect x="48" y="448" width="320" height="88" rx="6" fill="#2d3142"/>
-      <rect x="48" y="448" width="320" height="88" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="48" y1="488" x2="368" y2="488" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="208" y="472" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MergePolicy</text>
-      <text x="64" y="508" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ integration_branch: str</text>
-      <text x="64" y="524" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ integration_gate: Gate</text>
+      <rect x="48" y="448" width="320" height="88" rx="6" fill="#000000"/>
+      <rect x="48" y="448" width="320" height="88" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="48" y1="488" x2="368" y2="488" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="208" y="472" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MergePolicy</text>
+      <text x="64" y="508" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ integration_branch: str</text>
+      <text x="64" y="524" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ integration_gate: Gate</text>
 
       <!-- Class: PlanNode -->
-      <rect x="432" y="48" width="384" height="176" rx="6" fill="#2d3142"/>
-      <rect x="432" y="48" width="384" height="176" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="432" y1="88" x2="816" y2="88" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="624" y="72" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PlanNode</text>
-      <text x="448" y="108" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ node_id: str</text>
-      <text x="448" y="128" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ kind: NodeKind</text>
-      <text x="448" y="148" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ test_visibility: merged | hidden</text>
-      <text x="448" y="168" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ test_strength: Optional</text>
-      <text x="448" y="188" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ gate_min_cases: int</text>
-      <text x="448" y="208" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">constructor refuses invalid shapes</text>
+      <rect x="432" y="48" width="384" height="176" rx="6" fill="#000000"/>
+      <rect x="432" y="48" width="384" height="176" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="432" y1="88" x2="816" y2="88" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="624" y="72" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PlanNode</text>
+      <text x="448" y="108" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ node_id: str</text>
+      <text x="448" y="128" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ kind: NodeKind</text>
+      <text x="448" y="148" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ test_visibility: merged | hidden</text>
+      <text x="448" y="168" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ test_strength: Optional</text>
+      <text x="448" y="188" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ gate_min_cases: int</text>
+      <text x="448" y="208" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">constructor refuses invalid shapes</text>
 
       <!-- Class: TestsNodeV5 -->
-      <rect x="432" y="280" width="384" height="148" rx="6" fill="#2d3142"/>
-      <rect x="432" y="280" width="384" height="148" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="432" y1="320" x2="816" y2="320" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="624" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">TestsNodeV5</text>
-      <text x="448" y="340" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ kind: Literal["tests"]</text>
-      <text x="448" y="360" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ test_visibility: merged | hidden</text>
-      <text x="448" y="380" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ test_strength: TestStrength</text>
-      <text x="448" y="400" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ gate: Gate</text>
-      <text x="448" y="416" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ instruction: str</text>
+      <rect x="432" y="280" width="384" height="148" rx="6" fill="#000000"/>
+      <rect x="432" y="280" width="384" height="148" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="432" y1="320" x2="816" y2="320" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="624" y="304" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">TestsNodeV5</text>
+      <text x="448" y="340" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ kind: Literal["tests"]</text>
+      <text x="448" y="360" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ test_visibility: merged | hidden</text>
+      <text x="448" y="380" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ test_strength: TestStrength</text>
+      <text x="448" y="400" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ gate: Gate</text>
+      <text x="448" y="416" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ instruction: str</text>
 
       <!-- Class: AgentNode -->
-      <rect x="864" y="280" width="376" height="148" rx="6" fill="#2d3142"/>
-      <rect x="864" y="280" width="376" height="148" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="864" y1="320" x2="1240" y2="320" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="1052" y="304" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentNode</text>
-      <text x="880" y="340" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ kind: Literal["agent"]</text>
-      <text x="880" y="360" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ instruction: str</text>
-      <text x="880" y="380" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ gate: Gate</text>
-      <text x="880" y="400" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ prompt_assets: Tuple[...]</text>
-      <text x="880" y="416" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ effects: Tuple[NodeEffect, ...]</text>
+      <rect x="864" y="280" width="376" height="148" rx="6" fill="#000000"/>
+      <rect x="864" y="280" width="376" height="148" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="864" y1="320" x2="1240" y2="320" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="1052" y="304" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentNode</text>
+      <text x="880" y="340" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ kind: Literal["agent"]</text>
+      <text x="880" y="360" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ instruction: str</text>
+      <text x="880" y="380" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ gate: Gate</text>
+      <text x="880" y="400" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ prompt_assets: Tuple[...]</text>
+      <text x="880" y="416" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ effects: Tuple[NodeEffect, ...]</text>
 
       <!-- Class: Gate -->
-      <rect x="432" y="480" width="384" height="128" rx="6" fill="#2d3142"/>
-      <rect x="432" y="480" width="384" height="128" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="432" y1="520" x2="816" y2="520" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="624" y="504" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Gate</text>
-      <text x="448" y="540" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ runner: Literal["pytest", "vitest"]</text>
-      <text x="448" y="560" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ argv: Tuple[str, ...]</text>
-      <text x="448" y="580" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ min_cases: int</text>
-      <text x="448" y="596" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">floor: plan_validate._gate_floor_supplied</text>
+      <rect x="432" y="480" width="384" height="128" rx="6" fill="#000000"/>
+      <rect x="432" y="480" width="384" height="128" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="432" y1="520" x2="816" y2="520" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="624" y="504" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Gate</text>
+      <text x="448" y="540" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ runner: Literal["pytest", "vitest"]</text>
+      <text x="448" y="560" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ argv: Tuple[str, ...]</text>
+      <text x="448" y="580" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ min_cases: int</text>
+      <text x="448" y="596" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">floor: plan_validate._gate_floor_supplied</text>
 
       <!-- Legend: relationship vocabulary -->
-      <line x1="40" y1="680" x2="1240" y2="680" stroke="rgba(245,245,245,0.12)" stroke-width="0.8"/>
-      <text x="40" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
+      <line x1="40" y1="680" x2="1240" y2="680" stroke="rgba(248,248,248,0.12)" stroke-width="0.8"/>
+      <text x="40" y="696" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
 
-      <line x1="40" y1="720" x2="68" y2="720" stroke="#f5f5f5" stroke-width="1" marker-end="url(#plan-uml-triangle)"/>
-      <text x="76" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
+      <line x1="40" y1="720" x2="68" y2="720" stroke="#f8f8f8" stroke-width="1" marker-end="url(#plan-uml-triangle)"/>
+      <text x="76" y="724" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
 
-      <line x1="188" y1="720" x2="216" y2="720" stroke="#f5f5f5" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#plan-uml-triangle)"/>
-      <text x="224" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Realization</text>
+      <line x1="188" y1="720" x2="216" y2="720" stroke="#f8f8f8" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#plan-uml-triangle)"/>
+      <text x="224" y="724" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Realization</text>
 
-      <line x1="336" y1="720" x2="364" y2="720" stroke="#f5f5f5" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
-      <text x="372" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
+      <line x1="336" y1="720" x2="364" y2="720" stroke="#f8f8f8" stroke-width="1" marker-start="url(#plan-uml-diamond-filled)"/>
+      <text x="372" y="724" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
 
-      <line x1="520" y1="720" x2="548" y2="720" stroke="#f5f5f5" stroke-width="1" marker-start="url(#plan-uml-diamond-hollow)"/>
-      <text x="556" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
+      <line x1="520" y1="720" x2="548" y2="720" stroke="#f8f8f8" stroke-width="1" marker-start="url(#plan-uml-diamond-hollow)"/>
+      <text x="556" y="724" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
 
-      <line x1="688" y1="720" x2="716" y2="720" stroke="#bfc0c0" stroke-width="1" marker-end="url(#plan-uml-open)"/>
-      <text x="724" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Association</text>
+      <line x1="688" y1="720" x2="716" y2="720" stroke="#c4c4c4" stroke-width="1" marker-end="url(#plan-uml-open)"/>
+      <text x="724" y="724" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Association</text>
 
-      <line x1="836" y1="720" x2="864" y2="720" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#plan-uml-open)"/>
-      <text x="872" y="724" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
+      <line x1="836" y1="720" x2="864" y2="720" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#plan-uml-open)"/>
+      <text x="872" y="724" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
     </svg>
   </div>
 </body>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Historical · NodeState lifecycle (superseded)</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,14 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:       #2d3142;
-      --color-ink:         #f5f5f5;
-      --color-muted:       #bfc0c0;
-      --color-soft:        #8e98ac;
-      --color-rule:        rgba(245,245,245,0.12);
-      --color-accent:      #f08a59;
-      --color-accent-tint: rgba(240,138,89,0.10);
-      --color-link:        #6a95d8;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:         'Geist', system-ui, sans-serif;
       --font-serif:        'Instrument Serif', serif;
       --font-mono:         'Geist Mono', ui-monospace, monospace;
@@ -90,7 +83,7 @@
     }
 
     .card {
-      background: #393e53;
+      background: #0b0b0b;
       border-radius: 6px;
       border: 1px solid var(--color-rule);
       padding: 1.25rem;
@@ -104,7 +97,7 @@
       gap: 0.6rem;
       margin-bottom: 0.875rem;
       padding-bottom: 0.875rem;
-      border-bottom: 1px solid rgba(245,245,245,0.08);
+      border-bottom: 1px solid rgba(248,248,248,0.08);
     }
 
     .card-dot {
@@ -141,14 +134,14 @@
       content: '—';
       position: absolute;
       left: 0;
-      color: rgba(245,245,245,0.25);
+      color: #929292;
       font-size: 0.75rem;
     }
 
     .footer {
       margin-top: 2rem;
       padding-top: 1.5rem;
-      border-top: 1px solid rgba(245,245,245,0.10);
+      border-top: 1px solid rgba(248,248,248,0.10);
       font-family: var(--font-mono);
       font-size: 0.72rem;
       letter-spacing: 0.06em;
@@ -178,149 +171,149 @@
       <title id="20-state-node-title">NodeState lifecycle</title>
       <desc id="20-state-node-desc">Maestro NodeState machine: PENDING to RUNNING to VERIFIED to MERGED on the scheduler path, fail_attempt RUNNING back to PENDING, RUNNING or VERIFIED to BLOCKED, operator retry back to PENDING, skip --accept-sha to MERGED, and abandon to CANCELLED. A review-budget grant is not a BLOCKED-to-PENDING escape; the attempt stays BLOCKED until absence-proven run resume. SEMANTIC_BUDGET_EXHAUSTED is returned to PENDING by bare run resume, which floors retry spend rather than granting ceiling. run cancel maps any non-absolute terminal to CANCELLED; resume reopens RUN_CANCEL to PENDING.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Transitions (drawn first) -->
       <!-- start → PENDING -->
-      <line x1="208" y1="200" x2="232" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="208" y1="200" x2="232" y2="200" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- PENDING → RUNNING  start_attempt actor=scheduler -->
-      <line x1="392" y1="200" x2="440" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="392" y1="200" x2="440" y2="200" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- RUNNING → VERIFIED  mark_verified actor=scheduler -->
-      <line x1="600" y1="200" x2="648" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="600" y1="200" x2="648" y2="200" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- VERIFIED → MERGED  mark_merged actor=scheduler MergeCause.SCHEDULER -->
-      <line x1="808" y1="200" x2="856" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="808" y1="200" x2="856" y2="200" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- MERGED → end -->
-      <line x1="1016" y1="200" x2="1080" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1016" y1="200" x2="1080" y2="200" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- RUNNING → PENDING  fail_attempt actor=scheduler -->
       <path d="M 456,240 V 268 H 312 V 240"
-            fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+            fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- RUNNING → BLOCKED  mark_blocked actor=scheduler -->
-      <line x1="520" y1="240" x2="520" y2="360" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="520" y1="240" x2="520" y2="360" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- VERIFIED → BLOCKED  mark_blocked at merge-time -->
       <path d="M 728,240 V 400 H 600"
-            fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+            fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <!-- BLOCKED → PENDING  retry actor=operator Escape.RETRY · semantic resume floor -->
       <path d="M 464,360 V 308 Q 464,300 456,300 H 320 Q 312,300 312,292 V 240"
-            fill="none" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+            fill="none" stroke="#c4c4c4" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
       <!-- BLOCKED → MERGED  skip --accept-sha actor=operator MergeCause.OPERATOR_ACCEPTED -->
       <path d="M 600,400 H 928 Q 936,400 936,392 V 240"
-            fill="none" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+            fill="none" stroke="#c4c4c4" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
       <!-- * → CANCELLED  abandon actor=operator CancelCause.ABANDONED -->
-      <line x1="136" y1="540" x2="232" y2="540" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <line x1="136" y1="540" x2="232" y2="540" stroke="#c4c4c4" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
       <!-- CANCELLED → end -->
-      <line x1="392" y1="540" x2="456" y2="540" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="392" y1="540" x2="456" y2="540" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- Transition labels -->
-      <rect x="396" y="180" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="416" y="190" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ATTEMPT</text>
+      <rect x="396" y="180" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="416" y="190" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ATTEMPT</text>
 
-      <rect x="602" y="180" width="44" height="12" rx="2" fill="#2d3142"/>
-      <text x="624" y="190" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED</text>
+      <rect x="602" y="180" width="44" height="12" rx="2" fill="#000000"/>
+      <text x="624" y="190" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED</text>
 
-      <rect x="812" y="180" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="832" y="190" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGED</text>
+      <rect x="812" y="180" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="832" y="190" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGED</text>
 
-      <rect x="348" y="248" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="388" y="258" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FAIL_ATTEMPT</text>
+      <rect x="348" y="248" width="80" height="12" rx="2" fill="#000000"/>
+      <text x="388" y="258" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FAIL_ATTEMPT</text>
 
-      <rect x="532" y="292" width="44" height="12" rx="2" fill="#2d3142"/>
-      <text x="554" y="302" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BLOCKED</text>
+      <rect x="532" y="292" width="44" height="12" rx="2" fill="#000000"/>
+      <text x="554" y="302" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BLOCKED</text>
 
-      <rect x="640" y="320" width="72" height="12" rx="2" fill="#2d3142"/>
-      <text x="676" y="330" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED TOO</text>
+      <rect x="640" y="320" width="72" height="12" rx="2" fill="#000000"/>
+      <text x="676" y="330" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED TOO</text>
 
-      <rect x="332" y="280" width="88" height="12" rx="2" fill="#2d3142"/>
-      <text x="376" y="290" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RESUME/RETRY</text>
+      <rect x="332" y="280" width="88" height="12" rx="2" fill="#000000"/>
+      <text x="376" y="290" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RESUME/RETRY</text>
 
-      <rect x="724" y="380" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="764" y="390" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SKIP --ACCEPT</text>
+      <rect x="724" y="380" width="80" height="12" rx="2" fill="#000000"/>
+      <text x="764" y="390" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SKIP --ACCEPT</text>
 
-      <rect x="148" y="520" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="176" y="530" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ABANDON</text>
+      <rect x="148" y="520" width="56" height="12" rx="2" fill="#000000"/>
+      <text x="176" y="530" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ABANDON</text>
 
       <!-- Start dot -->
-      <circle cx="200" cy="200" r="6" fill="#f5f5f5"/>
+      <circle cx="200" cy="200" r="6" fill="#f8f8f8"/>
 
       <!-- * any non-ABSOLUTELY_TERMINAL -->
-      <circle cx="120" cy="540" r="6" fill="#f5f5f5"/>
-      <text x="120" y="524" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">*</text>
+      <circle cx="120" cy="540" r="6" fill="#f8f8f8"/>
+      <text x="120" y="524" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">*</text>
 
       <!-- PENDING -->
-      <rect x="232" y="160" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="232" y="160" width="160" height="80" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="240" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="260" y="177" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
-      <text x="312" y="204" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PENDING</text>
-      <text x="312" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">create_run</text>
+      <rect x="232" y="160" width="160" height="80" rx="8" fill="#000000"/>
+      <rect x="232" y="160" width="160" height="80" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="240" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="260" y="177" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+      <text x="312" y="204" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PENDING</text>
+      <text x="312" y="220" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">create_run</text>
 
       <!-- RUNNING (focal) -->
-      <rect x="440" y="160" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="440" y="160" width="160" height="80" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="448" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
-      <text x="468" y="177" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
-      <text x="520" y="204" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">RUNNING</text>
-      <text x="520" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">start_attempt</text>
+      <rect x="440" y="160" width="160" height="80" rx="8" fill="#000000"/>
+      <rect x="440" y="160" width="160" height="80" rx="8" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="448" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="468" y="177" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+      <text x="520" y="204" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">RUNNING</text>
+      <text x="520" y="220" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">start_attempt</text>
 
       <!-- VERIFIED -->
-      <rect x="648" y="160" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="648" y="160" width="160" height="80" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="656" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="676" y="177" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
-      <text x="728" y="204" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">VERIFIED</text>
-      <text x="728" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">mark_verified</text>
+      <rect x="648" y="160" width="160" height="80" rx="8" fill="#000000"/>
+      <rect x="648" y="160" width="160" height="80" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="656" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="676" y="177" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+      <text x="728" y="204" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">VERIFIED</text>
+      <text x="728" y="220" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">mark_verified</text>
 
       <!-- MERGED -->
-      <rect x="856" y="160" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="856" y="160" width="160" height="80" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <rect x="864" y="168" width="48" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
-      <text x="888" y="177" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ABS.TERM</text>
-      <text x="936" y="204" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
-      <text x="936" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SCHEDULER</text>
+      <rect x="856" y="160" width="160" height="80" rx="8" fill="#000000"/>
+      <rect x="856" y="160" width="160" height="80" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <rect x="864" y="168" width="48" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.50)" stroke-width="0.8"/>
+      <text x="888" y="177" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ABS.TERM</text>
+      <text x="936" y="204" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
+      <text x="936" y="220" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">SCHEDULER</text>
 
       <!-- BLOCKED (focal — two resume stories) -->
-      <rect x="440" y="360" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="440" y="360" width="160" height="80" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="448" y="368" width="52" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
-      <text x="474" y="377" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OP.TERM</text>
-      <text x="520" y="404" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
-      <text x="520" y="420" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">mark_blocked</text>
+      <rect x="440" y="360" width="160" height="80" rx="8" fill="#000000"/>
+      <rect x="440" y="360" width="160" height="80" rx="8" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="448" y="368" width="52" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="474" y="377" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OP.TERM</text>
+      <text x="520" y="404" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
+      <text x="520" y="420" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">mark_blocked</text>
 
       <!-- CANCELLED -->
-      <rect x="232" y="500" width="160" height="80" rx="8" fill="#2d3142"/>
-      <rect x="232" y="500" width="160" height="80" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <rect x="240" y="508" width="48" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
-      <text x="264" y="517" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ABS.TERM</text>
-      <text x="312" y="544" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLED</text>
-      <text x="312" y="560" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ABANDONED</text>
+      <rect x="232" y="500" width="160" height="80" rx="8" fill="#000000"/>
+      <rect x="232" y="500" width="160" height="80" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <rect x="240" y="508" width="48" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.50)" stroke-width="0.8"/>
+      <text x="264" y="517" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ABS.TERM</text>
+      <text x="312" y="544" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLED</text>
+      <text x="312" y="560" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ABANDONED</text>
 
       <!-- End rings -->
-      <circle cx="1088" cy="200" r="8" fill="none" stroke="#f5f5f5" stroke-width="1"/>
-      <circle cx="1088" cy="200" r="5" fill="#f5f5f5"/>
-      <circle cx="464" cy="540" r="8" fill="none" stroke="#f5f5f5" stroke-width="1"/>
-      <circle cx="464" cy="540" r="5" fill="#f5f5f5"/>
+      <circle cx="1088" cy="200" r="8" fill="none" stroke="#f8f8f8" stroke-width="1"/>
+      <circle cx="1088" cy="200" r="5" fill="#f8f8f8"/>
+      <circle cx="464" cy="540" r="8" fill="none" stroke="#f8f8f8" stroke-width="1"/>
+      <circle cx="464" cy="540" r="5" fill="#f8f8f8"/>
 
       <!-- Legend -->
-      <line x1="40" y1="652" x2="1240" y2="652" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <line x1="40" y1="652" x2="1240" y2="652" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="676" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
 
-      <line x1="160" y1="672" x2="192" y2="672" stroke="#bfc0c0" stroke-width="1.2"/>
-      <text x="200" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">scheduler</text>
+      <line x1="160" y1="672" x2="192" y2="672" stroke="#c4c4c4" stroke-width="1.2"/>
+      <text x="200" y="676" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">scheduler</text>
 
-      <line x1="320" y1="672" x2="352" y2="672" stroke="#bfc0c0" stroke-width="1.2" stroke-dasharray="5,4"/>
-      <text x="360" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">operator escape</text>
+      <line x1="320" y1="672" x2="352" y2="672" stroke="#c4c4c4" stroke-width="1.2" stroke-dasharray="5,4"/>
+      <text x="360" y="676" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">operator escape</text>
 
-      <rect x="528" y="664" width="16" height="16" rx="4" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="552" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">RUNNING · BLOCKED</text>
+      <rect x="528" y="664" width="16" height="16" rx="4" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="552" y="676" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">RUNNING · BLOCKED</text>
 
-      <circle cx="760" cy="672" r="8" fill="none" stroke="#f5f5f5" stroke-width="1"/>
-      <circle cx="760" cy="672" r="5" fill="#f5f5f5"/>
-      <text x="776" y="676" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ABSOLUTELY_TERMINAL</text>
-      <text x="40" y="708" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">review-budget grant stays BLOCKED · SEMANTIC_BUDGET_EXHAUSTED: bare resume floors spend → PENDING · cancel_run → CANCELLED</text>
+      <circle cx="760" cy="672" r="8" fill="none" stroke="#f8f8f8" stroke-width="1"/>
+      <circle cx="760" cy="672" r="5" fill="#f8f8f8"/>
+      <text x="776" y="676" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">ABSOLUTELY_TERMINAL</text>
+      <text x="40" y="708" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">review-budget grant stays BLOCKED · SEMANTIC_BUDGET_EXHAUSTED: bare resume floors spend → PENDING · cancel_run → CANCELLED</text>
     </svg>
 
     <div class="cards">

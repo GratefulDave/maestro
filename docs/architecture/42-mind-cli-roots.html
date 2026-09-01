@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>maestro</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,12 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;   /* deep warm charcoal */
-      --color-ink:     #f5f5f5;   /* warm off-white */
-      --color-muted:   #bfc0c0;   /* silver */
-      --color-accent:  #f08a59;   /* accent */
-      --color-soft:    #8e98ac;
-      --color-rule:    rgba(245,245,245,0.12);
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -75,7 +70,7 @@
     }
     @media (max-width: 820px) { .cards { grid-template-columns: 1fr; } }
     .card {
-      background: #393e53;
+      background: #0b0b0b;
       border: 1px solid var(--color-rule);
       border-radius: 6px;
       padding: 1.25rem;
@@ -90,7 +85,7 @@
       gap: 0.6rem;
       margin-bottom: 0.875rem;
       padding-bottom: 0.875rem;
-      border-bottom: 1px solid rgba(245,245,245,0.08);
+      border-bottom: 1px solid rgba(248,248,248,0.08);
     }
     .card-dot { width: 7px; height: 7px; border-radius: 50%; }
     .card-dot.ink { background: var(--color-ink); }
@@ -113,7 +108,7 @@
       content: '—';
       position: absolute;
       left: 0;
-      color: rgba(245,245,245,0.25);
+      color: #929292;
       font-size: 0.75rem;
     }
   </style>
@@ -128,103 +123,103 @@
       <title id="42-mind-cli-roots-title">maestro</title>
       <desc id="42-mind-cli-roots-desc">Nine CLI root verbs from maestro.py build_parser: bootstrap, plan, deliver, run, retry, skip, abandon, attempt, and workspace, with run as the focal command. run amend is a subverb of run, not a tenth root.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
-      <text x="40" y="168" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">ROOT VERBS</text>
+      <text x="40" y="168" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">ROOT VERBS</text>
 
       <!-- Connectors first: title-root stem, sibling bus, child drops -->
-      <line x1="640" y1="176" x2="640" y2="220" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="96" y1="220" x2="1184" y2="220" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="96" y1="220" x2="96" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="232" y1="220" x2="232" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="368" y1="220" x2="368" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="504" y1="220" x2="504" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="640" y1="220" x2="640" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="776" y1="220" x2="776" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="912" y1="220" x2="912" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="1048" y1="220" x2="1048" y2="256" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="1184" y1="220" x2="1184" y2="256" stroke="#bfc0c0" stroke-width="1"/>
+      <line x1="640" y1="176" x2="640" y2="220" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="96" y1="220" x2="1184" y2="220" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="96" y1="220" x2="96" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="232" y1="220" x2="232" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="368" y1="220" x2="368" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="504" y1="220" x2="504" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="640" y1="220" x2="640" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="776" y1="220" x2="776" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="912" y1="220" x2="912" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="1048" y1="220" x2="1048" y2="256" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="1184" y1="220" x2="1184" y2="256" stroke="#c4c4c4" stroke-width="1"/>
 
       <!-- bootstrap -->
-      <rect x="40" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="40" y="256" width="112" height="48" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <rect x="48" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
-      <text x="64" y="272" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="96" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">bootstrap</text>
+      <rect x="40" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="40" y="256" width="112" height="48" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <rect x="48" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.40)" stroke-width="0.8"/>
+      <text x="64" y="272" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="96" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">bootstrap</text>
 
       <!-- plan -->
-      <rect x="176" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="176" y="256" width="112" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="184" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="200" y="272" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="232" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">plan</text>
+      <rect x="176" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="176" y="256" width="112" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="184" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="200" y="272" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="232" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">plan</text>
 
       <!-- deliver -->
-      <rect x="312" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="312" y="256" width="112" height="48" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <rect x="320" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
-      <text x="336" y="272" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="368" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">deliver</text>
+      <rect x="312" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="312" y="256" width="112" height="48" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <rect x="320" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.40)" stroke-width="0.8"/>
+      <text x="336" y="272" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="368" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">deliver</text>
 
       <!-- run (focal) -->
-      <rect x="448" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="448" y="256" width="112" height="48" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="456" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
-      <text x="472" y="272" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="504" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">run</text>
+      <rect x="448" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="448" y="256" width="112" height="48" rx="6" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="456" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="472" y="272" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="504" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">run</text>
 
       <!-- retry -->
-      <rect x="584" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="584" y="256" width="112" height="48" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <rect x="592" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
-      <text x="608" y="272" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="640" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">retry</text>
+      <rect x="584" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="584" y="256" width="112" height="48" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <rect x="592" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.40)" stroke-width="0.8"/>
+      <text x="608" y="272" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="640" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">retry</text>
 
       <!-- skip -->
-      <rect x="720" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="720" y="256" width="112" height="48" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <rect x="728" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
-      <text x="744" y="272" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="776" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">skip</text>
+      <rect x="720" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="720" y="256" width="112" height="48" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <rect x="728" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.40)" stroke-width="0.8"/>
+      <text x="744" y="272" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="776" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">skip</text>
 
       <!-- abandon -->
-      <rect x="856" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="856" y="256" width="112" height="48" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <rect x="864" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
-      <text x="880" y="272" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="912" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">abandon</text>
+      <rect x="856" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="856" y="256" width="112" height="48" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <rect x="864" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.40)" stroke-width="0.8"/>
+      <text x="880" y="272" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="912" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">abandon</text>
 
       <!-- attempt -->
-      <rect x="992" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="992" y="256" width="112" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="1000" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="1016" y="272" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="1048" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt</text>
+      <rect x="992" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="992" y="256" width="112" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="1000" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="1016" y="272" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="1048" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt</text>
 
       <!-- workspace -->
-      <rect x="1128" y="256" width="112" height="48" rx="6" fill="#2d3142"/>
-      <rect x="1128" y="256" width="112" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="1136" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="1152" y="272" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="1184" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">workspace</text>
+      <rect x="1128" y="256" width="112" height="48" rx="6" fill="#000000"/>
+      <rect x="1128" y="256" width="112" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="1136" y="264" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="1152" y="272" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="1184" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">workspace</text>
 
       <!-- Legend -->
-      <line x1="40" y1="652" x2="1240" y2="652" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="668" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <line x1="40" y1="652" x2="1240" y2="652" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="668" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
 
-      <rect x="40" y="684" width="16" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="64" y="692" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal · run</text>
+      <rect x="40" y="684" width="16" height="12" rx="2" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="64" y="692" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Focal · run</text>
 
-      <rect x="200" y="684" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="224" y="692" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Command group</text>
+      <rect x="200" y="684" width="16" height="12" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="224" y="692" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Command group</text>
 
-      <rect x="400" y="684" width="16" height="12" rx="2" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="424" y="692" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Leaf verb</text>
+      <rect x="400" y="684" width="16" height="12" rx="2" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="424" y="692" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Leaf verb</text>
     </svg>
 
     <div class="cards">

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Derived run state · Maestro</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,14 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:       #2d3142;
-      --color-ink:         #f5f5f5;
-      --color-muted:       #bfc0c0;
-      --color-soft:        #8e98ac;
-      --color-rule:        rgba(245,245,245,0.12);
-      --color-accent:      #f08a59;
-      --color-accent-tint: rgba(240,138,89,0.10);
-      --color-link:        #6a95d8;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:         'Geist', system-ui, sans-serif;
       --font-serif:        'Instrument Serif', serif;
       --font-mono:         'Geist Mono', ui-monospace, monospace;
@@ -78,7 +71,7 @@
     }
 
     .card {
-      background: #393e53;
+      background: #0b0b0b;
       border-radius: 6px;
       border: 1px solid var(--color-rule);
       padding: 1.25rem;
@@ -92,7 +85,7 @@
       gap: 0.6rem;
       margin-bottom: 0.875rem;
       padding-bottom: 0.875rem;
-      border-bottom: 1px solid rgba(245,245,245,0.08);
+      border-bottom: 1px solid rgba(248,248,248,0.08);
     }
 
     .card-dot {
@@ -129,14 +122,14 @@
       content: '—';
       position: absolute;
       left: 0;
-      color: rgba(245,245,245,0.25);
+      color: #929292;
       font-size: 0.75rem;
     }
 
     .footer {
       margin-top: 2rem;
       padding-top: 1.5rem;
-      border-top: 1px solid rgba(245,245,245,0.10);
+      border-top: 1px solid rgba(248,248,248,0.10);
       font-family: var(--font-mono);
       font-size: 0.72rem;
       letter-spacing: 0.06em;
@@ -163,125 +156,125 @@
       <title id="21-state-run-title">Derived run state</title>
       <desc id="21-state-run-desc">Predicate stack of derive_run_state, in code order, first match returns: EMPTY, then settled ABSOLUTELY_TERMINAL (MERGED / CANCELLED / QUIESCENT), then ABANDONED, then CANCELLING, then RUNNING, then BLOCKED, then PENDING, then QUIESCENT fallthrough. Not a sequential PENDING→RUNNING machine. scheduler_liveness None is unknown, never dead.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Predicate stack — code order, first match returns -->
-      <text x="40" y="36" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">FIRST MATCH WINS · lifecycle.derive_run_state</text>
-      <line x1="56" y1="56" x2="56" y2="560" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <circle cx="56" cy="56" r="6" fill="#f5f5f5"/>
+      <text x="40" y="36" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">FIRST MATCH WINS · lifecycle.derive_run_state</text>
+      <line x1="56" y1="56" x2="56" y2="560" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <circle cx="56" cy="56" r="6" fill="#f8f8f8"/>
 
       <!-- 1 EMPTY -->
-      <rect x="80" y="48" width="520" height="44" rx="8" fill="#2d3142"/>
-      <rect x="80" y="48" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="96" y="76" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">1</text>
-      <text x="120" y="76" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">no nodes?</text>
-      <rect x="720" y="48" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="48" width="200" height="44" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="820" y="76" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">EMPTY</text>
-      <line x1="600" y1="70" x2="720" y2="70" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="48" width="520" height="44" rx="8" fill="#000000"/>
+      <rect x="80" y="48" width="520" height="44" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="96" y="76" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">1</text>
+      <text x="120" y="76" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">no nodes?</text>
+      <rect x="720" y="48" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="48" width="200" height="44" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="820" y="76" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">EMPTY</text>
+      <line x1="600" y1="70" x2="720" y2="70" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 2 settled -->
-      <rect x="80" y="108" width="520" height="88" rx="8" fill="#2d3142"/>
-      <rect x="80" y="108" width="520" height="88" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="96" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">2</text>
-      <text x="120" y="136" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">all ABSOLUTELY_TERMINAL?</text>
-      <text x="120" y="156" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">all MERGED ∧ ¬cancel → MERGED</text>
-      <text x="120" y="172" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">cancel_requested ∨ outcome CANCELLED → CANCELLED</text>
-      <text x="120" y="188" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">else settled mix → QUIESCENT</text>
-      <rect x="720" y="108" width="200" height="28" rx="8" fill="#2d3142"/>
-      <rect x="720" y="108" width="200" height="28" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="820" y="128" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
-      <rect x="940" y="108" width="140" height="28" rx="8" fill="#2d3142"/>
-      <rect x="940" y="108" width="140" height="28" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="1010" y="128" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLED</text>
-      <rect x="720" y="148" width="200" height="28" rx="8" fill="#2d3142"/>
-      <rect x="720" y="148" width="200" height="28" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="820" y="168" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
-      <line x1="600" y1="152" x2="720" y2="152" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="108" width="520" height="88" rx="8" fill="#000000"/>
+      <rect x="80" y="108" width="520" height="88" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="96" y="136" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">2</text>
+      <text x="120" y="136" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">all ABSOLUTELY_TERMINAL?</text>
+      <text x="120" y="156" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">all MERGED ∧ ¬cancel → MERGED</text>
+      <text x="120" y="172" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">cancel_requested ∨ outcome CANCELLED → CANCELLED</text>
+      <text x="120" y="188" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">else settled mix → QUIESCENT</text>
+      <rect x="720" y="108" width="200" height="28" rx="8" fill="#000000"/>
+      <rect x="720" y="108" width="200" height="28" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="820" y="128" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
+      <rect x="940" y="108" width="140" height="28" rx="8" fill="#000000"/>
+      <rect x="940" y="108" width="140" height="28" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="1010" y="128" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLED</text>
+      <rect x="720" y="148" width="200" height="28" rx="8" fill="#000000"/>
+      <rect x="720" y="148" width="200" height="28" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="820" y="168" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
+      <line x1="600" y1="152" x2="720" y2="152" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 3 ABANDONED (focal) -->
-      <rect x="80" y="212" width="520" height="52" rx="8" fill="#2d3142"/>
-      <rect x="80" y="212" width="520" height="52" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="96" y="236" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace">3</text>
-      <text x="120" y="236" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">pid dead ∧ (RUNNING ∨ no outcome)?</text>
-      <text x="120" y="252" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">dead + RUNNING abandons even with an outcome</text>
-      <rect x="720" y="216" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="216" width="200" height="44" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="820" y="244" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ABANDONED</text>
-      <line x1="600" y1="238" x2="720" y2="238" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <rect x="80" y="212" width="520" height="52" rx="8" fill="#000000"/>
+      <rect x="80" y="212" width="520" height="52" rx="8" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="96" y="236" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace">3</text>
+      <text x="120" y="236" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">pid dead ∧ (RUNNING ∨ no outcome)?</text>
+      <text x="120" y="252" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">dead + RUNNING abandons even with an outcome</text>
+      <rect x="720" y="216" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="216" width="200" height="44" rx="8" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="820" y="244" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ABANDONED</text>
+      <line x1="600" y1="238" x2="720" y2="238" stroke="#ff6b35" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
 
       <!-- 4 CANCELLING -->
-      <rect x="80" y="280" width="520" height="44" rx="8" fill="#2d3142"/>
-      <rect x="80" y="280" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="96" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">4</text>
-      <text x="120" y="308" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">cancel_requested?</text>
-      <rect x="720" y="280" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="280" width="200" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="820" y="308" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLING</text>
-      <line x1="600" y1="302" x2="720" y2="302" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="280" width="520" height="44" rx="8" fill="#000000"/>
+      <rect x="80" y="280" width="520" height="44" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="96" y="308" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">4</text>
+      <text x="120" y="308" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">cancel_requested?</text>
+      <rect x="720" y="280" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="280" width="200" height="44" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="820" y="308" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">CANCELLING</text>
+      <line x1="600" y1="302" x2="720" y2="302" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 5 RUNNING -->
-      <rect x="80" y="340" width="520" height="44" rx="8" fill="#2d3142"/>
-      <rect x="80" y="340" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="96" y="368" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">5</text>
-      <text x="120" y="368" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">any node RUNNING?</text>
-      <rect x="720" y="340" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="340" width="200" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="820" y="368" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">RUNNING</text>
-      <line x1="600" y1="362" x2="720" y2="362" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="340" width="520" height="44" rx="8" fill="#000000"/>
+      <rect x="80" y="340" width="520" height="44" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="96" y="368" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">5</text>
+      <text x="120" y="368" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">any node RUNNING?</text>
+      <rect x="720" y="340" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="340" width="200" height="44" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="820" y="368" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">RUNNING</text>
+      <line x1="600" y1="362" x2="720" y2="362" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 6 BLOCKED -->
-      <rect x="80" y="400" width="520" height="44" rx="8" fill="#2d3142"/>
-      <rect x="80" y="400" width="520" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <text x="96" y="428" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">6</text>
-      <text x="120" y="428" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">any node BLOCKED?</text>
-      <rect x="720" y="400" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="400" width="200" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <text x="820" y="428" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
-      <line x1="600" y1="422" x2="720" y2="422" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="400" width="520" height="44" rx="8" fill="#000000"/>
+      <rect x="80" y="400" width="520" height="44" rx="8" fill="rgba(196,196,196,0.10)" stroke="#929292" stroke-width="1"/>
+      <text x="96" y="428" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">6</text>
+      <text x="120" y="428" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">any node BLOCKED?</text>
+      <rect x="720" y="400" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="400" width="200" height="44" rx="8" fill="rgba(196,196,196,0.10)" stroke="#929292" stroke-width="1"/>
+      <text x="820" y="428" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BLOCKED</text>
+      <line x1="600" y1="422" x2="720" y2="422" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 7 PENDING -->
-      <rect x="80" y="460" width="520" height="44" rx="8" fill="#2d3142"/>
-      <rect x="80" y="460" width="520" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <text x="96" y="488" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">7</text>
-      <text x="120" y="488" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">any node PENDING?</text>
-      <rect x="720" y="460" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="460" width="200" height="44" rx="8" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <text x="820" y="488" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PENDING</text>
-      <line x1="600" y1="482" x2="720" y2="482" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="460" width="520" height="44" rx="8" fill="#000000"/>
+      <rect x="80" y="460" width="520" height="44" rx="8" fill="rgba(196,196,196,0.10)" stroke="#929292" stroke-width="1"/>
+      <text x="96" y="488" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">7</text>
+      <text x="120" y="488" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">any node PENDING?</text>
+      <rect x="720" y="460" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="460" width="200" height="44" rx="8" fill="rgba(196,196,196,0.10)" stroke="#929292" stroke-width="1"/>
+      <text x="820" y="488" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PENDING</text>
+      <line x1="600" y1="482" x2="720" y2="482" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- 8 QUIESCENT fallthrough -->
-      <rect x="80" y="520" width="520" height="44" rx="8" fill="#2d3142"/>
-      <rect x="80" y="520" width="520" height="44" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="96" y="548" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">8</text>
-      <text x="120" y="548" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">else fallthrough</text>
-      <rect x="720" y="520" width="200" height="44" rx="8" fill="#2d3142"/>
-      <rect x="720" y="520" width="200" height="44" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="820" y="548" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
-      <line x1="600" y1="542" x2="720" y2="542" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="80" y="520" width="520" height="44" rx="8" fill="#000000"/>
+      <rect x="80" y="520" width="520" height="44" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="96" y="548" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">8</text>
+      <text x="120" y="548" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">else fallthrough</text>
+      <rect x="720" y="520" width="200" height="44" rx="8" fill="#000000"/>
+      <rect x="720" y="520" width="200" height="44" rx="8" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="820" y="548" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">QUIESCENT</text>
+      <line x1="600" y1="542" x2="720" y2="542" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- Legend -->
-      <line x1="40" y1="588" x2="1240" y2="588" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <line x1="40" y1="588" x2="1240" y2="588" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="616" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
 
-      <rect x="160" y="604" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="184" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">LIVE · RUNNING CANCELLING</text>
+      <rect x="160" y="604" width="16" height="12" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="184" y="616" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">LIVE · RUNNING CANCELLING</text>
 
-      <rect x="400" y="604" width="16" height="12" rx="2" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="424" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">STOPPED</text>
+      <rect x="400" y="604" width="16" height="12" rx="2" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="424" y="616" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">STOPPED</text>
 
-      <rect x="520" y="604" width="16" height="12" rx="2" fill="rgba(191,192,192,0.10)" stroke="#8e98ac" stroke-width="1"/>
-      <text x="544" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">PENDING · BLOCKED</text>
+      <rect x="520" y="604" width="16" height="12" rx="2" fill="rgba(196,196,196,0.10)" stroke="#929292" stroke-width="1"/>
+      <text x="544" y="616" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">PENDING · BLOCKED</text>
 
-      <rect x="720" y="604" width="16" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="744" y="616" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">ABANDONED</text>
+      <rect x="720" y="604" width="16" height="12" rx="2" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="744" y="616" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">ABANDONED</text>
 
-      <text x="40" y="644" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">first match wins · scheduler_liveness None is unknown, never dead · not PENDING then RUNNING</text>
+      <text x="40" y="644" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">first match wins · scheduler_liveness None is unknown, never dead · not PENDING then RUNNING</text>
     </svg>
 
     <div class="cards">

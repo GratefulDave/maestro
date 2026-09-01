@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Scheduler.run · ready_nodes until _declare</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,10 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;
-      --color-ink:     #f5f5f5;
-      --color-muted:   #bfc0c0;
-      --color-accent:  #f08a59;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -67,124 +64,124 @@
       <title id="30-flow-run-title">Scheduler.run · ready_nodes until _declare</title>
       <desc id="30-flow-run-desc">Scheduler.run loops on ready_nodes after create_run. Admission checks the PASS receipt, plan eligibility, and SEMANTIC budget before any ledger write. Post-gate fail is fail_attempt with PENDING SEMANTIC retry unless identical refusal or budget. For an agent node whose post-node gate PASSED, falsify_outputs reverts to `_pre_candidate_base`. Merge waits on a derived build::review PASS for the current candidate SHA. After resume, lane retry reads floored spend, not a raised ceiling. Quiescence goes to _declare.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
-      <line x1="560" y1="136" x2="560" y2="168" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="680" y1="88" x2="880" y2="88" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="560" y1="232" x2="560" y2="264" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="680" y1="200" x2="880" y2="200" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="560" y1="328" x2="560" y2="352" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="660" y1="400" x2="880" y2="400" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="560" y1="448" x2="560" y2="480" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="660" y1="528" x2="880" y2="528" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="560" y1="576" x2="560" y2="608" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="136" x2="560" y2="168" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="680" y1="88" x2="880" y2="88" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="232" x2="560" y2="264" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="680" y1="200" x2="880" y2="200" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="328" x2="560" y2="352" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="660" y1="400" x2="880" y2="400" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="448" x2="560" y2="480" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="660" y1="528" x2="880" y2="528" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="560" y1="576" x2="560" y2="608" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
       <path d="M 460,632 H 328 A 8,8 0 0 1 320,624 V 208 A 8,8 0 0 1 328,200 H 440"
-            fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+            fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
-      <rect x="572" y="144" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="592" y="154" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PASS</text>
+      <rect x="572" y="144" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="592" y="154" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PASS</text>
 
-      <rect x="740" y="68" width="60" height="12" rx="2" fill="#2d3142"/>
-      <text x="770" y="78" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REFUSED</text>
+      <rect x="740" y="68" width="60" height="12" rx="2" fill="#000000"/>
+      <text x="770" y="78" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REFUSED</text>
 
-      <rect x="572" y="240" width="48" height="12" rx="2" fill="#2d3142"/>
-      <text x="596" y="250" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READY</text>
+      <rect x="572" y="240" width="48" height="12" rx="2" fill="#000000"/>
+      <text x="596" y="250" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READY</text>
 
-      <rect x="740" y="180" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="780" y="190" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">QUIESCENT</text>
+      <rect x="740" y="180" width="80" height="12" rx="2" fill="#000000"/>
+      <text x="780" y="190" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">QUIESCENT</text>
 
-      <rect x="740" y="380" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="760" y="390" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FAIL</text>
+      <rect x="740" y="380" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="760" y="390" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FAIL</text>
 
-      <rect x="572" y="456" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="612" y="466" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POST PASS</text>
+      <rect x="572" y="456" width="80" height="12" rx="2" fill="#000000"/>
+      <text x="612" y="466" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POST PASS</text>
 
-      <rect x="700" y="508" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="740" y="518" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">STILL GREEN</text>
+      <rect x="700" y="508" width="80" height="12" rx="2" fill="#000000"/>
+      <text x="740" y="518" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">STILL GREEN</text>
 
-      <rect x="572" y="584" width="72" height="12" rx="2" fill="#2d3142"/>
-      <text x="608" y="594" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED</text>
+      <rect x="572" y="584" width="72" height="12" rx="2" fill="#000000"/>
+      <text x="608" y="594" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">VERIFIED</text>
 
-      <rect x="256" y="612" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="284" y="622" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGED</text>
+      <rect x="256" y="612" width="56" height="12" rx="2" fill="#000000"/>
+      <text x="284" y="622" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGED</text>
 
-      <polygon points="560,40 680,88 560,136 440,88" fill="#2d3142"/>
-      <polygon points="560,40 680,88 560,136 440,88" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="560" y="84" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">receipt+plan+budget</text>
-      <text x="560" y="100" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">admitted?</text>
+      <polygon points="560,40 680,88 560,136 440,88" fill="#000000"/>
+      <polygon points="560,40 680,88 560,136 440,88" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="560" y="84" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">receipt+plan+budget</text>
+      <text x="560" y="100" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">admitted?</text>
 
-      <rect x="880" y="48" width="280" height="80" rx="20" fill="#2d3142"/>
-      <rect x="880" y="48" width="280" height="80" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="1020" y="76" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">run refused</text>
-      <text x="1020" y="92" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">RUN_RECEIPT_NOT_PASS · ABSENT</text>
-      <text x="1020" y="106" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">NOT_CANONICAL_OR_ELIGIBLE · v1–v4</text>
-      <text x="1020" y="118" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">NODE_BUDGET_EXHAUSTED_ACROSS_RUNS</text>
+      <rect x="880" y="48" width="280" height="80" rx="20" fill="#000000"/>
+      <rect x="880" y="48" width="280" height="80" rx="20" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="1020" y="76" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">run refused</text>
+      <text x="1020" y="92" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">RUN_RECEIPT_NOT_PASS · ABSENT</text>
+      <text x="1020" y="106" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">NOT_CANONICAL_OR_ELIGIBLE · v1–v4</text>
+      <text x="1020" y="118" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">NODE_BUDGET_EXHAUSTED_ACROSS_RUNS</text>
 
-      <text x="1240" y="176" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">--allow-exhausted-node is recorded, not remembered.</text>
-      <path d="M 940,170 Q 948,150 958,132" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
-      <circle cx="960" cy="128" r="2" fill="#f5f5f5"/>
+      <text x="1240" y="176" fill="#c4c4c4" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">--allow-exhausted-node is recorded, not remembered.</text>
+      <path d="M 940,170 Q 948,150 958,132" fill="none" stroke="rgba(248,248,248,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="960" cy="128" r="2" fill="#f8f8f8"/>
 
-      <rect x="440" y="168" width="240" height="64" rx="6" fill="#2d3142"/>
-      <rect x="440" y="168" width="240" height="64" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="560" y="196" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ready_nodes</text>
-      <text x="560" y="212" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">create_run · deps MERGED</text>
+      <rect x="440" y="168" width="240" height="64" rx="6" fill="#000000"/>
+      <rect x="440" y="168" width="240" height="64" rx="6" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="560" y="196" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ready_nodes</text>
+      <text x="560" y="212" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">create_run · deps MERGED</text>
 
-      <rect x="880" y="168" width="200" height="64" rx="20" fill="#2d3142"/>
-      <rect x="880" y="168" width="200" height="64" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="980" y="192" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">_declare</text>
-      <text x="980" y="208" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ACCEPTED · BLOCKED</text>
-      <text x="980" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">STUCK · CANCELLED</text>
+      <rect x="880" y="168" width="200" height="64" rx="20" fill="#000000"/>
+      <rect x="880" y="168" width="200" height="64" rx="20" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="980" y="192" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">_declare</text>
+      <text x="980" y="208" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">ACCEPTED · BLOCKED</text>
+      <text x="980" y="220" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">STUCK · CANCELLED</text>
 
-      <rect x="460" y="264" width="200" height="64" rx="6" fill="#2d3142"/>
-      <rect x="460" y="264" width="200" height="64" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="560" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">worktree</text>
-      <text x="560" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">take_baseline · launch</text>
+      <rect x="460" y="264" width="200" height="64" rx="6" fill="#000000"/>
+      <rect x="460" y="264" width="200" height="64" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="560" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">worktree</text>
+      <text x="560" y="308" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">take_baseline · launch</text>
 
-      <polygon points="560,352 660,400 560,448 460,400" fill="#2d3142"/>
-      <polygon points="560,352 660,400 560,448 460,400" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="560" y="404" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">post-gate?</text>
+      <polygon points="560,352 660,400 560,448 460,400" fill="#000000"/>
+      <polygon points="560,352 660,400 560,448 460,400" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="560" y="404" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">post-gate?</text>
 
-      <rect x="880" y="384" width="240" height="168" rx="20" fill="#2d3142"/>
-      <rect x="880" y="384" width="240" height="168" rx="20" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="1000" y="444" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">fail_attempt</text>
-      <text x="1000" y="464" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PENDING retry · SEMANTIC</text>
-      <text x="1000" y="480" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BLOCKED on budget or SEMANTIC_REFUSAL_REPEATED</text>
-      <text x="1000" y="500" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">resume: lane retry reads floor</text>
-      <text x="1000" y="516" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">not a raised ceiling</text>
+      <rect x="880" y="384" width="240" height="168" rx="20" fill="#000000"/>
+      <rect x="880" y="384" width="240" height="168" rx="20" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="1000" y="444" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">fail_attempt</text>
+      <text x="1000" y="464" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PENDING retry · SEMANTIC</text>
+      <text x="1000" y="480" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BLOCKED on budget or SEMANTIC_REFUSAL_REPEATED</text>
+      <text x="1000" y="500" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">resume: lane retry reads floor</text>
+      <text x="1000" y="516" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">not a raised ceiling</text>
 
-      <polygon points="560,480 660,528 560,576 460,528" fill="#2d3142"/>
-      <polygon points="560,480 660,528 560,576 460,528" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="560" y="524" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">falsify first?</text>
-      <text x="560" y="540" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">revert to first-attempt base</text>
+      <polygon points="560,480 660,528 560,576 460,528" fill="#000000"/>
+      <polygon points="560,480 660,528 560,576 460,528" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="560" y="524" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">falsify first?</text>
+      <text x="560" y="540" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">revert to first-attempt base</text>
 
-      <rect x="460" y="608" width="200" height="48" rx="6" fill="#2d3142"/>
-      <rect x="460" y="608" width="200" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="560" y="628" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review PASS · merge</text>
-      <text x="560" y="644" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">derived build::review SHA</text>
+      <rect x="460" y="608" width="200" height="48" rx="6" fill="#000000"/>
+      <rect x="460" y="608" width="200" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="560" y="628" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review PASS · merge</text>
+      <text x="560" y="644" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">derived build::review SHA</text>
 
-      <text x="1240" y="348" fill="#bfc0c0" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">A test file its author wrote cannot certify code its author wrote.</text>
-      <path d="M 1160,360 Q 1140,372 1120,384" fill="none" stroke="rgba(245,245,245,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
-      <circle cx="1120" cy="384" r="2" fill="#f5f5f5"/>
+      <text x="1240" y="348" fill="#c4c4c4" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">A test file its author wrote cannot certify code its author wrote.</text>
+      <path d="M 1160,360 Q 1140,372 1120,384" fill="none" stroke="rgba(248,248,248,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="1120" cy="384" r="2" fill="#f8f8f8"/>
 
-      <line x1="40" y1="720" x2="1240" y2="720" stroke="rgba(245,245,245,0.12)" stroke-width="0.8"/>
-      <text x="40" y="740" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · SHAPE CARRIES TYPE</text>
+      <line x1="40" y1="720" x2="1240" y2="720" stroke="rgba(248,248,248,0.12)" stroke-width="0.8"/>
+      <text x="40" y="740" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · SHAPE CARRIES TYPE</text>
 
-      <rect x="40" y="756" width="24" height="12" rx="6" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="72" y="766" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Start / end (oval)</text>
+      <rect x="40" y="756" width="24" height="12" rx="6" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="72" y="766" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Start / end (oval)</text>
 
-      <rect x="240" y="756" width="24" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="272" y="766" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Step (rectangle)</text>
+      <rect x="240" y="756" width="24" height="12" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="272" y="766" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Step (rectangle)</text>
 
-      <polygon points="452,762 464,756 476,762 464,768" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="488" y="766" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision (diamond)</text>
+      <polygon points="452,762 464,756 476,762 464,768" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="488" y="766" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Decision (diamond)</text>
 
-      <rect x="660" y="756" width="24" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="692" y="766" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal — ready_nodes · falsify before VERIFIED</text>
+      <rect x="660" y="756" width="24" height="12" rx="2" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="692" y="766" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Focal — ready_nodes · falsify before VERIFIED</text>
     </svg>
   </div>
 </body>

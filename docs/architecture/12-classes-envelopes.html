@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Envelope types · UML class diagram</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,10 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;
-      --color-ink:     #f5f5f5;
-      --color-muted:   #bfc0c0;
-      --color-accent:  #f08a59;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -67,138 +64,138 @@
       <title id="12-classes-envelopes-title">Envelope types · UML class diagram</title>
       <desc id="12-classes-envelopes-desc">UML class diagram of EnvelopeBase with BuildOutput and ReviewOutput inheriting, AgentCall depending on output_type and GateReport gates, plus PhaseParams and AgentConfig.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
         <marker id="uml-triangle" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+          <polygon points="0 0, 16 6, 0 12" fill="#000000" stroke="#f8f8f8" stroke-width="1"/>
         </marker>
         <marker id="uml-triangle-accent" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f08a59" stroke-width="1"/>
+          <polygon points="0 0, 16 6, 0 12" fill="#000000" stroke="#ff6b35" stroke-width="1"/>
         </marker>
         <marker id="uml-diamond-filled" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f5f5f5"/>
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f8f8f8"/>
         </marker>
         <marker id="uml-diamond-hollow" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#000000" stroke="#f8f8f8" stroke-width="1"/>
         </marker>
         <marker id="uml-open" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
-          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#bfc0c0" stroke-width="1"/>
+          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#c4c4c4" stroke-width="1"/>
         </marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Relationships (drawn before boxes) -->
       <!-- BuildOutput extends EnvelopeBase -->
-      <line x1="570" y1="280" x2="570" y2="184" stroke="#f08a59" stroke-width="1" marker-end="url(#uml-triangle-accent)"/>
+      <line x1="570" y1="280" x2="570" y2="184" stroke="#ff6b35" stroke-width="1" marker-end="url(#uml-triangle-accent)"/>
       <!-- ReviewOutput extends EnvelopeBase -->
-      <line x1="710" y1="280" x2="710" y2="184" stroke="#f08a59" stroke-width="1" marker-end="url(#uml-triangle-accent)"/>
+      <line x1="710" y1="280" x2="710" y2="184" stroke="#ff6b35" stroke-width="1" marker-end="url(#uml-triangle-accent)"/>
       <!-- AgentCall depends on EnvelopeBase (output_type) -->
-      <path d="M 360,480 H 632 Q 640,480 640,472 V 184" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#uml-open)"/>
+      <path d="M 360,480 H 632 Q 640,480 640,472 V 184" fill="none" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#uml-open)"/>
       <!-- AgentCall depends on GateReport (gates) -->
-      <line x1="360" y1="520" x2="960" y2="520" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#uml-open)"/>
+      <line x1="360" y1="520" x2="960" y2="520" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#uml-open)"/>
 
-      <rect x="460" y="460" width="80" height="12" rx="2" fill="#2d3142"/>
-      <text x="500" y="470" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">OUTPUT_TYPE</text>
+      <rect x="460" y="460" width="80" height="12" rx="2" fill="#000000"/>
+      <text x="500" y="470" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">OUTPUT_TYPE</text>
 
-      <rect x="636" y="500" width="48" height="12" rx="2" fill="#2d3142"/>
-      <text x="660" y="510" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GATES</text>
+      <rect x="636" y="500" width="48" height="12" rx="2" fill="#000000"/>
+      <text x="660" y="510" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GATES</text>
 
       <!-- PhaseParams -->
-      <rect x="40" y="64" width="280" height="136" rx="6" fill="#2d3142"/>
-      <rect x="40" y="64" width="280" height="136" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="40" y1="104" x2="320" y2="104" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="180" y="90" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PhaseParams</text>
-      <text x="56" y="124" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ name: str</text>
-      <text x="56" y="140" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ kind: PhaseKind</text>
-      <text x="56" y="156" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ owner: str</text>
-      <text x="56" y="172" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ description: str</text>
-      <text x="56" y="188" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ retries: int</text>
+      <rect x="40" y="64" width="280" height="136" rx="6" fill="#000000"/>
+      <rect x="40" y="64" width="280" height="136" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="40" y1="104" x2="320" y2="104" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="180" y="90" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PhaseParams</text>
+      <text x="56" y="124" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ name: str</text>
+      <text x="56" y="140" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ kind: PhaseKind</text>
+      <text x="56" y="156" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ owner: str</text>
+      <text x="56" y="172" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ description: str</text>
+      <text x="56" y="188" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ retries: int</text>
 
       <!-- EnvelopeBase (focal) -->
-      <rect x="500" y="64" width="280" height="120" rx="6" fill="#2d3142"/>
-      <rect x="500" y="64" width="280" height="120" rx="6" fill="rgba(240,138,89,0.04)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="500" y="64" width="280" height="40" rx="6" fill="rgba(240,138,89,0.10)"/>
-      <rect x="500" y="96" width="280" height="8" fill="rgba(240,138,89,0.10)"/>
-      <line x1="500" y1="104" x2="780" y2="104" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
-      <text x="640" y="90" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">EnvelopeBase</text>
-      <text x="516" y="124" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ status: Literal["success", "fail"]</text>
-      <text x="516" y="140" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ summary: str</text>
-      <text x="516" y="156" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ artifacts: list[str]</text>
-      <text x="516" y="172" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ notes_for_next_agent: str</text>
+      <rect x="500" y="64" width="280" height="120" rx="6" fill="#000000"/>
+      <rect x="500" y="64" width="280" height="120" rx="6" fill="rgba(255,107,53,0.10)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="500" y="64" width="280" height="40" rx="6" fill="rgba(255,107,53,0.20)"/>
+      <rect x="500" y="96" width="280" height="8" fill="rgba(255,107,53,0.20)"/>
+      <line x1="500" y1="104" x2="780" y2="104" stroke="rgba(255,107,53,0.45)" stroke-width="1"/>
+      <text x="640" y="90" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">EnvelopeBase</text>
+      <text x="516" y="124" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ status: Literal["success", "fail"]</text>
+      <text x="516" y="140" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ summary: str</text>
+      <text x="516" y="156" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ artifacts: list[str]</text>
+      <text x="516" y="172" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ notes_for_next_agent: str</text>
 
       <!-- AgentConfig -->
-      <rect x="960" y="64" width="280" height="152" rx="6" fill="#2d3142"/>
-      <rect x="960" y="64" width="280" height="152" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="960" y1="104" x2="1240" y2="104" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="1100" y="90" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentConfig</text>
-      <text x="976" y="124" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ name: str</text>
-      <text x="976" y="140" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ coding_agent: Literal["omp", "pi", "claude_code"]</text>
-      <text x="976" y="156" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ model: Optional[str]</text>
-      <text x="976" y="172" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ purpose: str</text>
-      <text x="976" y="188" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ prompt_engineering: PromptEngineering</text>
-      <text x="976" y="204" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">…</text>
+      <rect x="960" y="64" width="280" height="152" rx="6" fill="#000000"/>
+      <rect x="960" y="64" width="280" height="152" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="960" y1="104" x2="1240" y2="104" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="1100" y="90" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentConfig</text>
+      <text x="976" y="124" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ name: str</text>
+      <text x="976" y="140" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ coding_agent: Literal["omp", "pi", "claude_code"]</text>
+      <text x="976" y="156" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ model: Optional[str]</text>
+      <text x="976" y="172" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ purpose: str</text>
+      <text x="976" y="188" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ prompt_engineering: PromptEngineering</text>
+      <text x="976" y="204" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">…</text>
 
       <!-- BuildOutput -->
-      <rect x="380" y="280" width="240" height="88" rx="6" fill="#2d3142"/>
-      <rect x="380" y="280" width="240" height="88" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="380" y1="320" x2="620" y2="320" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="500" y="306" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BuildOutput</text>
-      <text x="396" y="340" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ changed_files: list[str]</text>
-      <text x="396" y="356" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ commit_message: str</text>
+      <rect x="380" y="280" width="240" height="88" rx="6" fill="#000000"/>
+      <rect x="380" y="280" width="240" height="88" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="380" y1="320" x2="620" y2="320" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="500" y="306" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BuildOutput</text>
+      <text x="396" y="340" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ changed_files: list[str]</text>
+      <text x="396" y="356" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ commit_message: str</text>
 
       <!-- ReviewOutput -->
-      <rect x="680" y="280" width="280" height="104" rx="6" fill="#2d3142"/>
-      <rect x="680" y="280" width="280" height="104" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="680" y1="320" x2="960" y2="320" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="820" y="306" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ReviewOutput</text>
-      <text x="696" y="340" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ approved: bool</text>
-      <text x="696" y="356" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ findings: list[ReviewFinding]</text>
-      <text x="696" y="372" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ blocking: list[str]</text>
+      <rect x="680" y="280" width="280" height="104" rx="6" fill="#000000"/>
+      <rect x="680" y="280" width="280" height="104" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="680" y1="320" x2="960" y2="320" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="820" y="306" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ReviewOutput</text>
+      <text x="696" y="340" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ approved: bool</text>
+      <text x="696" y="356" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ findings: list[ReviewFinding]</text>
+      <text x="696" y="372" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ blocking: list[str]</text>
 
       <!-- AgentCall -->
-      <rect x="40" y="440" width="320" height="120" rx="6" fill="#2d3142"/>
-      <rect x="40" y="440" width="320" height="120" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="40" y1="480" x2="360" y2="480" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="200" y="466" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentCall</text>
-      <text x="56" y="500" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ output_type: Type[EnvelopeBase]</text>
-      <text x="56" y="516" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ prompt: str</text>
-      <text x="56" y="532" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ previous: Optional[EnvelopeBase]</text>
-      <text x="56" y="548" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ gates: list[Callable]</text>
+      <rect x="40" y="440" width="320" height="120" rx="6" fill="#000000"/>
+      <rect x="40" y="440" width="320" height="120" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="40" y1="480" x2="360" y2="480" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="200" y="466" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">AgentCall</text>
+      <text x="56" y="500" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ output_type: Type[EnvelopeBase]</text>
+      <text x="56" y="516" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ prompt: str</text>
+      <text x="56" y="532" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ previous: Optional[EnvelopeBase]</text>
+      <text x="56" y="548" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ gates: list[Callable]</text>
 
       <!-- GateReport -->
-      <rect x="960" y="440" width="280" height="136" rx="6" fill="#2d3142"/>
-      <rect x="960" y="440" width="280" height="136" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="960" y1="480" x2="1240" y2="480" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <line x1="960" y1="512" x2="1240" y2="512" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="1100" y="466" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">GateReport</text>
-      <text x="976" y="500" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ checks: list[GateCheck]</text>
-      <text x="976" y="532" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ check(item, ok, note): GateReport</text>
-      <text x="976" y="548" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ violations: list[str]</text>
-      <text x="976" y="564" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace">+ passed: bool</text>
+      <rect x="960" y="440" width="280" height="136" rx="6" fill="#000000"/>
+      <rect x="960" y="440" width="280" height="136" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="960" y1="480" x2="1240" y2="480" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <line x1="960" y1="512" x2="1240" y2="512" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="1100" y="466" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">GateReport</text>
+      <text x="976" y="500" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ checks: list[GateCheck]</text>
+      <text x="976" y="532" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ check(item, ok, note): GateReport</text>
+      <text x="976" y="548" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ violations: list[str]</text>
+      <text x="976" y="564" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace">+ passed: bool</text>
 
       <!-- Legend -->
-      <line x1="40" y1="656" x2="1240" y2="656" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="672" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
+      <line x1="40" y1="656" x2="1240" y2="656" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="672" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
 
-      <line x1="40" y1="696" x2="68" y2="696" stroke="#f5f5f5" stroke-width="1" marker-end="url(#uml-triangle)"/>
-      <text x="76" y="700" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
+      <line x1="40" y1="696" x2="68" y2="696" stroke="#f8f8f8" stroke-width="1" marker-end="url(#uml-triangle)"/>
+      <text x="76" y="700" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
 
-      <line x1="188" y1="696" x2="216" y2="696" stroke="#f5f5f5" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#uml-triangle)"/>
-      <text x="224" y="700" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Realization</text>
+      <line x1="188" y1="696" x2="216" y2="696" stroke="#f8f8f8" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#uml-triangle)"/>
+      <text x="224" y="700" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Realization</text>
 
-      <line x1="336" y1="696" x2="364" y2="696" stroke="#f5f5f5" stroke-width="1" marker-start="url(#uml-diamond-filled)"/>
-      <text x="372" y="700" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
+      <line x1="336" y1="696" x2="364" y2="696" stroke="#f8f8f8" stroke-width="1" marker-start="url(#uml-diamond-filled)"/>
+      <text x="372" y="700" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
 
-      <line x1="520" y1="696" x2="548" y2="696" stroke="#f5f5f5" stroke-width="1" marker-start="url(#uml-diamond-hollow)"/>
-      <text x="556" y="700" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
+      <line x1="520" y1="696" x2="548" y2="696" stroke="#f8f8f8" stroke-width="1" marker-start="url(#uml-diamond-hollow)"/>
+      <text x="556" y="700" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
 
-      <line x1="704" y1="696" x2="732" y2="696" stroke="#bfc0c0" stroke-width="1" marker-end="url(#uml-open)"/>
-      <text x="740" y="700" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Association</text>
+      <line x1="704" y1="696" x2="732" y2="696" stroke="#c4c4c4" stroke-width="1" marker-end="url(#uml-open)"/>
+      <text x="740" y="700" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Association</text>
 
-      <line x1="848" y1="696" x2="876" y2="696" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#uml-open)"/>
-      <text x="884" y="700" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
+      <line x1="848" y1="696" x2="876" y2="696" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#uml-open)"/>
+      <text x="884" y="700" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
     </svg>
   </div>
 </body>

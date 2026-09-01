@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Maestro · Deployment</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,10 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;
-      --color-ink:     #f5f5f5;
-      --color-muted:   #bfc0c0;
-      --color-accent:  #f08a59;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -67,143 +64,143 @@
       <title id="03-deployment-title">Maestro local deployment</title>
       <desc id="03-deployment-desc">Deployment diagram placing adws and maestro.config.yaml in the git repository; lifecycle.sqlite3 plus receipts and keys in repository_state; a hidden-tests bare repo under harness-private state, never in the run object DB; run worktrees linked to the run repo at repository_state/runs/&lt;run_id&gt;/worktrees; Herdr visible panes on the host; and an optional visualizer on bun:4600. Derived build::review lives in the ledger. workspace_not_found is absence for every pane and invalidates cached lane layouts.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Zones (drawn first) -->
-      <rect x="40" y="40" width="340" height="580" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
-      <rect x="56" y="44" width="80" height="12" fill="#2d3142"/>
-      <text x="96" y="53" fill="rgba(245,245,245,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">GIT REPO</text>
+      <rect x="40" y="40" width="340" height="580" rx="8" fill="rgba(248,248,248,0.02)" stroke="rgba(248,248,248,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="56" y="44" width="80" height="12" fill="#000000"/>
+      <text x="96" y="53" fill="rgba(248,248,248,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">GIT REPO</text>
 
-      <rect x="420" y="40" width="440" height="580" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
-      <rect x="436" y="44" width="160" height="12" fill="#2d3142"/>
-      <text x="516" y="53" fill="rgba(245,245,245,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">REPOSITORY STATE</text>
+      <rect x="420" y="40" width="440" height="580" rx="8" fill="rgba(248,248,248,0.02)" stroke="rgba(248,248,248,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="436" y="44" width="160" height="12" fill="#000000"/>
+      <text x="516" y="53" fill="rgba(248,248,248,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">REPOSITORY STATE</text>
 
-      <rect x="900" y="40" width="340" height="580" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
-      <rect x="916" y="44" width="96" height="12" fill="#2d3142"/>
-      <text x="964" y="53" fill="rgba(245,245,245,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">HERDR HOST</text>
+      <rect x="900" y="40" width="340" height="580" rx="8" fill="rgba(248,248,248,0.02)" stroke="rgba(248,248,248,0.20)" stroke-width="0.8" stroke-dasharray="4,4"/>
+      <rect x="916" y="44" width="96" height="12" fill="#000000"/>
+      <text x="964" y="53" fill="rgba(248,248,248,0.40)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">HERDR HOST</text>
 
       <!-- Network paths (behind nodes) -->
-      <line x1="356" y1="136" x2="444" y2="136" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
-      <path d="M 256,240 V 328 Q 256,336 264,336 H 444" fill="none" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
-      <path d="M 164,240 V 408 Q 164,416 172,416 H 564 Q 572,416 572,424 V 432" fill="none" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
-      <path d="M 1070,240 V 408 Q 1070,416 1062,416 H 716 Q 708,416 708,424 V 432" fill="none" stroke="#f08a59" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
-      <path d="M 924,504 H 888 Q 880,504 880,496 V 424 a 8,8 0 0,1 0,-16 V 208 Q 880,200 872,200 H 836" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <line x1="356" y1="136" x2="444" y2="136" stroke="#78a9ff" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <path d="M 256,240 V 328 Q 256,336 264,336 H 444" fill="none" stroke="#78a9ff" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <path d="M 164,240 V 408 Q 164,416 172,416 H 564 Q 572,416 572,424 V 432" fill="none" stroke="#78a9ff" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <path d="M 1070,240 V 408 Q 1070,416 1062,416 H 716 Q 708,416 708,424 V 432" fill="none" stroke="#ff6b35" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <path d="M 924,504 H 888 Q 880,504 880,496 V 424 a 8,8 0 0,1 0,-16 V 208 Q 880,200 872,200 H 836" fill="none" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
 
       <!-- Path labels -->
-      <rect x="372" y="116" width="56" height="12" rx="2" fill="#2d3142"/>
-      <text x="400" y="125" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LEDGER</text>
+      <rect x="372" y="116" width="56" height="12" rx="2" fill="#000000"/>
+      <text x="400" y="125" fill="#78a9ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LEDGER</text>
 
-      <rect x="308" y="316" width="76" height="12" rx="2" fill="#2d3142"/>
-      <text x="346" y="325" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BARE REPO</text>
+      <rect x="308" y="316" width="76" height="12" rx="2" fill="#000000"/>
+      <text x="346" y="325" fill="#78a9ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">BARE REPO</text>
 
-      <rect x="52" y="360" width="104" height="12" rx="2" fill="#2d3142"/>
-      <text x="104" y="369" fill="#6a95d8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GIT WORKTREE</text>
+      <rect x="52" y="360" width="104" height="12" rx="2" fill="#000000"/>
+      <text x="104" y="369" fill="#78a9ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">GIT WORKTREE</text>
 
-      <rect x="972" y="316" width="88" height="12" rx="2" fill="#2d3142"/>
-      <text x="1016" y="325" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PANE SPLIT</text>
+      <rect x="972" y="316" width="88" height="12" rx="2" fill="#000000"/>
+      <text x="1016" y="325" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PANE SPLIT</text>
 
-      <rect x="888" y="280" width="88" height="12" rx="2" fill="#2d3142"/>
-      <text x="932" y="289" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POLL SQLITE</text>
+      <rect x="888" y="280" width="88" height="12" rx="2" fill="#000000"/>
+      <text x="932" y="289" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POLL SQLITE</text>
 
       <!-- Node: adws -->
-      <rect x="64" y="80" width="292" height="160" rx="6" fill="#2d3142"/>
-      <rect x="64" y="80" width="292" height="160" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="72" y="88" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="88" y="97" fill="#f5f5f5" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
-      <text x="210" y="120" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">adws</text>
-      <text x="210" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">maestro.py</text>
-      <rect x="72" y="200" width="276" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="80" y="216" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">maestro.config.yaml</text>
-      <text x="340" y="216" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
+      <rect x="64" y="80" width="292" height="160" rx="6" fill="#000000"/>
+      <rect x="64" y="80" width="292" height="160" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="72" y="88" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="88" y="97" fill="#f8f8f8" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="210" y="120" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">adws</text>
+      <text x="210" y="136" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">maestro.py</text>
+      <rect x="72" y="200" width="276" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="80" y="216" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">maestro.config.yaml</text>
+      <text x="340" y="216" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
 
       <!-- Node: lifecycle (focal) — object DB; receipts/keys are files beside it, not vault -->
-      <rect x="444" y="80" width="392" height="176" rx="6" fill="#2d3142"/>
-      <rect x="444" y="80" width="392" height="176" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="452" y="88" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
-      <text x="472" y="97" fill="#f08a59" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
-      <text x="640" y="120" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">lifecycle</text>
-      <text x="640" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CandidateReview · ActorSession</text>
-      <rect x="452" y="152" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="168" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">SCHEMA</text>
-      <text x="820" y="168" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">sqlite3</text>
-      <rect x="452" y="184" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="200" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">route-receipts</text>
-      <text x="820" y="200" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
-      <rect x="452" y="216" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="232" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">keys</text>
-      <text x="820" y="232" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">signing.pub</text>
+      <rect x="444" y="80" width="392" height="176" rx="6" fill="#000000"/>
+      <rect x="444" y="80" width="392" height="176" rx="6" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="452" y="88" width="40" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="472" y="97" fill="#ff6b35" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORE</text>
+      <text x="640" y="120" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">lifecycle</text>
+      <text x="640" y="136" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CandidateReview · ActorSession</text>
+      <rect x="452" y="152" width="376" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="460" y="168" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">SCHEMA</text>
+      <text x="820" y="168" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">sqlite3</text>
+      <rect x="452" y="184" width="376" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="460" y="200" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">route-receipts</text>
+      <text x="820" y="200" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">v1</text>
+      <rect x="452" y="216" width="376" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="460" y="232" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">keys</text>
+      <text x="820" y="232" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">signing.pub</text>
 
       <!-- Node: hidden vault — separate bare repo; never in the run object DB -->
-      <rect x="444" y="272" width="392" height="128" rx="6" fill="#2d3142"/>
-      <rect x="444" y="272" width="392" height="128" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <rect x="452" y="280" width="40" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
-      <text x="472" y="289" fill="#bfc0c0" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BARE</text>
-      <text x="640" y="312" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">hidden vault</text>
-      <text x="640" y="328" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">harness-private · not object DB</text>
-      <rect x="452" y="352" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="368" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">hidden-tests</text>
-      <text x="820" y="368" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">git-bare</text>
+      <rect x="444" y="272" width="392" height="128" rx="6" fill="#000000"/>
+      <rect x="444" y="272" width="392" height="128" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <rect x="452" y="280" width="40" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.50)" stroke-width="0.8"/>
+      <text x="472" y="289" fill="#c4c4c4" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BARE</text>
+      <text x="640" y="312" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">hidden vault</text>
+      <text x="640" y="328" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">harness-private · not object DB</text>
+      <rect x="452" y="352" width="376" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="460" y="368" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">hidden-tests</text>
+      <text x="820" y="368" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">git-bare</text>
       <!-- Node: worktrees -->
-      <rect x="444" y="432" width="392" height="148" rx="6" fill="#2d3142"/>
-      <rect x="444" y="432" width="392" height="148" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="452" y="440" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="468" y="449" fill="#f5f5f5" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
-      <text x="640" y="472" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">worktrees</text>
-      <text x="640" y="488" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">linked to run repo</text>
-      <rect x="452" y="520" width="376" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="460" y="536" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">checkouts</text>
-      <text x="820" y="536" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">git</text>
+      <rect x="444" y="432" width="392" height="148" rx="6" fill="#000000"/>
+      <rect x="444" y="432" width="392" height="148" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="452" y="440" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="468" y="449" fill="#f8f8f8" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="640" y="472" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">worktrees</text>
+      <text x="640" y="488" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">linked to run repo</text>
+      <rect x="452" y="520" width="376" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="460" y="536" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">checkouts</text>
+      <text x="820" y="536" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">git</text>
 
       <!-- Node: herdr -->
-      <rect x="924" y="80" width="292" height="160" rx="6" fill="#2d3142"/>
-      <rect x="924" y="80" width="292" height="160" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="932" y="88" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="948" y="97" fill="#f5f5f5" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
-      <text x="1070" y="120" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Herdr</text>
-      <text x="1070" y="136" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">workspace_not_found = absence</text>
-      <rect x="932" y="200" width="276" height="24" rx="4" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="940" y="216" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">herdr</text>
-      <text x="1200" y="216" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">0.8.0</text>
+      <rect x="924" y="80" width="292" height="160" rx="6" fill="#000000"/>
+      <rect x="924" y="80" width="292" height="160" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="932" y="88" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="948" y="97" fill="#f8f8f8" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="1070" y="120" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Herdr</text>
+      <text x="1070" y="136" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">workspace_not_found = absence</text>
+      <rect x="932" y="200" width="276" height="24" rx="4" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="940" y="216" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">herdr</text>
+      <text x="1200" y="216" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">0.8.0</text>
 
       <!-- Node: visualizer (optional) -->
-      <rect x="924" y="432" width="292" height="148" rx="6" fill="#2d3142"/>
-      <rect x="924" y="432" width="292" height="148" rx="6" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
-      <rect x="932" y="440" width="64" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.22)" stroke-width="0.8"/>
-      <text x="964" y="449" fill="#8e98ac" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OPTIONAL</text>
-      <text x="1070" y="480" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">visualizer</text>
-      <text x="1070" y="496" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">bun:4600</text>
-      <text x="1070" y="512" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">apps/visualizer</text>
+      <rect x="924" y="432" width="292" height="148" rx="6" fill="#000000"/>
+      <rect x="924" y="432" width="292" height="148" rx="6" fill="rgba(248,248,248,0.02)" stroke="rgba(248,248,248,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="932" y="440" width="64" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.22)" stroke-width="0.8"/>
+      <text x="964" y="449" fill="#929292" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">OPTIONAL</text>
+      <text x="1070" y="480" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">visualizer</text>
+      <text x="1070" y="496" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">bun:4600</text>
+      <text x="1070" y="512" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">apps/visualizer</text>
 
       <!-- Legend strip -->
-      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="656" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="656" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
 
-      <rect x="40" y="672" width="14" height="10" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="60" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal / ledger</text>
+      <rect x="40" y="672" width="14" height="10" rx="2" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="60" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Focal / ledger</text>
 
-      <rect x="200" y="672" width="14" height="10" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="220" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Infra node</text>
+      <rect x="200" y="672" width="14" height="10" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="220" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Infra node</text>
 
-      <rect x="340" y="672" width="14" height="10" rx="2" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
-      <text x="360" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Store</text>
+      <rect x="340" y="672" width="14" height="10" rx="2" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="360" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Store</text>
 
-      <rect x="460" y="672" width="14" height="10" rx="2" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
-      <text x="480" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Optional</text>
+      <rect x="460" y="672" width="14" height="10" rx="2" fill="rgba(248,248,248,0.02)" stroke="rgba(248,248,248,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="480" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Optional</text>
 
-      <line x1="600" y1="676" x2="628" y2="676" stroke="#6a95d8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
-      <text x="636" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Cross-zone</text>
+      <line x1="600" y1="676" x2="628" y2="676" stroke="#78a9ff" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="636" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Cross-zone</text>
 
-      <line x1="760" y1="676" x2="788" y2="676" stroke="#f08a59" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
-      <text x="796" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Pane bind</text>
+      <line x1="760" y1="676" x2="788" y2="676" stroke="#ff6b35" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <text x="796" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Pane bind</text>
 
-      <line x1="920" y1="676" x2="948" y2="676" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
-      <text x="956" y="680" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Optional poll</text>
-      <text x="40" y="704" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">hidden vault is a bare repo under harness-private state, never in the run object DB · worktrees linked to the run repo · derived build::review in the ledger · workspace_not_found is absence</text>
+      <line x1="920" y1="676" x2="948" y2="676" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <text x="956" y="680" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Optional poll</text>
+      <text x="40" y="704" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">hidden vault is a bare repo under harness-private state, never in the run object DB · worktrees linked to the run repo · derived build::review in the ledger · workspace_not_found is absence</text>
     </svg>
   </div>
 </body>

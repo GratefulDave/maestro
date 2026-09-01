@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Unread candidate · Review, do not rebuild</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,10 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;
-      --color-ink:     #f5f5f5;
-      --color-muted:   #bfc0c0;
-      --color-accent:  #f08a59;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -67,88 +64,88 @@
       <title id="35-flow-unreviewed-title">Unread candidate · Review, do not rebuild</title>
       <desc id="35-flow-unreviewed-desc">Scheduler._resume_unreviewed_candidate reviews the last CandidateReview still PUBLISHED or DISPATCHED at the candidate SHA with no builder, so HEAD and the attempt ref both hold it; PASS merges derived build::review, REJECT can prepare_descendant_candidate without HeadMoved, a builder cut from that SHA is GATE_NOT_FALSIFIABLE, and a terminal review or no candidate falls through to an ordinary attempt at the integration head.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Arrows (drawn first, behind nodes) -->
-      <line x1="480" y1="168" x2="600" y2="168" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="360" y1="216" x2="360" y2="264" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="760" y1="200" x2="760" y2="248" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="880" y1="296" x2="1000" y2="296" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
-      <line x1="760" y1="344" x2="760" y2="392" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="480" y1="168" x2="600" y2="168" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="360" y1="216" x2="360" y2="264" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="760" y1="200" x2="760" y2="248" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="880" y1="296" x2="1000" y2="296" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="760" y1="344" x2="760" y2="392" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#arrow)"/>
 
       <!-- Arrow labels -->
-      <rect x="524" y="148" width="32" height="12" rx="2" fill="#2d3142"/>
-      <text x="540" y="158" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
+      <rect x="524" y="148" width="32" height="12" rx="2" fill="#000000"/>
+      <text x="540" y="158" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
 
-      <rect x="324" y="234" width="28" height="12" rx="2" fill="#2d3142"/>
-      <text x="338" y="244" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
+      <rect x="324" y="234" width="28" height="12" rx="2" fill="#000000"/>
+      <text x="338" y="244" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
 
-      <rect x="920" y="276" width="40" height="12" rx="2" fill="#2d3142"/>
-      <text x="940" y="286" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PASS</text>
+      <rect x="920" y="276" width="40" height="12" rx="2" fill="#000000"/>
+      <text x="940" y="286" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PASS</text>
 
-      <rect x="700" y="362" width="52" height="12" rx="2" fill="#2d3142"/>
-      <text x="726" y="372" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REJECT</text>
+      <rect x="700" y="362" width="52" height="12" rx="2" fill="#000000"/>
+      <text x="726" y="372" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REJECT</text>
 
       <!-- last review PUBLISHED or DISPATCHED? -->
-      <polygon points="360,120 480,168 360,216 240,168" fill="#2d3142"/>
-      <polygon points="360,120 480,168 360,216 240,168" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="360" y="164" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">last review</text>
-      <text x="360" y="180" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PUBLISHED or DISPATCHED</text>
+      <polygon points="360,120 480,168 360,216 240,168" fill="#000000"/>
+      <polygon points="360,120 480,168 360,216 240,168" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="360" y="164" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">last review</text>
+      <text x="360" y="180" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PUBLISHED or DISPATCHED</text>
 
       <!-- ordinary attempt at integration head -->
-      <rect x="240" y="264" width="240" height="56" rx="28" fill="#2d3142"/>
-      <rect x="240" y="264" width="240" height="56" rx="28" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="360" y="288" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ordinary attempt</text>
-      <text x="360" y="304" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">at integration head</text>
+      <rect x="240" y="264" width="240" height="56" rx="28" fill="#000000"/>
+      <rect x="240" y="264" width="240" height="56" rx="28" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="360" y="288" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ordinary attempt</text>
+      <text x="360" y="304" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">at integration head</text>
 
       <!-- review, no builder; worktree at candidate SHA (focal) -->
-      <rect x="600" y="136" width="320" height="64" rx="6" fill="#2d3142"/>
-      <rect x="600" y="136" width="320" height="64" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="760" y="164" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review, no builder</text>
-      <text x="760" y="180" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">worktree at candidate SHA</text>
+      <rect x="600" y="136" width="320" height="64" rx="6" fill="#000000"/>
+      <rect x="600" y="136" width="320" height="64" rx="6" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="760" y="164" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review, no builder</text>
+      <text x="760" y="180" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">worktree at candidate SHA</text>
 
       <!-- review PASS? -->
-      <polygon points="760,248 880,296 760,344 640,296" fill="#2d3142"/>
-      <polygon points="760,248 880,296 760,344 640,296" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="760" y="300" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review PASS?</text>
+      <polygon points="760,248 880,296 760,344 640,296" fill="#000000"/>
+      <polygon points="760,248 880,296 760,344 640,296" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="760" y="300" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">review PASS?</text>
 
       <!-- merge (derived build::review) -->
-      <rect x="1000" y="272" width="240" height="48" rx="24" fill="#2d3142"/>
-      <rect x="1000" y="272" width="240" height="48" rx="24" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="1120" y="292" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">merge</text>
-      <text x="1120" y="308" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">derived build::review</text>
+      <rect x="1000" y="272" width="240" height="48" rx="24" fill="#000000"/>
+      <rect x="1000" y="272" width="240" height="48" rx="24" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="1120" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">merge</text>
+      <text x="1120" y="308" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">derived build::review</text>
 
       <!-- repair descendant of candidate -->
-      <rect x="640" y="392" width="240" height="56" rx="6" fill="#2d3142"/>
-      <rect x="640" y="392" width="240" height="56" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="760" y="416" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">repair descendant</text>
-      <text x="760" y="432" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">prepare_descendant_candidate</text>
+      <rect x="640" y="392" width="240" height="56" rx="6" fill="#000000"/>
+      <rect x="640" y="392" width="240" height="56" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="760" y="416" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">repair descendant</text>
+      <text x="760" y="432" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">prepare_descendant_candidate</text>
 
       <!-- Callout (not a node) -->
-      <text x="1240" y="80" fill="#f08a59" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">builder cut from the candidate SHA → GATE_NOT_FALSIFIABLE</text>
-      <path d="M 1000,92 Q 960,112 920,136" fill="none" stroke="rgba(240,138,89,0.50)" stroke-width="1" stroke-dasharray="4,3"/>
-      <circle cx="920" cy="136" r="2" fill="#f08a59"/>
+      <text x="1240" y="80" fill="#ff6b35" font-size="12" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">builder cut from the candidate SHA → GATE_NOT_FALSIFIABLE</text>
+      <path d="M 1000,92 Q 960,112 920,136" fill="none" stroke="rgba(255,107,53,0.55)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="920" cy="136" r="2" fill="#ff6b35"/>
 
       <!-- Legend -->
-      <line x1="40" y1="656" x2="1240" y2="656" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="672" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND · SHAPE CARRIES TYPE</text>
+      <line x1="40" y1="656" x2="1240" y2="656" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="672" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND · SHAPE CARRIES TYPE</text>
 
-      <rect x="40" y="688" width="24" height="12" rx="6" fill="rgba(245,245,245,0.03)" stroke="rgba(245,245,245,0.30)" stroke-width="1"/>
-      <text x="72" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">End (oval)</text>
+      <rect x="40" y="688" width="24" height="12" rx="6" fill="rgba(248,248,248,0.03)" stroke="rgba(248,248,248,0.30)" stroke-width="1"/>
+      <text x="72" y="696" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">End (oval)</text>
 
-      <rect x="180" y="688" width="24" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="212" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Step</text>
+      <rect x="180" y="688" width="24" height="12" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="212" y="696" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Step</text>
 
-      <polygon points="300,696 312,688 324,696 312,704" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="336" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Decision</text>
+      <polygon points="300,696 312,688 324,696 312,704" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="336" y="696" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Decision</text>
 
-      <rect x="432" y="688" width="24" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="464" y="696" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal — review, no builder</text>
+      <rect x="432" y="688" width="24" height="12" rx="2" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="464" y="696" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Focal — review, no builder</text>
     </svg>
   </div>
 </body>

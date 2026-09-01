@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Live runtime · UML class diagram</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,14 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:       #2d3142;
-      --color-paper-2:     #393e53;
-      --color-ink:         #f5f5f5;
-      --color-muted:       #bfc0c0;
-      --color-soft:        #8e98ac;
-      --color-accent:      #f08a59;
-      --color-accent-tint: rgba(240,138,89,0.10);
-      --color-link:        #6a95d8;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:         'Geist', system-ui, sans-serif;
       --font-serif:        'Instrument Serif', serif;
       --font-mono:         'Geist Mono', ui-monospace, monospace;
@@ -72,165 +65,165 @@
       <desc id="13-uml-runtime-desc">Class diagram of the live ADW runtime: Scheduler uses LifecycleStore and HerdrLauncher as transport only, and consumes Plan (v1–v4 runnable; PlanV5 authored but refused at run start). Modules HiddenVault, PlanAmendment, and GateCapture are landed. HiddenVault has no production caller. No composed hidden-gate types.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-          <polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/>
+          <polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/>
         </marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-          <polygon points="0 0, 8 3, 0 6" fill="#f08a59"/>
+          <polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/>
         </marker>
         <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-          <polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/>
+          <polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/>
         </marker>
         <marker id="runtime-uml-triangle" markerWidth="16" markerHeight="12" refX="15" refY="6" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 0, 16 6, 0 12" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+          <polygon points="0 0, 16 6, 0 12" fill="#000000" stroke="#f8f8f8" stroke-width="1"/>
         </marker>
         <marker id="runtime-uml-diamond-filled" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f5f5f5"/>
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#f8f8f8"/>
         </marker>
         <marker id="runtime-uml-diamond-hollow" markerWidth="18" markerHeight="10" refX="0" refY="5" orient="auto" markerUnits="userSpaceOnUse">
-          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#2d3142" stroke="#f5f5f5" stroke-width="1"/>
+          <polygon points="0 5, 9 0, 18 5, 9 10" fill="#000000" stroke="#f8f8f8" stroke-width="1"/>
         </marker>
         <marker id="runtime-uml-open" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
-          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#bfc0c0" stroke-width="1"/>
+          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#c4c4c4" stroke-width="1"/>
         </marker>
         <marker id="runtime-uml-open-accent" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
-          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#f08a59" stroke-width="1"/>
+          <path d="M0,0 L9,4 L0,8" fill="none" stroke="#ff6b35" stroke-width="1"/>
         </marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Relationships (drawn before boxes) -->
       <!-- Scheduler uses HerdrLauncher (transport) -->
-      <line x1="440" y1="80" x2="400" y2="80" stroke="#f08a59" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open-accent)"/>
+      <line x1="440" y1="80" x2="400" y2="80" stroke="#ff6b35" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open-accent)"/>
       <!-- Scheduler uses LifecycleStore -->
-      <line x1="840" y1="80" x2="880" y2="80" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <line x1="840" y1="80" x2="880" y2="80" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
       <!-- Scheduler uses PlanAmendment -->
-      <path d="M 440,200 H 420 Q 412,200 412,208 V 352 Q 412,360 404,360 H 400" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <path d="M 440,200 H 420 Q 412,200 412,208 V 352 Q 412,360 404,360 H 400" fill="none" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
       <!-- Scheduler consumes Plan -->
-      <line x1="640" y1="280" x2="640" y2="320" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <line x1="640" y1="280" x2="640" y2="320" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
 
       <!-- Relationship labels -->
-      <rect x="332" y="60" width="76" height="12" rx="2" fill="#2d3142"/>
-      <text x="370" y="69" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TRANSPORT</text>
+      <rect x="332" y="60" width="76" height="12" rx="2" fill="#000000"/>
+      <text x="370" y="69" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TRANSPORT</text>
 
-      <rect x="844" y="60" width="32" height="12" rx="2" fill="#2d3142"/>
-      <text x="860" y="69" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">USES</text>
+      <rect x="844" y="60" width="32" height="12" rx="2" fill="#000000"/>
+      <text x="860" y="69" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">USES</text>
 
-      <rect x="652" y="292" width="64" height="12" rx="2" fill="#2d3142"/>
-      <text x="684" y="301" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CONSUMES</text>
+      <rect x="652" y="292" width="64" height="12" rx="2" fill="#000000"/>
+      <text x="684" y="301" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CONSUMES</text>
 
-      <rect x="348" y="340" width="48" height="12" rx="2" fill="#2d3142"/>
-      <text x="372" y="349" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">AMEND</text>
+      <rect x="348" y="340" width="48" height="12" rx="2" fill="#000000"/>
+      <text x="372" y="349" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">AMEND</text>
 
       <!-- Class: HerdrLauncher -->
-      <rect x="40" y="40" width="360" height="200" rx="6" fill="#2d3142"/>
-      <rect x="40" y="40" width="360" height="200" rx="6" fill="#393e53" stroke="#8e98ac" stroke-width="1"/>
-      <line x1="40" y1="80" x2="400" y2="80" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <line x1="40" y1="140" x2="400" y2="140" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="220" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">HerdrLauncher</text>
-      <text x="56" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ herdr_path: Path</text>
-      <text x="56" y="120" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ admitted_routes: AdmittedRouteSet</text>
-      <text x="56" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ launch(spec): LaunchHandle</text>
-      <text x="56" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ poll(handle): PollResult</text>
-      <text x="56" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ cancel(handle, deadline): None</text>
-      <text x="56" y="220" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">transport only</text>
+      <rect x="40" y="40" width="360" height="200" rx="6" fill="#000000"/>
+      <rect x="40" y="40" width="360" height="200" rx="6" fill="#0b0b0b" stroke="#929292" stroke-width="1"/>
+      <line x1="40" y1="80" x2="400" y2="80" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <line x1="40" y1="140" x2="400" y2="140" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="220" y="64" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">HerdrLauncher</text>
+      <text x="56" y="100" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ herdr_path: Path</text>
+      <text x="56" y="120" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ admitted_routes: AdmittedRouteSet</text>
+      <text x="56" y="160" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ launch(spec): LaunchHandle</text>
+      <text x="56" y="180" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ poll(handle): PollResult</text>
+      <text x="56" y="200" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ cancel(handle, deadline): None</text>
+      <text x="56" y="220" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">transport only</text>
 
       <!-- Class: Scheduler (focal) -->
-      <rect x="440" y="40" width="400" height="240" rx="6" fill="#2d3142"/>
-      <rect x="440" y="40" width="400" height="240" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="440" y="40" width="400" height="40" rx="6" fill="rgba(240,138,89,0.10)"/>
-      <rect x="440" y="72" width="400" height="8" fill="rgba(240,138,89,0.10)"/>
-      <line x1="440" y1="80" x2="840" y2="80" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
-      <line x1="440" y1="180" x2="840" y2="180" stroke="rgba(240,138,89,0.40)" stroke-width="1"/>
-      <text x="640" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Scheduler</text>
-      <text x="456" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ run_id: str</text>
-      <text x="456" y="120" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Dict[str, PlanNode]</text>
-      <text x="456" y="140" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ config: SchedulerConfig</text>
-      <text x="456" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ deps: SchedulerDeps</text>
-      <text x="456" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ project(): None</text>
-      <text x="456" y="220" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ run(): RunReport</text>
-      <text x="456" y="240" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ _lane_retry() · floored spends</text>
-      <text x="456" y="260" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ cancel(): None</text>
+      <rect x="440" y="40" width="400" height="240" rx="6" fill="#000000"/>
+      <rect x="440" y="40" width="400" height="240" rx="6" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="440" y="40" width="400" height="40" rx="6" fill="rgba(255,107,53,0.20)"/>
+      <rect x="440" y="72" width="400" height="8" fill="rgba(255,107,53,0.20)"/>
+      <line x1="440" y1="80" x2="840" y2="80" stroke="rgba(255,107,53,0.45)" stroke-width="1"/>
+      <line x1="440" y1="180" x2="840" y2="180" stroke="rgba(255,107,53,0.45)" stroke-width="1"/>
+      <text x="640" y="64" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Scheduler</text>
+      <text x="456" y="100" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ run_id: str</text>
+      <text x="456" y="120" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Dict[str, PlanNode]</text>
+      <text x="456" y="140" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ config: SchedulerConfig</text>
+      <text x="456" y="160" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ deps: SchedulerDeps</text>
+      <text x="456" y="200" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ project(): None</text>
+      <text x="456" y="220" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ run(): RunReport</text>
+      <text x="456" y="240" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ _lane_retry() · floored spends</text>
+      <text x="456" y="260" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ cancel(): None</text>
 
       <!-- Class: LifecycleStore -->
-      <rect x="880" y="40" width="360" height="240" rx="6" fill="#2d3142"/>
-      <rect x="880" y="40" width="360" height="240" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="880" y1="80" x2="1240" y2="80" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <line x1="880" y1="140" x2="1240" y2="140" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="1060" y="64" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LifecycleStore</text>
-      <text x="896" y="100" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ db_path: str</text>
-      <text x="896" y="120" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ granted_extra_attempts: int</text>
-      <text x="896" y="160" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ plan_versions(run_id)</text>
-      <text x="896" y="180" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ amend_run_plan(...): int</text>
-      <text x="896" y="200" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ review_refresh_count(run_id): int</text>
-      <text x="896" y="220" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ undispatched_quiescence_attempts</text>
-      <text x="896" y="240" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ current_lane_retry_spends() · floored</text>
+      <rect x="880" y="40" width="360" height="240" rx="6" fill="#000000"/>
+      <rect x="880" y="40" width="360" height="240" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="880" y1="80" x2="1240" y2="80" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <line x1="880" y1="140" x2="1240" y2="140" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="1060" y="64" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LifecycleStore</text>
+      <text x="896" y="100" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ db_path: str</text>
+      <text x="896" y="120" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ granted_extra_attempts: int</text>
+      <text x="896" y="160" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ plan_versions(run_id)</text>
+      <text x="896" y="180" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ amend_run_plan(...): int</text>
+      <text x="896" y="200" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ review_refresh_count(run_id): int</text>
+      <text x="896" y="220" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ undispatched_quiescence_attempts</text>
+      <text x="896" y="240" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ current_lane_retry_spends() · floored</text>
 
       <!-- Class: PlanAmendment «module» -->
-      <rect x="40" y="280" width="360" height="160" rx="6" fill="#2d3142"/>
-      <rect x="40" y="280" width="360" height="160" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="40" y1="336" x2="400" y2="336" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="220" y="304" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">«module»</text>
-      <text x="220" y="324" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PlanAmendment</text>
-      <text x="56" y="356" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ classify(current, amended, states)</text>
-      <text x="56" y="376" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ Verdict.amendable: bool</text>
-      <text x="56" y="396" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ Refusal: Enum</text>
-      <text x="56" y="416" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">maestro run amend</text>
+      <rect x="40" y="280" width="360" height="160" rx="6" fill="#000000"/>
+      <rect x="40" y="280" width="360" height="160" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="40" y1="336" x2="400" y2="336" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="220" y="304" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">«module»</text>
+      <text x="220" y="324" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PlanAmendment</text>
+      <text x="56" y="356" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ classify(current, amended, states)</text>
+      <text x="56" y="376" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ Verdict.amendable: bool</text>
+      <text x="56" y="396" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ Refusal: Enum</text>
+      <text x="56" y="416" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">maestro run amend</text>
 
       <!-- Class: Plan / PlanV5 note -->
-      <rect x="440" y="320" width="400" height="160" rx="6" fill="#2d3142"/>
-      <rect x="440" y="320" width="400" height="160" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="440" y1="360" x2="840" y2="360" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <line x1="440" y1="440" x2="840" y2="440" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="640" y="344" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan</text>
-      <text x="456" y="380" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: v1–v4 runnable</text>
-      <text x="456" y="400" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ plan_id: str</text>
-      <text x="456" y="420" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Agent · Tests · Code</text>
-      <text x="456" y="460" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">PlanV5 authored · not in _RUNNABLE</text>
-      <text x="456" y="476" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ to_plan_nodes(): Tuple[PlanNode, ...]</text>
+      <rect x="440" y="320" width="400" height="160" rx="6" fill="#000000"/>
+      <rect x="440" y="320" width="400" height="160" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="440" y1="360" x2="840" y2="360" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <line x1="440" y1="440" x2="840" y2="440" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="640" y="344" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Plan</text>
+      <text x="456" y="380" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ schema_version: v1–v4 runnable</text>
+      <text x="456" y="400" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ plan_id: str</text>
+      <text x="456" y="420" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ nodes: Agent · Tests · Code</text>
+      <text x="456" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">PlanV5 authored · not in _RUNNABLE</text>
+      <text x="456" y="476" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ to_plan_nodes(): Tuple[PlanNode, ...]</text>
 
       <!-- Class: HiddenVault «module» (landed, unwired) -->
-      <rect x="880" y="320" width="360" height="160" rx="6" fill="#2d3142"/>
-      <rect x="880" y="320" width="360" height="160" rx="6" fill="#393e53" stroke="#8e98ac" stroke-width="1" stroke-dasharray="4,3"/>
-      <line x1="880" y1="376" x2="1240" y2="376" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="1060" y="344" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">«module»</text>
-      <text x="1060" y="364" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">HiddenVault</text>
-      <text x="896" y="396" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ ensure_vault(state_root, run_id)</text>
-      <text x="896" y="416" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ seed(vault, repo, branch): str</text>
-      <text x="896" y="436" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ attempt_repository(...): Path</text>
-      <text x="896" y="456" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">no production caller · v5 not runnable</text>
+      <rect x="880" y="320" width="360" height="160" rx="6" fill="#000000"/>
+      <rect x="880" y="320" width="360" height="160" rx="6" fill="#0b0b0b" stroke="#929292" stroke-width="1" stroke-dasharray="4,3"/>
+      <line x1="880" y1="376" x2="1240" y2="376" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="1060" y="344" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">«module»</text>
+      <text x="1060" y="364" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">HiddenVault</text>
+      <text x="896" y="396" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ ensure_vault(state_root, run_id)</text>
+      <text x="896" y="416" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ seed(vault, repo, branch): str</text>
+      <text x="896" y="436" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ attempt_repository(...): Path</text>
+      <text x="896" y="456" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">no production caller · v5 not runnable</text>
 
       <!-- Class: GateCapture «module» -->
-      <rect x="880" y="520" width="360" height="140" rx="6" fill="#2d3142"/>
-      <rect x="880" y="520" width="360" height="140" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <line x1="880" y1="576" x2="1240" y2="576" stroke="rgba(245,245,245,0.22)" stroke-width="1"/>
-      <text x="1060" y="544" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">«module»</text>
-      <text x="1060" y="564" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">GateCapture</text>
-      <text x="896" y="596" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ unexpected_cases(...): Tuple[str, ...]</text>
-      <text x="896" y="616" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ unsatisfiable_min_cases(...): int</text>
-      <text x="896" y="636" fill="#f5f5f5" font-size="9" font-family="'Geist Mono', monospace">+ scan_production_source(...)</text>
+      <rect x="880" y="520" width="360" height="140" rx="6" fill="#000000"/>
+      <rect x="880" y="520" width="360" height="140" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <line x1="880" y1="576" x2="1240" y2="576" stroke="rgba(248,248,248,0.22)" stroke-width="1"/>
+      <text x="1060" y="544" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">«module»</text>
+      <text x="1060" y="564" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">GateCapture</text>
+      <text x="896" y="596" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ unexpected_cases(...): Tuple[str, ...]</text>
+      <text x="896" y="616" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ unsatisfiable_min_cases(...): int</text>
+      <text x="896" y="636" fill="#f8f8f8" font-size="9" font-family="'Geist Mono', monospace">+ scan_production_source(...)</text>
 
       <!-- Legend: relationship vocabulary -->
-      <line x1="40" y1="720" x2="1240" y2="720" stroke="rgba(245,245,245,0.12)" stroke-width="0.8"/>
-      <text x="40" y="736" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
+      <line x1="40" y1="720" x2="1240" y2="720" stroke="rgba(248,248,248,0.12)" stroke-width="0.8"/>
+      <text x="40" y="736" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND · RELATIONSHIPS</text>
 
-      <line x1="40" y1="760" x2="68" y2="760" stroke="#f5f5f5" stroke-width="1" marker-end="url(#runtime-uml-triangle)"/>
-      <text x="76" y="764" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
+      <line x1="40" y1="760" x2="68" y2="760" stroke="#f8f8f8" stroke-width="1" marker-end="url(#runtime-uml-triangle)"/>
+      <text x="76" y="764" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Inheritance</text>
 
-      <line x1="200" y1="760" x2="228" y2="760" stroke="#f5f5f5" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#runtime-uml-triangle)"/>
-      <text x="236" y="764" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Realization</text>
+      <line x1="200" y1="760" x2="228" y2="760" stroke="#f8f8f8" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#runtime-uml-triangle)"/>
+      <text x="236" y="764" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Realization</text>
 
-      <line x1="360" y1="760" x2="388" y2="760" stroke="#f5f5f5" stroke-width="1" marker-start="url(#runtime-uml-diamond-filled)"/>
-      <text x="396" y="764" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
+      <line x1="360" y1="760" x2="388" y2="760" stroke="#f8f8f8" stroke-width="1" marker-start="url(#runtime-uml-diamond-filled)"/>
+      <text x="396" y="764" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Composition · owns</text>
 
-      <line x1="548" y1="760" x2="576" y2="760" stroke="#f5f5f5" stroke-width="1" marker-start="url(#runtime-uml-diamond-hollow)"/>
-      <text x="584" y="764" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
+      <line x1="548" y1="760" x2="576" y2="760" stroke="#f8f8f8" stroke-width="1" marker-start="url(#runtime-uml-diamond-hollow)"/>
+      <text x="584" y="764" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Aggregation · has</text>
 
-      <line x1="736" y1="760" x2="764" y2="760" stroke="#bfc0c0" stroke-width="1" marker-end="url(#runtime-uml-open)"/>
-      <text x="772" y="764" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Association</text>
+      <line x1="736" y1="760" x2="764" y2="760" stroke="#c4c4c4" stroke-width="1" marker-end="url(#runtime-uml-open)"/>
+      <text x="772" y="764" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Association</text>
 
-      <line x1="900" y1="760" x2="928" y2="760" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
-      <text x="936" y="764" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
+      <line x1="900" y1="760" x2="928" y2="760" stroke="#c4c4c4" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#runtime-uml-open)"/>
+      <text x="936" y="764" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Dependency · uses</text>
     </svg>
   </div>
 </body>

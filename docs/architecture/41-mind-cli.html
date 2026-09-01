@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#2d3142">
+  <meta name="theme-color" content="#000000">
   <title>Maestro operator verbs · Tree</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="dark.css">
@@ -12,10 +12,7 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       color-scheme: dark;
-      --color-paper:   #2d3142;   /* deep warm charcoal */
-      --color-ink:     #f5f5f5;   /* warm off-white */
-      --color-muted:   #bfc0c0;   /* silver */
-      --color-accent:  #f08a59;   /* accent */
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
       --font-sans:     'Geist', system-ui, sans-serif;
       --font-serif:    'Instrument Serif', serif;
       --font-mono:     'Geist Mono', ui-monospace, monospace;
@@ -67,104 +64,104 @@
       <title id="41-mind-cli-title">Maestro operator verbs</title>
       <desc id="41-mind-cli-desc">CLI tree of maestro operator verbs with every plan, run, and workspace subverb listed; attempt salvage collapsed; run start is the focal command. Run group is start, status, list, pause, cancel, amend, resume, convergence, findings, test-strength. run amend is its own verb, not a resume flag. Remaining roots live on 42-mind-cli-roots.html.</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#6a95d8"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
       </defs>
 
-      <rect width="100%" height="100%" fill="#2d3142"/>
+      <rect width="100%" height="100%" fill="#000000"/>
 
       <!-- Tier tags -->
-      <text x="40" y="148" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">TIER 0 · ROOT</text>
-      <text x="40" y="300" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">TIER 1</text>
-      <text x="40" y="392" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">TIER 2</text>
+      <text x="40" y="148" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">TIER 0 · ROOT</text>
+      <text x="40" y="300" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">TIER 1</text>
+      <text x="40" y="392" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">TIER 2</text>
 
       <!-- Connectors first -->
       <!-- maestro → run (spine) -->
-      <line x1="640" y1="168" x2="640" y2="272" stroke="#bfc0c0" stroke-width="1"/>
+      <line x1="640" y1="168" x2="640" y2="272" stroke="#c4c4c4" stroke-width="1"/>
       <!-- bus: plan ← maestro → workspace → attempt salvage -->
       <path d="M 304,272 V 232 Q 304,224 312,224 H 1112 Q 1120,224 1120,232 V 272"
-            fill="none" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="880" y1="224" x2="880" y2="272" stroke="#bfc0c0" stroke-width="1"/>
+            fill="none" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="880" y1="224" x2="880" y2="272" stroke="#c4c4c4" stroke-width="1"/>
 
       <!-- plan / run / workspace drop to their verb lists -->
-      <line x1="304" y1="320" x2="304" y2="400" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="640" y1="320" x2="640" y2="400" stroke="#bfc0c0" stroke-width="1"/>
-      <line x1="880" y1="320" x2="880" y2="400" stroke="#bfc0c0" stroke-width="1"/>
+      <line x1="304" y1="320" x2="304" y2="400" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="640" y1="320" x2="640" y2="400" stroke="#c4c4c4" stroke-width="1"/>
+      <line x1="880" y1="320" x2="880" y2="400" stroke="#c4c4c4" stroke-width="1"/>
 
       <!-- maestro -->
-      <rect x="560" y="120" width="160" height="48" rx="6" fill="#2d3142"/>
-      <rect x="560" y="120" width="160" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="568" y="128" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="584" y="136" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ROOT</text>
-      <text x="640" y="156" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">maestro</text>
+      <rect x="560" y="120" width="160" height="48" rx="6" fill="#000000"/>
+      <rect x="560" y="120" width="160" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="568" y="128" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="584" y="136" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ROOT</text>
+      <text x="640" y="156" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">maestro</text>
 
       <!-- plan -->
-      <rect x="224" y="272" width="160" height="48" rx="6" fill="#2d3142"/>
-      <rect x="224" y="272" width="160" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="232" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="248" y="288" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="304" y="308" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">plan</text>
+      <rect x="224" y="272" width="160" height="48" rx="6" fill="#000000"/>
+      <rect x="224" y="272" width="160" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="232" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="248" y="288" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="304" y="308" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">plan</text>
 
       <!-- run -->
-      <rect x="560" y="272" width="160" height="48" rx="6" fill="#2d3142"/>
-      <rect x="560" y="272" width="160" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="568" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="584" y="288" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="640" y="308" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">run</text>
+      <rect x="560" y="272" width="160" height="48" rx="6" fill="#000000"/>
+      <rect x="560" y="272" width="160" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="568" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="584" y="288" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="640" y="308" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">run</text>
 
       <!-- workspace -->
-      <rect x="800" y="272" width="160" height="48" rx="6" fill="#2d3142"/>
-      <rect x="800" y="272" width="160" height="48" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <rect x="808" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(245,245,245,0.40)" stroke-width="0.8"/>
-      <text x="824" y="288" fill="#f5f5f5" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
-      <text x="880" y="308" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">workspace</text>
+      <rect x="800" y="272" width="160" height="48" rx="6" fill="#000000"/>
+      <rect x="800" y="272" width="160" height="48" rx="6" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="808" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="824" y="288" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CMD</text>
+      <text x="880" y="308" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">workspace</text>
 
       <!-- attempt salvage (collapsed attempt) -->
-      <rect x="1040" y="272" width="160" height="48" rx="6" fill="#2d3142"/>
-      <rect x="1040" y="272" width="160" height="48" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <rect x="1048" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.40)" stroke-width="0.8"/>
-      <text x="1064" y="288" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="1120" y="308" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt salvage</text>
+      <rect x="1040" y="272" width="160" height="48" rx="6" fill="#000000"/>
+      <rect x="1040" y="272" width="160" height="48" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <rect x="1048" y="280" width="32" height="12" rx="2" fill="transparent" stroke="rgba(196,196,196,0.40)" stroke-width="0.8"/>
+      <text x="1064" y="288" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="1120" y="308" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">attempt salvage</text>
 
       <!-- plan subverbs -->
-      <rect x="88" y="400" width="432" height="88" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="104" y="424" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">PLAN SUBVERBS</text>
-      <text x="104" y="448" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">author · validate · finalize · gate · review · ship</text>
-      <text x="104" y="468" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">show · list · set-aside · set-aside-log</text>
+      <rect x="88" y="400" width="432" height="88" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="104" y="424" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">PLAN SUBVERBS</text>
+      <text x="104" y="448" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">author · validate · finalize · gate · review · ship</text>
+      <text x="104" y="468" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">show · list · set-aside · set-aside-log</text>
 
       <!-- run start (focal) + remaining run verbs -->
-      <rect x="544" y="400" width="192" height="48" rx="6" fill="#2d3142"/>
-      <rect x="544" y="400" width="192" height="48" rx="6" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <rect x="552" y="408" width="32" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
-      <text x="568" y="416" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
-      <text x="640" y="436" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">start</text>
-      <rect x="544" y="456" width="192" height="88" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="560" y="476" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">status · list · pause</text>
-      <text x="560" y="492" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">cancel · amend · resume</text>
-      <text x="560" y="508" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">convergence · findings</text>
-      <text x="560" y="524" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">test-strength</text>
+      <rect x="544" y="400" width="192" height="48" rx="6" fill="#000000"/>
+      <rect x="544" y="400" width="192" height="48" rx="6" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="552" y="408" width="32" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="568" y="416" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VERB</text>
+      <text x="640" y="436" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">start</text>
+      <rect x="544" y="456" width="192" height="88" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="560" y="476" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">status · list · pause</text>
+      <text x="560" y="492" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">cancel · amend · resume</text>
+      <text x="560" y="508" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">convergence · findings</text>
+      <text x="560" y="524" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">test-strength</text>
 
       <!-- workspace subverbs -->
-      <rect x="760" y="400" width="240" height="88" rx="6" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="776" y="424" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">WORKSPACE SUBVERBS</text>
-      <text x="776" y="448" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">author · validate · finalize</text>
-      <text x="776" y="468" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">start · status · cancel · resume</text>
-      <text x="776" y="488" fill="#f5f5f5" font-size="12" font-family="'Geist', sans-serif">publish · rollback</text>
+      <rect x="760" y="400" width="240" height="88" rx="6" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="776" y="424" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">WORKSPACE SUBVERBS</text>
+      <text x="776" y="448" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">author · validate · finalize</text>
+      <text x="776" y="468" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">start · status · cancel · resume</text>
+      <text x="776" y="488" fill="#f8f8f8" font-size="12" font-family="'Geist', sans-serif">publish · rollback</text>
 
       <!-- Legend -->
-      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
-      <text x="40" y="660" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="40" y="660" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
 
-      <rect x="40" y="672" width="16" height="12" rx="2" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
-      <text x="64" y="684" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Focal verb</text>
+      <rect x="40" y="672" width="16" height="12" rx="2" fill="rgba(255,107,53,0.18)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="64" y="684" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Focal verb</text>
 
-      <rect x="200" y="672" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-      <text x="224" y="684" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Command group</text>
+      <rect x="200" y="672" width="16" height="12" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="224" y="684" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Command group</text>
 
-      <rect x="400" y="672" width="16" height="12" rx="2" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="0.8"/>
-      <text x="424" y="684" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Verb</text>
-      <text x="560" y="684" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace">amend is own verb, not a resume flag</text>
+      <rect x="400" y="672" width="16" height="12" rx="2" fill="rgba(248,248,248,0.05)" stroke="#c4c4c4" stroke-width="0.8"/>
+      <text x="424" y="684" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Verb</text>
+      <text x="560" y="684" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace">amend is own verb, not a resume flag</text>
     </svg>
   </div>
 </body>
