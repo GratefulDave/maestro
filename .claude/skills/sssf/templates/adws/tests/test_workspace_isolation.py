@@ -11,7 +11,6 @@ ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
 from adw_modules import launcher
-from adw_modules import permissions
 
 
 class ZeroSandboxDependencyTest(unittest.TestCase):
@@ -79,30 +78,23 @@ class HostAgentArgvTest(unittest.TestCase):
             self.assertNotIn("Write", argv)
             self.assertTrue(any("AGENTS.md" in item for item in argv))
 
-    def test_claude_argv_uses_native_denylist_and_keeps_write(self) -> None:
+    def test_claude_argv_is_exact_remote_control_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             argv = launcher.build_claude_argv(
                 Path("claude"), self._spec(root, "claude")
             )
-            self.assertIn("--dangerously-skip-permissions", argv)
-            self.assertEqual(argv[-1], "--remote-control")
             self.assertEqual(
-                argv[argv.index("--append-system-prompt-file") + 1],
-                str((root / ".maestro-agent" / "CLAUDE.md").resolve()),
+                argv,
+                (
+                    "claude",
+                    "--model",
+                    "opus",
+                    "--effort",
+                    "high",
+                    "--remote-control",
+                ),
             )
-            self.assertNotIn("--settings", argv)
-            self.assertNotIn("--hook", argv)
-            self.assertNotIn("--tools", argv)
-            self.assertNotIn("--permission-mode", argv)
-            denied = argv.index("--disallowedTools") + 1
-            self.assertEqual(argv[denied : denied + 2], ("Task", "Agent"))
-            self.assertEqual(
-                permissions.route_capability_argv("claude"),
-                ("--disallowedTools", "Task", "Agent"),
-            )
-            self.assertEqual(permissions.route_capability_argv("omp"), ())
-            self.assertTrue(permissions.argv_denies_delegation("claude", argv))
 
     def test_pane_env_forwards_only_scratch_and_native_write_paths_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

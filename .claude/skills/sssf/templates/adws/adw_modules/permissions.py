@@ -28,9 +28,6 @@ Two keys drive it, both in sssf.config.yaml:
     defaults.protected_files   paths no agent may touch unless it names them itself
     agents[].writes      None = unrestricted · [] = read-only · [...] = only these
 
-The second half of this module is the capability axis rather than the write
-axis, and it is enforced at dispatch rather than after the fact — see
-`route_capability_argv` for why the two are enforced at opposite ends.
 """
 
 from __future__ import annotations
@@ -38,7 +35,6 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, Sequence, Tuple
 
 from .data_types import AgentConfig, SSSFConfig
 
@@ -204,111 +200,3 @@ def enforce(run, phase, agent: AgentConfig, before: dict[str, str]) -> list[str]
     )
 
 
-# ── The capability axis: what an actor may INVOKE ──────────────────────────
-#
-# Everything above answers "what may this agent change", after the fact, from
-# the repository itself. This answers a question the write axis structurally
-# cannot: what may this agent *delegate*. A write is visible in a diff. Work
-# handed to a sub-agent is not — it lands in the actor's own transcript as its
-# own output, and the receipt the actor then signs names the actor.
-#
-# §3.6 B12 requires that no actor sign off on its own output and that review be
-# cross-vendor over the merged surface. §1.2 forbids any lifecycle transition
-# caused by an agent's claim about its own work. A reviewer that spawns a
-# sub-task, waits for it, and relays its conclusion satisfies neither: the
-# verdict originates somewhere the signature does not name, and nothing
-# downstream can tell the difference, because the transcript, the receipt and
-# the signature all say the actor Maestro launched.
-#
-# This is not hypothetical and it is not rare. In
-# run-2a44d226e75a4be391a14f02b78a6d25, 23 of 39 launched reviews spawned a
-# named sub-task through omp's `hub`/`task` tools and blocked on it; 17 of
-# those went on to write a signed receipt attesting
-# `{"model": "openai-codex/gpt-5.6-luna"}` over a verdict produced by a
-# `gpt-5.6-terra` sub-task, three of them PASS. The remaining six were SIGHUPed
-# mid-`hub op=wait`, wrote no receipt at all, and were absorbed as
-# environmental stalls that cancelled and rebuilt the *builder* (#94, #90,
-# #101).
-#
-# **Why this axis is enforced at dispatch and the write axis is not.** A write
-# can be undone: `enforce` rolls the path back and fails the phase, and the
-# repository is the durable record either way. A delegated judgement cannot be
-# undone after the fact, because by the time anything could look, the only
-# surviving artifact is a signed receipt that says the right actor produced it.
-# The capability is denied in launch argv where the client supports it and by
-# the configured OMP profile otherwise, before the delegated tool can run.
-#
-# **What this does and does not contain.** It is the same honest limit §9.6
-# draws around `--dangerously-skip-permissions`: this contains a *mistaken*
-# actor, not a hostile one. `bash` remains available as a native host tool, and an
-# actor determined to reach a second model can shell out to one. What it stops
-# is the ordinary case — the reviewer that reaches for the delegation tool
-# sitting in its schema because the tool is there.
-
-#: Per route, the tool names that let an actor hand its work to another model.
-#: omp's `task` spawns a sub-agent, `hub` starts and awaits named background
-#: jobs, and `eval` exposes `agent()`; all three are in that binary's
-#: `BUILTIN_TOOL_NAMES`. Claude's equivalents are `Task` and its current
-#: spelling `Agent`; both are named because a deny list that names only the
-#: retired spelling denies nothing.
-DELEGATION_TOOLS: Dict[str, Tuple[str, ...]] = {
-    "omp": ("task", "hub", "eval"),
-    "claude": ("Task", "Agent"),
-}
-
-
-def route_delegation_tools(route: str) -> Tuple[str, ...]:
-    """The tools `route` must not hand an actor. Empty for an unknown route."""
-    return DELEGATION_TOOLS.get(route, ())
-
-
-def route_capability_argv(route: str) -> Tuple[str, ...]:
-    """Return Claude's explicit delegation denylist; OMP states none in argv.
-
-    Role sessions load the host-authenticated profile plus repository
-    capabilities. Containment is a deny list, not a Bash-only ``--tools``
-    hatch: Claude receives one variadic ``--disallowedTools`` argument for every
-    name in `route_delegation_tools`. OMP has no equivalent denylist flag here;
-    the named role profile omits `task`/`hub`/`eval`.
-
-    An unknown route yields no flags. That route is refused by
-    `HerdrLauncher.launch` before an argv builder can run.
-    """
-    denied = route_delegation_tools(route)
-    if route != "claude" or not denied:
-        return ()
-    return ("--disallowedTools", *denied)
-
-
-def argv_denies_delegation(route: str, argv: Sequence[str]) -> bool:
-    """Whether `argv` leaves `route`'s actor unable to delegate its work.
-
-    An observation, not a gate. Production never calls it. Tests assert it
-    over planted argv and over the real builders. True requires a containment
-    *stated in the argv*: an allowlist that names no delegation tool and does
-    not grant `eval`, or a deny list that names every delegation tool.
-
-    Granting `eval` is still not denial: omp's eval sandbox exposes `agent()`.
-    An argv that lists it on `--tools` returns False.
-    """
-    denied = route_delegation_tools(route)
-    if not denied:
-        return True
-    tokens = list(argv)
-    for index, token in enumerate(tokens):
-        if token == "--tools" and index + 1 < len(tokens):
-            allowed = {t.strip() for t in tokens[index + 1].split(",") if t.strip()}
-            if "eval" in allowed:
-                return False
-            if allowed and not (allowed & set(denied)):
-                return True
-    for index, token in enumerate(tokens):
-        if token in ("--disallowedTools", "--disallowed-tools"):
-            collected: set[str] = set()
-            for extra in tokens[index + 1 :]:
-                if extra.startswith("-"):
-                    break
-                collected.update(t.strip() for t in extra.split(",") if t.strip())
-            if set(denied) <= collected:
-                return True
-    return False
