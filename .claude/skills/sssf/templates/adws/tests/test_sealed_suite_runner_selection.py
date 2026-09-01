@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -611,6 +612,197 @@ class RealVitestIsCountedTest(unittest.TestCase):
         self.assertEqual(out["returncode"], 0)
         self.assertEqual(out["executed"], 2)
         self.assertEqual(out["counts"]["passed"], 2)
+
+
+#: The real shape, captured from `rr.execute_cases` against vitest 4.1.11 and
+#: 3.2.7. The summary is on stdout and the failure banner is on stderr, and
+#: `execute_cases` returns `stdout + "\n" + stderr`, so the banner is ALWAYS
+#: last on a failing run whatever order it was printed in. Kept as a literal so
+#: the regression is pinned on machines with no vitest installed.
+_VITEST_FAILING_OUTPUT = """
+ RUN  v4.1.11 /tmp/vfix
+
+ ❯ src/allfail.test.ts (3 tests | 3 failed) 4ms
+
+ Test Files  1 failed (1)
+      Tests  3 failed (3)
+   Start at  17:20:01
+   Duration  71ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/allfail.test.ts > a
+AssertionError: expected 1 to be 2
+"""
+
+_VITEST_MIXED_OUTPUT = """
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+"""
+
+
+class VitestSummaryParsingTest(unittest.TestCase):
+    """The totals line is found by its shape, not by containing `Tests`.
+
+    Scanning backwards for the last line containing the word `Tests` found the
+    failure banner instead, which carries no count, so every failing vitest
+    suite parsed to all zeros.
+    """
+
+    def test_the_failure_banner_does_not_defeat_the_summary(self) -> None:
+        counts = tc._parse_suite_counts("vitest", _VITEST_FAILING_OUTPUT)
+        self.assertEqual(counts["failed"], 3)
+        self.assertEqual(sum(counts.values()), 3)
+
+    def test_a_mixed_run_counts_both_sides_past_the_banner(self) -> None:
+        counts = tc._parse_suite_counts("vitest", _VITEST_MIXED_OUTPUT)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["passed"], 1)
+
+    def test_the_banner_alone_parses_to_nothing(self) -> None:
+        # Not a summary, so it must contribute no counts rather than be read as
+        # one. `run_private_suite` turns a zero count on exit 0 into a refusal.
+        banner = "⎯⎯⎯ Failed Tests 11 ⎯⎯⎯"
+        self.assertEqual(sum(tc._parse_suite_counts("vitest", banner).values()), 0)
+
+    def test_the_test_files_line_is_not_the_summary(self) -> None:
+        # `Test Files  1 failed (1)` counts FILES. Reading it as the case
+        # summary would report 1 failed case for a file holding eleven.
+        output = " Test Files  1 failed (1)\n      Tests  11 failed (11)\n"
+        self.assertEqual(tc._parse_suite_counts("vitest", output)["failed"], 11)
+        files_only = " Test Files  1 failed (1)\n"
+        self.assertEqual(sum(tc._parse_suite_counts("vitest", files_only).values()), 0)
+
+    def test_the_summary_anchor_tolerates_the_reporters_indentation(self) -> None:
+        for line in ("      Tests  2 passed (2)", "Tests  2 passed (2)"):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    tc._parse_suite_counts("vitest", line)["passed"], 2
+                )
+
+    def test_pytest_parsing_is_untouched_by_the_vitest_anchor(self) -> None:
+        # The two branches are independent; the anchor is vitest's alone.
+        output = (
+            "1 failed, 1 passed in 0.01s\n"
+            "⎯⎯⎯ Failed Tests 1 ⎯⎯⎯\n"
+        )
+        counts = tc._parse_suite_counts("pytest", output)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["passed"], 1)
+
+
+class RealVitestCountsEveryShapeTest(unittest.TestCase):
+    """All four shapes, real binary, through `rr.execute_cases`.
+
+    A shell run with `2>&1` interleaves stdout and stderr in real time and puts
+    the banner FIRST, which parses correctly and hides the defect entirely.
+    Only the harness's separate capture reorders them, so the measurement has
+    to go through `execute_cases` rather than through a terminal.
+    """
+
+    def setUp(self) -> None:
+        self.vitest = _discover_vitest()
+        if self.vitest is None:
+            self.skipTest("no vitest binary found; set MAESTRO_TEST_VITEST")
+
+    @contextlib.contextmanager
+    def _project(self, body: str):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / "package.json").write_text(
+                '{"name":"sealed","private":true,"type":"module"}\n', encoding="utf-8"
+            )
+            (root / "src").mkdir()
+            (root / "src" / "a.test.ts").write_text(body, encoding="utf-8")
+            yield root, "src/a.test.ts"
+
+    def _counts(self, body: str) -> tuple[dict, int]:
+        with self._project(body) as (root, selector):
+            resolved = rr.ResolvedRunner(runner="vitest", executable=self.vitest)
+            gate = tc._suite_gate(None, (selector,))
+            exec_gate = SimpleNamespace(
+                runner="vitest",
+                argv=tc._suite_selectors(gate, (selector,)),
+                cwd=".",
+                min_cases=1,
+            )
+            raw = rr.execute_cases(resolved, exec_gate, root, timeout_s=300.0)
+        return tc._parse_suite_counts("vitest", raw["output"]), int(raw["returncode"])
+
+    def test_all_passing(self) -> None:
+        counts, code = self._counts(
+            'import { it, expect } from "vitest";\n'
+            'it("a", () => { expect(1).toBe(1); });\n'
+            'it("b", () => { expect(1).toBe(1); });\n'
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(counts["passed"], 2)
+
+    def test_all_failing_reports_the_true_count_not_zero(self) -> None:
+        counts, code = self._counts(
+            'import { it, expect } from "vitest";\n'
+            'it("a", () => { expect(1).toBe(2); });\n'
+            'it("b", () => { expect(1).toBe(2); });\n'
+            'it("c", () => { expect(1).toBe(2); });\n'
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(counts["failed"], 3)
+        self.assertEqual(sum(counts.values()), 3)
+
+    def test_mixed_reports_both_sides(self) -> None:
+        counts, code = self._counts(
+            'import { it, expect } from "vitest";\n'
+            'it("ok", () => { expect(1).toBe(1); });\n'
+            'it("bad", () => { expect(1).toBe(2); });\n'
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(counts["passed"], 1)
+        self.assertEqual(counts["failed"], 1)
+
+    def test_all_skipped_is_counted_then_refused_as_unevaluated(self) -> None:
+        body = (
+            'import { it, expect } from "vitest";\n'
+            'it.skip("a", () => { expect(1).toBe(1); });\n'
+            'it.skip("b", () => { expect(1).toBe(1); });\n'
+        )
+        counts, code = self._counts(body)
+        self.assertEqual(code, 0)
+        self.assertEqual(counts["skipped"], 2)
+        # Reaching ALL_CASES_SKIPPED rather than COUNTS_UNPARSEABLE is itself
+        # proof the summary parsed: an unread summary would have measured zero.
+        with self._project(body) as (root, selector):
+            with mock.patch.object(
+                rr,
+                "resolve",
+                return_value=rr.ResolvedRunner(runner="vitest", executable=self.vitest),
+            ):
+                with self.assertRaises(pr.SealedEnvironmentError) as caught:
+                    tc.run_private_suite(root, (selector,), timeout_s=300.0)
+        message = str(caught.exception)
+        self.assertIn("SEALED_SUITE_ALL_CASES_SKIPPED:vitest", message)
+        self.assertIn("every one of the 2 counted cases", message)
+
+    def test_the_summary_is_on_stdout_and_the_banner_on_stderr(self) -> None:
+        """The mechanism itself, so a reporter change is caught here first."""
+        with self._project(
+            'import { it, expect } from "vitest";\n'
+            'it("bad", () => { expect(1).toBe(2); });\n'
+        ) as (root, selector):
+            result = subprocess.run(
+                [self.vitest, "run", selector],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=300.0,
+            )
+        summary = [
+            line for line in result.stdout.splitlines() if tc._VITEST_SUMMARY.match(line)
+        ]
+        self.assertEqual(len(summary), 1, result.stdout)
+        self.assertIn("Failed Tests", result.stderr)
+        self.assertNotIn("Failed Tests", result.stdout)
 
 
 class EnvironmentFaultsAreTypedTest(unittest.TestCase):

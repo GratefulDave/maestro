@@ -18,6 +18,33 @@ from . import runner_resolution as rr
 from . import scheduler_types as st
 
 _PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|error|skipped|xfailed)")
+
+#: vitest's totals line, anchored on its shape rather than on containing the
+#: word `Tests`.
+#:
+#: vitest writes its summary to STDOUT and its failure banner to STDERR:
+#:
+#:     stdout:       Tests  1 failed | 1 passed (2)
+#:     stderr: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+#:
+#: `rr.execute_cases` returns `stdout + "\n" + stderr`, so on any failing run
+#: the banner lands AFTER the summary no matter what order they were printed
+#: in. Scanning backwards for the last line containing `Tests` therefore found
+#: the banner, which carries no `N failed` token, and every failing vitest
+#: suite parsed to all zeros — `executed: 0` for a run that executed eleven
+#: cases. That did not read as a pass (a banner implies failures implies a
+#: non-zero exit, which `code_review` already treats as failed), but it wrote a
+#: wrong `public_result_summary` into the ledger and neutered the
+#: `executed < min_cases` check on exactly the runs it exists for.
+#:
+#: This was invisible to a shell measurement: running vitest with `2>&1`
+#: interleaves the streams in real time and puts the banner FIRST, which parses
+#: correctly. Only the harness's separate capture reorders them.
+#:
+#: The summary begins the line (leading whitespace only); the banner has
+#: box-drawing characters and the word `Failed` before `Tests`. `Test Files`
+#: does not match either, because the word there is `Test`.
+_VITEST_SUMMARY = re.compile(r"^\s*Tests\s")
 PRIVATE_MANIFEST_SCHEMA = "private-manifest.v1"
 
 
@@ -696,7 +723,7 @@ def _parse_suite_counts(runner: str, output: str) -> dict[str, int]:
         return counts
     tests_line = ""
     for line in reversed(output.splitlines()):
-        if re.search(r"\bTests\b", line):
+        if _VITEST_SUMMARY.match(line):
             tests_line = line
             break
     if tests_line:
