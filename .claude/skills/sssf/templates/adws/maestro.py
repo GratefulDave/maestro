@@ -30,8 +30,10 @@ from adw_modules.handoff_budget import (
     OMP_CONTEXT_WINDOW_TOKENS,
     route_publishes_a_window,
 )
+from adw_modules import code_review as cr
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
+from adw_modules import private_review as prv
 from adw_modules import scheduler_types as st
 from adw_modules import tests_chain as tchain
 from adw_modules.lifecycle import (
@@ -122,6 +124,24 @@ def _config_argv(value: object, label: str) -> tuple[str, ...]:
     for index, item in enumerate(value):
         argv.append(_config_string(item, f"{label}[{index}]"))
     return tuple(argv)
+
+
+def _config_timeout(value: object, label: str) -> float:
+    """Seconds allowed for one provisioning run. Absent keeps the default.
+
+    A deployment whose `provision_argv` installs several manifests on a cold
+    cache legitimately needs longer than the default, and a timeout there is
+    reported as a provisioning failure -- which would read as a broken command
+    rather than a slow one.
+    """
+    if value is None:
+        return lch.PROVISION_TIMEOUT_S
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _MaestroConfigurationError(label + " must be a positive number")
+    seconds = float(value)
+    if seconds <= 0:
+        raise _MaestroConfigurationError(label + " must be a positive number")
+    return seconds
 
 
 def _canonical_role_routes(
@@ -253,6 +273,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
     loaded["role_routes"] = _canonical_role_routes(loaded.get("role_routes"))
     loaded["provision_argv"] = _config_argv(
         loaded.get("provision_argv"), "provision_argv"
+    )
+    loaded["provision_timeout_s"] = _config_timeout(
+        loaded.get("provision_timeout_s"), "provision_timeout_s"
     )
     loaded["dashboard"] = _canonical_dashboard(loaded.get("dashboard"))
     loaded["repo"] = repo.resolve()
@@ -1572,6 +1595,8 @@ def _actor_for(
         claude_path=Path(str(executables.get("claude") or "claude")),
         admitted_routes=admitted,
         provision_argv=layout.get("provision_argv") or (),
+        provision_timeout_s=layout.get("provision_timeout_s")
+        or lch.PROVISION_TIMEOUT_S,
         workspace_label=lch.workspace_label_for(_project_identity(target), run_id),
     )
     plan = json.loads(compiled.plan_bytes)
@@ -2139,6 +2164,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _RunRefused(exc.code, str(exc)).emit()
     except _MaestroConfigurationError as exc:
         return _RunRefused("RUN_CONFIGURATION_REQUIRED", str(exc)).emit()
+    except prv.PrivateReviewError as exc:
+        # A review tree that cannot be provisioned, or a project no available
+        # interpreter satisfies, is a fault of this machine. It is already kept
+        # out of the builder's findings by being raised rather than recorded;
+        # this keeps it out of a traceback too, so the frozen operator surface
+        # answers with the same typed JSON it answers every other refusal with.
+        # Every other `PrivateReviewError` names a factory invariant, not an
+        # environment, and is deliberately left to surface as it does today.
+        detail = cr.sealed_environment_detail(exc)
+        if detail is None:
+            raise
+        return _RunRefused(cr.SEALED_ENVIRONMENT_OUTCOME, detail).emit()
 
 
 if __name__ == "__main__":

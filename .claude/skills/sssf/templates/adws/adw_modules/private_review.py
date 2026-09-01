@@ -29,6 +29,33 @@ class PrivateLeakError(PrivateReviewError):
     """Public bytes contained private test or vault material."""
 
 
+class SealedEnvironmentError(PrivateReviewError):
+    """A sealed suite yielded no usable measurement. Never a candidate defect.
+
+    The fault is the machine, the environment, or the suite itself — never the
+    code under test. Two families qualify, and the operator's response to both is
+    the same: repair something outside the candidate and resume.
+
+    The suite could not run: the review tree would not provision, the resolved
+    runner is unusable, its interpreter does not satisfy the project's declared
+    `requires-python`, or no runner can be derived from the sealed files.
+
+    The suite ran but measured nothing: the runner exited cleanly while reporting
+    no readable count, or every counted case was skipped. Either way zero
+    assertions were evaluated against the candidate.
+
+    In all of them no verdict about the candidate exists, so none may be recorded
+    against the builder — a builder cannot fix a suite that never judged it, and
+    telling it to try is the burn this class exists to prevent.
+
+    The operator boundary recognises these by class. Membership is what makes that
+    recognition structural rather than a match on message text: a renamed code or
+    a sixth case must not silently fall through to a traceback.
+    """
+
+    code = "SEALED_SUITE_ENVIRONMENT_REFUSED"
+
+
 class IsolationError(PrivateReviewError):
     """Private objects were reachable from a run or builder repository."""
 

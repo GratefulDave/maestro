@@ -577,6 +577,11 @@ AGENT_QUIESCENT_STATUS = "idle"
 #: appearing, before `poll` reads it as a turn that stopped without declaring.
 AGENT_QUIESCENCE_CONFIRM_S = 60.0
 
+#: Default bound on one provisioning run. Deployments override it through
+#: `maestro.config.yaml`'s `provision_timeout_s`, on the same route
+#: `provision_argv` travels.
+PROVISION_TIMEOUT_S = 600.0
+
 
 #: The statuses the recovery wait treats as "this round is over": the actor is
 #: demonstrably alive (`working`), demonstrably settled after a turn (`done`),
@@ -2402,6 +2407,7 @@ class HerdrLauncher:
         claude_path: Path,
         admitted_routes: AdmittedRouteSet,
         provision_argv: Sequence[str] = (),
+        provision_timeout_s: float = PROVISION_TIMEOUT_S,
         workspace_label: str = "",
     ) -> None:
         if not isinstance(admitted_routes, AdmittedRouteSet):
@@ -2411,6 +2417,11 @@ class HerdrLauncher:
         self.claude_path = Path(claude_path)
         self.admitted_routes = admitted_routes
         self.provision_argv = tuple(provision_argv)
+        #: Bound on one provisioning run, for an agent worktree here and for the
+        #: review tree the scheduler materializes. `bun install && uv sync` on a
+        #: cold cache outruns the default, so a deployment can raise it; a
+        #: timeout must read as a slow install, not a broken command.
+        self.provision_timeout_s = float(provision_timeout_s)
         #: Label for a parent Space Maestro creates when none is open on the
         #: repository (the operator's own Space, when open, is the parent and
         #: keeps its label). Empty keeps the non-run path: panes split from
@@ -5288,7 +5299,9 @@ class HerdrLauncher:
     def provision(self, worktree: Path) -> None:
         if not self.provision_argv:
             return
-        result = run_harness_process(self.provision_argv, cwd=worktree, timeout=600)
+        result = run_harness_process(
+            self.provision_argv, cwd=worktree, timeout=self.provision_timeout_s
+        )
         if result.returncode != 0:
             raise RuntimeError("PROVISION_FAILED:{}".format(result.stderr[-400:]))
 

@@ -911,6 +911,40 @@ def _write_test_files(extra: Mapping[str, Any]) -> dict[str, str]:
 
 
 
+def _resolved_provision_argv(
+    actor: object, override: Optional[Sequence[str]]
+) -> tuple[str, ...]:
+    """The command that installs a tree's declared dependencies.
+
+    The deployment's `provision_argv` already reaches the launcher, which
+    provisions agent worktrees. A *review* tree is materialized by the scheduler
+    instead, so it has to be provisioned from here or its sealed suite runs
+    against a tree with nothing installed -- collecting zero cases, which
+    `code_review` then reports as the builder's tests failing.
+
+    Read off the actor's launcher rather than re-reading the config: that is the
+    binding this run was actually admitted with. An actor with no launcher (a
+    test double, `FakeLauncher`) resolves to no provisioning, which is the
+    behaviour every existing caller already has.
+    """
+    if override is None:
+        launcher = getattr(actor, "launcher", None)
+        override = getattr(launcher, "provision_argv", ()) or ()
+    return tuple(str(item) for item in override)
+
+
+def _resolved_provision_timeout(actor: object) -> float | None:
+    """Seconds allowed for one review-tree provisioning run, or None for default.
+
+    Rides the same launcher binding as the argv, because the two are one
+    setting: a deployment that declares a multi-manifest install is the same
+    deployment that needs longer than the default to run it.
+    """
+    launcher = getattr(actor, "launcher", None)
+    seconds = getattr(launcher, "provision_timeout_s", None)
+    return None if seconds is None else float(seconds)
+
+
 class FactoryScheduler:
     """Advance every ready lane one frozen stage at a time."""
 
@@ -927,12 +961,15 @@ class FactoryScheduler:
             Callable[[str, st.LaneStage, st.LaneStage], None]
         ] = None,
         compiled: Optional[st.CompiledPlan] = None,
+        provision_argv: Optional[Sequence[str]] = None,
     ) -> None:
         self.store = store
         self.run_id = run_id
         self.actor = actor
         self.runtime = runtime
         self.target = target
+        self._provision_argv = _resolved_provision_argv(actor, provision_argv)
+        self._provision_timeout_s = _resolved_provision_timeout(actor)
         self.stage_started = stage_started
         self.stage_completed = stage_completed
         self._compiled = compiled
@@ -1937,6 +1974,8 @@ class FactoryScheduler:
                 public_contract=product_contract,
                 gate=self._sealed_suite_gate(lane),
                 runtime_root=Path(self.target.target_repository_root),
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
             )
         except prv.PrivatePathCollisionError as exc:
             self._complete_test_invalidation(
@@ -2154,6 +2193,8 @@ class FactoryScheduler:
                 scratch_root=self.runtime.path / "worktrees",
                 gate=self._sealed_suite_gate(lane),
                 runtime_root=Path(self.target.target_repository_root),
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
             )
             if result["failed"]:
                 failures.append(lane.lane_id)
