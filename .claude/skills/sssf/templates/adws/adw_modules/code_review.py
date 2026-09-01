@@ -23,6 +23,67 @@ _RUNNER_REVISE = {
     "violated_requirement": "accepted sealed tests bind the candidate",
 }
 
+_INTEGRATION_GATE_REVISE = {
+    "implementation_area": "merged integration surface",
+    "observed_behavior": "a run-level sealed suite failed against the merged integration",
+    "required_behavior": "the merged integration must pass every run-level sealed suite",
+    "violated_requirement": "an unconsumed tests lane gates the run, not a single lane",
+}
+
+
+def run_integration_gate(
+    *,
+    run_id: str,
+    lane_id: str,
+    input_digest: str,
+    state_root: Path,
+    integration_repo: Path,
+    integration_sha: str,
+    sealed_bundle: st.LaneArtifact,
+    scratch_root: Path,
+    gate: Mapping[str, object] | object | None = None,
+    runtime_root: Path | None = None,
+) -> Mapping[str, object]:
+    """Run one unconsumed lane's sealed suite against the merged integration head.
+
+    Same primitives as review_builder_output, aimed at the integration head instead
+    of a single lane's candidate. Read-only with respect to the vault and the repo.
+    """
+    if sealed_bundle.kind is not st.ArtifactKind.SEALED_TEST_BUNDLE:
+        raise pr.PrivateReviewError("integration gate requires SEALED_TEST_BUNDLE")
+    st.require_git_sha(integration_sha, name="integration_sha")
+    vault = hv.ensure_vault(state_root, run_id)
+    files = tc.sealed_private_files(vault, sealed_bundle)
+    if not files:
+        raise pr.PrivateReviewError("sealed bundle has no private tests")
+    dest = Path(scratch_root) / "integration-gate-{0}-{1}".format(
+        lane_id, input_digest[:12]
+    )
+    _review_tree(integration_repo, integration_sha, dest)
+    hv.copy_blobs_to_tree(vault, dest, files)
+    run = tc.run_private_suite(
+        dest,
+        tuple(files),
+        gate=gate,
+        runtime_root=runtime_root or integration_repo,
+    )
+    min_cases = int(run.get("min_cases") or 1)
+    counts = run["counts"]
+    failed = bool(
+        run["returncode"] != 0
+        or counts["failed"]
+        or counts["errored"]
+        or run["executed"] < min_cases
+    )
+    return {
+        "counts": counts,
+        "executed": run["executed"],
+        "failed": failed,
+        "lane_id": lane_id,
+        "min_cases": min_cases,
+    }
+
+
 def _review_tree(repo: Path, sha: str, dest: Path) -> Path:
     dest = Path(dest)
     if dest.exists() and dest.is_dir() and any(dest.iterdir()):
