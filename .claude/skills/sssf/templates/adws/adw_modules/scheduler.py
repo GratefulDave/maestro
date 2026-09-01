@@ -1536,9 +1536,14 @@ class FactoryScheduler:
         returned = {prv.normalize_repo_path(path) for path in files}
         declared = set(lane.declared_outputs)
         if returned != declared:
-            raise TypedTestOutputsRefused(
-                "private files must equal declared outputs"
-            )
+            undeclared = sorted(returned - declared)
+            missing = sorted(declared - returned)
+            detail = "private files must equal declared outputs"
+            if undeclared:
+                detail += "; undeclared: " + ", ".join(undeclared)
+            if missing:
+                detail += "; missing: " + ", ".join(missing)
+            raise TypedTestOutputsRefused(detail)
 
 
     def _require_draft_min_cases(
