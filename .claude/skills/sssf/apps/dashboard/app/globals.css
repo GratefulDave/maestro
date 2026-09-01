@@ -878,14 +878,26 @@ code,
   color: var(--color-ink) !important;
 }
 
-.dag-node-running {
+.dag-node-running,
+.dag-node-writing_tests,
+.dag-node-building {
   border-color: var(--color-info) !important;
 }
 
 .dag-node-reviewing,
 .dag-node-candidate_ready,
-.dag-node-waiting_for_new_candidate {
+.dag-node-waiting_for_new_candidate,
+.dag-node-reviewing_tests,
+.dag-node-reviewing_code {
   border-color: var(--color-accent) !important;
+}
+
+.dag-node-ready_to_merge {
+  border-color: var(--color-ready, #87afd7) !important;
+}
+
+.dag-node-waiting_for_user {
+  border-color: var(--color-warn) !important;
 }
 
 .dag-node-repair_handoff,
@@ -901,7 +913,9 @@ code,
   border-color: var(--color-warn) !important;
 }
 
-.dag-node-verified {
+.dag-node-verified,
+.dag-node-tests_sealed,
+.dag-node-merged {
   border-color: var(--color-ok) !important;
 }
 

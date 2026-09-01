@@ -1,4 +1,13 @@
 export const STATUS_TONES: Record<string, string> = {
+  // artifact-factory LaneStage (adws/adw_modules/scheduler_types.py::LaneStage)
+  planned: "pending",
+  writing_tests: "info",
+  reviewing_tests: "review",
+  tests_sealed: "ok",
+  building: "info",
+  reviewing_code: "review",
+  ready_to_merge: "ready",
+  waiting_for_user: "warn",
   merged: "ok",
   verified: "ok",
   accepted: "ok",

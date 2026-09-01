@@ -10,6 +10,14 @@ import type { LucideIcon } from "@/lib/icons";
 import { STATUS_TONES } from "@/lib/status";
 
 const STATUS_ICONS: Record<string, LucideIcon> = {
+  planned: Circle,
+  writing_tests: Loader2,
+  reviewing_tests: Shield,
+  tests_sealed: CheckCircle2,
+  building: Loader2,
+  reviewing_code: Shield,
+  ready_to_merge: Clock,
+  waiting_for_user: Clock,
   merged: CheckCircle2,
   verified: CheckCircle2,
   accepted: CheckCircle2,
@@ -33,6 +41,13 @@ const STATUS_ICONS: Record<string, LucideIcon> = {
 
 };
 
+const SPINNING_STATUSES = new Set([
+  "running",
+  "cancelling",
+  "writing_tests",
+  "building",
+]);
+
 export function StatusPill({
   status,
   label,
@@ -45,7 +60,7 @@ export function StatusPill({
   const normalized = status.toLowerCase();
   const Icon = STATUS_ICONS[normalized] ?? Circle;
   const tone = STATUS_TONES[normalized] ?? "pending";
-  const spinning = normalized === "running" || normalized === "cancelling";
+  const spinning = SPINNING_STATUSES.has(normalized);
 
   return (
     <span className={`status-pill status-${tone}`} title={title}>
