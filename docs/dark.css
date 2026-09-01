@@ -1,0 +1,71 @@
+/* Maestro docs dark design system.
+   Source of truth: docs/architecture/index.html */
+
+:root {
+  color-scheme: dark;
+  --color-paper:       #2d3142;
+  --color-paper-2:     #393e53;
+  --color-ink:         #f5f5f5;
+  --color-muted:       #bfc0c0;
+  --color-soft:        #8e98ac;
+  --color-rule:        rgba(245, 245, 245, 0.12);
+  --color-accent:      #f08a59;
+  --color-accent-tint: rgba(240, 138, 89, 0.08);
+  --color-link:        #6a95d8;
+  --font-sans:   'Geist', system-ui, sans-serif;
+  --font-serif:  'Instrument Serif', 'Times New Roman', serif;
+  --font-mono:   'Geist Mono', ui-monospace, Menlo, monospace;
+
+  --paper: var(--color-paper);
+  --paper-2: var(--color-paper-2);
+  --ink: var(--color-ink);
+  --muted: var(--color-muted);
+  --soft: var(--color-soft);
+  --rule: var(--color-rule);
+  --rule-solid: rgba(191, 192, 192, 0.25);
+  --accent: var(--color-accent);
+  --accent-tint: var(--color-accent-tint);
+  --link: var(--color-link);
+  --sans: var(--font-sans);
+  --serif: var(--font-serif);
+  --mono: var(--font-mono);
+}
+
+html {
+  color-scheme: dark;
+  background: var(--color-paper);
+  overflow-x: clip;
+  max-width: 100%;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  overflow-x: clip;
+  max-width: 100%;
+}
+
+a {
+  color: var(--color-link);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+a:hover { color: var(--color-ink); }
+
+a:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+code, pre { font-family: var(--font-mono); }
+code { color: var(--color-ink); }
+
+.frame,
+.figure,
+.diagram-scroll,
+.table-wrap {
+  overflow-x: auto;
+  min-width: 0;
+  max-width: 100%;
+}
