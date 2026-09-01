@@ -820,11 +820,33 @@ class HerdrStageActor:
         )
         return frozenset(item for item in listed.split("\0") if item)
 
-    def _collect_uncommitted(self, checkout: Path) -> dict[str, str]:
+    def _collect_uncommitted(
+        self, checkout: Path, outputs: Sequence[str] = ()
+    ) -> dict[str, str]:
+        """Collect role output from the working tree.
+
+        Scoped to `outputs` when the caller passes them, the same way
+        `_commit_declared` scopes the builder's pathspec. Only a tests lane
+        passes a scope: its private files must equal its declared outputs, so
+        an unscoped sweep read a toolchain byproduct the role never declared
+        -- a package manager's lockfile, a stray `__pycache__` entry -- as
+        role output and refused TYPED_TEST_OUTPUTS for a file no role wrote.
+        A build lane declares product paths its tester does not write to, and
+        the unscoped sweep is how that lane's private tests are delivered, so
+        it passes no scope and keeps the whole-tree behaviour.
+        """
+        requested = tuple(str(item) for item in outputs)
+        pathspec = ("--",) + requested if requested else ()
         listed = self._git(
-            checkout, "ls-files", "-o", "-m", "--exclude-standard", check=False
+            checkout,
+            "ls-files",
+            "-o",
+            "-m",
+            "--exclude-standard",
+            *pathspec,
+            check=False,
         )
-        deleted = self._deleted_tracked(checkout)
+        deleted = self._deleted_tracked(checkout, *requested)
         files: dict[str, str] = {}
         for rel in listed.splitlines():
             rel = rel.strip()
@@ -1283,7 +1305,10 @@ class HerdrStageActor:
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         files = dict(payload.get("private_files") or {})
         if (cwd_used / ".git").exists():
-            files.update(self._collect_uncommitted(cwd_used))
+            scope: Sequence[str] = ()
+            if ctx.lane.lane_kind == st.LANE_KIND_TESTS:
+                scope = ctx.lane.declared_outputs
+            files.update(self._collect_uncommitted(cwd_used, scope))
         return {"private_files": files}
 
     def review_tests(

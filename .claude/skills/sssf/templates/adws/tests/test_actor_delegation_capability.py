@@ -35,9 +35,9 @@ from adw_modules.scheduler_types import (
 )
 
 _ROLE_ROUTES: Mapping[str, Mapping[str, str]] = {
-    "tester": {"route": "claude", "model": "opus", "effort": "high"},
+    "tester": {"route": "omp", "profile": "grok"},
     "test-reviewer": {"route": "omp", "profile": "openai-performance"},
-    "builder": {"route": "omp", "profile": "grok"},
+    "builder": {"route": "claude", "model": "opus", "effort": "high"},
     "code-reviewer": {"route": "omp", "profile": "openai-performance"},
     "integration-reviewer": {
         "route": "omp",
@@ -710,6 +710,67 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             with self.assertRaisesRegex(FactoryRefused, "ROLE_OUTPUT_UNSAFE"):
                 actor._await_envelope(handle, envelope, "tester")
 
+
+    def _tester_private_files(
+        self, *, lane_kind: str | None, outputs: tuple[str, ...], files: dict
+    ) -> set:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            product = root / "product"
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            head = _init_repo(product)
+            target = gitpub.bind_target_worktree(product, "refs/heads/main")
+            ctx = LaneContext(
+                run_id="run-typed",
+                lane=_lane(lane_kind=lane_kind, outputs=outputs),
+                plan_revision=1,
+                plan_digest="cd" * 32,
+                plan_artifact_ref="plan:x",
+                input_digest="11" * 32,
+                stage=LaneStage.WRITING_TESTS,
+                artifacts={},
+                builder_base_sha=head,
+            )
+            actor = maestro.HerdrStageActor(
+                cast(lch.LauncherAdapter, RecordingLauncher(files=files)),
+                state,
+                target,
+                _ROLE_ROUTES,
+            )
+            return set(actor.write_tests(ctx)["private_files"])
+
+    def test_a_tests_lane_drops_an_undeclared_toolchain_byproduct(self) -> None:
+        """A tests lane returns its declared outputs, not toolchain leavings.
+
+        Observed in production: a tester ran an unprompted `bun install`, the
+        resulting `bun.lock` was swept out of the working tree as role output,
+        and the lane refused TYPED_TEST_OUTPUTS naming a file no role wrote.
+        """
+        declared = "tests/architecture/test_wp7.py"
+        self.assertEqual(
+            self._tester_private_files(
+                lane_kind="tests",
+                outputs=(declared,),
+                files={declared: "def test_x():\n    raise\n", "bun.lock": "{}\n"},
+            ),
+            {declared},
+        )
+
+    def test_a_build_lane_still_collects_its_undeclared_private_tests(self) -> None:
+        """A build lane declares product paths its tester does not write to.
+
+        Its private tests live at undeclared paths, so that sweep stays whole
+        tree: scoping it to the declared outputs would deliver nothing.
+        """
+        self.assertEqual(
+            self._tester_private_files(
+                lane_kind="build",
+                outputs=("product.py",),
+                files={"tests/hidden.py": "assert False\n"},
+            ),
+            {"tests/hidden.py"},
+        )
 
     def test_tester_prompt_names_envelope_and_keeps_private_files_off_product(
         self,
@@ -1547,9 +1608,9 @@ class RoleRouteBindingTest(unittest.TestCase):
             self.assertEqual(
                 actual,
                 {
-                    "tester": ("claude", "opus", "high", ""),
+                    "tester": ("omp", "", "", "grok"),
                     "test-reviewer": ("omp", "", "", "openai-performance"),
-                    "builder": ("omp", "", "", "grok"),
+                    "builder": ("claude", "opus", "high", ""),
                     "code-reviewer": ("omp", "", "", "openai-performance"),
                     "integration-reviewer": (
                         "omp",
@@ -1560,19 +1621,21 @@ class RoleRouteBindingTest(unittest.TestCase):
                 },
             )
 
-    def test_template_config_routes_omp_roles_to_shared_base_profiles(self) -> None:
+    def test_template_config_routes_roles_to_requested_backends(self) -> None:
         routes = _template_role_routes()
-        self.assertEqual(routes["tester"]["route"], "claude")
-        self.assertEqual(routes["tester"]["model"], "opus")
-        self.assertEqual(routes["tester"]["effort"], "high")
-        self.assertEqual(routes["tester"]["profile"], "")
-        self.assertEqual(routes["builder"]["profile"], "grok")
+        self.assertEqual(routes["tester"]["route"], "omp")
+        self.assertEqual(routes["tester"]["model"], "")
+        self.assertEqual(routes["tester"]["effort"], "")
+        self.assertEqual(routes["tester"]["profile"], "grok")
+        self.assertEqual(routes["builder"]["route"], "claude")
+        self.assertEqual(routes["builder"]["model"], "opus")
+        self.assertEqual(routes["builder"]["effort"], "high")
+        self.assertEqual(routes["builder"]["profile"], "")
         for role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
             self.assertEqual(routes[role]["route"], "omp")
             self.assertEqual(routes[role]["model"], "")
             self.assertEqual(routes[role]["effort"], "")
             self.assertEqual(routes[role]["profile"], "openai-performance")
-        self.assertEqual(routes["builder"]["route"], "omp")
         raw = (ADWS / "maestro.config.yaml").read_text(encoding="utf-8")
         for obsolete in (
             "grok-test",

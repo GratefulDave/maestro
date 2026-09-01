@@ -20,9 +20,9 @@ import maestro
 
 def _role_routes() -> dict[str, dict[str, str]]:
     return {
-        "tester": {"route": "claude", "model": "opus", "effort": "high"},
+        "tester": {"route": "omp", "profile": "grok"},
         "test-reviewer": {"route": "omp", "profile": "openai-performance"},
-        "builder": {"route": "omp", "profile": "grok"},
+        "builder": {"route": "claude", "model": "opus", "effort": "high"},
         "code-reviewer": {"route": "omp", "profile": "openai-performance"},
         "integration-reviewer": {
             "route": "omp",

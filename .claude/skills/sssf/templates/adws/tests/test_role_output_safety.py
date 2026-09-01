@@ -33,9 +33,9 @@ from adw_modules import launcher as lch
 from adw_modules.scheduler import FactoryRefused
 
 _ROLE_ROUTES: Mapping[str, Mapping[str, str]] = {
-    "tester": {"route": "claude", "model": "opus", "effort": "high"},
+    "tester": {"route": "omp", "profile": "grok"},
     "test-reviewer": {"route": "omp", "profile": "openai-performance"},
-    "builder": {"route": "omp", "profile": "grok"},
+    "builder": {"route": "claude", "model": "opus", "effort": "high"},
     "code-reviewer": {"route": "omp", "profile": "openai-performance"},
     "integration-reviewer": {"route": "omp", "profile": "openai-performance"},
 }
@@ -118,9 +118,9 @@ class _RoleOutputCase(unittest.TestCase):
         self.base = _git(self.checkout, "rev-parse", "HEAD")
         return self.base
 
-    def collect(self) -> dict[str, str]:
+    def collect(self, outputs: Sequence[str] = ()) -> dict[str, str]:
         with _watchdog():
-            return self.actor._collect_uncommitted(self.checkout)
+            return self.actor._collect_uncommitted(self.checkout, outputs)
 
     def commit_declared(self, outputs: Sequence[str]) -> tuple[str, bool]:
         with _watchdog():
@@ -230,6 +230,47 @@ class SharedPolicyTest(_RoleOutputCase):
             maestro._role_output_disposition(
                 self.checkout, self.checkout / "never-written.py"
             )
+
+
+class ScopedTesterCollectionTest(_RoleOutputCase):
+    """Declared outputs scope the tester sweep, as they scope the builder.
+
+    A tests lane must return exactly its declared outputs. An unscoped sweep
+    read a toolchain byproduct the role never declared -- observed in
+    production as a `bun.lock` written by an unprompted `bun install`, and as
+    a stray `__pycache__` entry -- as role output, and the lane then refused
+    TYPED_TEST_OUTPUTS for a file no role had authored.
+    """
+
+    def test_undeclared_byproduct_is_not_role_output(self) -> None:
+        self.write("tests/architecture/test_wp7.py", "def test_x():\n    raise\n")
+        self.write("bun.lock", '{"lockfileVersion": 2}\n')
+        self.write("tests/architecture/__pycache__/test_wp7.cpython-312.pyc", "")
+        self.assertEqual(
+            self.collect(("tests/architecture/test_wp7.py",)),
+            {"tests/architecture/test_wp7.py": "def test_x():\n    raise\n"},
+        )
+
+    def test_unscoped_collection_still_sweeps_everything(self) -> None:
+        self.write("tests/architecture/test_wp7.py", "x = 1\n")
+        self.write("bun.lock", "lock\n")
+        self.assertEqual(
+            self.collect(),
+            {"tests/architecture/test_wp7.py": "x = 1\n", "bun.lock": "lock\n"},
+        )
+
+    def test_undeclared_output_absent_reports_as_missing(self) -> None:
+        self.write("bun.lock", "lock\n")
+        self.assertEqual(self.collect(("tests/architecture/test_wp7.py",)), {})
+
+    def test_deleted_declared_output_still_refuses(self) -> None:
+        self.write("tests/architecture/test_wp7.py", "x = 1\n")
+        self.track("tests/architecture/test_wp7.py")
+        (self.checkout / "tests/architecture/test_wp7.py").unlink()
+        with self.assertRaisesRegex(
+            FactoryRefused, "ROLE_OUTPUT_DELETED:tests/architecture/test_wp7.py"
+        ):
+            self.collect(("tests/architecture/test_wp7.py",))
 
 
 class TesterCollectionMatrixTest(_RoleOutputCase):
