@@ -170,15 +170,31 @@ def _topology_reply(
             return {"result": {"workspace": _child_record()}}
         return None
     if verb == ("worktree", "list"):
+        # The repository's whole worktree set, as Herdr answers it: the
+        # source checkout first, carrying the Space open on it, then the
+        # linked lane children. This is where a Space's binding is read
+        # from -- `WorkspaceInfo.worktree` is not it.
         return {
             "result": {
-                "source": {"source_workspace_id": PARENT_ID},
+                "source": {
+                    "repo_key": "repo:/repo/product",
+                    "repo_name": "product",
+                    "repo_root": "/repo/product",
+                    "source_checkout_path": "/repo/product",
+                    "source_workspace_id": PARENT_ID,
+                },
                 "worktrees": [
+                    {
+                        "path": "/repo/product",
+                        "open_workspace_id": PARENT_ID,
+                        "is_linked_worktree": False,
+                        "label": "product",
+                    },
                     {
                         "open_workspace_id": CHILD_ID,
                         "is_linked_worktree": True,
                         "label": LANE,
-                    }
+                    },
                 ],
             }
         }
@@ -249,25 +265,52 @@ class WorkspaceAdoptTest(unittest.TestCase):
 
         launcher._herdr = fake_herdr  # type: ignore[method-assign]
         self.assertEqual(launcher._run_workspace({}), PARENT_ID)
-        self.assertTrue(any(call[:2] == ("workspace", "list") for call in calls))
-        self.assertTrue(any(call[:2] == ("workspace", "get") for call in calls))
+        # The parent is resolved from the repository's worktree listing --
+        # once, keyed on the checkout -- and not from `workspace list`, whose
+        # records carry no binding to match on.
+        listings = [call for call in calls if call[:2] == ("worktree", "list")]
+        self.assertEqual(len(listings), 1)
+        self.assertIn("--cwd", listings[0])
+        self.assertFalse(any(call[:2] == ("workspace", "list") for call in calls))
         self.assertFalse(any(call[:2] == ("workspace", "create") for call in calls))
 
     def test_untagged_space_on_the_repo_is_the_parent_and_is_not_tagged(self) -> None:
-        """The operator's own Space -- non-linked, bound to the primary
-        checkout, carrying no Maestro tokens -- is the parent. It is adopted
-        by binding and never tagged."""
+        """The operator's own Space -- the one Herdr names as the source
+        checkout, carrying no Maestro tokens and no `worktree` field of its
+        own -- is the parent. It is adopted by binding and never tagged."""
         launcher = _bare_launcher("FDAdb-e892")
         calls: list[tuple[str, ...]] = []
+        # Exactly the shape Herdr reports for a Space the operator opened:
+        # no `worktree` key at all, while `worktree list` names it the source.
         operator = _workspace_info(
             "wOP", "product", tokens=None, checkout="/repo/product", linked=False
         )
+        operator.pop("worktree")
 
         def fake_herdr(*args: str, **kwargs: object) -> dict:
             del kwargs
             calls.append(args)
-            if args[:2] == ("workspace", "list"):
-                return {"result": {"type": "workspace_list", "workspaces": [operator]}}
+            if args[:2] == ("worktree", "list"):
+                return {
+                    "result": {
+                        "type": "worktree_list",
+                        "source": {
+                            "repo_key": "repo:/repo/product",
+                            "repo_name": "product",
+                            "repo_root": "/repo/product",
+                            "source_checkout_path": "/repo/product",
+                            "source_workspace_id": "wOP",
+                        },
+                        "worktrees": [
+                            {
+                                "path": "/repo/product",
+                                "open_workspace_id": "wOP",
+                                "is_linked_worktree": False,
+                                "label": "product",
+                            }
+                        ],
+                    }
+                }
             if args[:2] == ("workspace", "get") and args[2] == "wOP":
                 return {"result": {"type": "workspace_info", "workspace": operator}}
             raise AssertionError(args)

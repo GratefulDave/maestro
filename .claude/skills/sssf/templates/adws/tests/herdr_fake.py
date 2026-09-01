@@ -4,9 +4,15 @@ Every reply is shaped like the real CLI's ``{"result": {"type": ..., ...}}``
 envelope, with the record shapes from ``herdr api schema --json``:
 
 * ``WorkspaceInfo``: ``workspace_id, number, label, focused, pane_count,
-  tab_count, active_tab_id, agent_status, worktree`` where ``worktree`` is a
-  ``WorkspaceWorktreeInfo`` (``repo_key, repo_name, repo_root, checkout_path,
-  is_linked_worktree``) or ``None``; ``tokens`` is present only once tagged.
+  tab_count, active_tab_id, agent_status``; ``tokens`` is present only once
+  tagged. ``worktree`` (a ``WorkspaceWorktreeInfo`` of ``repo_key, repo_name,
+  repo_root, checkout_path, is_linked_worktree``) is present ONLY for a Space
+  Herdr bound when it created it -- ``workspace create --cwd <repo>`` on a
+  repository with no source Space yet, or ``worktree open``. It is absent
+  from a Space the operator opened or the session restored, and from a second
+  create on an already-sourced repository, and is never backfilled. It is
+  therefore NOT a Space's repository binding; ``worktree list`` is, and
+  answers for every Space. See ``add_workspace(reports_binding=...)``.
 * ``WorktreeInfo``: ``path, branch, is_bare, is_detached, is_prunable,
   is_linked_worktree, label, open_workspace_id`` (``None`` once closed).
 * ``TabInfo``: ``tab_id, workspace_id, number, label, focused, pane_count,
@@ -54,28 +60,22 @@ Public surface, kept small on purpose (other test modules import it):
     A Herdr error code ``pane close`` / ``workspace close`` refuses with.
 ``.cascade_close_children``
     Whether ``workspace close`` on a non-linked Space also closes the linked
-    children opened under it (default False: children survive). Whether real
-    Herdr cascades is UNOBSERVED; the launcher is tested under both.
+    children opened under it. Default True: OBSERVED on herdr 0.8.2 -- closing
+    the parent Space removed its linked child from ``workspace list``. The
+    launcher is still tested under both.
 ``.source_space_rule``
     Which non-linked Space Herdr treats as a repository's source, i.e. the
     Space a linked child is grouped under and reported as
-    ``WorktreeSourceInfo.source_workspace_id``. ``"requested"`` (default):
-    the ``--workspace`` parent. ``"first-open"`` / ``"last-open"``: the
-    earliest / latest live non-linked Space bound to the same ``repo_root``
-    wins, whatever ``--workspace`` named. Under Shape A (lanes are linked
-    children of the operator's own Space) the normal case has exactly one
-    non-linked Space on the repository and the rule cannot matter; it only
-    matters when a second such Space appears, which the launcher refuses by
-    name. The real precedence rule is UNOBSERVED: neither
-    ``herdr worktree open --help`` nor the bundled schema states it. To
-    observe it, in a throwaway Herdr session with a Space already open at a
-    repository's primary checkout: ``herdr workspace create --cwd <primary>
-    --label probe``, ``herdr worktree open --workspace <probe id> --path
-    <linked checkout>``, then ``herdr worktree list --workspace <probe id>``
-    and read ``source.source_workspace_id`` and the sidebar grouping.
+    ``WorktreeSourceInfo.source_workspace_id``. Default ``"first-open"``:
+    OBSERVED on herdr 0.8.2 -- a repository's source is the first Space
+    opened on its primary checkout, and a second ``workspace create --cwd
+    <same repo>`` neither displaces it nor receives a binding of its own.
+    ``"last-open"`` and ``"requested"`` remain for contrast.
 ``.source_workspace_nullable``
     Report ``source_workspace_id: null`` in ``worktree list`` (the schema
-    allows it); the launcher must then rely on the listing membership.
+    allows it); the launcher must then rely on the listing membership. Real
+    Herdr omits the key entirely when no Space is open on the source
+    checkout, which the fake also does whenever no live Space is bound.
 ``.snapshot()`` / ``.records_unchanged(snapshot, ids)``
     Deep copy of all state; whether the named ids are byte-identical to it.
 ``FakeHerdrStopped``
@@ -159,8 +159,8 @@ class FakeHerdr:
         self.wait_output_error = ""
         self.close_workspace_error = ""
         self.close_pane_error = ""
-        self.cascade_close_children = False
-        self.source_space_rule = "requested"
+        self.cascade_close_children = True
+        self.source_space_rule = "first-open"
         self.source_workspace_nullable = False
         #: cwd -> repo_root for checkouts that are linked worktrees of a repo
         #: (``workspace create --cwd <linked checkout>`` binds as linked).
@@ -212,6 +212,7 @@ class FakeHerdr:
         worktree: Optional[dict],
         *,
         tokens: Optional[dict[str, str]] = None,
+        reports_binding: bool = False,
     ) -> dict:
         workspace_id = self._next("w")
         record = {
@@ -224,6 +225,11 @@ class FakeHerdr:
             "active_tab_id": "",
             "agent_status": "unknown",
             "worktree": worktree,
+            # Whether this Space's *emitted* WorkspaceInfo carries `worktree`.
+            # The fake keeps the binding internally for every Space so
+            # `worktree list` can answer, exactly as real Herdr resolves it
+            # live; what varies is whether the record reports it.
+            "_reports_binding": bool(reports_binding and worktree),
         }
         if tokens:
             record["tokens"] = dict(tokens)
@@ -256,14 +262,24 @@ class FakeHerdr:
         linked: bool = False,
         repo_root: str | Path | None = None,
         tokens: Optional[dict[str, str]] = None,
+        reports_binding: bool = False,
     ) -> str:
+        """Plant a Space the launcher did not create.
+
+        `reports_binding` defaults to False because that is the shape of every
+        Space an operator has open: Herdr fills `WorkspaceInfo.worktree` in
+        only for a Space it bound at creation, and never backfills. The Space
+        is still the repository's source in `worktree list`.
+        """
         with self.lock:
             resolved = _resolved(str(cwd))
             if linked:
                 root = _resolved(str(repo_root or Path(resolved).parent))
                 self.linked_checkouts[resolved] = root
             binding = self._binding_for_cwd(resolved)
-            return self._new_workspace(label, binding, tokens=tokens)["workspace_id"]
+            return self._new_workspace(
+                label, binding, tokens=tokens, reports_binding=reports_binding
+            )["workspace_id"]
 
     def open_child(
         self,
@@ -389,7 +405,9 @@ class FakeHerdr:
         if verb == ("worktree", "open"):
             return self._worktree_open(args)
         if verb == ("worktree", "list"):
-            return self._worktree_list(flag(args, "--workspace") or "")
+            return self._worktree_list(
+                flag(args, "--workspace") or "", flag(args, "--cwd") or ""
+            )
         if verb == ("tab", "list"):
             workspace_id = flag(args, "--workspace") or ""
             self._require_workspace(workspace_id)
@@ -521,6 +539,16 @@ class FakeHerdr:
 
     def _workspace_info(self, workspace_id: str) -> dict:
         record = dict(self.workspaces[workspace_id])
+        # Herdr 0.8.2 emits `WorkspaceInfo.worktree` only for a Space it bound
+        # when it created it -- `workspace create --cwd <repo>` on a
+        # repository with no source Space yet, or `worktree open`. A Space the
+        # operator opened, one restored with the session, and a second Space
+        # created on an already-sourced repository all report no binding, even
+        # while `worktree list` names one of them the repository's source.
+        # Herdr never backfills the field, so it is not the binding and
+        # nothing may read it as one.
+        if not record.pop("_reports_binding", False):
+            record.pop("worktree", None)
         record["pane_count"] = sum(
             1
             for pane in self.panes.values()
@@ -582,7 +610,18 @@ class FakeHerdr:
     def _workspace_create(self, args: tuple[str, ...]) -> dict:
         cwd = flag(args, "--cwd") or ""
         label = flag(args, "--label") or ""
-        record = self._new_workspace(label, self._binding_for_cwd(cwd))
+        binding = self._binding_for_cwd(cwd)
+        # A repository has one source Space: the first one opened on it. A
+        # create that follows is handed no binding of its own (observed:
+        # `workspace create --cwd <repo>` twice, second record has no
+        # `worktree`), and does not displace the source.
+        repo_root = str(binding.get("repo_root") or "") if binding else ""
+        already_sourced = bool(repo_root) and bool(
+            self._source_space_for("", repo_root)
+        )
+        record = self._new_workspace(
+            label, binding, reports_binding=not already_sourced
+        )
         workspace_id = record["workspace_id"]
         tab = self.tabs[record["active_tab_id"]]
         root = next(
@@ -605,20 +644,30 @@ class FakeHerdr:
         return self.linked_checkouts.get(resolved) or resolved
 
     def _source_space_for(self, requested: str, repo_root: str) -> str:
-        """The Space a linked child of `repo_root` is grouped under."""
-        if self.source_space_rule in ("first-open", "last-open"):
-            bound = [
-                wid
-                for wid, rec in self.workspaces.items()
-                if wid not in self.closed_workspaces
-                and isinstance(rec.get("worktree"), dict)
-                and rec["worktree"].get("is_linked_worktree") is False
-                and _resolved(str(rec["worktree"].get("repo_root") or ""))
-                == _resolved(repo_root)
-            ]
-            if bound:
-                return bound[0] if self.source_space_rule == "first-open" else bound[-1]
-        return requested
+        """The Space Herdr reports as `repo_root`'s source, or ``""``.
+
+        Empty when no live Space is open on the repository's primary
+        checkout: real `worktree list` then omits `source_workspace_id`
+        entirely rather than naming the Space that asked.
+        """
+        if not repo_root:
+            return requested
+        bound = [
+            wid
+            for wid, rec in self.workspaces.items()
+            if wid not in self.closed_workspaces
+            and isinstance(rec.get("worktree"), dict)
+            and rec["worktree"].get("is_linked_worktree") is False
+            and _resolved(str(rec["worktree"].get("repo_root") or ""))
+            == _resolved(repo_root)
+        ]
+        if self.source_space_rule == "requested" and requested:
+            return requested
+        if not bound:
+            # No live Space is open on the primary checkout. Herdr reports no
+            # source at all; it does not name the Space that asked.
+            return ""
+        return bound[-1] if self.source_space_rule == "last-open" else bound[0]
 
     def _open_linked(self, parent_id: str, path: str, label: str) -> dict:
         # Real Herdr does not refuse an unbound or linked `--workspace`; the
@@ -627,7 +676,11 @@ class FakeHerdr:
         repo_root = self._repo_root_of(parent_id, path)
         resolved = _resolved(path)
         self.linked_checkouts[resolved] = repo_root
-        child = self._new_workspace(label, self._binding_for_cwd(resolved))
+        # Herdr binds a Space it opens on a worktree and reports it: observed
+        # `worktree open` -> `workspace.worktree.is_linked_worktree: true`.
+        child = self._new_workspace(
+            label, self._binding_for_cwd(resolved), reports_binding=True
+        )
         source_id = self._source_space_for(parent_id, repo_root)
         self.worktrees.setdefault(source_id, []).append(
             {
@@ -691,27 +744,35 @@ class FakeHerdr:
             }
         }
 
-    def _worktree_list(self, parent_id: str) -> dict:
-        self._require_workspace(parent_id)
-        binding = self.workspaces[parent_id].get("worktree")
-        repo_root = str(binding.get("repo_root") or "") if isinstance(binding, dict) else ""
-        source_id = self._source_space_for(parent_id, repo_root) if repo_root else parent_id
+    def _worktree_list(self, parent_id: str = "", cwd: str = "") -> dict:
+        """`worktree list` for a Space (`--workspace`) or a path (`--cwd`).
+
+        Both answer about the *repository*: `source` describes the primary
+        checkout and names the Space open on it, and `worktrees` is the whole
+        set. A `--cwd` inside a linked checkout resolves to the same primary,
+        and a path outside any work tree is `not_git_worktree`.
+        """
+        if parent_id:
+            self._require_workspace(parent_id)
+            binding = self.workspaces[parent_id].get("worktree")
+        else:
+            binding = self._binding_for_cwd(cwd)
+        if not isinstance(binding, dict):
+            self._raise(lch.NOT_GIT_WORKTREE)
+        repo_root = str(binding.get("repo_root") or "")
+        if not repo_root:
+            self._raise(lch.NOT_GIT_WORKTREE)
+        source_id = self._source_space_for(parent_id, repo_root)
         source: dict = {
-            "repo_key": "",
-            "repo_name": "",
-            "repo_root": "",
-            "source_checkout_path": "",
-            "source_workspace_id": None if self.source_workspace_nullable else source_id,
+            "repo_key": "repo:{}".format(repo_root),
+            "repo_name": Path(repo_root).name,
+            "repo_root": repo_root,
+            "source_checkout_path": repo_root,
         }
-        if isinstance(binding, dict):
-            source.update(
-                {
-                    "repo_key": str(binding.get("repo_key") or ""),
-                    "repo_name": str(binding.get("repo_name") or ""),
-                    "repo_root": str(binding.get("repo_root") or ""),
-                    "source_checkout_path": str(binding.get("checkout_path") or ""),
-                }
-            )
+        if self.source_workspace_nullable:
+            source["source_workspace_id"] = None
+        elif source_id:
+            source["source_workspace_id"] = source_id
         # The worktrees of a repository are a repository-level fact: any
         # Space bound to the repo lists them all, including those opened
         # under a Space that has since closed.
@@ -724,7 +785,20 @@ class FakeHerdr:
         ]
         if source_id not in keys:
             keys.append(source_id)
-        worktrees = []
+        # The primary checkout is a worktree like any other, and is the entry
+        # that reports which Space is open on the source.
+        worktrees = [
+            {
+                "path": _resolved(repo_root),
+                "branch": "main",
+                "is_bare": False,
+                "is_detached": False,
+                "is_prunable": False,
+                "is_linked_worktree": False,
+                "label": Path(repo_root).name,
+                "open_workspace_id": source_id or None,
+            }
+        ]
         for key in keys:
             for item in self.worktrees.get(key, ()):
                 entry = dict(item)
