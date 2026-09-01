@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -321,10 +320,64 @@ def private_draft_overlay_paths(
 
 
 
+#: Which runner a sealed file's name names. `.py` is pytest outright; a
+#: JavaScript or TypeScript file only names vitest when it is a test file, so a
+#: `.ts` helper sealed beside a `.test.ts` suite does not get a vote of its own.
+#: Anything else votes for nothing.
+_PYTEST_SUFFIX = ".py"
+_VITEST_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_VITEST_STEMS = (".test", ".spec")
+
+
+def _file_runner(path: str) -> str | None:
+    """The runner a single sealed file names, or `None` when it names none."""
+    name = str(path).rsplit("/", 1)[-1]
+    if name.endswith(_PYTEST_SUFFIX):
+        return "pytest"
+    for extension in _VITEST_EXTENSIONS:
+        if name.endswith(extension):
+            stem = name[: -len(extension)]
+            if stem.endswith(_VITEST_STEMS):
+                return "vitest"
+            return None
+    return None
+
+
+def _derive_runner(files: Sequence[str]) -> str:
+    """The one runner a sealed file set names, or a refusal.
+
+    Nothing in the artifact-factory plan schema can supply a gate —
+    `plan_model.LANE_KEYS` has no `gate` key and `plan_validate` refuses a lane
+    carrying one — so every sealed suite arrives here with `gate=None`. This
+    used to answer `pytest` unconditionally, which ran a vitest suite under
+    pytest: `found no collectors for …/paid-dpa.test.ts`, exit 4, zero cases
+    executed, which `code_review` reads as a failed sealed suite and turns a
+    reviewer PASS into REVISE. Deriving is the fix; guessing is what broke it,
+    so an ambiguous or unreadable file set refuses instead of picking a side.
+    """
+    named = {runner for runner in map(_file_runner, files) if runner is not None}
+    if len(named) == 1:
+        return named.pop()
+    # Only the distinct suffixes go in the message: the sealed file names are
+    # private and this error travels back through public review payloads.
+    suffixes = sorted(
+        {"." + str(path).rsplit(".", 1)[-1] for path in files if "." in str(path)}
+    )
+    if not named:
+        raise pr.SealedEnvironmentError(
+            "SEALED_SUITE_RUNNER_UNDERIVABLE: no sealed file names a runner "
+            "(suffixes: {0})".format(", ".join(suffixes) or "none")
+        )
+    raise pr.SealedEnvironmentError(
+        "SEALED_SUITE_RUNNER_AMBIGUOUS: sealed files name more than one runner "
+        "({0}; suffixes: {1})".format(", ".join(sorted(named)), ", ".join(suffixes))
+    )
+
+
 def _suite_gate(gate: Any, files: Sequence[str]) -> SimpleNamespace:
     if gate is None:
         return SimpleNamespace(
-            runner="pytest",
+            runner=_derive_runner(files),
             argv=tuple(files),
             cwd=".",
             min_cases=1,
@@ -351,6 +404,256 @@ def _suite_gate(gate: Any, files: Sequence[str]) -> SimpleNamespace:
         cwd=cwd,
         min_cases=int(min_cases),
     )
+
+
+# ── the interpreter the project declares ────────────────────────────────────
+#
+# Resolving pytest through `rr.resolve` finds a project-local binary, which is
+# most of the answer. It is not all of it: a project may declare
+# `requires-python = ">=3.12"` in its `pyproject.toml` while the only pytest on
+# the machine runs 3.9. That combination cannot import the project at all, and
+# the way it fails is the problem — `executed == 0`, which `code_review` reads
+# as "sealed private tests failed, errored, or did not execute" and reports
+# against the BUILDER. No builder can raise the harness's Python version, so
+# this refuses with its own typed error naming the environment instead.
+#
+# `tomllib` is stdlib from 3.11. On an older harness the version assertion is
+# skipped rather than crashing, and no third-party parser is introduced for it.
+try:  # pragma: no cover - exercised by whichever interpreter runs the suite
+    import tomllib
+except ImportError:  # pragma: no cover - Python < 3.11
+    tomllib = None  # type: ignore[assignment]
+
+_VERSION_PROBE = "import sys;print('%d.%d.%d' % sys.version_info[:3])"
+_VERSION_TIMEOUT_S = 30.0
+_SPECIFIER_CLAUSE = re.compile(r"^(===|==|!=|~=|>=|<=|>|<)\s*([0-9A-Za-z_.*+!-]+)$")
+
+
+def _release(text: str) -> tuple[int, ...] | None:
+    """The leading numeric release segments of a version, or `None`."""
+    match = re.match(r"^\s*v?(\d+(?:\.\d+)*)", str(text))
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _pad(release: Sequence[int], length: int) -> tuple[int, ...]:
+    parts = tuple(release)
+    if len(parts) >= length:
+        return parts[:length]
+    return parts + (0,) * (length - len(parts))
+
+
+def _compare(left: Sequence[int], right: Sequence[int]) -> int:
+    width = max(len(tuple(left)), len(tuple(right)))
+    one, two = _pad(left, width), _pad(right, width)
+    return (one > two) - (one < two)
+
+
+def _prefix_equal(version: Sequence[int], want: Sequence[int]) -> bool:
+    return _pad(version, len(tuple(want))) == tuple(want)
+
+
+def _satisfies(version: Sequence[int], specifier: str) -> bool | None:
+    """Whether `version` meets a PEP 440 specifier set, or `None` if unreadable.
+
+    Deliberately small: Python's own version is always a numeric release, so
+    the epoch, pre/post/dev, and local-version rules have nothing to bite on
+    here. Anything this does not understand — including `===` arbitrary
+    equality — returns `None`, and the caller skips the assertion rather than
+    refusing a run over a specifier it cannot read.
+    """
+    for clause in str(specifier).split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        match = _SPECIFIER_CLAUSE.match(clause)
+        if match is None:
+            return None
+        operator, raw = match.group(1), match.group(2)
+        if operator == "===":
+            return None
+        wildcard = raw.endswith(".*")
+        want = _release(raw[:-2] if wildcard else raw)
+        if want is None or (wildcard and operator not in ("==", "!=")):
+            return None
+        if operator == "~=":
+            if len(want) < 2:
+                return None
+            ok = _compare(version, want) >= 0 and _prefix_equal(version, want[:-1])
+        elif operator == "==":
+            ok = (
+                _prefix_equal(version, want)
+                if wildcard
+                else _compare(version, want) == 0
+            )
+        elif operator == "!=":
+            ok = not (
+                _prefix_equal(version, want)
+                if wildcard
+                else _compare(version, want) == 0
+            )
+        elif operator == ">=":
+            ok = _compare(version, want) >= 0
+        elif operator == "<=":
+            ok = _compare(version, want) <= 0
+        elif operator == ">":
+            ok = _compare(version, want) > 0
+        else:
+            ok = _compare(version, want) < 0
+        if not ok:
+            return False
+    return True
+
+
+def _nearest_pyproject(start: Path, stop: Path) -> Path | None:
+    """The closest `pyproject.toml` at or above `start`, bounded by `stop`."""
+    current = Path(start).resolve()
+    boundary = Path(stop).resolve()
+    if current != boundary and boundary not in current.parents:
+        return None
+    while True:
+        candidate = current / "pyproject.toml"
+        if candidate.is_file():
+            return candidate
+        if current == boundary or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _requires_python(project: Path) -> str | None:
+    if tomllib is None:
+        return None
+    try:
+        with Path(project).open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, ValueError):
+        return None
+    table = data.get("project")
+    if not isinstance(table, Mapping):
+        return None
+    value = table.get("requires-python")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _python_requirements(
+    base: Path, cwd: str, files: Sequence[str]
+) -> tuple[tuple[str, str], ...]:
+    """`(pyproject path, requires-python)` for every project the suite touches.
+
+    The gate's own `cwd` and each sealed file's directory are both walked
+    upward, because a monorepo declares `requires-python` beside the service
+    under test (`services/api-gateway/pyproject.toml`) rather than at the root
+    the gate happens to run from.
+    """
+    if tomllib is None:
+        return ()
+    base = Path(base)
+    starts = [base / (cwd or ".")]
+    for path in files:
+        try:
+            relative = pr.normalize_repo_path(str(path))
+        except pr.PrivateReviewError:
+            continue
+        starts.append((base / relative).parent)
+    found: dict[str, str] = {}
+    for start in starts:
+        project = _nearest_pyproject(start, base)
+        if project is None:
+            continue
+        specifier = _requires_python(project)
+        if specifier:
+            found.setdefault(str(project), specifier)
+    return tuple(sorted(found.items()))
+
+
+def _interpreter_argv(resolved: rr.ResolvedRunner) -> tuple[str, ...] | None:
+    """How to invoke the interpreter `resolved` runs under, or `None`.
+
+    Three shapes, in falling order of certainty: an environment launcher
+    (`uv run pytest` -> `uv run python`), the interpreter sitting beside the
+    console script (`.venv/bin/pytest` -> `.venv/bin/python`), and the absolute
+    path in the console script's own shebang. `None` means the interpreter
+    could not be identified, and the caller then skips the version assertion
+    rather than refusing a runner it has not measured.
+    """
+    prefix = tuple(resolved.argv_prefix)
+    if not prefix:
+        return None
+    if len(prefix) > 1:
+        if prefix[-1] != resolved.runner:
+            return None
+        return prefix[:-1] + ("python",)
+    executable = Path(prefix[0])
+    for name in ("python", "python3"):
+        sibling = executable.parent / name
+        if sibling.is_file() and os.access(str(sibling), os.X_OK):
+            return (str(sibling),)
+    try:
+        with executable.open("rb") as handle:
+            first = handle.readline()
+    except OSError:
+        return None
+    if not first.startswith(b"#!"):
+        return None
+    tokens = first[2:].decode("utf-8", "replace").strip().split()
+    if not tokens:
+        return None
+    head = Path(tokens[0])
+    if head.is_absolute() and head.is_file() and os.access(str(head), os.X_OK):
+        return (str(head),)
+    return None
+
+
+def _interpreter_release(argv: Sequence[str], cwd: Path) -> tuple[int, ...] | None:
+    try:
+        result = subprocess.run(
+            list(argv) + ["-c", _VERSION_PROBE],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=_VERSION_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _release((result.stdout or "").strip())
+
+
+def _assert_declared_python(
+    resolved: rr.ResolvedRunner,
+    root: Path,
+    tree: Path,
+    cwd: str,
+    files: Sequence[str],
+) -> None:
+    """Refuse a pytest whose interpreter the project's own metadata rejects."""
+    if resolved.runner != "pytest":
+        return
+    requirements = _python_requirements(root, cwd, files)
+    if not requirements:
+        requirements = _python_requirements(tree, cwd, files)
+    if not requirements:
+        return
+    argv = _interpreter_argv(resolved)
+    if argv is None:
+        return
+    working = Path(root) / (cwd or ".")
+    version = _interpreter_release(argv, working if working.is_dir() else Path(root))
+    if version is None:
+        return
+    found = ".".join(str(part) for part in version)
+    for project, specifier in requirements:
+        if _satisfies(version, specifier) is not False:
+            continue
+        raise pr.SealedEnvironmentError(
+            "SEALED_SUITE_PYTHON_UNSUPPORTED: the sealed suite resolved pytest to "
+            "{0}, running Python {1}, which does not satisfy requires-python "
+            "{2!r} declared in {3}. This is a harness environment fault: the "
+            "candidate under test was never executed, and no change to it can "
+            "fix this.".format(" ".join(resolved.argv_prefix), found, specifier, project)
+        )
 
 
 def _suite_selectors(gate: SimpleNamespace, files: Sequence[str]) -> tuple[str, ...]:
@@ -420,21 +723,45 @@ def run_private_suite(
     files = tuple(paths)
     bound = _suite_gate(gate, files)
     root = Path(runtime_root or tree)
+    # Where the runner is resolved FROM is not the same question for the two
+    # runners, because only one of them has its environment bridged into the
+    # tree. `rr.COLLECT_RUNTIME_DIRS` is `("node_modules",)`: before executing,
+    # `prepare_collect_tree` symlinks the runtime root's `node_modules` into
+    # the tree, so a vitest resolved against the runtime root and the modules
+    # it imports are the same installation, and resolving vitest there is
+    # correct.
+    #
+    # Nothing bridges a Python environment. A pytest resolved against the
+    # runtime root is the REAL repository's interpreter, while
+    # `rr.execute_cases` runs it with cwd inside the review tree. Two ways that
+    # goes wrong, both silent: the repository's environment lacks what the
+    # candidate needs and the suite reports zero executed cases, or — worse —
+    # that environment has the project installed editable, `import app.x`
+    # resolves to the REAL repository's source, and the sealed suite greenly
+    # certifies code that is not the candidate's.
+    #
+    # It currently works only because the repository happens to have no
+    # `.venv`, so `_rank_candidates` falls through to `uv run pytest`, and uv
+    # discovers its environment from cwd — which is the tree. Creating a
+    # `.venv` in the repository would silently take resolution away from the
+    # tree. So pytest resolves against the tree it will execute in. If the tree
+    # has no usable environment, `rr.resolve` refuses, and an explicit
+    # `SEALED_SUITE_RUNNER_UNUSABLE:pytest` is the right answer — better than
+    # running the wrong interpreter against the wrong source.
+    resolution_root = Path(tree) if bound.runner == "pytest" else root
     try:
-        if bound.runner == "pytest":
-            resolved = rr.ResolvedRunner(
-                runner="pytest",
-                executable=sys.executable,
-                launcher_args=("-m", "pytest"),
-                origin="declared",
-                cwd=bound.cwd,
-            )
-        else:
-            resolved = rr.resolve(bound.runner, root, bound.cwd)
+        # Both runners resolve through `rr.resolve`. pytest used to be pinned
+        # to `sys.executable -m pytest`, the interpreter the *scheduler* runs
+        # under — a 3.9 scheduler could never import a
+        # `requires-python = ">=3.12"` project, so the sealed suite failed on
+        # import forever. `rr.resolve` probes a project-local environment first
+        # and refuses rather than guessing.
+        resolved = rr.resolve(bound.runner, resolution_root, bound.cwd)
     except rr.RunnerUnusable as extra:
-        raise pr.PrivateReviewError(
+        raise pr.SealedEnvironmentError(
             "SEALED_SUITE_RUNNER_UNUSABLE:{0}".format(bound.runner)
         ) from extra
+    _assert_declared_python(resolved, resolution_root, Path(tree), bound.cwd, files)
     exec_gate = SimpleNamespace(
         runner=bound.runner,
         argv=_suite_selectors(bound, files),
@@ -454,9 +781,61 @@ def run_private_suite(
     executed = (
         counts["passed"] + counts["failed"] + counts["errored"] + counts["skipped"]
     )
-    if executed < 1 and bound.runner != "pytest" and returncode == 0:
-        executed = bound.min_cases
-        counts["passed"] = executed
+    if returncode == 0 and executed < 1:
+        # A runner that exited 0 while the parser found no cases has produced a
+        # measurement this code cannot read. It is not a pass.
+        #
+        # This used to credit `executed = min_cases; counts["passed"] = executed`
+        # for every runner except pytest. No plan can declare a gate, so
+        # `min_cases` is always 1, and the moment vitest became reachable that
+        # fabrication turned "vitest executed nothing" into a green sealed suite
+        # binding the candidate — `code_review`'s `executed < min_cases` check
+        # cannot fire against a count this function invented. A false REVISE is
+        # loud and costs builder rounds; a false green is silent and ships.
+        #
+        # Measured before deleting it, because a fallback that covers a real
+        # case must not be removed blind. vitest's default reporter prints its
+        # `Tests` summary line on every terminating run — `Tests  2 passed (2)`,
+        # `Tests  1 failed | 1 passed (2)`, `Tests  2 skipped (2)` — on 3.2.7
+        # and 4.1.11 alike, and the two shapes that print no readable count
+        # (an empty test file, a filter matching nothing) both exit non-zero and
+        # never reach here. The fallback was covering nothing.
+        #
+        # pytest needs no exemption from the same rule: it cannot exit 0 having
+        # collected nothing, because that is exit 5 (NO_TESTS_COLLECTED). Both
+        # runners now fail closed identically.
+        raise pr.SealedEnvironmentError(
+            "SEALED_SUITE_COUNTS_UNPARSEABLE:{0}: the sealed suite's runner "
+            "exited 0 but reported no executed cases, so how many cases ran "
+            "could not be measured. An unreadable measurement is not a pass "
+            "and is not a defect in the candidate under test.".format(bound.runner)
+        )
+    evaluated = counts["passed"] + counts["failed"] + counts["errored"]
+    if returncode == 0 and executed > 0 and evaluated == 0:
+        # Cases were counted and not one of them ran an assertion. `it.skip` or
+        # `@pytest.mark.skip` across the board proves exactly what an empty
+        # suite proves, and `executed` — which counts skips — would otherwise
+        # clear `code_review`'s `executed < min_cases` check and bind the
+        # candidate green.
+        #
+        # Deliberately narrower than dropping `skipped` from `executed`: a
+        # suite with one passed case and ten skipped has exercised the
+        # candidate and must still pass, and redefining `executed` would move
+        # `min_cases` under every existing suite. Only a suite that evaluated
+        # NOTHING refuses.
+        #
+        # Measured, on real binaries: a fully skipped suite exits 0 in both
+        # runners — pytest prints `1 skipped in 0.00s`, vitest prints
+        # `Tests  2 skipped (2)` — so this is reachable and silent, which is
+        # what makes it worth a refusal rather than a count adjustment. The
+        # `returncode == 0` guard keeps a genuinely failing run on the failure
+        # path, where blaming the candidate is correct.
+        raise pr.SealedEnvironmentError(
+            "SEALED_SUITE_ALL_CASES_SKIPPED:{0}: every one of the {1} counted "
+            "cases was skipped, so the sealed suite evaluated nothing. A suite "
+            "that asserted nothing is not a pass and is not a defect in the "
+            "candidate under test.".format(bound.runner, executed)
+        )
     return {
         "counts": counts,
         "executed": executed,
