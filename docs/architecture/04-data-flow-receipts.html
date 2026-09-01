@@ -4,11 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#2d3142">
   <title>What may cause a lifecycle transition</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="dark.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
+      color-scheme: dark;
       --color-paper:       #2d3142;
       --color-paper-2:     #393e53;
       --color-ink:         #f5f5f5;
@@ -22,6 +25,7 @@
       --font-mono:         'Geist Mono', ui-monospace, monospace;
     }
 
+    html { color-scheme: dark; background: var(--color-paper); }
     body {
       font-family: var(--font-sans);
       background: var(--color-paper);
@@ -73,7 +77,7 @@
     .node-title { fill: var(--color-ink); font: 600 9px var(--font-sans); text-anchor: middle; }
     .node-sub { fill: var(--color-muted); font: 400 6.5px var(--font-mono); text-anchor: middle; }
     .node-tool { fill: var(--color-soft); font: 400 6.5px var(--font-mono); text-anchor: middle; }
-    .chip-text { fill: #fff; font-size: 5px; font-weight: 700; }
+    .chip-text { fill: #2d3142; font-size: 5px; font-weight: 700; }
     .focal-text { fill: var(--color-accent); }
     .legend-label { fill: var(--color-muted); font-size: 7px; font-weight: 500; letter-spacing: 0.12em; text-anchor: end; }
     .legend-text { fill: var(--color-muted); font: 400 7px var(--font-sans); }
@@ -85,6 +89,7 @@
     <h1>What may cause a lifecycle transition</h1>
     <p class="lede">Typed records and signed receipts only. Never pane text, prompt text, free-text envelope fields, or an agent’s claim. Prompt submission proof is the actor transcript turn, not pane revision or agent_status. The visualizer is read-only and is omitted.</p>
 
+    <div class="figure">
     <svg viewBox="0 0 728 436" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="04-data-flow-receipts-title 04-data-flow-receipts-desc">
       <title id="04-data-flow-receipts-title">What may cause a lifecycle transition</title>
       <desc id="04-data-flow-receipts-desc">Operator CLI and plan IR bind a signed receipt; the scheduler hands typed records and a signed merge receipt to SQLite lifecycle, which is the only store that may write a transition. Pane text, prompts, free-text envelope fields, agent claims, pane revision, and agent_status cannot. Prompt submission proof is the actor transcript turn.</desc>
@@ -156,7 +161,7 @@
       <text x="196" y="67" class="node-title">Operator CLI</text>
       <text x="196" y="79" class="node-sub">typed verbs only</text>
       <text x="196" y="91" class="node-tool">maestro.py</text>
-      <rect x="226" y="98" width="16" height="8" rx="3" fill="#b8915a"/>
+      <rect x="226" y="98" width="16" height="8" rx="3" fill="#bfc0c0"/>
       <text x="234" y="104" class="chip-text">TB</text>
 
       <!-- PLN · BIND · Plan IR+receipt -->
@@ -166,9 +171,9 @@
       <text x="308" y="147" class="node-title">Plan IR+receipt</text>
       <text x="308" y="159" class="node-sub">PASS binds IR bytes</text>
       <text x="308" y="171" class="node-tool">plan_validate</text>
-      <rect x="262" y="178" width="16" height="8" rx="3" fill="#b8915a"/>
+      <rect x="262" y="178" width="16" height="8" rx="3" fill="#bfc0c0"/>
       <text x="270" y="184" class="chip-text">TB</text>
-      <rect x="338" y="178" width="16" height="8" rx="3" fill="#9c6b50"/>
+      <rect x="338" y="178" width="16" height="8" rx="3" fill="#f08a59"/>
       <text x="346" y="184" class="chip-text">FL</text>
 
       <!-- SCH · SCHEDULE · Scheduler -->
@@ -178,9 +183,9 @@
       <text x="420" y="227" class="node-title">Scheduler</text>
       <text x="420" y="239" class="node-sub">typed records in</text>
       <text x="420" y="251" class="node-tool">scheduler.run</text>
-      <rect x="374" y="258" width="16" height="8" rx="3" fill="#b8915a"/>
+      <rect x="374" y="258" width="16" height="8" rx="3" fill="#bfc0c0"/>
       <text x="382" y="264" class="chip-text">TB</text>
-      <rect x="450" y="258" width="16" height="8" rx="3" fill="#b8915a"/>
+      <rect x="450" y="258" width="16" height="8" rx="3" fill="#bfc0c0"/>
       <text x="458" y="264" class="chip-text">TB</text>
 
       <!-- PLN · MERGE · Signed merge receipt -->
@@ -190,9 +195,9 @@
       <text x="532" y="147" class="node-title">Merge receipt</text>
       <text x="532" y="159" class="node-sub">Ed25519 · signed</text>
       <text x="532" y="171" class="node-tool">ReceiptStore</text>
-      <rect x="486" y="178" width="16" height="8" rx="3" fill="#b8915a"/>
+      <rect x="486" y="178" width="16" height="8" rx="3" fill="#bfc0c0"/>
       <text x="494" y="184" class="chip-text">TB</text>
-      <rect x="562" y="178" width="16" height="8" rx="3" fill="#9c6b50"/>
+      <rect x="562" y="178" width="16" height="8" rx="3" fill="#f08a59"/>
       <text x="570" y="184" class="chip-text">FL</text>
 
       <!-- LIF · RECORD · SQLite lifecycle (focal) -->
@@ -202,7 +207,7 @@
       <text x="644" y="307" class="node-title">SQLite lifecycle</text>
       <text x="644" y="319" class="node-sub">node_lifecycle row</text>
       <text x="644" y="331" class="node-tool">lifecycle.sqlite3</text>
-      <rect x="598" y="338" width="16" height="8" rx="3" fill="#9c6b50"/>
+      <rect x="598" y="338" width="16" height="8" rx="3" fill="#f08a59"/>
       <text x="606" y="344" class="chip-text">FL</text>
 
       <text x="132" y="372" class="legend-label">STEPS</text>
@@ -223,10 +228,10 @@
       <text x="476" y="373" class="legend-text">Record</text>
 
       <text x="132" y="393" class="legend-label">DATA TYPE</text>
-      <rect x="148" y="386" width="16" height="8" rx="3" fill="#b8915a"/>
+      <rect x="148" y="386" width="16" height="8" rx="3" fill="#bfc0c0"/>
       <text x="156" y="392" class="chip-text">TB</text>
       <text x="168" y="393" class="legend-text">Typed record</text>
-      <rect x="248" y="386" width="16" height="8" rx="3" fill="#9c6b50"/>
+      <rect x="248" y="386" width="16" height="8" rx="3" fill="#f08a59"/>
       <text x="256" y="392" class="chip-text">FL</text>
       <text x="268" y="393" class="legend-text">Signed receipt</text>
       <text x="360" y="393" class="legend-text">left chip = input · right chip = output</text>
@@ -239,6 +244,7 @@
       <line x1="404" y1="412" x2="428" y2="412" stroke="#f08a59" stroke-width="1.2" marker-end="url(#arr-accent)"/>
       <text x="436" y="415" class="legend-text">Causes MERGED</text>
     </svg>
+    </div>
   </div>
 </body>
 </html>

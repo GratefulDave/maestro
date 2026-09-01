@@ -32,7 +32,6 @@ from typing import (
 )
 
 from . import handoff_budget as hb
-from . import permissions
 from .route_receipts import AdmittedRouteSet
 
 
@@ -300,6 +299,9 @@ AGENT_NOT_FOUND = "agent_not_found"
 AGENT_NOT_READY = "agent_not_ready"
 PANE_NOT_FOUND = "pane_not_found"
 WORKSPACE_NOT_FOUND = "workspace_not_found"
+#: A `worktree` call was handed a path outside any Git work tree. Absence of a
+#: repository, not a failure: the caller reads it as "no binding here".
+NOT_GIT_WORKTREE = "not_git_worktree"
 
 #: Maestro-owned Herdr report-metadata source. Tokens, not labels, are identity.
 MAESTRO_METADATA_SOURCE = "maestro"
@@ -803,26 +805,15 @@ def build_omp_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
 
 
 def build_claude_argv(binary: Path, spec: LaunchSpec) -> Tuple[str, ...]:
-    """Claude's host-agent argv from 76861e2 plus prompt-file and denylist.
-
-    ``--disallowedTools`` is the native CLI control that denies Task/Agent.
-    No ``--settings`` isolation hook and no container-wrapped Bash.
-    """
-    argv = [
+    """Build the exact Claude remote-control command."""
+    return (
         str(binary),
         "--model",
         spec.model,
         "--effort",
         spec.effort,
-        "--dangerously-skip-permissions",
-        *permissions.route_capability_argv(spec.route),
-    ]
-    if spec.system_prompt_path is not None:
-        argv.extend(
-            ("--append-system-prompt-file", str(spec.system_prompt_path.resolve()))
-        )
-    argv.append("--remote-control")
-    return tuple(argv)
+        "--remote-control",
+    )
 
 
 class TranscriptTailer:
@@ -2688,32 +2679,139 @@ class HerdrLauncher:
             )
         return workspace
 
-    def _worktree_is_linked(self, workspace: Mapping[str, object]) -> bool:
-        info = workspace.get("worktree")
-        return isinstance(info, dict) and info.get("is_linked_worktree") is True
+    def _worktree_listing(
+        self,
+        environment: Mapping[str, str],
+        *,
+        cwd: Optional[Path] = None,
+        workspace_id: str = "",
+    ) -> Optional[Mapping[str, object]]:
+        """`herdr worktree list` for a checkout or a Space; `None` off-repo.
+
+        A Space's repository binding is read here rather than from
+        `WorkspaceInfo.worktree`, because that field is not the binding: Herdr
+        fills it in only when it creates the Space itself on a resolvable
+        checkout *and* the repository has no source Space yet, and it never
+        backfills. Observed on herdr 0.8.2 / protocol 20: the operator's own
+        Space -- opened by the UI or restored with the session -- carries no
+        such field even while `worktree list` names it the repository's
+        source, and a second `workspace create --cwd <same repo>` is handed
+        `worktree: null`. Reading the field therefore answers "unbound" for
+        exactly the Spaces a run must adopt. `worktree list` recomputes the
+        binding on every call, so it answers for every Space.
+        """
+        if bool(cwd) == bool(workspace_id):
+            raise ValueError("worktree list takes one of cwd, workspace_id")
+        flags = ("--cwd", str(cwd)) if cwd else ("--workspace", workspace_id)
+        try:
+            return self._herdr("worktree", "list", *flags, env=environment)
+        except HerdrCallError as exc:
+            if exc.code == NOT_GIT_WORKTREE:
+                return None
+            if exc.code == WORKSPACE_NOT_FOUND and workspace_id:
+                raise _WorkspaceGone(workspace_id) from exc
+            raise
+
+    def _listing_source(
+        self, listing: Optional[Mapping[str, object]], key: str
+    ) -> str:
+        """One `source` field of a `worktree list` reply, or ``""``."""
+        source = _extract(listing, "source") if listing is not None else None
+        if not isinstance(source, dict):
+            return ""
+        return str(source.get(key) or "")
+
+    def _source_space_id(self, listing: Optional[Mapping[str, object]]) -> str:
+        """The Space open on the repository's source checkout, or ``""``.
+
+        `source_workspace_id` states it, but the schema permits `null` and
+        Herdr omits the key entirely when no Space is open. The listing
+        carries the same fact a second way -- the non-linked worktree entry
+        is the source checkout, and its `open_workspace_id` is the Space on
+        it -- so the entry answers when the summary field does not, and
+        answers `""` in exactly the same case.
+        """
+        named = self._listing_source(listing, "source_workspace_id")
+        if named or listing is None:
+            return named
+        for item in _herdr_list(listing, "worktrees"):
+            if item.get("is_linked_worktree") is False:
+                return str(item.get("open_workspace_id") or "")
+        return ""
+
+    def _open_checkout(
+        self, listing: Optional[Mapping[str, object]], workspace_id: str
+    ) -> Optional[dict]:
+        """The worktree a `worktree list` reply reports this Space as open on.
+
+        Keyed on `open_workspace_id`, so a listing taken against the parent
+        answers for a child and the reverse: Herdr returns the repository's
+        whole worktree set whichever Space or path it was asked about.
+        """
+        if listing is None or not workspace_id:
+            return None
+        for item in _herdr_list(listing, "worktrees"):
+            if str(item.get("open_workspace_id") or "") == workspace_id:
+                return item
+        return None
+
+    def _space_is_linked(
+        self, workspace_id: str, environment: Mapping[str, str]
+    ) -> bool:
+        """Whether `workspace_id` is a Space open on a linked worktree."""
+        entry = self._open_checkout(
+            self._worktree_listing(environment, workspace_id=workspace_id),
+            workspace_id,
+        )
+        return entry is not None and entry.get("is_linked_worktree") is True
 
     def _parent_binding_defect(
-        self, workspace: object, repo_cwd: Path
+        self, workspace_id: str, repo_cwd: Path, environment: Mapping[str, str]
     ) -> str:
-        """Why a created parent is not the repository's source Space, or ``""``.
+        """Why a Space is not the repository's source Space, or ``""``.
 
-        Real `WorkspaceInfo.worktree` is `WorkspaceWorktreeInfo | null`
-        (`repo_key, repo_name, repo_root, checkout_path, is_linked_worktree`).
-        The parent must be a non-linked workspace whose `repo_root` is the
-        primary worktree passed as `--cwd`.
+        The parent must be the Space Herdr reports as open on the primary
+        checkout of `repo_cwd` -- `source_workspace_id`, and non-linked.
         """
-        if not isinstance(workspace, dict):
-            return "NO_WORKSPACE_RECORD"
-        info = workspace.get("worktree")
-        if not isinstance(info, dict):
+        if not workspace_id:
+            return "NO_WORKSPACE_ID"
+        return self._binding_defect_in(
+            self._worktree_listing(environment, workspace_id=workspace_id),
+            workspace_id,
+            repo_cwd,
+        )
+
+    def _binding_defect_in(
+        self,
+        listing: Optional[Mapping[str, object]],
+        workspace_id: str,
+        repo_cwd: Path,
+    ) -> str:
+        """The same judgement against a listing already in hand.
+
+        Adoption reads the repository's listing to find the source Space and
+        then judges that Space by it, in one call rather than two: a Space
+        that opened and closed around a second call would otherwise be
+        adopted or refused on a repository state that no longer exists.
+        """
+        if listing is None:
             return "NO_WORKTREE_BINDING"
-        if info.get("is_linked_worktree") is not False:
-            return "PARENT_IS_LINKED"
-        repo_root = str(info.get("repo_root") or "")
+        repo_root = self._listing_source(listing, "repo_root")
         if not repo_root:
             return "NO_REPO_ROOT"
         if Path(repo_root).resolve() != Path(repo_cwd).resolve():
             return "REPO_ROOT_MISMATCH:{}".format(repo_root)
+        # Identity before shape: a Space that is not the repository's source
+        # is refused for that reason, which names the Space that took it,
+        # rather than for the missing checkout entry that follows from it.
+        source_id = self._source_space_id(listing)
+        if source_id != workspace_id:
+            return "NOT_SOURCE_SPACE:{}".format(source_id or "none")
+        entry = self._open_checkout(listing, workspace_id)
+        if entry is None:
+            return "NO_WORKTREE_BINDING"
+        if entry.get("is_linked_worktree") is not False:
+            return "PARENT_IS_LINKED"
         return ""
 
     def _run_workspace(self, environment: Mapping[str, str]) -> str:
@@ -2772,9 +2870,18 @@ class HerdrLauncher:
             # Herdr groups a linked child under the workspace whose checkout
             # is the repository's source. A parent Herdr did not bind to the
             # primary worktree would collect its lanes under some other Space
-            # (the `run -> run -> lane` sidebar), so the binding is proven on
-            # the created record and an unbound parent is closed, not kept.
-            unbound = self._parent_binding_defect(workspace, repo_cwd)
+            # (the `run -> run -> lane` sidebar), so the binding is proven by
+            # asking Herdr again and an unbound parent is closed, not kept.
+            # The re-probe is the whole proof: a Space that became the
+            # repository's source is named by `worktree list` now, and one
+            # that lost the race to an operator Space opened since the adopt
+            # above answers `NOT_SOURCE_SPACE` and is closed here.
+            try:
+                unbound = self._parent_binding_defect(
+                    parent_id, repo_cwd, environment
+                )
+            except _WorkspaceGone:
+                unbound = "PARENT_GONE"
             if unbound:
                 try:
                     self._close_workspace_absent_ok(parent_id, environment)
@@ -2804,59 +2911,50 @@ class HerdrLauncher:
             return
 
     def _adopt_existing_workspace(self, environment: Mapping[str, str]) -> str:
-        """Adopt the unique non-linked Space bound to the primary checkout.
+        """Adopt the Space Herdr names as the repository's source checkout.
 
         The parent is the operator's own Space when one is open on the
         repository (the one the command is run from); lanes are its linked
-        children. Identity is the repository binding -- `worktree.repo_root`
-        resolves to the primary worktree and the Space is not linked --
-        never run tokens: the operator's Space is not Maestro's to tag, and
-        several runs may share it. Two such Spaces are refused by name; none
-        means Maestro creates its own (`_run_workspace`).
+        children. Identity is the repository binding, never run tokens: the
+        operator's Space is not Maestro's to tag, and several runs may share
+        it. Herdr binds one Space per repository and reports it as
+        `worktree list --cwd <primary>`'s `source_workspace_id`, so the
+        parent is unique by construction -- there is no second Space to name
+        and no `workspace list` scan, which could not answer this anyway
+        (its records carry no binding). No source Space means the operator
+        has the repository closed and Maestro creates its own
+        (`_run_workspace`).
         """
         root = self._repository_root
         if root == Path():
             return ""
         try:
-            payload = self._herdr("workspace", "list", env=environment)
+            listing = self._worktree_listing(environment, cwd=root)
         except BaseException as exc:
             raise LaunchRefused(
                 LaunchRefusal.WORKSPACE_UNRESOLVED,
-                "workspace list: {0}: {1}".format(type(exc).__name__, exc),
+                "worktree list: {0}: {1}".format(type(exc).__name__, exc),
                 pane_created=False,
             ) from exc
-        bound: List[str] = []
-        described: List[str] = []
-        for item in _herdr_list(payload, "workspaces"):
-            workspace_id = str(item.get("workspace_id") or "")
-            if not workspace_id or self._parent_binding_defect(item, root):
-                continue
-            bound.append(workspace_id)
-            tagged = _herdr_tokens(item).get(METADATA_TOKEN_KIND) == METADATA_KIND_RUN
-            described.append(
-                "{}({},{})".format(
-                    workspace_id,
-                    _herdr_label(item),
-                    "maestro-tagged" if tagged else "untagged",
-                )
-            )
-        if len(bound) > 1:
-            # Named with label and tagging so the operator can tell the
-            # Space Maestro created from their own and close the right one.
+        if listing is None:
             raise LaunchRefused(
-                LaunchRefusal.BINDING_MISMATCH,
-                "DUPLICATE_RUN_WORKSPACE:{}".format(",".join(described)),
+                LaunchRefusal.WORKSPACE_UNRESOLVED,
+                "REPO_NOT_A_WORKTREE:{}".format(root),
                 pane_created=False,
             )
-        if not bound:
+        repo_root = self._listing_source(listing, "repo_root")
+        if repo_root and Path(repo_root).resolve() != root.resolve():
+            raise LaunchRefused(
+                LaunchRefusal.BINDING_MISMATCH,
+                "RUN_WORKSPACE_BINDING_MISMATCH::REPO_ROOT_MISMATCH:{}".format(
+                    repo_root
+                ),
+                pane_created=False,
+            )
+        workspace_id = self._source_space_id(listing)
+        if not workspace_id:
             return ""
-        workspace_id = bound[0]
-        try:
-            live = self._workspace_record(workspace_id, environment)
-        except _WorkspaceGone:
-            # Listed, then closed before it could be read: absent.
-            return ""
-        defect = self._parent_binding_defect(live, root)
+        defect = self._binding_defect_in(listing, workspace_id, root)
         if defect:
             raise LaunchRefused(
                 LaunchRefusal.BINDING_MISMATCH,
@@ -3108,20 +3206,18 @@ class HerdrLauncher:
         ):
             return None
         try:
-            payload = self._herdr(
-                "worktree", "list", "--workspace", parent_id, env=environment
-            )
+            payload = self._worktree_listing(environment, workspace_id=parent_id)
         except HerdrCallError as exc:
-            if exc.code == WORKSPACE_NOT_FOUND:
-                raise _WorkspaceGone(parent_id) from exc
             raise LaunchRefused(
                 LaunchRefusal.TAB_UNRESOLVED,
                 "{0}: {1}".format(type(exc).__name__, exc),
                 pane_created=False,
             ) from exc
+        if payload is None:
+            return None
         source = _extract(payload, "source")
         if isinstance(source, dict):
-            source_id = str(source.get("source_workspace_id") or "")
+            source_id = self._source_space_id(payload)
             if source_id and source_id != parent_id:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_DRIFT,
@@ -3403,7 +3499,11 @@ class HerdrLauncher:
             child = self._workspace_record(child_id, environment)
         except _WorkspaceGone as exc:
             self._refuse_live_pane("child workspace_not_found", exc)
-        if not self._worktree_is_linked(child):
+        try:
+            child_linked = self._space_is_linked(child_id, environment)
+        except _WorkspaceGone as exc:
+            self._refuse_live_pane("child workspace_not_found", exc)
+        if not child_linked:
             self._refuse_live_pane("CHILD_NOT_LINKED:{}".format(child_id))
         lane_id = str(spec.lane_label or spec.lane_key or "")
         parent_id = self._parent_workspace_id
@@ -3429,7 +3529,9 @@ class HerdrLauncher:
                 self._refuse_live_pane("NO_PARENT_TOKEN")
             parent_id = parent_token
             try:
-                parent = self._workspace_record(parent_id, environment)
+                # Read for liveness only: the binding is proven below against
+                # Herdr's worktree listing, not against this record.
+                self._workspace_record(parent_id, environment)
             except _WorkspaceGone:
                 # The Space the child was opened under is gone (closed and
                 # reopened by the operator) while the child and its agent
@@ -3451,18 +3553,25 @@ class HerdrLauncher:
                 if pane_tokens.get(METADATA_TOKEN_PARENT):
                     pane_tokens = dict(pane_tokens)
                     pane_tokens[METADATA_TOKEN_PARENT] = parent_id
-                parent = self._workspace_record(parent_id, environment)
+                self._workspace_record(parent_id, environment)
             # The parent the child names must be a non-linked Space bound to
             # this repository; run tokens on it are not required (an
             # operator's Space carries none, a Maestro-created one may).
-            if self._worktree_is_linked(parent):
-                self._refuse_live_pane("PARENT_IS_LINKED_CHILD:{}".format(parent_id))
-            if self._repository_root != Path():
-                defect = self._parent_binding_defect(parent, self._repository_root)
-                if defect:
+            try:
+                if self._space_is_linked(parent_id, environment):
                     self._refuse_live_pane(
-                        "PARENT_NOT_REPO_BOUND:{}:{}".format(parent_id, defect)
+                        "PARENT_IS_LINKED_CHILD:{}".format(parent_id)
                     )
+                if self._repository_root != Path():
+                    defect = self._parent_binding_defect(
+                        parent_id, self._repository_root, environment
+                    )
+                    if defect:
+                        self._refuse_live_pane(
+                            "PARENT_NOT_REPO_BOUND:{}:{}".format(parent_id, defect)
+                        )
+            except _WorkspaceGone as exc:
+                self._refuse_live_pane("parent workspace_not_found", exc)
             # The child's own identity is proven against the parent it
             # names, not only the pane's: a lane child retagged for another
             # run must not lend its pane to this one.
@@ -3500,7 +3609,11 @@ class HerdrLauncher:
             child = self._workspace_record(workspace_id, environment)
         except _WorkspaceGone as exc:
             self._refuse_live_pane("child workspace_not_found", exc)
-        if self._worktree_is_linked(child):
+        try:
+            child_linked = self._space_is_linked(workspace_id, environment)
+        except _WorkspaceGone as exc:
+            self._refuse_live_pane("child workspace_not_found", exc)
+        if child_linked:
             parent_id = parent_id or _herdr_tokens(child).get(METADATA_TOKEN_PARENT, "")
         group = str(spec.lane_key or "")
         label = str(spec.lane_label or group)
@@ -3715,17 +3828,12 @@ class HerdrLauncher:
         self, parent_id: str, child_id: str, environment: Mapping[str, str]
     ) -> bool:
         """Whether `worktree list --workspace parent` holds `child` as open."""
-        try:
-            payload = self._herdr(
-                "worktree", "list", "--workspace", parent_id, env=environment
-            )
-        except HerdrCallError as exc:
-            if exc.code == WORKSPACE_NOT_FOUND:
-                raise _WorkspaceGone(parent_id) from exc
-            raise
+        payload = self._worktree_listing(environment, workspace_id=parent_id)
+        if payload is None:
+            return False
         source = _extract(payload, "source")
         if isinstance(source, dict):
-            source_id = str(source.get("source_workspace_id") or "")
+            source_id = self._source_space_id(payload)
             if source_id and source_id != parent_id:
                 return False
         return any(

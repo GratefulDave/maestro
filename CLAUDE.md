@@ -245,6 +245,24 @@ fails. `kill_reviewer` does not reliably close panes. Reviewer panes are not nam
 `maestro-*`; identify them by agent kind, repo cwd, and title. Pane liveness is not
 lane stage.
 
+**A Space's repository binding is `herdr worktree list`, never `WorkspaceInfo.worktree`.**
+Herdr fills that record field in only for a Space it binds when it creates it — a
+`workspace create --cwd <repo>` on a repository that has no source Space yet, or a
+`worktree open` — and it never backfills. So every Space an operator opened reports no
+`worktree` at all, while `worktree list --cwd <repo>` simultaneously names one of them
+`source.source_workspace_id`. A repository has exactly one source Space: the first opened
+on its primary checkout. A second `workspace create --cwd <same repo>` is handed no
+binding and does not displace it. Closing a Space cascade-closes its linked children.
+
+That field cost two shipped bugs. Believing it made every operator Space read as unbound,
+so a run created a second Space, which Herdr then also left unbound, and refused itself
+with `WORKSPACE_UNRESOLVED:RUN_WORKSPACE_UNBOUND:<id>:NO_WORKTREE_BINDING`. The suite was
+green throughout because `tests/herdr_fake.py` synthesized the field on every record.
+**A fake built from `herdr api schema --json` proves only that a field is permitted, never
+that the binary sends it.** Before depending on any Herdr field, read it off the real
+binary — `herdr workspace get <id>`, `herdr worktree list --cwd <repo>` — in a throwaway
+Space, and delete the Space afterwards.
+
 ## Historical — 2026-08-29 attempt/repair cluster (not current diagnostics)
 
 A cluster of refusals on one path is usually **one wrong idea wearing different

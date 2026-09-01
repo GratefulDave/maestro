@@ -47,19 +47,24 @@ The stage names the work that happens next. Completing a stage writes its immuta
 
 ## Herdr runtime topology
 
-One parent run Space group per (repository identity, `run_id`). Display label is `<repository-basename>-<first-four-run-hash-characters>`: strip a leading `run-` before selecting the four-character suffix; preserve the repository basename's casing. The full `run_id` is runtime identity; the short form is display-only. Examples: FDAdb + `e892fe...` → `FDAdb-e892`; FDAdb + `run-9f20c17f...` → `FDAdb-9f20`.
+Lanes hang under the Space Herdr reports as the repository's source checkout — `herdr worktree list --cwd <repo>` names it `source.source_workspace_id` — which is the operator's own Space when they have the repository open. Herdr binds one Space per repository, so that parent is unique. Maestro creates its own only when no Space is open there, labelled `<repository-basename>-<first-four-run-hash-characters>`: strip a leading `run-` before selecting the four-character suffix; preserve the repository basename's casing. The full `run_id` is runtime identity; the short form is display-only. Examples: FDAdb + `e892fe...` → `FDAdb-e892`; FDAdb + `run-9f20c17f...` → `FDAdb-9f20`.
 
 One linked child worktree workspace per active lane, labelled the exact authored `lane_id` (for example `lane-wp6-tests`), created only when that lane first dispatches an agent. The Spaces sidebar hierarchy comes from Herdr's native worktree Space-group relationship:
 
 ```text
-herdr workspace create ...
-herdr worktree open --workspace <parent-run-workspace-id> \
+herdr worktree list --cwd <target-repository-root>   # -> source.source_workspace_id
+herdr worktree open --workspace <parent-workspace-id> \
   --path <approved-lane-role-worktree> --label <lane-id> --no-focus
 ```
 
+The parent is that `source_workspace_id`; `herdr workspace create --cwd <target-repository-root>`
+runs only when Herdr reports none, and its binding is re-proved from `worktree list`
+afterwards. A Space's binding is never read from `WorkspaceInfo.worktree`, which Herdr
+fills in only for a Space it binds at creation and never backfills.
+
 Do not simulate this with ordinary tabs, Agent-view filters, display metadata alone, naming prefixes, or changes to `~/.config/herdr`.
 
-Role panes are created only when that role first starts. Live pane labels are exactly `tester`, `tester-reviewer`, `builder`, `code-reviewer`, or `integration-reviewer` — do not repeat the run or lane. The first role in a lane may use the child workspace's root pane; later roles split only inside that same child. Never split from `--current` or another lane's pane. All placement uses explicit parent, child, tab, or pane IDs and `--no-focus`. Concurrent first launches create exactly one parent and exactly one child per lane. No pane from one run may land in another run's parent or child workspace.
+Role panes are created only when that role first starts. Live pane labels are exactly `tester`, `tester-reviewer`, `builder`, `code-reviewer`, or `integration-reviewer` — do not repeat the run or lane. The first role in a lane may use the child workspace's root pane; later roles split only inside that same child. Never split from `--current` or another lane's pane. All placement uses explicit parent, child, tab, or pane IDs and `--no-focus`. Concurrent first launches resolve exactly one parent and create exactly one child per lane. No pane from one run may land in another run's parent or child workspace.
 
 Stable actor identity is `(repository identity, run_id, lane_id, role)`. A reviewer `REVISE` leaves both the originating role and reviewer panes open; the next correction resubmits to the existing session, pane, agent, transcript, and approved cwd with a fresh prompt and envelope. Each of tester, tester-reviewer, builder, and code-reviewer owns a distinct role-scoped worktree; builder and code-reviewer do not share a dirty checkout; private tester bytes never enter builder or code-reviewer paths or prompts. The mutable role tree is transport scratch, never workflow authority; `lane_state.stage` plus immutable artifacts remain the only durable workflow authority. Idle after output is normal and is not completion.
 
@@ -67,7 +72,7 @@ Role confinement is mandatory, not prompt guidance. OMP and Claude remain host p
 
 Scheduler restart and amendment rediscover from Herdr report-metadata (Maestro-owned source: full `run_id`, canonical repository fingerprint, `lane_id` where applicable, role where applicable, parent run workspace ID for lane children) plus verified live IDs, parent relationship, pane cwd, agent ownership, stable agent name, and role label. Labels are display text, not adoption proof. Only a confirmed `pane_not_found`, `workspace_not_found`, or `agent_not_found` recreates the missing expected object. Duplicate, label-only, wrong-parent, wrong-cwd, wrong-agent, dirty, unknown, or malformed candidates refuse; never adopt or rename them as current roles. Transport identity stays out of `lane_state` and artifact identity. Amendment reuses the same parent and expected role sessions; new lanes create linked children lazily.
 
-Keep role panes open while the run is executing, waiting, integration-review pending, publishable, or blocked by review/amendment. Cleanup may begin only after successful `MAIN_PUBLICATION` and derived COMPLETE. For every role: prove idle, send `/rename <repository-basename>-<short-run>-<lane-id>-<role>` as composer text plus Enter, wait for exact `Session renamed to "<full-session-name>".`, then close child lane workspaces, then the parent if it has no retained run-level work, then remove cwd. Rename or close failure leaves that pane and cwd intact (for example `SESSION_RENAME_UNCONFIRMED`) without rolling back publication. Cleanup is idempotent.
+Keep role panes open while the run is executing, waiting, integration-review pending, publishable, or blocked by review/amendment. Cleanup may begin only after successful `MAIN_PUBLICATION` and derived COMPLETE. For every role: prove idle, send `/rename <repository-basename>-<short-run>-<lane-id>-<role>` as composer text plus Enter, wait for exact `Session renamed to "<full-session-name>".`, then close the child lane workspaces, then remove cwd. A parent Maestro did not create is never closed: closing a Space cascade-closes its linked children, so closing the operator's Space would take their own work with it. Rename or close failure leaves that pane and cwd intact (for example `SESSION_RENAME_UNCONFIRMED`) without rolling back publication. Cleanup is idempotent.
 
 ---
 

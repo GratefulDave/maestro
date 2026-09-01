@@ -7,6 +7,7 @@
   <meta name="theme-color" content="#2d3142">
   <title>Persistent role topology · Maestro</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="dark.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -73,12 +74,12 @@
   <div class="frame">
     <p class="eyebrow">Current · Architecture</p>
     <h1>Persistent role topology</h1>
-    <p class="lede">Herdr is transport. One parent run Space per (repository identity, <code>run_id</code>), labelled <code>&lt;repository-basename&gt;-&lt;first-four-run-hash-characters&gt;</code> — example <code>FDAdb-e892</code>. Linked children use the exact authored <code>lane_id</code> and appear only when that lane first dispatches. Role panes are lazy: <code>tester</code>, <code>tester-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, and <code>integration-reviewer</code> in the last topological lane. Rediscovery adopts exact Herdr report-metadata identity, never a label. Cleanup after <code>COMPLETE</code>: idle proof, <code>/rename</code>, confirm, then close children then parent. <a href="00-artifact-factory.html">Artifact factory</a> · <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
+    <p class="lede">Herdr is transport. Lanes are linked children of the Space Herdr names as the repository's source checkout — <code>worktree list --cwd &lt;repo&gt;</code> → <code>source_workspace_id</code> — which is the operator's own Space when they have the repository open. Herdr binds one Space per repository, so that parent is unique; Maestro creates its own (labelled <code>&lt;repository-basename&gt;-&lt;first-four-run-hash-characters&gt;</code>, example <code>FDAdb-e892</code>) only when no Space is open there, and never tags or closes a Space it did not create. Linked children use the exact authored <code>lane_id</code> and appear only when that lane first dispatches. Role panes are lazy: <code>tester</code>, <code>tester-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, and <code>integration-reviewer</code> in the last topological lane. Rediscovery adopts exact Herdr report-metadata identity, never a label. Cleanup after <code>COMPLETE</code>: idle proof, <code>/rename</code>, confirm, then close the lane children. <a href="00-artifact-factory.html">Artifact factory</a> · <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
 
     <div class="figure">
     <svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-role-topology-title 00-role-topology-desc">
       <title id="00-role-topology-title">Persistent role topology</title>
-      <desc id="00-role-topology-desc">Parent run Space FDAdb-e892 groups two linked child worktree workspaces labelled the exact lane_id values lane-wp6-tests and lane-wp6-build. Role panes tester, tester-reviewer, builder, code-reviewer, and integration-reviewer are created lazily; integration-reviewer appears only in the last topological lane. Scheduler rediscovery adopts exact Herdr report-metadata identity. Cleanup after COMPLETE renames each session, then closes children, then the parent.</desc>
+      <desc id="00-role-topology-desc">The repository's source Space, normally the operator's own, groups two linked child worktree workspaces labelled the exact lane_id values lane-wp6-tests and lane-wp6-build. Role panes tester, tester-reviewer, builder, code-reviewer, and integration-reviewer are created lazily; integration-reviewer appears only in the last topological lane. Scheduler rediscovery adopts exact Herdr report-metadata identity. Cleanup after COMPLETE renames each session, then closes the lane children; a Space Maestro did not create is never closed.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
@@ -109,8 +110,8 @@
       <rect x="464" y="32" width="240" height="80" rx="6" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
       <rect x="472" y="40" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
       <text x="492" y="49" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SPACE</text>
-      <text x="584" y="72" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">FDAdb-e892</text>
-      <text x="584" y="92" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">&lt;repo&gt;-&lt;4hash&gt;</text>
+      <text x="584" y="72" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">FDAdb</text>
+      <text x="584" y="92" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">operator&#8217;s Space · source checkout</text>
 
       <rect x="156" y="192" width="200" height="80" rx="6" fill="#2d3142"/>
       <rect x="156" y="192" width="200" height="80" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
@@ -165,7 +166,7 @@
       <text x="40" y="572" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
 
       <rect x="40" y="588" width="16" height="12" rx="2" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
-      <text x="64" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Parent Space</text>
+      <text x="64" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Parent Space (adopted)</text>
 
       <rect x="200" y="588" width="16" height="12" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
       <text x="224" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Linked child worktree</text>
@@ -176,7 +177,7 @@
       <rect x="584" y="588" width="16" height="12" rx="2" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
       <text x="608" y="598" fill="#bfc0c0" font-size="8" font-family="'Geist', sans-serif">Last-topo integration-reviewer</text>
 
-      <text x="40" y="624" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">Metadata rediscovery · COMPLETE: /rename then close children then parent · not one tab / five eager panes</text>
+      <text x="40" y="624" fill="#8e98ac" font-size="8" font-family="'Geist Mono', monospace">Metadata rediscovery · COMPLETE: /rename then close lane children · not one tab / five eager panes</text>
     </svg>
     </div>
   </div>
