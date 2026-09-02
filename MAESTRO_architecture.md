@@ -6,7 +6,7 @@ This document is the executable architecture. Runtime source must implement it d
 
 **Proven slice:** exactly two dependent lanes. No broader framework.
 
-**Diagrams:** current factory — [`docs/architecture/00-artifact-factory.html`](docs/architecture/00-artifact-factory.html); nine-stage machine — [`docs/architecture/00-lane-stage.html`](docs/architecture/00-lane-stage.html); persistent role topology — [`docs/architecture/00-role-topology.html`](docs/architecture/00-role-topology.html). The rest of [`docs/architecture/`](docs/architecture/index.html) is historical / superseded.
+**Diagrams:** the whole mechanism on one page — every stage, the artifact or verdict that causes every transition, and the private-test boundary — is Figure 1 of [`docs/architecture/00-artifact-factory.html`](docs/architecture/00-artifact-factory.html), which also carries the durable-state topology; nine-stage machine — [`docs/architecture/00-lane-stage.html`](docs/architecture/00-lane-stage.html); persistent role topology — [`docs/architecture/00-role-topology.html`](docs/architecture/00-role-topology.html). The rest of [`docs/architecture/`](docs/architecture/index.html) is historical / superseded.
 
 ---
 
@@ -55,6 +55,8 @@ No second field may independently describe lane position: not a parallel state e
 ## 3. Frozen state-transition table
 
 Every legal lane advance is one of these edges. Trigger, required immutable input, emitted artifact, reviewer verdict, and next stage are named. Missing cells are not implicit second authorities.
+
+This table is drawn as Figure 1 of [`docs/architecture/00-artifact-factory.html`](docs/architecture/00-artifact-factory.html), with the private-test boundary of §11 and the sealing gate that is its only exit. The table is authority; the figure is a reading of it.
 
 | Current stage | Trigger | Required immutable input | Emitted artifact | Reviewer verdict | Next stage |
 |---|---|---|---|---|---|

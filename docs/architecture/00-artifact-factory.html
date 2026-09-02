@@ -58,6 +58,26 @@
     .lede a { color: var(--color-link); }
     .lede a:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
     .topology { margin-top: 1.5rem; }
+    h2.fig-h {
+      font-family: var(--font-serif);
+      font-size: clamp(1.15rem, 1.4vw + 0.7rem, 1.375rem);
+      font-weight: 400;
+      letter-spacing: -0.01em;
+      line-height: 1.2;
+      color: var(--color-ink);
+      margin: 2.5rem 0 0.75rem;
+    }
+    h2.fig-h:first-of-type { margin-top: 0; }
+    .figcaption {
+      font-family: var(--font-sans);
+      font-size: 0.8125rem;
+      line-height: 1.6;
+      color: var(--color-muted);
+      margin-top: 0.875rem;
+      max-width: 56rem;
+    }
+    .figcaption strong { color: var(--color-ink); font-weight: 600; }
+    .figcaption a { color: var(--color-link); }
     .figure { overflow-x: auto; }
     svg { width: 100%; height: auto; display: block; }
     @media (max-width: 720px) {
@@ -69,8 +89,203 @@
   <div class="frame">
     <p class="eyebrow">Current · Architecture</p>
     <h1>Nine-stage artifact factory</h1>
-    <p class="lede">Durable authority is one <code>lane_state.stage</code> field plus immutable artifacts under an external <code>runtime_state_root</code>. Herdr and OMP are transport only: one parent Space labelled <code>&lt;repo&gt;-&lt;4hash&gt;</code>, linked children labelled exact <code>lane_id</code>, and lazy <code>tester</code> / <code>tester-reviewer</code> / <code>builder</code> / <code>code-reviewer</code> / last-topo <code>integration-reviewer</code> panes. Historical gallery diagrams are superseded. <a href="00-role-topology.html">Persistent role topology</a> · <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
+    <p class="lede">Durable authority is one <code>lane_state.stage</code> field plus immutable artifacts under an external <code>runtime_state_root</code>. Herdr and OMP are transport only: one parent Space labelled <code>&lt;repo&gt;-&lt;4hash&gt;</code>, linked children labelled exact <code>lane_id</code>, and lazy <code>tester</code> / <code>tester-reviewer</code> / <code>builder</code> / <code>code-reviewer</code> / last-topo <code>integration-reviewer</code> panes. Historical gallery diagrams are superseded. Figure 1 below carries the whole lane machine: every stage, the artifact or verdict that causes every transition, and the private-test boundary the builder never reads across. <a href="00-role-topology.html">Persistent role topology</a> · <a href="00-lane-stage.html">Lane stage machine</a> · <a href="index.html">Gallery</a> · <a href="../index.html">Docs home</a></p>
 
+    <h2 class="fig-h">The mechanism: what causes each stage change</h2>
+    <div class="figure">
+    <svg viewBox="0 0 1360 880" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-mech-title 00-mech-desc">
+      <title id="00-mech-title">Nine-stage lane machine, with the artifact or verdict that causes every transition and the private-test boundary</title>
+      <desc id="00-mech-desc">PLANNED emits LANE_PLAN and enters a dashed private zone containing WRITING_TESTS, REVIEWING_TESTS and TESTS_SEALED. Inside the zone TEST_DRAFT advances to review; a TEST_REVIEW PASS verdict advances to sealing and a REVISE verdict returns to WRITING_TESTS. The single exit from the zone is a sealing gate that passes the bundle id and vault digest, the public behavioral contract, declared outputs, allowed paths, architecture constraints and prior redacted findings, and withholds private test source, fixtures, vault paths, private manifests and tests-lane declared paths. BUILDING emits BUILDER_OUTPUT to REVIEWING_CODE; CODE_REVIEW PASS advances to READY_TO_MERGE, CODE_REVIEW REVISE returns redacted findings to BUILDING, a byte-identical retry is refused as NOOP_BUILDER_REVISION, and a private-path collision emits TEST_INVALIDATION which re-enters the zone at WRITING_TESTS carrying only a redacted reason. INTEGRATION_MERGE advances READY_TO_MERGE to MERGED; BASE_INVALIDATION sends a stale zero-delta base back to BUILDING. A final-review REVISE moves MERGED to WAITING_FOR_USER, which run resume or run amend resolves. Authored lane_kind routes bypass one half each.</desc>
+      <defs>
+        <marker id="m-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="m-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="m-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
+      </defs>
+      <rect width="100%" height="100%" fill="#000000"/>
+
+      <!-- Private zone -->
+      <rect x="344" y="104" width="720" height="132" rx="10" fill="rgba(255,107,53,0.06)" stroke="#ff6b35" stroke-width="1" stroke-dasharray="5,4" opacity="0.9"/>
+
+      <!-- Row A arrows -->
+      <path d="M 144,248 V 174 Q 144,162 156,162 H 356" fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="256" y="154" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">LANE_PLAN</text>
+      <line x1="536" y1="162" x2="612" y2="162" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="576" y="216" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEST_DRAFT</text>
+      <text x="576" y="228" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">+ public behavioral contract</text>
+      <line x1="792" y1="162" x2="868" y2="162" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="832" y="216" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEST_REVIEW</text>
+      <text x="832" y="228" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PASS</text>
+      <path d="M 704,124 V 76 H 448 V 116" fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="576" y="66" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">TEST_REVIEW · REVISE — actionable findings to the same tester session</text>
+
+      <!-- TEST_INVALIDATION: re-enters the private zone carrying only a redacted reason -->
+      <path d="M 664,400 V 388 H 824 V 256 H 424 V 204" fill="none" stroke="#ff6b35" stroke-width="1.2" marker-end="url(#m-arrow-accent)"/>
+      <text x="836" y="300" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace">TEST_INVALIDATION</text>
+      <text x="836" y="312" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">private-path collision</text>
+      <text x="836" y="324" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">redacted reason only</text>
+
+      <!-- Sealed bundle leaves the zone through the gate (bridged over TEST_INVALIDATION) -->
+      <path d="M 960,200 V 244 H 712 V 266" fill="none" stroke="#000000" stroke-width="5"/>
+      <path d="M 960,200 V 244 H 712 V 266" fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="968" y="248" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">SEALED_TEST_BUNDLE</text>
+      <text x="968" y="260" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">vault digest only</text>
+
+      <!-- Sealing gate -->
+      <rect x="400" y="270" width="384" height="112" rx="8" fill="#000000"/>
+      <rect x="400" y="270" width="384" height="112" rx="8" fill="rgba(255,107,53,0.12)" stroke="#ff6b35" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="412" y="288" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.08em">SEALING GATE — THE ONLY EXIT FROM THE PRIVATE ZONE</text>
+      <text x="412" y="306" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">CROSSES</text>
+      <text x="412" y="320" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">bundle id + vault digest</text>
+      <text x="412" y="332" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">public contract · outputs</text>
+      <text x="412" y="344" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">allowed paths · constraints</text>
+      <text x="412" y="356" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">prior redacted findings</text>
+      <text x="604" y="306" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.06em">WITHHELD</text>
+      <text x="604" y="320" fill="#929292" font-size="8" font-family="'Geist', sans-serif">private test source</text>
+      <text x="604" y="332" fill="#929292" font-size="8" font-family="'Geist', sans-serif">fixtures · selectors · literals</text>
+      <text x="604" y="344" fill="#929292" font-size="8" font-family="'Geist', sans-serif">vault paths · manifests</text>
+      <text x="604" y="356" fill="#929292" font-size="8" font-family="'Geist', sans-serif">tests-lane declared paths</text>
+      <text x="412" y="374" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">REVIEWING_CODE runs the sealed suite in scratch; that broker result is authoritative.</text>
+      <line x1="448" y1="382" x2="448" y2="396" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+
+      <!-- Authored lane_kind bypass routes -->
+      <path d="M 144,324 V 438 H 356" fill="none" stroke="#78a9ff" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#m-arrow-link)"/>
+      <text x="156" y="392" fill="#78a9ff" font-size="8" font-family="'Geist Mono', monospace">lane_kind=build</text>
+      <text x="156" y="404" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">no private half</text>
+      <path d="M 1048,162 H 1216 V 392" fill="none" stroke="#78a9ff" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#m-arrow-link)"/>
+      <text x="1208" y="196" fill="#78a9ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">lane_kind=tests</text>
+      <text x="1208" y="208" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">the sealed bundle is</text>
+      <text x="1208" y="220" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">the merge receipt</text>
+
+      <!-- Row B arrows -->
+      <line x1="536" y1="438" x2="612" y2="438" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="576" y="498" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BUILDER_OUTPUT</text>
+      <text x="576" y="510" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">candidate sha</text>
+      <line x1="792" y1="438" x2="868" y2="438" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="832" y="498" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CODE_REVIEW</text>
+      <text x="832" y="510" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">PASS</text>
+      <line x1="1048" y1="438" x2="1124" y2="438" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="1086" y="498" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">INTEGRATION_MERGE</text>
+      <text x="1086" y="510" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">before → after sha</text>
+
+      <!-- Return edges below row B -->
+      <path d="M 704,476 V 532 H 424 V 484" fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="564" y="548" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">CODE_REVIEW · REVISE — redacted findings only</text>
+      <path d="M 960,476 V 588 H 472 V 484" fill="none" stroke="#c4c4c4" stroke-width="1.2" marker-end="url(#m-arrow)"/>
+      <text x="716" y="604" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">BASE_INVALIDATION — stale zero-delta base, newly observed integration HEAD</text>
+      <path d="M 392,476 V 492 H 348 V 424 H 352" fill="none" stroke="#c4c4c4" stroke-width="1.2" stroke-dasharray="3,3" marker-end="url(#m-arrow)"/>
+      <text x="336" y="466" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">byte-identical retry</text>
+      <text x="336" y="478" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">NOOP_BUILDER_REVISION</text>
+      <text x="336" y="490" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">refused · stays BUILDING</text>
+
+      <!-- MERGED to WAITING_FOR_USER -->
+      <line x1="1216" y1="476" x2="1216" y2="636" stroke="#ff6b35" stroke-width="1.2" marker-end="url(#m-arrow-accent)"/>
+      <text x="1204" y="530" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">FINAL_INTEGRATION_REVIEW · REVISE</text>
+      <text x="1204" y="542" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">USER_WAIT(AMENDMENT_REQUIRED)</text>
+
+      <rect x="464" y="85" width="560" height="15" fill="#000000"/>
+      <text x="470" y="96" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.10em">PRIVATE ZONE · TESTER AND TESTER-REVIEWER TREES · VAULT · BYTES NEVER ENTER THE PRODUCT REPO</text>
+      <!-- PLANNED -->
+      <rect x="56" y="248" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="56" y="248" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="64" y="256" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="84" y="265" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="218" y="258" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="144" y="292" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">PLANNED</text>
+      <text x="144" y="308" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">materialize lane plan</text>
+
+      <!-- WRITING_TESTS -->
+      <rect x="360" y="124" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="360" y="124" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="368" y="132" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="388" y="141" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="522" y="134" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="448" y="168" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">WRITING_TESTS</text>
+      <text x="448" y="184" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">tester writes private cases</text>
+
+      <!-- REVIEWING_TESTS -->
+      <rect x="616" y="124" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="616" y="124" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="624" y="132" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="644" y="141" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="778" y="134" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="704" y="168" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">REVIEWING_TESTS</text>
+      <text x="704" y="184" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">cross-vendor reviewer</text>
+
+      <!-- TESTS_SEALED -->
+      <rect x="872" y="124" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="872" y="124" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="880" y="132" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="900" y="141" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="1034" y="134" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="960" y="168" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">TESTS_SEALED</text>
+      <text x="960" y="184" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">bytes into the vault</text>
+
+      <!-- BUILDING -->
+      <rect x="360" y="400" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="360" y="400" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="368" y="408" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="388" y="417" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="522" y="410" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="448" y="444" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">BUILDING</text>
+      <text x="448" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">builder never sees the tests</text>
+
+      <!-- REVIEWING_CODE -->
+      <rect x="616" y="400" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="616" y="400" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="624" y="408" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="644" y="417" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="778" y="410" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="704" y="444" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">REVIEWING_CODE</text>
+      <text x="704" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">holds vault access</text>
+
+      <!-- READY_TO_MERGE -->
+      <rect x="872" y="400" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="872" y="400" width="176" height="76" rx="8" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <rect x="880" y="408" width="40" height="12" rx="2" fill="transparent" stroke="rgba(248,248,248,0.40)" stroke-width="0.8"/>
+      <text x="900" y="417" fill="#f8f8f8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STAGE</text>
+      <rect x="1034" y="410" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="960" y="444" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">READY_TO_MERGE</text>
+      <text x="960" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">one integration branch</text>
+
+      <!-- MERGED (terminal) -->
+      <rect x="1128" y="400" width="176" height="76" rx="8" fill="#000000"/>
+      <rect x="1128" y="400" width="176" height="76" rx="8" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="1136" y="408" width="40" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="1156" y="417" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DONE</text>
+      <text x="1216" y="444" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">MERGED</text>
+      <text x="1216" y="460" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">merged exactly once</text>
+
+      <!-- WAITING_FOR_USER -->
+      <rect x="1096" y="640" width="248" height="96" rx="8" fill="#000000"/>
+      <rect x="1096" y="640" width="248" height="96" rx="8" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <rect x="1104" y="648" width="40" height="12" rx="2" fill="transparent" stroke="rgba(255,107,53,0.55)" stroke-width="0.8"/>
+      <text x="1124" y="657" fill="#ff6b35" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">WAIT</text>
+      <text x="1220" y="686" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">WAITING_FOR_USER</text>
+      <text x="1220" y="702" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">USER_WAIT recorded</text>
+      <text x="1220" y="716" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">resume_stage + input digest</text>
+      <text x="1080" y="668" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">run resume · USER_DECISION → the recorded resume_stage</text>
+      <text x="1080" y="684" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">run amend · PLAN_AMENDMENT → PLANNED, every named lane</text>
+      <text x="1080" y="700" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">bare run resume after AMENDMENT_REQUIRED → still waiting</text>
+
+      <!-- Legend -->
+      <line x1="56" y1="756" x2="1304" y2="756" stroke="rgba(248,248,248,0.10)" stroke-width="0.8"/>
+      <text x="56" y="776" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <rect x="56" y="792" width="16" height="12" rx="2" fill="#0b0b0b" stroke="#f8f8f8" stroke-width="1"/>
+      <text x="80" y="802" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Stage</text>
+      <rect x="140" y="792" width="16" height="12" rx="2" fill="rgba(255,107,53,0.20)" stroke="#ff6b35" stroke-width="1"/>
+      <text x="164" y="802" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Terminal · wait</text>
+      <rect x="272" y="792" width="16" height="12" rx="2" fill="rgba(255,107,53,0.12)" stroke="#ff6b35" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="296" y="802" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Private zone · sealing gate</text>
+      <line x1="464" y1="798" x2="500" y2="798" stroke="#78a9ff" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#m-arrow-link)"/>
+      <text x="510" y="802" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">Authored lane_kind route</text>
+      <rect x="676" y="794" width="6" height="6" rx="1" fill="#ff6b35"/>
+      <text x="692" y="802" fill="#c4c4c4" font-size="8" font-family="'Geist', sans-serif">May pause to WAITING_FOR_USER on USER_WAIT(PAUSE); run resume restores that exact stage and input</text>
+      <text x="56" y="832" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">Every edge is caused by an immutable artifact or a PASS / REVISE verdict. No transition keys on pane text, prompt text, or a role's claim about its own work.</text>
+      <text x="56" y="848" fill="#929292" font-size="8" font-family="'Geist Mono', monospace">REVISE is artifact data, not a tenth stage. lane_state.stage is the one mutable field; artifacts and Git refs identify immutable inputs and outputs, never the stage.</text>
+    </svg>
+    </div>
+    <p class="figcaption"><strong>Figure 1. The nine-stage lane machine and the private-test boundary.</strong> Each arrow is labelled with the artifact or verdict that causes it, taken from the transition table in <a href="../../MAESTRO_architecture.md">§3 of the factory contract</a>. The dashed zone is the private half: the tester and tester-reviewer work in trees outside the product repository, and sealed bytes go to the vault. Exactly one edge leaves that zone into <code>BUILDING</code>, and the gate on it names everything the builder receives and everything it does not — a builder that could read the suite would be writing to the test, so the boundary is the reason a <code>PASS</code> means anything. Only two things ever come back across it: <code>TEST_INVALIDATION</code> carrying a redacted reason for a private-path collision, and the redacted findings inside a <code>CODE_REVIEW</code>. The code reviewer, not the builder, runs the sealed suite in scratch, and that broker result is authoritative for the candidate.</p>
+    <h2 class="fig-h">Where the durable state lives</h2>
     <div class="figure">
     <svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-artifact-factory-title 00-artifact-factory-desc">
       <title id="00-artifact-factory-title">Nine-stage artifact factory</title>
