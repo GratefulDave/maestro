@@ -339,6 +339,154 @@ def lane_table(
     return rows
 
 
+def run_artifact(
+    conn: sqlite3.Connection, run_id: str, kind: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM run_artifacts WHERE run_id=? AND artifact_kind=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (run_id, kind),
+    ).fetchone()
+
+
+def run_table(
+    conn: sqlite3.Connection, run_id: str, run_row: sqlite3.Row
+) -> list[tuple[str, str]]:
+    """Every gate between the last MERGED lane and a published main.
+
+    These are the rows whose absence cost run f50638ab four hand-backs. The
+    lane table said MERGED, MERGED, MERGED, nothing stalled, while a red run
+    gate, a spent final review and three publication refusals sat past its
+    last line -- so a handover satisfied the Stop hook and died anyway.
+
+    Read-only, and it says so where it cannot answer: evaluating a run-level
+    sealed gate means provisioning a tree and executing a suite, which is not
+    something a reporting tool may do. It names the lanes that gate instead.
+    """
+    rows: list[tuple[str, str]] = []
+    stages = {str(r["lane_id"]): str(r["stage"]) for r in lane_rows(conn, run_id)}
+    merged = st.LaneStage.MERGED.value
+    unmerged = sorted(lane for lane, stage in stages.items() if stage != merged)
+    rows.append(
+        ("lanes_merged", "{0}/{1}".format(len(stages) - len(unmerged), len(stages)))
+    )
+    rows.append(("lanes_not_merged", ",".join(unmerged) if unmerged else _ABSENT))
+
+    published = run_artifact(conn, run_id, "MAIN_PUBLICATION")
+    review = run_artifact(conn, run_id, "FINAL_INTEGRATION_REVIEW")
+    amendment = run_artifact(conn, run_id, "PLAN_AMENDMENT")
+    if review is None:
+        rows.append(("final_review", _ABSENT))
+    else:
+        payload = _loads(review["payload_json"])
+        spent = amendment is not None and int(amendment["sequence"]) > int(
+            review["sequence"]
+        )
+        rows.append(
+            (
+                "final_review",
+                "seq={0} verdict={1} integration={2} affected={3}{4}".format(
+                    review["sequence"],
+                    payload.get("verdict", _ABSENT),
+                    str(payload.get("integration_sha", _ABSENT))[:12],
+                    ",".join(payload.get("affected_lanes") or ()) or _ABSENT,
+                    " SPENT(answered by a later amendment)" if spent else "",
+                ),
+            )
+        )
+    rows.append(
+        (
+            "published",
+            _ABSENT
+            if published is None
+            else str(_loads(published["payload_json"]).get("published_sha", ""))[:12],
+        )
+    )
+
+    # The six publication preflight gates, with the values the preflight will
+    # read. Reported individually rather than as one verdict: the preflight
+    # refuses on the first, so a single pass/fail hides the next two.
+    rows.extend(publication_rows(run_row, review, published is not None))
+    return rows
+
+
+def publication_rows(
+    run_row: sqlite3.Row, review: Optional[sqlite3.Row], published: bool
+) -> list[tuple[str, str]]:
+    try:
+        from adw_modules import git_publication as gp
+    except Exception as exc:  # noqa: BLE001 - a report never raises
+        return [("publication_preflight", "UNREADABLE:{0}".format(exc))]
+    repository = str(run_row["target_repository_root"])
+    main_ref = str(run_row["target_main_ref"])
+    expected = str(run_row["target_initial_main_sha"])
+    reviewed = ""
+    if review is not None:
+        reviewed = str(_loads(review["payload_json"]).get("integration_sha") or "")
+    rows: list[tuple[str, str]] = []
+    if published:
+        # Publication is exactly-once and receipt-backed. After it, main has
+        # deliberately moved past `target_initial_main_sha`, so the gates below
+        # would all read as refusals about a decision already taken. Reporting
+        # them as refusals is the over-broad predicate this section exists to
+        # stop; the honest row is that they no longer apply.
+        return [("publication_preflight", "N/A already published")]
+    try:
+        binding = gp.bind_target_worktree(Path(repository), main_ref)
+        git = binding.git()
+        head = git.symbolic_head()
+        main_sha = git.rev_parse(main_ref)
+        git_dir = binding.target_worktree_git_dir
+        rows.append(("pub_head", "{0} {1}".format(head, "OK" if head == main_ref else "MISMATCH")))
+        rows.append(
+            (
+                "pub_main_vs_expected",
+                "{0} vs {1} {2}".format(
+                    main_sha[:12],
+                    expected[:12],
+                    "OK" if main_sha == expected else "REFUSES",
+                ),
+            )
+        )
+        rows.append(
+            (
+                "pub_index",
+                "OK" if git.diff_cached_quiet(expected, git_dir=git_dir) else "REFUSES",
+            )
+        )
+        rows.append(
+            (
+                "pub_worktree",
+                "OK" if git.diff_files_quiet(git_dir=git_dir) else "REFUSES dirty",
+            )
+        )
+        if not reviewed:
+            rows.append(("pub_untracked", "UNKNOWN no reviewed integration sha"))
+            rows.append(("pub_ignored", "UNKNOWN no reviewed integration sha"))
+            return rows
+        touched = gp.publication_touched_paths(
+            binding,
+            expected_before_sha=main_sha,
+            reviewed_integration_sha=reviewed,
+        )
+        for label, ignored in (("pub_untracked", False), ("pub_ignored", True)):
+            observed = git.ls_others(ignored=ignored, git_dir=git_dir)
+            hits = gp.collides(observed, touched)
+            rows.append(
+                (
+                    label,
+                    "{0} present, {1} on a written path{2}".format(
+                        len(observed),
+                        len(hits),
+                        " REFUSES: " + ",".join(hits[:5]) if hits else " OK",
+                    ),
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - a report never raises
+        rows.append(("publication_preflight", "UNREADABLE:{0}".format(exc)))
+    return rows
+
+
 def render(run_id: str, lane_id: str, rows: Sequence[tuple[str, str]]) -> str:
     width = max([len(name) for name, _ in rows] + [len("FIELD")])
     lines = ["LANE_GATES run={0} lane={1}".format(run_id, lane_id)]
@@ -403,6 +551,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.run, args.lane if args.lane else _ABSENT
                 )
             )
+        # Always last, and always present even when --lane narrowed the lane
+        # blocks: the gates past MERGED belong to the run, not to a lane, and
+        # they are the ones a handover keeps missing.
+        blocks.append(
+            render(args.run, "-", run_table(conn, args.run, run_row)).replace(
+                "LANE_GATES", "RUN_GATES", 1
+            )
+        )
         sys.stdout.write("\n\n".join(blocks) + "\n")
         return 0 if (level and not waiting) else 1
     finally:
