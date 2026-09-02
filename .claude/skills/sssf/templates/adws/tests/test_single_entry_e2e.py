@@ -572,12 +572,23 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
         self.assertIn("FINAL_INTEGRATION_REVIEW", run_kinds)
         self.assertIn("MAIN_PUBLICATION", run_kinds)
 
-        # Both reviewers sent at least one lane back before passing it.
+        # The test reviewer sent every lane back before passing it: nothing
+        # outranks it, because a draft has no measurement to appeal to.
         for lane in LANES:
             self.assertIn((lane, "test-reviewer", "REVISE"), self.panes.verdicts)
-            self.assertIn((lane, "code-reviewer", "REVISE"), self.panes.verdicts)
             self.assertIn((lane, "test-reviewer", "PASS"), self.panes.verdicts)
-            self.assertIn((lane, "code-reviewer", "PASS"), self.panes.verdicts)
+
+        stages = self.lane_stages(run_id)
+        # The code reviewer is different, and this is the whole point of it.
+        # It said REVISE on a candidate whose sealed suite had just passed, and
+        # the suite is authoritative, so the lane merged anyway and the code
+        # reviewer was never asked a second time. Its opinion is recorded, not
+        # obeyed. Asserting it eventually said PASS would be asserting that a
+        # reviewer can hold a green candidate hostage.
+        for lane in LANES:
+            self.assertIn((lane, "code-reviewer", "REVISE"), self.panes.verdicts)
+            self.assertNotIn((lane, "code-reviewer", "PASS"), self.panes.verdicts)
+            self.assertEqual(stages[lane], st.LaneStage.MERGED.value)
 
         # The publication reached the target repository's main ref.
         head = _git(self.repo, "rev-parse", "refs/heads/main")

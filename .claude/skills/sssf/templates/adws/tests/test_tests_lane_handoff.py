@@ -147,9 +147,14 @@ class HandoffActor:
         if ctx.lane.lane_kind == st.LANE_KIND_TESTS:
             files = {
                 path: (
+                    # Same reason as the untyped branch below: existence is
+                    # true of the first candidate, so a first-round REVISE
+                    # against a green suite could never be honoured.
                     "# {0}\nfrom pathlib import Path\n"
-                    "def test_product_exists():\n"
+                    "def test_product_is_ready():\n"
                     "    assert Path('product.py').is_file()\n"
+                    "    assert Path('product.py').read_text()"
+                    ".strip().endswith('ready')\n"
                 ).format(SECRET)
                 for path in ctx.lane.declared_outputs
             }
@@ -157,9 +162,16 @@ class HandoffActor:
         return {
             "files": {
                 "tests/test_{0}_private.py".format(ctx.lane.lane_id.replace("-", "_")): (
+                    # Existence alone is satisfied by the builder's very first
+                    # candidate, which made the scripted first-round REVISE
+                    # below unreachable once a green suite became authoritative.
+                    # The marker gives the first round something real to fail,
+                    # so the revise round happens for the reason the factory
+                    # says it should.
                     "# {0}\nfrom pathlib import Path\n"
-                    "def test_output_exists():\n"
+                    "def test_output_is_ready():\n"
                     "    assert Path({1!r}).is_file()\n"
+                    "    assert Path({1!r}).read_text().strip().endswith('ready')\n"
                 ).format(SECRET, ctx.lane.declared_outputs[0])
             },
             "private_tokens": (SECRET,),
@@ -170,6 +182,9 @@ class HandoffActor:
         return st.ReviewerVerdict.PASS, ()
 
     def build(self, ctx: sch.LaneContext) -> dict:
+        # The opening candidate for a lane is deliberately not "ready", so the
+        # sealed suite is red and the scripted REVISE is a legitimate one.
+        marker = "draft" if ctx.lane.lane_id not in self.build_lanes else "ready"
         self.build_lanes.append(ctx.lane.lane_id)
         self.building_entries.append((ctx.lane.lane_id, ctx.entry_kind))
         self.builder_contracts.append(ctx.public_contract)
@@ -182,7 +197,7 @@ class HandoffActor:
             dest = work / path
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(
-                "{0}:{1}\n".format(ctx.lane.lane_id, ctx.input_digest),
+                "{0}:{1}:{2}\n".format(ctx.lane.lane_id, ctx.input_digest, marker),
                 encoding="utf-8",
             )
             _git(work, "add", path)
@@ -227,6 +242,7 @@ class NoopActor(HandoffActor):
                 "tests/test_a_private.py": (
                     "from pathlib import Path\ndef test_a():\n"
                     "    assert Path('a.txt').is_file()\n"
+                    "    assert Path('a.txt').read_text().strip() == 'ready'\n"
                 )
             }
         }
@@ -564,18 +580,39 @@ class TestsLaneHandoffTests(unittest.TestCase):
             kinds.index(st.ArtifactKind.BUILDER_OUTPUT.value),
         )
 
-    def test_code_revise_can_resubmit_byte_identical_builder_output(self) -> None:
+    def test_a_byte_identical_resubmit_is_recorded_and_cannot_flip_the_verdict(
+        self,
+    ) -> None:
+        """Identical bytes get an identical answer, and the lane stops.
+
+        This used to assert the lane MERGED: the builder resubmitted the same
+        candidate sha and the reviewer, asked a second time about bytes it had
+        already seen, changed its mind to PASS. That is precisely the re-review
+        of byte-identical input B10 says must be impossible or explicitly
+        recorded.
+
+        The verdict is now the sealed measurement's, and a measurement is a
+        function of the candidate. So the second round reaches the same red
+        answer as the first, both rounds are recorded, and the lane stops for
+        the operator rather than merging on a reviewer's change of heart.
+        """
         compiled = plan_compiler.compile_plan(
             _unified_plan_bytes(), plan_revision=1, plan_artifact_ref="plan:noop"
         )
         actor = NoopActor(self.repo, self.runtime.path / "worktrees")
         scheduler = self._start(compiled, actor, "run-noop")
-        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
-        self.assertEqual(self.store.lane_stage("run-noop", "lane-a"), st.LaneStage.MERGED)
+        self.assertEqual(scheduler.run(), st.RunStatus.WAITING)
+        self.assertEqual(
+            self.store.lane_stage("run-noop", "lane-a"),
+            st.LaneStage.WAITING_FOR_USER,
+        )
+        # Three, not two: the stall guard gives a lane its grace window before
+        # it stops, and every one of these rounds re-submitted the same bytes.
         self.assertEqual(
             actor.building_entries,
             [
                 ("lane-a", st.BuildingEntryKind.INITIAL),
+                ("lane-a", st.BuildingEntryKind.CODE_REVISE),
                 ("lane-a", st.BuildingEntryKind.CODE_REVISE),
             ],
         )
@@ -586,19 +623,25 @@ class TestsLaneHandoffTests(unittest.TestCase):
                 ("run-noop", "lane-a", st.ArtifactKind.BUILDER_OUTPUT.value),
             )
         )
-        self.assertEqual(len(builders), 2)
+        self.assertEqual(len(builders), 3)
+        # Every round is the same candidate, and every round is recorded.
         self.assertEqual(
-            [json.loads(row[0])["candidate_sha"] for row in builders],
-            [actor.first_sha, actor.first_sha],
+            {json.loads(row[0])["candidate_sha"] for row in builders},
+            {actor.first_sha},
         )
         reviews = list(
             self.store.conn.execute(
-                "SELECT artifact_id FROM lane_artifacts "
-                "WHERE run_id=? AND lane_id=? AND artifact_kind=?",
+                "SELECT payload_json FROM lane_artifacts "
+                "WHERE run_id=? AND lane_id=? AND artifact_kind=? ORDER BY sequence",
                 ("run-noop", "lane-a", st.ArtifactKind.CODE_REVIEW.value),
             )
         )
-        self.assertEqual(len(reviews), 2)
+        self.assertEqual(len(reviews), 3)
+        # Identical bytes, identical answer. That is the property.
+        self.assertEqual(
+            {json.loads(row[0])["verdict"] for row in reviews},
+            {st.ReviewerVerdict.REVISE.value},
+        )
 
     def test_amendment_changed_paused_resets_planned(self) -> None:
         self.assertEqual(

@@ -1235,7 +1235,15 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
         ), mock.patch.object(
             sch.cr, "measure_candidate", return_value=measurement
         ) as measure, mock.patch.object(
-            sch.cr, "review_builder_output", return_value=None
+            sch.cr,
+            "review_builder_output",
+            # The real call returns a CODE_REVIEW artifact, and the scheduler
+            # reads the verdict the measurement settled on off it. A None here
+            # is not a cheaper stand-in, it is a different function.
+            # This measurement is green (0 failed, 0 errored), so the verdict
+            # the suite settles on is PASS -- the reviewer cannot send a
+            # passing candidate back.
+            return_value=SimpleNamespace(verdict=st.ReviewerVerdict.PASS),
         ) as review:
             scheduler._reviewing_code("lane-a")
 

@@ -1196,6 +1196,107 @@ class ArtifactStoreTests(unittest.TestCase):
             reconstructed["A"].declared_outputs, self.lane_a.declared_outputs
         )
 
+    def test_an_answered_review_stops_naming_lanes_for_later_amendments(self) -> None:
+        """A REVISE binds the amendment that answers it, and no others.
+
+        On run f50638ab the final review named two lanes, the amendment that
+        addressed it landed, and both lanes went on to MERGE. Every later
+        amendment was still refused `AMENDMENT_DOES_NOT_ADDRESS_REVIEW` for not
+        re-editing those two -- which by then were merged and correct, so the
+        only way to satisfy the check was to damage finished work. The lane
+        that actually needed amending was a third one the review never named.
+        """
+        integration = self._merge_both()
+        review_id = self._revise_named_a(integration)
+
+        changed_a = make_lane("A", spec=digest_label("spec:A:review"))
+        first = make_plan(changed_a, self.lane_b, revision=2, stamp="answered-first")
+        first_resets = (
+            st.LaneReset("A", st.LaneStage.WAITING_FOR_USER, st.LaneStage.PLANNED),
+            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.TESTS_SEALED),
+        )
+        self.store.apply_amendment(
+            RUN_ID,
+            1,
+            first,
+            self._amendment_artifact(
+                first,
+                first_resets,
+                "answered-first",
+                integration_head=integration,
+                final_review_artifact_id=review_id,
+            ),
+            first_resets,
+        )
+
+        # The second amendment leaves A exactly as the first one left it and
+        # touches only B. Under the stale lookup this was refused.
+        changed_b = make_lane("B", spec=digest_label("spec:B:second"))
+        second = make_plan(changed_a, changed_b, revision=3, stamp="answered-second")
+        second_resets = (
+            st.LaneReset("A", st.LaneStage.PLANNED, st.LaneStage.PLANNED),
+            st.LaneReset("B", st.LaneStage.TESTS_SEALED, st.LaneStage.PLANNED),
+        )
+        artifact = run_artifact(
+            st.ArtifactKind.PLAN_AMENDMENT,
+            digest_label("answered-second"),
+            {
+                "final_review_artifact_id": st.NO_FINAL_REVIEW,
+                "integration_head": integration,
+                "invalidated_inputs": [],
+                "new_plan_artifact_ref": second.plan_artifact_ref,
+                "new_plan_digest": second.plan_digest,
+                "new_plan_revision": second.plan_revision,
+                "prior_plan_digest": first.plan_digest,
+                "prior_plan_revision": 2,
+                "projection": [lane.lane_id for lane in second.lanes],
+                "resets": [
+                    {
+                        "from_stage": item.from_stage.value,
+                        "lane_id": item.lane_id,
+                        "to_stage": item.to_stage.value,
+                    }
+                    for item in second_resets
+                ],
+                "retained_inputs": [],
+            },
+            revision=3,
+        )
+        self.store.apply_amendment(RUN_ID, 2, second, artifact, second_resets)
+
+        reconstructed = {
+            lane.lane_id: lane for lane in self.store.active_projection(RUN_ID)
+        }
+        self.assertEqual(reconstructed["A"].spec_digest, changed_a.spec_digest)
+        self.assertEqual(reconstructed["B"].spec_digest, changed_b.spec_digest)
+        self.assertEqual(self.store.lane_stage(RUN_ID, "B"), st.LaneStage.PLANNED)
+
+    def test_an_unanswered_review_still_names_its_lanes(self) -> None:
+        # The freshness test must not make the obligation vanish. With no
+        # amendment recorded after the review, the named lane is still bound.
+        integration = self._merge_both()
+        review_id = self._revise_named_a(integration)
+        unchanged = make_plan(self.lane_a, self.lane_b, revision=2, stamp="still-named")
+        resets = (
+            st.LaneReset("A", st.LaneStage.WAITING_FOR_USER, st.LaneStage.PLANNED),
+            st.LaneReset("B", st.LaneStage.MERGED, st.LaneStage.BUILDING),
+        )
+        with self.assertRaises(AmendmentRefused) as raised:
+            self.store.apply_amendment(
+                RUN_ID,
+                1,
+                unchanged,
+                self._amendment_artifact(
+                    unchanged,
+                    resets,
+                    "still-named",
+                    integration_head=integration,
+                    final_review_artifact_id=review_id,
+                ),
+                resets,
+            )
+        self.assertIn("AMENDMENT_DOES_NOT_ADDRESS_REVIEW", str(raised.exception))
+
     def test_base_invalidation_returns_to_building_without_pause(self) -> None:
         self._to_sealed(self.lane_a)
         self._build(

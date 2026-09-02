@@ -306,6 +306,12 @@ def _project_identity(target: gitpub.TargetBinding) -> str:
     return "{}-{}".format(name, target.target_repository_fingerprint)
 
 
+#: Seconds a superseded role pane gets to be proven quiescent and closed.
+#: Matches the launcher's own post-launch cancel budget; the lane never waits
+#: on this, because a refusal here is reported rather than raised.
+_SUPERSEDED_CLOSE_SECONDS = 5.0
+
+
 class _RoleSession:
     def __init__(
         self,
@@ -485,7 +491,7 @@ class HerdrStageActor:
             }
         )
         self.project_identity = _project_identity(target)
-        self._roles: dict[tuple[str, str], _RoleSession] = {}
+        self._roles: dict[tuple[str, str, str], _RoleSession] = {}
 
     def _validate_role_git(self, repo: Path) -> None:
         resolved = Path(repo).resolve()
@@ -1152,8 +1158,23 @@ class HerdrStageActor:
             return existing
         return lch.workspace_label_for(self.project_identity, ctx.run_id)
 
-    def _role_key(self, ctx: LaneContext, role: str) -> tuple[str, str]:
-        return (ctx.lane.lane_id, role)
+    def _role_key(self, ctx: LaneContext, role: str) -> tuple[str, str, str]:
+        """Identity of one role's long-lived agent session.
+
+        The lane's spec digest is part of the identity because a plan revision
+        rewrites the lane's contract while the superseded text stays in the
+        bound agent's context window. On run f50638ab a code reviewer went from
+        turn 46 to turn 51 across an amendment and kept quoting the acceptance
+        sentence the amendment had already corrected: the document was fixed
+        and the reader was not.
+
+        The digest is the key rather than the `amend` verb, so a fresh session
+        falls out of every path that changes a spec instead of out of the one
+        path somebody remembered to special-case. `_role_dir` is deliberately
+        not keyed the same way -- the checkout is bound by path, and its
+        candidate commits have to survive the session that made them.
+        """
+        return (ctx.lane.lane_id, role, ctx.lane.spec_digest)
 
     def _role_dir(self, ctx: LaneContext, role: str, *, create: bool = True) -> Path:
         path = self.worktrees / ctx.run_id / ctx.lane.lane_id / role
@@ -1232,7 +1253,19 @@ class HerdrStageActor:
             if isinstance(payload, dict) and self._payload_ok(role, payload):
                 wait = getattr(self.launcher, "wait_for_idle", None)
                 if wait is not None:
-                    wait(handle)
+                    try:
+                        wait(handle)
+                    except lch.AgentNotInteractive as exc:
+                        # The declaration is already on disk and already valid;
+                        # this wait only lets the composer finish rendering so
+                        # the next prompt is not typed into a busy one. The
+                        # correction path re-checks that itself before it
+                        # submits, so a slow render is not this run's answer.
+                        self._say(
+                            lane_id or "-",
+                            "{0} composer still rendering".format(role),
+                            str(exc),
+                        )
                 return payload
             result = self.launcher.poll(handle)
             if result.state in (lch.PollState.GONE, lch.PollState.EXITED):
@@ -1259,7 +1292,7 @@ class HerdrStageActor:
             pane_created=bool(exc.pane_created),
         )
 
-    def _retain_completed(self, handle: object, key: tuple[str, str]) -> None:
+    def _retain_completed(self, handle: object, key: tuple[str, str, str]) -> None:
         retain = getattr(self.launcher, "retain", None)
         if retain is None:
             return
@@ -1267,6 +1300,51 @@ class HerdrStageActor:
             retain(handle)
         except lch.LaunchRefused:
             self._roles.pop(key, None)
+
+    def _release_superseded(self, key: tuple[str, str, str]) -> bool:
+        """Close the session a previous revision of this (lane, role) bound.
+
+        Dropping the record is not enough. `HerdrLauncher` keeps its own role
+        registry keyed by `(lane_key, pane_role)` with no digest in it, and
+        `launch` adopts a still-running role agent and resubmits into it, so a
+        new key with the old pane still open resumes the same context window
+        the new key exists to leave behind. `cancel` is the launcher-side close
+        -- it proves quiescence, closes the pane, and drops the launcher's own
+        role handle -- and it is the only pane close this actor performs.
+
+        Best effort by construction: a close that refuses is reported in the
+        step log and the record dropped anyway. A pane Herdr would not close is
+        an operator's problem, never a reason to fail the lane.
+
+        Answers whether anything was released, because the caller then owns a
+        checkout an earlier revision's session left behind.
+        """
+        lane_id, role, _digest = key
+        stale = [
+            other
+            for other in self._roles
+            if other[0] == lane_id and other[1] == role and other != key
+        ]
+        cancel = getattr(self.launcher, "cancel", None)
+        for other in stale:
+            stored = self._roles.pop(other)
+            if stored.handle is None or cancel is None:
+                continue
+            try:
+                cancel(stored.handle, time.monotonic() + _SUPERSEDED_CLOSE_SECONDS)
+            except Exception as exc:
+                self._say(
+                    lane_id,
+                    "superseded {0} pane not closed".format(role),
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                )
+                continue
+            self._say(
+                lane_id,
+                "closed superseded {0} pane".format(role),
+                "spec {0}".format(other[2][:12]),
+            )
+        return bool(stale)
 
     def _launch(
         self,
@@ -1278,6 +1356,9 @@ class HerdrStageActor:
         prepare_cwd: Callable[[Path], None],
     ) -> tuple[Mapping[str, Any], object, Path]:
         key = self._role_key(ctx, role)
+        # Every dispatch crosses here, which is why the release is here and
+        # not in the five stage methods that each compute the same key.
+        superseded = self._release_superseded(key)
         route = self.role_routes[role]
         stored = self._roles.get(key)
         if stored is not None:
@@ -1347,6 +1428,13 @@ class HerdrStageActor:
             self._retain_completed(handle, key)
             return payload, handle, cwd_used
 
+        if superseded:
+            # This checkout is the released session's, adopted by path so its
+            # candidate commits survive. A first launch would have created it
+            # at the right sha and a resubmit would have prepared it; this is
+            # neither, so a reviewer would otherwise read the tree the previous
+            # revision left rather than the one it was dispatched against.
+            prepare_cwd(cwd)
         system_prompt = self._materialize_role_instructions(
             cwd, role, route["route"], ctx.lane.lane_kind
         )
@@ -1432,7 +1520,7 @@ class HerdrStageActor:
 
     def _bind_checkout(
         self,
-        key: tuple[str, str],
+        key: tuple[str, str, str],
         attempt: Path,
         checkout: Path | None,
         cwd_used: Path,

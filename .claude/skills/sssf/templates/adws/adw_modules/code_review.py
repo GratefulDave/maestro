@@ -891,6 +891,7 @@ def review_builder_output(
     files = measurement.files
     run = measurement.run
     summary = measurement.summary
+    advisory: tuple[Mapping[str, str], ...] = ()
     if measurement.runner_failed:
         if verdict is st.ReviewerVerdict.PASS:
             verdict = st.ReviewerVerdict.REVISE
@@ -901,6 +902,26 @@ def review_builder_output(
             findings = (
                 _COLLECTION_REVISE if measurement.collection_broken else _RUNNER_REVISE,
             )
+    elif verdict is st.ReviewerVerdict.REVISE:
+        # Section 7: "REVIEWING_CODE runs the predecessor sealed suite in
+        # scratch; that broker result is authoritative for the candidate." A
+        # green suite has answered the behavioural question, so a reviewer
+        # cannot send the candidate back over behaviour it cannot measure.
+        #
+        # This is the other half of the coercion above, and it was the missing
+        # half. Without it a REVISE outranked a passing suite and the builder
+        # obeyed: lane-wp7-build measured 11 of 11, was told to "restore
+        # optional nonnegative-integer n in every DPA matrix schema and
+        # preserve it in matrix", and measured 9 of 11 four minutes later. The
+        # sealed case asserts matrix is exactly {a, b, c, d}. The review
+        # ordered its own acceptance test broken and got its wish.
+        #
+        # The findings are not discarded. They ride the artifact as advisory,
+        # redacted on the same path as actionable ones, so a real observation
+        # survives for a reader without costing a passing candidate.
+        advisory = tuple(dict(item) for item in findings)
+        findings = ()
+        verdict = st.ReviewerVerdict.PASS
     private_files = {
         path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in files.items()
     }
@@ -930,6 +951,9 @@ def review_builder_output(
         blob_ids=tuple(files.values()),
     )
     findings_out = pr.actionable_findings(verdict, findings, tokens)
+    # Redacted on the findings path, never the actionable one: these do not
+    # reach the builder and cannot cause a transition.
+    advisory_out = pr.redact_findings(advisory, tokens) if advisory else ()
     # Exactly the names the builder is handed as `bound_surface`, derived from
     # the same sealed files. Values are never in here -- the extractor is a
     # whitelist of identifiers, not a filter over text.
@@ -943,6 +967,7 @@ def review_builder_output(
         "builder_base_sha": builder_base_sha,
         "candidate_ref": candidate_ref,
         "candidate_sha": candidate_sha,
+        "advisory_findings": [dict(item) for item in advisory_out],
         "findings": [dict(item) for item in findings_out],
         "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,

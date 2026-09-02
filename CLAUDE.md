@@ -140,6 +140,43 @@ that refuses identically twice now blocks rather than retrying. That is a
 decision about a running factory, not a housekeeping sync, and it was left to
 the operator rather than taken by the agent that made the change.
 
+**Historical snapshot re-derived 2026-09-02** with `runtime_sync.py check`,
+template ↔ the-library only: a run was executing against FDAdb, so no deployment
+was read.
+
+| comparison | result |
+| --- | --- |
+| template ↔ the-library | level over **155** compared files at this reading, but only after the repair below, and that repair was still uncommitted in the-library when this was written. Nothing is excluded and no file is missing from either side. |
+
+How that one file reads wrong is the part worth keeping. The check reports
+the-library "ahead by 141 lines (343 vs 202)" — and the-library is not ahead.
+The template's copy is the newer one: #175 deliberately dropped the
+delegation-capability axis from role launch, deleting `route_capability_argv`,
+`argv_denies_delegation` and the `--disallowedTools Task Agent` flags they
+produced. the-library still holds the pre-#175 file from the 2026-08-21 mirror,
+so **the newer side reads as behind purely because its file got shorter.**
+
+This is the one shape `--overwrite-ahead` is for, and a plain
+`mirror --apply` will not fix it: the mirror refuses a destination file that
+looks ahead, so every ordinary sync carries the other 154 files across and
+silently leaves this one diverged. It survived two such syncs that way, including
+`sync(sssf): mirror the ADW runtime from maestro (#151)`, whose commit message
+claims a mirror this file was not part of.
+
+The flag's danger is unchanged everywhere else — read which side is ahead, and
+why, before reaching for it. And **the repair is not durable until it is
+committed in the destination repository**, which is a separate act from writing
+it. That is not hypothetical here: on 2026-09-02 the overwrite was applied, a
+check confirmed the copies level, and a later git operation in that repository
+discarded the uncommitted file and put the divergence straight back. A green
+`test_template_parity` proves the bytes on disk agree; it says nothing about
+whether they are committed, so confirm with `git status` there, never with
+parity.
+
+The compared set is 155 where 2026-08-27 read 231, and `excluded` and
+`missing_files` are both empty, so that is a runtime with fewer files in both
+copies rather than a widening exclusion.
+
 `--overwrite-ahead` deserves its own warning here, because it was nearly used
 on the `lexgenius` docs above. The flag discards destination files that look
 *ahead* of the source — which is indistinguishable from someone's uncommitted
@@ -296,6 +333,46 @@ attempt's `extra_json` recovery keys; `attempt_sealed_output`;
 stored refusals; then the worktree HEAD and `refs/heads/maestro/{run}/{node}/a{n}`.
 Four of those were wrong at once. Reading three of them and stopping is what cost
 four handovers.
+
+## Historical — 2026-09-02 run f50638ab (not current diagnostics)
+
+Two failures on one FDAdb run, unrelated in mechanism and the same in shape: a
+value was read that answered a different question than the caller was asking,
+and neither the type nor the query said so.
+
+**A slow composer is not a verdict about work already declared.**
+`wait_for_interactive_agent` raised a bare `RuntimeError`, so no caller could
+separate "this agent refused" from "this pane has not finished drawing", and no
+caller caught it. One of those callers is `_await_envelope`, which runs *after*
+the envelope is written. On run f50638ab the tester wrote a valid envelope,
+`_await_envelope` read it, validated it and satisfied `_payload_ok` — and then
+the 60s courtesy wait for the Claude pane's composer timed out with
+`AGENT_INTERACTIVE_READY_TIMEOUT` and ended the run while holding the good
+result. The agent read `idle` / `interactive_ready` moments later. The fix
+decides nothing new: `AgentNotInteractive` is the same failure, typed.
+Post-envelope it is reported and the payload returned, because the correction
+path re-checks composer readiness itself before it submits. At `resubmit`, where
+a prompt genuinely cannot be delivered into a busy composer, it becomes
+`LaunchRefusal.PROMPT_SUBMISSION_REFUSED`; at session cleanup,
+`SESSION_RENAME_UNCONFIRMED`. **An untyped exception on a path with more than one
+caller defers the decision to whichever caller forgets to catch it**, and a wait
+whose own docstring says the work is already on disk must not be able to discard
+it.
+
+**A final review an amendment answered is spent.** `_active_final_review` took
+the newest `FINAL_INTEGRATION_REVIEW` row with no freshness test of any kind, and
+`apply_amendment` reads it to decide which lanes an amendment must change. On the
+same run a REVISE named `lane-wp7-build` and `lane-wp7-gateway-build`, the v3
+amendment answered it, and both lanes reached `MERGED` — after which every later
+amendment was refused `AMENDMENT_DOES_NOT_ADDRESS_REVIEW` for not re-editing two
+lanes that were merged and correct. The only way to satisfy that refusal was to
+damage finished work. A `PLAN_AMENDMENT` recorded after the review *is* the
+answer, since applying one is the only way to respond to a REVISE, so the lookup
+now ignores a review a later amendment precedes. **Everywhere else a final review
+is bound to the fingerprint of the surface it judged; this one lookup was bound to
+nothing.** Where a stored record authorizes something, find the query that fetches
+it and ask what makes it current — `ORDER BY sequence DESC LIMIT 1` is a guess
+that the newest row is still the live one.
 
 ## Historical — diagnosing attempt-worktree retries (not current diagnostics)
 
