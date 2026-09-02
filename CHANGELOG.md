@@ -103,6 +103,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   go through `runner_resolution.run_bounded`, which gives the child its own
   session and kills the group on timeout; collection keeps a listing that
   arrived before the hang and refuses only on an empty one.
+- **The suite is green on a clean checkout again.** Eight failures, two causes,
+  neither of them a defect in the runtime. Six were
+  `tests/test_deployment_parity.py` comparing the template against `lexgenius`
+  and `lexgenius-pipeline`, which `.maestro/deployments.json` still declared:
+  both carry the pre-#165 runtime — `maestro.py` at 10604 lines against the
+  template's 2501, 197 files existing in one copy and not the other, neither
+  touched since before the cutover — so they are a different generation of the
+  product rather than drift, and neither is in use. The registry now declares
+  none, which is a supported, named state the check reports rather than a check
+  that was deleted; a deployment is declared again when one is installed. The
+  other two were `tests/test_actor_delegation_capability.py` asserting the
+  claude route's behaviour for a tester the template routes to `omp`. Four
+  assertions in that one test hardcoded a route: the instruction filename (both
+  directions — the builder's asserted `AGENTS.md` and the tester's `CLAUDE.md`,
+  each the constant belonging to the other route), the Claude-only bound
+  paragraph `maestro.py:730` appends only for claude, and the launch argv. They
+  now derive from `spec.route` through `_instruction_filename` and
+  `_expected_argv`, so they follow a reroute instead of breaking on one. The
+  argv assertion additionally stopped recomputing `build_omp_argv` after the
+  fact: it appends `-c` once the session dir holds a jsonl, so the recomputation
+  described the second dispatch rather than the first, and the recorder had
+  built the recorded argv with that same function, so the comparison could only
+  ever agree with itself. It asserts the first launch's actual profile, system
+  prompt and absence of `-c` instead.
 - **Every vault ref is named by what it pins.** Draft and sealed refs were keyed
   on the review's `input_digest` but pinned a `git commit` sha, which embeds the
   wall clock; a second draft of one input a second later asked the same ref to
