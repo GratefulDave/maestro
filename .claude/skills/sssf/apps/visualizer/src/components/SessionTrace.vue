@@ -736,7 +736,7 @@ function selectPhase(p: Phase) {
 .ctx-bar {
   height: 6px;
   border-radius: 999px;
-  background: rgba(6, 8, 15, 0.75);
+  background: rgba(0, 0, 0, 0.75);
   border: 1px solid var(--border-soft);
   overflow: hidden;
 }
@@ -773,7 +773,7 @@ function selectPhase(p: Phase) {
   position: absolute;
   top: 0;
   bottom: 0;
-  border-left: 1px dashed rgba(174, 191, 212, 0.14);
+  border-left: 1px dashed rgba(196, 196, 196, 0.22);
 }
 
 .block {

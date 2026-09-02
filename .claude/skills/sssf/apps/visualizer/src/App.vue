@@ -183,7 +183,7 @@ const showTabs = computed(() => sources.value.length > 1)
   align-items: center;
   justify-content: space-between;
   padding: 15px 28px;
-  background: rgba(11, 15, 24, 0.72);
+  background: rgba(11, 11, 11, 0.72);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   position: sticky;
