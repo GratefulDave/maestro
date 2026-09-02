@@ -22,6 +22,7 @@ import { basename, isAbsolute, resolve } from "node:path";
 import { SssfDb } from "./db.ts";
 import { ArtifactFactoryDb, ARTIFACT_FACTORY_TABLES } from "./artifactFactoryDb.ts";
 import { MAESTRO_TABLES, MaestroDb, discoverMaestroLedger, openLedgerReadonly } from "./maestroDb.ts";
+import { StepLogReader, stepLogPathFor } from "./stepLog.ts";
 import type { SourceInfo, SourceKind } from "../shared/types.ts";
 
 const DEFAULT_SSSF_RELATIVE = "adws/adw_data/sssf.db";
@@ -126,6 +127,15 @@ export interface Source {
   readonly sssf?: SssfDb;
   readonly maestro?: MaestroDb;
   readonly artifactFactory?: ArtifactFactoryDb;
+  /**
+   * The scheduler's step narration beside this ledger, on run sources only.
+   *
+   * Derived from the ledger's own directory rather than configured, because
+   * the writer puts it there: knowing which ledger we serve is already
+   * knowing where its steps are. A tracer source has none — the tracer
+   * narrates itself through its events table.
+   */
+  readonly stepLog?: StepLogReader;
   info(): SourceInfo;
   close(): void;
 }
@@ -172,6 +182,7 @@ function makeSource(
       path,
       label: base,
       artifactFactory,
+      stepLog: new StepLogReader(stepLogPathFor(path)),
       info: () => ({
         id,
         kind,
@@ -191,6 +202,7 @@ function makeSource(
     path,
     label: base,
     maestro,
+    stepLog: new StepLogReader(stepLogPathFor(path)),
     info: () => ({
       id,
       kind,

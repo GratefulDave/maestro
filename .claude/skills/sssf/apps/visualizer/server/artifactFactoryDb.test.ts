@@ -218,6 +218,24 @@ describe("source identities", () => {
     for (const source of [...forward, ...reverse]) source.close();
   });
 
+  test("every run source carries the step log beside its own ledger", () => {
+    const legacy = legacyLedger(join("steps-hist", "FDAdb"));
+    const factory = factoryLedger(join("steps-current", "FDAdb"), (db) => {
+      db.query("INSERT INTO ledger_meta (schema_version) VALUES ('artifact-factory.v1')").run();
+      insertFactoryRun(db, "run-steps", [{ id: "lane-a", needs: [], stage: "BUILDING" }]);
+    });
+    const sources = resolveSources(["--db", legacy, "--db", factory], root);
+    // Derived from each ledger's own directory, so two factories served by one
+    // process never read each other's narration.
+    expect(sources.map((s) => s.stepLog?.path)).toEqual([
+      join(root, "steps-hist", "FDAdb", "steps.jsonl"),
+      join(root, "steps-current", "FDAdb", "steps.jsonl"),
+    ]);
+    // Not written yet is the ordinary state, and it is not an error.
+    expect(sources[1]!.stepLog!.read().present).toBe(false);
+    for (const source of sources) source.close();
+  });
+
   test("registry keeps the legacy database and discovers runtime_state_root ledger", () => {
     const repo = join(root, "product-repo");
     mkdirSync(join(repo, "adws"), { recursive: true });

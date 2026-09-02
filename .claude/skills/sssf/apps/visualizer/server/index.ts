@@ -179,6 +179,23 @@ const server = Bun.serve({
       return detail ? json(detail) : notFound(`no run ${param(req, "run_id")}`);
     }),
 
+    /**
+     * What this run's scheduler is doing right now, past a byte cursor.
+     *
+     * `after` is the `cursor` of the previous page, so a poll loop re-reads
+     * nothing: the file only grows. A page whose `has_more` is set means the
+     * client stopped short of the end and should ask again immediately.
+     *
+     * Read-only, like every other route here — the step log belongs to the
+     * scheduler and the dashboard is a reader of it.
+     */
+    "/api/sources/:source_id/runs/:run_id/steps": safely((req) => {
+      const source = sourceFor(req);
+      if (!source?.stepLog) return notFound(`no run source ${param(req, "source_id")}`);
+      const page = source.stepLog.read(intQuery(req, "after", 0), param(req, "run_id"));
+      return json({ ...page, server_now_ms: Date.now() });
+    }),
+
     "/api/sessions": safely(
       withSssf((sssf, req) => json(sssf.sessions(intQuery(req, "limit", 200)))),
     ),

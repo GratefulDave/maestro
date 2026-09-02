@@ -47,5 +47,6 @@ export type {
   MaestroRunOutcome,
   MaestroLiveState,
   RunLiveness,
-
+  StepLine,
+  StepLogPage,
 } from '@shared/types'
