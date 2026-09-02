@@ -16,6 +16,7 @@ from typing import Mapping, Sequence
 from . import bound_surface as bsf
 from . import hidden_vault as hv
 from . import private_review as pr
+from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
 from .launcher import PROVISION_TIMEOUT_S, run_harness_process
@@ -475,6 +476,16 @@ _NUMERIC = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:\.\d+)?(?![A-Za-z0-9_.])")
 #: A line that renders a collection literal rather than describing a comparison.
 _COLLECTION_PREFIXES = ("{", "}", "'", '"', "+", "-")
 
+#: A diff line whose body is one whole scalar literal. vitest renders a scalar
+#: comparison as `- 200` / `+ 400`, which is the same contract vocabulary as the
+#: `expected 400 to be 200` marker line above it, not a fixture value. A member
+#: of a rendered collection never has this shape: it carries its key
+#: (`+   "n": 47`), or its separator (`-   1,`), or its bracket, and the single
+#: space is deliberate -- collection members are indented further.
+_SCALAR_DIFF_BODY = re.compile(
+    r"^[+-] (?:-?\d+(?:\.\d+)?|null|undefined|true|false|NaN)$"
+)
+
 
 def _renders_a_collection(line: str) -> bool:
     # A number inside a rendered collection is a fixture value; a number in a
@@ -484,6 +495,8 @@ def _renders_a_collection(line: str) -> bool:
     # `Left contains 7 more items:` is a header whose number counts keys rather
     # than naming a value, and it is more useful to the builder intact.
     body = line[2:].strip() if line.startswith("E ") else line
+    if _SCALAR_DIFF_BODY.match(body.strip()):
+        return False
     if body.startswith(_COLLECTION_PREFIXES):
         return True
     return "{" in body or "[" in body
@@ -515,6 +528,12 @@ def _bound_surface_names(private_files: Mapping[str, str]) -> tuple[str, ...]:
                 names.add(str(symbol))
     for key in surface.get("object_keys") or ():
         names.add(str(key))
+    # A route path is a name the builder is already handed, so redacting it out
+    # of the failure line that names it is the one thing that keeps the lane
+    # guessing: `assert '[redacted]' == '/internal[redacted]'` hid the whole
+    # answer for 20+ rounds on run f50638ab.
+    for route in surface.get("routes") or ():
+        names.add(str(route))
     return tuple(sorted(name for name in names if name))
 
 
@@ -551,13 +570,25 @@ def redacted_failure_lines(
     kept: list[str] = []
     in_block = False
     for raw in output.splitlines():
+        # vitest colours its diff, so `- Expected` arrives as `\x1b[32m- Expected
+        # \x1b[39m` and every test below reads `\x1b` as the first character:
+        # `_is_continuation` sees neither leading whitespace nor a prefix, and the
+        # whole comparison body is dropped. pytest is unaffected because it emits
+        # no colour off a TTY. Strip once, here, so the marker test, the
+        # continuation test, and the redaction all read the same text. The
+        # expression is `runner_resolution`'s, not a second copy.
+        raw = rr._ANSI.sub("", raw)
         line = raw.strip()
         if not line:
-            # pytest indents the separator inside a comparison body, so a
-            # whitespace-only line is part of the block, not the end of it.
-            # Treating it as a terminator dropped every dict diff.
-            if not (in_block and raw):
-                in_block = False
+            # A blank line separates a comparison body from its header, it does
+            # not end it. pytest indents its separator, so the earlier test for
+            # a non-empty `raw` kept pytest's dict diffs; vitest emits a truly
+            # empty line either side of `- Expected / + Received`, so that test
+            # closed the block one line before the diff arrived and dropped
+            # every one of them. A blank line now carries no verdict at all --
+            # the block still ends where it ended before, at the first line that
+            # is neither a marker nor a continuation, and vitest's own `❯`
+            # frame is such a line because it names a test.
             continue
         if _names_a_test(line):
             in_block = False
