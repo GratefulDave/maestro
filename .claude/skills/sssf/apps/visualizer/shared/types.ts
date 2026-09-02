@@ -687,6 +687,53 @@ export interface MaestroRunDetail {
   run_transitions: MaestroTransition[];
 }
 
+// ── step log: what a lane is doing between transitions ───────────────────────
+// The ledger records a stage change when it happens; a stage that takes
+// minutes therefore looks identical to a stuck one. The scheduler narrates
+// each step it takes into `steps.jsonl` beside the ledger, and this is that
+// narration. It is display only — no field here decides a stage, and the
+// dashboard never writes the file.
+
+/** One appended line of scheduler narration. */
+export interface StepLine {
+  /** ISO 8601 with offset, as the scheduler stamped it. Null if unparseable. */
+  ts: string | null;
+  run_id: string;
+  /** The lane this step belongs to, or `"-"` for a run-level step. */
+  lane_id: string;
+  message: string;
+  /** Always present in the contract; often empty. */
+  detail: string;
+}
+
+/** GET /api/sources/:id/runs/:run_id/steps?after=<byte offset> */
+export interface StepLogPage {
+  /**
+   * Whether the file exists at all. A run whose scheduler has narrated
+   * nothing yet answers `false`, which is a normal state and renders as "no
+   * steps" rather than as an error.
+   */
+  present: boolean;
+  steps: StepLine[];
+  /**
+   * Byte offset the next page starts at. Advances over whole lines only, so a
+   * line the writer is still appending is left for the following poll.
+   * Unaffected by run filtering: it counts bytes, not returned records.
+   */
+  cursor: number;
+  /**
+   * This page was cut short by the server's read cap — ask again now rather
+   * than on the next tick. Distinct from "bytes remain past `cursor`": the
+   * bytes of a line the writer is half-way through appending always remain,
+   * and treating those as more-to-fetch spins the client.
+   */
+  has_more: boolean;
+  /** The file's size when it was read, for the same reason `cursor` is a byte. */
+  size: number;
+  /** The server's clock, so step ages are measured the way attempts are. */
+  server_now_ms?: number;
+}
+
 /** GET /api/health */
 export interface HealthResponse {
   ok: boolean;

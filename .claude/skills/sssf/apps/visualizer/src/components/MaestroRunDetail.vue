@@ -14,8 +14,8 @@
  */
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { Ban, ChevronRight, GitBranch, TriangleAlert, UserRound } from 'lucide-vue-next'
-import type { MaestroAttempt, MaestroNode, MaestroRunDetail } from '../lib/types'
-import { ApiHttpError, fetchRun } from '../lib/api'
+import type { MaestroAttempt, MaestroNode, MaestroRunDetail, StepLine } from '../lib/types'
+import { ApiHttpError, fetchRun, fetchSteps } from '../lib/api'
 import {
   acceptedTestCandidate,
   candidateLifecycleForNode,
@@ -23,7 +23,8 @@ import {
   testBytesLocation,
   testStrengthPhase,
 } from '../lib/maestroLifecycle'
-import { fmtDate, fmtDuration, ts } from '../lib/format'
+import { RUN_LANE, appendSteps, emptyStepFeed, latestStep, stepsFor } from '../lib/stepFeed'
+import { fmtClock, fmtDate, fmtDuration, fmtOffset, ts } from '../lib/format'
 import MaestroStateChip from './MaestroStateChip.vue'
 
 const props = defineProps<{ sourceId: string; runId: string }>()
@@ -45,9 +46,23 @@ const open = ref<Set<string>>(new Set())
 const skewMs = ref(0)
 const nowMs = ref(Date.now())
 
+/**
+ * The scheduler's narration for this run, accumulated across polls.
+ *
+ * The ledger records a stage change when it completes, so REVIEWING_CODE is
+ * one unchanging row for the whole time the scheduler spends provisioning a
+ * tree, running the sealed suite and waiting on a reviewer — indistinguishable
+ * on screen from a lane that has stopped. These lines are what happens in
+ * between. They are display only: the chip still reads the ledger's stage, and
+ * a step that disagrees with it is stale narration rather than a state change.
+ */
+const steps = shallowRef(emptyStepFeed())
+
 let timer: ReturnType<typeof setInterval> | undefined
 let clock: ReturnType<typeof setInterval> | undefined
 let inflight = false
+let stepsInflight = false
+let stepTimer: ReturnType<typeof setInterval> | undefined
 
 async function tick() {
   if (inflight || notFound.value) return
@@ -73,9 +88,42 @@ async function tick() {
   }
 }
 
+/**
+ * Pull whatever the scheduler has narrated since the last poll.
+ *
+ * Separate from `tick` on purpose: the step log is a file beside the ledger
+ * and either can be unreadable while the other is fine, so a missing log must
+ * never blank the run and a stale run must never blank the feed. A page that
+ * reports `has_more` means this client stopped short of the end, so it keeps
+ * reading rather than waiting a second per bounded page — a reader that fell
+ * behind would otherwise never catch up.
+ */
+async function stepTick() {
+  if (stepsInflight || notFound.value) return
+  stepsInflight = true
+  try {
+    for (let page = 0; page < 20; page += 1) {
+      // Sequential by necessity, not by oversight: each request's cursor is
+      // the previous response's, so there is nothing to run in parallel.
+      // eslint-disable-next-line no-await-in-loop
+      const next = await fetchSteps(props.sourceId, props.runId, steps.value.cursor)
+      steps.value = appendSteps(steps.value, next)
+      if (!next.has_more) break
+    }
+  } catch {
+    // The narration is a convenience over the ledger. Losing a poll of it is
+    // not worth a banner, and the run's own error bar already says when the
+    // server is unreachable.
+  } finally {
+    stepsInflight = false
+  }
+}
+
 onMounted(() => {
   void tick()
+  void stepTick()
   timer = setInterval(() => void tick(), 1000)
+  stepTimer = setInterval(() => void stepTick(), 1000)
   // A separate, faster clock so an in-flight attempt's timer keeps counting
   // between polls instead of stepping once a second behind the network.
   clock = setInterval(() => (nowMs.value = Date.now()), 250)
@@ -83,14 +131,19 @@ onMounted(() => {
 onUnmounted(() => {
   clearInterval(timer)
   clearInterval(clock)
+  clearInterval(stepTimer)
 })
 watch(
   () => props.runId,
   () => {
     notFound.value = false
     run.value = null
+    // A byte cursor is an offset into one run's file read; carrying it across
+    // runs would start the next one part-way through its own narration.
+    steps.value = emptyStepFeed()
     if (!timer) timer = setInterval(() => void tick(), 1000)
     void tick()
+    void stepTick()
   },
 )
 
@@ -216,6 +269,46 @@ function attemptWhy(attempt: MaestroAttempt): string | null {
   return null
 }
 
+/**
+ * How long ago a step happened, on the server's clock.
+ *
+ * The same clock the attempt timers use: the scheduler stamps these on its
+ * own host, and a browser a few seconds out would otherwise render the newest
+ * step as having happened in the future.
+ */
+function stepAge(step: StepLine): string {
+  const at = ts(step.ts)
+  if (!Number.isFinite(at)) return ''
+  return `${fmtOffset(Math.max(0, serverNow.value - at))} ago`
+}
+
+function stepClock(step: StepLine): string {
+  return fmtClock(step.ts)
+}
+
+/** This lane's narration, oldest first. */
+function laneSteps(nodeId: string): StepLine[] {
+  return stepsFor(steps.value, nodeId)
+}
+
+/** What a lane is doing right now — the line a collapsed card shows. */
+function laneLatest(nodeId: string): StepLine | null {
+  return latestStep(steps.value, nodeId)
+}
+
+/** Run-level narration: `run opened`, `run finished`. */
+const runSteps = computed(() => stepsFor(steps.value, RUN_LANE))
+
+/**
+ * Whether to say anything about steps at all.
+ *
+ * Three states, and conflating any two of them is what makes a working lane
+ * look broken: the log has not been read yet (say nothing), the scheduler
+ * writes no log for this run (say so once, at the run, not on every lane), and
+ * the log exists but this lane has not narrated yet (say so on the lane).
+ */
+const stepLogAbsent = computed(() => steps.value.loaded && !steps.value.present)
+
 function toggle(nodeId: string) {
   const next = new Set(open.value)
   if (next.has(nodeId)) next.delete(nodeId)
@@ -337,6 +430,25 @@ function expanded(node: MaestroNode): boolean {
           <span v-else>no integration worktree on disk for this run</span>
         </div>
 
+        <!--
+          What the scheduler has said about the run as a whole. Absent for
+          every run that predates the step log, and for one whose scheduler
+          has not opened yet — both are ordinary, so they read as a stated
+          fact rather than as a missing panel.
+        -->
+        <div v-if="stepLogAbsent" class="run-steps none">
+          no step log beside this ledger — lane progress shows only at each
+          transition
+        </div>
+        <div v-else-if="runSteps.length" class="run-steps">
+          <span class="steps-label">scheduler</span>
+          <span v-for="(step, i) in runSteps.slice(-3)" :key="i" class="run-step">
+            <span class="step-message">{{ step.message }}</span>
+            <span v-if="step.detail" class="step-detail">{{ step.detail }}</span>
+            <span class="step-age" :title="stepClock(step)">{{ stepAge(step) }}</span>
+          </span>
+        </div>
+
         <div v-if="inFlight.length" class="inflight">
           <span
             v-for="attempt in inFlight"
@@ -397,6 +509,49 @@ function expanded(node: MaestroNode): boolean {
               >
                 paired with {{ testStrengthByNode.get(node.node_id)!.pairedWith }}
               </span>
+            </div>
+
+            <!--
+              What this lane is doing between transitions.
+              Collapsed, it is one line — the newest step — because that is
+              the whole complaint the feed answers: a lane sitting on
+              REVIEWING_CODE for four minutes reads as stopped, and
+              `provisioning review tree` reads as working. Opened, the lane's
+              recent steps in order, newest last, so the operator can see how
+              it got where it is.
+            -->
+            <div v-if="!stepLogAbsent" class="node-steps">
+              <template v-if="laneSteps(node.node_id).length">
+                <div v-if="!expanded(node)" class="step-line latest">
+                  <span class="step-message">{{ laneLatest(node.node_id)!.message }}</span>
+                  <span v-if="laneLatest(node.node_id)!.detail" class="step-detail">
+                    {{ laneLatest(node.node_id)!.detail }}
+                  </span>
+                  <span class="step-age" :title="stepClock(laneLatest(node.node_id)!)">
+                    {{ stepAge(laneLatest(node.node_id)!) }}
+                  </span>
+                </div>
+                <div v-else class="step-list">
+                  <div
+                    v-for="(step, i) in laneSteps(node.node_id)"
+                    :key="i"
+                    class="step-line"
+                    :class="{ latest: i === laneSteps(node.node_id).length - 1 }"
+                  >
+                    <span class="step-clock">{{ stepClock(step) }}</span>
+                    <span class="step-message">{{ step.message }}</span>
+                    <span v-if="step.detail" class="step-detail">{{ step.detail }}</span>
+                    <span
+                      v-if="i === laneSteps(node.node_id).length - 1"
+                      class="step-age"
+                    >
+                      {{ stepAge(step) }}
+                    </span>
+                  </div>
+                </div>
+              </template>
+              <!-- Deliberate, not broken: this lane simply has not spoken. -->
+              <div v-else class="step-line none">no steps recorded for this lane yet</div>
             </div>
 
             <div class="node-sub">
@@ -849,6 +1004,112 @@ function expanded(node: MaestroNode): boolean {
 .attempt-hint {
   color: var(--faint);
   font-size: 14px;
+}
+
+/* ── scheduler narration ──────────────────────────────────────────────────
+   Deliberately quieter than the ledger-derived rows around it. A step is
+   what the scheduler says it is doing; the chip above is what the run
+   actually is. Monospaced because the details are counts, shas and vendor
+   names, and left-aligned columns make a run of them scannable. */
+.run-steps {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 7px 12px;
+  border-radius: 9px;
+  background: var(--panel-3);
+  border: 1px solid var(--border-soft);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.run-steps.none {
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--faint);
+  font-style: italic;
+}
+
+.steps-label {
+  color: var(--faint);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+.run-step {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.node-steps {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 0;
+}
+
+.step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 190px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border-left: 2px solid var(--border);
+  background: var(--panel-3);
+  border-radius: 0 8px 8px 0;
+}
+
+.step-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  color: var(--faint);
+}
+
+/* The newest line is the answer to "what is it doing?", so it is the one
+   that reads at full strength; the ones above it are how it got here. */
+.step-line.latest {
+  color: var(--dim);
+}
+
+.step-line.none {
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--faint);
+  font-style: italic;
+}
+
+.step-clock {
+  color: var(--faint);
+  opacity: 0.7;
+  flex: none;
+}
+
+.step-message {
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-detail {
+  color: var(--faint);
+  opacity: 0.85;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-age {
+  margin-left: auto;
+  color: var(--faint);
+  opacity: 0.75;
+  flex: none;
 }
 
 .needs {

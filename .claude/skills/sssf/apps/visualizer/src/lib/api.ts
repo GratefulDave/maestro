@@ -10,6 +10,7 @@ import type {
   SessionDetail,
   SessionSummary,
   SourceInfo,
+  StepLogPage,
 } from './types'
 
 /**
@@ -94,6 +95,20 @@ export function fetchRun(sourceId: string, runId: string): Promise<MaestroRunDet
   return getJson(
     `/api/sources/${encodeURIComponent(sourceId)}/runs/${encodeURIComponent(runId)}`,
   ) as Promise<MaestroRunDetail>
+}
+
+/**
+ * The scheduler's narration for one run, past a byte cursor.
+ *
+ * `after` is the previous page's `cursor`, so a poll loop re-reads nothing —
+ * the file only grows. A step log the scheduler has not written yet answers
+ * `present: false`, which is a state the UI renders, not an error it reports:
+ * a 404 would be indistinguishable from a run that has gone away.
+ */
+export function fetchSteps(sourceId: string, runId: string, after = 0): Promise<StepLogPage> {
+  return getJson(
+    `/api/sources/${encodeURIComponent(sourceId)}/runs/${encodeURIComponent(runId)}/steps?after=${after}`,
+  ) as Promise<StepLogPage>
 }
 
 // PhaseDetail imports the prompts type from here alongside fetchPrompts.
