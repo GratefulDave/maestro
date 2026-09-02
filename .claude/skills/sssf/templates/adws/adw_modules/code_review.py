@@ -588,6 +588,39 @@ def redacted_failure_lines(
     return tuple(kept)
 
 
+#: One line of framing, prepended to the findings the builder is handed when
+#: the sealed suite was red. The failure lines come off the runner; the
+#: findings are a model's reading of a candidate it saw without the tests, and
+#: twice in one session that reading was the exact inverse of the assertion --
+#: a builder told to preserve the very keys a sealed case forbids regressed a
+#: lane that had been green. Nothing is deleted here: a located finding such
+#: as "you wrote outside your declared outputs" is true whatever the suite
+#: says. Only the order of authority is stated.
+_FINDINGS_FRAMING = (
+    "The sealed suite reported failures against your last candidate. Its "
+    "failure lines in redacted_failures are ground truth, verbatim from the "
+    "runner. The findings below are one model's reading of them, written "
+    "without sight of the tests. Where a finding disagrees with a failure "
+    "line, the failure line is right."
+)
+
+
+def _summary_is_red(summary: Mapping[str, object]) -> bool:
+    """Whether the measured suite disagreed with the candidate.
+
+    Counts arrive off an artifact payload, so a missing or unparsable key is
+    read as zero rather than raised on: framing that fails closed would turn
+    a malformed count into a lost review.
+    """
+    for key in ("failed", "errored"):
+        try:
+            if int(summary.get(key, 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def builder_view(
     *,
     public_contract: Mapping[str, object],
@@ -614,11 +647,13 @@ def builder_view(
             raise pr.PrivateReviewError(
                 "builder revise view requires CODE_REVIEW REVISE"
             )
+        summary = dict(prior_code_review.payload["public_result_summary"])
+        findings = list(prior_code_review.payload["findings"])
+        if _summary_is_red(summary):
+            findings.insert(0, _FINDINGS_FRAMING)
         prior = {
-            "findings": list(prior_code_review.payload["findings"]),
-            "public_result_summary": dict(
-                prior_code_review.payload["public_result_summary"]
-            ),
+            "findings": findings,
+            "public_result_summary": summary,
             "redacted_failures": list(
                 prior_code_review.payload.get("redacted_failures") or ()
             ),
