@@ -73,6 +73,18 @@ def _plan_bytes(*, a_goal: str = "emit a.txt") -> bytes:
 
 
 class ScriptedActor:
+    #: Whether this actor's opening candidate deliberately fails its sealed
+    #: suite. The scripted first-round REVISE below is only reachable when it
+    #: does: a green suite is authoritative and cannot be sent back. An actor
+    #: whose reviewer always returns PASS must set this False, because a red
+    #: suite outranks a PASS just as firmly.
+    first_candidate_is_draft = True
+
+    #: When set, only these lanes open with a draft. Empty means every lane
+    #: does. A lane whose scripted reviewer never returns REVISE must not be
+    #: listed, because its red suite would outrank that PASS and loop.
+    draft_lanes: tuple[str, ...] = ()
+
     def __init__(self, repo: Path, worktrees: Path) -> None:
         self.repo = repo
         self.worktrees = worktrees
@@ -86,8 +98,16 @@ class ScriptedActor:
         lines = ["# secret-selector", "from pathlib import Path", ""]
         for output in ctx.lane.declared_outputs:
             ident = Path(output).stem.replace("-", "_")
-            lines.append("def test_{0}_{1}_exists():".format(name, ident))
+            # Not existence: the builder's first candidate satisfies that, and
+            # a green suite is authoritative, so the scripted first-round
+            # REVISE below would never be honoured. The marker gives the
+            # opening round something real to fail.
+            lines.append("def test_{0}_{1}_is_ready():".format(name, ident))
             lines.append("    assert Path({0!r}).is_file()".format(output))
+            lines.append(
+                "    assert Path({0!r}).read_text().strip()"
+                ".endswith('ready')".format(output)
+            )
             lines.append("")
         return {
             "files": {"tests/test_{0}_private.py".format(name): "\n".join(lines)},
@@ -102,6 +122,20 @@ class ScriptedActor:
         return st.ReviewerVerdict.PASS, ()
 
     def build(self, ctx: sch.LaneContext) -> dict:
+        # The opening candidate of a build attempt is a draft, so its sealed
+        # suite is red and the first-round REVISE is a legitimate one. Keyed on
+        # the entry kind rather than on this actor's own history, because a
+        # follow-up run gets a fresh actor and the lane would otherwise look
+        # new again and never reach "ready".
+        drafts_this_lane = self.first_candidate_is_draft and (
+            not self.draft_lanes or ctx.lane.lane_id in self.draft_lanes
+        )
+        marker = (
+            "draft"
+            if drafts_this_lane
+            and ctx.entry_kind is st.BuildingEntryKind.INITIAL
+            else "ready"
+        )
         self.building_entries.append(
             (ctx.lane.lane_id, ctx.entry_kind, ctx.plan_revision)
         )
@@ -112,8 +146,8 @@ class ScriptedActor:
         _git(self.repo, "worktree", "add", "--detach", str(work), ctx.builder_base_sha)
         for path in ctx.lane.declared_outputs:
             (work / path).write_text(
-                "{0}:{1}:{2}\n".format(
-                    ctx.lane.lane_id, ctx.plan_revision, ctx.input_digest
+                "{0}:{1}:{2}:{3}\n".format(
+                    ctx.lane.lane_id, ctx.plan_revision, ctx.input_digest, marker
                 ),
                 encoding="utf-8",
             )
@@ -479,6 +513,8 @@ class FactoryCutoverTests(unittest.TestCase):
         )
 
         class PassActor(ScriptedActor):
+            first_candidate_is_draft = False
+
             def review_tests(self, ctx):
                 del ctx
                 return st.ReviewerVerdict.PASS, ()
@@ -583,6 +619,8 @@ class FactoryCutoverTests(unittest.TestCase):
         self.assertEqual(self.store.lane_stage(run_id, "lane-b"), st.LaneStage.TESTS_SEALED)
 
         class ResumeActor(ScriptedActor):
+            first_candidate_is_draft = False
+
             def review_tests(self, ctx):
                 del ctx
                 return st.ReviewerVerdict.PASS, ()
@@ -615,6 +653,8 @@ class FactoryCutoverTests(unittest.TestCase):
         )
 
         class PassActor(ScriptedActor):
+            first_candidate_is_draft = False
+
             def review_tests(self, ctx):
                 del ctx
                 return st.ReviewerVerdict.PASS, ()
@@ -677,6 +717,8 @@ class FactoryCutoverTests(unittest.TestCase):
         )
 
         class PassActor(ScriptedActor):
+            first_candidate_is_draft = False
+
             def review_tests(self, ctx):
                 del ctx
                 return st.ReviewerVerdict.PASS, ()
@@ -743,6 +785,8 @@ class FactoryCutoverTests(unittest.TestCase):
         )
 
         class PassActor(ScriptedActor):
+            first_candidate_is_draft = False
+
             def review_tests(self, ctx):
                 del ctx
                 return st.ReviewerVerdict.PASS, ()
@@ -810,6 +854,11 @@ class FactoryCutoverTests(unittest.TestCase):
         )
 
         class TwelveStepActor(ScriptedActor):
+            # Only lane-a is scripted to take a revise round here; lane-b is
+            # expected to build once and pass.
+            draft_lanes = ("lane-a",)
+
+
             def __init__(self, repo, worktrees, *, fail_b: bool) -> None:
                 super().__init__(repo, worktrees)
                 self.fail_b = fail_b
@@ -948,6 +997,8 @@ class FactoryCutoverTests(unittest.TestCase):
         )
 
         class PassActor(ScriptedActor):
+            first_candidate_is_draft = False
+
             def review_tests(self, ctx):
                 del ctx
                 return st.ReviewerVerdict.PASS, ()

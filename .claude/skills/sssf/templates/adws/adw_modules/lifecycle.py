@@ -1810,10 +1810,35 @@ class ArtifactStore:
         return row is not None
 
     def _active_final_review(self, run_id: str) -> Optional[sqlite3.Row]:
+        """The final review still outstanding, or `None` once one answered it.
+
+        Everywhere else a final review is bound to the fingerprint of the
+        surface it judged, so a stale one cannot authorize anything. This
+        lookup had no freshness test at all, and `apply_amendment` reads it to
+        decide which lanes an amendment must change. A REVISE therefore went on
+        naming the same lanes forever: on run f50638ab the amendment that
+        answered it landed, both named lanes reached MERGED, and every later
+        amendment was still refused `AMENDMENT_DOES_NOT_ADDRESS_REVIEW` for not
+        re-editing two lanes that were already merged and already correct.
+
+        A `PLAN_AMENDMENT` recorded after the review is that answer -- applying
+        one is the only way to respond to a REVISE -- so a review it precedes
+        is spent. The publication path reads the same lookup and agrees: after
+        the plan changes, a PASS recorded against the old plan is not a
+        licence to publish, which its own fingerprint check already said.
+        """
         return self.conn.execute(
             "SELECT * FROM run_artifacts WHERE run_id=? AND artifact_kind=? "
-            "ORDER BY sequence DESC LIMIT 1",
-            (run_id, st.ArtifactKind.FINAL_INTEGRATION_REVIEW.value),
+            "AND sequence > COALESCE("
+            "  (SELECT MAX(sequence) FROM run_artifacts "
+            "   WHERE run_id=? AND artifact_kind=?), 0"
+            ") ORDER BY sequence DESC LIMIT 1",
+            (
+                run_id,
+                st.ArtifactKind.FINAL_INTEGRATION_REVIEW.value,
+                run_id,
+                st.ArtifactKind.PLAN_AMENDMENT.value,
+            ),
         ).fetchone()
 
     def _wait_reason(self, run_id: str, lane_id: str) -> Optional[st.WaitReason]:

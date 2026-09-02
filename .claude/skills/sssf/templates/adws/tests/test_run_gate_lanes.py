@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from adw_modules import scheduler as sch
 from adw_modules import scheduler_types as st
 
+_REAL_RUN_ROW = sch.run_row
+
 
 def lane(
     lane_id: str,
@@ -104,3 +106,98 @@ def test_a_tests_lane_needed_only_by_another_tests_lane_still_gates() -> None:
         lane("b", kind="build", needs=("t-outer",)),
     )
     assert gate_lanes(*lanes) == ("t-inner",)
+
+
+def test_a_red_run_gate_names_the_lane_whose_suite_failed() -> None:
+    """A REVISE must name someone; a red gate is evidence about one lane only.
+
+    The blame used to be every build lane in the plan, whichever suite went
+    red. On run f50638ab that named `lane-wp7-gateway-build` over an assertion
+    about a browser route it does not own -- and since an amendment must change
+    the spec of every lane a review names, correcting one bad test assertion
+    could only be done by also editing two builds that were already right.
+
+    Naming is a floor, not a ceiling: the operator may still amend any other
+    lane in the same amendment. What the harness must not do is *require* an
+    edit it has no evidence for.
+    """
+    head = "a" * 40
+    fingerprint = "b" * 64
+    recorded: dict[str, object] = {}
+
+    class _Store:
+        def active_final_review_fingerprint(self, run_id: str, integration: str) -> str:
+            del run_id, integration
+            return fingerprint
+
+        def active_projection(self, run_id: str) -> tuple[st.LaneProjection, ...]:
+            del run_id
+            return WP7
+
+        def complete_final_review(
+            self, run_id, review_fingerprint, integration, observed, artifact, affected
+        ):
+            del run_id, review_fingerprint, integration, observed
+            recorded["payload"] = artifact.payload
+            recorded["affected"] = tuple(affected)
+            return None
+
+    class _Locks:
+        def acquire(self, level: int) -> None:
+            del level
+
+        def release(self) -> None:
+            return None
+
+    class _Git:
+        def rev_parse(self, ref: str) -> str:
+            del ref
+            return "c" * 40
+
+    class _Target:
+        target_repository_root = "/nonexistent"
+
+        def git(self) -> _Git:
+            return _Git()
+
+    class _Actor:
+        called = False
+
+        def review_integration(self, ctx, lanes, integration):
+            del ctx, lanes, integration
+            _Actor.called = True
+            raise AssertionError("the reviewer must not run when a gate is red")
+
+    scheduler = object.__new__(sch.FactoryScheduler)
+    scheduler.run_id = "run-1"
+    scheduler.store = _Store()
+    scheduler.locks = _Locks()
+    scheduler.target = _Target()
+    scheduler.actor = _Actor()
+    scheduler._compiled = None
+    scheduler._integration_head = lambda: head
+    scheduler._plan_artifact_ref = lambda row: "plan.v1"
+    scheduler._failed_run_gates = lambda lanes, h, f: ("lane-wp7-e2e-tests",)
+    sch.run_row = lambda store, run_id: {  # type: ignore[assignment]
+        "plan_revision": 1,
+        "plan_digest": "d" * 64,
+        "target_main_ref": "refs/heads/main",
+    }
+
+    try:
+        sch.FactoryScheduler._final_review(scheduler)
+    finally:
+        sch.run_row = _REAL_RUN_ROW  # type: ignore[assignment]
+
+    payload = recorded["payload"]
+    assert payload["verdict"] == st.ReviewerVerdict.REVISE.value
+    assert recorded["affected"] == ("lane-wp7-e2e-tests",)
+    assert payload["affected_lanes"] == ["lane-wp7-e2e-tests"]
+
+    # The lanes that used to be blamed, and are not the ones with evidence.
+    build_lanes = {
+        item.lane_id for item in WP7 if item.lane_kind == st.LANE_KIND_BUILD
+    }
+    assert build_lanes == {"lane-wp7-build", "lane-wp7-gateway-build"}
+    assert not build_lanes.intersection(recorded["affected"])
+    assert _Actor.called is False

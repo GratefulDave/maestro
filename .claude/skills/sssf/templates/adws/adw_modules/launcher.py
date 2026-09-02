@@ -254,6 +254,18 @@ class _WorkspaceGone(RuntimeError):
 
 
 
+class AgentNotInteractive(RuntimeError):
+    """A pane whose composer did not come back within the bounded wait.
+
+    Distinct from `LaunchRefused` and `HerdrCallError`, which say the agent is
+    *wrong* or the call was *refused*. This says only that a settled composer
+    was not observed in time, which is a statement about the pane's rendering,
+    not about the work. A caller holding a declaration the agent already wrote
+    must be able to tell the two apart: an untyped `RuntimeError` here ended a
+    run whose tester had already written a valid envelope.
+    """
+
+
 class HerdrCallError(RuntimeError):
     """A refused `herdr` call, carrying Herdr's own structured error code.
 
@@ -2160,9 +2172,9 @@ def wait_for_interactive_agent(
             return False
         return settled(payload)
 
-    def refusal() -> RuntimeError:
+    def refusal() -> AgentNotInteractive:
         suffix = " probe={0}".format(probe_denial[0]) if probe_denial else ""
-        return RuntimeError(
+        return AgentNotInteractive(
             "AGENT_INTERACTIVE_READY_TIMEOUT:{0}{1}".format(name, suffix)
         )
 
@@ -4808,12 +4820,23 @@ class HerdrLauncher:
         if envelope_path is not None:
             object.__setattr__(handle, "envelope_path", Path(envelope_path))
         self._verified_handle_binding(handle)
-        wait_for_interactive_agent(
-            lambda *args, **kwargs: self._herdr(
-                *args, env=handle.environment, **kwargs
-            ),
-            handle.agent_name,
-        )
+        try:
+            wait_for_interactive_agent(
+                lambda *args, **kwargs: self._herdr(
+                    *args, env=handle.environment, **kwargs
+                ),
+                handle.agent_name,
+            )
+        except AgentNotInteractive as exc:
+            # Here the wait is a real precondition -- the prompt cannot be
+            # delivered into a busy composer -- so this does refuse. It refuses
+            # in the type this path already declares, so the lane's own failure
+            # handling sees it instead of the run dying on an untyped error.
+            raise LaunchRefused(
+                LaunchRefusal.PROMPT_SUBMISSION_REFUSED,
+                str(exc),
+                pane_created=True,
+            ) from exc
         submit_agent_prompt(
             lambda *args, **kwargs: self._herdr(
                 *args, env=handle.environment, **kwargs
@@ -5274,6 +5297,15 @@ class HerdrLauncher:
                 ) from exc
             except LaunchRefused:
                 raise
+            except AgentNotInteractive as exc:
+                # Same outcome as any other unconfirmed rename, said in the
+                # type this path already declares. Untyped, it escaped every
+                # caller and ended the run at cleanup.
+                raise LaunchRefused(
+                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
+                    "{0}: {1}".format(type(exc).__name__, exc),
+                    pane_created=True,
+                ) from exc
             name = self._session_name(handle, project_identity)
             self._confirm_session_rename(handle, name, timeout_s)
             confirmed.append(handle)
@@ -5368,7 +5400,7 @@ class FakeLauncher:
     def wait_for_idle(self, handle: LaunchHandle, timeout_s: float = 60.0) -> None:
         del timeout_s
         if self.agent_status(handle) != "idle":
-            raise RuntimeError(
+            raise AgentNotInteractive(
                 "AGENT_INTERACTIVE_READY_TIMEOUT:{}".format(handle.agent_name)
             )
 

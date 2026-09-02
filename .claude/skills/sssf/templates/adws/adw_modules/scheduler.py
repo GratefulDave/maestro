@@ -6,6 +6,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -2185,7 +2186,21 @@ class FactoryScheduler:
             ctx,
             _with_input_artifact_ids(artifact, ids),
         )
-        if verdict is st.ReviewerVerdict.REVISE:
+        settled = artifact.verdict
+        if settled is not None and settled is not verdict:
+            # The sealed measurement outranked the reviewer. Say which way, so
+            # the log records that the transition came from the suite.
+            self._say(
+                lane_id,
+                "sealed suite is authoritative; verdict recorded as {0}".format(
+                    settled.value
+                ),
+                "reviewer said {0}".format(verdict.value),
+            )
+        # The artifact carries the verdict the measurement settled on, and the
+        # transition above was derived from it. Reading the reviewer's own
+        # answer here would block a lane whose suite is green.
+        if settled is st.ReviewerVerdict.REVISE:
             self._block_if_stalled(lane_id)
 
     def _block_if_stalled(self, lane_id: str) -> None:
@@ -2390,6 +2405,44 @@ class FactoryScheduler:
             artifact_ref=st.integration_ref(self.run_id),
         )
         _complete(self.store, ctx, artifact)
+        self._reclaim_lane_scratch(lane_id)
+
+    def _reclaim_lane_scratch(self, lane_id: str) -> None:
+        """Drop a merged lane's review trees.
+
+        `measure_candidate` provisions `review-<lane>-<digest>` per review round
+        and nothing ever removed it, so a lane's disk grew with its round count
+        and a finished run left every tree behind. Two build lanes on FDAdb run
+        f50638ab reached 87 of them, 5.8G, against 5.7G of live checkouts.
+
+        Safe because these are derived: each is rebuilt from an immutable
+        commit plus the sealed blobs on demand. The merge is recorded before
+        this runs, so a failure here costs disk, never progress -- which is why
+        every error is swallowed rather than raised.
+        """
+        root = self.runtime.path / "worktrees"
+        prefix = "review-{0}-".format(lane_id)
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return
+        removed = 0
+        for path in entries:
+            if not path.is_dir() or path.is_symlink():
+                continue
+            if not path.name.startswith(prefix):
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                continue
+            removed += 1
+        if removed:
+            self._say(
+                lane_id,
+                "reclaimed review scratch",
+                "{0} tree(s)".format(removed),
+            )
 
     def _run_gate_lanes(
         self, lanes: Sequence[st.LaneProjection]
@@ -2456,11 +2509,17 @@ class FactoryScheduler:
             if gate_failures:
                 verdict = st.ReviewerVerdict.REVISE
                 findings = (cr._INTEGRATION_GATE_REVISE,)
-                affected = tuple(
-                    lane.lane_id
-                    for lane in lanes
-                    if lane.lane_kind == st.LANE_KIND_BUILD
-                )
+                # A REVISE must name someone, so name the only lane there is
+                # evidence about: the one whose suite went red. Which side is
+                # wrong -- the suite or a build -- is not something a red gate
+                # says, and naming every build lane guessed it. On run
+                # f50638ab that guess named a gateway lane over a browser-route
+                # assertion, and because an amendment must change every lane a
+                # review names, correcting one bad test assertion could only be
+                # done by also editing two builds that were already right.
+                # Naming is a floor, not a ceiling: the operator may still amend
+                # any other lane in the same amendment.
+                affected = tuple(gate_failures)
             else:
                 verdict, findings, affected = self.actor.review_integration(
                     ctx, lanes, head

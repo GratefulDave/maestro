@@ -70,6 +70,9 @@ def _ctx(artifacts=None):
             lane_id="lane-a",
             lane_kind=st.LANE_KIND_BUILD,
             declared_outputs=("src/lib/paidDpa.ts",),
+            # A real LaneProjection always carries one, and the role key is
+            # keyed on it so a revised spec does not reuse the agent session.
+            spec_digest=_digest("spec"),
         ),
         plan_revision=1,
         run_id="run1",
