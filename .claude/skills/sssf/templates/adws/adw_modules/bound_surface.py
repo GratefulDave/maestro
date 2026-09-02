@@ -12,9 +12,20 @@ The line this module draws:
     Names are contract. Values are secrets.
 
 `derive_bound_surface` returns module specifiers, imported and dereferenced
-symbol names, and object-literal keys. It never returns a string literal, a
-number, a regex, a fixture, or anything else an assertion compares against, so
-its output can be handed to a builder without unsealing the suite.
+symbol names, object-literal keys, and the route paths the suite addresses its
+requests to. It never returns a string in a value position, a number, a regex,
+a fixture, or anything else an assertion compares against, so its output can be
+handed to a builder without unsealing the suite.
+
+A route is admitted by *where it sits*, never by what it looks like: the path
+argument of an HTTP-verb call, of `fetch`, `URL` or `Request`, or of a helper
+in the same file that provably forwards its parameter to one of those. The same
+path spelled as the expected value of an assertion is a value and stays sealed.
+A key is admitted because it is in key position of a dict or object literal,
+wherever that literal sits. On the WP7 gateway run the sealed suite named
+`query_hash` and `manifest_sha256` only as keys of the upstream body its source
+double answered with, so a builder that was never shown them returned the same
+five failures for eleven rounds.
 
 The output is built as a *whitelist*: every element is a name this module
 affirmatively recognized in a syntactic position that can only hold a name, and
@@ -56,8 +67,22 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 #: whitespace, no quotes, no punctuation an assertion literal would carry.
 _SPECIFIER = re.compile(r"^[A-Za-z0-9_@][A-Za-z0-9_.:/\\@-]*$")
 
+#: A route is an absolute path: it starts with `/` and carries only path
+#: characters and template placeholders (`{id}`, `:id`). No query string, no
+#: fragment, no scheme or host, no whitespace, no quote -- so no expected
+#: message, no URL fixture, and no value can pass at all.
+_ROUTE = re.compile(r"^/[A-Za-z0-9_\-./{}:]*$")
+
 _MAX_SPECIFIER_LENGTH = 200
 _MAX_IDENTIFIER_LENGTH = 120
+_MAX_ROUTE_LENGTH = 200
+
+#: Attribute names whose string argument is a request path: `client.post(...)`,
+#: `app.get(...)`, `router.route(...)`. `request` takes the method first and
+#: the path second.
+_HTTP_VERBS = frozenset(
+    {"get", "post", "put", "patch", "delete", "head", "options", "route", "request"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +96,8 @@ def derive_bound_surface(files: Mapping[str, str]) -> dict:
     `files` maps a sealed test path to that file's content. The return value is
 
         {"modules": [{"specifier": str, "symbols": [str, ...]}, ...],
-         "object_keys": [str, ...]}
+         "object_keys": [str, ...],
+         "routes": [str, ...]}
 
     sorted at every level, with empty lists rather than missing keys, and never
     `None`. A file whose language is unrecognized, or which does not parse,
@@ -79,6 +105,7 @@ def derive_bound_surface(files: Mapping[str, str]) -> dict:
     """
     modules: dict[str, set[str]] = {}
     object_keys: set[str] = set()
+    routes: set[str] = set()
 
     for path in sorted(files):
         content = files[path]
@@ -86,14 +113,17 @@ def derive_bound_surface(files: Mapping[str, str]) -> dict:
             continue
         language = _language_of(path)
         if language == "python":
-            found_modules, found_keys = _python_surface(content)
+            found_modules, found_keys, found_routes = _python_surface(content)
         elif language == "javascript":
-            found_modules, found_keys = _javascript_surface(str(path), content)
+            found_modules, found_keys, found_routes = _javascript_surface(
+                str(path), content
+            )
         else:
             continue
         for specifier, symbols in found_modules.items():
             modules.setdefault(specifier, set()).update(symbols)
         object_keys |= found_keys
+        routes |= found_routes
 
     clean: dict[str, set[str]] = {}
     for specifier, symbols in modules.items():
@@ -109,6 +139,9 @@ def derive_bound_surface(files: Mapping[str, str]) -> dict:
             for specifier in sorted(clean)
         ],
         "object_keys": sorted(name for name in object_keys if _is_identifier(name)),
+        "routes": sorted(
+            {path for path in map(_route_path, routes) if _is_route(path)}
+        ),
     }
 
 
@@ -135,6 +168,25 @@ def _is_specifier(value: Any) -> bool:
         isinstance(value, str)
         and len(value) <= _MAX_SPECIFIER_LENGTH
         and bool(_SPECIFIER.match(value))
+    )
+
+
+def _route_path(value: str) -> str:
+    """The path of a positional route, without its query or fragment.
+
+    `client.get("/v1/faers/analytics?dimension=reaction")` addresses
+    `/v1/faers/analytics`; the query carries a value and is cut, not read.
+    """
+    for separator in ("?", "#"):
+        value = value.split(separator, 1)[0]
+    return value
+
+
+def _is_route(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= _MAX_ROUTE_LENGTH
+        and bool(_ROUTE.match(value))
     )
 
 
@@ -248,12 +300,14 @@ def _python_calls_symbol(node: ast.expr, symbols: set[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _python_surface(source: str) -> tuple[dict[str, set[str]], set[str]]:
-    """Modules, symbols and asserted dict keys from one Python sealed file."""
+def _python_surface(
+    source: str,
+) -> tuple[dict[str, set[str]], set[str], set[str]]:
+    """Modules, symbols, dict keys and routes from one Python sealed file."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError):
-        return {}, set()
+        return {}, set(), set()
 
     modules: dict[str, set[str]] = {}
     #: A dotted *local* path (`mapping`, `app.mapping`) to the module specifier
@@ -290,9 +344,9 @@ def _python_surface(source: str) -> tuple[dict[str, set[str]], set[str]]:
                 modules.setdefault(specifier, set()).add(chain[cut])
                 break
 
-    keys = _python_asserted_keys(tree)
+    keys = _python_dict_keys(tree)
     keys |= _python_result_keys(tree, _first_party_symbols(modules))
-    return modules, keys
+    return modules, keys, _python_routes(tree)
 
 
 def _python_from_specifier(node: ast.ImportFrom) -> str | None:
@@ -325,16 +379,31 @@ def _python_attribute_chain(node: ast.Attribute) -> list[str] | None:
     return parts
 
 
-def _python_asserted_keys(tree: ast.AST) -> set[str]:
-    """Keys of the dict literals this file compares against.
+def _python_dict_keys(tree: ast.AST) -> set[str]:
+    """String keys of every dict literal in the file, wherever it sits.
 
-    Two sources, and only two. A dict literal written inside a comparison, and a
-    module-level `NAME = {...}` that a comparison names — the second because the
-    pinned expectations in a real suite are hoisted into constants
-    (`assert data["metrics"] == EXPECTED_METRICS`) and the keys of that constant
-    are precisely the contract the builder has to produce.
+    The dict a comparison is written against, the hoisted `EXPECTED = {...}`
+    it names, the body a source double answers with, the claims a helper mints
+    a token from: each is a shape the implementation has to produce or consume,
+    and the key position of a literal can hold nothing but a name. Reading only
+    the dicts a comparison touched is what left `query_hash` and
+    `manifest_sha256` sealed on the WP7 gateway run -- the suite named them
+    solely as keys of the upstream fixture. Values are never read: the walk
+    visits `ast.Dict` nodes and their keys, nothing else.
     """
-    literals: dict[str, ast.Dict] = {}
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key in node.keys:
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                keys.add(key.value)
+    return keys
+
+
+def _python_string_constants(tree: ast.AST) -> dict[str, str]:
+    """`NAME = "literal"`, first binding wins. Read only from a path position."""
+    constants: dict[str, str] = {}
     for node in ast.walk(tree):
         target: ast.expr | None = None
         value: ast.expr | None = None
@@ -342,42 +411,49 @@ def _python_asserted_keys(tree: ast.AST) -> set[str]:
             target, value = node.targets[0], node.value
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             target, value = node.target, node.value
-        if isinstance(target, ast.Name) and isinstance(value, ast.Dict):
-            literals.setdefault(target.id, value)
-
-    keys: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        for side in [node.left, *node.comparators]:
-            _python_collect_side(side, literals, keys)
-    return keys
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        ):
+            constants.setdefault(target.id, value.value)
+    return constants
 
 
-def _python_collect_side(
-    side: ast.expr, literals: Mapping[str, ast.Dict], keys: set[str]
-) -> None:
-    for inner in ast.walk(side):
-        if isinstance(inner, ast.Dict):
-            _python_collect_dict(inner, keys)
-        elif isinstance(inner, ast.Name):
-            literal = literals.get(inner.id)
-            if literal is not None:
-                _python_collect_dict(literal, keys)
+def _python_routes(tree: ast.AST) -> set[str]:
+    """Paths in the path argument of an HTTP-verb call or route decorator.
 
-
-def _python_collect_dict(node: ast.Dict, keys: set[str]) -> None:
-    """String keys of a dict literal and of every dict nested inside it.
-
-    Values are walked into only to reach further *keys*: `ast.walk` visits the
-    nested `ast.Dict` nodes, and nothing but a key position is ever read.
+    `client.post("/v1/faers/dpa", ...)`, `@app.get("/health")`,
+    `client.request("POST", "/v1/faers/dpa")`: the callee's attribute names the
+    verb, and the verb fixes which argument is the path. A path that is
+    compared against (`assert request.url.path == "/v1/..."`), interpolated
+    (`f"{base}/dpa"`), or handed to any other call is not read. A bare name in
+    the path position resolves to a string constant bound in this file, because
+    a real suite hoists its paths exactly as it hoists its expectations.
     """
-    for inner in ast.walk(node):
-        if not isinstance(inner, ast.Dict):
+    constants = _python_string_constants(tree)
+    routes: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
-        for key in inner.keys:
-            if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                keys.add(key.value)
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        verb = node.func.attr
+        if verb not in _HTTP_VERBS:
+            continue
+        position = 1 if verb == "request" else 0
+        candidates: list[ast.expr] = []
+        if len(node.args) > position:
+            candidates.append(node.args[position])
+        candidates.extend(
+            keyword.value for keyword in node.keywords if keyword.arg in ("url", "path")
+        )
+        for candidate in candidates:
+            if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+                routes.add(candidate.value)
+            elif isinstance(candidate, ast.Name) and candidate.id in constants:
+                routes.add(constants[candidate.id])
+    return routes
 
 
 # ---------------------------------------------------------------------------
@@ -696,12 +772,38 @@ def _match_bracket(tokens: list[_Token], index: int) -> int:
 # --- object literal keys ----------------------------------------------------
 
 
+#: A `{` opens an object literal only where the token before it can precede
+#: nothing but an expression. After `)` it is an `if`/`for`/function body,
+#: after `=>` an arrow body, after `;`, `}`, `else` or `try` a block. A block
+#: is not read as an object -- its `if (` would be a method-shorthand key --
+#: but the object literals inside it still are.
+_OBJECT_AFTER_PUNCT = frozenset(
+    {
+        "(", ",", "=", ":", "[", "?", "!", "...",
+        "||", "&&", "??", "|", "&", "+", "-", "*", "/", "%", "<", ">",
+        "==", "===", "!=", "!==",
+    }
+)
+_OBJECT_AFTER_NAME = frozenset(
+    {"return", "typeof", "await", "yield", "in", "of", "default", "as"}
+)
+
+
+def _opens_object_literal(tokens: list[_Token], index: int) -> bool:
+    if index <= 0 or not _is_punct(tokens, index, "{"):
+        return False
+    before = tokens[index - 1]
+    if before.kind == "punct":
+        return before.value in _OBJECT_AFTER_PUNCT
+    return before.kind == "name" and before.value in _OBJECT_AFTER_NAME
+
+
 def _collect_keys_in_range(
     tokens: list[_Token], start: int, end: int, keys: set[str]
 ) -> None:
     index = start
     while index < end:
-        if _is_punct(tokens, index, "{"):
+        if _opens_object_literal(tokens, index):
             index = min(_collect_object_keys(tokens, index, keys), end)
             continue
         index += 1
@@ -774,7 +876,14 @@ def _skip_object_value(
         if _is_punct(tokens, index, ","):
             return index + 1
         if _is_punct(tokens, index, "{"):
-            index = _collect_object_keys(tokens, index, keys)
+            if _opens_object_literal(tokens, index):
+                index = _collect_object_keys(tokens, index, keys)
+                continue
+            # An arrow body or block as a property value: skip it whole,
+            # reading only the object literals inside it.
+            stop = _match_bracket(tokens, index)
+            _collect_keys_in_range(tokens, index + 1, max(stop - 1, index + 1), keys)
+            index = stop
             continue
         if _is_punct(tokens, index, "(", "["):
             stop = _match_bracket(tokens, index)
@@ -787,55 +896,20 @@ def _skip_object_value(
     return index
 
 
-#: The matchers whose argument is a literal shape the implementation must
-#: produce. `toBe`/`toContain` compare against a value, so their arguments are
-#: never read.
-_SHAPE_MATCHERS = frozenset({"toEqual", "toStrictEqual", "toMatchObject"})
-
-
 def _javascript_object_keys(tokens: list[_Token]) -> set[str]:
+    """Keys of every object literal in the file, wherever it sits.
+
+    The shape a matcher is handed, the constant it resolves, the envelope a
+    stubbed gateway answers with, the init a request is built from: each is a
+    shape the implementation has to produce or consume, and a key position can
+    hold nothing but a name. Only a `{` in expression position is read
+    (`_opens_object_literal`); a block is walked for the literals inside it and
+    contributes nothing of its own. `toBe("dupixent")` still contributes
+    nothing -- a bare string is never in key position.
+    """
     keys: set[str] = set()
-    literals = _javascript_literal_bindings(tokens)
-
-    for index, token in enumerate(tokens):
-        if token.kind != "name" or token.value not in _SHAPE_MATCHERS:
-            continue
-        if not _is_punct(tokens, index - 1, ".", "?."):
-            continue
-        if not _is_punct(tokens, index + 1, "("):
-            continue
-        open_paren = index + 1
-        close = _match_bracket(tokens, open_paren)
-        start, stop = open_paren + 1, max(close - 1, open_paren + 1)
-        _collect_keys_in_range(tokens, start, stop, keys)
-        # `toEqual(EXPECTED)` — one bare name naming a literal declared in this
-        # file. Anything more complex than a bare name is not resolved.
-        if stop - start == 1 and tokens[start].kind == "name":
-            region = literals.get(tokens[start].value)
-            if region is not None:
-                _collect_keys_in_range(tokens, region[0], region[1], keys)
+    _collect_keys_in_range(tokens, 0, len(tokens), keys)
     return keys
-
-
-def _javascript_literal_bindings(
-    tokens: list[_Token],
-) -> dict[str, tuple[int, int]]:
-    """`const NAME = { ... }` / `= [ ... ]`, as the token range of the literal."""
-    bindings: dict[str, tuple[int, int]] = {}
-    for index, token in enumerate(tokens):
-        if token.kind != "name" or token.value not in ("const", "let", "var"):
-            continue
-        if not _is_name(tokens, index + 1):
-            continue
-        if not _is_punct(tokens, index + 2, "="):
-            continue
-        opener = index + 3
-        if not _is_punct(tokens, opener, "{", "["):
-            continue
-        bindings.setdefault(
-            tokens[index + 1].value, (opener, _match_bracket(tokens, opener))
-        )
-    return bindings
 
 
 # --- imports and namespace bindings -----------------------------------------
@@ -843,7 +917,7 @@ def _javascript_literal_bindings(
 
 def _javascript_surface(
     path: str, source: str
-) -> tuple[dict[str, set[str]], set[str]]:
+) -> tuple[dict[str, set[str]], set[str], set[str]]:
     tokens = _tokenize_javascript(source)
     modules: dict[str, set[str]] = {}
     #: local binding name -> module specifier
@@ -884,7 +958,7 @@ def _javascript_surface(
 
     keys = _javascript_object_keys(tokens)
     keys |= _javascript_result_keys(tokens, _first_party_symbols(modules))
-    return modules, keys
+    return modules, keys, _javascript_routes(tokens)
 
 
 def _read_import(
@@ -980,6 +1054,24 @@ def _javascript_loader_helpers(tokens: list[_Token]) -> set[str]:
     treated as one.
     """
     helpers: set[str] = set()
+    for name, params, (start, stop) in _javascript_function_declarations(tokens):
+        for cursor in range(start, stop):
+            if (
+                tokens[cursor].kind == "name"
+                and tokens[cursor].value == "import"
+                and _is_punct(tokens, cursor + 1, "(")
+            ):
+                helpers.add(name)
+                break
+    return helpers
+
+
+def _javascript_function_declarations(
+    tokens: list[_Token],
+) -> list[tuple[str, int, tuple[int, int]]]:
+    """`function NAME(` and `const NAME = [async] [function] (`, with the
+    index of the parameter list and the token range of the body."""
+    declarations: list[tuple[str, int, tuple[int, int]]] = []
     for index, token in enumerate(tokens):
         name: str | None = None
         params: int | None = None
@@ -1002,16 +1094,8 @@ def _javascript_loader_helpers(tokens: list[_Token]) -> set[str]:
         body = _function_body_range(tokens, params)
         if body is None:
             continue
-        start, stop = body
-        for cursor in range(start, stop):
-            if (
-                tokens[cursor].kind == "name"
-                and tokens[cursor].value == "import"
-                and _is_punct(tokens, cursor + 1, "(")
-            ):
-                helpers.add(name)
-                break
-    return helpers
+        declarations.append((name, params, body))
+    return declarations
 
 
 def _function_body_range(
@@ -1105,6 +1189,97 @@ def _normalize_relative(specifier: str, directory: str) -> str | None:
     if joined.startswith("..") or joined in (".", "/"):
         return None
     return joined or None
+
+
+# --- routes -----------------------------------------------------------------
+
+
+#: Bare callees whose first string argument is a request path. `fetch(...)`
+#: is called as is; `URL` and `Request` are constructed with `new`.
+_REQUEST_CALLEES = frozenset({"fetch", "URL", "Request"})
+
+
+def _javascript_routes(tokens: list[_Token]) -> set[str]:
+    """Paths in the path argument of a request call, or of a helper to one.
+
+    `fetch("/v1/x")`, `new URL("/v1/x", base)`, `new Request("/v1/x", init)`,
+    `client.post("/v1/x")`: the callee fixes that its first argument is an
+    address. A helper declared in this file counts only when its first
+    parameter provably reaches that position (`function context(path) { new
+    URL(path, ...) }`), the way a loader helper counts only when it hands its
+    argument to `import()`. `toBe("https://host/v1/x")` is an expected value
+    and is never read; a template literal is never read.
+    """
+    constants = _javascript_string_bindings(tokens)
+    helpers = _javascript_request_helpers(tokens)
+    routes: set[str] = set()
+    for index, token in enumerate(tokens):
+        if not _is_request_callee(tokens, index, helpers):
+            continue
+        argument = index + 2
+        if argument >= len(tokens) or not _is_punct(tokens, argument + 1, ")", ","):
+            continue
+        if tokens[argument].kind == "str":
+            routes.add(tokens[argument].value)
+        elif tokens[argument].kind == "name":
+            value = constants.get(tokens[argument].value)
+            if value is not None:
+                routes.add(value)
+    return routes
+
+
+def _is_request_callee(tokens: list[_Token], index: int, helpers: set[str]) -> bool:
+    """Whether the name at `index` is called with a request path first."""
+    if not _is_name(tokens, index) or not _is_punct(tokens, index + 1, "("):
+        return False
+    name = tokens[index].value
+    if _is_punct(tokens, index - 1, ".", "?."):
+        return name == "fetch" or (name in _HTTP_VERBS and name != "request")
+    if name in _REQUEST_CALLEES:
+        return name == "fetch" or _is_name(tokens, index - 1, "new")
+    return name in helpers
+
+
+def _javascript_request_helpers(tokens: list[_Token]) -> set[str]:
+    """Functions in this file whose first parameter is forwarded as a path."""
+    declarations = _javascript_function_declarations(tokens)
+    helpers: set[str] = set()
+    for _ in range(len(declarations) + 1):
+        grew = False
+        for name, params, (start, stop) in declarations:
+            if name in helpers or not _is_name(tokens, params + 1):
+                continue
+            parameter = tokens[params + 1].value
+            for cursor in range(start, stop):
+                if (
+                    _is_name(tokens, cursor, parameter)
+                    and _is_punct(tokens, cursor - 1, "(")
+                    and _is_punct(tokens, cursor + 1, ")", ",")
+                    and _is_request_callee(tokens, cursor - 2, helpers)
+                ):
+                    helpers.add(name)
+                    grew = True
+                    break
+        if not grew:
+            break
+    return helpers
+
+
+def _javascript_string_bindings(tokens: list[_Token]) -> dict[str, str]:
+    """`const NAME = "literal"`, first binding wins. Read only from a path
+    position -- the map holds values, and nothing but a route slot reads it."""
+    bindings: dict[str, str] = {}
+    for index, token in enumerate(tokens):
+        if token.kind != "name" or token.value not in ("const", "let", "var"):
+            continue
+        if not (_is_name(tokens, index + 1) and _is_punct(tokens, index + 2, "=")):
+            continue
+        if index + 3 < len(tokens) and tokens[index + 3].kind == "str":
+            bindings.setdefault(tokens[index + 1].value, tokens[index + 3].value)
+    return bindings
+
+
+# --- result shape -----------------------------------------------------------
 
 
 def _javascript_result_keys(tokens: list[_Token], symbols: set[str]) -> set[str]:

@@ -310,7 +310,11 @@ class ComparisonBodyTest(unittest.TestCase):
         joined = "\n".join(cr.redacted_failure_lines(PYTEST_VV_DIFF, ()))
         self.assertIn("Common items", joined)
 
-    def test_an_unindented_blank_line_does_end_the_block(self) -> None:
+    def test_a_blank_line_does_not_carry_the_verdict(self) -> None:
+        # A blank line separates a comparison body from its header rather than
+        # ending it, so it decides nothing either way. The block still ends at
+        # the first line that is neither a marker nor a continuation, which is
+        # what drops the unrelated line here.
         out = "E   AssertionError: boom\n{'a': 1}\n\nunrelated {'b': 2} line\n"
         joined = "\n".join(cr.redacted_failure_lines(out, ()))
         self.assertNotIn("unrelated", joined)
@@ -428,6 +432,136 @@ class ViewAgreesWithPayloadTest(unittest.TestCase):
         view = self._view(("E   AssertionError: NameError",), ())
         self.assertEqual(view["sealed_digest"], self.SEALED_DIGEST)
 
+    def test_a_route_path_reaches_the_forwarded_lines(self) -> None:
+        """The path a route assertion names is a name, not a value.
+
+        Run f50638ab's gateway lane sat at failed=5 for eleven rounds because
+        `_bound_surface_names` returned symbols and object keys but not routes,
+        so the only line carrying the answer arrived as
+        `assert '[redacted]' == '/internal[redacted]'`. `derive_bound_surface`
+        had already extracted the path; the redactor blanked it back out.
+        """
+        sealed = {
+            "tests/test_dpa.py": (
+                "def test_dpa_proxies_the_source_path(client):\n"
+                '    response = client.post("/v1/faers/dpa", json={"drug": "dupixent"})\n'
+                "    assert upstream.url.path == source_base_path('FAERS') + '/dpa'\n"
+            )
+        }
+        names = cr._bound_surface_names(sealed)
+        self.assertIn("/v1/faers/dpa", names)
+
+        output = (
+            "E   AssertionError: assert '/v1/faers/dpa' == '/internal/v1/faers/dpa'\n"
+        )
+        tokens = pr.collect_private_tokens(files=sealed)
+        blanked = "\n".join(cr.redacted_failure_lines(output, tokens, allow=()))
+        self.assertNotIn("/v1/faers/dpa", blanked)
+
+        kept = "\n".join(cr.redacted_failure_lines(output, tokens, allow=names))
+        self.assertIn("/v1/faers/dpa", kept)
+        self.assertIn("/internal/v1/faers/dpa", kept)
+        # A route is admitted; the case that asserted it is not.
+        self.assertNotIn("test_dpa_proxies_the_source_path", kept)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Captured verbatim from run f50638ab / lane-wp7-build round 87 -- real escape
+# bytes, not an imitation of them. Two properties of vitest's output are what
+# this exercises, and either one alone hides the diff:
+#
+#   * it colours the diff, so `\x1b` is the first character of `- Expected`
+#     rather than the `-` that `_is_continuation` looks for;
+#   * it separates the diff from its `AssertionError` header with a *truly*
+#     empty line, where pytest indents its separator.
+#
+# Before the extractor stripped the colour and stopped reading a blank line as a
+# terminator, every one of these lines was dropped and the builder saw only the
+# truncated `AssertionError:` one-liner above them.
+VITEST_COLOURED_DIFF = (
+    " FAIL  src/lib/seo/paid-dpa.test.ts > WP7 paid DPA > entitled request\n"
+    "AssertionError: expected 400 to be 200 // Object.is equality\n"
+    "\n"
+    "\x1b[32m- Expected\x1b[39m\n"
+    "\x1b[31m+ Received\x1b[39m\n"
+    "\n"
+    "\x1b[32m- 200\x1b[39m\n"
+    "\x1b[31m+ 400\x1b[39m\n"
+    "\n"
+    " \u276f src/lib/seo/paid-dpa.test.ts:188:29\n"
+    "    186|     const response = await handleDpaPost(SECRET_FIXTURE);\n"
+    "    187| \n"
+    "    188|     expect(response.status).toBe(200);\n"
+)
+
+# The same shape around an object comparison. The fixture values inside the
+# rendering must still go, colour or no colour.
+VITEST_COLOURED_OBJECT_DIFF = (
+    "AssertionError: expected { n: 47 } to deeply equal { n: 12 }\n"
+    "\n"
+    "\x1b[32m- Expected\x1b[39m\n"
+    "\x1b[31m+ Received\x1b[39m\n"
+    "\n"
+    "\x1b[2m  {\x1b[22m\n"
+    "\x1b[32m-   \"n\": 47,\x1b[39m\n"
+    "\x1b[31m+   \"n\": 12,\x1b[39m\n"
+    "\x1b[2m  }\x1b[22m\n"
+)
+
+
+class VitestColouredDiffTest(unittest.TestCase):
+    """vitest's diff reaches the builder, without its escape sequences."""
+
+    def test_the_diff_body_is_forwarded(self) -> None:
+        joined = "\n".join(cr.redacted_failure_lines(VITEST_COLOURED_DIFF, ()))
+        self.assertIn("- Expected", joined)
+        self.assertIn("+ Received", joined)
+
+    def test_the_scalar_diff_keeps_its_status_codes(self) -> None:
+        # `- 200` / `+ 400` is the same contract vocabulary as the marker line
+        # `expected 400 to be 200`, and it is the whole answer to the failure.
+        joined = "\n".join(cr.redacted_failure_lines(VITEST_COLOURED_DIFF, ()))
+        self.assertIn("- 200", joined)
+        self.assertIn("+ 400", joined)
+
+    def test_no_escape_sequence_survives(self) -> None:
+        for line in cr.redacted_failure_lines(VITEST_COLOURED_DIFF, ()):
+            self.assertNotIn("\x1b", line, line)
+
+    def test_the_source_frame_is_still_dropped(self) -> None:
+        # The `\u276f` pointer names the test, which ends the block before its
+        # source frames -- the same rule that dropped them before.
+        joined = "\n".join(cr.redacted_failure_lines(VITEST_COLOURED_DIFF, ()))
+        self.assertNotIn("SECRET_FIXTURE", joined)
+        self.assertNotIn("handleDpaPost", joined)
+        self.assertNotIn("paid-dpa.test.ts", joined)
+        self.assertNotIn("expect(response.status)", joined)
+
+    def test_the_case_name_is_still_dropped(self) -> None:
+        joined = "\n".join(cr.redacted_failure_lines(VITEST_COLOURED_DIFF, ()))
+        self.assertNotIn("entitled request", joined)
+
+    def test_a_value_inside_a_coloured_rendering_is_still_redacted(self) -> None:
+        joined = "\n".join(
+            cr.redacted_failure_lines(VITEST_COLOURED_OBJECT_DIFF, ())
+        )
+        self.assertIn('"n"', joined)
+        for value in ("47", "12"):
+            self.assertNotIn(value, joined, joined)
+
+    def test_a_private_token_in_a_coloured_line_is_still_redacted(self) -> None:
+        output = "AssertionError: boom\n\n\x1b[31m+ cf-access-client-id\x1b[39m\n"
+        joined = "\n".join(cr.redacted_failure_lines(output, ("cf-access-client-id",)))
+        self.assertNotIn("cf-access-client-id", joined)
+        self.assertIn(pr._REDACTED, joined)
+
+    def test_an_array_member_keeps_no_number(self) -> None:
+        # A bare `- 200` is a scalar comparison; `-   1,` is one member of a
+        # rendered collection and its number is a fixture value.
+        output = "AssertionError: boom\n\n- [\n-   1,\n-   2,\n- ]\n"
+        joined = "\n".join(cr.redacted_failure_lines(output, ()))
+        self.assertNotIn("1,", joined)
+        self.assertNotIn("2,", joined)
