@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import json
 import os
-import shutil
 import signal
 import subprocess
 import threading
@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional, Protocol
 
+from . import bound_surface as bsf
 from . import code_review as cr
 from . import git_publication as gitpub
 from . import hidden_vault as hv
@@ -140,6 +141,56 @@ def _latest(
             )
     return None
 
+
+
+def _sealed_error_history(
+    store: ArtifactStore, run_id: str, lane_id: str
+) -> list[int]:
+    """Sealed failure counts for this lane's review rounds since the last block.
+
+    Counted as failed + errored rather than as passes. The two read the same
+    while `executed` holds still, but a round that collects a different number
+    of cases makes a pass count incomparable to the one before it, and a lane
+    whose suite shrinks would look like it was regressing. Errors are the
+    number that stays honest, and lower is better.
+
+    The USER_WAIT record is the reset marker: only rounds recorded after the
+    most recent one count. That is what makes an operator resume grant a fresh
+    window without storing a counter anywhere.
+    """
+    marker = 0
+    for row in store.conn.execute(
+        "SELECT sequence FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+        "AND artifact_kind=? ORDER BY sequence DESC LIMIT 1",
+        (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
+    ):
+        marker = int(row["sequence"])
+    history: list[int] = []
+    for row in store.conn.execute(
+        "SELECT sequence, payload_json FROM lane_artifacts WHERE run_id=? "
+        "AND lane_id=? AND artifact_kind=? AND sequence>? ORDER BY sequence ASC",
+        (run_id, lane_id, st.ArtifactKind.CODE_REVIEW.value, marker),
+    ):
+        summary = _loads(row["payload_json"]).get("public_result_summary") or {}
+        failed = summary.get("failed")
+        errored = summary.get("errored")
+        if isinstance(failed, int) and isinstance(errored, int):
+            history.append(failed + errored)
+    return history
+
+
+def _stalled(history: Sequence[int]) -> bool:
+    """True when the lane has had its slack and is no longer clearing errors.
+
+    History is error counts, so lower is better. Under the grace window a lane
+    may oscillate freely. At or past it, a round that fails to set a strict new
+    low is the end of the line: 8,8,8 stops on the third round, and 9,8,10,9
+    stops on the fourth because 9 never beats the 8 already reached. A lane
+    that keeps driving errors down never stops.
+    """
+    if len(history) < st.NO_PROGRESS_GRACE_ROUNDS:
+        return False
+    return history[-1] >= min(history[:-1])
 
 
 def _writing_tests_predecessors(
@@ -655,6 +706,22 @@ class LaneContext:
     public_contract: Mapping[str, Any] | None = None
     sealed_digest: str = ""
     draft_correction: Sequence[Mapping[str, str]] | None = None
+    #: Counts from the sealed suite, measured before the code reviewer votes.
+    #: Public by construction -- the same five integers ship to the builder as
+    #: `public_result_summary` -- so showing them to the reviewer leaks nothing
+    #: and is the difference between a located finding and a canned sentence.
+    sealed_result_summary: Mapping[str, int] | None = None
+    #: Set on the second ask, when the suite is red and the reviewer's first
+    #: answer carried no finding the builder could act on.
+    sealed_findings_required: bool = False
+    #: The names -- and only the names -- the sealed acceptance suite binds to:
+    #: module specifiers, the symbols imported from each, and the result-object
+    #: keys the assertions read. Names are contract; values are secrets. The
+    #: builder cannot be expected to guess a symbol it was never told about,
+    #: and guessing is exactly what it did nineteen times on FDAdb before this
+    #: field existed. Derived from the sealed files by `bound_surface`, which
+    #: extracts identifiers and never literals, numbers, or fixture data.
+    bound_surface: Mapping[str, Any] | None = None
 
 
 class StageActor(Protocol):
@@ -888,19 +955,7 @@ def _draft_min_cases_findings(
 
 
 def _remove_collect_tree(dest: Path, vault: Path) -> None:
-    dest = Path(dest)
-    subprocess.run(
-        ["git", "-C", str(vault), "worktree", "remove", "--force", str(dest)],
-        capture_output=True,
-        check=False,
-    )
-    subprocess.run(
-        ["git", "-C", str(vault), "worktree", "prune"],
-        capture_output=True,
-        check=False,
-    )
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
+    hv.remove_vault_worktree(vault, dest)
 
 
 def _write_test_files(extra: Mapping[str, Any]) -> dict[str, str]:
@@ -960,6 +1015,7 @@ class FactoryScheduler:
         stage_completed: Optional[
             Callable[[str, st.LaneStage, st.LaneStage], None]
         ] = None,
+        step: Optional[Callable[..., None]] = None,
         compiled: Optional[st.CompiledPlan] = None,
         provision_argv: Optional[Sequence[str]] = None,
     ) -> None:
@@ -972,6 +1028,13 @@ class FactoryScheduler:
         self._provision_timeout_s = _resolved_provision_timeout(actor)
         self.stage_started = stage_started
         self.stage_completed = stage_completed
+        self.step = step
+        # An actor that can report its own dispatch and wait gets the same
+        # channel; a fake in the tests simply has no attribute to set.
+        try:
+            actor.step = step  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
         self._compiled = compiled
         self._compiled_kinds = {
             lane.lane_id: lane.lane_kind for lane in compiled.lanes
@@ -1073,7 +1136,8 @@ class FactoryScheduler:
             )
             if wait is None:
                 continue
-            if wait.payload.get("wait_reason") != st.WaitReason.PAUSE.value:
+            reasons = {r.value for r in st.RESUMABLE_WAIT_REASONS}
+            if wait.payload.get("wait_reason") not in reasons:
                 continue
             self.store.resume_lane(self.run_id, lane.lane_id)
 
@@ -1310,6 +1374,25 @@ class FactoryScheduler:
             return digest, {"integration_head": head}
         raise FactoryRefused(f"not pauseable {stage.value}")
 
+    def _say(self, lane_id: str, message: str, detail: str = "") -> None:
+        """Report one step inside a stage. Never workflow state.
+
+        Deliberately swallowing: an observer that raises must not be able to
+        fail a lane. Nothing downstream reads these, and no transition keys on
+        one -- they exist so an operator can tell provisioning from a hung
+        agent from a dead scheduler while a stage is still running.
+        """
+        # getattr, not self.step: a scheduler built with __new__ for a targeted
+        # test has no attribute, and reporting must never be the thing that
+        # raises.
+        step = getattr(self, "step", None)
+        if step is None:
+            return
+        try:
+            step(lane_id, message, detail)
+        except Exception:
+            pass
+
     def _advance(self, lane_id: str) -> None:
         stage = self.store.lane_stage(self.run_id, lane_id)
         if stage is st.LaneStage.WRITING_TESTS:
@@ -1541,7 +1624,9 @@ class FactoryScheduler:
             artifacts=artifacts,
             integration_head=tip,
         )
+        self._say(lane_id, "asking tester for private test draft")
         extra = dict(self.actor.write_tests(ctx))
+        self._say(lane_id, "tester returned a draft")
         files = self._require_draft_min_cases(ctx, _write_test_files(extra))
         self._require_typed_test_outputs(lane, files)
         contract = prv.public_contract(
@@ -1615,8 +1700,9 @@ class FactoryScheduler:
         run_repo = Path(self.target.target_repository_root)
         vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
         base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
-        dest = self.runtime.path / "worktrees" / "draft-collect-{0}-{1}-{2}".format(
-            ctx.lane.lane_id, ctx.input_digest[:12], os.urandom(4).hex()
+        dest = hv.scratch_worktree_path(
+            self.runtime.path / "worktrees",
+            "draft-collect-{0}".format(ctx.lane.lane_id),
         )
         hv.checkout_vault_worktree(vault, base, dest)
         try:
@@ -1669,7 +1755,13 @@ class FactoryScheduler:
             artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft},
             public_contract=draft.payload.get("public_contract"),
         )
+        self._say(lane_id, "asking test reviewer")
         verdict, findings = self.actor.review_tests(ctx)
+        self._say(
+            lane_id,
+            "test reviewer answered {0}".format(verdict.value),
+            "{0} finding(s)".format(len(findings)),
+        )
         draft_artifact = _record_as_lane_artifact(draft, lane)
         tokens = tc.draft_private_tokens(
             state_root=self.runtime.path,
@@ -1739,6 +1831,34 @@ class FactoryScheduler:
                 artifact, [plan.artifact_id, draft.artifact_id, review.artifact_id]
             ),
         )
+
+    def _bound_surface(
+        self, lane: st.LaneProjection, sealed: ArtifactRecord
+    ) -> Mapping[str, Any] | None:
+        """The names the sealed acceptance suite binds to, for the builder.
+
+        Names are contract; values are secrets. `derive_bound_surface` returns
+        module specifiers, the symbols imported from each, and the keys read off
+        result objects -- never a string literal, a number, a selector, or
+        fixture data -- so this crosses the private-test boundary on the same
+        terms as the five public counts.
+
+        Read from the vault exactly the way `_reviewing_code` and
+        `code_review.measure_candidate` read it: `hidden_vault` for the bare
+        repository, `tests_chain.sealed_private_files` for the path-to-blob map.
+        """
+        vault = hv.ensure_vault(self.runtime.path, self.run_id)
+        blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(sealed, lane))
+        files = {
+            path: hv.cat_blob(vault, blob).decode("utf-8")
+            for path, blob in blobs.items()
+        }
+        surface = bsf.derive_bound_surface(files)
+        if not surface.get("modules") and not surface.get("object_keys"):
+            # Nothing extracted is not an empty contract, it is no contract.
+            # Rendering it would tell the builder the suite binds to nothing.
+            return None
+        return surface
 
     def _building(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -1851,7 +1971,20 @@ class FactoryScheduler:
             ),
             sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
         )
+        surface = self._bound_surface(lane, sealed)
+        if surface is not None:
+            ctx = dataclasses.replace(ctx, bound_surface=surface)
+            self._say(
+                lane_id,
+                "derived the bound surface from the sealed suite",
+                "{0} module(s), {1} result key(s)".format(
+                    len(surface.get("modules") or ()),
+                    len(surface.get("object_keys") or ()),
+                ),
+            )
+        self._say(lane_id, "asking builder for a candidate")
         extra = dict(self.actor.build(ctx))
+        self._say(lane_id, "builder returned a candidate")
         candidate_sha = extra["candidate_sha"]
         changed = bool(extra.get("changed", True))
         admitted = gitpub.admit_candidate(
@@ -1955,9 +2088,73 @@ class FactoryScheduler:
                     ctx, ids, sealed_artifact, exc
                 )
                 return
-        verdict, findings = self.actor.review_code(ctx)
         constraints = tuple(lane.public_acceptance) or ("produce declared outputs",)
         try:
+            # Measure BEFORE the reviewer votes. A reviewer that does not know
+            # the suite is red votes PASS with no findings, the harness then
+            # downgrades it, and the builder is handed a canned sentence naming
+            # no file -- which is how a lane burns a round learning nothing.
+            self._say(
+                lane_id,
+                "provisioning review tree and running sealed suite",
+                "candidate {0}".format(builder.payload["candidate_sha"][:12]),
+            )
+            measurement = cr.measure_candidate(
+                request=request,
+                state_root=self.runtime.path,
+                candidate_repo=Path(self.target.target_repository_root),
+                candidate_sha=builder.payload["candidate_sha"],
+                candidate_ref=builder.payload["candidate_ref"],
+                builder_base_sha=builder.payload["builder_base_sha"],
+                sealed_bundle=sealed_artifact,
+                scratch_root=self.runtime.path / "worktrees",
+                allow_candidate_paths=typed_build,
+                gate=self._sealed_suite_gate(lane),
+                runtime_root=Path(self.target.target_repository_root),
+                provision_argv=self._provision_argv,
+                provision_timeout_s=self._provision_timeout_s,
+            )
+            counts = measurement.summary
+            self._say(
+                lane_id,
+                "sealed suite {0}".format(
+                    "FAILED" if measurement.runner_failed else "passed"
+                ),
+                "{0} executed, {1} passed, {2} failed, {3} errored".format(
+                    counts["executed"],
+                    counts["passed"],
+                    counts["failed"],
+                    counts["errored"],
+                ),
+            )
+            ctx = dataclasses.replace(
+                ctx, sealed_result_summary=dict(measurement.summary)
+            )
+            self._say(lane_id, "asking code reviewer")
+            verdict, findings = self.actor.review_code(ctx)
+            self._say(
+                lane_id,
+                "code reviewer answered {0}".format(verdict.value),
+                "{0} finding(s)".format(len(findings)),
+            )
+            if measurement.runner_failed and not findings:
+                # It saw the counts and still had nothing locatable to say. Ask
+                # once more, saying so. One extra reviewer turn is cheap next to
+                # a builder round spent guessing which of five cases failed.
+                self._say(
+                    lane_id,
+                    "no actionable finding against a red suite, asking again",
+                )
+                verdict, findings = self.actor.review_code(
+                    dataclasses.replace(ctx, sealed_findings_required=True)
+                )
+                self._say(
+                    lane_id,
+                    "code reviewer answered {0} on the second ask".format(
+                        verdict.value
+                    ),
+                    "{0} finding(s)".format(len(findings)),
+                )
             artifact = cr.review_builder_output(
                 request=request,
                 state_root=self.runtime.path,
@@ -1976,6 +2173,7 @@ class FactoryScheduler:
                 runtime_root=Path(self.target.target_repository_root),
                 provision_argv=self._provision_argv,
                 provision_timeout_s=self._provision_timeout_s,
+                measurement=measurement,
             )
         except prv.PrivatePathCollisionError as exc:
             self._complete_test_invalidation(
@@ -1986,6 +2184,41 @@ class FactoryScheduler:
             self.store,
             ctx,
             _with_input_artifact_ids(artifact, ids),
+        )
+        if verdict is st.ReviewerVerdict.REVISE:
+            self._block_if_stalled(lane_id)
+
+    def _block_if_stalled(self, lane_id: str) -> None:
+        """Stop a build lane that has stopped climbing.
+
+        Called once the REVISE has been recorded, so the lane already sits at
+        BUILDING. Blocking here rather than at REVIEWING_CODE means a resume
+        rebuilds against the findings instead of re-running the sealed suite
+        over a candidate that was already judged.
+        """
+        history = _sealed_error_history(self.store, self.run_id, lane_id)
+        if not _stalled(history):
+            return
+        stage = self.store.lane_stage(self.run_id, lane_id)
+        if stage not in st.PAUSEABLE_STAGES:
+            return
+        digest, observed = self._pause_input(lane_id, stage)
+        self.store.pause_lane(
+            self.run_id,
+            lane_id,
+            stage,
+            digest,
+            observed=observed,
+            reason=st.WaitReason.NO_PROGRESS,
+        )
+        self._say(
+            lane_id,
+            "no progress, blocking for the operator",
+            "sealed errors {0} over {1} round(s); resume grants another {2}".format(
+                ", ".join(str(count) for count in history),
+                len(history),
+                st.NO_PROGRESS_GRACE_ROUNDS,
+            ),
         )
 
     def _complete_test_invalidation(

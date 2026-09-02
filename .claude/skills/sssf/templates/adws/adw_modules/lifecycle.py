@@ -1432,9 +1432,12 @@ class ArtifactStore:
         expected_input_digest: str,
         *,
         observed: Optional[Mapping[str, Any]] = None,
+        reason: st.WaitReason = st.WaitReason.PAUSE,
     ) -> ArtifactRecord:
         if expected_stage not in st.PAUSEABLE_STAGES:
             raise st.IllegalStageEdge(expected_stage.value)
+        if reason not in st.RESUMABLE_WAIT_REASONS:
+            raise st.IllegalStageEdge(reason.value)
         now = now_iso()
         self._begin()
         try:
@@ -1450,7 +1453,7 @@ class ArtifactStore:
             wait_digest = st.user_wait_input_digest(
                 predecessor_artifact_id=predecessor_id,
                 predecessor_sequence=predecessor_seq,
-                wait_reason=st.WaitReason.PAUSE,
+                wait_reason=reason,
                 resume_stage=expected_stage,
                 resume_input_digest=expected_input_digest,
                 run_id=run_id,
@@ -1463,7 +1466,7 @@ class ArtifactStore:
                 "predecessor_sequence": predecessor_seq,
                 "resume_input_digest": expected_input_digest,
                 "resume_stage": expected_stage.value,
-                "wait_reason": st.WaitReason.PAUSE.value,
+                "wait_reason": reason.value,
             }
             artifact = st.LaneArtifact(
                 kind=st.ArtifactKind.USER_WAIT,

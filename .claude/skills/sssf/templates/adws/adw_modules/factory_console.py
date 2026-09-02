@@ -48,6 +48,21 @@ class FactoryConsole:
             f"[cyan]▶[/cyan] [bold]{escape(lane_id)}[/bold]  {escape(stage.value)}"
         )
 
+    def step(self, lane_id: str, message: str, detail: str = "") -> None:
+        """One step inside a stage, printed as it happens.
+
+        A stage is not an atomic act. REVIEWING_CODE provisions a tree, runs a
+        sealed suite, dispatches a reviewer, waits on its envelope, and may ask
+        it a second time -- minutes apart, and every one of them was silent
+        between the stage's start line and its completion line. An operator
+        watching that could not tell provisioning from a hung agent from a dead
+        scheduler, which is the report this method exists to answer.
+        """
+        line = f"[dim]·[/dim] [bold]{escape(lane_id)}[/bold]  {escape(message)}"
+        if detail:
+            line += f"  [dim]{escape(detail)}[/dim]"
+        self._console.print(line)
+
     def stage_completed(
         self,
         lane_id: str,

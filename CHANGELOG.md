@@ -6,6 +6,57 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **The sealed suite is measured before the code reviewer votes.**
+  `code_review.measure_candidate` runs the suite once and hands the reviewer
+  the five public counts; a reviewer that returns no locatable finding against
+  a red suite is asked once more with findings required. A `CODE_REVIEW`
+  carries `redacted_failures`: the runner's failure lines with every private
+  token redacted and only the bound-surface names allowed through, so the
+  builder learns which key or status was wrong without seeing a test.
+- **The builder is handed the bound surface of the sealed suite.**
+  `bound_surface.derive_bound_surface` extracts module specifiers, imported
+  symbols and result-object keys from the sealed files as a whitelist of
+  names; no literal, number, selector or fixture value crosses. Names are
+  contract; values are secrets.
+- **A build lane that stops climbing blocks for the operator.** After
+  `NO_PROGRESS_GRACE_ROUNDS` review rounds, a round that fails to set a strict
+  new low in `failed + errored` pauses the lane with wait reason
+  `NO_PROGRESS`; `run resume` clears it and the `USER_WAIT` record is the reset
+  marker, so no counter is stored. `8, 8, 8` stops; `10, 8, 6, 4` never does.
+- **A durable step log.** Every operator step line is appended to
+  `<runtime_state_root>/steps.jsonl` as one JSON object, bounded by `run
+  opened` and `run finished`. Reporting only: nothing in the runtime reads it
+  back into a lifecycle decision, and a failed append cannot fail a lane.
+
+### Fixed
+- **Every vault ref is named by what it pins.** Draft and sealed refs were keyed
+  on the review's `input_digest` but pinned a `git commit` sha, which embeds the
+  wall clock; a second draft of one input a second later asked the same ref to
+  pin a different sha and was refused (`already pins X, not Y`), the same shape
+  as the private-results ref fixed earlier. `commit_all` now commits under
+  fixed dates and identity with signing off, so a sha is a function of tree,
+  parent and message; `draft_ref` and `sealed_ref` are keyed on the manifest
+  digest of the commit they pin and are pinned after the leak checks; the
+  private manifest diffs against the commit's own parent instead of the
+  force-updated `integration-seed`; and the draft worktree gets a scratch
+  name and is removed when the call ends, so a crashed round can never leave a
+  directory a retry is refused for adopting. Identical bytes now reach the
+  identical ref and different bytes a different one, so a collision is not
+  expressible and `update_immutable_ref` refusing stays correct.
+- **A draft commit is anchored from the moment it exists until its ref pins
+  it.** `write_test_draft` removed its scratch worktree right after
+  committing, before the manifest digest, the leak checks and the pin, so the
+  commit carrying private test bytes sat unreferenced across that whole
+  window. The worktree now outlives the pin and is removed on the way out,
+  succeed or refuse; a refused draft still ends with no worktree and no ref.
+  `tests/test_draft_ref_window.py` observes the registration through git at
+  the instant the pin is requested.
+- **A vault ref refusal names the digest it was handed.** `draft_ref`,
+  `sealed_ref` and `private_results_ref` are keyed on three different digests
+  but all refused a malformed one as `input_digest`, which is not a field any
+  of them takes. Each now names its own.
+
 ### Changed
 - **Maestro now runs one nine-stage artifact factory instead of overlapping
   attempt, actor-generation, retry, recovery-marker, candidate, and review

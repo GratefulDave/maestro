@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -548,7 +549,7 @@ def test_producer_artifact_pin():
         vault = hv.vault_path(self.state, self.run_id)
         commit = hv.rev_parse(vault, draft.artifact_ref)
         sealed_name = hv.sealed_ref(
-            request.run_id, request.lane_id, request.input_digest
+            request.run_id, request.lane_id, draft.payload["private_draft_digest"]
         )
         hv.update_immutable_ref(vault, sealed_name, commit)
         first = tc.seal_accepted_tests(
@@ -730,6 +731,131 @@ def test_producer_artifact_pin():
         self.assertFalse((dest / TEST_PATH).exists())
 
 
+    def _review_call(self, sealed, review_digest, good_sha, good_ref, base, scratch_name):
+        return cr.review_builder_output(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=review_digest,
+            ),
+            state_root=self.state,
+            candidate_repo=self.repo,
+            candidate_sha=good_sha,
+            candidate_ref=good_ref,
+            builder_base_sha=base,
+            sealed_bundle=sealed,
+            verdict=st.ReviewerVerdict.PASS,
+            scratch_root=self.root / scratch_name,
+            architecture_constraints=CONSTRAINTS,
+        )
+
+    def test_a_review_that_raises_leaves_no_ref_behind(self):
+        """A review that never became an artifact pins nothing.
+
+        The ref is pinned after every check, so a refusal on the way leaves
+        the vault as it found it. Whether the retry can then record is not
+        this test's question: the ref is keyed on the result bytes, so a
+        retry records regardless (`test_the_same_input_can_be_reviewed_twice`).
+        """
+        draft = self._draft(_digest("retry-draft"))
+        passed = self._review(draft, _digest("retry-review"), st.ReviewerVerdict.PASS)
+        sealed = self._seal(draft, passed, self._builder())
+        base = _git(self.repo, "rev-parse", "HEAD")
+        good_sha, good_ref = self._candidate(FIXED)
+        review_digest = _digest("retry-code-review")
+        vault = hv.vault_path(self.state, self.run_id)
+        prefix = "refs/maestro/private-results/{0}/{1}/".format(
+            self.run_id, self.lane_id
+        )
+
+        boom = RuntimeError("the view blew up after the suite ran")
+        with mock.patch.object(cr, "builder_view", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                self._review_call(
+                    sealed, review_digest, good_sha, good_ref, base, "scratch-retry-1"
+                )
+
+        # Nothing durable survives a review that never produced an artifact.
+        listed = _git(vault, "for-each-ref", "--format=%(refname)", prefix)
+        self.assertEqual(listed, "")
+
+        # The retry re-runs the suite, so its stdout may differ in the
+        # duration alone -- and it must still be able to pin.
+        accepted = self._review_call(
+            sealed, review_digest, good_sha, good_ref, base, "scratch-retry-2"
+        )
+        self.assertIs(accepted.verdict, st.ReviewerVerdict.PASS)
+        self.assertEqual(
+            accepted.artifact_ref,
+            hv.private_results_ref(
+                self.run_id, self.lane_id, accepted.payload["private_results_digest"]
+            ),
+        )
+        self.assertTrue(hv.rev_parse(vault, accepted.artifact_ref))
+
+    def test_the_same_input_can_be_reviewed_twice(self):
+        """The ref is keyed on what it pins, so re-review cannot collide.
+
+        Two reviews of one input are two observations. Each names its ref by
+        the digest of its own result bytes: identical bytes reach the identical
+        ref (pinning is idempotent), different bytes reach a different ref. A
+        second `review_builder_output` over the same input therefore completes
+        and records, with no guard and no mutable ref.
+        """
+        draft = self._draft(_digest("twice-draft"))
+        passed = self._review(draft, _digest("twice-review"), st.ReviewerVerdict.PASS)
+        sealed = self._seal(draft, passed, self._builder())
+        base = _git(self.repo, "rev-parse", "HEAD")
+        good_sha, good_ref = self._candidate(FIXED)
+        review_digest = _digest("twice-code-review")
+        vault = hv.vault_path(self.state, self.run_id)
+
+        first = self._review_call(
+            sealed, review_digest, good_sha, good_ref, base, "scratch-twice-1"
+        )
+        second = self._review_call(
+            sealed, review_digest, good_sha, good_ref, base, "scratch-twice-2"
+        )
+        for artifact in (first, second):
+            self.assertIs(artifact.verdict, st.ReviewerVerdict.PASS)
+            digest = artifact.payload["private_results_digest"]
+            self.assertEqual(
+                artifact.artifact_ref,
+                hv.private_results_ref(self.run_id, self.lane_id, digest),
+            )
+            pinned = hv.rev_parse(vault, artifact.artifact_ref)
+            self.assertEqual(st.digest_bytes(hv.cat_blob(vault, pinned)), digest)
+        # The input digest never names a ref: it is not what the ref pins.
+        with self.assertRaises(hv.VaultError):
+            hv.rev_parse(
+                vault, hv.private_results_ref(self.run_id, self.lane_id, review_digest)
+            )
+        # Every ref under the lane's prefix is one the two reviews named:
+        # nothing was pinned on the way that did not become an artifact.
+        prefix = "refs/maestro/private-results/{0}/{1}/".format(
+            self.run_id, self.lane_id
+        )
+        listed = _git(vault, "for-each-ref", "--format=%(refname)", prefix)
+        self.assertEqual(
+            set(listed.split()), {first.artifact_ref, second.artifact_ref}
+        )
+
+    def test_a_pinned_ref_still_refuses_a_different_result(self):
+        """Moving the pin must not turn the ref mutable.
+
+        The point of pinning last is that a review which never became an
+        artifact leaves nothing behind, not that a recorded result can be
+        overwritten by a later one.
+        """
+        vault = hv.ensure_vault(self.state, self.run_id)
+        ref = hv.private_results_ref(self.run_id, self.lane_id, _digest("pin-1"))
+        first = hv.hash_blob(vault, b'{"counts": 1}')
+        second = hv.hash_blob(vault, b'{"counts": 2}')
+        hv.pin_object_ref(vault, ref, first)
+        hv.pin_object_ref(vault, ref, first)  # idempotent
+        with self.assertRaises(hv.VaultError):
+            hv.pin_object_ref(vault, ref, second)
+
     def test_code_review_copies_absent_private_tests_and_runs_them(self):
         draft = self._draft(_digest("absent-path-draft"))
         passed = self._review(
@@ -763,6 +889,112 @@ def test_producer_artifact_pin():
         self.assertTrue((dest / TEST_PATH).is_file())
         self.assertEqual((dest / "refund.py").read_text(), FIXED)
         self.assertNotEqual((dest / TEST_PATH).read_text(), FIXED)
+
+    def test_commit_all_names_a_commit_by_its_content_not_the_clock(self):
+        """Two commits of one tree, parent and message are one sha.
+
+        Red when `commit_all` lets the inherited clock into the commit: the
+        two worktrees below are committed under different `GIT_*_DATE`
+        values, which is what any two runs a second apart look like.
+        """
+        vault = hv.ensure_vault(self.state, self.run_id)
+        base = hv.seed(vault, self.repo, INTEGRATION_REF)
+        shas = []
+        for stamp in ("@100 +0000", "@200 +0000"):
+            dest = self.worktrees / ("clock-" + stamp[1:4])
+            hv.checkout_vault_worktree(vault, base, dest)
+            pr.write_files(dest, {TEST_PATH: TEST_SOURCE})
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp},
+            ):
+                shas.append(hv.commit_all(dest, "same message", paths=[TEST_PATH]))
+        self.assertEqual(shas[0], shas[1])
+
+    def test_a_draft_ref_is_named_by_what_it_pins(self):
+        draft = self._draft(_digest("named-by-content"))
+        vault = hv.vault_path(self.state, self.run_id)
+        self.assertEqual(
+            draft.artifact_ref,
+            hv.draft_ref(
+                self.run_id, self.lane_id, draft.payload["private_draft_digest"]
+            ),
+        )
+        self.assertEqual(draft.payload["private_draft_ref"], draft.artifact_ref)
+        with self.assertRaises(hv.VaultError):
+            hv.rev_parse(
+                vault, hv.draft_ref(self.run_id, self.lane_id, draft.input_digest)
+            )
+
+    def test_one_input_can_be_drafted_twice(self):
+        """The resume shape: a crashed round drafted, the retry drafts again.
+
+        Same input, same bytes, same worktrees root, a different wall clock.
+        Red under input-keyed refs (`already pins X, not Y`) and red under an
+        input-keyed worktree name (`refusing to adopt existing worktree`).
+        """
+        digest = _digest("drafted-twice")
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_AUTHOR_DATE": "@100 +0000", "GIT_COMMITTER_DATE": "@100 +0000"},
+        ):
+            first = self._draft(digest)
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_AUTHOR_DATE": "@200 +0000", "GIT_COMMITTER_DATE": "@200 +0000"},
+        ):
+            second = self._draft(digest)
+        self.assertEqual(first.artifact_ref, second.artifact_ref)
+        self.assertEqual(first.payload, second.payload)
+        vault = hv.vault_path(self.state, self.run_id)
+        self.assertEqual(
+            hv.rev_parse(vault, first.artifact_ref),
+            hv.rev_parse(vault, second.artifact_ref),
+        )
+        # The draft worktree is scaffolding and does not outlive the call.
+        self.assertEqual(list(self.worktrees.rglob("draft-*")), [])
+
+    def test_two_drafts_of_one_input_both_record(self):
+        """A tester asked twice writes twice; neither answer is refused."""
+        digest = _digest("drafted-differently")
+        first = self._draft(digest)
+        other = TEST_SOURCE + "\n# the tester answered differently the second time\n"
+        second = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id, lane_id=self.lane_id, input_digest=digest
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TEST_PATH: other},
+            public_contract=CONTRACT,
+            worktrees_root=self.worktrees / digest[:8],
+        )
+        self.assertNotEqual(first.artifact_ref, second.artifact_ref)
+        vault = hv.vault_path(self.state, self.run_id)
+        self.assertNotEqual(
+            hv.rev_parse(vault, first.artifact_ref),
+            hv.rev_parse(vault, second.artifact_ref),
+        )
+
+    def test_sealed_files_survive_the_integration_seed_moving(self):
+        """A bundle's manifest is a function of its commit, not of the seed.
+
+        Red when the private files are diffed against the current
+        `integration-seed`: once integration moves, files the draft never
+        touched read as private and the recorded digest no longer matches.
+        """
+        draft = self._draft(_digest("seed-moves-draft"))
+        passed = self._review(draft, _digest("seed-moves-review"), st.ReviewerVerdict.PASS)
+        sealed = self._seal(draft, passed, self._builder())
+        (self.repo / "refund.py").write_text(FIXED)
+        _git(self.repo, "add", "refund.py")
+        _git(self.repo, "commit", "-qm", "integration moved")
+        vault = hv.vault_path(self.state, self.run_id)
+        moved = hv.seed(vault, self.repo, INTEGRATION_REF)
+        self.assertNotEqual(moved, hv.rev_parse(vault, sealed.artifact_ref + "^"))
+        files = tc.sealed_private_files(vault, sealed)
+        self.assertEqual(set(files), {TEST_PATH})
 
     def test_same_inputs_yield_identical_canonical_bytes(self):
         first = self._draft(_digest("draft-1"))

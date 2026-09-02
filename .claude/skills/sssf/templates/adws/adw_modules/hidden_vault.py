@@ -34,11 +34,14 @@ def _git(
     check: bool = True,
     input: bytes | str | None = None,
     text: bool | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     if text is None:
         text = not isinstance(input, (bytes, bytearray))
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
@@ -101,33 +104,56 @@ def seed(vault: Path, repo: Path, integration_ref: str) -> str:
     return _git(vault, "rev-parse", dest).stdout.strip()
 
 
-def draft_ref(run_id: str, lane_id: str, input_digest: str) -> str:
+def draft_ref(run_id: str, lane_id: str, private_draft_digest: str) -> str:
+    """Name the ref that pins one private test draft.
+
+    Keyed on the draft's own manifest digest -- the commit it pins and the
+    private blobs that commit carries -- never on the review input that asked
+    for it. A tester answers one input with whatever it writes, so an input
+    can legitimately produce several drafts; each names its own ref, and a
+    re-draft of identical bytes reaches the identical ref. See
+    `commit_all` for why the commit sha is a function of those bytes.
+    """
     return "refs/maestro/drafts/{0}/{1}/{2}".format(
         _require_id("run_id", run_id),
         _require_id("lane_id", lane_id),
-        _require_digest(input_digest),
+        _require_digest("private_draft_digest", private_draft_digest),
     )
 
 
-def sealed_ref(run_id: str, lane_id: str, input_digest: str) -> str:
+def sealed_ref(run_id: str, lane_id: str, sealed_digest: str) -> str:
+    """Name the ref that pins one sealed test bundle.
+
+    Keyed on `sealed_digest`, the manifest digest of the commit it pins, for
+    the same reason as `draft_ref`.
+    """
     return "refs/maestro/sealed/{0}/{1}/{2}".format(
         _require_id("run_id", run_id),
         _require_id("lane_id", lane_id),
-        _require_digest(input_digest),
+        _require_digest("sealed_digest", sealed_digest),
     )
 
 
-def private_results_ref(run_id: str, lane_id: str, input_digest: str) -> str:
+def private_results_ref(run_id: str, lane_id: str, results_digest: str) -> str:
+    """Name the ref that pins one private test result.
+
+    Keyed on the digest of the result bytes themselves, not on the review's
+    input: the runner's output is an observation (its summary line carries a
+    wall-clock duration), so one input can legitimately yield many results.
+    Keying on the content makes `pin_object_ref` idempotent by construction.
+    """
     return "refs/maestro/private-results/{0}/{1}/{2}".format(
         _require_id("run_id", run_id),
         _require_id("lane_id", lane_id),
-        _require_digest(input_digest),
+        _require_digest("results_digest", results_digest),
     )
 
 
-def _require_digest(value: str) -> str:
+def _require_digest(name: str, value: str) -> str:
+    # Named by the caller: each ref helper is keyed on a different digest, and
+    # the refusal must say which one it was handed.
     if not _DIGEST.fullmatch(value):
-        raise VaultError("input_digest {0!r} is not SHA-256 hex".format(value))
+        raise VaultError("{0} {1!r} is not SHA-256 hex".format(name, value))
     return value
 
 
@@ -224,17 +250,63 @@ def checkout_vault_worktree(vault: Path, base_sha: str, dest: Path) -> Path:
     return dest.resolve()
 
 
+def scratch_worktree_path(worktrees_root: Path, prefix: str) -> Path:
+    """A path for a vault worktree that exists only while one call runs.
+
+    The name carries no identity: two calls over the same input get two
+    names, so a worktree left behind by a crashed call can never be the one a
+    retry is refused for adopting. What the worktree produced lives in the
+    vault object database; the directory is scaffolding and is removed by
+    `remove_vault_worktree` when the call ends.
+    """
+    return Path(worktrees_root) / "{0}-{1}".format(prefix, os.urandom(8).hex())
+
+
+def remove_vault_worktree(vault: Path, dest: Path) -> None:
+    """Drop a scratch worktree and its registration; never raises."""
+    dest = Path(dest)
+    _git(vault, "worktree", "remove", "--force", str(dest), check=False)
+    _git(vault, "worktree", "prune", check=False)
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+
+
+#: A vault commit is named by what it carries and nothing else.
+#:
+#: `git commit` embeds the wall clock in both the author and committer lines,
+#: so two commits of one tree, one parent and one message made a second apart
+#: have different shas. The drafts and sealed refs are keyed on a digest over
+#: the commit they pin, so a sha that moved with the clock meant one input
+#: could name two refs -- or, keyed the old way, one ref could be asked to pin
+#: two shas, which `update_immutable_ref` correctly refuses. Fixing the dates
+#: and identity, and switching signing off (a signature carries its own
+#: timestamp), makes the sha a pure function of (tree, parent, message):
+#: identical bytes commit to the identical sha, every time.
+_COMMIT_ENV = {
+    "GIT_AUTHOR_NAME": "maestro-private-review",
+    "GIT_AUTHOR_EMAIL": "maestro-private-review@invalid",
+    "GIT_AUTHOR_DATE": "@0 +0000",
+    "GIT_COMMITTER_NAME": "maestro-private-review",
+    "GIT_COMMITTER_EMAIL": "maestro-private-review@invalid",
+    "GIT_COMMITTER_DATE": "@0 +0000",
+}
+_COMMIT_ARGS = ("-c", "commit.gpgsign=false", "commit", "-q")
+
+
 def commit_all(
     worktree: Path, message: str, *, paths: Sequence[str] | None = None
 ) -> str:
-    _git(worktree, "config", "user.email", "maestro-private-review@invalid")
-    _git(worktree, "config", "user.name", "maestro-private-review")
+    """Commit the worktree (or `paths`) and return a content-addressed sha.
+
+    The sha depends only on the tree, the parent and `message`; see
+    `_COMMIT_ENV`.
+    """
     if paths is None:
         _git(worktree, "add", "-A")
         changed = bool(_git(worktree, "status", "--porcelain").stdout.strip())
         if not changed:
             raise VaultError("test draft produced no changes")
-        _git(worktree, "commit", "-qm", message)
+        _git(worktree, *_COMMIT_ARGS, "-m", message, extra_env=_COMMIT_ENV)
         return _git(worktree, "rev-parse", "HEAD").stdout.strip()
     pathspec = tuple(paths)
     if not pathspec:
@@ -252,7 +324,16 @@ def commit_all(
     )
     if not changed:
         raise VaultError("test draft produced no changes")
-    _git(worktree, "commit", "-q", "--only", "-m", message, "--", *pathspec)
+    _git(
+        worktree,
+        *_COMMIT_ARGS,
+        "--only",
+        "-m",
+        message,
+        "--",
+        *pathspec,
+        extra_env=_COMMIT_ENV,
+    )
     return _git(worktree, "rev-parse", "HEAD").stdout.strip()
 
 

@@ -92,7 +92,12 @@ def _select_private_blobs(
     commit: str,
     payload: Mapping[str, object],
 ) -> tuple[tuple[str, str], ...]:
-    base = hv.rev_parse(vault, "refs/maestro/integration-seed")
+    # The private files are what the draft commit changed against the base it
+    # was written on, and that base is the commit's own parent. Reading it off
+    # `refs/maestro/integration-seed` instead would make the manifest a
+    # function of a ref that every later draft force-updates: once integration
+    # moved, an older bundle's files no longer matched its recorded digest.
+    base = hv.rev_parse(vault, commit + "^")
     if payload.get("private_manifest_schema") == PRIVATE_MANIFEST_SCHEMA:
         selected = _private_blobs(vault, base, commit)
         if not selected:
@@ -139,66 +144,77 @@ def write_test_draft(
         raise pr.PrivateReviewError("test draft files are empty")
     vault = hv.ensure_vault(state_root, request.run_id)
     base = hv.seed(vault, run_repo, integration_ref)
-    dest = Path(worktrees_root) / "draft-{0}-{1}".format(
-        request.lane_id, request.input_digest[:12]
+    dest = hv.scratch_worktree_path(
+        worktrees_root, "draft-{0}".format(request.lane_id)
     )
     hv.checkout_vault_worktree(vault, base, dest)
-    written = pr.write_files(dest, files)
-    commit = hv.commit_all(
-        dest,
-        "test draft {0}".format(request.input_digest),
-        paths=written,
-    )
-    ref = hv.draft_ref(request.run_id, request.lane_id, request.input_digest)
-    hv.update_immutable_ref(vault, ref, commit)
-    private = _private_blobs(vault, base, commit)
-    selected_paths = tuple(path for path, _blob in private)
-    if frozenset(selected_paths) != frozenset(envelope):
-        raise pr.PrivateReviewError(
-            "path-limited draft commit files mismatch envelope"
+    # The worktree stays registered until the draft ref is pinned. Its HEAD
+    # is the only thing anchoring the commit before that ref exists, so
+    # removing it earlier would leave the commit unreferenced across every
+    # check below. A draft those checks refuse still ends with the worktree
+    # gone and no ref, which is the intended outcome for a refused draft.
+    try:
+        written = pr.write_files(dest, files)
+        commit = hv.commit_all(
+            dest,
+            "test draft {0}".format(request.input_digest),
+            paths=written,
         )
-    private_draft_digest = _manifest_digest(commit, private)
-    payload = {
-        "input_artifact_ids": list(request.input_artifact_ids),
-        "input_digest": request.input_digest,
-        "private_draft_digest": private_draft_digest,
-        "private_draft_ref": ref,
-        "private_manifest_digest": private_draft_digest,
-        "private_manifest_schema": PRIVATE_MANIFEST_SCHEMA,
-        "public_contract": contract,
-    }
+        private = _private_blobs(vault, base, commit)
+        selected_paths = tuple(path for path, _blob in private)
+        if frozenset(selected_paths) != frozenset(envelope):
+            raise pr.PrivateReviewError(
+                "path-limited draft commit files mismatch envelope"
+            )
+        private_draft_digest = _manifest_digest(commit, private)
+        ref = hv.draft_ref(request.run_id, request.lane_id, private_draft_digest)
+        payload = {
+            "input_artifact_ids": list(request.input_artifact_ids),
+            "input_digest": request.input_digest,
+            "private_draft_digest": private_draft_digest,
+            "private_draft_ref": ref,
+            "private_manifest_digest": private_draft_digest,
+            "private_manifest_schema": PRIVATE_MANIFEST_SCHEMA,
+            "public_contract": contract,
+        }
 
-    private_files = {
-        path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in private
-    }
-    tokens = pr.collect_private_tokens(
-        files=private_files,
-        vault_path=vault,
-        vault_refs=(ref,),
-        blob_ids=tuple(blob for _path, blob in private) + (commit,),
-    )
-    public_tokens = pr.public_contract_allow(
-        contract,
-        extra=(
-            request.input_digest,
-            private_draft_digest,
-            ref,
-            PRIVATE_MANIFEST_SCHEMA,
-        ),
-    )
-    pr.refuse_private_leak(payload, tokens, allow=public_tokens)
-    artifact = pr.make_lane_artifact(
-        kind=st.ArtifactKind.TEST_DRAFT,
-        request=request,
-        payload=payload,
-        artifact_ref=ref,
-    )
+        private_files = {
+            path: hv.cat_blob(vault, blob).decode("utf-8") for path, blob in private
+        }
+        tokens = pr.collect_private_tokens(
+            files=private_files,
+            vault_path=vault,
+            vault_refs=(ref,),
+            blob_ids=tuple(blob for _path, blob in private) + (commit,),
+        )
+        public_tokens = pr.public_contract_allow(
+            contract,
+            extra=(
+                request.input_digest,
+                private_draft_digest,
+                ref,
+                PRIVATE_MANIFEST_SCHEMA,
+            ),
+        )
+        pr.refuse_private_leak(payload, tokens, allow=public_tokens)
+        artifact = pr.make_lane_artifact(
+            kind=st.ArtifactKind.TEST_DRAFT,
+            request=request,
+            payload=payload,
+            artifact_ref=ref,
+        )
 
-    pr.refuse_private_leak(
-        st.canonical_bytes(artifact.payload),
-        tokens,
-        allow=public_tokens,
-    )
+        pr.refuse_private_leak(
+            st.canonical_bytes(artifact.payload),
+            tokens,
+            allow=public_tokens,
+        )
+        # Pinned last so a draft the checks above refused leaves no ref behind.
+        # The name is a digest over the commit, so this either creates the ref
+        # or finds it already pinned to this same commit; it cannot collide.
+        hv.update_immutable_ref(vault, ref, commit)
+    finally:
+        hv.remove_vault_worktree(vault, dest)
     return artifact
 
 
@@ -252,7 +268,15 @@ def seal_accepted_tests(
     commit = hv.rev_parse(vault, test_draft.artifact_ref)
     contract = test_draft.payload["public_contract"]
     private = _select_private_blobs(vault, commit, test_draft.payload)
-    sealed = hv.sealed_ref(request.run_id, request.lane_id, request.input_digest)
+    # Sealing accepts the draft commit as it is; nothing is re-committed. The
+    # sealed digest is therefore the draft's manifest digest recomputed over
+    # the same commit and the same blobs, and equals `private_draft_digest`
+    # by construction. `_select_private_blobs` has already refused a draft
+    # whose recorded digest does not match that recomputation, so the two
+    # names are one identity carried under two ref namespaces, not a
+    # coincidence.
+    sealed_digest = _manifest_digest(commit, private)
+    sealed = hv.sealed_ref(request.run_id, request.lane_id, sealed_digest)
     object_ids = (commit,) + tuple(blob for _path, blob in private)
     hv.prove_absent((run_repo,), object_ids)
     if builder_worktree is not None:
@@ -273,7 +297,6 @@ def seal_accepted_tests(
             raise pr.IsolationError("vault is inside the builder worktree")
         if str(vault_path).startswith(str(builder_root) + os.sep):
             raise pr.IsolationError("vault is under the builder worktree")
-    sealed_digest = _manifest_digest(commit, private)
     payload = {
         "input_artifact_ids": list(request.input_artifact_ids),
         "input_digest": request.input_digest,
@@ -316,6 +339,7 @@ def seal_accepted_tests(
         tokens,
         allow=public_tokens,
     )
+    # Pinned last, for the same reason as the draft ref; it cannot collide.
     hv.update_immutable_ref(vault, sealed, commit)
     return artifact
 
@@ -696,8 +720,20 @@ def _suite_selectors(gate: SimpleNamespace, files: Sequence[str]) -> tuple[str, 
         return (
             "--rootdir",
             ".",
-            "-q",
-            "--tb=no",
+            # Verbosity 2, not `-q`. Below it pytest truncates a dict
+            # comparison to `Omitting N identical items, use -vv to show` and
+            # renders both sides identically, so the only forwardable line
+            # said a dict differed from itself. Verified against the real
+            # binary that `_parse_suite_counts` still reads the summary line
+            # at this verbosity.
+            "-vv",
+            # One location-and-exception line per failure. `--tb=no` printed
+            # nothing but pytest's short summary, whose only content is
+            # `path::case_name` -- private, dropped, and therefore a lane that
+            # reported zero forwardable failures on every round forever.
+            # Verified against the real binary: this yields
+            # `path:LINE: AttributeError: ...` and no test source.
+            "--tb=line",
             "-o",
             "addopts=",
             "-p",

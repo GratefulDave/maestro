@@ -1211,6 +1211,21 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
         scheduler._plan_artifact_ref = lambda row_arg: "plan:ref"
         scheduler._sealed_suite_gate = lambda lane_arg: None
 
+        measurement = sch.cr.SealedMeasurement(
+            summary={
+                "errored": 0,
+                "executed": 3,
+                "failed": 0,
+                "passed": 3,
+                "skipped": 0,
+            },
+            runner_failed=False,
+            collection_broken=False,
+            min_cases=1,
+            run={},
+            files={},
+            vault=Path("/state/vault"),
+        )
         with mock.patch.object(sch, "_latest", return_value=artifact), mock.patch.object(
             sch, "_record_as_lane_artifact", return_value=None
         ), mock.patch.object(
@@ -1218,14 +1233,23 @@ class SchedulerProvisionArgvWiring(unittest.TestCase):
         ), mock.patch.object(
             sch, "_complete"
         ), mock.patch.object(
+            sch.cr, "measure_candidate", return_value=measurement
+        ) as measure, mock.patch.object(
             sch.cr, "review_builder_output", return_value=None
         ) as review:
             scheduler._reviewing_code("lane-a")
 
+        # The suite now runs in measure_candidate, so provisioning has to reach
+        # there; review_builder_output still carries it for its direct callers.
+        self.assertEqual(
+            measure.call_args.kwargs["provision_argv"], ("uv", "sync", "--frozen")
+        )
+        self.assertEqual(measure.call_args.kwargs["provision_timeout_s"], 1800.0)
         self.assertEqual(
             review.call_args.kwargs["provision_argv"], ("uv", "sync", "--frozen")
         )
         self.assertEqual(review.call_args.kwargs["provision_timeout_s"], 1800.0)
+        self.assertIs(review.call_args.kwargs["measurement"], measurement)
 
 
 if __name__ == "__main__":

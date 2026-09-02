@@ -23,7 +23,6 @@ if __name__ == "__main__":
 
 import yaml
 
-from adw_modules import factory_console as fconsole
 from adw_modules import git_publication as gitpub
 from adw_modules import hidden_vault as hv
 from adw_modules.handoff_budget import (
@@ -35,6 +34,7 @@ from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import private_review as prv
 from adw_modules import scheduler_types as st
+from adw_modules import step_log
 from adw_modules import tests_chain as tchain
 from adw_modules.lifecycle import (
     ArtifactStore,
@@ -734,6 +734,95 @@ class HerdrStageActor:
             (agent_root / name).write_bytes(encoded)
         return agent_root / ("CLAUDE.md" if route == "claude" else "AGENTS.md")
 
+    @staticmethod
+    def _sealed_counts_red(counts: Mapping[str, Any]) -> bool:
+        """Whether the measured sealed suite disagrees with the candidate.
+
+        Mirrors `code_review`'s own `runner_failed` on the public counts alone:
+        anything failed, anything errored, or nothing executed. `min_cases` is
+        not visible here, so zero-executed stands in for the under-count case.
+        """
+        try:
+            failed = int(counts.get("failed", 0) or 0)
+            errored = int(counts.get("errored", 0) or 0)
+            executed = int(counts.get("executed", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(failed or errored or executed == 0)
+
+    @staticmethod
+    def _failure_instruction(lines: Sequence[str]) -> str:
+        """Name the failures the builder is otherwise left to guess at.
+
+        These are the runner's own lines with every private token already
+        redacted upstream. They say which symbol or shape is wrong; they do not
+        say what any test expects.
+        """
+        shown = "\n".join("  {0}".format(line) for line in lines)
+        return (
+            " The sealed suite reported these failures against your last "
+            "candidate, verbatim from the runner with private values "
+            "redacted:\n{0}\nFix the causes named here. They are the actual "
+            "errors, not a summary of them. A [redacted] marker had a "
+            "private value removed -- treat the surrounding text as the "
+            "signal. Do not guess at failures that are not listed.".format(shown)
+        )
+
+    @staticmethod
+    def _bound_surface_instruction(surface: Mapping[str, Any]) -> str:
+        """Render the sealed suite's bound names as a builder instruction.
+
+        The builder cannot see the sealed tests, and until this existed it was
+        also not told the names they resolve against -- so it invented a module
+        path, invented an export, invented a result key, and failed on all
+        three at once. Names are contract; values are secrets. This renders the
+        names and says, in the same breath, that the values are withheld on
+        purpose so that a builder does not read the list as an invitation to
+        reverse-engineer the assertions.
+        """
+        modules = []
+        for entry in surface.get("modules") or ():
+            if not isinstance(entry, Mapping):
+                continue
+            specifier = str(entry.get("specifier") or "")
+            if not specifier:
+                continue
+            symbols = [str(name) for name in entry.get("symbols") or () if str(name)]
+            modules.append(
+                "{0} exports {1}".format(specifier, ", ".join(symbols))
+                if symbols
+                else specifier
+            )
+        keys = [str(key) for key in surface.get("object_keys") or () if str(key)]
+        if not modules and not keys:
+            return ""
+        text = (
+            " bound_surface is the set of names the sealed acceptance tests "
+            "bind to. It is the contract, not a suggestion: the implementation "
+            "must provide exactly these names, spelled exactly this way, "
+            "reachable from exactly these module specifiers. A name that is "
+            "absent or spelled differently fails every case that touches it, "
+            "and no amount of correct behavior behind a different name will "
+            "pass."
+        )
+        if modules:
+            text += " Modules and the symbols imported from them: {0}.".format(
+                "; ".join(modules)
+            )
+        if keys:
+            text += " Keys the assertions read off returned objects: {0}.".format(
+                ", ".join(keys)
+            )
+        text += (
+            " The VALUES behind those names -- expected strings, numbers, "
+            "fixture data, and the specific results the assertions compare "
+            "against -- are deliberately withheld and cannot be recovered from "
+            "this list. Do not guess at one and do not hardcode one. Derive the "
+            "behavior from public_contract and implement it; a value that "
+            "happens to satisfy a case you imagined is not the contract."
+        )
+        return text
+
     def _prompt_lane_spec(self, ctx: LaneContext, role: str) -> dict[str, Any]:
         spec = dict(self.lane_specs[ctx.lane.lane_id])
         if role in ("builder", "code-reviewer") and ctx.lane.lane_kind == st.LANE_KIND_BUILD:
@@ -795,11 +884,49 @@ class HerdrStageActor:
             )
         elif role == "builder":
             instructions += " Edit only declared_outputs. Do not git commit; the broker commits those files. No private tests, fixtures, or vault paths."
+            surface = extra.get("bound_surface")
+            if isinstance(surface, Mapping):
+                instructions += self._bound_surface_instruction(surface)
+            failures = extra.get("redacted_failures")
+            if isinstance(failures, Sequence) and not isinstance(failures, str):
+                lines = [str(item) for item in failures if str(item).strip()]
+                if lines:
+                    instructions += self._failure_instruction(lines)
         elif role == "code-reviewer":
             instructions += (
                 " Inspect this candidate product checkout. Findings must be "
                 "resolvable within declared_outputs. Private tests are absent."
             )
+            counts = extra.get("sealed_result_summary")
+            if isinstance(counts, Mapping) and self._sealed_counts_red(counts):
+                instructions += (
+                    " sealed_result_summary is the already-measured result of "
+                    "the sealed acceptance suite against THIS candidate: "
+                    "{0} executed, {1} passed, {2} failed, {3} errored. The "
+                    "suite is red, so the correct verdict is REVISE and PASS "
+                    "will be overridden. You cannot see the tests. Your job is "
+                    "to read the candidate against public_contract and "
+                    "declared_outputs and say WHICH code is wrong and HOW to "
+                    "fix it. Every finding must name a file in "
+                    "declared_outputs and the specific behavior that is wrong "
+                    "-- a missing branch, an unhandled input, a contract clause "
+                    "the code does not satisfy. Do not restate that tests "
+                    "failed; the builder already knows that and cannot act on "
+                    "it. Do not guess at test names or assertion text."
+                ).format(
+                    counts.get("executed", 0),
+                    counts.get("passed", 0),
+                    counts.get("failed", 0),
+                    counts.get("errored", 0),
+                )
+            if extra.get("sealed_findings_required"):
+                instructions += (
+                    " Your previous answer for this candidate carried no "
+                    "actionable finding while the sealed suite was red. That "
+                    "left the builder with nothing to change. Return REVISE "
+                    "with at least one finding naming a file in "
+                    "declared_outputs and the concrete change it needs."
+                )
         elif role == "integration-reviewer":
             instructions += " Inspect this exact integration SHA. Return verdict, findings, affected_lanes."
         if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
@@ -1052,6 +1179,17 @@ class HerdrStageActor:
             return None
         return list(findings)
 
+    def _redacted_failures(self, ctx: LaneContext) -> list[str]:
+        """Failure lines carried on the prior code review, if it left any."""
+        record = ctx.artifacts.get("CODE_REVIEW")
+        payload = getattr(record, "payload", None) or {}
+        if not isinstance(payload, Mapping):
+            return []
+        lines = payload.get("redacted_failures")
+        if not isinstance(lines, Sequence) or isinstance(lines, str):
+            return []
+        return [str(item) for item in lines if str(item).strip()]
+
     def _payload_ok(self, role: str, payload: Mapping[str, Any]) -> bool:
         if role in ("test-reviewer", "code-reviewer", "integration-reviewer"):
             return payload.get("verdict") in (
@@ -1060,10 +1198,23 @@ class HerdrStageActor:
             )
         return True
 
+    #: Set by FactoryScheduler when an operator console is attached. Reporting
+    #: only: nothing reads these and no transition keys on one.
+    step: Any = None
+
+    def _say(self, lane_id: str, message: str, detail: str = "") -> None:
+        if self.step is None:
+            return
+        try:
+            self.step(lane_id, message, detail)
+        except Exception:
+            pass
+
     def _await_envelope(
-        self, handle: object, envelope: Path, role: str
+        self, handle: object, envelope: Path, role: str, lane_id: str = ""
     ) -> Mapping[str, Any]:
         bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
+        waited = 0.0
         while True:
             envelope_exists = False
             try:
@@ -1092,6 +1243,15 @@ class HerdrStageActor:
                 )
                 raise FactoryRefused(outcome)
             time.sleep(0.1)
+            waited += 0.1
+            # A silent minute is indistinguishable from a hung agent. Say the
+            # wait is still a wait, at a cadence that does not flood a terminal.
+            if waited % 30 < 0.1:
+                self._say(
+                    lane_id or "-",
+                    "waiting on {0}".format(role),
+                    "{0}s elapsed".format(int(waited)),
+                )
 
     def _launch_failed(self, exc: lch.LaunchRefused) -> LaunchFailed:
         return LaunchFailed(
@@ -1175,7 +1335,11 @@ class HerdrStageActor:
             except lch.LaunchRefused as extra_exc:
                 raise self._launch_failed(extra_exc) from extra_exc
             cwd_used = Path(getattr(handle, "launched_cwd", cwd))
-            payload = self._await_envelope(handle, envelope, role)
+            self._say(
+                lane_id, "resubmitted to {0}".format(role), "turn {0}".format(turn)
+            )
+            payload = self._await_envelope(handle, envelope, role, lane_id)
+            self._say(lane_id, "{0} replied".format(role), "turn {0}".format(turn))
             stored.handle = handle
             stored.cwd = cwd_used
             stored.turns = turn
@@ -1222,7 +1386,13 @@ class HerdrStageActor:
         except lch.LaunchRefused as extra_exc:
             raise self._launch_failed(extra_exc) from extra_exc
         cwd_used = Path(getattr(handle, "launched_cwd", cwd))
-        payload = self._await_envelope(handle, envelope, role)
+        self._say(
+            lane_id,
+            "dispatched {0}".format(role),
+            "{0} {1}".format(route["route"], route.get("model") or route.get("profile") or ""),
+        )
+        payload = self._await_envelope(handle, envelope, role, lane_id)
+        self._say(lane_id, "{0} replied".format(role), "turn {0}".format(turn))
         bound = _RoleSession(handle, cwd_used, attempt, None, ctx.run_id)
         bound.turns = turn
         self._roles[key] = bound
@@ -1379,9 +1549,20 @@ class HerdrStageActor:
         if sealed is not None:
             extra["predecessor_bundle_id"] = sealed.artifact_id
             extra["predecessor_bundle_digest"] = ctx.sealed_digest
+        if ctx.bound_surface is not None:
+            # Names only. Module specifiers, exported symbols, and result-object
+            # keys -- the identifiers the sealed assertions resolve against. No
+            # literal, number, selector, or fixture value moves here.
+            extra["bound_surface"] = dict(ctx.bound_surface)
         findings = self._revise_findings(ctx, "CODE_REVIEW")
         if findings is not None:
             extra["revise_findings"] = findings
+        failures = self._redacted_failures(ctx)
+        if failures:
+            # The runner's own failure lines, already redacted against the
+            # sealed token set where they were produced. Without these the
+            # builder is told a count and has to guess which cases it names.
+            extra["redacted_failures"] = failures
         key = self._role_key(ctx, "builder")
         stored = self._roles.get(key)
         if stored is None:
@@ -1411,12 +1592,19 @@ class HerdrStageActor:
     def review_code(
         self, ctx: LaneContext
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]:
-        extra = {
+        extra: dict[str, Any] = {
             "candidate_sha": ctx.candidate_sha,
             "declared_outputs": list(ctx.lane.declared_outputs),
             "public_contract": ctx.public_contract,
             "sealed_digest": ctx.sealed_digest,
         }
+        if ctx.sealed_result_summary is not None:
+            # Counts only. These are the same five integers the builder already
+            # receives as public_result_summary, so no sealed source, case name,
+            # or assertion text moves here.
+            extra["sealed_result_summary"] = dict(ctx.sealed_result_summary)
+        if ctx.sealed_findings_required:
+            extra["sealed_findings_required"] = True
         sha = self._base_sha(ctx, "code-reviewer")
         key = self._role_key(ctx, "code-reviewer")
         stored = self._roles.get(key)
@@ -1858,7 +2046,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 repository=repo,
                 ledger=runtime.ledger_path(),
             )
-            console = fconsole.FactoryConsole()
+            console = step_log.RunReporter(run_id, runtime.path)
             console.opened(
                 "start",
                 run_id,
@@ -1874,6 +2062,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 target,
                 stage_started=console.stage_started,
                 stage_completed=console.stage_completed,
+                step=console.step,
                 compiled=compiled,
             )
             status = scheduler.run()
@@ -1943,7 +2132,7 @@ def _run_resume(args: argparse.Namespace) -> int:
     )
     try:
         try:
-            console = fconsole.FactoryConsole()
+            console = step_log.RunReporter(run_id, runtime.path)
             console.opened(
                 "resume",
                 run_id,
@@ -1959,6 +2148,7 @@ def _run_resume(args: argparse.Namespace) -> int:
                 target,
                 stage_started=console.stage_started,
                 stage_completed=console.stage_completed,
+                step=console.step,
                 compiled=compiled,
             )
             scheduler.resume_waiting()
@@ -1994,7 +2184,7 @@ def _run_amend(args: argparse.Namespace) -> int:
                 runtime=runtime,
                 target=target,
             )
-            console = fconsole.FactoryConsole()
+            console = step_log.RunReporter(run_id, runtime.path)
             console.opened(
                 "amend",
                 run_id,
@@ -2010,6 +2200,7 @@ def _run_amend(args: argparse.Namespace) -> int:
                 target,
                 stage_started=console.stage_started,
                 stage_completed=console.stage_completed,
+                step=console.step,
                 compiled=compiled,
             )
             status = scheduler.run()
