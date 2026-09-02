@@ -243,7 +243,7 @@ function dotClass(state: string): string {
 }
 
 .dot.idle {
-  background: #2b3448;
+  background: #5c5c5c;
 }
 
 .dot.live {

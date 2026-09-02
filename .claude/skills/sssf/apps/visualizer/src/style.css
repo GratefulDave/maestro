@@ -1,13 +1,17 @@
 :root {
-  --bg: #06080f;
-  --panel: #0d1119;
-  --panel-2: #131a26;
-  --panel-3: #0a0e16;
-  --border: #232c3d;
-  --border-soft: #222b3d;
-  --text: #f2f5fa;
-  --dim: #aabdd5;
-  --faint: #8b9cb6;
+  color-scheme: dark;
+  /* Ground is black. Panels step up from it; panel-3 is a recess below a panel. */
+  --bg: #000000;
+  --panel: #0b0b0b;
+  --panel-2: #111111;
+  --panel-3: #060606;
+  /* Both borders are load-bearing here: a panel fill sits ~1.1:1 on the black
+     ground, so the outline is the boundary. Both clear 3:1 against --bg. */
+  --border: #616161;
+  --border-soft: #5c5c5c;
+  --text: #f8f8f8;
+  --dim: #c4c4c4;
+  --faint: #929292;
   --green: #4ade80;
   --red: #ff6f67;
   --blue: #6cb6ff;
@@ -20,7 +24,7 @@
   --mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Monaco, 'Cascadia Mono',
     'Roboto Mono', monospace;
   /* Surface gradient shared by cards and panels — one recipe, everywhere. */
-  --surface: linear-gradient(180deg, #10141f 0%, #0b0f18 100%);
+  --surface: linear-gradient(180deg, #131313 0%, #0b0b0b 100%);
 }
 
 * {
@@ -33,13 +37,13 @@ body {
   padding: 0;
 }
 
+html {
+  background: var(--bg);
+}
+
 body {
-  /* Deep space with a faint violet/cyan aurora — fixed so scrolling glides over it. */
-  background:
-    radial-gradient(1100px 700px at 8% -10%, rgba(148, 163, 255, 0.09), transparent 62%),
-    radial-gradient(1000px 720px at 102% 108%, rgba(90, 210, 221, 0.07), transparent 60%),
-    linear-gradient(180deg, #06080f 0%, #090d17 100%);
-  background-attachment: fixed;
+  /* Flat black ground. No gradient, no colour wash — panels carry the depth. */
+  background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
   /* Readability floor: nothing in the app renders below 16px. */
@@ -66,7 +70,7 @@ pre {
   font-family: var(--mono);
   font-size: 16px;
   line-height: 1.55;
-  color: #cfdded;
+  color: #d4d4d4;
   white-space: pre-wrap;
   word-break: break-word;
 }

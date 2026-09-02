@@ -60,7 +60,7 @@ const text = computed(() => {
   padding: 3px 12px;
   border: 1px solid var(--border-soft);
   border-radius: 999px;
-  background: rgba(19, 26, 38, 0.6);
+  background: rgba(17, 17, 17, 0.6);
   font-size: 16px;
   white-space: nowrap;
 }
