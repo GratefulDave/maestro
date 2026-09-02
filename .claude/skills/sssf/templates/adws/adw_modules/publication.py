@@ -75,18 +75,29 @@ def preflight_publication(
             return PublicationPreflight(
                 False, "PUBLICATION_PREFLIGHT_REFUSED", "index dirty"
             )
-        if not git.diff_files_quiet():
+        if not git.diff_files_quiet(git_dir=binding.target_worktree_git_dir):
             return PublicationPreflight(
                 False, "PUBLICATION_PREFLIGHT_REFUSED", "worktree dirty"
             )
-        untracked = git.ls_others(ignored=False)
+        touched = gp.publication_touched_paths(
+            binding,
+            expected_before_sha=expected_before_sha,
+            reviewed_integration_sha=reviewed_integration_sha,
+        )
+        untracked = gp.collides(
+            git.ls_others(ignored=False, git_dir=binding.target_worktree_git_dir),
+            touched,
+        )
         if untracked:
             return PublicationPreflight(
                 False,
                 "PUBLICATION_PREFLIGHT_REFUSED",
                 "untracked:" + ",".join(untracked),
             )
-        ignored = git.ls_others(ignored=True)
+        ignored = gp.collides(
+            git.ls_others(ignored=True, git_dir=binding.target_worktree_git_dir),
+            touched,
+        )
         if ignored:
             return PublicationPreflight(
                 False, "PUBLICATION_PREFLIGHT_REFUSED", "ignored:" + ",".join(ignored)
