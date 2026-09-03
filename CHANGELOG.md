@@ -37,6 +37,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A runner the plan names is proven usable before any agent is dispatched.**
+  A lane's runner was first exercised at draft collection — after a tester had
+  been dispatched, spent its turn, and written a correct draft. On FDAdb
+  `lane-wp7-gw-dpa-tests` the tester spent nine minutes producing a valid suite
+  and was refused seven seconds later with `no usable pytest was found for .`,
+  then handed a correction turn asking it to fix an environment it does not
+  own. `FactoryScheduler._assert_runners_usable` now provisions one tree per
+  distinct `(runner, cwd)` the plan names and resolves each, at the chokepoint
+  both run verbs cross, refusing `RUNNER_PREFLIGHT_REFUSED` — a harness fault,
+  never a finding sent to an actor that cannot act on it.
+- **A pytest draft resolves against the tree it will collect in.**
+  `tests_chain._sealed_suite` has drawn that distinction since it was written:
+  vitest resolves against the runtime root because `prepare_collect_tree` links
+  its `node_modules` in, and nothing bridges a Python environment, so a pytest
+  resolved against the runtime root is the *real* repository's interpreter
+  pointed at the tree's source. `_collect_private_draft` resolved everything
+  against the runtime root, and the draft-collect tree was the one materialized
+  tree never provisioned. It now provisions before any private byte is written
+  — the containment order the review tree already keeps — and
+  `_collect_resolution_root` applies the sealed-suite rule, scoped to
+  deployments that declare `provision_argv`, since a deployment that provisions
+  nothing has no tree environment to prefer.
 - **A gate's argv keeps its options paired with their values.** `_collect_gate`
   and `_suite_selectors` partitioned `gate.argv` into `-`-prefixed tokens and
   everything else and concatenated the two groups, which detaches an option

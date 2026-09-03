@@ -209,7 +209,7 @@ class ReviewProvisioningError(SealedEnvironmentError):
         )
 
 
-def _provision_review_tree(
+def provision_tree(
     dest: Path,
     provision_argv: Sequence[str],
     timeout_s: float | None = None,
@@ -256,7 +256,7 @@ def _review_tree(
         tree = hv.refresh_materialized_commit(repo, sha, dest)
     else:
         tree = hv.materialize_commit(repo, sha, dest)
-    _provision_review_tree(tree, provision_argv, provision_timeout_s)
+    provision_tree(tree, provision_argv, provision_timeout_s)
     return tree
 
 
