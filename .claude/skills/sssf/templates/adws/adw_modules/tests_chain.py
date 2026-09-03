@@ -44,7 +44,25 @@ _PYTEST_TOTALS = re.compile(r"(\d+)\s+(passed|failed|errors?|error|skipped|xfail
 #: The summary begins the line (leading whitespace only); the banner has
 #: box-drawing characters and the word `Failed` before `Tests`. `Test Files`
 #: does not match either, because the word there is `Test`.
-_VITEST_SUMMARY = re.compile(r"^\s*Tests\s")
+#:
+#: Shape alone was not enough. vitest also writes, to STDERR, after a suite
+#: that passed:
+#:
+#:     Tests closed successfully but something prevents Vite server from exiting
+#:
+#: which begins the line with `Tests ` exactly as the summary does, and lands
+#: after it in the combined capture. Measured 2026-09-03 on FDAdb
+#: `lane-wp7-page-build`, whose config boots the Astro pipeline and leaves the
+#: Vite server open: the suite ran 15 cases and exited 0, the reverse scan took
+#: that warning, and every count parsed as zero -- refused
+#: `SEALED_SUITE_COUNTS_UNPARSEABLE` against a candidate whose sealed tests all
+#: passed. Feeding stdout alone to the parser returns 15; the combined capture
+#: returns 0.
+#:
+#: So the line must also CARRY a count. Every real totals line has at least one
+#: `N passed`/`N failed`/`N skipped`; no warning does. A suite that genuinely
+#: executed nothing still refuses, which is the point of the check.
+_VITEST_SUMMARY = re.compile(r"^\s*Tests\s+.*?\d+\s+(?:passed|failed|skipped)\b")
 PRIVATE_MANIFEST_SCHEMA = "private-manifest.v1"
 
 
