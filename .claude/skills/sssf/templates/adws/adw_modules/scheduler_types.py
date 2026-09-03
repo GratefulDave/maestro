@@ -45,6 +45,31 @@ REVISE_FINDING_KEYS = (
     "violated_requirement",
 )
 
+# A finding names the axis it was found on. `spec` is the default and the only
+# axis that existed before the standards rubric, so an envelope that names no
+# axis is a spec finding and keeps exactly the four keys above -- which is what
+# leaves every older envelope and every stored artifact parseable.
+FINDING_AXIS_SPEC = "spec"
+FINDING_AXIS_STANDARDS = "standards"
+FINDING_AXES = (FINDING_AXIS_SPEC, FINDING_AXIS_STANDARDS)
+
+# Ascending. `cap_severity` compares positions in this tuple; nothing else
+# orders severities, and no axis is ever ranked against the other.
+SEVERITY_INFO = "INFO"
+SEVERITY_WARNING = "WARNING"
+SEVERITY_ERROR = "ERROR"
+FINDING_SEVERITIES = (SEVERITY_INFO, SEVERITY_WARNING, SEVERITY_ERROR)
+
+# The standards axis is a hygiene report, not a second gate: its findings are
+# judgement calls, so a reviewer cannot raise one to ERROR and send a green
+# candidate back to BUILDING with it.
+STANDARDS_MAX_SEVERITY = SEVERITY_WARNING
+
+# Keys a finding may carry beyond the four required ones. A present key is
+# preserved through normalization; an absent one is not invented, so a spec
+# finding submitted without them comes back with exactly REVISE_FINDING_KEYS.
+FINDING_OPTIONAL_KEYS = ("axis", "severity")
+
 
 class LaneStage(str, Enum):
     PLANNED = "PLANNED"
@@ -220,6 +245,54 @@ def _reject_private_keys(value: Any, *, path: str = "") -> None:
             _reject_private_keys(inner, path=f"{path}[{index}]")
 
 
+def finding_axis(finding: Mapping[str, Any]) -> str:
+    """The axis a finding declares, defaulting to `spec`."""
+    raw = finding.get("axis")
+    if raw is None:
+        return FINDING_AXIS_SPEC
+    if not isinstance(raw, str) or raw not in FINDING_AXES:
+        raise CanonicalIdentityError("finding axis is not a known axis")
+    return raw
+
+
+def cap_severity(value: Any, ceiling: str = STANDARDS_MAX_SEVERITY) -> str:
+    """`value` clamped down to `ceiling`; an absent severity becomes `ceiling`."""
+    if ceiling not in FINDING_SEVERITIES:
+        raise CanonicalIdentityError("severity ceiling is not a known severity")
+    if value is None:
+        return ceiling
+    if not isinstance(value, str) or value not in FINDING_SEVERITIES:
+        raise CanonicalIdentityError("finding severity is not a known severity")
+    if FINDING_SEVERITIES.index(value) > FINDING_SEVERITIES.index(ceiling):
+        return ceiling
+    return value
+
+
+def partition_findings_by_axis(
+    findings: Sequence[Mapping[str, Any]],
+) -> Tuple[Tuple[Mapping[str, Any], ...], Tuple[Mapping[str, Any], ...]]:
+    """Split reviewer findings into `(spec, standards)`.
+
+    The standards half is normalized on the way out: its axis is stated
+    explicitly and its severity is capped at `STANDARDS_MAX_SEVERITY`, so a
+    finding submitted as ERROR arrives as WARNING. Only the spec half can carry
+    a lane back to `BUILDING`. The standards half is advisory by construction --
+    the caller keeps the two lists apart, and neither is ever ranked against the
+    other.
+    """
+    spec: list[Mapping[str, Any]] = []
+    standards: list[Mapping[str, Any]] = []
+    for finding in findings:
+        if finding_axis(finding) == FINDING_AXIS_STANDARDS:
+            row = dict(finding)
+            row["axis"] = FINDING_AXIS_STANDARDS
+            row["severity"] = cap_severity(row.get("severity"))
+            standards.append(row)
+        else:
+            spec.append(finding)
+    return tuple(spec), tuple(standards)
+
+
 def require_revise_findings(
     findings: Sequence[Mapping[str, Any]],
 ) -> Tuple[Mapping[str, Any], ...]:
@@ -227,14 +300,27 @@ def require_revise_findings(
         raise CanonicalIdentityError("REVISE requires actionable findings")
     normalized = []
     for finding in findings:
-        if set(finding) != set(REVISE_FINDING_KEYS):
+        keys = set(finding)
+        if not set(REVISE_FINDING_KEYS) <= keys:
+            raise CanonicalIdentityError("REVISE finding keys are not actionable")
+        if keys - set(REVISE_FINDING_KEYS) - set(FINDING_OPTIONAL_KEYS):
             raise CanonicalIdentityError("REVISE finding keys are not actionable")
         for key in REVISE_FINDING_KEYS:
             text = finding[key]
             if not isinstance(text, str) or not text.strip():
                 raise CanonicalIdentityError(f"REVISE finding {key} is empty")
         _reject_private_keys(finding)
-        normalized.append({key: finding[key] for key in REVISE_FINDING_KEYS})
+        row = {key: finding[key] for key in REVISE_FINDING_KEYS}
+        if "axis" in keys:
+            row["axis"] = finding_axis(finding)
+        if "severity" in keys:
+            severity = finding["severity"]
+            if not isinstance(severity, str) or severity not in FINDING_SEVERITIES:
+                raise CanonicalIdentityError(
+                    "finding severity is not a known severity"
+                )
+            row["severity"] = severity
+        normalized.append(row)
     return tuple(normalized)
 
 

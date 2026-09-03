@@ -842,6 +842,34 @@ def measure_candidate(
     )
 
 
+def _redacted_advisory(
+    findings: Sequence[Mapping[str, object]],
+    tokens: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    """Redact advisory findings, keeping the keys that classify them.
+
+    `pr.redact_findings` projects onto the four actionable keys, which is right
+    for anything that could reach the builder and wrong here: it would drop the
+    `axis` and `severity` that say a row is a hygiene judgement rather than a
+    demoted spec finding. Same redaction over the same tokens, one key wider,
+    and only for keys the finding actually carries -- a spec finding that named
+    no axis still comes back with exactly the four.
+    """
+    if not findings:
+        return ()
+    out: list[dict[str, str]] = []
+    for item in findings:
+        row = {
+            key: pr.redact_text(str(item[key]), tokens)
+            for key in st.REVISE_FINDING_KEYS
+        }
+        for key in st.FINDING_OPTIONAL_KEYS:
+            if key in item:
+                row[key] = pr.redact_text(str(item[key]), tokens)
+        out.append(row)
+    return tuple(out)
+
+
 def review_builder_output(
     *,
     request: pr.VaultLaneRequest,
@@ -891,6 +919,12 @@ def review_builder_output(
     files = measurement.files
     run = measurement.run
     summary = measurement.summary
+    # The two axes are separated before anything reads a verdict off them. A
+    # standards finding is a hygiene judgement call: it is capped at WARNING,
+    # it rides in `advisory_findings`, and it is not in the set that decides
+    # whether this lane goes back to BUILDING. Nothing below ranks one axis
+    # against the other -- they simply never meet again.
+    findings, standards = st.partition_findings_by_axis(findings)
     advisory: tuple[Mapping[str, str], ...] = ()
     if measurement.runner_failed:
         if verdict is st.ReviewerVerdict.PASS:
@@ -952,8 +986,11 @@ def review_builder_output(
     )
     findings_out = pr.actionable_findings(verdict, findings, tokens)
     # Redacted on the findings path, never the actionable one: these do not
-    # reach the builder and cannot cause a transition.
-    advisory_out = pr.redact_findings(advisory, tokens) if advisory else ()
+    # reach the builder and cannot cause a transition. Demoted spec findings
+    # come first and keep exactly the four actionable keys they arrived with;
+    # standards findings follow, carrying the axis and the capped severity that
+    # say what they are.
+    advisory_out = _redacted_advisory(advisory + standards, tokens)
     # Exactly the names the builder is handed as `bound_surface`, derived from
     # the same sealed files. Values are never in here -- the extractor is a
     # whitelist of identifiers, not a filter over text.
