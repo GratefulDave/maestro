@@ -7,6 +7,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **The tester is told where a test double belongs, and how to report a subject
+  it cannot reach.** `maestro.TEST_DOUBLE_BOUNDARY` is appended to both tester
+  rules: substitute only at a boundary the lane does not own, never a
+  collaborator inside its own declared outputs; one stand-in per operation
+  rather than one dispatcher routing a whitelist and failing everything else;
+  and if a case can only reach its subject through a file the lane does not
+  own, say so in the envelope instead of asserting through it. Authoring
+  guidance only — no transition keys on it, and no other role receives it, so
+  it cannot become a verdict axis in a loop that has no bound.
+  `docs/plan-authoring.md` gains the matching authoring question: not only
+  *could an agent satisfy this sentence by changing only these files*, but
+  *could the tests observe the answer through those outputs alone*.
+  `lane-wp7-gw-issue-build` failed the second while passing the first — its
+  acceptance reached `/v1/faers/dpa` through a `SourceHandler` stand-in owned
+  by another lane, which routes a fixed path list and 404s the rest, so the
+  lane could neither fix it nor pass without it and parked with no candidate
+  after three identical attempts.
 - **Independent ready lanes advance concurrently again; merges stay serialized.**
   `maestro.config.yaml` takes `concurrency` (default 1). Above 1,
   `FactoryScheduler` submits every ready non-merge lane's stage to a pool of
