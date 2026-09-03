@@ -705,16 +705,29 @@ class ConcurrentLaneTopologyTest(FactoryEndToEndBase):
         original = maestro.HerdrStageActor.review_code
 
         def observed(actor, ctx):
+            # Both sides of the call. Snapshotting only before it saw a
+            # `code-reviewer` pane purely because serial ordering meant some
+            # earlier lane had already made one; with lanes advancing
+            # concurrently every pre-call snapshot can precede the first, and
+            # the pane this assertion is about is the one this call creates.
             graphs.append(herdr_graph(self.herdr))
-            return original(actor, ctx)
+            try:
+                return original(actor, ctx)
+            finally:
+                graphs.append(herdr_graph(self.herdr))
 
         with mock.patch.object(maestro.HerdrStageActor, "review_code", observed):
             self.run_cli()
 
         self.assertTrue(graphs)
         graph = graphs[-1]
-        for workspace_id, labels in graph["panes"].items():
-            self.assertEqual(sorted(set(labels)), sorted(labels), workspace_id)
+        # No workspace holds two panes with the same role label at any moment a
+        # lane entered or left code review, not merely at the last one.
+        for observation in graphs:
+            for workspace_id, labels in observation["panes"].items():
+                self.assertEqual(
+                    sorted(set(labels)), sorted(labels), (workspace_id, observation)
+                )
         panes = {name for labels in graph["panes"].values() for name in labels}
         self.assertTrue({"tester", "builder", "code-reviewer"} <= panes, panes)
         by_pane: dict[str, list[str]] = defaultdict(list)

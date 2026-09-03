@@ -126,16 +126,21 @@ def _config_argv(value: object, label: str) -> tuple[str, ...]:
     return tuple(argv)
 
 
-def _config_concurrency(value: object, label: str) -> int:
-    """Worker threads for independent ready lanes. Absent means 1.
+#: Independent ready lanes advanced at once when a deployment declares none.
+DEFAULT_CONCURRENCY = 3
 
-    1 keeps every stage inline on the scheduler's own thread, which is what
-    every existing deployment runs today; a deployment opts into concurrent
-    author/review/build stages by raising it. Merges are serialized at any
-    value.
+
+def _config_concurrency(value: object, label: str) -> int:
+    """Worker threads for independent ready lanes. Absent means 3.
+
+    `MAESTRO_architecture.md` has required independent ready lanes to advance
+    concurrently since the contract was frozen, so serial is the deviation and
+    a deployment that says nothing gets the contract. 1 restores the inline
+    behaviour for a deployment that wants it. Merges are serialized at any
+    value, so this changes lane throughput and never integration order.
     """
     if value is None:
-        return 1
+        return DEFAULT_CONCURRENCY
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise _MaestroConfigurationError(label + " must be an integer >= 1")
     return int(value)
@@ -2228,7 +2233,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 stage_completed=console.stage_completed,
                 step=console.step,
                 compiled=compiled,
-                concurrency=layout.get("concurrency") or 1,
+                concurrency=layout.get("concurrency") or DEFAULT_CONCURRENCY,
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -2315,7 +2320,7 @@ def _run_resume(args: argparse.Namespace) -> int:
                 stage_completed=console.stage_completed,
                 step=console.step,
                 compiled=compiled,
-                concurrency=layout.get("concurrency") or 1,
+                concurrency=layout.get("concurrency") or DEFAULT_CONCURRENCY,
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -2368,7 +2373,7 @@ def _run_amend(args: argparse.Namespace) -> int:
                 stage_completed=console.stage_completed,
                 step=console.step,
                 compiled=compiled,
-                concurrency=layout.get("concurrency") or 1,
+                concurrency=layout.get("concurrency") or DEFAULT_CONCURRENCY,
             )
             status = scheduler.run()
             console.finished(run_id, status)

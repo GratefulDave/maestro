@@ -224,12 +224,16 @@ its lane vendors, models, and concurrency name a particular installation. The te
 carries the same schema keys as the deployments, with template-shaped values, and the parity test
 does compare it between the two template copies.
 
-That hold-out is why mirroring the runtime never makes a deployment run lanes in parallel.
-`concurrency` is opt-in: the template ships `1`, absent means `1`, and `runtime_sync` holds
-`maestro.config.yaml` back, so an upgraded install stays serial until someone sets the key in
-*that deployment's* file. FDAdb is set to `3`; the other deployments are unset and therefore
-serial. A deployment's value also survives every later mirror, which is the point — do not
-"fix" a deployment that looks different from the template here.
+Read `concurrency` there carefully, because the hold-out inverts what you would expect from it.
+The default is `3` — absent means three independent ready lanes at once, since the contract has
+always required that and serial is the deviation. But `runtime_sync` holds `maestro.config.yaml`
+back as deployment-owned, so **mirroring the runtime into an existing install does not give it the
+new default**: that install keeps whatever its own file already says. A deployment goes concurrent
+only when its own file is edited, or when it never had the key and something re-stamps it.
+
+FDAdb is explicitly `3`. `lexgenius` and `lexgenius-pipeline` carry their own pre-existing files
+and stay serial after a mirror. A deployment whose value differs from the template is correct
+rather than drifted — do not "fix" it here.
 
 The visualizer (`.claude/skills/sssf/apps/visualizer/`) exists only in this repo — no copies,
 no ambiguity.

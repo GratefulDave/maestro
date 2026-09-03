@@ -351,17 +351,26 @@ class ConcurrencyIsADeploymentKey(unittest.TestCase):
             )
             return maestro._load_maestro_config(repo, config)
 
-    def test_absent_means_one(self) -> None:
-        self.assertEqual(self._load("")["concurrency"], 1)
+    def test_absent_means_the_contract_default(self) -> None:
+        # The contract requires independent ready lanes to advance
+        # concurrently, so a deployment that declares nothing gets that, not
+        # the serial deviation.
+        self.assertEqual(self._load("")["concurrency"], maestro.DEFAULT_CONCURRENCY)
+        self.assertEqual(maestro.DEFAULT_CONCURRENCY, 3)
 
-    def test_template_stamps_one(self) -> None:
+    def test_template_stamps_the_default(self) -> None:
         template = Path(maestro.__file__).with_name("maestro.config.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("\nconcurrency: 1\n", template)
+        self.assertIn(
+            "\nconcurrency: {0}\n".format(maestro.DEFAULT_CONCURRENCY), template
+        )
 
-    def test_a_deployment_opts_in(self) -> None:
-        self.assertEqual(self._load("concurrency: 3\n")["concurrency"], 3)
+    def test_a_deployment_may_opt_back_to_serial(self) -> None:
+        self.assertEqual(self._load("concurrency: 1\n")["concurrency"], 1)
+
+    def test_a_deployment_may_raise_it(self) -> None:
+        self.assertEqual(self._load("concurrency: 6\n")["concurrency"], 6)
 
     def test_non_positive_and_non_integer_values_refuse(self) -> None:
         for bad in ("concurrency: 0\n", "concurrency: true\n", "concurrency: '2'\n", "concurrency: 1.5\n"):
