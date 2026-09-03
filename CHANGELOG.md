@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Independent ready lanes advance concurrently again; merges stay serialized.**
+  `maestro.config.yaml` takes `concurrency` (default 1). Above 1,
+  `FactoryScheduler` submits every ready non-merge lane's stage to a pool of
+  that many worker threads and waits for the set; `READY_TO_MERGE` stays on
+  the scheduler thread, one lane at a time. At 1 every stage runs inline as
+  before, so no deployment changes behaviour until it opts in. An interrupt
+  pauses every in-flight lane, and a worker that finishes after the pause has
+  its completion refused by the ledger rather than applied. Restores the
+  §10 contract the 2026-08-29 artifact-factory cutover dropped.
 - **Plan-contract IRs project onto `maestro-plan.artifact-factory.v1` lanes.**
   `adw_modules/plan_contract_ingress.py` receipt-verifies an approved IR and
   emits compiler-admissible lanes. Authoring is
@@ -37,6 +46,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **Three run-wide resources were not safe for two lanes at once.**
+  `OrderedLocks` kept what it held on the instance and began every `acquire`
+  by releasing it, so a second thread released the first's locks; held state
+  is now per thread. `ArtifactStore` shared one `sqlite3` connection across
+  threads, whose statement cache hands two callers the same prepared
+  statement (an existing run row read back as absent); it now opens one
+  connection per thread over the same WAL ledger, writers still serialized.
+  `hidden_vault.ensure_vault` and `seed` were idempotent in effect but not
+  atomic, so concurrent lanes failed on `git init` and on the seed ref lock;
+  each vault now has one in-process lock for those two.
 - **A runner the plan names is proven usable before any agent is dispatched.**
   A lane's runner was first exercised at draft collection — after a tester had
   been dispatched, spent its turn, and written a correct draft. On FDAdb

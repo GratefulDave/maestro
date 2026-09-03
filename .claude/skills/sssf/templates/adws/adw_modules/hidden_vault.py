@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import tarfile
+import threading
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -74,19 +75,43 @@ def vault_path(state_root: Path, run_id: str) -> Path:
     return Path(state_root).resolve() / "vaults" / "{0}.git".format(run_id)
 
 
+_VAULT_LOCKS_GUARD = threading.Lock()
+_VAULT_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _vault_lock(path: Path) -> threading.RLock:
+    """One in-process lock per vault for its run-wide mutations.
+
+    Lanes author concurrently, and each one ensures the run's vault and
+    seeds the same `refs/maestro/integration-seed` before it collects. Both
+    are idempotent in effect and neither is atomic: a second `git init` into
+    a directory the first is still initialising fails on `config` already
+    existing, and a second `git fetch` onto a ref the first is updating fails
+    to lock it. The lock makes the second caller find the first one's result.
+    """
+    key = str(Path(path).resolve())
+    with _VAULT_LOCKS_GUARD:
+        lock = _VAULT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _VAULT_LOCKS[key] = lock
+        return lock
+
+
 def ensure_vault(state_root: Path, run_id: str) -> Path:
     """The run's bare vault, created if absent. Idempotent. Mode 0700."""
     path = vault_path(state_root, run_id)
     parent = path.parent
-    if path.is_dir() and (path / "HEAD").is_file():
+    with _vault_lock(path):
+        if path.is_dir() and (path / "HEAD").is_file():
+            return path
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(parent, 0o700)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _git(parent, "init", "-q", "--bare", str(path))
+        os.chmod(path, stat.S_IRWXU)
+        _git(path, "config", "core.hooksPath", _HOOKS)
         return path
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(parent, 0o700)
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _git(parent, "init", "-q", "--bare", str(path))
-    os.chmod(path, stat.S_IRWXU)
-    _git(path, "config", "core.hooksPath", _HOOKS)
-    return path
 
 
 def seed(vault: Path, repo: Path, integration_ref: str) -> str:
@@ -94,14 +119,15 @@ def seed(vault: Path, repo: Path, integration_ref: str) -> str:
     if not integration_ref or integration_ref.startswith("-"):
         raise VaultError("integration_ref {0!r} is not a ref".format(integration_ref))
     dest = "refs/maestro/integration-seed"
-    _git(
-        vault,
-        "fetch",
-        "--no-tags",
-        str(Path(repo).resolve()),
-        "+{0}:{1}".format(integration_ref, dest),
-    )
-    return _git(vault, "rev-parse", dest).stdout.strip()
+    with _vault_lock(vault):
+        _git(
+            vault,
+            "fetch",
+            "--no-tags",
+            str(Path(repo).resolve()),
+            "+{0}:{1}".format(integration_ref, dest),
+        )
+        return _git(vault, "rev-parse", dest).stdout.strip()
 
 
 def draft_ref(run_id: str, lane_id: str, private_draft_digest: str) -> str:

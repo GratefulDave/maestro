@@ -10,6 +10,8 @@ import shutil
 import signal
 import subprocess
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as _wait_futures
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -25,7 +27,13 @@ from . import private_review as prv
 from . import runner_resolution as rr
 from . import scheduler_types as st
 from . import tests_chain as tc
-from .lifecycle import AmendmentRefused, ArtifactRecord, ArtifactStore, RunAlreadyExists
+from .lifecycle import (
+    AmendmentRefused,
+    ArtifactRecord,
+    ArtifactStore,
+    RunAlreadyExists,
+    StageCasConflict,
+)
 from .runtime_state import RuntimeStateRoot
 
 
@@ -771,9 +779,33 @@ class OrderedLocks:
         self._worktree_lock_path = os.path.join(
             worktree_git_dir, "maestro-publication.lock"
         )
-        self._locals: list[threading.RLock] = []
-        self._fds: list[int] = []
-        self._worktree_cm: Any = None
+        # What is held is per thread. Lanes advance on worker threads while
+        # merges stay on the main thread, and `acquire` begins by releasing
+        # whatever the *caller* holds so a re-entry re-takes in order; held
+        # state on the instance would make one thread release another's.
+        self._held = threading.local()
+
+    @property
+    def _locals(self) -> list[threading.RLock]:
+        held = self._held
+        if not hasattr(held, "locals"):
+            held.locals = []
+        return held.locals
+
+    @property
+    def _fds(self) -> list[int]:
+        held = self._held
+        if not hasattr(held, "fds"):
+            held.fds = []
+        return held.fds
+
+    @property
+    def _worktree_cm(self) -> Any:
+        return getattr(self._held, "worktree_cm", None)
+
+    @_worktree_cm.setter
+    def _worktree_cm(self, value: Any) -> None:
+        self._held.worktree_cm = value
 
     def acquire(self, levels: int) -> None:
         self.release()
@@ -1080,7 +1112,14 @@ class FactoryScheduler:
         step: Optional[Callable[..., None]] = None,
         compiled: Optional[st.CompiledPlan] = None,
         provision_argv: Optional[Sequence[str]] = None,
+        concurrency: int = 1,
     ) -> None:
+        if isinstance(concurrency, bool) or int(concurrency) < 1:
+            raise ValueError("concurrency is >= 1")
+        #: Independent ready lanes advance author/review/build stages on this
+        #: many worker threads; merges stay on the calling thread and are
+        #: serialized. 1 keeps every stage inline on the calling thread.
+        self.concurrency = int(concurrency)
         self.store = store
         self.run_id = run_id
         self.actor = actor
@@ -1105,9 +1144,11 @@ class FactoryScheduler:
         runtime.revalidate(row["runtime_state_fingerprint"])
         gitpub.revalidate_binding(target)
         self.locks = OrderedLocks(runtime, row["target_worktree_git_dir"])
-        self._inflight: Optional[tuple[str, st.LaneStage, str, Mapping[str, Any]]] = (
-            None
-        )
+        #: lane_id -> (lane_id, stage, input digest, observed) for every lane
+        #: whose stage is executing right now, on any thread.
+        self._inflight: dict[str, tuple[str, st.LaneStage, str, Mapping[str, Any]]] = {}
+        self._inflight_lock = threading.Lock()
+        self._pool: Optional[ThreadPoolExecutor] = None
 
     def run(self) -> st.RunStatus:
         previous = signal.getsignal(signal.SIGINT)
@@ -1135,6 +1176,7 @@ class FactoryScheduler:
                     self._final_review()
                     continue
                 progressed = False
+                advancing: list[str] = []
                 for lane_id in self.store.ready_lane_ids(self.run_id):
                     stage = self.store.lane_stage(self.run_id, lane_id)
                     if stage is st.LaneStage.READY_TO_MERGE:
@@ -1144,7 +1186,9 @@ class FactoryScheduler:
                         and self._legacy_correction_action() == "defer"
                     ):
                         continue
-                    self._advance(lane_id)
+                    advancing.append(lane_id)
+                if advancing:
+                    self._advance_ready(advancing)
                     progressed = True
                 merge_ready = [
                     lane_id
@@ -1161,7 +1205,43 @@ class FactoryScheduler:
             self._pause_on_interrupt()
             return st.RunStatus.WAITING
         finally:
+            pool, self._pool = self._pool, None
+            if pool is not None:
+                # Nothing is running here except after an interrupt, where a
+                # worker still inside an agent turn finishes on its own and
+                # its late completion is refused by the ledger (the lane is
+                # already WAITING_FOR_USER). Waiting on it would hold the
+                # operator's Ctrl-C until that turn ends.
+                pool.shutdown(wait=False, cancel_futures=True)
             signal.signal(signal.SIGINT, previous)
+
+    def _advance_ready(self, lane_ids: Sequence[str]) -> None:
+        """Advance every ready non-merge lane one stage.
+
+        With `concurrency` 1 each lane advances inline on this thread, in
+        order, exactly as before. Above 1 the lanes are submitted together to
+        a pool of that many workers and this thread waits for the whole set;
+        the first failure, in submission order, is re-raised after every
+        sibling has finished its stage, so a failing lane ends the run the
+        way an inline failure does. Merges never come through here.
+        """
+        if self.concurrency == 1:
+            for lane_id in lane_ids:
+                self._advance(lane_id)
+            return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self.concurrency, thread_name_prefix="maestro-lane"
+            )
+        futures: list[tuple[str, Future]] = [
+            (lane_id, self._pool.submit(self._advance, lane_id))
+            for lane_id in lane_ids
+        ]
+        _wait_futures([future for _, future in futures])
+        for _lane_id, future in futures:
+            exc = future.exception()
+            if exc is not None:
+                raise exc
 
     def status(self) -> st.RunStatus:
         self._resume_orphaned_integration_merge()
@@ -1211,10 +1291,9 @@ class FactoryScheduler:
         raise KeyboardInterrupt
 
     def _pause_on_interrupt(self) -> None:
-        targets: list[tuple[str, st.LaneStage, str, Mapping[str, Any]]] = []
-        if self._inflight is not None:
-            targets.append(self._inflight)
-        else:
+        with self._inflight_lock:
+            targets = list(self._inflight.values())
+        if not targets:
             for lane in self.store.active_projection(self.run_id):
                 stage = self.store.lane_stage(self.run_id, lane.lane_id)
                 if stage not in st.PAUSEABLE_STAGES:
@@ -1222,9 +1301,16 @@ class FactoryScheduler:
                 digest, observed = self._pause_input(lane.lane_id, stage)
                 targets.append((lane.lane_id, stage, digest, observed))
         for lane_id, stage, digest, observed in targets:
-            self.store.pause_lane(
-                self.run_id, lane_id, stage, digest, observed=observed
-            )
+            try:
+                self.store.pause_lane(
+                    self.run_id, lane_id, stage, digest, observed=observed
+                )
+            except StageCasConflict:
+                # A worker completed this stage between the interrupt and
+                # the pause: the lane is at its next stage and no longer in
+                # flight, so there is nothing of it to pause. Its siblings
+                # still are.
+                continue
 
     def _pause_input(
         self, lane_id: str, stage: st.LaneStage
@@ -1461,7 +1547,8 @@ class FactoryScheduler:
         if stage is st.LaneStage.WRITING_TESTS:
             self._maybe_correct_legacy_integration_base()
         digest, observed = self._pause_input(lane_id, stage)
-        self._inflight = (lane_id, stage, digest, observed)
+        with self._inflight_lock:
+            self._inflight[lane_id] = (lane_id, stage, digest, observed)
         if self.stage_started is not None:
             self.stage_started(lane_id, stage)
         try:
@@ -1491,7 +1578,8 @@ class FactoryScheduler:
                     lane_id, stage, self.store.lane_stage(self.run_id, lane_id)
                 )
         finally:
-            self._inflight = None
+            with self._inflight_lock:
+                self._inflight.pop(lane_id, None)
 
     def _common(self, lane_id: str) -> tuple[Mapping[str, Any], st.LaneProjection]:
         row = run_row(self.store, self.run_id)

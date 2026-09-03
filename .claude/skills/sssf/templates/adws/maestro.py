@@ -126,6 +126,21 @@ def _config_argv(value: object, label: str) -> tuple[str, ...]:
     return tuple(argv)
 
 
+def _config_concurrency(value: object, label: str) -> int:
+    """Worker threads for independent ready lanes. Absent means 1.
+
+    1 keeps every stage inline on the scheduler's own thread, which is what
+    every existing deployment runs today; a deployment opts into concurrent
+    author/review/build stages by raising it. Merges are serialized at any
+    value.
+    """
+    if value is None:
+        return 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise _MaestroConfigurationError(label + " must be an integer >= 1")
+    return int(value)
+
+
 def _config_timeout(value: object, label: str) -> float:
     """Seconds allowed for one provisioning run. Absent keeps the default.
 
@@ -278,6 +293,9 @@ def _load_maestro_config(repo: Path, config_path: Path) -> dict[str, Any]:
         loaded.get("provision_timeout_s"), "provision_timeout_s"
     )
     loaded["dashboard"] = _canonical_dashboard(loaded.get("dashboard"))
+    loaded["concurrency"] = _config_concurrency(
+        loaded.get("concurrency"), "concurrency"
+    )
     loaded["repo"] = repo.resolve()
     return loaded
 
@@ -2210,6 +2228,7 @@ def _run_start(args: argparse.Namespace) -> int:
                 stage_completed=console.stage_completed,
                 step=console.step,
                 compiled=compiled,
+                concurrency=layout.get("concurrency") or 1,
             )
             status = scheduler.run()
             console.finished(run_id, status)
@@ -2296,6 +2315,7 @@ def _run_resume(args: argparse.Namespace) -> int:
                 stage_completed=console.stage_completed,
                 step=console.step,
                 compiled=compiled,
+                concurrency=layout.get("concurrency") or 1,
             )
             scheduler.resume_waiting()
             status = scheduler.run()
@@ -2348,6 +2368,7 @@ def _run_amend(args: argparse.Namespace) -> int:
                 stage_completed=console.stage_completed,
                 step=console.step,
                 compiled=compiled,
+                concurrency=layout.get("concurrency") or 1,
             )
             status = scheduler.run()
             console.finished(run_id, status)
