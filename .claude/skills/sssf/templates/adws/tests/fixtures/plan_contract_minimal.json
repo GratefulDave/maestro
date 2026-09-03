@@ -1,0 +1,215 @@
+{
+  "schema_version": "plan-contract.v1",
+  "plan_id": "plan-minimal",
+  "title": "Minimal converter-port plan",
+  "plan_kind": "implementation",
+  "source_artifacts": [
+    {
+      "source_id": "src-a",
+      "path": "docs/a.md",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "required": true
+    },
+    {
+      "source_id": "src-b",
+      "path": "docs/b.md",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "required": true
+    }
+  ],
+  "requirements": [
+    {
+      "requirement_id": "req-t",
+      "text": "Tests lane writes tests/test_t.py covering the public contract.",
+      "source_ids": ["src-a"],
+      "surface": [{"path": "tests/test_t.py", "mutation": "written"}],
+      "effects": [{"effect": "network", "disposition": "none"}]
+    },
+    {
+      "requirement_id": "req-b",
+      "text": "Build lane writes src/b.py implementing the public contract.",
+      "source_ids": ["src-b"],
+      "surface": [{"path": "src/b.py", "mutation": "written"}],
+      "effects": [{"effect": "network", "disposition": "none"}]
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim-t",
+      "kind": "behavior",
+      "subject": "tests/test_t.py",
+      "predicate": "covers",
+      "object": "the public contract",
+      "polarity": "positive",
+      "source_requirement_ids": ["req-t"],
+      "source_ids": ["src-a"],
+      "verifier_ids": ["verify-t"],
+      "rendered_binding_ids": ["bind-t"]
+    },
+    {
+      "claim_id": "claim-b1",
+      "kind": "behavior",
+      "subject": "src/b.py",
+      "predicate": "implements",
+      "object": "the happy path",
+      "polarity": "positive",
+      "value": 1,
+      "unit": "case",
+      "mutation_kinds": ["actor-replacement", "predicate-replacement"],
+      "source_requirement_ids": ["req-b"],
+      "source_ids": ["src-b"],
+      "verifier_ids": ["verify-b"],
+      "rendered_binding_ids": ["bind-b1"],
+      "witness": {"cell": "happy"}
+    },
+    {
+      "claim_id": "claim-b2",
+      "kind": "behavior",
+      "subject": "src/b.py",
+      "predicate": "refuses",
+      "object": "invalid input",
+      "polarity": "negative",
+      "mutation_kinds": ["polarity-inversion"],
+      "source_requirement_ids": ["req-b"],
+      "source_ids": ["src-b"],
+      "verifier_ids": ["verify-b"],
+      "rendered_binding_ids": ["bind-b2"]
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "fx-t-unique-token",
+      "record_selector": "selector-t-unique",
+      "observed_value": "observed-t-unique",
+      "consumer_obligation": "obligation-t-unique",
+      "prohibited_behavior": "prohibited-t-unique",
+      "meaning": "meaning-t-unique",
+      "path": "docs/a.md",
+      "source_id": "src-a",
+      "affected_lane_ids": ["lane-t"],
+      "seam_ids": ["seam-shared"],
+      "verifier_ids": ["verify-t"],
+      "producer_metadata": {"origin": "tests"}
+    },
+    {
+      "fixture_id": "fx-b-unique-token",
+      "record_selector": "selector-b-unique",
+      "observed_value": "observed-b-unique",
+      "consumer_obligation": "obligation-b-unique",
+      "prohibited_behavior": "prohibited-b-unique",
+      "meaning": "meaning-b-unique",
+      "path": "docs/b.md",
+      "source_id": "src-b",
+      "affected_lane_ids": ["lane-b"],
+      "seam_ids": ["seam-shared"],
+      "verifier_ids": ["verify-b"],
+      "producer_metadata": {"origin": "build"}
+    }
+  ],
+  "seams": [
+    {
+      "seam_id": "seam-shared",
+      "producer": "tests/test_t.py",
+      "consumer": "src/b.py",
+      "contract": "src/b.py satisfies the public contract that tests/test_t.py records.",
+      "claim_ids": ["claim-t", "claim-b1", "claim-b2"],
+      "fixture_ids": ["fx-t-unique-token", "fx-b-unique-token"],
+      "requirement_ids": ["req-t", "req-b"],
+      "source_ids": ["src-a", "src-b"],
+      "verifier_ids": ["verify-t", "verify-b"]
+    }
+  ],
+  "lanes": [
+    {
+      "lane_id": "lane-t",
+      "title": "Author the public-contract tests",
+      "lane_kind": "tests",
+      "execution_context": ".",
+      "depends_on": [],
+      "requirement_ids": ["req-t"],
+      "verifier_ids": ["verify-t"],
+      "claim_ids": ["claim-t"],
+      "seam_ids": ["seam-shared"],
+      "fixture_ids": ["fx-t-unique-token"]
+    },
+    {
+      "lane_id": "lane-b",
+      "title": "Implement the public contract",
+      "lane_kind": "build",
+      "execution_context": ".",
+      "depends_on": ["lane-t"],
+      "requirement_ids": ["req-b"],
+      "verifier_ids": ["verify-b"],
+      "claim_ids": ["claim-b1", "claim-b2"],
+      "seam_ids": ["seam-shared"],
+      "fixture_ids": ["fx-b-unique-token"]
+    }
+  ],
+  "verifiers": [
+    {
+      "verifier_id": "verify-t",
+      "lane_ids": ["lane-t"],
+      "requirement_ids": ["req-t"],
+      "source_ids": ["src-a"],
+      "fixture_ids": ["fx-t-unique-token"],
+      "seam_ids": ["seam-shared"],
+      "claim_ids": ["claim-t"],
+      "command": "pytest tests/test_t.py -q",
+      "min_executed": 2,
+      "oracle": "the public contract holds",
+      "falsifiability": {
+        "mutation": "drop the happy-path assertion",
+        "expected_failure": "the covering case fails"
+      },
+      "independent": true,
+      "test_strength": {
+        "requirement_coverage": [
+          {"requirement_id": "req-t", "case_ids": ["case-public"]}
+        ],
+        "negative_control": {
+          "kind": "controlled_mutation",
+          "mutation": "invert polarity",
+          "expected_failure": "claim-t fails"
+        }
+      }
+    },
+    {
+      "verifier_id": "verify-b",
+      "lane_ids": ["lane-b"],
+      "requirement_ids": ["req-b"],
+      "source_ids": ["src-b"],
+      "fixture_ids": ["fx-b-unique-token"],
+      "seam_ids": ["seam-shared"],
+      "claim_ids": ["claim-b1", "claim-b2"],
+      "command": "pytest tests/test_t.py -q",
+      "min_executed": 2,
+      "oracle": "src/b.py meets both claims",
+      "falsifiability": {
+        "mutation": "accept invalid input",
+        "expected_failure": "the refusal case fails"
+      },
+      "independent": true
+    }
+  ],
+  "extensions": {
+    "maestro": {
+      "outputs": {
+        "lane-t": ["tests/test_t.py"],
+        "lane-b": ["src/b.py"]
+      },
+      "integration_branch": "main",
+      "prohibited_effects": [
+        {
+          "effect": "network",
+          "meaning": "No network calls during the lane."
+        }
+      ],
+      "integration_gate": {
+        "runner": "pytest",
+        "argv": ["tests/test_t.py", "-q"],
+        "cwd": ".",
+        "min_cases": 2
+      }
+    }
+  }
+}

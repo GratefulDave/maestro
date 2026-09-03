@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Plan-contract IRs project onto `maestro-plan.artifact-factory.v1` lanes.**
+  `adw_modules/plan_contract_ingress.py` receipt-verifies an approved IR and
+  emits compiler-admissible lanes. Authoring is
+  `uv run adws/tools/plan_author_cli.py --from-plan-contract <ir> --receipt <receipt>
+  --out <plan> --repo <target-worktree-root> [--rendered <html>]`, not a
+  `maestro.py` verb. A bound requirement that performs or omits a prohibited
+  effect is refused `UNMAPPABLE_EFFECTS:<lane>.<effect>`.
 - **The sealed suite is measured before the code reviewer votes.**
   `code_review.measure_candidate` runs the suite once and hands the reviewer
   the five public counts; a reviewer that returns no locatable finding against

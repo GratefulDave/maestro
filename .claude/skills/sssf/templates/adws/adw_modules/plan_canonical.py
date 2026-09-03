@@ -21,24 +21,24 @@ than to quietly rewrite them into digest agreement.
 from __future__ import annotations
 
 import json
+from typing import Any, Mapping
 
-from .plan_model import Plan, PlanParseError, parse_bytes
+from .plan_model import PlanParseError, parse_stored_mapping
 
 
-def canonicalize(plan: Plan) -> bytes:
-    """The canonical bytes for a parsed plan.
+def canonicalize(plan: Mapping[str, Any]) -> bytes:
+    """The canonical bytes for a plan mapping.
 
     Used at authoring time to write the file, and at validation time to check
     the stored file already equals its own canonical form. It is never used
-    to produce the input to a digest at run time — see the module docstring.
+    to produce the input to a digest at run time -- see the module docstring.
+
+    Takes the mapping rather than a parsed model: `maestro-plan.artifact-
+    factory.v1` has no model class, and an absent optional key must stay
+    absent. Dumping a model would materialise every unset field as null and
+    give one plan two byte-identities.
     """
-    payload = plan.model_dump(mode="json")
-    # `title` was added after the first plans shipped. Dumping None would
-    # rewrite every pre-field file as `"title":null` and break `is_canonical`
-    # — two identities for one plan. Absent stays absent.
-    if payload.get("title") is None:
-        payload.pop("title", None)
-    text = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+    text = json.dumps(plan, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False)
     return text.encode("utf-8") + b"\n"
 
@@ -48,11 +48,11 @@ def is_canonical(stored: bytes) -> bool:
 
     False for bytes that parse but are formatted differently. That is not
     pedantry: two byte-different files with one meaning would carry two
-    digests, which is two identities for one plan — the multiple-
+    digests, which is two identities for one plan -- the multiple-
     representations root cause (RC1, §4) at the identity layer.
     """
     try:
-        plan = parse_bytes(stored)
+        plan = parse_stored_mapping(stored)
     except PlanParseError:
         return False
     return canonicalize(plan) == stored
