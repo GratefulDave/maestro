@@ -1229,13 +1229,14 @@ def test_producer_artifact_pin():
             st.ReviewerVerdict.REVISE,
             findings=(
                 _finding(
-                    observed_behavior="the case asserts add(2, 3) == 2 + 3",
+                    observed_behavior="quoting: assert add(2, 3) == 2 + 3",
                     implementation_area="case " + TAUTOLOGY_CASE,
                 ),
             ),
         )
         located = review.payload["findings"][0]
         self.assertEqual(located["implementation_area"], "case " + TAUTOLOGY_CASE)
+        self.assertIn("[redacted]", located["observed_behavior"])
         self.assertNotIn("assert add(2, 3) == 2 + 3", located["observed_behavior"])
 
     def test_owned_producers_do_not_write_stage_or_sqlite(self):
