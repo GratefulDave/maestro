@@ -52,6 +52,20 @@ CONTRACT = {
 }
 CONSTRAINTS = ("change only declared outputs",)
 
+TAUTOLOGY_PATH = "tests/test_add_tautology.py"
+TAUTOLOGY_CASE = "test_add_two_and_three"
+TAUTOLOGY_SOURCE = """\
+from adder import add
+
+
+def {case}():
+    assert add(2, 3) == 2 + 3
+""".format(case=TAUTOLOGY_CASE)
+TAUTOLOGY_CONTRACT = {
+    "acceptance_criteria": ["adding two whole numbers yields their total"],
+    "declared_outputs": [TAUTOLOGY_PATH],
+}
+
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
@@ -1136,6 +1150,93 @@ def test_producer_artifact_pin():
             st.require_revise_findings(({"violated_requirement": "x"},))
         with self.assertRaises(pr.PrivateReviewError):
             pr.actionable_findings(st.ReviewerVerdict.PASS, (_finding(),))
+
+    def test_a_tautological_case_named_by_id_survives_as_a_located_finding(self):
+        """A test that cannot disagree with the code discharges nothing.
+
+        The reviewer names the case id, and redaction must leave that id
+        readable: the finding goes back to the tester, who has to find the
+        case. The private line `def test_add_two_and_three():` is a token;
+        the bare case id is not, which is why naming beats quoting.
+        """
+        input_digest = _digest("tautology-draft")
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=input_digest,
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TAUTOLOGY_PATH: TAUTOLOGY_SOURCE},
+            public_contract=TAUTOLOGY_CONTRACT,
+            worktrees_root=self.worktrees / input_digest[:8],
+        )
+        review = self._review(
+            draft,
+            _digest("tautology-review"),
+            st.ReviewerVerdict.REVISE,
+            findings=(
+                {
+                    "violated_requirement": (
+                        "every case must be able to disagree with the "
+                        "implementation"
+                    ),
+                    "observed_behavior": (
+                        "case {0} recomputes the expected value the way the "
+                        "implementation does, so it passes by construction"
+                    ).format(TAUTOLOGY_CASE),
+                    "required_behavior": (
+                        "case {0} must assert a known-good literal taken from "
+                        "the spec, not a recomputation"
+                    ).format(TAUTOLOGY_CASE),
+                    "implementation_area": "case {0}".format(TAUTOLOGY_CASE),
+                },
+            ),
+        )
+        self.assertIs(review.kind, st.ArtifactKind.TEST_REVIEW)
+        self.assertIs(review.verdict, st.ReviewerVerdict.REVISE)
+        findings = review.payload["findings"]
+        self.assertEqual(len(findings), 1)
+        located = findings[0]
+        self.assertEqual(located["implementation_area"], "case " + TAUTOLOGY_CASE)
+        self.assertIn(TAUTOLOGY_CASE, located["observed_behavior"])
+        self.assertIn("passes by construction", located["observed_behavior"])
+        for value in located.values():
+            self.assertNotIn("[redacted]", value)
+        self.assertNotIn("assert add(2, 3) == 2 + 3", json.dumps(review.payload))
+
+    def test_a_reviewer_that_quotes_the_tautological_line_is_redacted(self):
+        """Naming the case id is the only way the finding survives intact."""
+        input_digest = _digest("tautology-draft-quote")
+        draft = tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=input_digest,
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files={TAUTOLOGY_PATH: TAUTOLOGY_SOURCE},
+            public_contract=TAUTOLOGY_CONTRACT,
+            worktrees_root=self.worktrees / input_digest[:8],
+        )
+        review = self._review(
+            draft,
+            _digest("tautology-review-quote"),
+            st.ReviewerVerdict.REVISE,
+            findings=(
+                _finding(
+                    observed_behavior="the case asserts add(2, 3) == 2 + 3",
+                    implementation_area="case " + TAUTOLOGY_CASE,
+                ),
+            ),
+        )
+        located = review.payload["findings"][0]
+        self.assertEqual(located["implementation_area"], "case " + TAUTOLOGY_CASE)
+        self.assertNotIn("assert add(2, 3) == 2 + 3", located["observed_behavior"])
 
     def test_owned_producers_do_not_write_stage_or_sqlite(self):
         self._draft(_digest("draft-1"))

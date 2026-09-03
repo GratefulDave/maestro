@@ -170,6 +170,25 @@ must not quote the private assertion.
   harness scratch tree composed from the candidate commit plus vault blobs. The builder does not
   receive runner argv that names private paths.
 
+Three anti-patterns make a test worthless, and the acceptance you write is what steers the tester
+away from them or into them. The test reviewer is asked to name any case that matches one, with the
+case id, and a named case is a located finding that discharges nothing.
+
+- **Implementation-coupled.** The test mocks internal collaborators, tests private methods, or
+  verifies through a side channel. The tell is a test that breaks on a refactor with no behaviour
+  change. Acceptance that names a helper, a call count, or an internal structure asks for one.
+- **Tautological.** The assertion recomputes the expected value the same way the code does, so it
+  passes by construction. Expected values must come from an independent source: a known-good
+  literal, a worked example, the spec. The tell is `assert add(2, 3) == 2 + 3`. Acceptance that
+  restates the algorithm instead of naming an outcome asks for one.
+- **Horizontal slicing / shape-asserting.** All tests first, then all implementation, so the tests
+  verify an imagined shape rather than behaviour. The tell is assertions on structure — keys exist,
+  type is list — with no behavioural expectation. Acceptance that describes a return type rather
+  than a consequence asks for one.
+
+The loop the tester runs: red before green; one seam, one test per cycle; refactoring is not part
+of the loop.
+
 ## What a lane's outputs must cover
 
 A lane's `outputs` are not a summary of what it will touch. They are its entire write permission.
