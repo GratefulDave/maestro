@@ -200,6 +200,36 @@ Two ways to fix it:
 A lane whose outputs are all new files is the ordinary greenfield case. What is suspect is a lane
 whose *sentence* only comes true once some file it may not write changes.
 
+## Where a lane's seam falls
+
+The section above asks whether an agent could satisfy the instruction by changing only the declared
+outputs. There is a second question with the same shape and a different subject: **could the tests
+observe the answer through those outputs alone?** A lane can pass the first and fail the second, and
+when it does, nothing in the plan says so — the refusal arrives at run time, phrased as a product
+failure.
+
+`lane-wp7-gw-issue-build` is the worked example. It owned `commerce.py`, its instruction was
+satisfiable by editing `commerce.py`, and it was correct on the first question. Its acceptance posted
+an issued token to `/v1/faers/dpa`, whose upstream in the test environment is a `SourceHandler`
+stand-in owned by a different lane. That stand-in routes a fixed list of paths and returns 404 for
+everything else, so the route under test raised `SOURCE_ERROR` on every attempt. The lane could not
+fix the stand-in — it did not own the file — and could not pass without it. Three attempts, one
+identical failure, and the lane parked with no candidate.
+
+Two rules keep a seam where the lane can reach it:
+
+- **One adapter is a hypothetical seam; two adapters is a real one.** A stand-in that exists only so
+  one lane's tests can run is indirection, not a boundary. If a lane's acceptance depends on
+  substituting something, the substitution point and the lane's outputs belong to the same lane.
+- **The interface is the test surface.** A lane's declared outputs *are* its interface. An assertion
+  that has to travel through a sibling's fixture to reach its subject is describing a module boundary
+  that was drawn in a different place than the lane boundary.
+
+The fix is the same pair offered above — give the lane the wiring, or split so the assertion stops at
+files its lane may write — applied to the test path rather than the production path. When authoring a
+tests lane, trace one acceptance case from its entry point to its subject and name every file it
+passes through. Any of them the lane does not own is the seam this section is about.
+
 ## What a review rejection costs
 
 A rejection is not a fresh start and it is not a retry budget. `TEST_REVIEW(REVISE)` returns the
