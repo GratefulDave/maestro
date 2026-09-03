@@ -53,6 +53,28 @@ def _template_role_routes() -> Mapping[str, Mapping[str, str]]:
     return maestro._canonical_role_routes(loaded["role_routes"])
 
 
+def _instruction_filename(spec: Any) -> str:
+    """The instruction file the launched role's own vendor reads.
+
+    `maestro.py` writes the role contract to both names with identical bytes and
+    hands the role the one its route reads, so the expected name follows the
+    route rather than a constant. Hardcoding either name asserts the config
+    instead of the behaviour, and breaks when a role is rerouted.
+    """
+
+    return "CLAUDE.md" if spec.route == "claude" else "AGENTS.md"
+
+
+def _expected_argv(spec: Any) -> tuple[str, ...]:
+    """The argv the launcher builds for the route this spec declares."""
+
+    return (
+        lch.build_omp_argv(Path("omp"), spec)
+        if spec.route == "omp"
+        else lch.build_claude_argv(Path("claude"), spec)
+    )
+
+
 class LaunchRecord(TypedDict):
     argv: tuple[str, ...]
     dirty_at_launch: bool
@@ -190,11 +212,7 @@ class RecordingLauncher:
             )
         git_cwd = (spec.worktree / ".git").exists()
         head = _git(spec.worktree, "rev-parse", "HEAD") if git_cwd else ""
-        argv = (
-            lch.build_omp_argv(Path("omp"), spec)
-            if spec.route == "omp"
-            else lch.build_claude_argv(Path("claude"), spec)
-        )
+        argv = _expected_argv(spec)
         prompt = json.loads(spec.prompt_path.read_text(encoding="utf-8"))
         environment = dict(spec.environment)
         scratch_dirs = [
@@ -402,10 +420,11 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertTrue(first["scratch_ready"])
             self.assertNotEqual(worktree.resolve(), product.resolve())
             self.assertEqual(first["prompt"]["role"], "tester")
-            system_prompt = recorder.specs[0].system_prompt_path
+            launch_spec = recorder.specs[0]
+            system_prompt = launch_spec.system_prompt_path
             self.assertEqual(
                 system_prompt.resolve() if system_prompt is not None else None,
-                (worktree / ".maestro-agent" / "CLAUDE.md").resolve(),
+                (worktree / ".maestro-agent" / _instruction_filename(launch_spec)).resolve(),
             )
             assert system_prompt is not None
             system_text = system_prompt.read_text(encoding="utf-8")
@@ -420,18 +439,37 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 system_text,
             )
             self.assertIn("hidden validator/meta-test files", system_text)
-            self.assertIn("Claude-only bound: review only this assigned worktree", system_text)
+            claude_bound = "Claude-only bound: review only this assigned worktree"
+            if launch_spec.route == "claude":
+                self.assertIn(claude_bound, system_text)
+            else:
+                self.assertNotIn(claude_bound, system_text)
             self.assertIn("Native Read, Write, Edit, Bash, skills, and MCP remain available", system_text)
 
 
             self.assertEqual(
                 system_text,
-                (worktree / ".maestro-agent" / "AGENTS.md").read_text(encoding="utf-8"),
+                (worktree / ".maestro-agent" / _instruction_filename(launch_spec)).read_text(
+                    encoding="utf-8"
+                ),
+            )
+            # Not `_expected_argv(launch_spec)`: `build_omp_argv` appends `-c` once
+            # the session dir holds a jsonl, so recomputing it after the second
+            # dispatch describes that dispatch, not this one -- and the recorder
+            # built `first["argv"]` with that same function, so the comparison
+            # could only ever agree with itself. Assert what the first launch
+            # actually carried.
+            first_argv = first["argv"]
+            self.assertEqual(first_argv[0], "omp")
+            self.assertEqual(
+                first_argv[first_argv.index("--profile") + 1],
+                _ROLE_ROUTES["tester"]["profile"],
             )
             self.assertEqual(
-                first["argv"],
-                lch.build_claude_argv(Path("claude"), recorder.specs[0]),
+                Path(first_argv[first_argv.index("--append-system-prompt") + 1]),
+                (worktree / ".maestro-agent" / _instruction_filename(launch_spec)).resolve(),
             )
+            self.assertNotIn("-c", first_argv)
             resubmit_handle = recorder.resubmits[0]["handle"]
             self.assertEqual(resubmit_handle.pane_id, "p:lane-a:tester")
             self.assertEqual(
@@ -875,10 +913,11 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertEqual(prompt["sealed_digest"], "33" * 32)
             cwd = Path(recorder.launches[0]["worktree"])
             self.assertTrue((state / "worktrees").resolve() in cwd.resolve().parents)
-            system_prompt = recorder.specs[0].system_prompt_path
+            launch_spec = recorder.specs[0]
+            system_prompt = launch_spec.system_prompt_path
             self.assertEqual(
                 system_prompt.resolve() if system_prompt is not None else None,
-                (cwd / ".maestro-agent" / "AGENTS.md").resolve(),
+                (cwd / ".maestro-agent" / _instruction_filename(launch_spec)).resolve(),
             )
             self.assertIn(
                 "Modify only the declared product outputs",
