@@ -7,6 +7,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **The code reviewer has a Standards axis, and it can never gate a candidate.**
+  `adw_modules/review_standards.py` carries the hygiene baseline the reviewer
+  is judged against when the repository documents nothing: Fowler's twelve
+  smells plus one deep-module item, each as *what it is -> how to fix*, and
+  three bounding rules -- a documented repo standard overrides the baseline,
+  every standards finding is a judgement call rather than a hard violation,
+  and anything tooling already enforces is skipped.
+  `discover_standards_files` names the repo's own standards files by path, so
+  the override rule has something to read without putting an unbounded
+  document into a size-checked handoff. Findings carrying `axis: "standards"`
+  are split out by `scheduler_types.partition_findings_by_axis`, capped at
+  severity `WARNING`, and recorded in `advisory_findings`;
+  `code_review.review_builder_output` reads the verdict off the spec axis
+  alone, so a hygiene observation cannot return a green candidate to
+  `BUILDING`. Findings may now carry optional `axis` and `severity` keys; an
+  envelope that names neither is a spec finding with exactly the four
+  actionable keys it always had, so older envelopes and stored artifacts still
+  parse. `MAESTRO_architecture.md` §4 states the axis, the cap, and the rule
+  that the two axes are never merged or ranked.
 - **Independent ready lanes advance concurrently again; merges stay serialized.**
   `maestro.config.yaml` takes `concurrency` (default 1). Above 1,
   `FactoryScheduler` submits every ready non-merge lane's stage to a pool of
