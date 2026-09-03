@@ -936,6 +936,31 @@ def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleName
     )
 
 
+def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
+    """The collection refusal, as a finding its own author can act on.
+
+    A draft that lists too few cases gets one correction turn; a draft that
+    cannot be collected at all used to raise straight past it, so the tester
+    was never told what broke and wrote the same draft on every resume. The
+    detail is the text the refusal already carries, redacted at the raise, and
+    the tester authored the files it describes -- the seal keeps private tests
+    from the builder, not from the actor that wrote them.
+    """
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": "native collect refused: {0}".format(detail),
+                "required_behavior": (
+                    "the draft must collect under the lane's gate command; fix "
+                    "what the refusal names and resubmit"
+                ),
+                "violated_requirement": "gate collection",
+            },
+        )
+    )
+
+
 def _draft_min_cases_findings(
     collected: int, min_cases: int
 ) -> tuple[dict[str, str], ...]:
@@ -1677,7 +1702,20 @@ class FactoryScheduler:
             return dict(files)
         current = dict(files)
         seen = st.digest_canonical(current)
-        collected = self._collect_private_draft(ctx, gate, current)
+        try:
+            collected = self._collect_private_draft(ctx, gate, current)
+        except DraftCollectionRefused as refused:
+            # One correction turn, on the same channel a short draft gets. An
+            # identical resubmission re-raises, so this cannot loop.
+            correction = _draft_collection_findings(str(refused))
+            extra = dict(
+                self.actor.write_tests(replace(ctx, draft_correction=correction))
+            )
+            current = _write_test_files(extra)
+            if st.digest_canonical(current) == seen:
+                raise
+            seen = st.digest_canonical(current)
+            collected = self._collect_private_draft(ctx, gate, current)
         if collected >= gate.min_cases:
             return current
         correction = _draft_min_cases_findings(collected, gate.min_cases)
