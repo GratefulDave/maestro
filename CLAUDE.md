@@ -224,6 +224,13 @@ its lane vendors, models, and concurrency name a particular installation. The te
 carries the same schema keys as the deployments, with template-shaped values, and the parity test
 does compare it between the two template copies.
 
+That hold-out is why mirroring the runtime never makes a deployment run lanes in parallel.
+`concurrency` is opt-in: the template ships `1`, absent means `1`, and `runtime_sync` holds
+`maestro.config.yaml` back, so an upgraded install stays serial until someone sets the key in
+*that deployment's* file. FDAdb is set to `3`; the other deployments are unset and therefore
+serial. A deployment's value also survives every later mirror, which is the point — do not
+"fix" a deployment that looks different from the template here.
+
 The visualizer (`.claude/skills/sssf/apps/visualizer/`) exists only in this repo — no copies,
 no ambiguity.
 

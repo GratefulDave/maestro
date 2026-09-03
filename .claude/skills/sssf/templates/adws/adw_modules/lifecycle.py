@@ -277,15 +277,18 @@ class ArtifactStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db_path = str(path)
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(
-            self.db_path, isolation_level=None, check_same_thread=False
-        )
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA busy_timeout=5000;")
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
-        self.conn.execute("PRAGMA foreign_keys=ON;")
-        self.conn.execute("PRAGMA defer_foreign_keys=ON;")
+        # One connection per thread. A `sqlite3.Connection` shared across
+        # threads hands the same cached prepared statement to two callers at
+        # once: a SELECT on one thread returns no row, or raises
+        # `InterfaceError`, while another thread steps the same statement
+        # (reproduced 2026-09-03 with two readers and one writer on one
+        # connection: thousands of empty reads in two seconds). WAL mode
+        # gives each thread's connection a consistent snapshot; writers are
+        # still serialized through `_lock`.
+        self._connections_guard = threading.Lock()
+        self._connections: list[sqlite3.Connection] = []
+        self._local = threading.local()
+        self._closed = False
         names = _tables(self.conn)
         if not names:
             self.conn.executescript(SCHEMA)
@@ -310,8 +313,31 @@ class ArtifactStore:
             return
         self._refuse_schema()
 
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The calling thread's connection, opened on first use."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            if self._closed:
+                raise sqlite3.ProgrammingError(
+                    "Cannot operate on a closed database."
+                )
+            conn = sqlite3.connect(
+                self.db_path, isolation_level=None, check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000;")
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA defer_foreign_keys=ON;")
+            with self._connections_guard:
+                self._connections.append(conn)
+            self._local.conn = conn
+        return conn
+
     def _refuse_schema(self) -> None:
-        self.conn.close()
+        self.close()
         raise LedgerSchemaUnsupported(
             "preserve the ledger read-only and start a new run/database"
         )
@@ -384,13 +410,18 @@ class ArtifactStore:
             except sqlite3.Error:
                 pass
             try:
-                self.conn.close()
+                self.close()
             except sqlite3.Error:
                 pass
             raise
 
     def close(self) -> None:
-        self.conn.close()
+        """Close every thread's connection. Idempotent."""
+        with self._connections_guard:
+            self._closed = True
+            connections, self._connections = self._connections, []
+        for conn in connections:
+            conn.close()
 
     def __enter__(self) -> "ArtifactStore":
         return self

@@ -1,5 +1,8 @@
 schema: maestro-config.v1
 runtime_state_root: /nonexistent/maestro-runtime-state
+# Worker threads for independent ready lanes (author/review/build stages).
+# Merges are serialized at any value. 1 keeps every stage inline.
+concurrency: 1
 role_routes:
   tester:
     route: omp
