@@ -654,7 +654,18 @@ class HerdrStageActor:
         shutil.rmtree(resolved, ignore_errors=True)
 
     def _schema(self, role: str) -> dict[str, Any]:
-        findings = list(st.REVISE_FINDING_KEYS)
+        # One object inside a list, with each key carrying a placeholder --
+        # never the bare key names. `list(REVISE_FINDING_KEYS)` renders as
+        # `["implementation_area", "observed_behavior", ...]`, which reads as
+        # "findings is an array of four strings", and a reviewer that reads it
+        # that way fills the array positionally. On run 7a80027d the
+        # lane-wp1-sections-tests reviewer did exactly that: one correct,
+        # complete finding flattened into four string elements in key order.
+        # `require_revise_findings` then refused it deep inside
+        # `tests_chain.review_test_draft`, and the CanonicalIdentityError left
+        # the scheduler and ended the run, taking four healthy in-flight lanes
+        # with it. The reviewer had done the work; only the shape was wrong.
+        findings = [{key: "<{0}>".format(key) for key in st.REVISE_FINDING_KEYS}]
         if role == "tester":
             return {"private_files": {"<path>": "<utf-8 contents>"}}
         if role == "builder":
@@ -1911,9 +1922,24 @@ class HerdrStageActor:
     ) -> tuple[st.ReviewerVerdict, Sequence[Mapping[str, str]]]:
         if "verdict" not in payload:
             raise FactoryRefused("REVIEW_VERDICT_MISSING")
-        return st.ReviewerVerdict(payload["verdict"]), list(
-            payload.get("findings") or ()
-        )
+        findings = list(payload.get("findings") or ())
+        # Refuse a misshapen finding here, where the envelope is still in
+        # hand and the role that produced it is known. Without this the first
+        # thing to notice is `require_revise_findings`, several frames inside
+        # the artifact writer, and what reaches the operator is a bare
+        # CanonicalIdentityError naming neither the lane nor the role nor what
+        # was actually wrong. Same termination, stated.
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, Mapping):
+                raise FactoryRefused(
+                    "REVIEW_FINDINGS_MALFORMED:findings[{0}] is {1}, not an "
+                    "object carrying {2}".format(
+                        index,
+                        type(finding).__name__,
+                        ", ".join(st.REVISE_FINDING_KEYS),
+                    )
+                )
+        return st.ReviewerVerdict(payload["verdict"]), findings
 
 
 def _actor_for(
