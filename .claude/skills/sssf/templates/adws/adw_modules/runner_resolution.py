@@ -84,6 +84,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -570,6 +571,71 @@ COLLECT_DETAIL_LINES = 20
 COLLECT_DETAIL_LINE_CHARS = 220
 
 
+class BoundedRun(object):
+    """One runner invocation's outcome, with `timed_out` kept separate.
+
+    `subprocess.run(timeout=…)` raises, and the output the child had already
+    written is reachable only off the exception -- so every caller that wrote
+    the obvious `except TimeoutExpired: raise` threw away a measurement that
+    may already have finished. It also kills only the direct child: a runner
+    that forks workers leaves them running, holding the module cache and the
+    ports the next lane needs.
+
+    Measured 2026-09-03 against FDAdb `lane-wp7-cookie-tests`, vitest 3.2.7:
+    `vitest list` under an Astro `getViteConfig` prints its complete listing
+    and then never exits, because the Astro/Cloudflare pipeline holds the Vite
+    server open and `list` has no force-exit path (`vitest run` force-exits
+    ten seconds after `close timed out`). Collection was refused at 120s and
+    twice more at 600s with all six case ids already on stdout, and the probe
+    processes were still alive twenty-eight minutes later.
+    """
+
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out")
+
+    def __init__(
+        self, returncode: int, stdout: str, stderr: str, timed_out: bool
+    ) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+
+
+def run_bounded(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_s: float,
+) -> BoundedRun:
+    """Run `argv`, capture both streams, and never leave the tree running.
+
+    The child gets its own session, so a timeout kills the whole process
+    group rather than the one pid Python happens to hold. Output written
+    before the deadline is returned rather than discarded; whether it is
+    enough is the caller's decision, not this function's.
+    """
+    proc = subprocess.Popen(
+        list(argv),
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(env),
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return BoundedRun(proc.returncode, stdout or "", stderr or "", False)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        return BoundedRun(-1, stdout or "", stderr or "", True)
+
+
 class CollectFailed(RuntimeError):
     """Native collect/list did not enumerate. Fail closed; do not guess."""
 
@@ -705,27 +771,26 @@ def collect_cases(
         merged.update(env)
     merged["PYTEST_ADDOPTS"] = ""
     try:
-        result = subprocess.run(
-            list(argv),
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            env=merged,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as extra:
-        raise CollectFailed(
-            resolved.runner,
-            detail="{0} did not finish collecting in {1}s".format(
-                resolved.runner, timeout_s
-            ),
-        ) from extra
+        result = run_bounded(argv, cwd=cwd, env=merged, timeout_s=timeout_s)
     except OSError as extra:
         raise CollectFailed(
             resolved.runner,
             detail="{0} could not be run".format(resolved.runner),
         ) from extra
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    if result.timed_out:
+        # A runner that enumerated and then would not exit has answered the
+        # only question collection asks. Refuse on an empty listing -- never
+        # on the exit that did not come.
+        ids = collected_identifiers(output)
+        if ids:
+            return ids
+        raise CollectFailed(
+            resolved.runner,
+            detail="{0} did not finish collecting in {1}s".format(
+                resolved.runner, timeout_s
+            ),
+        )
     capable = CAPABLE_EXIT.get(resolved.runner)
     if result.returncode not in (0, capable):
         hide = (str(cwd), str(cwd.resolve()), str(Path(tree)), str(Path(tree).resolve()))
@@ -740,7 +805,6 @@ def collect_cases(
                 hide=hide,
             ),
         )
-    output = (result.stdout or "") + "\n" + (result.stderr or "")
     return collected_identifiers(output)
 
 
@@ -780,27 +844,20 @@ def execute_cases(
     merged["PYTEST_ADDOPTS"] = ""
     merged["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     try:
-        result = subprocess.run(
-            list(argv),
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            env=merged,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as extra:
-        del extra
-        return {
-            "output": "{0} did not finish executing in {1}s".format(
-                resolved.runner, timeout_s
-            ),
-            "returncode": -1,
-        }
+        result = run_bounded(argv, cwd=cwd, env=merged, timeout_s=timeout_s)
     except OSError as extra:
         del extra
         return {
             "output": "{0} could not be run".format(resolved.runner),
+            "returncode": -1,
+        }
+    if result.timed_out:
+        # Unlike collection, an execution that did not finish has not
+        # answered anything -- but its process tree is dead either way.
+        return {
+            "output": "{0} did not finish executing in {1}s".format(
+                resolved.runner, timeout_s
+            ),
             "returncode": -1,
         }
     return {

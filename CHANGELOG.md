@@ -37,6 +37,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A gate's argv keeps its options paired with their values.** `_collect_gate`
+  and `_suite_selectors` partitioned `gate.argv` into `-`-prefixed tokens and
+  everything else and concatenated the two groups, which detaches an option
+  from its value. On FDAdb `lane-wp7-cookie-tests` the authored
+  `--config tests/wp7-checkout/vitest.config.ts …` reached vitest as
+  `--config <a test file>`; vite loaded that file as a config, evaluated
+  `vitest` outside a worker, and refused with `Vitest failed to access its
+  internal state`. Four tester turns were refused identically, because nothing
+  the tester could write was the thing that was wrong. Both call sites now use
+  `private_review.substituted_gate_argv`, which rebuilds the argv in place: a
+  bare token after a `-`-prefixed token carrying no `=` is that option's value,
+  a planned selector the draft did not write is dropped, and a written file the
+  plan did not name is appended.
+- **A runner that enumerated and then would not exit has answered.**
+  `collect_cases` called `subprocess.run(timeout=…)`, so a timeout raised past
+  the output the child had already written and blamed the draft for it, and it
+  killed one pid rather than the process tree. `vitest list` under an Astro
+  `getViteConfig` prints its complete listing and never exits — the
+  Astro/Cloudflare pipeline holds the Vite server open and `list` has no
+  force-exit path the way `vitest run` does. Collection was refused at 120s and
+  twice more at 600s with all six case ids already on stdout, and the probe
+  processes were alive twenty-eight minutes later. Both runner invocations now
+  go through `runner_resolution.run_bounded`, which gives the child its own
+  session and kills the group on timeout; collection keeps a listing that
+  arrived before the hang and refuses only on an empty one.
 - **Every vault ref is named by what it pins.** Draft and sealed refs were keyed
   on the review's `input_digest` but pinned a `git commit` sha, which embeds the
   wall clock; a second draft of one input a second later asked the same ref to

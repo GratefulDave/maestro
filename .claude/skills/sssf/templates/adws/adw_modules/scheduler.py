@@ -920,17 +920,10 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
 
 
 def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleNamespace:
-    written = tuple(sorted({prv.normalize_repo_path(path) for path in files}))
-    flags = tuple(token for token in gate.argv if str(token).startswith("-"))
-    planned = tuple(
-        prv.normalize_repo_path(str(token))
-        for token in gate.argv
-        if not str(token).startswith("-")
-    )
-    selectors = planned if planned and set(planned) <= set(written) else written
+    argv, _selectors = prv.substituted_gate_argv(gate.argv, files)
     return SimpleNamespace(
         runner=gate.runner,
-        argv=flags + selectors,
+        argv=argv,
         cwd=gate.cwd,
         min_cases=gate.min_cases,
     )
