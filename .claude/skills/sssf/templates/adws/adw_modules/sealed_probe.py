@@ -385,7 +385,7 @@ def probe_tree(
         # only adds files, so an early hit is always a late hit too.
         if _collides(dest, files):
             return _collision_result()
-        cr._provision_review_tree(dest, provision_argv, provision_timeout_s)
+        cr.provision_tree(dest, provision_argv, provision_timeout_s)
         if _collides(dest, files):
             return _collision_result()
         hv.copy_blobs_to_tree(vault, dest, files)

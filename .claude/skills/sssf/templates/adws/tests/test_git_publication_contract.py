@@ -635,7 +635,7 @@ class GitPublicationContract(unittest.TestCase):
     def test_preflight_refusals_do_not_mutate_refs(self) -> None:
         reviewed = _tree_commit(self.root, self.base, {"pub.txt": "p\n"})
         fingerprint = "aa" * 32
-        _write(self.root / "dirty.txt", "x")
+        _write(self.root / "pub.txt", "x")
         with self.assertRaises(gp.GitPublicationRefused) as raised:
             gp.publish_or_reconcile(self.binding, **self._pub(reviewed, fingerprint))
         self.assertEqual(raised.exception.code, "PUBLICATION_PREFLIGHT_REFUSED")
@@ -644,7 +644,47 @@ class GitPublicationContract(unittest.TestCase):
         self.assertIsNone(
             git.read_ref(gp.publication_ref_name(self.run_id, fingerprint))
         )
-        (self.root / "dirty.txt").unlink()
+        (self.root / "pub.txt").unlink()
+
+    def test_untouched_untracked_and_ignored_files_do_not_refuse(self) -> None:
+        """A dependency tree is not a reason to refuse publication.
+
+        The synchronizer only opens paths the delta names, so the presence of
+        `node_modules/` or the deployment's own `adws/` says nothing about
+        whether the publication can be applied. Refusing on repo-wide presence
+        made publication unreachable in every checkout that had ever installed
+        anything -- which is why no run had ever published.
+        """
+        _write(self.root / ".gitignore", "node_modules/\n")
+        _git(self.root, "add", ".gitignore")
+        _git(self.root, "commit", "-m", "ignore deps")
+        self.base = BoundGit(self.root).rev_parse("refs/heads/main")
+        reviewed = _tree_commit(self.root, self.base, {"pub.txt": "p\n"})
+        fingerprint = gp.final_review_input_fingerprint(
+            integration_sha=reviewed,
+            plan_revision=1,
+            plan_digest="4" * 64,
+            lanes=(),
+        )
+        _write(self.root / "node_modules" / "left-pad" / "index.js", "module\n")
+        _write(self.root / "adws" / "maestro.py", "runtime\n")
+        payload = gp.publish_or_reconcile(
+            self.binding, **self._pub(reviewed, fingerprint)
+        )
+        self.assertEqual(payload["published_sha"], reviewed)
+        self.assertEqual(BoundGit(self.root).rev_parse("refs/heads/main"), reviewed)
+
+    def test_untracked_file_on_a_published_path_still_refuses(self) -> None:
+        """The narrowing keeps the collision it was built for."""
+
+        reviewed = _tree_commit(self.root, self.base, {"pub.txt": "p\n"})
+        fingerprint = "bb" * 32
+        _write(self.root / "pub.txt", "squatter\n")
+        with self.assertRaises(gp.GitPublicationRefused) as raised:
+            gp.publish_or_reconcile(self.binding, **self._pub(reviewed, fingerprint))
+        self.assertEqual(raised.exception.code, "PUBLICATION_PREFLIGHT_REFUSED")
+        self.assertEqual(raised.exception.detail, "untracked:pub.txt")
+        self.assertEqual(BoundGit(self.root).rev_parse("refs/heads/main"), self.base)
 
     def test_atomic_receipt_and_main(self) -> None:
         reviewed = _tree_commit(self.root, self.base, {"pub.txt": "p\n"})

@@ -1182,6 +1182,23 @@ class HerdrStageActor:
             path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _lane_child_anchor(self, ctx: LaneContext, cwd: Path) -> Path | None:
+        """A git-backed path for this lane's Herdr child, or None to use `cwd`.
+
+        A private-tree role runs in a tree materialized out of the vault with
+        no `.git`, and `herdr worktree open` resolves a registered git worktree
+        and refuses anything else. The lane's child is a container, not the
+        role's cwd, so it may be anchored on a sibling role's checkout. It must
+        never be the repository root: that path is the run's parent Space, and
+        opening a child there hands back the parent and relabels it.
+        """
+        if (cwd / ".git").exists():
+            return None
+        for candidate in self._role_cwds(ctx).values():
+            if (candidate / ".git").exists():
+                return candidate
+        return None
+
     def _role_cwds(self, ctx: LaneContext) -> dict[str, Path]:
         return {
             role: self._role_dir(ctx, role, create=False) / "checkout"
@@ -1467,6 +1484,7 @@ class HerdrStageActor:
             workspace_label=self._workspace_label(ctx),
             pane_group_size=len(lch.LANE_PANE_ROLES),
             role_cwds=self._role_cwds(ctx),
+            child_anchor=self._lane_child_anchor(ctx, cwd),
             prepare_adopted_cwd=prepare_adopted_cwd,
         )
         try:

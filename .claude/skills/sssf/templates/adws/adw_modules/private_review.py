@@ -11,7 +11,7 @@ import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, List, Mapping, Sequence, Set, Tuple
 
 from . import scheduler_types as st
 
@@ -170,6 +170,77 @@ def normalize_repo_path(path: str) -> str:
     if any(part in ("", ".", "..") for part in parts):
         raise PrivateReviewError("path is not a normalized POSIX file")
     return posixpath.normpath(raw)
+
+
+def _maybe_repo_path(token: str) -> str:
+    """`normalize_repo_path` where a non-path token is simply not one."""
+    try:
+        return normalize_repo_path(token)
+    except PrivateReviewError:
+        return ""
+
+
+def substituted_gate_argv(
+    argv: Sequence[str], files: Iterable[str]
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """A gate's argv with its selectors replaced by the files actually written.
+
+    Returns `(argv, selectors)`: the whole invocation, and just the path
+    operands within it.
+
+    Every token keeps its authored position. That is the entire point. The
+    shape this replaced partitioned argv into `-`-prefixed tokens and
+    everything else and then concatenated the two groups, which detaches an
+    option from its value: the authored
+
+        --config tests/wp7-checkout/vitest.config.ts tests/wp7-checkout a.test.ts b.test.ts
+
+    became
+
+        --config b.test.ts a.test.ts vitest.config.ts
+
+    so vite loaded a *test file* as its config, evaluated `vitest` outside a
+    worker, and refused with `Vitest failed to access its internal state`.
+    Every draft the tester wrote was refused identically, because nothing the
+    tester could write was the thing that was wrong (measured 2026-09-03,
+    FDAdb `lane-wp7-cookie-tests`, four turns).
+
+    A bare token immediately after a `-`-prefixed token carrying no `=` is
+    that option's value and is preserved verbatim. A planned selector the
+    draft did not write is dropped, and a written file the plan did not name
+    is appended -- which is what the old fallback to the written set was for.
+    """
+    written = tuple(sorted({normalize_repo_path(path) for path in files}))
+    rebuilt: List[str] = []
+    selectors: List[str] = []
+    seen: Set[str] = set()
+    expects_value = False
+    for token in argv:
+        text = str(token)
+        if text.startswith("-"):
+            rebuilt.append(text)
+            expects_value = "=" not in text
+            continue
+        norm = _maybe_repo_path(text)
+        if expects_value:
+            expects_value = False
+            rebuilt.append(norm if norm in written else text)
+            if norm in written:
+                seen.add(norm)
+            continue
+        if norm in written:
+            rebuilt.append(norm)
+            selectors.append(norm)
+            seen.add(norm)
+        # A planned selector the draft did not write names nothing in the
+        # tree; carrying it forward is what the written-set fallback existed
+        # to avoid.
+    for path in written:
+        if path in seen:
+            continue
+        rebuilt.append(path)
+        selectors.append(path)
+    return tuple(rebuilt), tuple(selectors)
 
 
 def _nonempty(value: str, label: str) -> str:

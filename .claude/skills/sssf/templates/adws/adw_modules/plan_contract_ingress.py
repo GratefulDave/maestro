@@ -1,25 +1,7 @@
-"""Receipt-verified projection from plan-contract.v1 to maestro-plan.v2.
+"""Receipt-verified projection from plan-contract.v1 onto SCHEMA_VERSION.
 
-This is an authoring boundary, not a lossy converter. Missing Maestro
-extensions, ambient paths, receiptless input, and unparseable gates refuse.
-
-**It emits v2, and the version moved because what this module puts in
-`nodes[].instruction` changed meaning.** It used to write the lane's title
-there and drop `requirements[].text` — the sentence that bounds the lane's
-scope — so every builder and every reviewer downstream faithfully relayed a
-summary of the contract instead of the contract (§19 M26). `_node_instruction`
-below fixed that. Emitting `maestro-plan.v1` afterwards would have left a plan
-projected before the fix byte-indistinguishable *in version* from one
-projected after it, and a fully-fixed runtime would have executed the
-degenerate one without a word: the field is populated either way, so no
-consumer and no reader sweep can separate them. The version string is
-the only channel that carries this, and
-`maestro._RUNNABLE_PLAN_SCHEMA_VERSIONS` is the reader that acts on it.
-
-`_assert_ingress_projection_is_total` now guards this projection the
-way `plan_model._assert_projection_is_total` guards the next one: a
-lane-bound IR field with no destination and no named exemption is a
-raise, not a silent drop (§3.6 B15, §19 M1, §19 M26, issue #96).
+This is an authoring boundary, not a lossy converter. It emits lanes, not
+nodes. Totality is guarded by `_assert_ingress_projection_is_total`.
 """
 from __future__ import annotations
 
@@ -29,8 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from . import plan_author
-from . import plan_model
-from . import plan_validate
+from . import scheduler_types as st
+from .plan_model import LANE_KEYS, SCHEMA_VERSION
 
 
 EXECUTABLE_KINDS = frozenset({"implementation", "brownfield", "prd", "workflow"})
@@ -38,31 +20,14 @@ RECEIPT_VERSION = "plan-contract-review.v1"
 
 
 class IngressError(plan_author.AuthoringError):
-    """A plan-contract package cannot become a Maestro plan.
+    """A plan-contract package cannot become a Maestro plan."""
 
-    `blockers` carries the typed admission blockers when the refusal is an
-    admission refusal, and is empty otherwise. The joined message stays for an
-    operator reading a terminal; a caller that needs to branch on which
-    obligation fired reads the tuple, because thirteen blockers rendered into
-    one string is a wall no code can take apart and `validate_plan` already
-    returns its blockers typed.
-    """
-
-    def __init__(self, message: str,
-                 blockers: Sequence["plan_validate.AdmissionBlocker"] = ()
-                 ) -> None:
+    def __init__(self, message: str) -> None:
         super().__init__(message)
-        self.blockers: Tuple["plan_validate.AdmissionBlocker", ...] = tuple(
-            blockers)
 
 
 class IngressProjectionIncomplete(RuntimeError):
-    """`project_draft` did not account for a field the IR declares.
-
-    The same shape as `plan_model.ProjectionIncomplete`, one projection
-    earlier. A declared field with no destination reads as a default
-    downstream instead of failing here (§3.6 B15, §19 M1, §19 M26).
-    """
+    """`project_draft` did not account for a field the IR declares."""
 
 
 def _sha256(data: bytes) -> str:
@@ -80,41 +45,21 @@ def _load_json(path: Path, code: str) -> dict:
 
 
 def _require_text(value: object, code: str, label: str) -> str:
-    """A field the projection carries verbatim: present, a string, non-empty.
-
-    `x.get("k") or <fallback>` is three different bugs wearing one operator.
-    It picks quietly between synonyms, it invents a value the plan never
-    declared, and it treats a deliberate falsy value — `0`, `""`, `[]` — as
-    absence. §7.4 records what the second one costs: a per-gate threshold the
-    destination had no field for was dropped, every gate in every run was
-    adjudicated against a default of 1 while plans declared 70, and a run
-    reached ACCEPTED that way. This function and its siblings below are how
-    that operator stops appearing on this path.
-    """
+    """A field the projection carries verbatim: present, a string, non-empty."""
     if not isinstance(value, str) or not value:
         raise IngressError("{}:{}".format(code, label))
     return value
 
 
 def _require_count(value: object, code: str, label: str) -> int:
-    """A threshold the adjudicator will count against. `bool` is not an `int`
-    here even though Python says otherwise: `min_cases: true` is a typo, not a
-    demand for one passing case."""
+    """A threshold the adjudicator will count against. `bool` is not an `int`."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise IngressError("{}:{}".format(code, label))
     return value
 
 
 def _require_id_list(value: object, code: str, label: str) -> list:
-    """A list of ids, or nothing. Absence is legal and means the empty list;
-    a malformed value is not absence.
-
-    `list(lane.get("depends_on") or [])` accepted a *string* and spelled it
-    out one character per dependency, so `"depends_on": "lane-a"` projected
-    six phantom node ids. And a filtered comprehension over `source_ids`
-    dropped every non-string entry without a word, so evidence a lane declared
-    it reads simply vanished from `reads`.
-    """
+    """A list of ids, or nothing. Absence is legal and means the empty list."""
     if value is None:
         return []
     if not isinstance(value, list):
@@ -180,19 +125,7 @@ def _parse_verifier_command(command: object) -> Tuple[str, Tuple[str, ...]]:
 
 
 def _requirements_by_id(ir: Mapping[str, Any]) -> dict:
-    """`{requirement_id: requirement}` over the IR's declared requirements.
-
-    One index, built once and read by both consumers below. Two indexes built
-    from the same list are two chances to disagree about which record a lane's
-    `requirement_ids` names, and this projection now resolves that binding
-    twice — once for the effects a requirement authorises, once for the words
-    that bound the node's scope.
-
-    A malformed entry is skipped rather than refused here. Both callers refuse
-    in their own vocabulary when the id they were looking for is missing, and
-    a refusal raised from the index would name the plan's requirement list
-    instead of the lane whose contract is incomplete.
-    """
+    """`{requirement_id: requirement}` over the IR's declared requirements."""
     declared = ir.get("requirements")
     index: dict = {}
     for item in declared if isinstance(declared, list) else ():
@@ -204,77 +137,12 @@ def _requirements_by_id(ir: Mapping[str, Any]) -> dict:
     return index
 
 
-#: How a requirement's own words are labelled inside a node's instruction.
-#: A label rather than a bare paste: the builder and the reviewer both need to
-#: know that what follows is the plan's transcribed requirement and not a
-#: paraphrase written for them, because the whole value of the text is that it
-#: is the sentence the plan author actually wrote.
 REQUIREMENT_HEADING = "Requirement {0}, in the plan's own words:"
 
 
 def _node_instruction(ir: Mapping[str, Any], lane: Mapping[str, Any],
                       lane_id: str) -> str:
-    """The lane's title as a label, then the requirement text that bounds it.
-
-    §3.6 B9 makes the reviewer's input a declared contract — goal, `produces`,
-    acceptance — and §19 M1 records the cost of a projection that dropped the
-    goal: every agent-node reviewer in every run was told "make the gate pass"
-    and nothing else. This is that same defect one projection earlier. The
-    field was populated, so nothing downstream could tell a summary from the
-    contract, and every consumer faithfully relayed a lossy value.
-
-    Measured over the four executable plans in the `lexgenius-pipeline`
-    deployment, 2,256 bytes of lane titles stood in for 18,824 bytes of
-    `requirements[].text` across 51 agent nodes. `lane-p4-enrichment-ordering`
-    carried 199 bytes of a 971-byte requirement, and the dropped remainder is
-    the sentence deferring the production wiring to a later plan. Its reviewer
-    rejected the diff six times for omitting exactly that wiring, on
-    `diff.implements_the_stated_instruction`, and burned the lane's whole
-    review ceiling.
-
-    Of the three shapes issue #87 lists, this is the third, and the other two
-    are refused on the design's own terms:
-
-    * A bare `requirement_id` on the node makes the bounding text a *reference*
-      to bytes that live outside the plan. `maestro-plan.v1` is frozen from the
-      moment it ships and its bytes are its identity (§6.3) — that is why a
-      `PromptAsset` is carried by content digest. Text recoverable only from
-      the authoring IR is text that can change without changing the plan
-      digest, and the IR "takes no further part" after this projection.
-    * `prompt_assets` is a channel with no runtime reader. `plan_model`'s
-      `_NODE_PROJECTION_EXEMPT` records the reason in the code — "consumed
-      while authoring the plan, not while running it; nothing on the
-      scheduler's side reads one" — and a `PromptAsset` is a `path` plus a
-      `sha256`, so routing text through it would mean writing files from a
-      projection documented as a pure function of the IR, the receipt and the
-      repository, *and* building the reader that does not exist. A channel
-      with no writers is B15's field with no readers; the repair is not to
-      write into it, it is to use the channel that already has both.
-
-    `instruction` has both. `maestro._agent_node_prompt` opens the builder's
-    prompt with it and `code_review._node_goal` is the reviewer's declared
-    goal, so widening this one field reaches both halves of the contract with
-    no new channel, no new field, and no new reader to keep in step.
-
-    One recorded objection is answered rather than ignored.
-    `scheduler_types.PlanNode.effects` says handing the reviewer the
-    requirement's own text "was considered and declined", because the text of
-    `lane-p1-canonical-object-key` said both "pure derivation and policy
-    module" and "server-side copy it", which would put the reviewer in the
-    builder's position adjudicating a contradiction. That objection was about
-    a *self-contradictory* requirement, and admission now refuses exactly that
-    IR: `EFFECT_AUTHORIZED` blocks a requirement that prescribes an effect its
-    own plan forbids, and it runs below, before any plan file is written. The
-    contradiction the objection feared cannot reach a node any more, so what
-    survives admission is text a reviewer can read without weighing one clause
-    against another. `effects` stays typed and stays carried; this adds the
-    scope the typed field was never able to express — which lane owns which
-    work, and which work a later plan owns.
-
-    §1.2 is unaffected. No lifecycle transition keys on these bytes: they are
-    plan content, canonicalized and digested like every other field, read by
-    the two prompt builders and by nothing that moves a node between states.
-    """
+    """The lane's title as a label, then the requirement text that bounds it."""
     title = _require_text(
         lane.get("title"), "UNMAPPABLE_LANES", "{}.title".format(lane_id))
     bound = _require_id_list(
@@ -284,17 +152,11 @@ def _node_instruction(ir: Mapping[str, Any], lane: Mapping[str, Any],
     blocks = [title]
     seen = set()
     for requirement_id in bound:
-        # Declared order, first occurrence only. The plan's bytes are its
-        # identity, so the instruction must be a pure function of the IR: a
-        # set here would order it by hash and a duplicate id would paste one
-        # requirement twice.
         if requirement_id in seen:
             continue
         seen.add(requirement_id)
         requirement = index.get(requirement_id)
         if not isinstance(requirement, dict):
-            # The lane binds an id the plan does not declare. Refused rather
-            # than skipped: skipping is how the title became the whole brief.
             raise IngressError(
                 "UNMAPPABLE_REQUIREMENTS:{}.requirement_ids:{}".format(
                     lane_id, requirement_id))
@@ -302,257 +164,229 @@ def _node_instruction(ir: Mapping[str, Any], lane: Mapping[str, Any],
             requirement.get("text"), "UNMAPPABLE_REQUIREMENTS",
             "{}.text".format(requirement_id)).strip()
         if not text:
-            # `_require_text` refuses `""`; a requirement whose text is only
-            # whitespace is the same absence spelled differently, and it would
-            # otherwise project a heading with nothing under it.
             raise IngressError(
                 "UNMAPPABLE_REQUIREMENTS:{}.text".format(requirement_id))
         blocks.append("{0}\n{1}".format(
             REQUIREMENT_HEADING.format(requirement_id), text))
-    # A lane binding no requirement at all is deliberately not refused here.
-    # Admission's `SURFACE_REACHABLE` already refuses it below, naming the
-    # output no requirement claims — a message about the plan's requirement
-    # coverage, which is what is actually wrong. Refusing here first would
-    # replace that with a worse one and would send an author back twice for
-    # two defects in one document, which §11.1 rejects.
     return "\n\n".join(blocks)
 
 
-def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any]) -> list:
-    """The lane's dispositions toward each act the plan forbids.
-
-    A lane's effects are the union of the requirements it binds. Admission has
-    already refused two requirements on one lane that disagree about an
-    effect, so the union is well defined by the time this runs — the first
-    disposition found is the only one there is.
-
-    Only prohibited effects are carried. A disposition toward an act the plan
-    does not forbid is not a prohibition, and every prohibited effect has a
-    transcribed `meaning`, so every projected record is complete by
-    construction rather than by a later check.
-    """
+def _node_effects(ir: Mapping[str, Any], lane: Mapping[str, Any],
+                  lane_id: str) -> list:
+    """Every prohibited effect, with a non-performed disposition from bound requirements."""
     extensions = ir.get("extensions")
     maestro = extensions.get("maestro") if isinstance(extensions, dict) else {}
     declared = maestro.get("prohibited_effects") if isinstance(maestro, dict) else None
+    prohibited: list = []
     meanings = {}
+    seen = set()
     for entry in declared if isinstance(declared, list) else ():
-        if isinstance(entry, dict) and isinstance(entry.get("effect"), str):
-            meaning = entry.get("meaning")
-            if isinstance(meaning, str) and meaning.strip():
-                meanings[entry["effect"]] = meaning.strip()
-    if not meanings:
-        return []
+        if not isinstance(entry, dict):
+            continue
+        effect = entry.get("effect")
+        if not isinstance(effect, str) or not effect or effect in seen:
+            continue
+        seen.add(effect)
+        prohibited.append(effect)
+        meaning = entry.get("meaning")
+        if isinstance(meaning, str) and meaning.strip():
+            meanings[effect] = meaning.strip()
     by_id = _requirements_by_id(ir)
+    bound = _require_id_list(
+        lane.get("requirement_ids"), "UNMAPPABLE_LANES",
+        "{}.requirement_ids".format(lane_id))
     dispositions = {}
-    for requirement_id in lane.get("requirement_ids") or []:
+    for requirement_id in bound:
         requirement = by_id.get(requirement_id)
         if not isinstance(requirement, dict):
             continue
+        declared_effects = {}
         for entry in requirement.get("effects") or []:
             if not isinstance(entry, dict):
                 continue
-            effect, disposition = entry.get("effect"), entry.get("disposition")
-            if effect in meanings and isinstance(disposition, str):
-                dispositions.setdefault(effect, disposition)
-    return [{"effect": effect, "disposition": dispositions[effect],
-             "meaning": meanings[effect]}
-            for effect in sorted(dispositions)]
+            effect = entry.get("effect")
+            if isinstance(effect, str) and effect:
+                declared_effects.setdefault(effect, entry.get("disposition"))
+        for effect in prohibited:
+            disposition = declared_effects.get(effect)
+            if disposition == "performed" or not isinstance(disposition, str) or not disposition:
+                raise IngressError(
+                    "UNMAPPABLE_EFFECTS:{}.{}".format(lane_id, effect))
+            dispositions.setdefault(effect, disposition)
+    emitted = []
+    for effect in prohibited:
+        if effect not in meanings:
+            continue
+        item = {"effect": effect, "meaning": meanings[effect]}
+        if effect in dispositions:
+            item["disposition"] = dispositions[effect]
+        emitted.append(item)
+    return emitted
 
 
-#: Plan Contract names authoring roles; Maestro names runtime node kinds.
-#: Absent `lane_kind` remains a build lane for older Plan IR.
-_LANE_KIND_TO_NODE_KIND: Dict[str, str] = {
-    "build": "agent",
-    "tests": "tests",
-}
-
-
-#: Node kinds a plan-contract lane cannot emit.
-_UNEMITTED_NODE_KINDS: Dict[str, str] = {
-    "code": ("a plan-contract lane is agent work; a code node's command is "
-             "not a lane and has no IR binding to project"),
-}
-
-#: Destination node types the next projection (`to_plan_nodes`) accepts.
-#: The guard covers every kind, not only `agent`, so a TestsNode field
-#: cannot be dropped by being out of this module's current emit set.
-#: `TestsNodeV4` is the tests kind this projection emits; `TestsNode` stays
-#: listed because a v3 plan already shipped still parses to it.
-_DESTINATION_NODE_TYPES: Tuple[type, ...] = (
-    plan_model.AgentNode, plan_model.CodeNode, plan_model.TestsNode,
-    plan_model.TestsNodeV4)
-
-
-def _projected_test_strength(declared: Any, lane_id: str,
-                             verifier_id: Any) -> Dict[str, Any]:
-    """The verifier's authored test-strength contract, validated and carried.
-
-    Validated by constructing the plan model rather than by re-checking its
-    rules here: `TestStrength` already refuses a requirement covered only by
-    its happy path, a `controlled_mutation` with no mutation, and an
-    `expected_reason_pattern` that is not a regular expression. A second copy
-    of those rules in this module would be one contract with two definitions,
-    which is the shape this whole design convicts.
-
-    Carried as the model's own JSON dump, so the plan file holds exactly what
-    the plan model will parse back — never a hand-built dict that happens to
-    resemble it.
-    """
-    if declared is None or not isinstance(declared, Mapping):
-        raise IngressError(
-            "UNMAPPABLE_VERIFIERS:{0}.test_strength".format(lane_id))
-    try:
-        contract = plan_model.TestStrength.model_validate(dict(declared))
-    except ValueError as error:
-        # `ValidationError` is a `ValueError`, and so is every rule
-        # `TestStrength` states itself. Anything else raised from a
-        # `model_validate` is this module's bug rather than the author's, and
-        # it must not be reported as a malformed contract.
-        raise IngressError(
-            "UNMAPPABLE_VERIFIERS:{0}.test_strength:{1}".format(
-                verifier_id or lane_id, error)) from None
-    return contract.model_dump(mode="json")
-
-
-#: Lane fields this projection carries onto the node, or `None` if dropped.
-#: Completeness is this table, not a list of the six known drops: a field
-#: added to a lane later with neither a destination nor an exemption
-#: raises. Follows `_GATE_PROJECTION`.
 _LANE_PROJECTION: Dict[str, Optional[str]] = {
-    "lane_id": "node_id",
-    "title": "instruction",
-    "lane_kind": "kind",
-    "execution_context": "cwd",
+    "lane_id": "id",
+    "title": "spec.goal, spec.instruction",
+    "lane_kind": "lane_kind",
+    "execution_context": "spec.gate.cwd",
     "depends_on": "needs",
-    "requirement_ids": "instruction",
-    "verifier_ids": None,
-    "claim_ids": None,
-    "seam_ids": None,
+    "requirement_ids": "spec.instruction, spec.bindings.requirement_ids",
+    "verifier_ids": "spec.bindings.verifier_ids",
+    "claim_ids": "acceptance, spec.bindings.claim_ids",
+    "seam_ids": "spec.seams, spec.bindings.seam_ids",
     "fixture_ids": None,
 }
-
 _LANE_PROJECTION_EXEMPT: Dict[str, str] = {
-    "verifier_ids": (
-        "the gate is bound by verifiers[].lane_ids, which this "
-        "projection already requires to name exactly one verifier; "
-        "lane.verifier_ids is the reverse index and carrying both would "
-        "be two answers for one fact"),
-    "claim_ids": (
-        "consumed by plan_validate's CLAIM_UNWITNESSABLE obligation at "
-        "admission, deliberately not carried into the plan"),
-    "seam_ids": (
-        "seams are authoring-time producer/consumer/contract prose; "
-        "maestro-plan has no seam type, and pasting them into a prompt "
-        "is a channel with no runtime reader (§3.6 B15 the other way)"),
     "fixture_ids": (
-        "fixtures are authoring-time records; CLAIM_UNWITNESSABLE reads "
-        "typed witness cells, not fixture prose, and maestro-plan has "
-        "no fixture type to carry one into"),
+        "a builder never receives fixtures (docs/plan-authoring.md:148-151); "
+        "the ids and records reach the paired tester via "
+        "spec.obligations.for_build_lanes"),
 }
+_LANE_PROJECTION_TESTS = dict(_LANE_PROJECTION, **{
+    "fixture_ids": "spec.obligations.observed_baseline, spec.bindings.fixture_ids",
+})
+_LANE_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
 
-#: Bound `requirements[]` fields. `source_ids` lands on `reads` so a
-#: requirement cannot name evidence its node then silently cannot read.
 _REQUIREMENT_PROJECTION: Dict[str, Optional[str]] = {
-    "requirement_id": "requirement_ids",
-    "text": "instruction",
-    "source_ids": "reads",
+    "requirement_id": "spec.bindings.requirement_ids",
+    "text": "spec.instruction",
+    "source_ids": "spec.sources",
     "surface": None,
-    "effects": "effects",
+    "effects": "spec.effects",
 }
-
 _REQUIREMENT_PROJECTION_EXEMPT: Dict[str, str] = {
     "surface": (
-        "consumed by admission SURFACE_DECLARED and SURFACE_REACHABLE; "
-        "maestro-plan has no surface field, and the reader is admission "
-        "rather than the node"),
+        "Plan Contract SKILL.md:48-53 still names Maestro ingress as the "
+        "reader; validate_contract_surface was deleted in e7b477e and this "
+        "port does not re-add SURFACE_REACHABLE. No factory reader remains."),
 }
 
 
-#: Bound `verifiers[]` fields. Gate carries runner, argv, cwd, min_cases
-#: only; oracle/falsifiability/independent have no destination there.
+_VERIFIER_REVERSE_EXEMPT: Dict[str, str] = {
+    "requirement_ids": (
+        "reverse index of the lane's requirement_ids, already carried "
+        "via instruction, effects and spec.sources; a second copy is two answers"),
+    "fixture_ids": (
+        "reverse index of the lane's fixture_ids. A build lane never receives "
+        "fixture records (docs/plan-authoring.md:148-151); a tests lane receives "
+        "them via spec.obligations.observed_baseline from the lane binding, not "
+        "this reverse index"),
+    "seam_ids": (
+        "reverse index of the lane's seam_ids, already carried on spec.seams, "
+        "spec.bindings.seam_ids, and spec.instruction; a second copy is two answers"),
+    "claim_ids": (
+        "reverse index of the lane's claim_ids, already carried on acceptance "
+        "and spec.bindings.claim_ids; a second copy is two answers"),
+}
+_VERIFIER_TEST_FACING = (
+    "test-facing; docs/plan-authoring.md:283-286 forbids these on a "
+    "builder prompt")
 _VERIFIER_PROJECTION: Dict[str, Optional[str]] = {
-    "verifier_id": "gate",
-    "lane_ids": "gate",
-    "command": "gate",
-    "min_executed": "min_cases",
-    "source_ids": "reads",
-    "oracle": None,
+    "verifier_id": "acceptance[0]",
+    "oracle": "acceptance[0]",
+    "lane_ids": "spec.gate",
+    "command": "spec.gate",
+    "min_executed": "spec.gate",
+    "source_ids": "spec.sources",
     "falsifiability": None,
     "independent": None,
-    # The one verifier field that *is* carried onto the node, and only onto a
-    # tests node. `falsifiability` above stays exempt because it is free text
-    # and §1.2 forbids a transition keyed on prose; this is the typed thing
-    # that replaces it — coverage obligations bound to case ids and an
-    # executable negative control — so it has a destination and a reader.
-    "test_strength": "test_strength",
+    "test_strength": None,
     "requirement_ids": None,
     "fixture_ids": None,
     "seam_ids": None,
     "claim_ids": None,
 }
-
-_VERIFIER_NOT_CARRIED = (
-    "Gate carries runner, argv, cwd and min_cases only. This field is "
-    "free text or an authoring reverse-index; §1.2 forbids a transition "
-    "keyed on prose, and CLAIM_UNWITNESSABLE is the typed stand-in for "
-    "falsifiability at admission")
-
 _VERIFIER_PROJECTION_EXEMPT: Dict[str, str] = {
-    "oracle": _VERIFIER_NOT_CARRIED,
-    "falsifiability": _VERIFIER_NOT_CARRIED,
-    "independent": _VERIFIER_NOT_CARRIED,
-    "requirement_ids": (
-        "reverse index of the lane's requirement_ids, already carried "
-        "via instruction, effects and reads; a second copy is two answers"),
-    "fixture_ids": (
-        "reverse index of the lane's fixture_ids, which are themselves "
-        "exempt; carrying the copy would be a destination the original "
-        "binding does not have"),
-    "seam_ids": (
-        "reverse index of the lane's seam_ids, which are themselves "
-        "exempt; carrying the copy would be a destination the original "
-        "binding does not have"),
-    "claim_ids": (
-        "reverse index of the lane's claim_ids, consumed at admission "
-        "by CLAIM_UNWITNESSABLE and not carried into the plan"),
+    "falsifiability": _VERIFIER_TEST_FACING,
+    "independent": _VERIFIER_TEST_FACING,
+    "test_strength": (
+        "refused on a build verifier as UNMAPPABLE_VERIFIERS:<lane>.test_strength; "
+        "not dropped and not carried"),
+    **_VERIFIER_REVERSE_EXEMPT,
 }
+_VERIFIER_PROJECTION_TESTS: Dict[str, Optional[str]] = {
+    "verifier_id": "acceptance[0], spec.obligations.verifier",
+    "oracle": "acceptance[0], spec.obligations.verifier",
+    "lane_ids": "spec.gate",
+    "command": "spec.gate",
+    "min_executed": "spec.gate",
+    "source_ids": "spec.sources",
+    "falsifiability": "spec.obligations.verifier",
+    "independent": "spec.obligations.verifier",
+    "test_strength": "spec.obligations.verifier",
+    "requirement_ids": None,
+    "fixture_ids": None,
+    "seam_ids": None,
+    "claim_ids": None,
+}
+_VERIFIER_PROJECTION_TESTS_EXEMPT: Dict[str, str] = dict(_VERIFIER_REVERSE_EXEMPT)
 
 
-_CLAIM_NOT_CARRIED = (
-    "consumed by plan_validate's CLAIM_UNWITNESSABLE obligation at "
-    "admission, deliberately not carried into the plan")
-
+_CLAIM_FIELDS = (
+    "antecedent_claim_id",
+    "claim_id",
+    "compression",
+    "domain",
+    "exception_ids",
+    "identifier_pattern",
+    "kind",
+    "mutation_kinds",
+    "object",
+    "owner",
+    "polarity",
+    "postconditions",
+    "preconditions",
+    "predicate",
+    "rendered_binding_ids",
+    "schema_ref",
+    "serializer",
+    "source_ids",
+    "source_requirement_ids",
+    "state_from",
+    "state_to",
+    "subject",
+    "unit",
+    "value",
+    "verifier_ids",
+    "witness",
+)
+_CLAIM_TEST_FACING = (
+    "test-facing; delivered verbatim to the paired tester via "
+    "spec.obligations.for_build_lanes")
 _CLAIM_PROJECTION: Dict[str, Optional[str]] = {
-    "claim_id": None,
-    "kind": None,
-    "mutation_kinds": None,
-    "object": None,
-    "polarity": None,
-    "predicate": None,
-    "rendered_binding_ids": None,
-    "source_ids": None,
-    "source_requirement_ids": None,
-    "subject": None,
-    "unit": None,
-    "value": None,
-    "verifier_ids": None,
-    "witness": None,
+    "claim_id": "acceptance",
+    "subject": "acceptance",
+    "predicate": "acceptance",
+    "object": "acceptance",
+    "polarity": "acceptance",
+    "value": "acceptance",
+    "unit": "acceptance",
+    **{name: None for name in _CLAIM_FIELDS if name not in {
+        "claim_id", "subject", "predicate", "object", "polarity", "value", "unit",
+    }},
 }
 _CLAIM_PROJECTION_EXEMPT: Dict[str, str] = {
-    name: _CLAIM_NOT_CARRIED for name in _CLAIM_PROJECTION}
+    name: _CLAIM_TEST_FACING
+    for name in _CLAIM_FIELDS
+    if name not in {
+        "claim_id", "subject", "predicate", "object", "polarity", "value", "unit",
+    }
+}
+_CLAIM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
+    name: "spec.obligations.claims" for name in _CLAIM_FIELDS
+}
+_CLAIM_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
 
-_SEAM_NOT_CARRIED = (
-    "seams are authoring-time producer/consumer/contract prose; "
-    "maestro-plan has no seam type, and pasting them into a prompt is "
-    "a channel with no runtime reader (§3.6 B15 the other way)")
-
+_SEAM_REVERSE = (
+    "reverse index; seam_id/producer/consumer/contract already sit on "
+    "spec.seams and in spec.instruction. This index is not a second copy of those four.")
 _SEAM_PROJECTION: Dict[str, Optional[str]] = {
-    "seam_id": None,
-    "contract": None,
-    "producer": None,
-    "consumer": None,
+    "seam_id": "spec.seams",
+    "producer": "spec.seams",
+    "consumer": "spec.seams",
+    "contract": "spec.seams",
     "claim_ids": None,
     "fixture_ids": None,
     "requirement_ids": None,
@@ -560,30 +394,107 @@ _SEAM_PROJECTION: Dict[str, Optional[str]] = {
     "verifier_ids": None,
 }
 _SEAM_PROJECTION_EXEMPT: Dict[str, str] = {
-    name: _SEAM_NOT_CARRIED for name in _SEAM_PROJECTION}
+    "claim_ids": _SEAM_REVERSE,
+    "fixture_ids": _SEAM_REVERSE,
+    "requirement_ids": _SEAM_REVERSE,
+    "source_ids": _SEAM_REVERSE,
+    "verifier_ids": _SEAM_REVERSE,
+}
+_SEAM_PROJECTION_TESTS: Dict[str, Optional[str]] = {
+    "seam_id": "spec.seams",
+    "producer": "spec.seams",
+    "consumer": "spec.seams",
+    "contract": "spec.seams",
+    "claim_ids": "spec.obligations.seams",
+    "fixture_ids": "spec.obligations.seams",
+    "requirement_ids": "spec.obligations.seams",
+    "source_ids": "spec.obligations.seams",
+    "verifier_ids": "spec.obligations.seams",
+}
+_SEAM_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
 
 
-_FIXTURE_NOT_CARRIED = (
-    "fixtures are authoring-time records; CLAIM_UNWITNESSABLE reads "
-    "typed witness cells, not fixture prose, and maestro-plan has no "
-    "fixture type to carry one into")
-
+_FIXTURE_FIELDS = (
+    "fixture_id",
+    "affected_lane_ids",
+    "consumer_obligation",
+    "meaning",
+    "observed_value",
+    "path",
+    "producer_metadata",
+    "prohibited_behavior",
+    "record_selector",
+    "seam_ids",
+    "source_id",
+    "verifier_ids",
+)
 _FIXTURE_PROJECTION: Dict[str, Optional[str]] = {
-    "fixture_id": None,
-    "affected_lane_ids": None,
-    "consumer_obligation": None,
-    "meaning": None,
-    "observed_value": None,
-    "path": None,
-    "producer_metadata": None,
-    "prohibited_behavior": None,
-    "record_selector": None,
-    "seam_ids": None,
-    "source_id": None,
-    "verifier_ids": None,
+    name: None for name in _FIXTURE_FIELDS
 }
 _FIXTURE_PROJECTION_EXEMPT: Dict[str, str] = {
-    name: _FIXTURE_NOT_CARRIED for name in _FIXTURE_PROJECTION}
+    name: _LANE_PROJECTION_EXEMPT["fixture_ids"] for name in _FIXTURE_FIELDS
+}
+_FIXTURE_PROJECTION_TESTS: Dict[str, Optional[str]] = {
+    name: "spec.obligations.observed_baseline" for name in _FIXTURE_FIELDS
+}
+_FIXTURE_PROJECTION_TESTS_EXEMPT: Dict[str, str] = {}
+
+
+_EXTENSION_PROJECTION: Dict[str, Optional[str]] = {
+    "outputs": "outputs",
+    "integration_branch": "spec.integration.integration_branch",
+    "prohibited_effects": "spec.effects",
+    "repo": None,
+    "integration_gate": None,
+}
+_EXTENSION_PROJECTION_EXEMPT: Dict[str, str] = {
+    "repo": "the repository is --repo at run start (MAESTRO_architecture.md §10); no plan field",
+    "integration_gate": (
+        "no plan-level reader: the factory's run-level gate is a tests lane no "
+        "build lane consumes (scheduler.py:2447-2461); the value is parsed and "
+        "shape-checked (kept refusals) and then discarded"),
+}
+
+_IR_PROJECTION: Dict[str, Optional[str]] = {
+    "schema_version": "IR_SCHEMA",
+    "plan_id": "trace.plan_id",
+    "title": "trace.title",
+    "plan_kind": "EXECUTABLE_KINDS",
+    "author": None,
+    "source_artifacts": "spec.sources",
+    "requirements": "spec.instruction, spec.effects, spec.bindings.requirement_ids",
+    "claims": "acceptance, spec.obligations.claims",
+    "fixtures": "spec.obligations.observed_baseline, spec.obligations.for_build_lanes",
+    "seams": "spec.seams, spec.obligations.seams",
+    "lanes": "lanes",
+    "verifiers": "spec.gate, acceptance[0]",
+    "traceability": None,
+    "rendered_bindings": "spec.obligations.rendered_bindings",
+    "links": None,
+    "approval": None,
+    "extensions": "_EXTENSIONS_PROJECTION",
+}
+_IR_PROJECTION_EXEMPT: Dict[str, str] = {
+    "author": (
+        "identity of the IR author; no factory reader. The receipt names the "
+        "bytes and --repo names the worktree"),
+    "traceability": (
+        "Plan Contract reverse index; lane bindings already carried as "
+        "spec.bindings. A second copy is two answers"),
+    "links": "HTML/view hyperlinks; no factory reader",
+    "approval": (
+        "the PASS receipt is the approval; _verify_receipt checks it against "
+        "the IR bytes"),
+}
+_EXTENSIONS_PROJECTION: Dict[str, Optional[str]] = {
+    "claim_kinds": None,
+    "maestro": "_EXTENSION_PROJECTION",
+}
+_EXTENSIONS_PROJECTION_EXEMPT: Dict[str, str] = {
+    "claim_kinds": (
+        "Plan Contract vocabulary for claim.kind; no factory reader. The "
+        "compiler digests spec whole and does not interpret claim kinds"),
+}
 
 
 def _records_by_id(ir: Mapping[str, Any], collection: str,
@@ -627,13 +538,7 @@ def _extend_unique(target: list, values: Sequence[str],
 
 def _lane_source_reads(ir: Mapping[str, Any], lane: Mapping[str, Any],
                        verifier: Mapping[str, Any], lane_id: str) -> list:
-    """Union of the verifier's source_ids and each bound requirement's.
-
-    `reads` used to be built from the verifier alone, so a requirement
-    that named evidence its node then could not read was invisible:
-    the field was populated, and `reads_are_sufficient` passed on the
-    ids that did arrive (issue #96 instance 2, the #87 sub-shape).
-    """
+    """Union of the verifier's source_ids and each bound requirement's."""
     reads: list = []
     seen: set = set()
     _extend_unique(reads, _require_id_list(
@@ -650,6 +555,214 @@ def _lane_source_reads(ir: Mapping[str, Any], lane: Mapping[str, Any],
             requirement.get("source_ids"), "UNMAPPABLE_REQUIREMENTS",
             "{}.source_ids".format(requirement_id)), seen)
     return reads
+
+
+def _lane_kind(lane: Mapping[str, Any], lane_id: str) -> str:
+    kind = lane.get("lane_kind", "build")
+    if kind not in ("build", "tests"):
+        raise IngressError("UNMAPPABLE_LANE_KIND:{}".format(lane_id))
+    return kind
+
+
+def _gate(verifier: Mapping[str, Any], cwd: str, lane_id: str) -> dict:
+    runner, argv = _parse_verifier_command(verifier.get("command"))
+    if not argv:
+        raise IngressError("BROAD_GATE:{}".format(verifier.get("verifier_id")))
+    min_cases = _require_count(
+        verifier.get("min_executed"), "UNMAPPABLE_VERIFIERS", lane_id)
+    return {"runner": runner, "argv": list(argv), "cwd": cwd, "min_cases": min_cases}
+
+
+def _sources_for(ir: Mapping[str, Any], ids: Sequence[str]) -> list:
+    index = _records_by_id(ir, "source_artifacts", "source_id")
+    records = []
+    for source_id in ids:
+        item = index.get(source_id)
+        if not isinstance(item, dict):
+            raise IngressError("UNMAPPABLE_SOURCES:{}".format(source_id))
+        records.append(item)
+    return records
+
+
+def _claim_sentence(claim: Mapping[str, Any]) -> str:
+    claim_id = _require_text(
+        claim.get("claim_id"), "UNMAPPABLE_CLAIMS", "claim_id")
+    polarity = _require_text(
+        claim.get("polarity"), "UNMAPPABLE_CLAIMS",
+        "{}.polarity".format(claim_id))
+    subject = _require_text(
+        claim.get("subject"), "UNMAPPABLE_CLAIMS",
+        "{}.subject".format(claim_id))
+    predicate = _require_text(
+        claim.get("predicate"), "UNMAPPABLE_CLAIMS",
+        "{}.predicate".format(claim_id))
+    obj = _require_text(
+        claim.get("object"), "UNMAPPABLE_CLAIMS",
+        "{}.object".format(claim_id))
+    sentence = "{} ({}): {} {} {}".format(
+        claim_id, polarity, subject, predicate, obj)
+    value, unit = claim.get("value"), claim.get("unit")
+    has_value = value is not None and value != ""
+    has_unit = isinstance(unit, str) and unit
+    if has_value or has_unit:
+        tail = []
+        if has_value:
+            tail.append(str(value))
+        if has_unit:
+            tail.append(str(unit))
+        sentence += " = " + " ".join(tail)
+    return sentence
+
+
+def _acceptance(verifier: Mapping[str, Any], claims: Sequence[Mapping[str, Any]]) -> list:
+    verifier_id = _require_text(
+        verifier.get("verifier_id"), "UNMAPPABLE_VERIFIERS", "verifier_id")
+    oracle = _require_text(
+        verifier.get("oracle"), "UNMAPPABLE_VERIFIERS",
+        "{}.oracle".format(verifier_id))
+    return ["{}: {}".format(verifier_id, oracle)] + [
+        _claim_sentence(claim) for claim in claims
+    ]
+
+
+def _seam_prose(seams: Sequence[Mapping[str, Any]]) -> str:
+    blocks = []
+    for seam in seams:
+        seam_id = _require_text(
+            seam.get("seam_id"), "UNMAPPABLE_SEAMS", "seam_id")
+        producer = _require_text(
+            seam.get("producer"), "UNMAPPABLE_SEAMS",
+            "{}.producer".format(seam_id))
+        consumer = _require_text(
+            seam.get("consumer"), "UNMAPPABLE_SEAMS",
+            "{}.consumer".format(seam_id))
+        contract = _require_text(
+            seam.get("contract"), "UNMAPPABLE_SEAMS",
+            "{}.contract".format(seam_id))
+        blocks.append(
+            "Seam {} ({} -> {}):\n{}".format(
+                seam_id, producer, consumer, contract))
+    return "\n\n".join(blocks)
+
+
+def _paired_build_lanes(ir: Mapping[str, Any], tests_lane_id: str) -> list:
+    ids = []
+    for item in ir.get("lanes") if isinstance(ir.get("lanes"), list) else ():
+        if not isinstance(item, dict):
+            continue
+        lane_id = item.get("lane_id")
+        if not isinstance(lane_id, str) or not lane_id:
+            continue
+        if _lane_kind(item, lane_id) != "build":
+            continue
+        depends = item.get("depends_on")
+        if isinstance(depends, list) and tests_lane_id in depends:
+            ids.append(lane_id)
+    return ids
+
+
+def _bindings(lane: Mapping[str, Any], kind: str) -> dict:
+    lane_id = lane.get("lane_id")
+    label = lane_id if isinstance(lane_id, str) and lane_id else "lane"
+    bindings = {
+        "requirement_ids": _require_id_list(
+            lane.get("requirement_ids"), "UNMAPPABLE_LANES",
+            "{}.requirement_ids".format(label)),
+        "verifier_ids": _require_id_list(
+            lane.get("verifier_ids"), "UNMAPPABLE_LANES",
+            "{}.verifier_ids".format(label)),
+        "claim_ids": _require_id_list(
+            lane.get("claim_ids"), "UNMAPPABLE_LANES",
+            "{}.claim_ids".format(label)),
+        "seam_ids": _require_id_list(
+            lane.get("seam_ids"), "UNMAPPABLE_LANES",
+            "{}.seam_ids".format(label)),
+    }
+    if kind == "tests":
+        bindings["fixture_ids"] = _require_id_list(
+            lane.get("fixture_ids"), "UNMAPPABLE_LANES",
+            "{}.fixture_ids".format(label))
+    return bindings
+
+
+def _pack_obligations(
+        ir: Mapping[str, Any], source_lane: Mapping[str, Any],
+        source_verifier: Mapping[str, Any]) -> dict:
+    return {
+        "claims": _bound_records(
+            ir, source_lane, "claim_ids", "claims", "claim_id"),
+        "observed_baseline": _bound_records(
+            ir, source_lane, "fixture_ids", "fixtures", "fixture_id"),
+        "seams": _bound_records(
+            ir, source_lane, "seam_ids", "seams", "seam_id"),
+        "verifier": dict(source_verifier),
+    }
+
+
+def _obligations(
+        ir: Mapping[str, Any], lane: Mapping[str, Any],
+        verifier: Mapping[str, Any],
+        projected_build_lanes: Sequence[Mapping[str, Any]]) -> dict:
+    lanes_by_id = {}
+    for item in ir.get("lanes") if isinstance(ir.get("lanes"), list) else ():
+        if isinstance(item, dict) and isinstance(item.get("lane_id"), str):
+            lanes_by_id.setdefault(item["lane_id"], item)
+    verifiers = ir.get("verifiers") if isinstance(ir.get("verifiers"), list) else []
+    paired = []
+    for projected in projected_build_lanes:
+        build_lane = lanes_by_id[projected["id"]]
+        build_verifiers = [
+            item for item in verifiers
+            if isinstance(item, dict) and projected["id"] in item.get("lane_ids", [])
+        ]
+        packed = _pack_obligations(ir, build_lane, build_verifiers[0])
+        packed["lane_id"] = projected["id"]
+        packed["acceptance"] = list(projected["acceptance"])
+        paired.append(packed)
+    own = _pack_obligations(ir, lane, verifier)
+    rendered = ir.get("rendered_bindings")
+    return {
+        "claims": own["claims"],
+        "observed_baseline": own["observed_baseline"],
+        "seams": own["seams"],
+        "verifier": own["verifier"],
+        "for_build_lanes": paired,
+        "rendered_bindings": list(rendered) if isinstance(rendered, list) else [],
+    }
+
+
+def _bound_id_set(lanes: Sequence[Mapping[str, Any]], key: str) -> set:
+    ids = set()
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            continue
+        for item in lane.get(key) or []:
+            if isinstance(item, str) and item:
+                ids.add(item)
+    return ids
+
+
+def _assert_binding_closure(ir: Mapping[str, Any], lanes: Sequence[Any]) -> None:
+    """Every claim/fixture/seam/requirement/verifier is named by some lane.
+
+    Chosen over a silent exemption: an unbound record is how extra keys were
+    dropped. IngressProjectionIncomplete already names this class of drop.
+    """
+    bound = {
+        "claim": (_bound_id_set(lanes, "claim_ids"), "claims", "claim_id"),
+        "fixture": (_bound_id_set(lanes, "fixture_ids"), "fixtures", "fixture_id"),
+        "seam": (_bound_id_set(lanes, "seam_ids"), "seams", "seam_id"),
+        "requirement": (_bound_id_set(lanes, "requirement_ids"), "requirements", "requirement_id"),
+        "verifier": (_bound_id_set(lanes, "verifier_ids"), "verifiers", "verifier_id"),
+    }
+    for label, (ids, collection, id_key) in bound.items():
+        for item in ir.get(collection) or []:
+            if not isinstance(item, dict):
+                continue
+            record_id = item.get(id_key)
+            if isinstance(record_id, str) and record_id and record_id not in ids:
+                raise IngressProjectionIncomplete(
+                    "{0} {1} is bound to no lane".format(label, record_id))
 
 
 def _assert_table_reasons(projection: Dict[str, Optional[str]],
@@ -691,19 +804,39 @@ def _assert_payload_accounted(payload: Mapping[str, Any],
                 label, ", ".join(unaccounted), table))
 
 
+def _tables_for(kind: str):
+    if kind == "tests":
+        return (
+            (_LANE_PROJECTION_TESTS, _LANE_PROJECTION_TESTS_EXEMPT, "_LANE_PROJECTION"),
+            (_VERIFIER_PROJECTION_TESTS, _VERIFIER_PROJECTION_TESTS_EXEMPT, "_VERIFIER_PROJECTION"),
+            (_CLAIM_PROJECTION_TESTS, _CLAIM_PROJECTION_TESTS_EXEMPT, "_CLAIM_PROJECTION"),
+            (_SEAM_PROJECTION_TESTS, _SEAM_PROJECTION_TESTS_EXEMPT, "_SEAM_PROJECTION"),
+            (_FIXTURE_PROJECTION_TESTS, _FIXTURE_PROJECTION_TESTS_EXEMPT, "_FIXTURE_PROJECTION"),
+        )
+    return (
+        (_LANE_PROJECTION, _LANE_PROJECTION_EXEMPT, "_LANE_PROJECTION"),
+        (_VERIFIER_PROJECTION, _VERIFIER_PROJECTION_EXEMPT, "_VERIFIER_PROJECTION"),
+        (_CLAIM_PROJECTION, _CLAIM_PROJECTION_EXEMPT, "_CLAIM_PROJECTION"),
+        (_SEAM_PROJECTION, _SEAM_PROJECTION_EXEMPT, "_SEAM_PROJECTION"),
+        (_FIXTURE_PROJECTION, _FIXTURE_PROJECTION_EXEMPT, "_FIXTURE_PROJECTION"),
+    )
+
+
 def _assert_ingress_projection_is_total(
         ir: Mapping[str, Any], lane: Mapping[str, Any],
-        verifier: Mapping[str, Any], node: Mapping[str, Any]) -> None:
+        verifier: Mapping[str, Any], projected: Mapping[str, Any],
+        maestro: Mapping[str, Any]) -> None:
     """Raise unless every field this lane binds is carried or exempted."""
-    lane_id = node.get("node_id")
+    lane_id = projected.get("id")
+    kind = projected["lane_kind"]
+    (lane_proj, lane_exempt, lane_table), (ver_proj, ver_exempt, ver_table), (
+        claim_proj, claim_exempt, claim_table), (seam_proj, seam_exempt, seam_table), (
+        fix_proj, fix_exempt, fix_table) = _tables_for(kind)
     _assert_payload_accounted(
-        lane, _LANE_PROJECTION, _LANE_PROJECTION_EXEMPT,
-        "_LANE_PROJECTION", "lane {}".format(lane_id))
+        lane, lane_proj, lane_exempt, lane_table, "lane {}".format(lane_id))
     _assert_payload_accounted(
-        verifier, _VERIFIER_PROJECTION, _VERIFIER_PROJECTION_EXEMPT,
-        "_VERIFIER_PROJECTION",
+        verifier, ver_proj, ver_exempt, ver_table,
         "verifier {}".format(verifier.get("verifier_id")))
-
     for requirement in _bound_records(
             ir, lane, "requirement_ids", "requirements", "requirement_id"):
         _assert_payload_accounted(
@@ -713,106 +846,133 @@ def _assert_ingress_projection_is_total(
     for claim in _bound_records(
             ir, lane, "claim_ids", "claims", "claim_id"):
         _assert_payload_accounted(
-            claim, _CLAIM_PROJECTION, _CLAIM_PROJECTION_EXEMPT,
-            "_CLAIM_PROJECTION", "claim {}".format(claim.get("claim_id")))
+            claim, claim_proj, claim_exempt, claim_table,
+            "claim {}".format(claim.get("claim_id")))
     for seam in _bound_records(
             ir, lane, "seam_ids", "seams", "seam_id"):
         _assert_payload_accounted(
-            seam, _SEAM_PROJECTION, _SEAM_PROJECTION_EXEMPT,
-            "_SEAM_PROJECTION", "seam {}".format(seam.get("seam_id")))
+            seam, seam_proj, seam_exempt, seam_table,
+            "seam {}".format(seam.get("seam_id")))
     for fixture in _bound_records(
             ir, lane, "fixture_ids", "fixtures", "fixture_id"):
         _assert_payload_accounted(
-            fixture, _FIXTURE_PROJECTION, _FIXTURE_PROJECTION_EXEMPT,
-            "_FIXTURE_PROJECTION",
+            fixture, fix_proj, fix_exempt, fix_table,
             "fixture {}".format(fixture.get("fixture_id")))
+    _assert_payload_accounted(
+        maestro, _EXTENSION_PROJECTION, _EXTENSION_PROJECTION_EXEMPT,
+        "_EXTENSION_PROJECTION", "extensions.maestro")
 
-    kind = node.get("kind")
-    if kind not in set(_LANE_KIND_TO_NODE_KIND.values()):
-        reason = _UNEMITTED_NODE_KINDS.get(kind, "")
+    if set(projected) != set(LANE_KEYS):
         raise IngressProjectionIncomplete(
-            "lane {0}: project_draft emitted unsupported kind {1!r}{2}.".format(
-                lane_id, kind, (": " + reason) if reason else ""))
+            "lane {0}: projected keys {1!r} != LANE_KEYS".format(
+                lane_id, sorted(projected)))
 
-    # AgentNode and TestsNodeV4 share a launch shape; a field either declares
-    # that the emitted node does not carry is the #96 drop arriving on a kind
-    # this projection does not yet emit.
-    #
-    # Checked against the class for the kind actually emitted, **plus** the
-    # fields the two kinds share. Checking every lane against both classes
-    # outright was right only while the two had identical field sets: v4's
-    # `test_strength` belongs to a tests node and to no other, so demanding it
-    # of a build lane refuses every plan that has one. The shared set is what
-    # preserves the original guard — a field added to `AgentNode` is still a
-    # raise on a tests lane, and the other way round.
-    emitted_names = set(node)
-    for cls in (plan_model.AgentNode, plan_model.TestsNodeV4):
-        if cls not in _DESTINATION_NODE_TYPES:
-            raise IngressProjectionIncomplete(
-                "{0} is not in _DESTINATION_NODE_TYPES; the guard must "
-                "cover every node kind, including those PR #124 "
-                "added.".format(cls.__name__))
-    shared = (set(plan_model.AgentNode.model_fields)
-              & set(plan_model.TestsNodeV4.model_fields))
-    own = {
-        "agent": set(plan_model.AgentNode.model_fields),
-        "tests": set(plan_model.TestsNodeV4.model_fields),
-    }.get(str(kind), set())
-    missing = sorted((shared | own) - emitted_names)
-    if missing:
+    def _fail(field: str, expected: object, actual: object) -> None:
         raise IngressProjectionIncomplete(
-            "lane {0}: the {1} destination declares {2} which the emitted "
-            "node does not carry. A new field on a destination kind is a "
-            "raise, not a silent drop.".format(
-                lane_id, kind, ", ".join(missing)))
+            "lane {0}: {1} is {2!r} in the IR but {3!r} on the projected "
+            "lane; the projection carries the field name and not its "
+            "value.".format(lane_id, field, expected, actual))
 
-    if node.get("node_id") != lane.get("lane_id"):
-        raise IngressProjectionIncomplete(
-            "lane {0}: lane_id is {1!r} in the IR but node_id is {2!r} "
-            "on the projected node; the projection carries the field "
-            "name and not its value.".format(
-                lane_id, lane.get("lane_id"), node.get("node_id")))
-    title = lane.get("title")
-    instruction = node.get("instruction") or ""
-    if isinstance(title, str) and title and title not in instruction:
-        raise IngressProjectionIncomplete(
-            "lane {0}: title {1!r} is not in the projected "
-            "instruction; the projection carries the field name and "
-            "not its value.".format(lane_id, title))
-    needs = node.get("needs")
+    if projected.get("id") != lane.get("lane_id"):
+        _fail("id", lane.get("lane_id"), projected.get("id"))
     declared_needs = _require_id_list(
         lane.get("depends_on"), "UNMAPPABLE_LANES",
         "{}.depends_on".format(lane_id))
-    if list(needs) != declared_needs:
-        raise IngressProjectionIncomplete(
-            "lane {0}: depends_on is {1!r} in the IR but needs is {2!r} "
-            "on the projected node; the projection carries the field "
-            "name and not its value.".format(
-                lane_id, declared_needs, needs))
-    cwd = (node.get("gate") or {}).get("cwd")
-    if cwd != lane.get("execution_context"):
-        raise IngressProjectionIncomplete(
-            "lane {0}: execution_context is {1!r} in the IR but "
-            "gate.cwd is {2!r} on the projected node; the projection "
-            "carries the field name and not its value.".format(
-                lane_id, lane.get("execution_context"), cwd))
+    if list(projected.get("needs")) != declared_needs:
+        _fail("needs", declared_needs, projected.get("needs"))
+    declared_outputs = maestro.get("outputs", {}).get(lane.get("lane_id"))
+    if list(projected.get("outputs")) != list(declared_outputs or []):
+        _fail("outputs", declared_outputs, projected.get("outputs"))
+    spec = projected["spec"]
+    if spec.get("gate", {}).get("cwd") != lane.get("execution_context"):
+        _fail("spec.gate.cwd", lane.get("execution_context"),
+              spec.get("gate", {}).get("cwd"))
+    if spec.get("gate", {}).get("min_cases") != verifier.get("min_executed"):
+        _fail("spec.gate.min_cases", verifier.get("min_executed"),
+              spec.get("gate", {}).get("min_cases"))
+    title = lane.get("title")
+    instruction = spec.get("instruction") or ""
+    if spec.get("goal") != title:
+        _fail("spec.goal", title, spec.get("goal"))
+    if isinstance(title, str) and title and title not in instruction:
+        _fail("spec.instruction", title, instruction)
+    for seam in _bound_records(ir, lane, "seam_ids", "seams", "seam_id"):
+        seam_id = seam.get("seam_id")
+        if isinstance(seam_id, str) and seam_id and seam_id not in instruction:
+            _fail("spec.instruction", seam_id, instruction)
+    bindings = spec.get("bindings") or {}
+    carried = ["requirement_ids", "verifier_ids", "claim_ids", "seam_ids"]
+    if kind == "tests":
+        carried.append("fixture_ids")
+    for name in carried:
+        expected = _require_id_list(
+            lane.get(name), "UNMAPPABLE_LANES",
+            "{}.{}".format(lane_id, name))
+        actual = bindings.get(name)
+        if name not in bindings or list(actual) != expected:
+            _fail("spec.bindings.{}".format(name), expected, actual)
     expected_reads = _lane_source_reads(ir, lane, verifier, lane_id)
-    if list(node.get("reads") or []) != expected_reads:
+    actual_reads = [item.get("source_id") for item in spec.get("sources") or []]
+    if actual_reads != expected_reads:
+        _fail("spec.sources", expected_reads, actual_reads)
+    acceptance = projected.get("acceptance") or []
+    expected_head = "{}: {}".format(
+        verifier.get("verifier_id"), verifier.get("oracle"))
+    if not acceptance or acceptance[0] != expected_head:
+        _fail("acceptance[0]", expected_head,
+              acceptance[0] if acceptance else None)
+    claim_ids = _require_id_list(
+        lane.get("claim_ids"), "UNMAPPABLE_LANES",
+        "{}.claim_ids".format(lane_id))
+    if len(acceptance) != 1 + len(claim_ids):
+        _fail("len(acceptance)", 1 + len(claim_ids), len(acceptance))
+    branch = maestro.get("integration_branch")
+    if spec.get("integration", {}).get("integration_branch") != branch:
+        _fail("spec.integration.integration_branch", branch,
+              spec.get("integration", {}).get("integration_branch"))
+    if kind == "tests":
+        obligations = spec.get("obligations") or {}
+        if [item.get("claim_id") for item in obligations.get("claims") or []] != claim_ids:
+            _fail("obligations.claims", claim_ids,
+                  [item.get("claim_id") for item in obligations.get("claims") or []])
+        fixture_ids = _require_id_list(
+            lane.get("fixture_ids"), "UNMAPPABLE_LANES",
+            "{}.fixture_ids".format(lane_id))
+        if [item.get("fixture_id") for item in obligations.get("observed_baseline") or []] != fixture_ids:
+            _fail("obligations.observed_baseline", fixture_ids,
+                  [item.get("fixture_id") for item in obligations.get("observed_baseline") or []])
+        seam_ids = _require_id_list(
+            lane.get("seam_ids"), "UNMAPPABLE_LANES",
+            "{}.seam_ids".format(lane_id))
+        if [item.get("seam_id") for item in obligations.get("seams") or []] != seam_ids:
+            _fail("obligations.seams", seam_ids,
+                  [item.get("seam_id") for item in obligations.get("seams") or []])
+        paired = _paired_build_lanes(ir, lane.get("lane_id"))
+        actual_paired = [
+            item.get("lane_id") for item in obligations.get("for_build_lanes") or []
+        ]
+        if actual_paired != paired:
+            _fail("obligations.for_build_lanes", paired, actual_paired)
+    else:
+        if "obligations" in spec:
+            raise IngressProjectionIncomplete(
+                "lane {0}: build spec carries obligations".format(lane_id))
+        for key in bindings:
+            if "fixture" in key:
+                raise IngressProjectionIncomplete(
+                    "lane {0}: build bindings carry {1}".format(lane_id, key))
+    try:
+        st._reject_private_keys(projected["spec"])
+    except st.CanonicalIdentityError as exc:
         raise IngressProjectionIncomplete(
-            "lane {0}: bound source_ids union to {1!r} but the "
-            "projected node carries reads {2!r}; the projection "
-            "carries the field name and not its value.".format(
-                lane_id, expected_reads, node.get("reads")))
-    min_cases = (node.get("gate") or {}).get("min_cases")
-    if min_cases != verifier.get("min_executed"):
-        raise IngressProjectionIncomplete(
-            "lane {0}: the verifier declares min_executed={1}, the "
-            "projected node carries min_cases={2}.".format(
-                lane_id, verifier.get("min_executed"), min_cases))
+            "lane {0}: projected spec carries a private key ({1}); the "
+            "projection controls every key it emits, so this is a "
+            "projection defect".format(lane_id, exc)) from None
 
 
 def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     """Map one approved executable Plan IR onto a Maestro draft mapping."""
+    del repo
     if ir.get("schema_version") != "plan-contract.v1":
         raise IngressError("IR_SCHEMA")
     kind = ir.get("plan_kind")
@@ -821,6 +981,11 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     if kind not in EXECUTABLE_KINDS:
         raise IngressError("IR_PLAN_KIND:{}".format(kind))
     maestro = _maestro_extension(ir)
+    _assert_payload_accounted(
+        ir, _IR_PROJECTION, _IR_PROJECTION_EXEMPT, "_IR_PROJECTION", "ir")
+    _assert_payload_accounted(
+        ir["extensions"], _EXTENSIONS_PROJECTION, _EXTENSIONS_PROJECTION_EXEMPT,
+        "_EXTENSIONS_PROJECTION", "extensions")
     outputs_by_lane = maestro.get("outputs")
     if not isinstance(outputs_by_lane, dict) or not outputs_by_lane:
         raise IngressError("UNMAPPABLE_OUTPUTS")
@@ -841,12 +1006,6 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
     if not isinstance(sources, list) or not sources:
         raise IngressError("UNMAPPABLE_SOURCES")
 
-    # Every verifier is validated once, here, rather than absorbed by an
-    # `or []` inside the per-lane comprehension below. A malformed `lane_ids`
-    # there matched no lane, so the *lane* refused for having no verifier while
-    # the verifier that was actually malformed went unnamed — fail-closed, but
-    # pointing at the wrong object, which is how a plan defect gets read as a
-    # missing binding and edited in the wrong place.
     for index, item in enumerate(verifiers):
         if not isinstance(item, dict):
             raise IngressError("UNMAPPABLE_VERIFIERS:verifier[{}]".format(index))
@@ -860,13 +1019,9 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             raise IngressError(
                 "UNMAPPABLE_VERIFIERS:{}.lane_ids".format(verifier_id))
 
-    evidence = []
     for index, source in enumerate(sources):
         if not isinstance(source, dict):
             raise IngressError("UNMAPPABLE_SOURCES:{}".format(index))
-        # `source["source_id"]` was a bare index guarded by nothing, so an IR
-        # omitting it left this boundary as an untyped `KeyError` rather than
-        # as a refusal naming what was unmappable.
         source_id = _require_text(
             source.get("source_id"), "UNMAPPABLE_SOURCES",
             "source[{}].source_id".format(index))
@@ -874,31 +1029,10 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
             source.get("path"), "UNMAPPABLE_SOURCES",
             "{}.path".format(source_id))
         _require_relative(path, source_id)
-        # `required` had no reader at all, so a source declared optional was
-        # projected as an ordinary `Observed` and then refused downstream with
-        # `OBSERVED_PATH_ABSENT` if it happened to be missing — a refusal about
-        # a file, for a plan defect. Maestro's `Observed` evidence has no
-        # optional form: its path must exist at base and hash. §12.3 makes
-        # that a loud refusal rather than a silent upgrade to required.
         required = source.get("required")
         if required is not True:
             raise IngressError(
                 "UNMAPPABLE_SOURCES:{}.required".format(source_id))
-        # The pin, carried rather than dropped. `docs/plan-authoring.md` makes
-        # a hash-pinned `source_artifacts` entry the only way a document enters
-        # the pipeline, and the projection was discarding the hash — so the
-        # plan's `Observed.sha256` was filled from the repository by
-        # `plan_author.fill_git_facts` and the IR's declaration was never
-        # compared to anything. Carrying it is what arms
-        # `plan_validate`'s EVIDENCE_TYPED_AGAINST_GIT obligation, and
-        # `fill_git_facts` now refuses `OBSERVED_DIGEST_MISMATCH` before any
-        # plan file is written.
-        #
-        # The comparison deliberately does not happen here. It needs the blob
-        # at the base commit, `fill_git_facts` already reads exactly that, and
-        # a second copy of the rule at this boundary would be the same fact in
-        # two places — resolved from HEAD twice, which is also two answers if
-        # HEAD moves between them.
         digest = _require_text(
             source.get("sha256"), "UNMAPPABLE_SOURCES",
             "{}.sha256".format(source_id))
@@ -906,22 +1040,15 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
                 character not in "0123456789abcdef" for character in digest):
             raise IngressError(
                 "UNMAPPABLE_SOURCES:{}.sha256".format(source_id))
-        evidence.append({
-            "kind": "observed",
-            "evidence_id": source_id,
-            "path": path,
-            "sha256": digest,
-        })
 
-    nodes = []
-    lane_ids = []
+    projected_lanes = []
+    records = []
     for lane in lanes:
         if not isinstance(lane, dict):
             raise IngressError("UNMAPPABLE_LANES")
         lane_id = lane.get("lane_id")
         if not isinstance(lane_id, str) or not lane_id:
             raise IngressError("UNMAPPABLE_LANES")
-        lane_ids.append(lane_id)
         cwd = lane.get("execution_context")
         if not isinstance(cwd, str) or cwd in {"", "lane worktree root"}:
             raise IngressError("AMBIENT_CWD:{}".format(lane_id))
@@ -929,235 +1056,119 @@ def project_draft(ir: Mapping[str, Any], repo: Path) -> dict:
         outputs = outputs_by_lane.get(lane_id)
         if not isinstance(outputs, list) or not outputs:
             raise IngressError("UNMAPPABLE_OUTPUTS:{}".format(lane_id))
-        produced_ids = []
-        for index, output in enumerate(outputs):
+        for output in outputs:
             if not isinstance(output, str):
                 raise IngressError("UNMAPPABLE_OUTPUTS:{}".format(lane_id))
             _require_relative(output, lane_id)
-            evidence_id = "produced-{}-{}".format(lane_id, index)
-            produced_ids.append(evidence_id)
-            evidence.append({
-                "kind": "produced",
-                "evidence_id": evidence_id,
-                "path": output,
-                "producer": lane_id,
-            })
         lane_verifiers = [item for item in verifiers
                           if lane_id in item["lane_ids"]]
         if len(lane_verifiers) != 1:
             raise IngressError("UNMAPPABLE_VERIFIERS:{}".format(lane_id))
         verifier = lane_verifiers[0]
-        runner, argv = _parse_verifier_command(verifier.get("command"))
-        if not argv:
-            raise IngressError("BROAD_GATE:{}".format(verifier.get("verifier_id")))
-        min_cases = _require_count(
-            verifier.get("min_executed"), "UNMAPPABLE_VERIFIERS", lane_id)
-        source_reads = _lane_source_reads(ir, lane, verifier, lane_id)
+        lane_kind = _lane_kind(lane, lane_id)
         needs = _require_id_list(
             lane.get("depends_on"), "UNMAPPABLE_LANES",
             "{}.depends_on".format(lane_id))
-        # The node's `instruction` — the prompt the builder works from and the
-        # goal the reviewer judges against. This field has been widened twice
-        # now, each time because what it carried was smaller than the brief:
-        # first from the lane id, which handed an agent the string
-        # `lane-freeze` as its whole brief, then from the lane's title, which
-        # is a headline for a requirement rather than the requirement. It now
-        # carries the title as a label and the bound requirements' own words
-        # beneath it; `_node_instruction` records why, and why the two
-        # cheaper shapes were declined.
+        claims = _bound_records(ir, lane, "claim_ids", "claims", "claim_id")
+        seams = _bound_records(ir, lane, "seam_ids", "seams", "seam_id")
         instruction = _node_instruction(ir, lane, lane_id)
-        lane_kind = lane.get("lane_kind", "build")
-        try:
-            node_kind = _LANE_KIND_TO_NODE_KIND[lane_kind]
-        except (KeyError, TypeError):
-            raise IngressError(
-                "UNMAPPABLE_LANE_KIND:{}".format(lane_id)) from None
-        node = {
-            "kind": node_kind,
-            "node_id": lane_id,
-            "needs": needs,
-            "reads": source_reads,
-            "outputs": list(outputs),
+        prose = _seam_prose(seams)
+        if prose:
+            instruction = instruction + "\n\n" + prose
+        spec = {
+            "goal": _require_text(
+                lane.get("title"), "UNMAPPABLE_LANES",
+                "{}.title".format(lane_id)),
             "instruction": instruction,
-            "gate": {
-                "runner": runner,
-                "argv": list(argv),
-                "cwd": cwd,
-                "min_cases": min_cases,
-            },
-            "prompt_assets": [],
-            # What the code inside this node may do. The reviewer's contract
-            # answered where work could happen and nothing answered this, so a
-            # node told only "make the gate pass over these outputs" judged an
-            # executing materializer compliant.
-            "effects": _node_effects(ir, lane),
+            "integration": {"integration_branch": branch},
+            "gate": _gate(verifier, cwd, lane_id),
+            "effects": _node_effects(ir, lane, lane_id),
+            "sources": _sources_for(
+                ir, _lane_source_reads(ir, lane, verifier, lane_id)),
+            "seams": [
+                {key: seam[key] for key in (
+                    "seam_id", "producer", "consumer", "contract")}
+                for seam in seams
+            ],
+            "bindings": _bindings(lane, lane_kind),
         }
-        # A tests lane's verifier carries the contract its cases must
-        # discharge, and a tests lane without one cannot be emitted.
-        #
-        # Refusing here rather than emitting a contract-less tests node is
-        # what keeps the remedy real. `maestro run start` refuses a plan whose
-        # tests nodes declare none, and if this projection could still emit
-        # one, the operator's only route -- re-ship from the IR -- would
-        # produce the same refused plan forever.
+        projected = {
+            "id": lane_id,
+            "needs": needs,
+            "outputs": list(outputs),
+            "lane_kind": lane_kind,
+            "spec": spec,
+            "acceptance": _acceptance(verifier, claims),
+        }
         strength = verifier.get("test_strength")
-        if node_kind == "tests":
-            node["test_strength"] = _projected_test_strength(
-                strength, lane_id, verifier.get("verifier_id"))
+        if lane_kind == "tests":
+            if strength is None or not isinstance(strength, Mapping):
+                raise IngressError(
+                    "UNMAPPABLE_VERIFIERS:{0}.test_strength".format(lane_id))
         elif strength is not None:
             raise IngressError(
                 "UNMAPPABLE_VERIFIERS:{}.test_strength".format(lane_id))
-        _assert_ingress_projection_is_total(ir, lane, verifier, node)
-        nodes.append(node)
+        projected_lanes.append(projected)
+        records.append((lane, verifier, projected))
 
-    # Admission, before anything is written and therefore before a run can
-    # start. Two predicates over two domains, both answering "can any correct
-    # attempt satisfy this contract?": a lane whose requirement names a
-    # repository path the lane cannot write, and a requirement that prescribes
-    # an external act its own plan forbids. Both were paid for by the same run,
-    # in which one node could not write the file its behaviour needed and
-    # another was told in one paragraph to be a pure derivation module and to
-    # perform a server-side copy. Both read declared paths, declared
-    # enumerated values, declared ids, and the depends_on graph — no free
-    # text, §1.2.
-    #
-    # Both blocker sets are collected into one refusal rather than raised in
-    # turn: an author sent back twice for two defects in one document is the
-    # fail-fast validator §11.1 rejects.
-    #
-    # It runs here rather than on one caller because this is the chokepoint
-    # every route crosses: `plan author --from-plan-contract` and `plan ship`
-    # both reach a plan file only through `project_draft`. §19 M6 is the
-    # recorded cost of siting a check on a single launch path instead.
-    #
-    # It runs after the per-lane loop so that a malformed lane, verifier or
-    # output set is still refused in its own vocabulary; a surface blocker
-    # about a lane whose outputs never parsed would name the wrong defect.
-    admission_blockers = plan_validate.validate_admission(ir)
-    if admission_blockers:
-        raise IngressError(
-            "ADMISSION_REFUSED:" + " | ".join(
-                "{} {} {}".format(blocker.obligation.value, blocker.pointer,
-                                  blocker.message)
-                for blocker in admission_blockers),
-            admission_blockers)
+    _assert_binding_closure(ir, lanes)
+    for lane, verifier, projected in records:
+        if projected["lane_kind"] == "tests":
+            paired_ids = _paired_build_lanes(ir, projected["id"])
+            by_id = {item["id"]: item for item in projected_lanes}
+            paired = [by_id[item] for item in paired_ids]
+            projected["spec"]["obligations"] = _obligations(
+                ir, lane, verifier, paired)
+        _assert_ingress_projection_is_total(
+            ir, lane, verifier, projected, maestro)
 
-    # §8.8's one integration gate, in exactly one of two forms. It used to
-    # admit three overlapping ones — `runner` plus `argv`, a `command` line to
-    # parse, or `argv` treated as that command line — chosen by an `or` chain,
-    # so `argv` meant the gate's *selector* on one branch and the whole
-    # command including its binary on the other, and an IR carrying both a
-    # `runner` and a `command` had the `command` silently ignored.
     spelled = [key for key in ("runner", "command") if key in integration]
     if len(spelled) != 1:
         raise IngressError("UNMAPPABLE_INTEGRATION:runner-or-command")
     if spelled[0] == "runner":
-        ig_runner = _require_text(
+        _require_text(
             integration.get("runner"), "UNMAPPABLE_INTEGRATION", "runner")
-        ig_argv = tuple(_require_id_list(
+        tuple(_require_id_list(
             integration.get("argv"), "UNMAPPABLE_INTEGRATION", "argv"))
     else:
         if "argv" in integration:
             raise IngressError("UNMAPPABLE_INTEGRATION:command-and-argv")
-        ig_runner, ig_argv = _parse_verifier_command(integration["command"])
+        _parse_verifier_command(integration["command"])
+    ig_argv = None
+    if spelled[0] == "runner":
+        ig_argv = tuple(_require_id_list(
+            integration.get("argv"), "UNMAPPABLE_INTEGRATION", "argv"))
+    else:
+        _ig_runner, ig_argv = _parse_verifier_command(integration["command"])
     if not ig_argv:
         raise IngressError("UNMAPPABLE_INTEGRATION:argv")
-    # The only judged-legitimate default on this path, and it is keyed on the
-    # key's absence rather than on its falsiness. `.` is not a guess about what
-    # the author meant: §8.8 runs this gate once over the integrated tree, and
-    # the repository root is the only place that tree is whole. An empty
-    # string is a malformed value rather than an omission and refuses, and a
-    # declared cwd is now validated — it never was, so the integration gate
-    # was the one path on which `../elsewhere` reached a plan unchecked while
-    # every lane cwd beside it was refused `AMBIENT_PATH`.
     if "cwd" in integration:
         ig_cwd = _require_text(
             integration.get("cwd"), "UNMAPPABLE_INTEGRATION", "cwd")
         if ig_cwd != ".":
             _require_relative(ig_cwd, "integration_gate")
-    else:
-        ig_cwd = "."
-    # One spelling, required, counted. Two accepted keys with `or` between
-    # them made a disagreement invisible, made an explicit `0` read as absent,
-    # and made an integration gate that declared no threshold adjudicate at 1
-    # — §7.4's failure exactly, at the one gate that speaks for the whole
-    # tree. The lane verifier above has always refused this way; this is that
-    # rule applied to the gate every lane ends at.
     declared = [key for key in ("min_cases", "min_executed")
                 if key in integration]
     if len(declared) != 1:
         raise IngressError("UNMAPPABLE_INTEGRATION:min_cases")
-    ig_min = _require_count(
+    _require_count(
         integration[declared[0]], "UNMAPPABLE_INTEGRATION", declared[0])
-    plan_id = _require_text(ir.get("plan_id"), "IR_SCHEMA", "plan_id")
-    # Title is its own field. It used to be consumed only into `intent` and
-    # emitted nowhere else, so nothing downstream could recover it as a name
-    # (§16.3 item 61). `intent` keeps its meaning and its readers; title is
-    # an addition. Ship refuses an untitled IR here — a field added later
-    # is optional forever on the model (§3.6 B8), so the refusal lives at
-    # this chokepoint rather than as a required parse field.
-    title = _require_text(ir.get("title"), "IR_SCHEMA", "title")
-    draft = {
-        # Read from the model rather than spelled here: the constant and the
-        # registered parser class are the same fact, and a literal beside
-        # them is a second place for it to be wrong.
-        "schema_version": (
-            # v4, not v3: every tests node this projection emits carries a
-            # test-strength contract, and v3's `TestsNode` forbids extras so
-            # such a node cannot parse under it. Emitting v3 here would ship a
-            # plan `run start` refuses, with no verb able to produce one it
-            # would accept.
-            plan_model.SCHEMA_V4
-            if any(node["kind"] == "tests" for node in nodes)
-            else plan_model.SCHEMA_V2),
-        "plan_id": plan_id,
-        "title": title,
-        "intent": title,
-        "evidence": evidence,
-        "nodes": nodes,
-        "merge_policy": {
-            "integration_branch": branch,
-            "integration_gate": {
-                "runner": ig_runner,
-                "argv": list(ig_argv),
-                "cwd": ig_cwd,
-                "min_cases": ig_min,
-            },
-        },
-    }
-    # Absent means "the repository this is being authored in", and
-    # `plan_author.fill_git_facts` already resolves exactly that from the
-    # `repo` it is handed. Resolving it here too would be one fact in two
-    # places, disagreeing the first time either moved, so the key is omitted
-    # rather than filled twice — RC1's shape, at the smallest scale it comes in.
-    if "repo" in maestro:
-        draft["repo"] = _require_text(
-            maestro["repo"], "MAESTRO_EXTENSION_MISSING", "repo")
-    return draft
+    _require_text(ir.get("plan_id"), "IR_SCHEMA", "plan_id")
+    _require_text(ir.get("title"), "IR_SCHEMA", "title")
+    return {"schema_version": SCHEMA_VERSION, "lanes": projected_lanes}
 
 
 def project_canonical_plan(
         ir_path: Path, receipt_path: Path, repo: Path,
         rendered_path: Optional[Path] = None) -> Tuple[bytes, dict, dict]:
-    """Verify the receipt and project, without writing anything.
-
-    Split out from `author_from_plan_contract` so a caller can learn what the
-    plan *would* be before deciding whether to write it. `plan author` is
-    create-once by design -- the bytes are the plan's identity, and silently
-    overwriting them would change a digest out from under whatever already
-    refers to it -- but that left `plan ship` unable to resume: a ship whose
-    finalize step failed could not be re-run, because its author step refused
-    with `PLAN_EXISTS` against the file it had itself written moments earlier.
-    Projection is a pure function of the IR, the receipt, and the repository,
-    so computing it twice costs nothing and decides the question exactly.
-    """
+    """Verify the receipt and project, without writing anything."""
     ir_bytes = Path(ir_path).read_bytes()
     ir = _load_json(ir_path, "IR_UNREADABLE")
     receipt = _load_json(receipt_path, "RECEIPT_UNREADABLE")
     rendered = Path(rendered_path).read_bytes() if rendered_path else None
     _verify_receipt(ir_bytes, receipt, rendered)
     draft = project_draft(ir, repo)
-    stored = plan_author.author_plan(draft, repo)
+    stored = plan_author.author_plan(draft)
     return stored, draft, ir
 
 
@@ -1171,9 +1182,10 @@ def author_from_plan_contract(
     plan_author.write_canonical_plan(destination, stored)
     trace = {
         "plan_id": ir.get("plan_id"),
+        "title": ir.get("title"),
+        "repo": str(repo),
         "receipt_ir_sha256": receipt.get("ir_sha256"),
-        "lanes": [node["node_id"] for node in draft["nodes"]],
-        "sources": [item["evidence_id"] for item in draft["evidence"]
-                    if item["kind"] == "observed"],
+        "lanes": [lane["id"] for lane in draft["lanes"]],
+        "sources": [item["source_id"] for item in ir["source_artifacts"]],
     }
     return stored, trace

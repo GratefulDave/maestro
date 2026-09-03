@@ -292,11 +292,22 @@ class DraftMinCasesPreflightTests(unittest.TestCase):
         self.assertEqual(len(actor.bodies), 1)
 
     def test_collection_error_fails_closed_without_test_draft(self) -> None:
-        actor = DraftActor(["def broken(\n"])
+        """One correction turn, then closed. An identical resubmit re-raises.
+
+        The tester authored the draft the refusal describes, so it is told what
+        broke -- the seal keeps private tests from the builder, not from their
+        author. Repeating the same bytes ends it, so this cannot loop.
+        """
+        actor = DraftActor(["def broken(\n", "def broken(\n"])
         scheduler = self._start(actor)
         with self.assertRaises(sch.DraftCollectionRefused) as raised:
             scheduler._writing_tests(LANE_ID)
-        self.assertEqual(len(actor.write_contexts), 1)
+        self.assertEqual(len(actor.write_contexts), 2)
+        self.assertIsNone(actor.write_contexts[0].draft_correction)
+        correction = actor.write_contexts[1].draft_correction
+        self.assertEqual(len(correction), 1)
+        self.assertIn("collect refused", correction[0]["observed_behavior"])
+        self.assertNotIn("def broken", correction[0]["observed_behavior"])
         self.assertEqual(self._drafts(), [])
         self.assertEqual(actor.review_calls, 0)
         self.assertEqual(
@@ -310,7 +321,9 @@ class DraftMinCasesPreflightTests(unittest.TestCase):
         _install_fake_vitest(self.repo)
         secret = "SECRET_ORACLE_LITERAL"
         body = _vitest_cases(1).replace("case 0", secret)
-        actor = DraftActor([body], selector=VITEST_PRIVATE)
+        # Two identical bodies: the correction turn resubmits the same bytes,
+        # which is what ends the loop.
+        actor = DraftActor([body, body], selector=VITEST_PRIVATE)
         scheduler = self._start(actor, runner="vitest")
         failed = rr.CollectFailed(
             "vitest",
@@ -324,6 +337,7 @@ class DraftMinCasesPreflightTests(unittest.TestCase):
         with mock.patch.object(rr, "collect_cases", side_effect=failed):
             with self.assertRaises(sch.DraftCollectionRefused) as raised:
                 scheduler._writing_tests(LANE_ID)
+        # The correction turn resubmitted the same bytes, so it re-raised.
         msg = str(raised.exception)
         self.assertIn("ERR_MODULE_NOT_FOUND", msg)
         self.assertIn("Cannot find package 'vitest'", msg)

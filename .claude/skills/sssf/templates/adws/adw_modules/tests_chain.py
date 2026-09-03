@@ -708,14 +708,7 @@ def _assert_declared_python(
 
 
 def _suite_selectors(gate: SimpleNamespace, files: Sequence[str]) -> tuple[str, ...]:
-    written = tuple(sorted({pr.normalize_repo_path(path) for path in files}))
-    flags = tuple(token for token in gate.argv if str(token).startswith("-"))
-    planned = tuple(
-        pr.normalize_repo_path(str(token))
-        for token in gate.argv
-        if not str(token).startswith("-")
-    )
-    selectors = planned if planned and set(planned) <= set(written) else written
+    argv, selectors = pr.substituted_gate_argv(gate.argv, files)
     if gate.runner == "pytest":
         return (
             "--rootdir",
@@ -740,7 +733,7 @@ def _suite_selectors(gate: SimpleNamespace, files: Sequence[str]) -> tuple[str, 
             "no:cacheprovider",
             "--",
         ) + selectors
-    return flags + selectors
+    return argv
 
 def _parse_suite_counts(runner: str, output: str) -> dict[str, int]:
     counts = {"passed": 0, "failed": 0, "errored": 0, "skipped": 0}

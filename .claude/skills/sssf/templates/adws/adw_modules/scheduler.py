@@ -47,6 +47,17 @@ class FactoryRefused(st.KernelError):
     code = "FACTORY_REFUSED"
 
 
+class RunnerPreflightRefused(FactoryRefused):
+    """A runner the plan names cannot run here. No agent is dispatched.
+
+    This is the harness's environment failing, never a lane's work, so it
+    refuses the run rather than sending a finding to an actor that cannot act
+    on it.
+    """
+
+    code = "RUNNER_PREFLIGHT_REFUSED"
+
+
 class DraftMinCasesRefused(FactoryRefused):
     code = "DRAFT_MIN_CASES"
 
@@ -920,19 +931,69 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
 
 
 def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleNamespace:
-    written = tuple(sorted({prv.normalize_repo_path(path) for path in files}))
-    flags = tuple(token for token in gate.argv if str(token).startswith("-"))
-    planned = tuple(
-        prv.normalize_repo_path(str(token))
-        for token in gate.argv
-        if not str(token).startswith("-")
-    )
-    selectors = planned if planned and set(planned) <= set(written) else written
+    argv, _selectors = prv.substituted_gate_argv(gate.argv, files)
     return SimpleNamespace(
         runner=gate.runner,
-        argv=flags + selectors,
+        argv=argv,
         cwd=gate.cwd,
         min_cases=gate.min_cases,
+    )
+
+
+def _collect_resolution_root(
+    gate: SimpleNamespace, tree: Path, run_repo: Path, *, provisioned: bool
+) -> Path:
+    """Where the draft's runner is resolved from. The rule `tests_chain` states.
+
+    `prepare_collect_tree` symlinks the runtime root's `node_modules` into the
+    tree, so a vitest resolved against the runtime root is the same
+    installation the tree imports from. Nothing bridges a Python environment,
+    so a pytest resolved against the runtime root is the *real* repository's
+    interpreter pointed at the tree's source.
+
+    `tests_chain._sealed_suite` has drawn that distinction since it was
+    written; this call site did not, and resolved everything against the
+    runtime root. FDAdb has no `.venv`, so rank 1 was empty, resolution fell
+    through to `uv run pytest`, uv discovered a *different* repository's
+    environment, and every pytest draft was refused
+    `no usable pytest was found for .` before a single case was collected --
+    measured 2026-09-03 on `lane-wp7-gw-dpa-tests`, seven seconds after the
+    tester's first draft, with the declared output present in the envelope.
+
+    `provisioned` is what keeps this from being a stricter rule than the
+    deployment can satisfy. A deployment that declares no `provision_argv`
+    has no environment in the tree to prefer, and preferring it anyway would
+    refuse every pytest draft in a deployment that collected fine before.
+    Where there is nothing to provision, the runtime root is the only
+    environment there is.
+    """
+    if gate.runner == "pytest" and provisioned:
+        return Path(tree)
+    return Path(run_repo)
+
+
+def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
+    """The collection refusal, as a finding its own author can act on.
+
+    A draft that lists too few cases gets one correction turn; a draft that
+    cannot be collected at all used to raise straight past it, so the tester
+    was never told what broke and wrote the same draft on every resume. The
+    detail is the text the refusal already carries, redacted at the raise, and
+    the tester authored the files it describes -- the seal keeps private tests
+    from the builder, not from the actor that wrote them.
+    """
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": "native collect refused: {0}".format(detail),
+                "required_behavior": (
+                    "the draft must collect under the lane's gate command; fix "
+                    "what the refusal names and resubmit"
+                ),
+                "violated_requirement": "gate collection",
+            },
+        )
     )
 
 
@@ -1052,6 +1113,7 @@ class FactoryScheduler:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._handle_sigint)
         try:
+            self._assert_runners_usable()
             self._recover_legacy_retarget_journal()
             self._resume_orphaned_integration_merge()
             self._maybe_correct_legacy_integration_base()
@@ -1677,7 +1739,20 @@ class FactoryScheduler:
             return dict(files)
         current = dict(files)
         seen = st.digest_canonical(current)
-        collected = self._collect_private_draft(ctx, gate, current)
+        try:
+            collected = self._collect_private_draft(ctx, gate, current)
+        except DraftCollectionRefused as refused:
+            # One correction turn, on the same channel a short draft gets. An
+            # identical resubmission re-raises, so this cannot loop.
+            correction = _draft_collection_findings(str(refused))
+            extra = dict(
+                self.actor.write_tests(replace(ctx, draft_correction=correction))
+            )
+            current = _write_test_files(extra)
+            if st.digest_canonical(current) == seen:
+                raise
+            seen = st.digest_canonical(current)
+            collected = self._collect_private_draft(ctx, gate, current)
         if collected >= gate.min_cases:
             return current
         correction = _draft_min_cases_findings(collected, gate.min_cases)
@@ -1691,6 +1766,68 @@ class FactoryScheduler:
         if collected >= gate.min_cases:
             return current
         raise DraftMinCasesRefused(collected, gate.min_cases)
+
+    def _assert_runners_usable(self) -> None:
+        """Every runner the plan names must run, before any agent is dispatched.
+
+        A lane's runner was first exercised at draft collection -- after a
+        tester had been dispatched, had spent its turn, and had written a
+        correct draft. On 2026-09-03 `lane-wp7-gw-dpa-tests` spent nine
+        minutes producing a valid suite and was refused seven seconds later
+        with `no usable pytest was found for .`; a correction turn then asked
+        the tester to fix an environment it does not own, and it spent four
+        more minutes. Nothing the tester could write was the thing that was
+        wrong, and the run had no way to say so.
+
+        One tree per distinct `(runner, cwd)` the plan names, provisioned the
+        way collection provisions, and resolved. The tree is discarded; only
+        the verdict is kept. This is the whole plan's environment answered
+        once, at the chokepoint both run verbs cross, instead of per lane at
+        the point where it is too late to be cheap.
+        """
+        wanted: dict[tuple[str, str], None] = {}
+        for lane in self.store.active_projection(self.run_id):
+            gate = _lane_gate(self.actor, lane.lane_id)
+            if gate is None:
+                continue
+            wanted.setdefault((gate.runner, gate.cwd), None)
+        if not wanted:
+            return
+        run_repo = Path(self.target.target_repository_root)
+        vault = hv.ensure_vault(self.runtime.path, self.run_id)
+        base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
+        unusable: list[str] = []
+        for runner, cwd in wanted:
+            dest = hv.scratch_worktree_path(
+                self.runtime.path / "worktrees", "runner-preflight-{0}".format(runner)
+            )
+            hv.checkout_vault_worktree(vault, base, dest)
+            try:
+                self._say("", "checking {0} is usable in {1}".format(runner, cwd))
+                cr.provision_tree(
+                    dest, self._provision_argv, self._provision_timeout_s
+                )
+                rr.prepare_collect_tree(run_repo, dest)
+                probe_gate = SimpleNamespace(runner=runner, cwd=cwd)
+                rr.resolve(
+                    runner,
+                    _collect_resolution_root(
+                        probe_gate, dest, run_repo,
+                        provisioned=bool(self._provision_argv),
+                    ),
+                    cwd,
+                )
+            except rr.RunnerUnusable as extra:
+                detail = getattr(extra, "detail", None) or str(extra)
+                unusable.append(
+                    "{0} in {1}: {2}".format(
+                        runner, cwd, prv.redact_text(str(detail), (str(dest),))
+                    )
+                )
+            finally:
+                _remove_collect_tree(dest, vault)
+        if unusable:
+            raise RunnerPreflightRefused("; ".join(unusable))
 
     def _collect_private_draft(
         self,
@@ -1707,8 +1844,19 @@ class FactoryScheduler:
         )
         hv.checkout_vault_worktree(vault, base, dest)
         try:
+            # Before any private byte is written, exactly as the review tree
+            # provisions: nothing this runs, reads, or reports in an error can
+            # carry draft test bytes. It is also what puts an interpreter in
+            # the tree for `_collect_resolution_root` to find.
+            cr.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
             prv.write_files(dest, files)
-            resolved = rr.resolve(gate.runner, run_repo, gate.cwd)
+            resolved = rr.resolve(
+                gate.runner,
+                _collect_resolution_root(
+                    gate, dest, run_repo, provisioned=bool(self._provision_argv)
+                ),
+                gate.cwd,
+            )
             ids = rr.collect_cases(
                 resolved,
                 _collect_gate(gate, files),

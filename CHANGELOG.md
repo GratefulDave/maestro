@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **Plan-contract IRs project onto `maestro-plan.artifact-factory.v1` lanes.**
+  `adw_modules/plan_contract_ingress.py` receipt-verifies an approved IR and
+  emits compiler-admissible lanes. Authoring is
+  `uv run adws/tools/plan_author_cli.py --from-plan-contract <ir> --receipt <receipt>
+  --out <plan> --repo <target-worktree-root> [--rendered <html>]`, not a
+  `maestro.py` verb. A bound requirement that performs or omits a prohibited
+  effect is refused `UNMAPPABLE_EFFECTS:<lane>.<effect>`.
 - **The sealed suite is measured before the code reviewer votes.**
   `code_review.measure_candidate` runs the suite once and hands the reviewer
   the five public counts; a reviewer that returns no locatable finding against
@@ -30,6 +37,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **A runner the plan names is proven usable before any agent is dispatched.**
+  A lane's runner was first exercised at draft collection — after a tester had
+  been dispatched, spent its turn, and written a correct draft. On FDAdb
+  `lane-wp7-gw-dpa-tests` the tester spent nine minutes producing a valid suite
+  and was refused seven seconds later with `no usable pytest was found for .`,
+  then handed a correction turn asking it to fix an environment it does not
+  own. `FactoryScheduler._assert_runners_usable` now provisions one tree per
+  distinct `(runner, cwd)` the plan names and resolves each, at the chokepoint
+  both run verbs cross, refusing `RUNNER_PREFLIGHT_REFUSED` — a harness fault,
+  never a finding sent to an actor that cannot act on it.
+- **A pytest draft resolves against the tree it will collect in.**
+  `tests_chain._sealed_suite` has drawn that distinction since it was written:
+  vitest resolves against the runtime root because `prepare_collect_tree` links
+  its `node_modules` in, and nothing bridges a Python environment, so a pytest
+  resolved against the runtime root is the *real* repository's interpreter
+  pointed at the tree's source. `_collect_private_draft` resolved everything
+  against the runtime root, and the draft-collect tree was the one materialized
+  tree never provisioned. It now provisions before any private byte is written
+  — the containment order the review tree already keeps — and
+  `_collect_resolution_root` applies the sealed-suite rule, scoped to
+  deployments that declare `provision_argv`, since a deployment that provisions
+  nothing has no tree environment to prefer.
+- **A gate's argv keeps its options paired with their values.** `_collect_gate`
+  and `_suite_selectors` partitioned `gate.argv` into `-`-prefixed tokens and
+  everything else and concatenated the two groups, which detaches an option
+  from its value. On FDAdb `lane-wp7-cookie-tests` the authored
+  `--config tests/wp7-checkout/vitest.config.ts …` reached vitest as
+  `--config <a test file>`; vite loaded that file as a config, evaluated
+  `vitest` outside a worker, and refused with `Vitest failed to access its
+  internal state`. Four tester turns were refused identically, because nothing
+  the tester could write was the thing that was wrong. Both call sites now use
+  `private_review.substituted_gate_argv`, which rebuilds the argv in place: a
+  bare token after a `-`-prefixed token carrying no `=` is that option's value,
+  a planned selector the draft did not write is dropped, and a written file the
+  plan did not name is appended.
+- **A runner that enumerated and then would not exit has answered.**
+  `collect_cases` called `subprocess.run(timeout=…)`, so a timeout raised past
+  the output the child had already written and blamed the draft for it, and it
+  killed one pid rather than the process tree. `vitest list` under an Astro
+  `getViteConfig` prints its complete listing and never exits — the
+  Astro/Cloudflare pipeline holds the Vite server open and `list` has no
+  force-exit path the way `vitest run` does. Collection was refused at 120s and
+  twice more at 600s with all six case ids already on stdout, and the probe
+  processes were alive twenty-eight minutes later. Both runner invocations now
+  go through `runner_resolution.run_bounded`, which gives the child its own
+  session and kills the group on timeout; collection keeps a listing that
+  arrived before the hang and refuses only on an empty one.
 - **Every vault ref is named by what it pins.** Draft and sealed refs were keyed
   on the review's `input_digest` but pinned a `git commit` sha, which embeds the
   wall clock; a second draft of one input a second later asked the same ref to

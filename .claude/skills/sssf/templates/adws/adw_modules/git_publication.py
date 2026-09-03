@@ -10,7 +10,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -471,6 +471,37 @@ def measure_tree_delta(
     git = binding.git()
     raw = git.diff_tree_raw(base_sha, candidate_sha)
     return parse_diff_tree(raw)
+
+
+def publication_touched_paths(
+    binding: TargetBinding,
+    *,
+    expected_before_sha: str,
+    reviewed_integration_sha: str,
+) -> frozenset[str]:
+    """Every worktree path this publication will create, replace, or delete.
+
+    The synchronizer only ever opens a path the delta names: `_phase_a_backup`
+    verifies and renames the `delete`/`replace` leaves, and materializing the
+    reviewed index writes the `add` ones. A file the delta does not name is
+    never read, never moved, and never overwritten, so its presence cannot
+    damage the publication.
+    """
+    if expected_before_sha == reviewed_integration_sha:
+        return frozenset()
+    return frozenset(
+        path
+        for entry in measure_tree_delta(
+            binding, expected_before_sha, reviewed_integration_sha
+        )
+        for path in entry.represented_paths()
+    )
+
+
+def collides(observed: Sequence[str], touched: Collection[str]) -> tuple[str, ...]:
+    """The observed paths publication would have to write over, in order."""
+
+    return tuple(path for path in observed if path in touched)
 
 
 def validate_declared_ownership(
@@ -1074,12 +1105,21 @@ def _preflight_publication(
         raise GitPublicationRefused("PUBLICATION_PREFLIGHT_REFUSED", "index dirty")
     if not git.diff_files_quiet(git_dir=binding.target_worktree_git_dir):
         raise GitPublicationRefused("PUBLICATION_PREFLIGHT_REFUSED", "worktree dirty")
-    untracked = git.ls_others(ignored=False, git_dir=binding.target_worktree_git_dir)
+    touched = publication_touched_paths(
+        binding,
+        expected_before_sha=expected_before_sha,
+        reviewed_integration_sha=reviewed_integration_sha,
+    )
+    untracked = collides(
+        git.ls_others(ignored=False, git_dir=binding.target_worktree_git_dir), touched
+    )
     if untracked:
         raise GitPublicationRefused(
             "PUBLICATION_PREFLIGHT_REFUSED", "untracked:" + ",".join(untracked)
         )
-    ignored = git.ls_others(ignored=True, git_dir=binding.target_worktree_git_dir)
+    ignored = collides(
+        git.ls_others(ignored=True, git_dir=binding.target_worktree_git_dir), touched
+    )
     if ignored:
         raise GitPublicationRefused(
             "PUBLICATION_PREFLIGHT_REFUSED", "ignored:" + ",".join(ignored)
@@ -1187,9 +1227,20 @@ def _verify_postconditions(
         raise GitPublicationRefused("PUBLICATION_POSTCONDITION", "index")
     if not git.diff_files_quiet(git_dir=binding.target_worktree_git_dir):
         raise GitPublicationRefused("PUBLICATION_POSTCONDITION", "worktree")
-    if git.ls_others(
-        ignored=False, git_dir=binding.target_worktree_git_dir
-    ) or git.ls_others(ignored=True, git_dir=binding.target_worktree_git_dir):
+    # Scoped to the published paths for the same reason the preflight is: a
+    # `node_modules/` the synchronizer never opened says nothing about whether
+    # it applied the reviewed tree. A published path that is still untracked
+    # here would already have failed the index comparison above.
+    touched = publication_touched_paths(
+        binding,
+        expected_before_sha=git.rev_parse(binding.target_main_ref),
+        reviewed_integration_sha=reviewed_integration_sha,
+    )
+    if collides(
+        git.ls_others(ignored=False, git_dir=binding.target_worktree_git_dir), touched
+    ) or collides(
+        git.ls_others(ignored=True, git_dir=binding.target_worktree_git_dir), touched
+    ):
         raise GitPublicationRefused("PUBLICATION_POSTCONDITION", "untracked")
 
 

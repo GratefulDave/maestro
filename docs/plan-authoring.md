@@ -120,17 +120,22 @@ Run these in the repository the plan will change.
    view, and its review receipt under `.maestro/`.
 3. Obtain an independent PASS review receipt bound to the exact IR bytes. Adding
    `extensions.maestro` after that receipt changes the bytes and is refused.
-4. `uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>`
+4. `uv run adws/tools/plan_author_cli.py --from-plan-contract <ir> --receipt <receipt> --out <plan> --repo <target-worktree-root>`
+   — verifies the receipt against the IR bytes, projects lanes, runs the same objective compiler
+   as `run start`, and writes canonical plan bytes once (`PLAN_EXISTS` on a second call).
+   Authoring writes a plan file and starts no run, so it is a tool rather than an operator verb;
+   the operator surface stays frozen at `run start`, `run resume`, `run amend`, `run status`.
+5. `uv run adws/maestro.py run start <approved-plan> --repo <target-worktree-root> --main-ref <ref>`
    — creates the run, initial plan revision, complete DAG projection, and `PLANNED` lanes in one
    transaction, then creates the integration ref. Operator execution is only from the stamped
    `adws/` deployment.
-5. `run resume <run-id>` continues the next incomplete stage from the last accepted immutable
+6. `run resume <run-id>` continues the next incomplete stage from the last accepted immutable
    artifact. After an explicit pause it restores the recorded stage/input. After
    `AMENDMENT_REQUIRED` it leaves the lane waiting.
-6. `run amend <approved-plan> --run <run-id>` is the only verb that may apply a `PLAN_AMENDMENT`. Named already-merged lanes must
+7. `run amend <approved-plan> --run <run-id>` is the only verb that may apply a `PLAN_AMENDMENT`. Named already-merged lanes must
    change `spec_digest` (hence `lane_projection_digest`); `needs`/output changes on merged lanes are
    refused.
-7. `run status <run-id>` derives run status from durable rows after revalidating
+8. `run status <run-id>` derives run status from durable rows after revalidating
    `runtime_state_fingerprint`.
 
 There is no `retry`, `skip`, `abandon`, or `attempt salvage` verb. Those mechanisms are withdrawn.
@@ -249,8 +254,10 @@ admits a plan by schema-version allowlist of those projections; it admits object
 properties only.
 
 `plan_contract_ingress.author_from_plan_contract` verified a receipt against IR bytes and projected
-lanes onto nodes, `depends_on` onto `needs`, `execution_context` onto gate `cwd`, and `verifiers[]`
-onto `pytest`/`vitest` gates. That gate object is not a lane stage.
+lanes. The node/gate shape is withdrawn; the projection now emits
+`maestro-plan.artifact-factory.v1` lanes via `tools/plan_author_cli.py`. `depends_on` maps onto `needs`,
+`execution_context` onto gate `cwd`, and `verifiers[]` onto `pytest`/`vitest` gates. That gate
+object is not a lane stage.
 
 ### Historical `plan gate` / `review` / `ship` and bootstrap keys
 
