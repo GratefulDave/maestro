@@ -1467,6 +1467,11 @@ class HerdrStageActor:
             workspace_label=self._workspace_label(ctx),
             pane_group_size=len(lch.LANE_PANE_ROLES),
             role_cwds=self._role_cwds(ctx),
+            child_anchor=(
+                None
+                if (cwd / ".git").exists()
+                else Path(self.target.target_repository_root)
+            ),
             prepare_adopted_cwd=prepare_adopted_cwd,
         )
         try:
