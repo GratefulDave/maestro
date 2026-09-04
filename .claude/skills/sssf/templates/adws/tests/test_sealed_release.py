@@ -401,12 +401,18 @@ class SealedReleaseTests(unittest.TestCase):
             self.store.lane_stage("run-amend", "lane-build"), st.LaneStage.PLANNED
         )
         resume = _RecordingActor(self.repo, self.runtime.path / "worktrees")
-        # The amended build's first candidate is green. `_sealed_error_history`
-        # counts CODE_REVIEW rounds across plan revisions (only a USER_WAIT
-        # resets it), so a red opening round after revision 1's green one reads
-        # as three rounds without a new low and pauses the lane NO_PROGRESS.
-        # That rule is not what this case is about; it is tracked separately.
+        # The amended build's first candidate is green and its reviewer agrees.
+        # `_sealed_error_history` counts CODE_REVIEW rounds across plan
+        # revisions (only a USER_WAIT resets it), so a third round that fails to
+        # set a strict new low pauses the lane NO_PROGRESS. Both seeds are
+        # needed for that: `build_lanes` makes the candidate "ready" so the
+        # suite is green, and `code_rounds` skips `HandoffActor`'s scripted
+        # opening REVISE, which since #208 is no longer rewritten to PASS by a
+        # green suite and would otherwise be the stalling third round. The
+        # NO_PROGRESS rule is not what this case is about; it is tracked
+        # separately.
         resume.build_lanes.append("lane-build")
+        resume.code_rounds["lane-build"] = 1
         scheduler = self._scheduler(amended, resume, "run-amend")
         # The re-seal proves absence against a repository that holds the
         # released blob at the released path; that is not a leak, and the
