@@ -796,6 +796,16 @@ class LaneContext:
     #: field existed. Derived from the sealed files by `bound_surface`, which
     #: extracts identifiers and never literals, numbers, or fixture data.
     bound_surface: Mapping[str, Any] | None = None
+    #: The paths of THIS lane's own sealed acceptance suite -- for a build
+    #: lane, its tests-lane predecessor's; for an untyped lane, its own. The
+    #: builder's checkout must not hold a file at any of them, whatever its
+    #: base carries. A build lane's merge releases that suite into the
+    #: integration ref, so after an amendment the lane's own new base is an
+    #: integration head that carries the suite it is graded against. The merge
+    #: cannot un-release it; `maestro._refresh_builder_checkout` removes it
+    #: from the working tree instead. Other lanes' released suites are not
+    #: here: they are part of the surface this lane legitimately builds on.
+    sealed_private_paths: tuple[str, ...] = ()
 
 
 class StageActor(Protocol):
@@ -2213,6 +2223,26 @@ class FactoryScheduler:
                 released.add(blob)
         return frozenset(released)
 
+    def _own_sealed_paths(
+        self, lane: st.LaneProjection, sealed: ArtifactRecord
+    ) -> tuple[str, ...]:
+        """Where this lane's own sealed acceptance suite lives in a tree.
+
+        `sealed` is what `_sealed_for` resolved: for a build lane its
+        tests-lane predecessor's bundle, for an untyped lane its own. Read
+        the same way `_bound_surface` reads it, so the two agree about which
+        bundle is the lane's own.
+
+        Names only -- the keys of the path-to-blob map, never a blob. These
+        are the paths `maestro._refresh_builder_checkout` removes from the
+        builder's working tree. A vault read that fails leaves the set empty,
+        which would silently drop the guard, so it is allowed to raise: a
+        builder launched over its own suite is worse than a refused lane.
+        """
+        vault = hv.ensure_vault(self.runtime.path, self.run_id)
+        blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(sealed, lane))
+        return tuple(sorted(blobs))
+
     def _bound_surface(
         self, lane: st.LaneProjection, sealed: ArtifactRecord
     ) -> Mapping[str, Any] | None:
@@ -2351,6 +2381,7 @@ class FactoryScheduler:
                 declared_outputs=lane.declared_outputs,
             ),
             sealed_digest=str(sealed.payload.get("sealed_digest") or ""),
+            sealed_private_paths=self._own_sealed_paths(lane, sealed),
         )
         surface = self._bound_surface(lane, sealed)
         if surface is not None:

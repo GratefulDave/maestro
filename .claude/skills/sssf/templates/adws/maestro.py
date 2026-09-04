@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
@@ -1091,10 +1091,62 @@ class HerdrStageActor:
             kept.append(rel)
         return tuple(kept)
 
+    @staticmethod
+    def _exclude_pathspec(paths: Sequence[str]) -> tuple[str, ...]:
+        """`paths` as pathspec terms that subtract, matched literally.
+
+        `literal` because a sealed path is a git tree path and may hold a
+        glob character; without it `tests/[id].py` would subtract nothing.
+        """
+        return tuple(":(exclude,literal){0}".format(str(path)) for path in paths)
+
+    def _strip_paths(self, checkout: Path, paths: Sequence[str]) -> None:
+        """Remove `paths` from a working tree without recording a deletion.
+
+        The index is left alone, so nothing here can reach a candidate: the
+        removal is invisible to `git diff --cached base`, and callers subtract
+        the same paths from the commit pathspec so `git add -A` cannot stage
+        it either. `git reset --hard` puts every one of them back, which is
+        why this runs after each materialization rather than once.
+
+        `os.unlink` never follows a symlink, so a link planted at a sealed
+        path is removed rather than dereferenced. Emptied parents go too:
+        leaving `tests/acceptance/` behind names the suite's location, which
+        the builder is not told either.
+        """
+        root = checkout.resolve()
+        for raw in paths:
+            relative = PurePosixPath(str(raw))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise FactoryRefused("SEALED_STRIP_PATH_UNSAFE:{0}".format(raw))
+            target = checkout / Path(*relative.parts)
+            try:
+                os.unlink(target)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                # Anything else -- a directory planted at a sealed path, an
+                # unwritable parent -- fails closed. A builder launched over
+                # its own suite is worse than a refused lane.
+                raise FactoryRefused("SEALED_STRIP_REFUSED:{0}".format(raw)) from exc
+            parent = target.parent
+            while parent != checkout and root in parent.resolve().parents:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
     def _commit_declared(
-        self, checkout: Path, outputs: Sequence[str], base: str
+        self,
+        checkout: Path,
+        outputs: Sequence[str],
+        base: str,
+        *,
+        strip: Sequence[str] = (),
     ) -> tuple[str, bool]:
         requested = tuple(str(item) for item in outputs)
+        excluded = self._exclude_pathspec(strip)
         pathspec: tuple[str, ...] = ()
         if requested:
             listed = self._git(
@@ -1106,11 +1158,12 @@ class HerdrStageActor:
                 "--exclude-standard",
                 "--",
                 *requested,
+                *excluded,
             )
             pathspec = self._safe_role_pathspec(
                 checkout,
                 tuple(item for item in listed.split("\0") if item),
-                self._deleted_tracked(checkout, *requested),
+                self._deleted_tracked(checkout, *requested, *excluded),
             )
         if pathspec:
             self._git(checkout, "add", "-A", "--", *pathspec)
@@ -1128,6 +1181,7 @@ class HerdrStageActor:
         self._git(checkout, "reset", "--hard", base)
         self._clean_checkout(checkout)
         if not patch:
+            self._strip_paths(checkout, strip)
             return base, False
         self._git_bytes(
             checkout,
@@ -1140,7 +1194,12 @@ class HerdrStageActor:
         self._git(checkout, "config", "user.email", "maestro-builder@invalid")
         self._git(checkout, "config", "user.name", "maestro-builder")
         self._git(checkout, "commit", "-m", "declared outputs")
-        return self._git(checkout, "rev-parse", "HEAD"), True
+        candidate = self._git(checkout, "rev-parse", "HEAD")
+        # `reset --hard` above put the suite back and the commit carries it.
+        # Take it out again before returning: the builder's session lives in
+        # this directory between turns.
+        self._strip_paths(checkout, strip)
+        return candidate, True
 
     def _clean_checkout(self, checkout: Path) -> None:
         self._git(checkout, "clean", "-fdx", "-e", lch.ROLE_AGENT_DIR)
@@ -1152,17 +1211,41 @@ class HerdrStageActor:
         self._clean_checkout(checkout)
 
     def _refresh_builder_checkout(
-        self, checkout: Path, outputs: Sequence[str], base: str
+        self,
+        checkout: Path,
+        outputs: Sequence[str],
+        base: str,
+        *,
+        strip: Sequence[str] = (),
     ) -> None:
+        """Put the builder's checkout at `base`, minus its own sealed suite.
+
+        `strip` is the lane's own acceptance suite. Its base may legitimately
+        carry it: a build lane's merge releases the predecessor suite into the
+        integration ref, so after an amendment the lane restarts at an
+        integration head holding the very tests it is graded against. The
+        merge cannot un-release it, and a builder that can read its
+        acceptance tests writes to the assertions instead of the requirement
+        -- this repository's `sealed_probe` recovered thirteen hidden literals
+        from one bit of feedback per query and shipped a candidate that looked
+        clean. The removal stays out of the index, so the candidate delta
+        never names the suite and `validate_declared_ownership` sees the same
+        delta it always did.
+
+        A stripped path is subtracted from the dirtiness measurement too:
+        absence here is the guard doing its job, not the builder's work.
+        """
         if not (checkout / ".git").exists():
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         head = self._git(checkout, "rev-parse", "HEAD")
         parent = self._git(checkout, "rev-parse", "HEAD^", check=False)
-        dirty = bool(self._git(checkout, "status", "--porcelain"))
+        scope = ("--", ".") + self._exclude_pathspec(strip) if strip else ()
+        dirty = bool(self._git(checkout, "status", "--porcelain", *scope))
         if not dirty and (head == base or parent == base):
             self._clean_checkout(checkout)
+            self._strip_paths(checkout, strip)
             return
-        self._commit_declared(checkout, outputs, base)
+        self._commit_declared(checkout, outputs, base, strip=strip)
 
 
     def _refresh_private_tree(self, ctx: LaneContext, cwd: Path) -> None:
@@ -1704,6 +1787,10 @@ class HerdrStageActor:
 
     def build(self, ctx: LaneContext) -> Mapping[str, Any]:
         sha = self._base_sha(ctx, "builder")
+        # The lane's own acceptance suite, kept out of the checkout for the
+        # whole turn. Never in `extra` -- these are paths, and a path is a
+        # name the builder has no reason to hold.
+        strip = tuple(ctx.sealed_private_paths)
         extra: dict[str, Any] = {
             "builder_base_sha": sha,
             "declared_outputs": list(ctx.lane.declared_outputs),
@@ -1754,18 +1841,25 @@ class HerdrStageActor:
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
+        # `prepare_cwd` is not enough on its own. `_launch` calls it on the
+        # resubmit path, on an adopted pane, and on a superseded session --
+        # but a FIRST launch goes straight from `_prepare`, which materialized
+        # the worktree at `sha`, to `launcher.launch`. That is the turn an
+        # amended lane opens with, and `sha` is the integration head that
+        # carries its own suite, so the first turn is exactly the leak.
+        self._strip_paths(cwd, strip)
         _payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
             cwd,
             extra,
             prepare_cwd=lambda path: self._refresh_builder_checkout(
-                path, ctx.lane.declared_outputs, sha
+                path, ctx.lane.declared_outputs, sha, strip=strip
             ),
         )
         cwd_used = self._bind_checkout(key, attempt, checkout, cwd_used)
         candidate_sha, changed = self._commit_declared(
-            cwd_used, ctx.lane.declared_outputs, sha
+            cwd_used, ctx.lane.declared_outputs, sha, strip=strip
         )
         return {"candidate_sha": candidate_sha, "changed": changed}
 
