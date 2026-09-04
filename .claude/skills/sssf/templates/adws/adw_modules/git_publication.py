@@ -14,6 +14,7 @@ from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Iterator, Literal
 from . import scheduler_types as st
 from . import workspace_receipt as wr
@@ -635,7 +636,18 @@ def decide_merge_action(
     builder_base_sha: str,
     candidate_sha: str,
     integration_head: str,
+    sealed_present: bool = True,
 ) -> MergeDecision:
+    """Which of the three READY_TO_MERGE edges this candidate takes.
+
+    `sealed_present` is whether the integration HEAD already carries the
+    accepted suite this merge releases (`sealed_files_present`). A zero-delta
+    candidate is revalidated only when it does: a merge changes the
+    integration tree by exactly the suite otherwise, and that is a merge
+    with a commit, not a revalidation that creates none. A stale base is
+    `BASE_INVALIDATION` first regardless -- the suite is released against the
+    head the builder actually read, never against one it has not seen.
+    """
     if not changed and builder_base_sha != integration_head:
         return MergeDecision(
             action="BASE_INVALIDATION",
@@ -649,6 +661,14 @@ def decide_merge_action(
             raise GitPublicationRefused(
                 "CANDIDATE_OUTPUT_OWNERSHIP_REFUSED",
                 "zero-delta candidate must equal integration HEAD",
+            )
+        if not sealed_present:
+            return MergeDecision(
+                action="MERGE",
+                before_sha=integration_head,
+                candidate_sha=candidate_sha,
+                integration_head=integration_head,
+                builder_base_sha=builder_base_sha,
             )
         return MergeDecision(
             action="REVALIDATE",
@@ -737,6 +757,27 @@ def integration_merge_payload(
     }
 
 
+def _merge_parents(before_sha: str, candidate_sha: str) -> tuple[str, ...]:
+    """The parents of an integration merge commit.
+
+    A zero-delta candidate is the integration HEAD itself; git drops a
+    repeated parent silently, so name it once here and compare against the
+    same rule on reconciliation instead of reading back a tuple git rewrote.
+    """
+    if candidate_sha == before_sha:
+        return (before_sha,)
+    return (before_sha, candidate_sha)
+
+
+def sealed_files_present(binding: TargetBinding, sha: str, files: Mapping[str, bytes]) -> bool:
+    """Whether the tree at `sha` carries every file in `files` byte-for-byte."""
+    git = binding.git()
+    for path, data in files.items():
+        if git.tree_blob(sha, path) != git.hash_object(data, write=False):
+            return False
+    return True
+
+
 def _expected_merge_commit(
     git: BoundGit,
     *,
@@ -747,9 +788,16 @@ def _expected_merge_commit(
     candidate_sha: str,
     before_sha: str,
     epoch_seconds: int,
+    sealed_files: Mapping[str, bytes] = MappingProxyType({}),
 ) -> tuple[str, str, bytes]:
     try:
         tree = git.merge_tree_write_tree(before_sha, candidate_sha)
+        # The accepted suite rides in the same commit as the code it judged.
+        # Until here it lived only in the vault so the builder could not
+        # shape the candidate to its assertions; that builder is done, its
+        # candidate is reviewed, and the integration reviewer and every
+        # later reader get code and tests together.
+        tree = git.overlay_tree(tree, sealed_files)
     except GitError as exc:
         raise GitPublicationRefused(exc.code, exc.detail) from exc
     message = canonical_merge_message(
@@ -762,7 +810,10 @@ def _expected_merge_commit(
         expected_tree_sha=tree,
     )
     after = git.commit_tree(
-        tree, (before_sha, candidate_sha), message, epoch_seconds=epoch_seconds
+        tree,
+        _merge_parents(before_sha, candidate_sha),
+        message,
+        epoch_seconds=epoch_seconds,
     )
     return after, tree, message
 
@@ -781,6 +832,7 @@ def execute_exact_sha_merge(
     before_sha: str,
     epoch_seconds: int,
     input_digest: str,
+    sealed_files: Mapping[str, bytes] = MappingProxyType({}),
 ) -> dict[str, Any]:
     revalidate_binding(binding)
     git = binding.git()
@@ -804,6 +856,7 @@ def execute_exact_sha_merge(
         candidate_sha=candidate_sha,
         before_sha=before_sha,
         epoch_seconds=epoch_seconds,
+        sealed_files=sealed_files,
     )
     try:
         git.update_ref(ref, after, before_sha)
@@ -876,6 +929,7 @@ def reconcile_integration_merge(
     before_sha: str,
     epoch_seconds: int,
     input_digest: str,
+    sealed_files: Mapping[str, bytes] = MappingProxyType({}),
 ) -> dict[str, Any]:
     revalidate_binding(binding)
     git = binding.git()
@@ -904,6 +958,7 @@ def reconcile_integration_merge(
             before_sha=before_sha,
             epoch_seconds=epoch_seconds,
             input_digest=input_digest,
+            sealed_files=sealed_files,
         )
     expected, tree, message = _expected_merge_commit(
         git,
@@ -914,11 +969,12 @@ def reconcile_integration_merge(
         candidate_sha=candidate_sha,
         before_sha=before_sha,
         epoch_seconds=epoch_seconds,
+        sealed_files=sealed_files,
     )
     parents = git.commit_parents(head)
     if (
         head != expected
-        or parents != (before_sha, candidate_sha)
+        or parents != _merge_parents(before_sha, candidate_sha)
         or git.commit_tree_oid(head) != tree
         or git.commit_message(head) != message
     ):

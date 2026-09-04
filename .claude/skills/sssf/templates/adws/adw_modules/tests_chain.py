@@ -10,7 +10,7 @@ import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 from . import hidden_vault as hv
 from . import private_review as pr
@@ -275,7 +275,17 @@ def seal_accepted_tests(
     builder_worktree: Path | None,
     test_draft: st.LaneArtifact,
     test_review: st.LaneArtifact,
+    released: Collection[str] = (),
 ) -> st.LaneArtifact:
+    """Seal the accepted draft and prove its bytes are still private.
+
+    `released` names the object ids the run repository is allowed to hold:
+    the blobs a build lane's integration merge already carried out of the
+    vault at these same paths (`FactoryScheduler._released_object_ids`). An
+    unchanged tests lane re-sealing after an amendment finds its own accepted
+    bytes in the product repository for that reason and no other; anything
+    else present there is still a leak and still refuses.
+    """
     if test_draft.kind is not st.ArtifactKind.TEST_DRAFT:
         raise pr.PrivateReviewError("seal requires TEST_DRAFT")
     if test_review.kind is not st.ArtifactKind.TEST_REVIEW:
@@ -296,7 +306,9 @@ def seal_accepted_tests(
     sealed_digest = _manifest_digest(commit, private)
     sealed = hv.sealed_ref(request.run_id, request.lane_id, sealed_digest)
     object_ids = (commit,) + tuple(blob for _path, blob in private)
-    hv.prove_absent((run_repo,), object_ids)
+    hv.prove_absent(
+        (run_repo,), tuple(oid for oid in object_ids if oid not in released)
+    )
     if builder_worktree is not None:
         hv.prove_absent((builder_worktree,), object_ids)
         if commit in hv.advertised_object_ids(run_repo):

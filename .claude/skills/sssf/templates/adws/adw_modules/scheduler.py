@@ -529,6 +529,53 @@ def plan_artifact_ref_for(store: ArtifactStore, run_id: str, plan_revision: int)
     return found[0]
 
 
+def _released_sealed_files(
+    store: ArtifactStore, state_root: Path, run_id: str, lane: st.LaneProjection
+) -> dict[str, bytes]:
+    """The accepted suite a lane's integration merge carries out of the vault.
+
+    An authored build lane releases its predecessor tests lane's sealed
+    bundle at the current revision: path to bytes, the same map
+    `code_review.measure_candidate` overlays for review, so what the
+    integration ref carries is what the candidate was judged against.
+
+    An untyped lane releases nothing. Its private files are hidden
+    meta-tests at paths of the tester's choosing, and `REVIEWING_CODE`
+    refuses a candidate that holds a file at any of them
+    (`PRIVATE_PATH_COLLISION`). Once released they would be in every later
+    base, and the lane's own rebuild after an amendment would be refused for
+    carrying its own suite. Releasing those needs that check to change
+    first; it is not done here.
+    """
+    if lane.lane_kind != st.LANE_KIND_BUILD:
+        return {}
+    revision = run_row(store, run_id)["plan_revision"]
+    for dep in lane.needs:
+        dep_lane = next(
+            (
+                item
+                for item in store.active_projection(run_id)
+                if item.lane_id == dep
+            ),
+            None,
+        )
+        if dep_lane is None or dep_lane.lane_kind != st.LANE_KIND_TESTS:
+            continue
+        sealed = _latest(
+            store,
+            run_id,
+            dep,
+            st.ArtifactKind.SEALED_TEST_BUNDLE,
+            plan_revision=revision,
+        )
+        if sealed is None:
+            raise FactoryRefused(f"missing dependency sealed tests {dep}")
+        vault = hv.ensure_vault(state_root, run_id)
+        blobs = tc.sealed_private_files(vault, _record_as_lane_artifact(sealed, dep_lane))
+        return {path: hv.cat_blob(vault, blob) for path, blob in blobs.items()}
+    raise FactoryRefused("missing tests-lane sealed bundle")
+
+
 def _explain_ahead_merge(
     store: ArtifactStore,
     target: gitpub.TargetBinding,
@@ -537,6 +584,7 @@ def _explain_ahead_merge(
     ledger_tip: str,
     current: str,
     row: Mapping[str, Any],
+    state_root: Path,
 ) -> Optional[tuple[LaneContext, Mapping[str, Any]]]:
     lane = next(
         item for item in store.active_projection(run_id) if item.lane_id == lane_id
@@ -552,13 +600,15 @@ def _explain_ahead_merge(
     if builder is None or review is None:
         return None
     try:
+        released = _released_sealed_files(store, state_root, run_id, lane)
         decision = gitpub.decide_merge_action(
             changed=bool(builder.payload.get("changed", True)),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_sha=builder.payload["candidate_sha"],
             integration_head=ledger_tip,
+            sealed_present=gitpub.sealed_files_present(target, ledger_tip, released),
         )
-    except gitpub.GitPublicationRefused:
+    except (gitpub.GitPublicationRefused, FactoryRefused):
         return None
     if decision.action != "MERGE":
         return None
@@ -604,6 +654,7 @@ def _explain_ahead_merge(
             before_sha=ledger_tip,
             epoch_seconds=merge_epoch_seconds(row["created_at"]),
             input_digest=digest,
+            sealed_files=released,
         )
     except gitpub.GitPublicationRefused:
         return None
@@ -616,7 +667,10 @@ def _explain_ahead_merge(
 
 
 def reconcile_orphaned_integration_merge_locked(
-    store: ArtifactStore, target: gitpub.TargetBinding, run_id: str
+    store: ArtifactStore,
+    target: gitpub.TargetBinding,
+    run_id: str,
+    state_root: Path,
 ) -> None:
     """Caller already holds OrderedLocks 1-2 or 1-3. Does not acquire or release."""
     row = run_row(store, run_id)
@@ -632,7 +686,7 @@ def reconcile_orphaned_integration_merge_locked(
         if store.lane_stage(run_id, lane.lane_id) is not st.LaneStage.READY_TO_MERGE:
             continue
         explained = _explain_ahead_merge(
-            store, target, run_id, lane.lane_id, ledger_tip, current, row
+            store, target, run_id, lane.lane_id, ledger_tip, current, row, state_root
         )
         if explained is not None:
             matches.append(explained)
@@ -1310,7 +1364,7 @@ class FactoryScheduler:
         self.locks.acquire(2)
         try:
             reconcile_orphaned_integration_merge_locked(
-                self.store, self.target, self.run_id
+                self.store, self.target, self.run_id, self.runtime.path
             )
         finally:
             self.locks.release()
@@ -2117,13 +2171,15 @@ class FactoryScheduler:
             artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft, "TEST_REVIEW": review},
             public_contract=draft.payload.get("public_contract"),
         )
+        test_draft = _record_as_lane_artifact(draft, lane)
         artifact = tc.seal_accepted_tests(
             request=_request(ctx),
             state_root=self.runtime.path,
             run_repo=Path(self.target.target_repository_root),
             builder_worktree=None,
-            test_draft=_record_as_lane_artifact(draft, lane),
+            test_draft=test_draft,
             test_review=_record_as_lane_artifact(review, lane),
+            released=self._released_object_ids(lane, test_draft),
         )
         _complete(
             self.store,
@@ -2132,6 +2188,30 @@ class FactoryScheduler:
                 artifact, [plan.artifact_id, draft.artifact_id, review.artifact_id]
             ),
         )
+
+    def _released_object_ids(
+        self, lane: st.LaneProjection, test_draft: st.LaneArtifact
+    ) -> frozenset[str]:
+        """Blobs of this lane's draft that a build lane's merge already released.
+
+        Only an authored tests lane is ever released (`_released_sealed_files`),
+        and only at its own declared paths. A blob is released when the
+        integration tip carries it at the path the draft wrote it to; that
+        same blob anywhere else in the product repository is a leak and stays
+        one. Reading it off the integration ref rather than the ledger keeps
+        the proof about bytes: it is what the builder's base actually holds.
+        """
+        if lane.lane_kind != st.LANE_KIND_TESTS:
+            return frozenset()
+        vault = hv.ensure_vault(self.runtime.path, self.run_id)
+        head = self._integration_head()
+        git = self.target.git()
+        released = set()
+        for path in tc.private_draft_overlay_paths(vault, test_draft):
+            blob = git.tree_blob(head, path)
+            if blob is not None:
+                released.add(blob)
+        return frozenset(released)
 
     def _bound_surface(
         self, lane: st.LaneProjection, sealed: ArtifactRecord
@@ -2607,11 +2687,15 @@ class FactoryScheduler:
         if builder is None or review is None:
             raise FactoryRefused("missing READY_TO_MERGE inputs")
         head = self._integration_head()
+        released = _released_sealed_files(
+            self.store, self.runtime.path, self.run_id, lane
+        )
         decision = gitpub.decide_merge_action(
             changed=bool(builder.payload.get("changed", True)),
             builder_base_sha=builder.payload["builder_base_sha"],
             candidate_sha=builder.payload["candidate_sha"],
             integration_head=head,
+            sealed_present=gitpub.sealed_files_present(self.target, head, released),
         )
         if decision.action == "BASE_INVALIDATION":
             digest = st.base_invalidation_input_digest(
@@ -2707,6 +2791,7 @@ class FactoryScheduler:
                 before_sha=head,
                 epoch_seconds=merge_epoch_seconds(row["created_at"]),
                 input_digest=digest,
+                sealed_files=released,
             )
         payload = dict(payload)
         payload["integration_head"] = head
@@ -2799,14 +2884,18 @@ class FactoryScheduler:
                 failures.append(lane.lane_id)
         return tuple(failures)
 
-    def _sealed_paths(self) -> frozenset[str]:
-        """Every private test path sealed in this run, at the live revision.
+    def _sealed_paths(self, head: str) -> frozenset[str]:
+        """Every sealed private test path the integration surface does not carry.
 
-        These files are in the vault and are never written into the integration
-        surface, so an integration reviewer is never given them. The set is the
-        harness's own -- the same bundles `_failed_run_gates` overlays -- not a
-        pattern, so it names exactly the files that cannot be observed.
+        A build lane's merge releases its predecessor suite into the
+        integration ref, so at `head` those files are ordinary readable files
+        and a finding about them is an observation. What stays in the vault
+        is the suite of a tests lane no build lane consumes -- the ones
+        `_failed_run_gates` overlays -- and an untyped lane's meta-tests. The
+        set is measured off the tree at `head`, not derived from lane kinds,
+        so it names exactly the files the reviewer could not have read.
         """
+        git = self.target.git()
         paths: set[str] = set()
         for lane in self.store.active_projection(self.run_id):
             sealed = self._current_tests_sealed(lane.lane_id)
@@ -2819,7 +2908,7 @@ class FactoryScheduler:
                 )
             except Exception:  # noqa: BLE001 -- a vault read must not fail a review
                 continue
-            paths.update(files)
+            paths.update(path for path in files if git.tree_blob(head, path) is None)
         return frozenset(paths)
 
     def _drop_unobservable_findings(
@@ -2827,25 +2916,28 @@ class FactoryScheduler:
         verdict: st.ReviewerVerdict,
         findings: Sequence[Mapping[str, str]],
         affected: Sequence[str],
+        head: str,
     ) -> tuple[st.ReviewerVerdict, tuple[Mapping[str, str], ...], tuple[str, ...]]:
         """Discard findings about files the reviewer was never given.
 
-        Sealed tests live only in the vault. A reviewer that reports one missing,
-        uncollected, or exiting nonzero is describing a checkout it did not read,
-        so the finding is not an observation and cannot be evidence. The role
-        contract already says this in words; run a33d5e9b's integration reviewer
-        was handed that sentence in its own AGENTS.md and reported the absence
-        anyway, three times. An instruction is not a control (§ numbers, not
-        prose), so the claim is dropped where the verdict is recorded.
+        A sealed suite the integration ref does not carry lives only in the
+        vault. A reviewer that reports one missing, uncollected, or exiting
+        nonzero is describing a checkout it did not read, so the finding is
+        not an observation and cannot be evidence. The role contract already
+        says this in words; run a33d5e9b's integration reviewer was handed
+        that sentence in its own AGENTS.md and reported the absence anyway,
+        three times. An instruction is not a control (§ numbers, not prose),
+        so the claim is dropped where the verdict is recorded.
 
         This narrows nothing real: a finding about a file the reviewer CAN read
-        is untouched. When every finding was unobservable there is no evidence
-        left, and a REVISE with no finding is not a verdict -- it becomes PASS,
-        which is what the harness's own gate already measured.
+        -- product code, or a suite a merge released at `head` -- is untouched.
+        When every finding was unobservable there is no evidence left, and a
+        REVISE with no finding is not a verdict -- it becomes PASS, which is
+        what the harness's own gate already measured.
         """
         if verdict is not st.ReviewerVerdict.REVISE:
             return verdict, tuple(findings), tuple(affected)
-        sealed = self._sealed_paths()
+        sealed = self._sealed_paths(head)
         if not sealed:
             return verdict, tuple(findings), tuple(affected)
 
@@ -2918,7 +3010,7 @@ class FactoryScheduler:
                     ctx, lanes, head
                 )
                 verdict, findings, affected = self._drop_unobservable_findings(
-                    verdict, findings, affected
+                    verdict, findings, affected, head
                 )
             checked = prv.actionable_findings(verdict, findings)
             payload = {
@@ -3108,7 +3200,9 @@ def apply_factory_amendment(
                 raise AmendmentRefused("publication/in-progress")
         if _has_publication(store, run_id):
             raise AmendmentRefused("published runs are immutable")
-        reconcile_orphaned_integration_merge_locked(store, target, run_id)
+        reconcile_orphaned_integration_merge_locked(
+            store, target, run_id, runtime.path
+        )
         tip = ensure_run_integration_ref(target, store, run_id)
         resets = amendment_resets(store, run_id, compiled)
         payload = {

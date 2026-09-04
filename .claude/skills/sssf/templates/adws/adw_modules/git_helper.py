@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -195,6 +196,47 @@ class BoundGit:
         if not _HEX.fullmatch(tree):
             raise GitError("MERGE_TREE_REFUSED", tree)
         return tree
+
+    def tree_blob(self, sha: str, path: str) -> str | None:
+        """The blob at `path` in the tree of `sha`, or None when absent."""
+        require_oid(sha)
+        if not path or path.startswith("-") or "\n" in path:
+            raise GitError("INVALID_PATH", path)
+        result = self.run(
+            "rev-parse", "--verify", "--quiet", "{0}:{1}".format(sha, path), check=False
+        )
+        if result.returncode != 0:
+            return None
+        return require_oid(result.stdout.decode("utf-8").strip())
+
+    def overlay_tree(self, tree: str, files: Mapping[str, bytes]) -> str:
+        """`tree` with `files` written over it, as a new tree object.
+
+        Built in a throwaway index so the bound worktree and its index are
+        never touched: the integration ref is not checked out anywhere, and
+        `update-ref` on a checked-out branch is what a staged mass-deletion
+        looks like. The blobs are content-addressed, so the same bytes over
+        the same tree give the same tree id on every call -- which is what
+        lets a crashed merge be re-derived and compared rather than guessed.
+        """
+        require_oid(tree)
+        if not files:
+            return tree
+        with tempfile.TemporaryDirectory(prefix="maestro-overlay-") as scratch:
+            index = os.path.join(scratch, "index")
+            self.run("read-tree", tree, index_file=index)
+            for path in sorted(files):
+                if not path or path.startswith("-") or "\n" in path:
+                    raise GitError("INVALID_PATH", path)
+                blob = self.hash_object(files[path])
+                self.run(
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "100644,{0},{1}".format(blob, path),
+                    index_file=index,
+                )
+            return require_oid(self.text("write-tree", index_file=index))
 
     def commit_tree(
         self,

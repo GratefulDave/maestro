@@ -1,10 +1,12 @@
 """A reviewer cannot report a file it was never given.
 
-Sealed tests live only in the vault. `_failed_run_gates` overlays them onto the
-integration SHA and measures the gate itself; the integration reviewer gets a
-checkout without them, by design. So a finding whose `implementation_area` names
-a sealed path is not an observation -- the reviewer had nothing to observe -- and
-cannot be evidence for a REVISE.
+A suite no build lane's merge released lives only in the vault.
+`_failed_run_gates` overlays it onto the integration SHA and measures the gate
+itself; the integration reviewer gets a checkout without it, by design. So a
+finding whose `implementation_area` names such a path is not an observation --
+the reviewer had nothing to observe -- and cannot be evidence for a REVISE.
+(A released suite is an ordinary file at the integration SHA; `_sealed_paths`
+measures that off the tree, and a finding about it survives.)
 
 The role contract says this in words. On run a33d5e9b4a404f5889785cb1c9ca5f6f the
 integration reviewer was handed that exact sentence in its own AGENTS.md --
@@ -59,9 +61,14 @@ REAL = {
 }
 
 
+HEAD = "0" * 40
+
+
 def _scheduler(sealed: frozenset[str]) -> sch.FactoryScheduler:
     obj = sch.FactoryScheduler.__new__(sch.FactoryScheduler)
-    obj._sealed_paths = lambda: sealed  # type: ignore[method-assign]
+    # `_sealed_paths(head)` is what measures which sealed files the tree at
+    # `head` does not carry; these cases are about the filter that reads it.
+    obj._sealed_paths = lambda head: sealed  # type: ignore[method-assign]
     obj._say = lambda *_a, **_k: None  # type: ignore[method-assign]
     return obj
 
@@ -69,7 +76,7 @@ def _scheduler(sealed: frozenset[str]) -> sch.FactoryScheduler:
 class UnobservableFindingTests(unittest.TestCase):
     def test_a_finding_naming_a_sealed_path_is_dropped(self):
         verdict, findings, affected = _scheduler(SEALED)._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [UNOBSERVABLE], ["lane-a"]
+            st.ReviewerVerdict.REVISE, [UNOBSERVABLE], ["lane-a"], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.PASS)
         self.assertEqual(findings, ())
@@ -77,7 +84,7 @@ class UnobservableFindingTests(unittest.TestCase):
 
     def test_a_finding_about_a_readable_file_survives(self):
         verdict, findings, affected = _scheduler(SEALED)._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [REAL], ["lane-a"]
+            st.ReviewerVerdict.REVISE, [REAL], ["lane-a"], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.REVISE)
         self.assertEqual(list(findings), [REAL])
@@ -85,7 +92,7 @@ class UnobservableFindingTests(unittest.TestCase):
 
     def test_a_real_finding_beside_an_unobservable_one_keeps_the_revise(self):
         verdict, findings, affected = _scheduler(SEALED)._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [UNOBSERVABLE, REAL], ["lane-a"]
+            st.ReviewerVerdict.REVISE, [UNOBSERVABLE, REAL], ["lane-a"], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.REVISE)
         self.assertEqual(list(findings), [REAL])
@@ -93,7 +100,7 @@ class UnobservableFindingTests(unittest.TestCase):
 
     def test_a_pass_is_never_rewritten(self):
         verdict, findings, affected = _scheduler(SEALED)._drop_unobservable_findings(
-            st.ReviewerVerdict.PASS, [], []
+            st.ReviewerVerdict.PASS, [], [], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.PASS)
         self.assertEqual(findings, ())
@@ -104,7 +111,7 @@ class UnobservableFindingTests(unittest.TestCase):
         # of those files, and a substring match dropped a real REVISE for it.
         bare = dict(REAL, implementation_area="tests")
         verdict, findings, _ = _scheduler(SEALED)._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [bare], ["lane-a"]
+            st.ReviewerVerdict.REVISE, [bare], ["lane-a"], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.REVISE)
         self.assertEqual(list(findings), [bare])
@@ -117,14 +124,14 @@ class UnobservableFindingTests(unittest.TestCase):
             ),
         )
         verdict, findings, _ = _scheduler(SEALED)._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [located], ["lane-a"]
+            st.ReviewerVerdict.REVISE, [located], ["lane-a"], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.PASS)
         self.assertEqual(findings, ())
 
     def test_with_no_sealed_paths_nothing_is_dropped(self):
         verdict, findings, _ = _scheduler(frozenset())._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [UNOBSERVABLE], ["lane-a"]
+            st.ReviewerVerdict.REVISE, [UNOBSERVABLE], ["lane-a"], HEAD
         )
         self.assertIs(verdict, st.ReviewerVerdict.REVISE)
         self.assertEqual(list(findings), [UNOBSERVABLE])
