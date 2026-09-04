@@ -84,8 +84,8 @@ Product flow for every ready lane:
    contract).
 3. Test reviewer emits `TEST_REVIEW`: `PASS` seals; `REVISE` returns to the author with four-key
    actionable findings.
-4. `SEALED_TEST_BUNDLE` records vault digest/reference. Private bytes are absent from the run
-   repository and from every builder input.
+4. `SEALED_TEST_BUNDLE` records vault digest/reference. Private bytes are absent from every
+   builder input, and from the run repository until step 7 releases them.
 5. Builder emits `BUILDER_OUTPUT` bound to plan revision, integration base SHA, sealed-test digest,
    and an immutable candidate ref/SHA. The builder receives the public contract, architecture
    constraints, allowed paths, prior redacted review, and the sealed digest. It never receives
@@ -93,7 +93,9 @@ Product flow for every ready lane:
 6. Code reviewer runs the sealed tests against the candidate and emits `CODE_REVIEW`. `PASS`
    advances to merge; `REVISE` returns to `BUILDING` with redacted findings.
 7. `INTEGRATION_MERGE` records `before_sha`, accepted candidate SHA, and `after_sha`. Each accepted
-   lane merges exactly once into `refs/maestro/integration/<run-id>`.
+   lane merges exactly once into `refs/maestro/integration/<run-id>`. A build lane's merge also
+   releases its predecessor tests lane's accepted suite into that tree, so the repository carries
+   the tests its candidate was graded against.
 8. A dependent lane's first `BUILDING` input includes every needed lane's accepted integration
    artifact.
 9. When every lane is `MERGED`, final integration review evaluates the integration commit with all
@@ -151,7 +153,10 @@ acceptance criteria plus declared outputs plus `sealed_digest`. Private draft by
 vault.
 
 **The builder cannot read those tests.** That is the shipped contract, not a future option. Sealed
-tests never enter the run repository, the builder worktree, builder refs, rev-list, or fetch paths.
+tests never enter the builder worktree, builder refs, rev-list, or fetch paths, and they do not
+enter the run repository until the paired build lane's merge releases them into the integration
+ref — after that lane's own code review, so no builder could have shaped a candidate to them. A
+lane's own suite is stripped from its checkout on every turn even when its base already carries it.
 Anyone auditing a builder prompt and finding private test source, fixtures, selectors, or expected
 literals is looking at a leak.
 
@@ -175,7 +180,20 @@ must not quote the private assertion.
   write `def record(observation, *, x=None)` and pass every case. Where the contract makes something
   mandatory, say so in the acceptance criteria and state that the suite asserts the refusal — that
   the call is rejected and that no row, record, or side effect results. Positive cases alone are a
-  contract for the happy path only.
+  contract for the happy path only. A plan said `FaersDpaDataSchema` must have every key required;
+  the fixture the tester wrote omitted two of those keys and asserted the object *valid*, so a
+  correct implementation would have failed the suite. The test did not miss the defect, it
+  mandated it, and a test review passed it.
+- **The plan's case enumeration is a ceiling, not a floor.** A tester writes the cases the plan
+  names and stops. Across five lanes of one audited run, every suite held exactly the enumerated
+  cases and nothing else. Whatever the plan does not enumerate is not tested, so enumerate the
+  refusals, the boundaries, and the mixed states rather than trusting the tester to infer them.
+- **State an outcome for every combination, not a list of conditions.** A plan wrote "cookie and
+  any fetch invalid, unavailable or error -> unavailable". The builder implemented that list
+  literally, so a mixed result — one fetch `ok`, one `denied` — matched no clause, fell through to
+  `entitled`, and rendered paid rows to a visitor the gateway had already refused. The prose caused
+  the defect. Write the mapping as a total function over the input space: name the default outcome
+  and the conditions that override it, or enumerate every combination.
 - **State the public surface: names, arity, and return types.** "Raw bytes addressed by their own
   sha256" is an obligation; it is not an accessor name. When the tests lane invents `spl_bytes()` and
   the builder invents something else, both are faithful to the prose and the pair cannot link. Name
@@ -185,13 +203,14 @@ must not quote the private assertion.
   the permissive reading, the stub, or the previous lane's output is not testing the claim. This is
   the question a test review must answer; a case count, a green command, and a valid test file are
   each compatible with a suite that asserts nothing.
-- **Name the cases in `gate.required_cases`, not just how many in `min_cases`.** The harness
-  collects case identifiers from the draft and refuses one that is missing a required name, telling
-  the tester exactly which names are absent. A count cannot distinguish eleven happy-path cases from
-  a contract that also needs refusals; a list can. Write one name per obligation the contract makes
-  mandatory — the refusal cases especially, since those are the ones a positive-only suite silently
-  omits. The field is optional and a lane that declares none is checked on `min_cases` alone, so this
-  is the difference between an obligation the factory measures and one it hopes for.
+- **A named case is not an asserting case.** `gate.required_cases` matches names against a
+  collect-only listing, so nothing executes a case body and a required name is discharged by a
+  function that asserts nothing. Measured against the nine defects this factory has published it
+  would have caught none, and it would have produced one false refusal — of a suite whose reviewer
+  had just correctly asked for one case to be split in two, renaming both. Name the cases to make
+  each obligation visible in the plan, and to tell the tester which refusals a positive-only suite
+  would silently omit; never read a green `required_cases` check as evidence that the obligations
+  are met. What measures a suite is the test review, asked the question above.
 
 ## What a lane's outputs must cover
 
@@ -323,9 +342,11 @@ lane's commit had to carry the accepted test files byte-identically
 those tests, and that was then specified as the design rather than a leak.**
 
 That pairing rule is withdrawn. Sealed private tests never merge into the builder's tree. The
-factory equivalent is `SEALED_TEST_BUNDLE` in the vault plus absence proofs against the run
-repository and builder worktree. Final integration review runs sealed tests against the integration
-commit; publication is receipt-backed exactly once onto `main`.
+factory equivalent is `SEALED_TEST_BUNDLE` in the vault, plus an absence proof against the builder
+worktree that holds for the lane's own suite unconditionally, and one against the run repository
+that holds until the paired build lane's merge releases the accepted suite into the integration
+ref. Final integration review runs sealed tests against the integration commit; publication is
+receipt-backed exactly once onto `main`.
 
 `test_visibility: "merged" | "hidden"` on `maestro-plan.v5` was the migration sketch for that
 withdrawal. Hidden visibility is now the only builder-facing behavior; there is no merged-test

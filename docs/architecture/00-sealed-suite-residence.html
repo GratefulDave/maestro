@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <title>Where the sealed suite is, at each moment</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="dark.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      color-scheme: dark;
+      /* Palette comes from dark.css. Do not redeclare colour tokens here. */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    html { color-scheme: dark; background: var(--color-paper); }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { overflow-x: auto; max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Residence timeline · Maestro</p>
+    <h1>Where the sealed suite is, at each moment</h1>
+
+    <svg viewBox="0 0 1280 496" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="00-sealed-suite-residence-title 00-sealed-suite-residence-desc">
+      <title id="00-sealed-suite-residence-title">Residence of a lane's sealed suite across the lane lifecycle</title>
+      <desc id="00-sealed-suite-residence-desc">Four residences plotted against five moments of a typed tests-to-build lane pair. The vault holds the accepted bytes from TESTS_SEALED onward and never gives them up. A code-review scratch tree holds them only while REVIEWING_CODE runs, overlaid onto the candidate. The builder checkout and the candidate commit never hold them at all: the lane's own suite is stripped from the checkout on every turn and subtracted from the commit pathspec, so a base that carries a released suite cannot leak it into the candidate. The integration ref holds them from the build lane's INTEGRATION_MERGE onward, which is where the seal ends, and main carries them at publication.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#c4c4c4"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#ff6b35"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#78a9ff"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#000000"/>
+
+      <!-- Moment axis -->
+      <text x="352" y="68" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">TESTS_SEALED</text>
+      <text x="544" y="68" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">BUILDING</text>
+      <text x="736" y="68" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">REVIEWING_CODE</text>
+      <text x="928" y="68" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">MERGED</text>
+      <text x="1120" y="68" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">MAIN</text>
+      <line x1="40" y1="88" x2="1216" y2="88" stroke="#616161" stroke-width="0.8"/>
+
+      <!-- Column hairlines -->
+      <line x1="448" y1="88" x2="448" y2="360" stroke="#2b2b2b" stroke-width="0.8"/>
+      <line x1="640" y1="88" x2="640" y2="360" stroke="#2b2b2b" stroke-width="0.8"/>
+      <line x1="1024" y1="88" x2="1024" y2="360" stroke="#2b2b2b" stroke-width="0.8"/>
+
+      <!-- Row hairlines -->
+      <line x1="40" y1="168" x2="1216" y2="168" stroke="#2b2b2b" stroke-width="0.8"/>
+      <line x1="40" y1="232" x2="1216" y2="232" stroke="#2b2b2b" stroke-width="0.8"/>
+      <line x1="40" y1="296" x2="1216" y2="296" stroke="#2b2b2b" stroke-width="0.8"/>
+      <line x1="40" y1="360" x2="1216" y2="360" stroke="#616161" stroke-width="0.8"/>
+
+      <!-- Row 1 · vault -->
+      <text x="240" y="132" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="end">vault</text>
+      <text x="240" y="148" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">runtime_state_root</text>
+      <rect x="256" y="120" width="960" height="32" rx="4" fill="rgba(196,196,196,0.15)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="272" y="140" fill="#f8f8f8" font-size="10" font-weight="600" font-family="'Geist', sans-serif">accepted bytes, from the seal onward — never given up</text>
+
+      <!-- Row 2 · code-review scratch -->
+      <text x="240" y="196" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="end">review scratch</text>
+      <text x="240" y="212" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">measure_candidate</text>
+      <rect x="640" y="184" width="192" height="32" rx="4" fill="rgba(196,196,196,0.15)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="656" y="204" fill="#f8f8f8" font-size="10" font-weight="600" font-family="'Geist', sans-serif">overlaid on the candidate</text>
+
+      <!-- Row 3 · builder checkout and candidate — no bar, by construction -->
+      <text x="240" y="260" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="end">builder checkout · candidate</text>
+      <text x="240" y="276" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">sealed_private_paths</text>
+      <line x1="256" y1="272" x2="1216" y2="272" stroke="#929292" stroke-width="1" stroke-dasharray="4,4"/>
+      <rect x="648" y="250" width="176" height="16" rx="2" fill="#000000"/>
+      <text x="736" y="262" fill="#929292" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NEVER — STRIPPED EVERY TURN</text>
+
+      <!-- Row 4 · integration ref, then main (focal) -->
+      <text x="240" y="324" fill="#f8f8f8" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="end">integration ref → main</text>
+      <text x="240" y="340" fill="#929292" font-size="8" font-family="'Geist Mono', monospace" text-anchor="end">_expected_merge_commit</text>
+      <rect x="832" y="312" width="384" height="32" rx="4" fill="#32160d" stroke="#ff6b35" stroke-width="1"/>
+      <text x="848" y="332" fill="#ffb08f" font-size="10" font-weight="600" font-family="'Geist', sans-serif">released into the merge tree, and published with the code</text>
+
+      <!-- The seam: the build lane's merge -->
+      <line x1="832" y1="80" x2="832" y2="368" stroke="#ff6b35" stroke-width="1.2" stroke-dasharray="5,4"/>
+      <rect x="736" y="376" width="192" height="16" rx="2" fill="#000000"/>
+      <text x="832" y="388" fill="#ff6b35" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">INTEGRATION_MERGE</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="416" x2="1216" y2="416" stroke="#2b2b2b" stroke-width="0.8"/>
+      <text x="40" y="440" fill="#c4c4c4" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="160" y="428" width="24" height="12" rx="2" fill="rgba(196,196,196,0.15)" stroke="#c4c4c4" stroke-width="1"/>
+      <text x="192" y="440" fill="#c4c4c4" font-size="9" font-family="'Geist', sans-serif">bytes present</text>
+
+      <rect x="336" y="428" width="24" height="12" rx="2" fill="#32160d" stroke="#ff6b35" stroke-width="1"/>
+      <text x="368" y="440" fill="#c4c4c4" font-size="9" font-family="'Geist', sans-serif">released — the seal ends here</text>
+
+      <line x1="592" y1="436" x2="616" y2="436" stroke="#929292" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="624" y="440" fill="#c4c4c4" font-size="9" font-family="'Geist', sans-serif">absent by construction</text>
+
+
+      <!-- Editorial aside -->
+      <text x="40" y="476" fill="#929292" font-size="14" font-style="italic" font-family="'Instrument Serif', serif">An amendment can reset a build lane onto an integration head that already carries its suite; the checkout is stripped anyway, and the strip is subtracted from the commit pathspec. An untyped lane’s meta-tests and a tests lane no build lane consumes are never released — neither has a merge to ride.</text>
+    </svg>
+  </div>
+</body>
+</html>
