@@ -105,6 +105,34 @@ class _PassingActor(cutover.ScriptedActor):
         return st.ReviewerVerdict.PASS, ()
 
 
+class _PipelineActor(_PassingActor):
+    """lane-a's first stage is released only by lane-b reaching its second.
+
+    A scheduler that waits for the whole batch before it looks at the ready
+    set again cannot satisfy this: lane-b finishes authoring, then idles with
+    a free worker until lane-a returns, and lane-a is waiting on lane-b.
+    """
+
+    def __init__(self, repo: Path, worktrees: Path) -> None:
+        super().__init__(repo, worktrees)
+        self.a_authoring = threading.Event()
+        self.a_may_finish = threading.Event()
+        self.a_released_by_b = False
+
+    def write_tests(self, ctx: sch.LaneContext) -> dict:
+        with self.authoring:
+            if ctx.lane.lane_id == "lane-a":
+                self.a_authoring.set()
+                self.a_released_by_b = self.a_may_finish.wait(10)
+            return super().write_tests(ctx)
+
+    def review_tests(self, ctx: sch.LaneContext):
+        if ctx.lane.lane_id == "lane-b":
+            self.a_authoring.wait(10)
+            self.a_may_finish.set()
+        return st.ReviewerVerdict.PASS, ()
+
+
 class _HoldingActor(_PassingActor):
     """Authoring parks every lane until the test releases it."""
 
@@ -180,6 +208,17 @@ class IndependentLanesAdvanceConcurrently(_Run):
         )
         self.assertEqual(actor.authoring.peak, 2)
         self.assertNotIn(threading.main_thread().name, actor.authoring.threads)
+
+    def test_a_free_worker_is_refilled_before_the_slowest_lane_returns(self) -> None:
+        actor = _PipelineActor(self.repo, self.runtime.path / "worktrees")
+        status = self.scheduler(actor, concurrency=2).run()
+        self.assertIs(status, st.RunStatus.COMPLETE)
+        self.assertEqual(
+            self.stages(), {lane: st.LaneStage.MERGED for lane in LANES}
+        )
+        # lane-b could only reach its second stage while lane-a was still in
+        # its first if the scheduler refilled the worker lane-b freed.
+        self.assertTrue(actor.a_released_by_b)
 
     def test_concurrency_one_keeps_every_stage_inline_and_sequential(self) -> None:
         actor = _PassingActor(self.repo, self.runtime.path / "worktrees")
