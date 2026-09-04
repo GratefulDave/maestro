@@ -10,7 +10,7 @@ import shutil
 import signal
 import subprocess
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
 from concurrent.futures import wait as _wait_futures
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -1288,17 +1288,7 @@ class FactoryScheduler:
                     self._final_review()
                     continue
                 progressed = False
-                advancing: list[str] = []
-                for lane_id in self.store.ready_lane_ids(self.run_id):
-                    stage = self.store.lane_stage(self.run_id, lane_id)
-                    if stage is st.LaneStage.READY_TO_MERGE:
-                        continue
-                    if (
-                        stage is st.LaneStage.WRITING_TESTS
-                        and self._legacy_correction_action() == "defer"
-                    ):
-                        continue
-                    advancing.append(lane_id)
+                advancing = self._advanceable_lane_ids()
                 if advancing:
                     self._advance_ready(advancing)
                     progressed = True
@@ -1327,15 +1317,55 @@ class FactoryScheduler:
                 pool.shutdown(wait=False, cancel_futures=True)
             signal.signal(signal.SIGINT, previous)
 
+    def _advanceable_lane_ids(self) -> list[str]:
+        """Ready lanes whose current stage may advance on a worker right now.
+
+        A lane that is already executing still reads as ready here -- its
+        stage does not change until it completes -- so the caller filters
+        what it has already dispatched.
+        """
+        advancing: list[str] = []
+        for lane_id in self.store.ready_lane_ids(self.run_id):
+            stage = self.store.lane_stage(self.run_id, lane_id)
+            if stage is st.LaneStage.READY_TO_MERGE:
+                continue
+            if (
+                stage is st.LaneStage.WRITING_TESTS
+                and self._legacy_correction_action() == "defer"
+            ):
+                continue
+            advancing.append(lane_id)
+        return advancing
+
+    def _lane_parked(self) -> bool:
+        """True once any lane is WAITING_FOR_USER.
+
+        A parked lane ends the run at the next boundary, so refilling stops
+        and the pipeline drains rather than opening fresh agent turns the
+        operator is about to be asked about.
+        """
+        return any(
+            self.store.lane_stage(self.run_id, lane.lane_id)
+            is st.LaneStage.WAITING_FOR_USER
+            for lane in self.store.active_projection(self.run_id)
+        )
+
     def _advance_ready(self, lane_ids: Sequence[str]) -> None:
         """Advance every ready non-merge lane one stage.
 
         With `concurrency` 1 each lane advances inline on this thread, in
-        order, exactly as before. Above 1 the lanes are submitted together to
-        a pool of that many workers and this thread waits for the whole set;
-        the first failure, in submission order, is re-raised after every
-        sibling has finished its stage, so a failing lane ends the run the
-        way an inline failure does. Merges never come through here.
+        order, exactly as before. Above 1 the lanes go to a pool of that many
+        workers, and a worker that frees up is refilled from a freshly
+        computed ready set instead of idling until the slowest lane of the
+        batch returns. Waiting for the whole batch is what let three
+        admissible lanes sit behind one builder turn with two workers free.
+
+        Nothing new is submitted once a lane fails or once any lane parks;
+        the first failure, in submission order, is re-raised after every lane
+        that was already running has finished its stage, so a failing lane
+        ends the run the way an inline failure does. Merges never come
+        through here, so this returns with the pool empty and the outer loop
+        still sees the run between stages, as before.
         """
         if self.concurrency == 1:
             for lane_id in lane_ids:
@@ -1345,12 +1375,36 @@ class FactoryScheduler:
             self._pool = ThreadPoolExecutor(
                 max_workers=self.concurrency, thread_name_prefix="maestro-lane"
             )
-        futures: list[tuple[str, Future]] = [
-            (lane_id, self._pool.submit(self._advance, lane_id))
-            for lane_id in lane_ids
-        ]
-        _wait_futures([future for _, future in futures])
-        for _lane_id, future in futures:
+        queued: list[str] = list(lane_ids)
+        running: dict[Future, str] = {}
+        submitted: list[Future] = []
+        draining = False
+        while queued or running:
+            while queued and not draining and len(running) < self.concurrency:
+                lane_id = queued.pop(0)
+                future = self._pool.submit(self._advance, lane_id)
+                running[future] = lane_id
+                submitted.append(future)
+            if not running:
+                break
+            done, _pending = _wait_futures(
+                list(running), return_when=FIRST_COMPLETED
+            )
+            for future in done:
+                running.pop(future, None)
+                if future.exception() is not None:
+                    draining = True
+            if draining or self._lane_parked():
+                draining = True
+                queued.clear()
+                continue
+            busy = set(running.values()) | set(queued)
+            queued.extend(
+                lane_id
+                for lane_id in self._advanceable_lane_ids()
+                if lane_id not in busy
+            )
+        for future in submitted:
             exc = future.exception()
             if exc is not None:
                 raise exc
