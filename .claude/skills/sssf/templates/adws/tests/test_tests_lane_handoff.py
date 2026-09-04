@@ -354,7 +354,11 @@ class TestsLaneHandoffTests(unittest.TestCase):
             self.store.lane_stage("run-handoff", "lane-build"), st.LaneStage.MERGED
         )
         self.assertTrue((self.repo / "product.py").is_file())
-        self.assertFalse((self.repo / "tests/public_contract.py").exists())
+        # The build lane's merge released its predecessor suite, so the
+        # published SHA carries code and tests together.
+        self.assertIn(
+            SECRET, (self.repo / "tests/public_contract.py").read_text(encoding="utf-8")
+        )
         dumped = json.dumps(actor.builder_contracts)
         self.assertNotIn(SECRET, dumped)
         for contract in actor.builder_contracts:
