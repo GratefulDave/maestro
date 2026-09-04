@@ -390,6 +390,8 @@ Zero-delta revalidation records `before_sha == candidate_sha == after_sha` with 
 
 Final reviewer evaluates the exact integration HEAD against the active plan revision, ordered public contracts, sealed lane tests, and architecture constraints named by the fingerprint.
 
+The integration reviewer is told its checkout omits sealed test paths by design and that their absence is never a finding; that instruction is not a control. Before a `REVISE` is recorded, every finding whose `implementation_area` names a path sealed in the vault at the live revision is dropped — the reviewer was never given those bytes, so a claim about a missing, uncollected, or failing sealed path is not an observation. A finding about a path the reviewer can read is untouched. When dropping leaves no finding, the verdict becomes `PASS`: the harness already measured every sealed gate itself against this same integration SHA, so an unobservable `REVISE` would only repeat a check the reviewer cannot perform.
+
 Publication is exactly-once and receipt-backed: immutable `refs/maestro/publications/<run-id>/<review-input-fingerprint>` plus `MAIN_PUBLICATION`. `main` reaching the same SHA without Maestro's receipt is external activity and refuses `PUBLICATION_EXTERNAL_MISMATCH`, never inferred as successful publication.
 
 A crash after Git mutation but before ledger commit is idempotently reconciled from exact SHA/receipt evidence without adopting process state, including a present `locks/legacy_integration_retarget.<run-id>.json` journal.
