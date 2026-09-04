@@ -1713,31 +1713,6 @@ class HerdrStageActor:
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
-        # The builder's checkout holds every test file except the sealed one,
-        # so without this it submits blind and learns three minutes later that
-        # it was wrong. The probe is a builder-facing entrypoint beside this
-        # script -- not an operator verb -- and it resolves the state root, the
-        # vault, and the sealed bundle itself. Only the run, the lane, and the
-        # checkout the builder already occupies travel in this argv; no vault
-        # path, no state root, no sealed file name.
-        probe = _executing_maestro_file().resolve().parent / "sealed_probe.py"
-        extra["sealed_probe_command"] = [
-            "uv",
-            "run",
-            str(probe),
-            "--run",
-            ctx.run_id,
-            "--lane",
-            ctx.lane.lane_id,
-            "--checkout",
-            str(cwd),
-        ]
-        extra["sealed_probe_instruction"] = (
-            "sealed_probe_command runs the sealed acceptance suite against "
-            "your working tree and prints the same counts and redacted "
-            "failure lines the factory will produce for this candidate; run "
-            "it as often as you like before you finish."
-        )
         _payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
