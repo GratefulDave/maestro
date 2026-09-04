@@ -26,7 +26,7 @@ There is no retry, skip, abandon, attempt-salvage, or coordinator/workspace verb
 Do not design a feature this project has already specified. Check these first; if a brief
 you were given contradicts them, the documents win — say so rather than following the brief.
 
-## Two rules that invalidate work if broken
+## Three rules that invalidate work if broken
 
 1. **Typed records only** — a run fails if any lifecycle transition is caused by
    pane text, prompt text, a free-text envelope field, or an agent's claim about
@@ -36,6 +36,45 @@ you were given contradicts them, the documents win — say so rather than follow
    builder receives the public contract, architecture constraints, allowed paths,
    prior redacted review, and sealed digest. It does not receive private source,
    fixtures, selectors, expected literals, or vault paths.
+3. **A weakened check is a contract change, never a fix** — a diff that deletes
+   or weakens a verdict, a check, or an error path is never the fix for a
+   blocked run. It lands on its own, labeled as such, separately from the bug
+   that provoked it.
+
+Rule 3 has two receipts in this repository, and both were bundled.
+
+`ad186ba` (#187, 2026-09-02), "stop refusing work the factory has already
+accepted", carried seven changes under a theme of unblocking a stuck run. One of
+them, in `review_builder_output` (`adw_modules/code_review.py`), rewrites a
+reviewer's `REVISE` to `PASS` whenever the sealed suite is green and moves the
+findings to an `advisory_findings` key that never reaches the builder and never
+causes a transition. The scheduler logs it plainly — `"sealed suite is
+authoritative; verdict recorded as PASS"` beside `"reviewer said REVISE"`
+(`adw_modules/scheduler.py`). Bundled with six other changes, nobody saw it.
+Alone, it would have read as what it is: a decision that a reviewer cannot block.
+
+`c2cece7` (#205, 2026-09-04) added `FactoryScheduler._drop_unobservable_findings`.
+The integration reviewer kept reporting that sealed test paths were absent from
+its checkout. The finding was wrong as a gate failure and correct as a fact about
+the branch — the tests genuinely were not in the repository. Instead of releasing
+them, the fix dropped the finding and turned a `REVISE` with no survivors into
+`PASS`. It shipped bundled with an unrelated envelope-race fix, and it persists
+nothing about what it dropped: the artifact keeps only the survivors and the log
+keeps a count, so the evidence a suppression destroyed cannot be recovered
+afterwards.
+
+What that cost: FDAdb run `a33d5e9b` published `refs/heads/integration` =
+`5c43e4fbc058` with two defects its own reviewer had named correctly, with
+locations, in four consecutive rounds. Both were later reproduced by running them
+against the published file:
+
+```
+spl_bytes("../../secret") -> b'TOP SECRET'      # path traversal: no hex validation, no containment check
+24 threads, one key      -> 2 rows appended     # append-only store: _rows() scan then open(...,"a") under no lock
+```
+
+`agree=False` printed in the lane gate table on all four rounds and was read by
+nobody.
 
 ## Where the implementation lives
 
