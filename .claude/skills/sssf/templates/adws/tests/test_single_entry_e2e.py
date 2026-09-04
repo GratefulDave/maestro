@@ -52,11 +52,9 @@ FIXTURES = ADWS / "tests" / "fixtures" / "step8"
 LANES = ("lane-a", "lane-b")
 OUTPUTS = {"lane-a": "a.txt", "lane-b": "b.txt"}
 #: A final-review REVISE this suite can rely on. It names a declared output --
-#: a file the integration reviewer can actually read -- because a finding about
-#: the sealed suite is dropped before the verdict is recorded
-#: (`FactoryScheduler._drop_unobservable_findings`). This case is about the
-#: amendment wait, not about what a reviewer may say, so it uses an observable
-#: area rather than exercising the drop.
+#: a file the integration reviewer actually reads at the integration SHA -- so
+#: the fixture is a finding a real reviewer could have written. This case is
+#: about the amendment wait, not about what a reviewer may say.
 FINDING = {
     "implementation_area": "a.txt",
     "observed_behavior": "the declared output is empty",

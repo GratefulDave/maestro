@@ -731,10 +731,9 @@ class HerdrStageActor:
                 "measures every run-level sealed gate itself, against this "
                 "same integration SHA with that suite overlaid, before you "
                 "are asked, and a gate that failed reaches you as a REVISE "
-                "you are not consulted about. Do not run, re-run, or judge a "
-                "declared gate command, and never report a missing test path, "
-                "an uncollected case, a case count, or a gate exit code. Judge "
-                "the code in this checkout against the lane contracts."
+                "you are not consulted about. Do not run or re-run a "
+                "declared gate command. Judge the code in this checkout "
+                "against the lane contracts."
             ),
         }
         try:
