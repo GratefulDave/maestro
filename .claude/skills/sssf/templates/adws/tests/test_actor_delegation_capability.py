@@ -856,6 +856,10 @@ class PersistentRoleDispatchTest(unittest.TestCase):
             self.assertIn("Do not git commit", prompt["instructions"])
             self.assertIn("Do not delegate", prompt["instructions"])
             self.assertIn("Create UTF-8 JSON", prompt["instructions"])
+            # The rename is the declaration; writing into the polled path
+            # directly is what a reader can catch half-written.
+            self.assertIn(".part", prompt["instructions"])
+            self.assertIn("then rename it to", prompt["instructions"])
             self.assertIn("hidden meta-tests", prompt["instructions"])
             self.assertIn("never declared_outputs", prompt["instructions"])
             self.assertNotIn("Only sandboxed Bash", prompt["instructions"])
