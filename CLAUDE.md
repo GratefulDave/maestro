@@ -426,3 +426,43 @@ Consequences that follow from this, and that the incidents paid for:
   start time against the file mtime before telling anyone the run is fixed. Never hand over
   a `run start` line until the fix it depends on has been executed against the real binary
   in the real worktree.
+
+## Historical — 2026-09-04 run a33d5e9b (a green suite is not a verdict about the code)
+
+`lane-wp1-observations-build` recorded this gate row:
+
+```
+review[-1]  seq=3 executed=11 passed=11 failed=0 errored=0 reviewer=REVISE recorded=PASS agree=False
+```
+
+Eleven cases, eleven passes, and the final integration review said REVISE. The two
+readers disagreed because they were asked different questions. The lane's code review
+asks whether the sealed suite passes; it did. The final reviewer reads the code against
+the plan's claims, and saw `ObservationStore.record(observation, *, raw_spl=None)` — a
+signature under which an observation is appended with a null `spl_sha256`, and
+`_normalise` lets `release_id`, `method_version` and `code_sha256` persist as null.
+
+`claim-wp1-provenance` says every observation carries those three. Eleven cases asserted
+that a **correctly called** store records them. Not one asserted that an incorrectly
+called store refuses. A suite built only from the happy path cannot tell *required* from
+*accepted when supplied*, so the builder took the weaker reading — legitimately, because
+nothing in the contract or the cases forbade it. Three rounds of test review passed that
+suite.
+
+Two things follow, and neither is a new gate:
+
+- **`agree=False` on a review row is the signal, not noise.** A PASS from the runner beside
+  a REVISE from a reader means the suite does not encode what the claim says. Read the
+  reader, not the count.
+- **The fix belongs in the plan, not the builder.** Naming the obligation as *required*,
+  and requiring refusal cases beside the positive ones, is what makes the next suite able
+  to fail a permissive implementation. Patching the builder leaves the blind suite in
+  place to mislead the next candidate.
+
+Same run, one finding was false: the reviewer reported the build lane's gate exiting 4
+because `services/label-batch/tests/observations` does not exist on the integration
+surface. `_failed_run_gates` (`scheduler.py`) overlays the sealed bundle onto the
+integration head before running it, and it had already passed — a gate failure there
+produces exactly one fixed finding, `_INTEGRATION_GATE_REVISE`, which this verdict did
+not carry. **A located finding from a reviewer is a claim, not a measurement.** Check it
+against the factory's own row before acting on it.

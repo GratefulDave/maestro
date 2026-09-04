@@ -954,11 +954,22 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
     cwd = gate.get("cwd") or "."
     if not isinstance(cwd, str) or not cwd:
         raise DraftCollectionRefused("cwd")
+    # A count cannot tell eleven happy-path cases from a contract that also
+    # needs refusals. `required_cases` names the cases that must exist, so an
+    # obligation is measured rather than hoped for. Optional: a lane that
+    # declares none is checked on `min_cases` alone, as before.
+    required = gate.get("required_cases") or ()
+    if not isinstance(required, (list, tuple)):
+        raise DraftCollectionRefused("required_cases")
+    required = tuple(str(item) for item in required if str(item).strip())
+    if len(required) > int(min_cases):
+        raise DraftCollectionRefused("required_cases exceeds min_cases")
     return SimpleNamespace(
         runner=str(runner),
         argv=tuple(str(item) for item in argv),
         cwd=cwd,
         min_cases=int(min_cases),
+        required_cases=required,
     )
 
 
@@ -969,6 +980,7 @@ def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleName
         argv=argv,
         cwd=gate.cwd,
         min_cases=gate.min_cases,
+        required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
     )
 
 
@@ -1024,6 +1036,42 @@ def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
                     "what the refusal names and resubmit"
                 ),
                 "violated_requirement": "gate collection",
+            },
+        )
+    )
+
+
+def _missing_required_cases(
+    collected: Sequence[str], required: Sequence[str]
+) -> tuple[str, ...]:
+    """Required case names with no collected identifier naming them.
+
+    Matched as a substring of the collected identifier, because a runner prints
+    `path::name` (pytest) or `path > title` (vitest) and the plan names the case,
+    not the file it landed in.
+    """
+    return tuple(
+        name for name in required if not any(name in cid for cid in collected)
+    )
+
+
+def _draft_required_cases_findings(
+    missing: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": (
+                    "native collect listed no case named: {0}".format(
+                        ", ".join(missing)
+                    )
+                ),
+                "required_behavior": (
+                    "the suite must contain a case for each name the gate "
+                    "requires, discharging the obligation it names"
+                ),
+                "violated_requirement": "gate.required_cases",
             },
         )
     )
@@ -1841,19 +1889,35 @@ class FactoryScheduler:
                 raise
             seen = st.digest_canonical(current)
             collected = self._collect_private_draft(ctx, gate, current)
-        if collected >= gate.min_cases:
+        required = tuple(getattr(gate, "required_cases", ()) or ())
+
+        def shortfall(ids: Sequence[str]) -> tuple[dict[str, str], ...] | None:
+            """The correction this draft needs, or None when it satisfies the gate.
+
+            Names before count: a suite missing a required case is wrong in a way
+            the tester can act on, and saying "write 4 more cases" instead of
+            naming them is what let run a33d5e9b re-emit the same eleven.
+            """
+            missing = _missing_required_cases(ids, required)
+            if missing:
+                return _draft_required_cases_findings(missing)
+            if len(ids) < gate.min_cases:
+                return _draft_min_cases_findings(len(ids), gate.min_cases)
+            return None
+
+        correction = shortfall(collected)
+        if correction is None:
             return current
-        correction = _draft_min_cases_findings(collected, gate.min_cases)
         extra = dict(
             self.actor.write_tests(replace(ctx, draft_correction=correction))
         )
         current = _write_test_files(extra)
         if st.digest_canonical(current) == seen:
-            raise DraftMinCasesRefused(collected, gate.min_cases)
+            raise DraftMinCasesRefused(len(collected), gate.min_cases)
         collected = self._collect_private_draft(ctx, gate, current)
-        if collected >= gate.min_cases:
+        if shortfall(collected) is None:
             return current
-        raise DraftMinCasesRefused(collected, gate.min_cases)
+        raise DraftMinCasesRefused(len(collected), gate.min_cases)
 
     def _assert_runners_usable(self) -> None:
         """Every runner the plan names must run, before any agent is dispatched.
@@ -1922,7 +1986,7 @@ class FactoryScheduler:
         ctx: LaneContext,
         gate: SimpleNamespace,
         files: Mapping[str, str],
-    ) -> int:
+    ) -> tuple[str, ...]:
         run_repo = Path(self.target.target_repository_root)
         vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
         base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
@@ -1951,7 +2015,7 @@ class FactoryScheduler:
                 dest,
                 runtime_root=run_repo,
             )
-            return len(ids)
+            return tuple(ids)
         except (rr.CollectFailed, rr.RunnerUnusable) as extra:
             detail = getattr(extra, "detail", None) or extra.__class__.__name__
             tokens = prv.collect_private_tokens(

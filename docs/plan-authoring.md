@@ -169,6 +169,29 @@ must not quote the private assertion.
 - **Do not invent a second gate command for the builder.** Code review runs the sealed suite in a
   harness scratch tree composed from the candidate commit plus vault blobs. The builder does not
   receive runner argv that names private paths.
+- **Say *required*, not merely *present*, and require the refusal cases that prove it.** An
+  obligation phrased as "every record carries X" is discharged by a suite that only ever supplies X.
+  That suite cannot tell a required argument from an optional one, so a builder may legitimately
+  write `def record(observation, *, x=None)` and pass every case. Where the contract makes something
+  mandatory, say so in the acceptance criteria and state that the suite asserts the refusal — that
+  the call is rejected and that no row, record, or side effect results. Positive cases alone are a
+  contract for the happy path only.
+- **State the public surface: names, arity, and return types.** "Raw bytes addressed by their own
+  sha256" is an obligation; it is not an accessor name. When the tests lane invents `spl_bytes()` and
+  the builder invents something else, both are faithful to the prose and the pair cannot link. Name
+  the module path a case imports, each public callable, and what it returns — bytes or an object is a
+  difference the suite will discover and neither lane can guess.
+- **Ask of every case: would this fail a plausible wrong implementation?** A case that passes against
+  the permissive reading, the stub, or the previous lane's output is not testing the claim. This is
+  the question a test review must answer; a case count, a green command, and a valid test file are
+  each compatible with a suite that asserts nothing.
+- **Name the cases in `gate.required_cases`, not just how many in `min_cases`.** The harness
+  collects case identifiers from the draft and refuses one that is missing a required name, telling
+  the tester exactly which names are absent. A count cannot distinguish eleven happy-path cases from
+  a contract that also needs refusals; a list can. Write one name per obligation the contract makes
+  mandatory — the refusal cases especially, since those are the ones a positive-only suite silently
+  omits. The field is optional and a lane that declares none is checked on `min_cases` alone, so this
+  is the difference between an obligation the factory measures and one it hopes for.
 
 ## What a lane's outputs must cover
 
