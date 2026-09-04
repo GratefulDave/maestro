@@ -668,26 +668,27 @@ def test_producer_artifact_pin():
         self.assertFalse((self.root / "scratch-2" / ".git").exists())
 
 
-    def test_a_green_suite_outranks_a_reviewer_that_says_revise(self):
-        """Section 7: the broker result is authoritative for the candidate.
+    def test_a_reviewer_revise_stands_over_a_green_suite(self):
+        """A REVISE is a verdict, and a passing suite does not overturn it.
 
-        The red half of this rule was already enforced -- a PASS on a failing
-        suite is demoted to REVISE by the case above. The green half was not,
-        and its absence cost a run. On FDAdb run f50638ab, lane-wp7-build
-        measured 11 of 11 sealed cases, the reviewer returned REVISE telling
-        the builder to "restore optional nonnegative-integer n in every DPA
-        matrix schema and preserve it in matrix", and the sealed case asserts
-        that matrix is exactly {a, b, c, d}. The builder obeyed and the next
-        measurement was 9 of 11. The review ordered its own acceptance test
-        broken, and nothing stopped it.
+        The coercion in the other direction stays: a PASS on a failing suite is
+        demoted to REVISE by the case above, because the reviewer voted against
+        a measurement it could have read. This direction is not symmetric. The
+        sealed suite measures the cases it contains; a reviewer reads the code
+        against the plan, and almost everything it can see -- a field left
+        optional against a contract that requires it, a handler that never
+        reads the error it catches, an inverted config precedence -- is
+        something no green suite contradicts.
 
-        A reviewer may still observe anything it likes. It may not spend a
-        passing candidate on prose about behaviour the suite already measured,
-        so the observation is recorded as advisory and the verdict stands.
+        Coercing those to PASS published wrong code, which is not recoverable.
+        Letting a REVISE stand can cost a round when a reviewer asks for a
+        change the sealed suite refuses, and the suite refuses it: the next
+        candidate measures red and the finding is answered by machinery that
+        already exists. A recoverable cost, in place of an unrecoverable one.
         """
-        draft = self._draft(_digest("green-outranks-draft"))
+        draft = self._draft(_digest("revise-stands-draft"))
         passed = self._review(
-            draft, _digest("green-outranks-review"), st.ReviewerVerdict.PASS
+            draft, _digest("revise-stands-review"), st.ReviewerVerdict.PASS
         )
         builder = self._builder()
         sealed = self._seal(draft, passed, builder)
@@ -704,7 +705,7 @@ def test_producer_artifact_pin():
             request=_request(
                 run_id=self.run_id,
                 lane_id=self.lane_id,
-                input_digest=_digest("green-outranks-code-review"),
+                input_digest=_digest("revise-stands-code-review"),
             ),
             state_root=self.state,
             candidate_repo=self.repo,
@@ -714,7 +715,7 @@ def test_producer_artifact_pin():
             sealed_bundle=sealed,
             verdict=st.ReviewerVerdict.REVISE,
             findings=(located,),
-            scratch_root=self.root / "scratch-green-outranks",
+            scratch_root=self.root / "scratch-revise-stands",
             architecture_constraints=CONSTRAINTS,
         )
 
@@ -723,26 +724,26 @@ def test_producer_artifact_pin():
         self.assertEqual(artifact.payload["public_result_summary"]["errored"], 0)
         self.assertGreater(artifact.payload["public_result_summary"]["passed"], 0)
 
-        self.assertIs(artifact.verdict, st.ReviewerVerdict.PASS)
-        self.assertEqual(artifact.payload["verdict"], st.ReviewerVerdict.PASS.value)
-        # Nothing actionable reaches the builder, so nothing sends it back.
-        self.assertEqual(artifact.payload["findings"], [])
-        # The observation survives for a reader, redacted like any other.
-        self.assertEqual(len(artifact.payload["advisory_findings"]), 1)
+        self.assertIs(artifact.verdict, st.ReviewerVerdict.REVISE)
+        self.assertEqual(artifact.payload["verdict"], st.ReviewerVerdict.REVISE.value)
+        # The finding is actionable: it reaches the builder and sends it back.
+        self.assertEqual(len(artifact.payload["findings"]), 1)
         self.assertEqual(
-            set(artifact.payload["advisory_findings"][0]),
+            set(artifact.payload["findings"][0]),
             set(st.REVISE_FINDING_KEYS),
         )
+        self.assertNotIn("advisory_findings", artifact.payload)
         public = json.dumps(artifact.payload)
         self.assertNotIn(SECRET_LITERAL, public)
         self.assertNotIn(SECRET_SELECTOR, public)
         self.assertNotIn(TEST_PATH, public)
 
     def test_a_red_suite_still_keeps_the_reviewer_findings_actionable(self):
-        """The green rule must not leak into the red path.
+        """A failing suite sends the reviewer's located finding back unchanged.
 
-        Coercing on a green suite is only safe if a failing one still sends the
-        reviewer's located finding back to the builder unchanged.
+        The runner-failed branch rewrites a PASS and substitutes a finding when
+        the reviewer offered none. It must not touch a REVISE that arrived with
+        one.
         """
         draft = self._draft(_digest("red-keeps-draft"))
         passed = self._review(
@@ -779,7 +780,6 @@ def test_producer_artifact_pin():
         self.assertGreater(artifact.payload["public_result_summary"]["failed"], 0)
         self.assertIs(artifact.verdict, st.ReviewerVerdict.REVISE)
         self.assertEqual(len(artifact.payload["findings"]), 1)
-        self.assertEqual(artifact.payload["advisory_findings"], [])
 
     def test_code_review_refuses_sealed_path_colliding_with_candidate(self):
         product_path = "refund.py"

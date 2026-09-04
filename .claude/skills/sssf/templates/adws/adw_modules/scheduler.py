@@ -2488,8 +2488,9 @@ class FactoryScheduler:
         )
         settled = artifact.verdict
         if settled is not None and settled is not verdict:
-            # The sealed measurement outranked the reviewer. Say which way, so
-            # the log records that the transition came from the suite.
+            # The sealed measurement outranked the reviewer, which it can now
+            # do in one direction only: a failing runner promoting a PASS. Say
+            # so, because the transition came from the suite and not the vote.
             self._say(
                 lane_id,
                 "sealed suite is authoritative; verdict recorded as {0}".format(
@@ -2497,9 +2498,21 @@ class FactoryScheduler:
                 ),
                 "reviewer said {0}".format(verdict.value),
             )
-        # The artifact carries the verdict the measurement settled on, and the
-        # transition above was derived from it. Reading the reviewer's own
-        # answer here would block a lane whose suite is green.
+        # The artifact carries the settled verdict, and the transition above
+        # was derived from it, so the guard has to read the same field or it
+        # would judge a lane the transition did not send back.
+        #
+        # `settled` is now the reviewer's own answer in every case but one: a
+        # failing runner still promotes a PASS to REVISE. That lane is going
+        # back to BUILDING too, and it is the lane likeliest to loop, so it
+        # belongs in the guard. Keying on the reviewer's raw `verdict` -- what
+        # this read before ad186ba -- would skip exactly that case.
+        #
+        # A reviewer that says REVISE over a green suite now reaches here,
+        # which is the point. Those rounds score zero errors, so three of them
+        # satisfy `_stalled` and park the lane at WAITING_FOR_USER for the
+        # operator. That is the recoverable end of a reviewer that will not be
+        # satisfied; merging its candidate anyway was not.
         if settled is st.ReviewerVerdict.REVISE:
             self._block_if_stalled(lane_id)
 

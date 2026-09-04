@@ -585,22 +585,33 @@ class WholeFactoryRunTest(FactoryEndToEndBase):
             self.assertIn((lane, "test-reviewer", "PASS"), self.panes.verdicts)
 
         stages = self.lane_stages(run_id)
-        # The code reviewer is different, and this is the whole point of it.
-        # It said REVISE on a candidate whose sealed suite had just passed, and
-        # the suite is authoritative, so the lane merged anyway and the code
-        # reviewer was never asked a second time. Its opinion is recorded, not
-        # obeyed. Asserting it eventually said PASS would be asserting that a
-        # reviewer can hold a green candidate hostage.
+        # The code reviewer behaves the same way, and a green sealed suite does
+        # not overrule it. It said REVISE on a candidate whose suite had just
+        # passed, the lane went back to BUILDING, and it was asked again on the
+        # next candidate before the lane merged. A reviewer's verdict is the
+        # transition; the suite is what the next candidate has to satisfy.
         for lane in LANES:
             self.assertIn((lane, "code-reviewer", "REVISE"), self.panes.verdicts)
-            self.assertNotIn((lane, "code-reviewer", "PASS"), self.panes.verdicts)
+            self.assertIn((lane, "code-reviewer", "PASS"), self.panes.verdicts)
             self.assertEqual(stages[lane], st.LaneStage.MERGED.value)
 
-        # The publication reached the target repository's main ref.
+        # The publication reached the target repository's main ref, and it
+        # carries the candidate the code reviewer passed rather than the one
+        # it revised. The fake builder stamps its round number into the body,
+        # so this is the REVISE-does-not-merge assertion stated on published
+        # bytes: with code_revisions=1 the reviewer sent round 1 back, the
+        # builder produced round 2, and only round 2 may be on main. Reading
+        # the verdict list alone would not catch a lane that merged its first
+        # candidate and asked the reviewer again afterwards.
         head = _git(self.repo, "rev-parse", "refs/heads/main")
         for lane in LANES:
             blob = _git(self.repo, "cat-file", "-p", head + ":" + OUTPUTS[lane])
             self.assertIn(lane, blob)
+            self.assertEqual(self.panes.build_rounds[lane], 2)
+            revised = "{0}:{1}:1".format(lane, self.panes.nonce)
+            passed = "{0}:{1}:2".format(lane, self.panes.nonce)
+            self.assertEqual(blob.strip(), passed)
+            self.assertNotEqual(blob.strip(), revised)
 
         # Shape A: the lanes were linked children of the operator's own Space,
         # which Maestro neither created, tagged, nor closed.
