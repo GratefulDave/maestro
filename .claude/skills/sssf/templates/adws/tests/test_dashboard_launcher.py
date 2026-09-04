@@ -40,7 +40,10 @@ class FakeHost(_HostBase):
         self.warnings: list[str] = []
         self.next_pid = 1000
         self.files: set[str] = set()
+        self.missing_paths: set[str] = set()
+        self.executables: dict[int, str] = {}
         self.bun = "/fake/bun"
+        self.node = "/fake/node"
 
     def listeners(self, port: int) -> list[int]:
         with self._lock:
@@ -50,6 +53,17 @@ class FakeHost(_HostBase):
         with self._lock:
             proc = self.processes.get(pid)
             return bool(proc and proc["alive"])
+
+    def executable(self, pid: int) -> str | None:
+        with self._lock:
+            proc = self.processes.get(pid)
+            if not proc or not proc["alive"]:
+                return None
+            override = self.executables.get(pid)
+            if override is not None:
+                return override
+            argv = proc["argv"]
+            return argv[0] if argv else None
 
     def fingerprint(self, pid: int) -> launcher.Fingerprint | None:
         with self._lock:
@@ -122,13 +136,15 @@ class FakeHost(_HostBase):
     def which(self, name: str) -> str | None:
         if name == "bun":
             return self.bun
+        if name == "node":
+            return self.node
         return None
 
     def sleep(self, seconds: float) -> None:
         return None
 
     def path_is_file(self, path: Path) -> bool:
-        return True
+        return str(path) not in self.missing_paths
 
     def warn(self, detail: str) -> None:
         self.warnings.append(detail)
@@ -199,6 +215,52 @@ class DashboardLauncherTest(unittest.TestCase):
                 "http://localhost:4317/runs",
             ],
         )
+
+    def test_ui_runs_under_node_not_bun(self) -> None:
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        ui_pid = self.host.spawned[1]
+        argv = self.host.processes[ui_pid]["argv"]
+        self.assertEqual(argv[0], self.host.node)
+        self.assertEqual(argv[-3:], ("dev", "-p", "4317"))
+
+    def test_missing_node_skips_ui_but_not_api(self) -> None:
+        self.host.node = None
+        launcher.run_autoload(self.spec, self.host, self.runtime)
+        self.assertEqual(len(self.host.spawned), 1)
+        api_pid = self.host.spawned[0]
+        self.assertEqual(self.host.processes[api_pid]["argv"][0], self.host.bun)
+        self.assertIn("node is not on PATH; skipping UI", self.host.warnings)
+
+    def test_owned_ui_with_deleted_executable_is_restarted(self) -> None:
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        api_pid, ui_pid = self.host.spawned[0], self.host.spawned[1]
+        # The pid, argv and start time all survive a package upgrade that
+        # deletes the binary the process actually exec'd.
+        self.host.executables[ui_pid] = "/opt/homebrew/Cellar/bun/1.4.0/bin/bun"
+        self.host.missing_paths.add("/opt/homebrew/Cellar/bun/1.4.0/bin/bun")
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        self.assertIn(("TERM", ui_pid), self.host.signals)
+        self.assertNotIn(("TERM", api_pid), self.host.signals)
+        self.assertEqual(len(self.host.spawned), 3)
+        meta = json.loads((self.runtime / "ui.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["pid"], self.host.spawned[2])
+
+    def test_owned_api_with_deleted_executable_is_restarted(self) -> None:
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        api_pid, ui_pid = self.host.spawned[0], self.host.spawned[1]
+        self.host.executables[api_pid] = "/opt/homebrew/Cellar/bun/1.4.0/bin/bun"
+        self.host.missing_paths.add("/opt/homebrew/Cellar/bun/1.4.0/bin/bun")
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        self.assertIn(("TERM", api_pid), self.host.signals)
+        self.assertNotIn(("TERM", ui_pid), self.host.signals)
+        self.assertEqual(len(self.host.spawned), 3)
+
+    def test_intact_executable_is_not_restarted(self) -> None:
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        spawned = list(self.host.spawned)
+        self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
+        self.assertEqual(self.host.spawned, spawned)
+        self.assertEqual(self.host.signals, [])
 
     def test_stale_dead_pid_is_cleared_and_respawned(self) -> None:
         self.assertTrue(launcher.run_autoload(self.spec, self.host, self.runtime))
