@@ -128,21 +128,20 @@ def _scheduler(actor):
     return scheduler, artifact
 
 
-def _reviewed(measurement):
+def _reviewed(measurement, verdict):
     """What `review_builder_output` really hands back: an artifact.
 
-    Its verdict is the one the sealed measurement settles on, not the one the
-    reviewer offered -- a red suite demotes PASS, a green suite promotes
-    REVISE. Returning None here would have let the scheduler read a verdict
-    off nothing, which is what the fake used to do.
+    Its verdict is the reviewer's, with one coercion left: a red suite demotes
+    a PASS to REVISE, because the reviewer voted against a measurement it
+    could have read. A green suite no longer promotes a REVISE -- the fake
+    used to return PASS for every green round whatever the reviewer said,
+    which made it agree with the scheduler about a rule neither should have
+    had. Returning None here would have let the scheduler read a verdict off
+    nothing, which is what the fake did before that.
     """
-    return SimpleNamespace(
-        verdict=(
-            st.ReviewerVerdict.REVISE
-            if measurement.runner_failed
-            else st.ReviewerVerdict.PASS
-        )
-    )
+    if measurement.runner_failed:
+        return SimpleNamespace(verdict=st.ReviewerVerdict.REVISE)
+    return SimpleNamespace(verdict=verdict)
 
 
 def _drive(scheduler, artifact, measurement):
@@ -157,7 +156,7 @@ def _drive(scheduler, artifact, measurement):
     ) as measure, mock.patch.object(
         sch.cr,
         "review_builder_output",
-        side_effect=lambda **kwargs: _reviewed(measurement),
+        side_effect=lambda **kwargs: _reviewed(measurement, kwargs["verdict"]),
     ) as review:
         scheduler._reviewing_code("lane-a")
     return measure, review
@@ -224,15 +223,30 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
 
         self.assertEqual(len(actor.seen), 1)
 
-    def test_a_green_suite_the_reviewer_rejected_is_not_blocked_as_stalled(self):
-        """The stall guard reads the settled verdict, not the reviewer's.
+    def test_a_green_suite_the_reviewer_rejected_reaches_the_stall_guard(self):
+        """A REVISE is a REVISE, and the lane it sends back is guarded.
 
-        `_stalled` is `history[-1] >= min(history[:-1])`, and a green round
-        scores zero. A lane whose window already holds a zero would satisfy
-        that and be parked at WAITING_FOR_USER while its suite was passing.
-        The guard must only see the verdict the measurement settled on.
+        This asserted the opposite while a green suite outranked the reviewer:
+        the settled verdict was PASS, so the guard was never reached and a
+        lane could draw REVISE on every round and still merge on round one.
+        The guard is what makes the restored verdict recoverable rather than
+        infinite -- a green REVISE round scores zero errors, so three of them
+        satisfy `_stalled` and park the lane for the operator instead of
+        looping. Reaching the guard is not being blocked by it; `_stalled` is
+        false until the grace window fills.
         """
         actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        scheduler, artifact = _scheduler(actor)
+        scheduler._block_if_stalled = lambda lane_id: blocked.append(lane_id)
+        blocked: list[str] = []
+
+        _drive(scheduler, artifact, _measurement(runner_failed=False))
+
+        self.assertEqual(blocked, ["lane-a"])
+
+    def test_a_green_suite_the_reviewer_passed_never_reaches_the_stall_guard(self):
+        """The guard is for lanes going back, and a PASS is not going back."""
+        actor = _RecordingActor([(st.ReviewerVerdict.PASS, ())])
         scheduler, artifact = _scheduler(actor)
         scheduler._block_if_stalled = lambda lane_id: blocked.append(lane_id)
         blocked: list[str] = []
@@ -242,7 +256,13 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
         self.assertEqual(blocked, [])
 
     def test_a_red_suite_still_reaches_the_stall_guard(self):
-        actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
+        """Including the one coercion left: a PASS the red runner promoted.
+
+        The reviewer voted PASS here, so a guard keyed on the reviewer's own
+        answer -- which is what this read before ad186ba -- would skip the
+        lane that is likeliest to loop.
+        """
+        actor = _RecordingActor([(st.ReviewerVerdict.PASS, ())])
         scheduler, artifact = _scheduler(actor)
         scheduler._block_if_stalled = lambda lane_id: blocked.append(lane_id)
         blocked: list[str] = []

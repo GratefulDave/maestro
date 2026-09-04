@@ -74,10 +74,12 @@ def _plan_bytes(*, a_goal: str = "emit a.txt") -> bytes:
 
 class ScriptedActor:
     #: Whether this actor's opening candidate deliberately fails its sealed
-    #: suite. The scripted first-round REVISE below is only reachable when it
-    #: does: a green suite is authoritative and cannot be sent back. An actor
-    #: whose reviewer always returns PASS must set this False, because a red
-    #: suite outranks a PASS just as firmly.
+    #: suite. This was once the only way to reach the scripted first-round
+    #: REVISE below, because a green suite overruled the reviewer; a REVISE
+    #: now stands on its own and needs no red round to be honoured. The red
+    #: opening is kept because these tests are written around it. An actor
+    #: whose reviewer always returns PASS must still set this False: a red
+    #: suite promotes that PASS to REVISE and the lane would loop.
     first_candidate_is_draft = True
 
     #: When set, only these lanes open with a draft. Empty means every lane
@@ -98,10 +100,10 @@ class ScriptedActor:
         lines = ["# secret-selector", "from pathlib import Path", ""]
         for output in ctx.lane.declared_outputs:
             ident = Path(output).stem.replace("-", "_")
-            # Not existence: the builder's first candidate satisfies that, and
-            # a green suite is authoritative, so the scripted first-round
-            # REVISE below would never be honoured. The marker gives the
-            # opening round something real to fail.
+            # Not existence: the builder's first candidate satisfies that,
+            # and the marker is what gives the opening round something real
+            # to fail. That mattered absolutely when a green suite overruled
+            # the reviewer; it is now only what these tests are built around.
             lines.append("def test_{0}_{1}_is_ready():".format(name, ident))
             lines.append("    assert Path({0!r}).is_file()".format(output))
             lines.append(

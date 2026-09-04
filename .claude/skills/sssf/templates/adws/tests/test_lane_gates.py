@@ -59,14 +59,12 @@ def _review_payload(
     failed: int,
     errored: int,
     findings=(),
-    advisory=(),
 ) -> str:
     return json.dumps(
         {
             "input_digest": input_digest,
             "verdict": verdict,
             "findings": [dict(item) for item in findings],
-            "advisory_findings": [dict(item) for item in advisory],
             "public_result_summary": {
                 "errored": errored,
                 "executed": executed,
@@ -330,21 +328,10 @@ def test_unresolved_run_exits_nonzero(ledger, capsys):
 
 
 def test_reviewer_verdict_disagreement_is_visible():
-    coerced_to_pass = {
-        "verdict": st.ReviewerVerdict.PASS.value,
-        "advisory_findings": [{"observed_behavior": "a real observation"}],
-        "findings": [],
-    }
-    assert (
-        lane_gates.reviewer_verdict(coerced_to_pass)
-        == st.ReviewerVerdict.REVISE.value
-    )
-
     from adw_modules.code_review import _RUNNER_REVISE
 
     coerced_to_revise = {
         "verdict": st.ReviewerVerdict.REVISE.value,
-        "advisory_findings": [],
         "findings": [dict(_RUNNER_REVISE)],
     }
     assert (
@@ -352,12 +339,19 @@ def test_reviewer_verdict_disagreement_is_visible():
         == st.ReviewerVerdict.PASS.value
     )
 
-    agreed = {
+    # A REVISE over a green suite is no longer coerced, so there is nothing
+    # left behind to reconstruct: the recorded verdict is the voted one.
+    revised = {
         "verdict": st.ReviewerVerdict.REVISE.value,
-        "advisory_findings": [],
         "findings": [{"observed_behavior": "a located defect"}],
     }
-    assert lane_gates.reviewer_verdict(agreed) == st.ReviewerVerdict.REVISE.value
+    assert lane_gates.reviewer_verdict(revised) == st.ReviewerVerdict.REVISE.value
+
+    passed = {
+        "verdict": st.ReviewerVerdict.PASS.value,
+        "findings": [],
+    }
+    assert lane_gates.reviewer_verdict(passed) == st.ReviewerVerdict.PASS.value
 
 
 # --------------------------------------------------------------------------

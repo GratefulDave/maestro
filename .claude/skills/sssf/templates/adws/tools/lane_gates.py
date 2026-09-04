@@ -169,14 +169,12 @@ def review_rounds(
 def reviewer_verdict(payload: Mapping[str, Any]) -> str:
     """The verdict the reviewer voted, before the harness coerced it.
 
-    Read off the record, not guessed. A non-empty `advisory_findings` is what
-    a REVISE demoted to PASS over a green suite leaves behind; a substituted
-    runner finding is what a PASS promoted to REVISE over a red one leaves
-    behind. Anything else, the reviewer's verdict is the recorded one.
+    Read off the record, not guessed. A substituted runner finding is what a
+    PASS promoted to REVISE over a red suite leaves behind, and that is the
+    only coercion left: a REVISE stands whatever the suite measured. Anything
+    else, the reviewer's verdict is the recorded one.
     """
     recorded = str(payload.get("verdict") or _ABSENT)
-    if payload.get("advisory_findings"):
-        return st.ReviewerVerdict.REVISE.value
     for finding in payload.get("findings") or ():
         if not isinstance(finding, Mapping):
             continue
