@@ -127,6 +127,9 @@ class Host:
     def sleep(self, seconds: float) -> None:
         raise NotImplementedError
 
+    def executable(self, pid: int) -> str | None:
+        raise NotImplementedError
+
     def path_is_file(self, path: Path) -> bool:
         raise NotImplementedError
 
@@ -157,6 +160,11 @@ class RealHost(Host):
         except OSError:
             return False
         return True
+
+    def executable(self, pid: int) -> str | None:
+        if not self.pid_alive(pid):
+            return None
+        return _live_executable(pid)
 
     def fingerprint(self, pid: int) -> Fingerprint | None:
         if not self.pid_alive(pid):
@@ -230,6 +238,36 @@ class RealHost(Host):
 
     def path_is_file(self, path: Path) -> bool:
         return path.is_file()
+
+
+def _live_executable(pid: int) -> str | None:
+    """Path the process actually exec'd, as recorded by the kernel.
+
+    Not argv[0] and not `ps -o comm=`: both report the name the launcher used,
+    so a process started through a stable symlink still reads as that symlink
+    after the versioned target it resolved to has been deleted.
+    """
+    proc = Path("/proc/{0}/exe".format(pid))
+    if proc.is_symlink():
+        try:
+            target = os.readlink(proc)
+        except OSError:
+            return None
+        if target.endswith(" (deleted)"):
+            target = target[: -len(" (deleted)")]
+        return target or None
+    result = subprocess.run(
+        ["lsof", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 8)
+        if len(fields) == 9 and fields[3] == "txt":
+            return fields[8].strip() or None
+    return None
 
 
 def _live_argv(pid: int) -> tuple[str, ...] | None:
@@ -416,9 +454,14 @@ def api_argv(bun: str, spec: LaunchSpec) -> list[str]:
     return [bun, "run", str(server)]
 
 
-def ui_argv(bun: str, spec: LaunchSpec) -> list[str]:
+def ui_argv(node: str, spec: LaunchSpec) -> list[str]:
+    # Next.js forks its jest-worker children with process.execPath. Under Bun
+    # that is a versioned Homebrew Cellar path, so a `brew upgrade bun` deletes
+    # the binary out from under a running dev server and every worker spawn then
+    # fails ENOENT, surfacing as "t.send is not a function" in new WorkerPool.
+    # Run Next under node, which is what it forks correctly.
     nxt = dashboard_root(spec.launcher_file) / "node_modules" / ".bin" / "next"
-    return [bun, str(nxt), "dev", "-p", str(spec.ui_port)]
+    return [node, str(nxt), "dev", "-p", str(spec.ui_port)]
 
 
 def _stop_owned(host: Host, record: OwnerRecord) -> bool:
@@ -435,6 +478,36 @@ def _stop_owned(host: Host, record: OwnerRecord) -> bool:
     host.kill(pid)
     host.sleep(0.05)
     return not host.pid_alive(pid)
+
+
+def _runtime_intact(host: Host, record: OwnerRecord, meta: Path, kind: str) -> str:
+    """Whether the owned process still has its executable on disk.
+
+    Returns "healthy" (keep reusing), "stopped" (it was killed, respawn), or
+    "stuck" (it needs replacing but ownership no longer matches).
+
+    A pid, argv and start time all survive a package upgrade that deletes the
+    binary the process exec'd. Next.js forks its jest-worker children with
+    process.execPath, so such a server keeps answering while every worker
+    spawn fails ENOENT.
+    """
+    exe = host.executable(record.pid)
+    if exe is None or host.path_is_file(Path(exe)):
+        return "healthy"
+    host.warn(
+        "owned {0} on :{1} exec'd {2}, which no longer exists; restarting".format(
+            kind, record.port, exe
+        )
+    )
+    if not _stop_owned(host, record):
+        host.warn(
+            "owned {0} on :{1} runs a deleted executable but no longer matches ownership; skipping".format(
+                kind, record.port
+            )
+        )
+        return "stuck"
+    clear_owner(meta)
+    return "stopped"
 
 
 def _owned_listener(
@@ -512,7 +585,14 @@ def ensure_api(
                 )
             )
             return False
-        health = host.http_code(api_url(spec.api_port, HEALTH_PATH))
+        state = _runtime_intact(host, owned, meta, "API")
+        if state == "stuck":
+            return False
+        if state == "stopped":
+            listeners = host.listeners(spec.api_port)
+            health = None
+        else:
+            health = host.http_code(api_url(spec.api_port, HEALTH_PATH))
         if health == 200:
             try:
                 payload = host.http_json(api_url(spec.api_port, SOURCES_PATH))
@@ -538,7 +618,7 @@ def ensure_api(
                 listeners = host.listeners(spec.api_port)
             else:
                 return True
-        else:
+        elif state == "healthy":
             return True
     if listeners:
         host.warn(
@@ -563,7 +643,7 @@ def ensure_ui(
     spec: LaunchSpec,
     host: Host,
     runtime: Path,
-    bun: str,
+    node: str,
 ) -> bool:
     nxt = dashboard_root(spec.launcher_file) / "node_modules" / ".bin" / "next"
     if not host.path_is_file(nxt):
@@ -571,7 +651,7 @@ def ensure_ui(
         return False
     meta = runtime / "ui.json"
     log_path = runtime / "ui.log"
-    argv = ui_argv(bun, spec)
+    argv = ui_argv(node, spec)
     cwd = dashboard_root(spec.launcher_file)
     env = os.environ.copy()
     env["MAESTRO_API_PORT"] = str(spec.api_port)
@@ -585,7 +665,12 @@ def ensure_ui(
                 )
             )
             return False
-        return True
+        state = _runtime_intact(host, owned, meta, "UI")
+        if state == "stuck":
+            return False
+        if state == "healthy":
+            return True
+        listeners = host.listeners(spec.ui_port)
     if listeners:
         host.warn(
             "port {0} occupied by pid(s) {1}; skipping UI".format(
@@ -644,6 +729,7 @@ def wait_ready(spec: LaunchSpec, host: Host) -> bool:
 
 def run_autoload(spec: LaunchSpec, host: Host, runtime: Path) -> bool:
     bun = host.which("bun")
+    node = host.which("node")
     viz = visualizer_root(spec.launcher_file) / "server" / "index.ts"
     runtime.mkdir(parents=True, exist_ok=True)
     with exclusive_lock(runtime / "lock"):
@@ -653,7 +739,10 @@ def run_autoload(spec: LaunchSpec, host: Host, runtime: Path) -> bool:
             host.warn("visualizer API missing at {0}; skipping spawn".format(viz))
         else:
             ensure_api(spec, host, runtime, bun)
-            ensure_ui(spec, host, runtime, bun)
+            if node:
+                ensure_ui(spec, host, runtime, node)
+            else:
+                host.warn("node is not on PATH; skipping UI")
         if not wait_ready(spec, host):
             return False
         if spec.open_browser:
