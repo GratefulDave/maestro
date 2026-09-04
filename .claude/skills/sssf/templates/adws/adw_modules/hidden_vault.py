@@ -238,6 +238,28 @@ def rev_list_objects(repo: Path) -> str:
     return _git(repo, "rev-list", "--all", "--objects").stdout
 
 
+def objects_reachable_from(repo: Path, commit: str) -> frozenset[str]:
+    """Every object id reachable from one commit, its trees, and its history.
+
+    Not the commit's top tree alone. A checkout made from this commit shares
+    the whole ancestry, so anything `rev-list --objects` walks here is bytes
+    the holder of that commit could already read.
+
+    A commit the repository does not have yields the empty set rather than an
+    error, so a caller using this to widen an allowance grants nothing when
+    the commit is unknown.
+    """
+    listed = _git(repo, "rev-list", "--objects", commit, check=False)
+    if listed.returncode != 0:
+        return frozenset()
+    ids = set()
+    for line in listed.stdout.splitlines():
+        object_id = line.split(" ", 1)[0].strip()
+        if object_id:
+            ids.add(object_id)
+    return frozenset(ids)
+
+
 def prove_absent(repositories: Sequence[Path], object_ids: Sequence[str]) -> None:
     present = []
     for repo in repositories:
