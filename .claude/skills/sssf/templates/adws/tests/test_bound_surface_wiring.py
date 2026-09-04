@@ -330,7 +330,10 @@ class TheActorPutsTheSurfaceInExtra(unittest.TestCase):
             Path("/tmp/attempt/checkout"),
         )
         actor._bind_checkout = lambda key, attempt, checkout, used: used
-        actor._commit_declared = lambda cwd, outputs, sha: ("2" * 40, True)
+        actor._commit_declared = lambda cwd, outputs, sha, *, strip=(): (
+            "2" * 40,
+            True,
+        )
         actor._refresh_builder_checkout = lambda *a, **k: None
         return actor
 
@@ -352,6 +355,11 @@ class TheActorPutsTheSurfaceInExtra(unittest.TestCase):
             sealed_digest="3" * 64,
             artifacts={},
             bound_surface=surface,
+            # These cases are about the prompt, not the checkout. The strip
+            # guard is stubbed out above; a real `LaneContext` always carries
+            # this field, so a fake that omits it fails loudly rather than
+            # silently launching a builder over its own sealed suite.
+            sealed_private_paths=(),
         )
 
     def _extra(self, surface):
