@@ -723,7 +723,16 @@ class HerdrStageActor:
             ),
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
-                "verdict, findings, and only genuinely affected lane IDs."
+                "verdict, findings, and only genuinely affected lane IDs. "
+                "Sealed test paths are absent from this checkout by design, "
+                "and their absence is never a finding: the harness measures "
+                "every run-level sealed gate itself, against this same "
+                "integration SHA with the sealed suite overlaid, before you "
+                "are asked, and a gate that failed reaches you as a REVISE "
+                "you are not consulted about. Do not run, re-run, or judge a "
+                "declared gate command, and never report a missing test path, "
+                "an uncollected case, a case count, or a gate exit code. Judge "
+                "the code in this checkout against the lane contracts."
             ),
         }
         try:
@@ -742,7 +751,7 @@ class HerdrStageActor:
             "- Do not delegate or spawn subagents.\n"
             "- Treat the per-turn JSON prompt, envelope path, and envelope schema as authoritative.\n"
             "- Never commit, branch, merge, or rebase; the broker owns Git publication.\n"
-            "- Write only what this role permits, then write the requested UTF-8 JSON envelope and stop.\n\n"
+            "- Write only what this role permits, then write the requested UTF-8 JSON envelope to its `.part` sibling and rename it into place, and stop.\n\n"
             "{1}\n"
         ).format(role, role_rule)
         if route == "claude":
@@ -866,8 +875,10 @@ class HerdrStageActor:
         instructions = (
             "Work only inside CWD. Local file operations stay in CWD. Native "
             "Read, Write, Edit, Bash, skills, and MCP remain available. "
-            "Do not delegate. Stay inside CWD. Create UTF-8 JSON at {0} and "
-            "stop. Schema: {1}. CWD: {2}."
+            "Do not delegate. Stay inside CWD. Create UTF-8 JSON at {0}.part, "
+            "then rename it to {0}, then stop. The rename declares the turn "
+            "finished; never write into {0} directly, because a reader polling "
+            "it reads a partial file as a failed turn. Schema: {1}. CWD: {2}."
         ).format(envelope_path, json.dumps(schema, sort_keys=True), cwd.resolve())
 
         if role == "tester":
@@ -1304,6 +1315,34 @@ class HerdrStageActor:
                 return payload
             result = self.launcher.poll(handle)
             if result.state in (lch.PollState.GONE, lch.PollState.EXITED):
+                # Belt to the `.part`-then-rename braces above. An envelope
+                # written in place can be read mid-write: json.loads throws,
+                # envelope_exists is already True, and poll reports EXITED
+                # because `_declared_result` read the same partial file.
+                #
+                # EXITED does NOT mean the process died -- role sessions are
+                # persistent across turns -- so this re-read is not authoritative
+                # and must never be described as such. It is a second look that
+                # usually lands after the write, and it exists only for an agent
+                # that ignored the rename protocol. The protocol is the fix; this
+                # is what keeps one unlucky read from ending a run while some
+                # route still writes in place.
+                payload = None
+                try:
+                    payload = json.loads(_read_regular_text_under(bound, envelope))
+                except FileNotFoundError:
+                    envelope_exists = False
+                except FactoryRefused:
+                    raise
+                except (OSError, UnicodeError, ValueError):
+                    envelope_exists = True
+                if isinstance(payload, dict) and self._payload_ok(role, payload):
+                    self._say(
+                        lane_id or "-",
+                        "{0} envelope settled after exit".format(role),
+                        "",
+                    )
+                    return payload
                 outcome = (
                     "STAGE_PAYLOAD_INVALID"
                     if envelope_exists

@@ -954,11 +954,22 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
     cwd = gate.get("cwd") or "."
     if not isinstance(cwd, str) or not cwd:
         raise DraftCollectionRefused("cwd")
+    # A count cannot tell eleven happy-path cases from a contract that also
+    # needs refusals. `required_cases` names the cases that must exist, so an
+    # obligation is measured rather than hoped for. Optional: a lane that
+    # declares none is checked on `min_cases` alone, as before.
+    required = gate.get("required_cases") or ()
+    if not isinstance(required, (list, tuple)):
+        raise DraftCollectionRefused("required_cases")
+    required = tuple(str(item) for item in required if str(item).strip())
+    if len(required) > int(min_cases):
+        raise DraftCollectionRefused("required_cases exceeds min_cases")
     return SimpleNamespace(
         runner=str(runner),
         argv=tuple(str(item) for item in argv),
         cwd=cwd,
         min_cases=int(min_cases),
+        required_cases=required,
     )
 
 
@@ -969,6 +980,7 @@ def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleName
         argv=argv,
         cwd=gate.cwd,
         min_cases=gate.min_cases,
+        required_cases=tuple(getattr(gate, "required_cases", ()) or ()),
     )
 
 
@@ -1024,6 +1036,42 @@ def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
                     "what the refusal names and resubmit"
                 ),
                 "violated_requirement": "gate collection",
+            },
+        )
+    )
+
+
+def _missing_required_cases(
+    collected: Sequence[str], required: Sequence[str]
+) -> tuple[str, ...]:
+    """Required case names with no collected identifier naming them.
+
+    Matched as a substring of the collected identifier, because a runner prints
+    `path::name` (pytest) or `path > title` (vitest) and the plan names the case,
+    not the file it landed in.
+    """
+    return tuple(
+        name for name in required if not any(name in cid for cid in collected)
+    )
+
+
+def _draft_required_cases_findings(
+    missing: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    return st.require_revise_findings(
+        (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": (
+                    "native collect listed no case named: {0}".format(
+                        ", ".join(missing)
+                    )
+                ),
+                "required_behavior": (
+                    "the suite must contain a case for each name the gate "
+                    "requires, discharging the obligation it names"
+                ),
+                "violated_requirement": "gate.required_cases",
             },
         )
     )
@@ -1841,19 +1889,35 @@ class FactoryScheduler:
                 raise
             seen = st.digest_canonical(current)
             collected = self._collect_private_draft(ctx, gate, current)
-        if collected >= gate.min_cases:
+        required = tuple(getattr(gate, "required_cases", ()) or ())
+
+        def shortfall(ids: Sequence[str]) -> tuple[dict[str, str], ...] | None:
+            """The correction this draft needs, or None when it satisfies the gate.
+
+            Names before count: a suite missing a required case is wrong in a way
+            the tester can act on, and saying "write 4 more cases" instead of
+            naming them is what let run a33d5e9b re-emit the same eleven.
+            """
+            missing = _missing_required_cases(ids, required)
+            if missing:
+                return _draft_required_cases_findings(missing)
+            if len(ids) < gate.min_cases:
+                return _draft_min_cases_findings(len(ids), gate.min_cases)
+            return None
+
+        correction = shortfall(collected)
+        if correction is None:
             return current
-        correction = _draft_min_cases_findings(collected, gate.min_cases)
         extra = dict(
             self.actor.write_tests(replace(ctx, draft_correction=correction))
         )
         current = _write_test_files(extra)
         if st.digest_canonical(current) == seen:
-            raise DraftMinCasesRefused(collected, gate.min_cases)
+            raise DraftMinCasesRefused(len(collected), gate.min_cases)
         collected = self._collect_private_draft(ctx, gate, current)
-        if collected >= gate.min_cases:
+        if shortfall(collected) is None:
             return current
-        raise DraftMinCasesRefused(collected, gate.min_cases)
+        raise DraftMinCasesRefused(len(collected), gate.min_cases)
 
     def _assert_runners_usable(self) -> None:
         """Every runner the plan names must run, before any agent is dispatched.
@@ -1922,7 +1986,7 @@ class FactoryScheduler:
         ctx: LaneContext,
         gate: SimpleNamespace,
         files: Mapping[str, str],
-    ) -> int:
+    ) -> tuple[str, ...]:
         run_repo = Path(self.target.target_repository_root)
         vault = hv.ensure_vault(self.runtime.path, ctx.run_id)
         base = hv.seed(vault, run_repo, st.integration_ref(self.run_id))
@@ -1951,7 +2015,7 @@ class FactoryScheduler:
                 dest,
                 runtime_root=run_repo,
             )
-            return len(ids)
+            return tuple(ids)
         except (rr.CollectFailed, rr.RunnerUnusable) as extra:
             detail = getattr(extra, "detail", None) or extra.__class__.__name__
             tokens = prv.collect_private_tokens(
@@ -2722,6 +2786,86 @@ class FactoryScheduler:
                 failures.append(lane.lane_id)
         return tuple(failures)
 
+    def _sealed_paths(self) -> frozenset[str]:
+        """Every private test path sealed in this run, at the live revision.
+
+        These files are in the vault and are never written into the integration
+        surface, so an integration reviewer is never given them. The set is the
+        harness's own -- the same bundles `_failed_run_gates` overlays -- not a
+        pattern, so it names exactly the files that cannot be observed.
+        """
+        paths: set[str] = set()
+        for lane in self.store.active_projection(self.run_id):
+            sealed = self._current_tests_sealed(lane.lane_id)
+            if sealed is None:
+                continue
+            try:
+                files = tc.sealed_private_files(
+                    hv.ensure_vault(self.runtime.path, self.run_id),
+                    _record_as_lane_artifact(sealed, lane),
+                )
+            except Exception:  # noqa: BLE001 -- a vault read must not fail a review
+                continue
+            paths.update(files)
+        return frozenset(paths)
+
+    def _drop_unobservable_findings(
+        self,
+        verdict: st.ReviewerVerdict,
+        findings: Sequence[Mapping[str, str]],
+        affected: Sequence[str],
+    ) -> tuple[st.ReviewerVerdict, tuple[Mapping[str, str], ...], tuple[str, ...]]:
+        """Discard findings about files the reviewer was never given.
+
+        Sealed tests live only in the vault. A reviewer that reports one missing,
+        uncollected, or exiting nonzero is describing a checkout it did not read,
+        so the finding is not an observation and cannot be evidence. The role
+        contract already says this in words; run a33d5e9b's integration reviewer
+        was handed that sentence in its own AGENTS.md and reported the absence
+        anyway, three times. An instruction is not a control (§ numbers, not
+        prose), so the claim is dropped where the verdict is recorded.
+
+        This narrows nothing real: a finding about a file the reviewer CAN read
+        is untouched. When every finding was unobservable there is no evidence
+        left, and a REVISE with no finding is not a verdict -- it becomes PASS,
+        which is what the harness's own gate already measured.
+        """
+        if verdict is not st.ReviewerVerdict.REVISE:
+            return verdict, tuple(findings), tuple(affected)
+        sealed = self._sealed_paths()
+        if not sealed:
+            return verdict, tuple(findings), tuple(affected)
+
+        def names_sealed(area: str, path: str) -> bool:
+            # Path-segment match, never a raw substring. `area` is often a file
+            # with a line suffix ("a/b.py:12") or the directory that holds the
+            # suite ("a/b"), so both directions are needed -- but a bare "tests"
+            # must not match "services/x/tests/y.py" just by appearing in it.
+            if not area or not path:
+                return False
+            if area == path:
+                return True
+            if area.startswith(path) and area[len(path)] in ":#":
+                return True
+            return path.startswith(area + "/")
+
+        def observable(finding: Mapping[str, str]) -> bool:
+            area = str(finding.get("implementation_area") or "").strip()
+            return not any(names_sealed(area, path) for path in sealed)
+
+        kept = tuple(f for f in findings if observable(f))
+        dropped = len(findings) - len(kept)
+        if not dropped:
+            return verdict, tuple(findings), tuple(affected)
+        self._say(
+            "-",
+            "dropped {0} finding(s) about sealed paths".format(dropped),
+            "the reviewer was never given those files",
+        )
+        if kept:
+            return verdict, kept, tuple(affected)
+        return st.ReviewerVerdict.PASS, (), ()
+
     def _final_review(self) -> None:
         self.locks.acquire(2)
         try:
@@ -2759,6 +2903,9 @@ class FactoryScheduler:
             else:
                 verdict, findings, affected = self.actor.review_integration(
                     ctx, lanes, head
+                )
+                verdict, findings, affected = self._drop_unobservable_findings(
+                    verdict, findings, affected
                 )
             checked = prv.actionable_findings(verdict, findings)
             payload = {
