@@ -23,9 +23,7 @@ must not do:
   tree changes), and only a head that already carries it is revalidated;
 - an unchanged tests lane re-seals after a build amendment even though its
   accepted bytes are now legitimately in the product repository, while a
-  private blob anywhere else in that repository still refuses the seal;
-- a finding about a released suite is an observation and survives the
-  unobservable-finding filter.
+  private blob anywhere else in that repository still refuses the seal.
 
 What A1 deliberately does not guarantee: after an amendment the build lane's
 new base is the integration head, which now carries its own predecessor suite.
@@ -66,12 +64,6 @@ from tests.test_tests_lane_handoff import (  # noqa: E402
 )
 
 SUITE_PATH = "tests/public_contract.py"
-FINDING_ABOUT_THE_SUITE = {
-    "implementation_area": SUITE_PATH + ":3",
-    "observed_behavior": "the case asserts the file ends with 'ready' only",
-    "required_behavior": "the case must also assert the file is non-empty",
-    "violated_requirement": "declared test contract exists",
-}
 
 
 class _RecordingActor(HandoffActor):
@@ -208,32 +200,6 @@ class SealedReleaseTests(unittest.TestCase):
         for _lane, base in actor.builder_bases:
             self.assertFalse(_tree_has(self.repo, base, SUITE_PATH), base)
         self.assertNotIn(SECRET, json.dumps(actor.builder_contracts))
-
-    def test_a_finding_about_a_released_suite_is_an_observation(self) -> None:
-        compiled = plan_compiler.compile_plan(
-            _plan_bytes(), plan_revision=1, plan_artifact_ref="plan:observe"
-        )
-        actor = _RecordingActor(self.repo, self.runtime.path / "worktrees")
-        scheduler = self._start(compiled, actor, "run-observe")
-        self.assertEqual(scheduler.run(), st.RunStatus.COMPLETE)
-        head = self._merge("run-observe")["after_sha"]
-        # Nothing sealed in this run is unobservable at the integration head.
-        self.assertEqual(scheduler._sealed_paths(head), frozenset())
-        verdict, findings, affected = scheduler._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [FINDING_ABOUT_THE_SUITE], ["lane-tests"], head
-        )
-        self.assertIs(verdict, st.ReviewerVerdict.REVISE)
-        self.assertEqual(list(findings), [FINDING_ABOUT_THE_SUITE])
-        self.assertEqual(affected, ("lane-tests",))
-        # At the pre-merge tree the same path is still vault-only and the same
-        # finding is still not an observation.
-        before = self._merge("run-observe")["before_sha"]
-        self.assertEqual(scheduler._sealed_paths(before), frozenset({SUITE_PATH}))
-        verdict, findings, _ = scheduler._drop_unobservable_findings(
-            st.ReviewerVerdict.REVISE, [FINDING_ABOUT_THE_SUITE], ["lane-tests"], before
-        )
-        self.assertIs(verdict, st.ReviewerVerdict.PASS)
-        self.assertEqual(findings, ())
 
     # -- crash reconciliation ------------------------------------------------
 

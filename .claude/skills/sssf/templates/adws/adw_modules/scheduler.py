@@ -2915,93 +2915,6 @@ class FactoryScheduler:
                 failures.append(lane.lane_id)
         return tuple(failures)
 
-    def _sealed_paths(self, head: str) -> frozenset[str]:
-        """Every sealed private test path the integration surface does not carry.
-
-        A build lane's merge releases its predecessor suite into the
-        integration ref, so at `head` those files are ordinary readable files
-        and a finding about them is an observation. What stays in the vault
-        is the suite of a tests lane no build lane consumes -- the ones
-        `_failed_run_gates` overlays -- and an untyped lane's meta-tests. The
-        set is measured off the tree at `head`, not derived from lane kinds,
-        so it names exactly the files the reviewer could not have read.
-        """
-        git = self.target.git()
-        paths: set[str] = set()
-        for lane in self.store.active_projection(self.run_id):
-            sealed = self._current_tests_sealed(lane.lane_id)
-            if sealed is None:
-                continue
-            try:
-                files = tc.sealed_private_files(
-                    hv.ensure_vault(self.runtime.path, self.run_id),
-                    _record_as_lane_artifact(sealed, lane),
-                )
-            except Exception:  # noqa: BLE001 -- a vault read must not fail a review
-                continue
-            paths.update(path for path in files if git.tree_blob(head, path) is None)
-        return frozenset(paths)
-
-    def _drop_unobservable_findings(
-        self,
-        verdict: st.ReviewerVerdict,
-        findings: Sequence[Mapping[str, str]],
-        affected: Sequence[str],
-        head: str,
-    ) -> tuple[st.ReviewerVerdict, tuple[Mapping[str, str], ...], tuple[str, ...]]:
-        """Discard findings about files the reviewer was never given.
-
-        A sealed suite the integration ref does not carry lives only in the
-        vault. A reviewer that reports one missing, uncollected, or exiting
-        nonzero is describing a checkout it did not read, so the finding is
-        not an observation and cannot be evidence. The role contract already
-        says this in words; run a33d5e9b's integration reviewer was handed
-        that sentence in its own AGENTS.md and reported the absence anyway,
-        three times. An instruction is not a control (§ numbers, not prose),
-        so the claim is dropped where the verdict is recorded.
-
-        This narrows nothing real: a finding about a file the reviewer CAN read
-        -- product code, or a suite a merge released at `head` -- is untouched.
-        When every finding was unobservable there is no evidence left, and a
-        REVISE with no finding is not a verdict -- it becomes PASS, which is
-        what the harness's own gate already measured.
-        """
-        if verdict is not st.ReviewerVerdict.REVISE:
-            return verdict, tuple(findings), tuple(affected)
-        sealed = self._sealed_paths(head)
-        if not sealed:
-            return verdict, tuple(findings), tuple(affected)
-
-        def names_sealed(area: str, path: str) -> bool:
-            # Path-segment match, never a raw substring. `area` is often a file
-            # with a line suffix ("a/b.py:12") or the directory that holds the
-            # suite ("a/b"), so both directions are needed -- but a bare "tests"
-            # must not match "services/x/tests/y.py" just by appearing in it.
-            if not area or not path:
-                return False
-            if area == path:
-                return True
-            if area.startswith(path) and area[len(path)] in ":#":
-                return True
-            return path.startswith(area + "/")
-
-        def observable(finding: Mapping[str, str]) -> bool:
-            area = str(finding.get("implementation_area") or "").strip()
-            return not any(names_sealed(area, path) for path in sealed)
-
-        kept = tuple(f for f in findings if observable(f))
-        dropped = len(findings) - len(kept)
-        if not dropped:
-            return verdict, tuple(findings), tuple(affected)
-        self._say(
-            "-",
-            "dropped {0} finding(s) about sealed paths".format(dropped),
-            "the reviewer was never given those files",
-        )
-        if kept:
-            return verdict, kept, tuple(affected)
-        return st.ReviewerVerdict.PASS, (), ()
-
     def _final_review(self) -> None:
         self.locks.acquire(2)
         try:
@@ -3039,9 +2952,6 @@ class FactoryScheduler:
             else:
                 verdict, findings, affected = self.actor.review_integration(
                     ctx, lanes, head
-                )
-                verdict, findings, affected = self._drop_unobservable_findings(
-                    verdict, findings, affected, head
                 )
             checked = prv.actionable_findings(verdict, findings)
             payload = {
