@@ -841,8 +841,16 @@ def execute_cases(
     merged = dict(os.environ)
     if env is not None:
         merged.update(env)
+    # `PYTEST_ADDOPTS` is the operator's, so it is cleared: a gate must not
+    # read a flag from whoever started the run. A plugin in the suite's own
+    # environment is the project's, declared in its own dependencies, and the
+    # sealed cases are written against it -- `collect_cases` loads those
+    # plugins, so executing without them measures a different environment than
+    # the one the suite was collected and accepted in. An `async def` case then
+    # fails with "async def functions are not natively supported" no matter
+    # what the candidate does, and the redacted failure lines name the sealed
+    # tests, so the builder is told only how many failed.
     merged["PYTEST_ADDOPTS"] = ""
-    merged["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     try:
         result = run_bounded(argv, cwd=cwd, env=merged, timeout_s=timeout_s)
     except OSError as extra:

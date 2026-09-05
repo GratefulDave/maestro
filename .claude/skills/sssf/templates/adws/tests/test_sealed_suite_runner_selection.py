@@ -1231,5 +1231,60 @@ class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
         self.assertIn(str(tree / ".venv" / "bin" / "pytest"), message)
 
 
+class ExecutionLoadsThePluginsCollectionLoadedTest(unittest.TestCase):
+    """A gate runs the suite's own pytest plugins, not a stripped pytest.
+
+    `execute_cases` used to set `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` while
+    `collect_cases` did not, so a suite was enumerated and accepted under its
+    project's plugins and then executed without them. On FDAdb that made every
+    `async def` case fail with "async def functions are not natively
+    supported" however the candidate was written, three rounds running, and
+    the redacted failure lines named the sealed tests so the builder was told
+    only that four had failed.
+
+    A stub cannot observe plugin loading -- it replays whatever stdout it was
+    scripted with -- so this runs the real binary and asks for a fixture only
+    a third-party plugin defines. `worker_id` is pytest-xdist's and needs no
+    `-n`; under the stripped environment the case errors on a missing fixture.
+    """
+
+    def setUp(self) -> None:
+        self.pytest_bin = shutil.which("pytest")
+        if self.pytest_bin is None:
+            self.skipTest("no pytest binary on PATH")
+
+    def _run(self, env: dict[str, str] | None = None) -> dict:
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / "test_a.py").write_text(
+                "def test_a_plugin_fixture_resolves(worker_id):\n"
+                "    assert worker_id\n",
+                encoding="utf-8",
+            )
+            resolved = rr.ResolvedRunner(runner="pytest", executable=self.pytest_bin)
+            gate = SimpleNamespace(
+                runner="pytest", argv=("test_a.py",), cwd=".", min_cases=1
+            )
+            return rr.execute_cases(resolved, gate, root, timeout_s=300.0, env=env)
+
+    def test_a_case_needing_a_third_party_plugin_passes(self) -> None:
+        raw = self._run()
+        self.assertEqual(int(raw["returncode"]), 0, raw["output"])
+        self.assertEqual(tc._parse_suite_counts("pytest", raw["output"])["passed"], 1)
+
+    def test_the_stripped_environment_is_what_used_to_break_it(self) -> None:
+        # The same case under the environment the gate used to build. Without
+        # this the passing case above proves only that the fixture exists.
+        raw = self._run({"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
+        self.assertNotEqual(int(raw["returncode"]), 0)
+        self.assertIn("worker_id", raw["output"])
+
+    def test_the_operators_addopts_is_still_cleared(self) -> None:
+        # Clearing PYTEST_ADDOPTS is the hermeticity the gate does keep: a
+        # flag from whoever started the run must not reach it.
+        raw = self._run({"PYTEST_ADDOPTS": "--maxfail=0 --nonsense-flag"})
+        self.assertEqual(int(raw["returncode"]), 0, raw["output"])
+
+
 if __name__ == "__main__":
     unittest.main()
