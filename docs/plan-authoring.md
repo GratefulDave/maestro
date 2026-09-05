@@ -249,10 +249,23 @@ breaks something. So ask the other one:
 
 > **Could an agent satisfy this sentence and break a file that is not in these outputs?**
 
-The two questions have different answers, and the second one is the one that ships defects. Run
-`codemap impact` over each file a lane will change; every dependent it names either belongs in that
-lane's `outputs` or is a lane of its own. A dependent that is in neither is a file no builder may
-repair, no tester will construct a case for, and no reviewer holds a contract over.
+The two questions have different answers, and the second one is the one that ships defects. Enumerate
+the dependents of every file a lane will change; each one either belongs in that lane's `outputs` or
+is a lane of its own. A dependent that is in neither is a file no builder may repair, no tester will
+construct a case for, and no reviewer holds a contract over.
+
+**`codemap impact` answers this only for the file types its grammars parse, and it does not tell you
+which ones those are.** On FDAdb it reports *zero* dependents for `src/lib/seo/entity-route.ts`,
+which ten `.astro` pages import — it does not read `.astro` at all, and the empty answer looks
+exactly like a file nothing depends on. So run it, and then search the repository for the module
+specifier across every extension the project actually contains:
+
+```
+codemap impact <file> --direction reverse
+grep -rl "<module specifier>" <source root>     # every extension, no --include filter
+```
+
+The grep is not a formality. It is the half that would have caught the case below.
 
 FDAdb WP8 is what that costs. Its eight lanes declared 21 files and changed exactly 21 files, so the
 first question passed everywhere, and three separate defects reached a published integration ref
