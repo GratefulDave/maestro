@@ -141,6 +141,39 @@ def _resolved(path: str) -> str:
     return str(Path(path).resolve()) if path else ""
 
 
+#: The pane width this fake renders composer output at. Narrow on purpose: a
+#: session name carries a 64-hex repository fingerprint, so any realistic pane
+#: is narrower than the confirmation sentence.
+COMPOSER_COLUMNS = 51
+
+
+def _as_composer_renders(message: str) -> str:
+    """`message` broken across lines the way a real composer prints it.
+
+    Two different breaks, both observed in the pane that refused run
+    98fa094e's cleanup. The composer word-wraps its own text, putting a real
+    newline before a word that will not fit; the terminal then hard-wraps a
+    word longer than the pane mid-token. Emitting the sentence on one line --
+    which this fake used to do -- agreed with a contiguous substring match and
+    so could never fail while that match was wrong.
+    """
+    lines: List[str] = []
+    line = ""
+    for word in str(message).split(" "):
+        candidate = word if not line else line + " " + word
+        if line and len(candidate) > COMPOSER_COLUMNS:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+        while len(line) > COMPOSER_COLUMNS:
+            lines.append(line[:COMPOSER_COLUMNS])
+            line = line[COMPOSER_COLUMNS:]
+    if line:
+        lines.append(line)
+    return "\n".join(lines)
+
+
 class FakeHerdr:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -156,7 +189,6 @@ class FakeHerdr:
         self.hooks_after: Dict[Verb, List[Callable[[tuple[str, ...]], None]]] = {}
         self.agent_start_refusal = ""
         self.rename_confirms = True
-        self.wait_output_error = ""
         self.close_workspace_error = ""
         self.close_pane_error = ""
         self.cascade_close_children = True
@@ -488,19 +520,17 @@ class FakeHerdr:
             if key.lower() == "enter" and self.rename_confirms:
                 last = str(pane.get("last_text") or "")
                 if last.startswith("/rename "):
-                    pane["output"] = lch.session_rename_confirmation(
-                        last[len("/rename ") :]
+                    pane["output"] = _as_composer_renders(
+                        lch.session_rename_confirmation(last[len("/rename ") :])
                     )
             return {}
-        if verb == ("pane", "wait-output"):
-            if self.wait_output_error:
-                self._raise(self.wait_output_error)
-            self._require_pane(args[2])
-            needle = flag(args, "--match") or ""
-            text = str(self.panes[args[2]].get("output") or "")
-            if needle and needle not in text:
-                self._raise("wait_output_timeout")
-            return {"result": {"type": "pane_text", "text": text}}
+        # `pane wait-output` is deliberately not answered here. Nothing in the
+        # runtime calls it any more: it matches a literal substring against the
+        # snapshot, and the one thing Maestro waited on -- the composer's
+        # rename confirmation -- reaches the pane wrapped across lines, so that
+        # match could never succeed. An unimplemented verb reaches the
+        # `AssertionError` below, which is what a fake owes a caller that has
+        # started using a surface no test has agreed on.
         if verb == ("pane", "process-info"):
             pane_id = flag(args, "--pane") or ""
             self._require_pane(pane_id)

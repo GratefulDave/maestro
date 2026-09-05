@@ -1109,6 +1109,34 @@ def session_rename_confirmation(session_name: str) -> str:
     return 'Session renamed to "{}".'.format(session_name)
 
 
+def _squeezed(text: str) -> str:
+    """`text` with every run of whitespace removed."""
+    return "".join(str(text).split())
+
+
+def session_rename_confirmed(text: str, session_name: str) -> bool:
+    """Whether `text` carries the confirmation, however the composer broke it.
+
+    The confirmation is one sentence to the composer and several lines to the
+    pane. It word-wraps its own output, so a real newline lands after `to`,
+    and the terminal then hard-wraps the name itself mid-token. A session name
+    embeds a 64-hex repository fingerprint, so it is always long enough for
+    both to happen -- which makes a contiguous literal match, done here or by
+    `herdr pane wait-output --match`, unable to succeed for any name this
+    module can produce. `--source recent-unwrapped` does not rescue it: that
+    rejoins terminal wrapping, and the break after `to` is a newline the
+    renderer emitted.
+
+    Measured on the pane that refused run 98fa094e's cleanup: `Session renamed
+    to` matched, `code-reviewer".` matched, and `Session renamed to "FDAdb`
+    did not, in every one of Herdr's three snapshot sources. Comparing with
+    whitespace removed matched in all three. Whitespace is the only thing the
+    wrapping adds, so removing it is what compares the sentence rather than
+    its layout.
+    """
+    return _squeezed(session_rename_confirmation(session_name)) in _squeezed(text)
+
+
 def git_primary_workdir(repo: Path) -> Path:
     """The Git repository parent working tree, never a linked worktree cwd."""
     path = Path(repo).resolve()
@@ -2288,6 +2316,10 @@ def _wait_for_available_shell(
 #: fresh pane and nothing here can wait or loop without end.
 AGENT_START_BUSY_WINDOW_S = 10.0
 AGENT_START_BUSY_POLL_S = 0.5
+
+#: How often COMPLETE cleanup re-reads a pane while waiting for the composer
+#: to print its rename confirmation. The window is the caller's `timeout_s`.
+SESSION_RENAME_POLL_S = 0.5
 
 
 def _start_agent_when_free(
@@ -5191,9 +5223,7 @@ class HerdrLauncher:
             )
         return session_name_for("maestro", handle.correlation_token, lane, role)
 
-    def _pane_has_text(
-        self, handle: LaunchHandle, needle: str
-    ) -> bool:
+    def _pane_text(self, handle: LaunchHandle) -> str:
         try:
             payload = self._herdr(
                 "pane",
@@ -5204,18 +5234,24 @@ class HerdrLauncher:
                 env=handle.environment,
             )
         except BaseException:
-            return False
+            return ""
         result = payload.get("result", payload)
-        text = ""
         if isinstance(result, dict):
-            text = str(result.get("text") or "")
-        return needle in text
+            return str(result.get("text") or "")
+        return ""
 
     def _confirm_session_rename(
         self, handle: LaunchHandle, session_name: str, timeout_s: float
     ) -> None:
-        confirm = session_rename_confirmation(session_name)
-        if self._pane_has_text(handle, confirm):
+        """Rename the pane's session and read the composer's own confirmation.
+
+        The wait is polled here rather than delegated to `herdr pane
+        wait-output`, because that verb matches a literal substring against the
+        snapshot and the confirmation reaches the pane wrapped across lines.
+        `session_rename_confirmed` is the comparison that survives the
+        wrapping, and it needs the text in this process to apply it.
+        """
+        if session_rename_confirmed(self._pane_text(handle), session_name):
             return
         try:
             self._herdr(
@@ -5232,17 +5268,6 @@ class HerdrLauncher:
                 "enter",
                 env=handle.environment,
             )
-            self._herdr(
-                "pane",
-                "wait-output",
-                handle.pane_id,
-                "--match",
-                confirm,
-                "--timeout",
-                str(max(1, int(timeout_s * 1000))),
-                env=handle.environment,
-                timeout=timeout_s + 5.0,
-            )
         except BaseException as exc:
             if isinstance(exc, LaunchRefused):
                 raise
@@ -5253,6 +5278,19 @@ class HerdrLauncher:
                 ),
                 pane_created=True,
             ) from exc
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        while True:
+            if session_rename_confirmed(self._pane_text(handle), session_name):
+                return
+            if time.monotonic() >= deadline:
+                raise LaunchRefused(
+                    LaunchRefusal.SESSION_RENAME_UNCONFIRMED,
+                    "{0}: no confirmation within {1:.0f}s".format(
+                        handle.pane_id, float(timeout_s)
+                    ),
+                    pane_created=True,
+                )
+            time.sleep(SESSION_RENAME_POLL_S)
 
 
     def _close_workspace_absent_ok(
