@@ -2244,6 +2244,7 @@ class FactoryScheduler:
             test_draft=test_draft,
             test_review=_record_as_lane_artifact(review, lane),
             released=self._released_object_ids(lane, test_draft),
+            integration_initial_sha=str(row["integration_initial_sha"]),
         )
         _complete(
             self.store,

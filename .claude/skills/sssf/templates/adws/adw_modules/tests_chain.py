@@ -276,6 +276,7 @@ def seal_accepted_tests(
     test_draft: st.LaneArtifact,
     test_review: st.LaneArtifact,
     released: Collection[str] = (),
+    integration_initial_sha: str | None = None,
 ) -> st.LaneArtifact:
     """Seal the accepted draft and prove its bytes are still private.
 
@@ -285,6 +286,22 @@ def seal_accepted_tests(
     unchanged tests lane re-sealing after an amendment finds its own accepted
     bytes in the product repository for that reason and no other; anything
     else present there is still a leak and still refuses.
+
+    `integration_initial_sha` names the integration commit the run was
+    created on. An object reachable from it is not a leak, because git
+    identifies a blob by its content: a tester who writes a file whose bytes
+    already exist somewhere in the base -- a boilerplate `conftest.py`, an
+    empty `__init__.py`, whose blob id is the same everywhere -- produces an
+    object the repository was already holding before the vault held any draft
+    of this run. Two facts make the exemption safe rather than a loosening.
+    That object set is fixed at run creation, so nothing this run does can
+    add to it and no escape can authorize itself into it. And a blob
+    reachable from the base is in every builder checkout by construction, so
+    exempting it hands the builder nothing it could not already read. The
+    question narrows from "does the product repository hold these bytes" to
+    "does it hold them for a reason older than this run"; anything present
+    and not reachable from that commit is still a leak and still refuses.
+    Left unset, the exemption is empty and the check is exactly as it was.
     """
     if test_draft.kind is not st.ArtifactKind.TEST_DRAFT:
         raise pr.PrivateReviewError("seal requires TEST_DRAFT")
@@ -306,9 +323,15 @@ def seal_accepted_tests(
     sealed_digest = _manifest_digest(commit, private)
     sealed = hv.sealed_ref(request.run_id, request.lane_id, sealed_digest)
     object_ids = (commit,) + tuple(blob for _path, blob in private)
-    hv.prove_absent(
-        (run_repo,), tuple(oid for oid in object_ids if oid not in released)
-    )
+    refused = tuple(oid for oid in object_ids if oid not in released)
+    if refused and integration_initial_sha:
+        # Walking the base commit costs a full rev-list, so pay it only once
+        # and only when something is actually present to explain. A clean
+        # seal -- the ordinary case -- never touches it.
+        if any(not hv.object_is_absent(run_repo, oid) for oid in refused):
+            base_objects = hv.objects_reachable_from(run_repo, integration_initial_sha)
+            refused = tuple(oid for oid in refused if oid not in base_objects)
+    hv.prove_absent((run_repo,), refused)
     if builder_worktree is not None:
         hv.prove_absent((builder_worktree,), object_ids)
         if commit in hv.advertised_object_ids(run_repo):

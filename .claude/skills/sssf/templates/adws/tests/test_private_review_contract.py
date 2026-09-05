@@ -50,6 +50,20 @@ CONTRACT = {
     "acceptance_criteria": ["negative amounts are refused"],
     "declared_outputs": [TEST_PATH],
 }
+# Boilerplate a tester writes beside its cases and a repository commonly
+# already holds somewhere else. Nothing about it is secret; git still gives
+# it one blob id wherever it appears, which is what made it read as a leak.
+SHIM_PATH = "tests/store_boundary/conftest.py"
+BASE_SHIM_PATH = "tests/sections/conftest.py"
+SHIM_SOURCE = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "\n"
+    "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n"
+)
+EMPTY_PATH = "tests/store_boundary/__init__.py"
+BASE_EMPTY_PATH = "tests/sections/__init__.py"
+EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 CONSTRAINTS = ("change only declared outputs",)
 
 
@@ -445,6 +459,113 @@ def test_producer_artifact_pin():
         self.assertNotIn(str(vault.resolve()), view_text)
         self.assertNotIn("refs/maestro/sealed/", view_text)
         self.assertNotIn("refs/maestro/drafts/", view_text)
+
+    def _draft_with(self, input_digest, files, contract) -> st.LaneArtifact:
+        return tc.write_test_draft(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=input_digest,
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            integration_ref=INTEGRATION_REF,
+            files=files,
+            public_contract=contract,
+            worktrees_root=self.worktrees / input_digest[:8],
+        )
+
+    def _seal_on_base(self, draft, review, base: str) -> st.LaneArtifact:
+        """Seal the way the scheduler does: no builder worktree, base named."""
+        return tc.seal_accepted_tests(
+            request=_request(
+                run_id=self.run_id,
+                lane_id=self.lane_id,
+                input_digest=_digest("seal-" + draft.input_digest),
+            ),
+            state_root=self.state,
+            run_repo=self.repo,
+            builder_worktree=None,
+            test_draft=draft,
+            test_review=review,
+            integration_initial_sha=base,
+        )
+
+    def _commit_repo_file(self, path: str, body: str) -> str:
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "add {0}".format(path))
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def test_seal_allows_private_bytes_the_base_commit_already_holds(self):
+        base = self._commit_repo_file(BASE_SHIM_PATH, SHIM_SOURCE)
+        contract = {
+            "acceptance_criteria": CONTRACT["acceptance_criteria"],
+            "declared_outputs": [TEST_PATH, SHIM_PATH],
+        }
+        draft = self._draft_with(
+            _digest("collision-draft"),
+            {TEST_PATH: TEST_SOURCE, SHIM_PATH: SHIM_SOURCE},
+            contract,
+        )
+        vault = hv.vault_path(self.state, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        shared = hv.blob_id_in(vault, commit, SHIM_PATH)
+        self.assertEqual(shared, hv.blob_id_in(self.repo, base, BASE_SHIM_PATH))
+        self.assertFalse(hv.object_is_absent(self.repo, shared))
+        passed = self._review(
+            draft, _digest("collision-review"), st.ReviewerVerdict.PASS
+        )
+
+        sealed = self._seal_on_base(draft, passed, base)
+
+        self.assertIs(sealed.kind, st.ArtifactKind.SEALED_TEST_BUNDLE)
+        cases = tc.sealed_private_files(vault, sealed)
+        self.assertIn(TEST_PATH, cases)
+        self.assertTrue(hv.object_is_absent(self.repo, cases[TEST_PATH]))
+
+    def test_seal_allows_an_empty_private_file_the_base_already_holds(self):
+        base = self._commit_repo_file(BASE_EMPTY_PATH, "")
+        contract = {
+            "acceptance_criteria": CONTRACT["acceptance_criteria"],
+            "declared_outputs": [TEST_PATH, EMPTY_PATH],
+        }
+        draft = self._draft_with(
+            _digest("empty-draft"),
+            {TEST_PATH: TEST_SOURCE, EMPTY_PATH: ""},
+            contract,
+        )
+        vault = hv.vault_path(self.state, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        self.assertEqual(hv.blob_id_in(vault, commit, EMPTY_PATH), EMPTY_BLOB)
+        self.assertFalse(hv.object_is_absent(self.repo, EMPTY_BLOB))
+        passed = self._review(draft, _digest("empty-review"), st.ReviewerVerdict.PASS)
+
+        sealed = self._seal_on_base(draft, passed, base)
+
+        self.assertIs(sealed.kind, st.ArtifactKind.SEALED_TEST_BUNDLE)
+        cases = tc.sealed_private_files(vault, sealed)
+        self.assertTrue(hv.object_is_absent(self.repo, cases[TEST_PATH]))
+
+    def test_seal_refuses_private_bytes_the_base_commit_does_not_reach(self):
+        base = _git(self.repo, "rev-parse", "HEAD")
+        draft = self._draft(_digest("escape-draft"))
+        passed = self._review(draft, _digest("escape-review"), st.ReviewerVerdict.PASS)
+        vault = hv.vault_path(self.state, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        leaked = hv.blob_id_in(vault, commit, TEST_PATH)
+        # The accepted case reaches the product repository after the run was
+        # created. That is the escape the check exists to catch, and widening
+        # the allowance to the base commit must leave it caught.
+        self._commit_repo_file(TEST_PATH, TEST_SOURCE)
+        self.assertFalse(hv.object_is_absent(self.repo, leaked))
+
+        with self.assertRaises(hv.VaultError) as caught:
+            self._seal_on_base(draft, passed, base)
+
+        self.assertIn(leaked, str(caught.exception))
 
     def test_seal_without_pass_is_refused(self):
         draft = self._draft(_digest("draft-1"))
