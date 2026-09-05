@@ -238,9 +238,16 @@ deployment that holds shipped v1 plans refuses those plans until they are
 re-shipped, so sequence the mirror against what is running there rather than
 treating it as a neutral copy.
 
-`_node_goal` answers `1` in **both** deployments as of 2026-08-22, so no
-deployment's reviewers are judging against the placeholder. That is the cheap
-check, not a substitute for the table. The 2026-08-18 hand-level of
+**The `_node_goal` check below is withdrawn as of 2026-09-05 — it now answers
+`0` everywhere, including in this repository's own template, and that is
+correct rather than alarming.** The artifact-factory cutover (`e7b477e`) deleted
+the function; a reviewer's contract is now projected from
+`public_contract["acceptance_criteria"]` (`adw_modules/code_review.py`). Anyone
+running the grep on a current deployment reads a `0` that used to mean "every
+review here is degraded" and means nothing at all today. There is no one-line
+successor: to check that a deployment's reviewers hold a real contract, read a
+recent `CODE_REVIEW` artifact and see whether its findings cite the lane's
+acceptance criteria. The 2026-08-18 hand-level of
 lexgenius-pipeline remains the episode that cost
 `run-0120c32064d144c2aa55c344087e0b0a`, whose every reviewer was told "Make
 the gate '…' pass over selector '…', changing only the declared outputs"
@@ -251,12 +258,16 @@ Nothing enforces any of this and nothing would notice it drifting again (§16.3 
 "level" as a state anything maintains, and do not read a differing filename as a cost — `code_review.py`
 was reported as differing the whole time it was silently degrading every review in that deployment.
 Re-derive the table above before relying on it; it is a dated observation, not an invariant, and the
-only invariant here is the parity test between the two template copies. For the divergence with a
-known behavioural cost there is a direct check, cheaper than reading a diff and stating what it means:
+only invariant here is the parity test between the two template copies. There used to be a one-line
+check here for the divergence with a known behavioural cost:
 
 ```bash
-grep -c "def _node_goal" <deployment>/adws/adw_modules/code_review.py   # 0 = reviewers are judging against a placeholder
+grep -c "def _node_goal" <deployment>/adws/adw_modules/code_review.py   # WITHDRAWN — answers 0 everywhere; see above
 ```
+
+It is kept only so nobody reintroduces it from memory. A cheap check that outlives the code it
+greps for is worse than no check: it reports a catastrophe on a healthy deployment, and the next
+reader either panics or learns to ignore the file.
 
 `maestro.config.yaml` is deliberately *not* copied from a deployment. It is deployment-specific:
 its lane vendors, models, and concurrency name a particular installation. The template's copy
