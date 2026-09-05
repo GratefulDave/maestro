@@ -730,7 +730,19 @@ class HerdrStageActor:
                 "declared outputs. If an external test contradicts the lane's "
                 "public contract, assess the candidate against the contract "
                 "instead of demanding a test edit. Private tests are absent and "
-                "must not be inferred, requested, or cited."
+                "must not be inferred, requested, or cited.\n"
+                "For every declared output the candidate changed, enumerate its "
+                "callers inside this checkout before deciding: "
+                "`codemap impact <file> --direction reverse`, then "
+                "`grep -rl \"<module specifier>\" <source root>` with no "
+                "`--include` filter, because codemap parses only some "
+                "extensions and an unparsed importer is indistinguishable from "
+                "no importer. Read how each caller actually invokes the changed "
+                "code, and check the candidate against that call, not only "
+                "against the call the lane's own tests make. A caller the "
+                "candidate breaks is a finding even though the caller is not a "
+                "declared output: the defect is in the declared output and so "
+                "is its repair, which is what keeps the finding actionable."
             ),
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
@@ -744,7 +756,16 @@ class HerdrStageActor:
                 "are asked, and a gate that failed reaches you as a REVISE "
                 "you are not consulted about. Do not run or re-run a "
                 "declared gate command. Judge the code in this checkout "
-                "against the lane contracts."
+                "against the lane contracts.\n"
+                "You are the only reader who sees every lane's callers at "
+                "once, so enumerate them: for each file the merged surface "
+                "changed, run `codemap impact <file> --direction reverse` and "
+                "then `grep -rl \"<module specifier>\" <source root>` with no "
+                "`--include` filter -- codemap parses only some extensions, "
+                "and an unparsed importer looks exactly like no importer. A "
+                "caller no lane declared is the one thing no lane-level "
+                "reviewer could have checked. Read how it invokes the changed "
+                "code and say whether the merged surface still satisfies it."
             ),
         }
         try:
