@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **The tester and the test reviewer have the words for a worthless test.**
+  The tester's role contract now names three anti-patterns with their tells:
+  implementation-coupled (breaks on a refactor with no behaviour change),
+  tautological (the assertion recomputes the expected value the way the code
+  does, tell `assert add(2, 3) == 2 + 3`), and horizontal slicing /
+  shape-asserting (assertions on structure with no behavioural expectation),
+  plus the loop rules — red before green, one seam one test per cycle,
+  refactoring is not part of the loop. The test reviewer must answer one
+  question per anti-pattern and name any matching case *with the case id*; a
+  named case is a located finding, so the verdict is `REVISE`. The same three
+  paragraphs are in `docs/plan-authoring.md`, because the plan author writes
+  the acceptance the tester works from. Naming the case id rather than quoting
+  its source is what survives private-token redaction on the way back to the
+  tester.
 - **Independent ready lanes advance concurrently again; merges stay serialized.**
   `maestro.config.yaml` takes `concurrency` (default 1). Above 1,
   `FactoryScheduler` submits every ready non-merge lane's stage to a pool of

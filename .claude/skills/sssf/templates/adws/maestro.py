@@ -474,6 +474,42 @@ def _read_regular_text_under(root: Path, path: Path) -> str:
     return _read_regular_bytes_under(root, path)[1].decode("utf-8")
 
 
+TEST_CRAFT_ANTIPATTERNS = (
+    "## Test-craft anti-patterns\n"
+    "Three shapes make a test worthless. Do not write one, and say so if the "
+    "acceptance you were given asks for one.\n"
+    "- Implementation-coupled: mocks internal collaborators, tests private "
+    "methods, or verifies through a side channel. Tell: the test breaks on a "
+    "refactor with no behaviour change.\n"
+    "- Tautological: the assertion recomputes the expected value the same way "
+    "the code does, so it passes by construction. Expected values must come "
+    "from an independent source: a known-good literal, a worked example, the "
+    "spec. Tell: assert add(2, 3) == 2 + 3.\n"
+    "- Horizontal slicing / shape-asserting: all tests first then all "
+    "implementation, so tests verify an imagined shape rather than behaviour. "
+    "Tell: assertions on structure (keys exist, type is list) with no "
+    "behavioural expectation.\n"
+    "Loop rules: red before green; one seam, one test per cycle; refactoring "
+    "is not part of the loop.\n"
+)
+
+TEST_CRAFT_REVIEWER_QUESTION = (
+    "## Test-craft questions\n"
+    "Answer all three, every turn. Name any case that is "
+    "implementation-coupled (mocks internal collaborators, tests private "
+    "methods, or verifies through a side channel; the tell is a test that "
+    "breaks on a refactor with no behaviour change), with the case id. Name "
+    "any case that is tautological (the assertion recomputes the expected "
+    "value the same way the code does, so it passes by construction; expected "
+    "values must come from an independent source: a known-good literal, a "
+    "worked example, the spec), with the case id. Name any case that asserts "
+    "shape rather than behaviour (assertions on structure such as keys exist "
+    "or type is list, with no behavioural expectation), with the case id. A "
+    "named case is a located finding that discharges nothing, so the verdict "
+    "is REVISE.\n"
+)
+
+
 def _clear_precreated_role_cwd(dest: Path) -> bool:
     """Empty a precreated role cwd without replacing its process-bound inode."""
     if not _precreated_role_cwd(dest):
@@ -700,6 +736,7 @@ class HerdrStageActor:
                 "apply revise_findings to hidden validators; do not claim a "
                 "finding is fixed by resubmitting byte-identical hidden files."
             )
+        tester_rule = tester_rule + "\n\n" + TEST_CRAFT_ANTIPATTERNS
         role_rules = {
             "tester": tester_rule,
 
@@ -714,7 +751,7 @@ class HerdrStageActor:
                 "listed in the per-turn JSON. Integration-seed and product "
                 "files are context and out of scope. A private validator "
                 "failing against the base is expected when falsifiability "
-                "requires red-at-base."
+                "requires red-at-base.\n\n" + TEST_CRAFT_REVIEWER_QUESTION
             ),
             "builder": (
                 "Modify only the declared product outputs. Never read private "
