@@ -486,6 +486,39 @@ def _clear_precreated_role_cwd(dest: Path) -> bool:
     return True
 
 
+#: Where a test double may stand, and where it may not. Appended to both tester
+#: rules, because a `tests` lane and a hidden-validator lane draw the same seam.
+#:
+#: Authoring guidance, not a verdict axis: nothing reads this back and no
+#: transition keys on it. What it buys is a way for the tester to *report* an
+#: unreachable subject in its envelope instead of asserting through another
+#: lane's fixture and failing for a reason that is not about the product.
+#: `lane-wp7-gw-issue-build` spent three attempts and parked with no candidate
+#: on exactly that shape: its acceptance reached `/v1/faers/dpa` through a
+#: `SourceHandler` stand-in owned by a different lane, which routes a fixed
+#: path list and 404s everything else. The lane could neither fix the stand-in
+#: nor pass without it, and had no vocabulary for saying so.
+TEST_DOUBLE_BOUNDARY = (
+    "## Where a test double belongs\n"
+    "Substitute only at a boundary this lane does not own and cannot run: a "
+    "third-party service, another service across a network, the clock, "
+    "randomness. Never substitute a collaborator that lives inside this lane's "
+    "declared outputs -- exercise the real one through its interface. A double "
+    "there asserts the shape you imagined rather than the behaviour that was "
+    "built, and it keeps passing after the behaviour breaks.\n"
+    "A double answers one operation with one shape. A single dispatcher that "
+    "routes a whitelist of paths and fails everything else is not a double, it "
+    "is a second implementation: the next case added falls off the whitelist "
+    "and fails for a reason that has nothing to do with the product. Prefer one "
+    "named stand-in per operation over one conditional stand-in for all of "
+    "them.\n"
+    "If a case can only reach its subject through a file this lane does not "
+    "own, the seam is in the wrong place and no test written here will fix it. "
+    "Say that in the envelope, naming the file and the case. Reporting an "
+    "unreachable subject is a complete answer; asserting through it is not.\n"
+)
+
+
 class HerdrStageActor:
     """Persistent role panes. Envelope bytes are payload, not stage."""
 
@@ -700,6 +733,7 @@ class HerdrStageActor:
                 "apply revise_findings to hidden validators; do not claim a "
                 "finding is fixed by resubmitting byte-identical hidden files."
             )
+        tester_rule = tester_rule + "\n\n" + TEST_DOUBLE_BOUNDARY
         role_rules = {
             "tester": tester_rule,
 
