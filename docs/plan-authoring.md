@@ -368,17 +368,25 @@ factory operator surface. Factory execution uses `run start|resume|amend|status`
 `planctl` calls carried `--repo-root .` because IR lived in `.maestro/` while `source_artifacts`
 were repo-relative. Maestro refused `..` escapes.
 
-### Historical verifier commands and `test_strength`
+### Historical verifier commands, and `test_strength`, which is not historical
+
+**`test_strength` is still required, today, on every tests-lane verifier.** Ingress raises
+`UNMAPPABLE_VERIFIERS:<lane>.test_strength` when a tests verifier omits it *and* when a build
+verifier carries it (`adw_modules/plan_contract_ingress.py`). This section described it in the past
+tense for long enough to cost an authoring round; the paragraph below is a live contract, not a
+record. Only the surrounding verifier-command material is historical.
 
 Every lane declared one countable verifier. `Gate.runner` was `Literal["pytest", "vitest"]`. Shell
 scripts, Make targets, and health checks were refused as `maestro.command`. Authors were told to
 pass real argv (`npx vitest run …`), never `npm test`. Playwright/Cypress could not be gates.
 
-A tests lane's verifier carried `test_strength`: `coverage[]` with `requirement_id`, `aspect`
+A tests lane's verifier carries `test_strength`: `coverage[]` with `requirement_id`, `aspect`
 (positive and negative both required), `case_selector` substring, `min_cases`, plus
 `falsifiability.strategy` of `baseline_absent` or `controlled_mutation` matching
-`expected_reason_pattern`. `maestro run start` refused `RUN_TEST_STRENGTH_CONTRACT_ABSENT`.
-`case_selector` existed so lifecycle would not key on an agent's account of coverage.
+`expected_reason_pattern`. `case_selector` exists so lifecycle does not key on an agent's account of
+coverage. The `RUN_TEST_STRENGTH_CONTRACT_ABSENT` refusal at `run start` is gone — that part *is*
+historical; the ingress refusal above replaces it, which means an omission is caught when the plan
+is compiled rather than when a run is attempted.
 
 Those fields named private selectors and expected literals. They must not appear on a builder
 prompt or in public `CODE_REVIEW` findings under the factory contract. Public acceptance criteria
