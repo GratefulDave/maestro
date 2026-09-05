@@ -69,7 +69,22 @@ def normalize_declared_output(raw: Any) -> Optional[str]:
         return None
     if raw.endswith("/"):
         return None
-    if any(char in raw for char in "*?[]"):
+    # `*` and `?` only. A bracket is not a glob here, and refusing it made
+    # whole framework conventions unownable: Astro, Next.js, SvelteKit, Remix
+    # and Nuxt all spell a dynamic route `[slug].astro` / `[id].tsx`, so no
+    # lane could declare a single dynamic page. FDAdb's paid-panel regression
+    # is exactly a change to a helper whose ten callers are all `[slug].astro`
+    # -- the repair plan named them, as the authoring rule now requires, and
+    # the compiler refused all ten.
+    #
+    # Nothing globs a declared output, which is what makes this safe rather
+    # than lenient: `validate_declared_ownership` tests set membership on the
+    # exact strings (`git_publication`), `permissions._matches` compares byte
+    # equality unless the pattern itself carries `*` or `?` and `re.escape`s a
+    # bracket besides, `outputs_conflict` below is prefix arithmetic, and no
+    # `glob`/`fnmatch` in the runtime is ever handed one. Re-check that before
+    # widening this further.
+    if any(char in raw for char in "*?"):
         return None
     candidate = PurePosixPath(raw)
     native = PurePath(raw)

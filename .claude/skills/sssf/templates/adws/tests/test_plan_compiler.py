@@ -142,11 +142,53 @@ class ObjectiveCompilerTests(unittest.TestCase):
                 self.assertIn(pv.OUTPUT_PATH_INVALID, _codes(caught.exception))
 
     def test_globs_and_directories_are_refused(self):
-        for path in ("src/*.py", "src/?", "src/[a].py", "src/pkg/"):
+        for path in ("src/*.py", "src/?", "src/pkg/", "src/a*/b.py", "a?.py"):
             with self.subTest(path=path):
                 with self.assertRaises(PlanCompileError) as caught:
                     compile_plan(_dump(_plan(_lane("lane-a", outputs=[path]))))
                 self.assertIn(pv.OUTPUT_PATH_INVALID, _codes(caught.exception))
+
+    def test_a_bracketed_dynamic_route_is_an_ordinary_file_path(self):
+        """`[slug].astro` is a filename, not a glob, and lanes must own it.
+
+        Astro, Next.js, SvelteKit, Remix and Nuxt all spell a dynamic route
+        with brackets, so refusing the character made every dynamic page in
+        those projects unownable by any lane -- and a file no lane can own is
+        one no builder may repair and no reviewer holds a contract over, which
+        is the defect the outputs rule exists to prevent. FDAdb's paid-panel
+        regression lives in a helper whose ten callers are all `[slug].astro`.
+
+        Safe because nothing globs a declared output: ownership validation is
+        set membership on the exact strings, `permissions._matches` compares
+        byte equality unless the pattern itself carries `*` or `?`, and
+        `outputs_conflict` is prefix arithmetic.
+        """
+        paths = [
+            "src/pages/faers/drugs/[slug].astro",
+            "src/pages/maude/product-codes/[code]/trend.astro",
+            "app/routes/[id].tsx",
+        ]
+        compiled = compile_plan(_dump(_plan(_lane("lane-a", outputs=paths))))
+        # Sorted, because the compiler orders declared outputs.
+        self.assertEqual(sorted(compiled.lanes[0].declared_outputs), sorted(paths))
+
+    def test_two_dynamic_routes_still_conflict_when_equal(self):
+        # Admitting the character must not weaken one-owner-per-path.
+        payload = _plan(
+            _lane("lane-a", outputs=["src/pages/[slug].astro"]),
+            _lane("lane-b", outputs=["src/pages/[slug].astro"]),
+        )
+        with self.assertRaises(PlanCompileError) as caught:
+            compile_plan(_dump(payload))
+        self.assertIn(pv.OUTPUT_OWNERSHIP_CONFLICT, _codes(caught.exception))
+
+    def test_a_bracket_never_matches_a_sibling_it_would_glob(self):
+        # If anything ever globbed these, `[ab].astro` would own `a.astro`.
+        # Ownership is byte-exact, so the two are unrelated paths and a lane
+        # declaring both is admitted rather than refused as a conflict.
+        paths = ["src/pages/[ab].astro", "src/pages/a.astro"]
+        compiled = compile_plan(_dump(_plan(_lane("lane-a", outputs=paths))))
+        self.assertEqual(sorted(compiled.lanes[0].declared_outputs), sorted(paths))
 
     def test_equal_and_ancestor_outputs_conflict_across_lanes(self):
         equal = _plan(
