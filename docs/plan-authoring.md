@@ -242,6 +242,56 @@ Two ways to fix it:
 A lane whose outputs are all new files is the ordinary greenfield case. What is suspect is a lane
 whose *sentence* only comes true once some file it may not write changes.
 
+### Ask the mirror question too
+
+The question above catches a lane that cannot finish. It does not catch a lane that finishes and
+breaks something. So ask the other one:
+
+> **Could an agent satisfy this sentence and break a file that is not in these outputs?**
+
+The two questions have different answers, and the second one is the one that ships defects. Enumerate
+the dependents of every file a lane will change; each one either belongs in that lane's `outputs` or
+is a lane of its own. A dependent that is in neither is a file no builder may repair, no tester will
+construct a case for, and no reviewer holds a contract over.
+
+**`codemap impact` answers this only for the file types its grammars parse, and it does not tell you
+which ones those are.** On FDAdb it reports *zero* dependents for `src/lib/seo/entity-route.ts`,
+which ten `.astro` pages import — it does not read `.astro` at all, and the empty answer looks
+exactly like a file nothing depends on. So run it, and then search the repository for the module
+specifier across every extension the project actually contains:
+
+```
+codemap impact <file> --direction reverse
+grep -rl "<module specifier>" <source root>     # every extension, no --include filter
+```
+
+The grep is not a formality. It is the half that would have caught the case below.
+
+FDAdb WP8 is what that costs. Its eight lanes declared 21 files and changed exactly 21 files, so the
+first question passed everywhere, and three separate defects reached a published integration ref
+through the one gap:
+
+| lane changed | affected, declared by nobody | what shipped |
+| --- | --- | --- |
+| `src/lib/seo/entity-route.ts` | its 10 `.astro` callers | paid panel renders `unavailable`, zero producer calls |
+| `src/lib/api/contracts.ts` | `src/lib/api/dpa.test.ts` | 3 cases green at base, red at the merge |
+| `services/api-gateway/app/config.py` | `deploy/` | required env var nothing supplies |
+
+The first is the one to read twice. The lane's tester wrote three cases for `entity-route.ts` and
+every one of them passed the configuration in by hand, because the production callers pass nothing
+and *the production callers were not in the plan*. The suite was green, the reviewer passed it, and
+the shape it never tested is the only shape the site uses. A tester cannot write a case against a
+caller the plan does not mention.
+
+This is the same failure as "say *required*, not merely *present*" above, one level out: there, a
+suite that only ever supplies X cannot tell required from optional; here, a plan that only ever
+names the callee cannot tell a working call site from a broken one.
+
+Both repairs are the ones already listed. Give the lane the wiring — add the dependents to its
+`outputs`, which is usually right when the callers need no thought — or split, and let a downstream
+lane own the call sites and assert the production shape. What is never right is leaving the
+dependents unowned because the lane can finish without them.
+
 ## What a review rejection costs
 
 A rejection is not a fresh start and it is not a retry budget. `TEST_REVIEW(REVISE)` returns the
