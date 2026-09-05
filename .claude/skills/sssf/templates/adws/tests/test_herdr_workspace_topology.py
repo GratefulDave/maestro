@@ -786,7 +786,9 @@ class RenameCloseTest(unittest.TestCase):
 
     def test_rename_failure_leaves_workspaces_and_cwds(self) -> None:
         herdr = FakeHerdr()
-        herdr.wait_output_error = "wait_output_timeout"
+        # The composer never prints its confirmation, which is the only way
+        # the rename can now fail: the wait is a poll of the pane's own text.
+        herdr.rename_confirms = False
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
