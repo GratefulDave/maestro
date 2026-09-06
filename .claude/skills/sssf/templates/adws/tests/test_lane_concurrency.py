@@ -309,15 +309,13 @@ class ConcurrentFirstLaunchesCreateOneChildPerLane(unittest.TestCase):
     def test_four_lanes_racing_creation_get_one_parent_and_one_child_each(self) -> None:
         lanes = ["lane-wp{}-build".format(n) for n in range(1, 5)]
         with tempfile.TemporaryDirectory() as tmp:
-            run = topo._RunFixture(tmp, operator=False)
+            run = topo._RunFixture(tmp)
             call_lock = threading.Lock()
 
             def slow_creating_verbs(*args: str, **kw: object) -> dict:
-                # Widen the window between "no parent yet" / "no child yet"
-                # and the object existing, so an unguarded launcher would
-                # create twice (checked: it does, and refuses
-                # RUN_WORKSPACE_UNBOUND on the second parent). The fake's
-                # own bookkeeping stays serialized.
+                # Widen the window between "no child yet" and the child
+                # existing, so an unguarded launcher would open two children
+                # for one lane. The fake's own bookkeeping stays serialized.
                 if args[:2] in (topo.CREATE, topo.OPEN):
                     time.sleep(0.02)
                 with call_lock:
@@ -349,7 +347,7 @@ class ConcurrentFirstLaunchesCreateOneChildPerLane(unittest.TestCase):
                 )
                 assert isinstance(outcome, lch.LaunchHandle)
                 handles[lane] = outcome
-            self.assertEqual(len(topo._calls_after(run.herdr, 0, topo.CREATE)), 1)
+            self.assertEqual(topo._calls_after(run.herdr, 0, topo.CREATE), [])
             opens = topo._calls_after(run.herdr, 0, topo.OPEN)
             self.assertEqual(len(opens), len(lanes))
             self.assertEqual(

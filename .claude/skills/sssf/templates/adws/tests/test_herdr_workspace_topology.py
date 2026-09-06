@@ -68,7 +68,6 @@ def _launcher(
     launcher._repository_fingerprint = fingerprint
     launcher._repository_root = Path()
     launcher._tabs = {}
-    launcher._seed_tab_id = ""
     launcher._role_handles = {}
     launcher._cleaned_absent = set()
     return launcher
@@ -192,12 +191,13 @@ class NamingTest(unittest.TestCase):
 
 
 class LazyParentChildTest(unittest.TestCase):
-    def test_first_tester_creates_one_parent_and_one_linked_child(self) -> None:
+    def test_first_tester_creates_no_parent_and_one_linked_child(self) -> None:
         herdr = FakeHerdr()
         label = lch.workspace_label_for(PROJECT, RUN_HASH)
         launcher = _launcher(label)
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester = _checkout(Path(tmp), "tester")
             (tester / "secret.txt").write_text("private-tests", encoding="utf-8")
             spec = _spec(tester, lane=TESTS_LANE, role="tester")
@@ -205,10 +205,7 @@ class LazyParentChildTest(unittest.TestCase):
         self.assertFalse(reused)
         creates = [call for call in herdr.calls if call[:2] == ("workspace", "create")]
         opens = [call for call in herdr.calls if call[:2] == ("worktree", "open")]
-        self.assertEqual(len(creates), 1)
-        self.assertEqual(_flag(creates[0], "--label"), "FDAdb-e892")
-        self.assertTrue(_same_path(_flag(creates[0], "--cwd"), tester.parent))
-        self.assertIn("--no-focus", creates[0])
+        self.assertEqual(creates, [])
         self.assertEqual(len(opens), 1)
         self.assertEqual(_flag(opens[0], "--workspace"), handle.parent_workspace_id)
         self.assertEqual(_flag(opens[0], "--label"), TESTS_LANE)
@@ -223,8 +220,7 @@ class LazyParentChildTest(unittest.TestCase):
         self.assertIn(splits[0][2], herdr.closed_panes)
         parent = herdr.workspaces[handle.parent_workspace_id]
         child = herdr.workspaces[handle.child_workspace_id]
-        self.assertEqual(parent["tokens"][lch.METADATA_TOKEN_RUN], RUN_HASH)
-        self.assertEqual(parent["tokens"][lch.METADATA_TOKEN_KIND], lch.METADATA_KIND_RUN)
+        self.assertNotIn("tokens", parent)
         self.assertFalse(parent["worktree"]["is_linked_worktree"])
         self.assertTrue(child["worktree"]["is_linked_worktree"])
         self.assertEqual(child["tokens"][lch.METADATA_TOKEN_LANE], TESTS_LANE)
@@ -241,6 +237,7 @@ class LazyParentChildTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             _place(launcher, herdr, _spec(tester, lane=TESTS_LANE, role="tester"))
@@ -256,7 +253,7 @@ class LazyParentChildTest(unittest.TestCase):
         )
         self.assertEqual(
             sum(1 for call in herdr.calls if call[:2] == ("workspace", "create")),
-            1,
+            0,
         )
         self.assertEqual(handle.lane_key, BUILD_LANE)
         self.assertEqual(layout.lane_key, BUILD_LANE)
@@ -276,6 +273,7 @@ class SameLanePlacementTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             (tester / "secret.txt").write_text("private-tests", encoding="utf-8")
@@ -331,6 +329,7 @@ class SameLanePlacementTest(unittest.TestCase):
         for index, role in enumerate(lch.LANE_PANE_ROLES):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
                 herdr = FakeHerdr()
+                herdr.add_workspace(PROJECT, Path(tmp))
                 launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
                 launcher._herdr = herdr  # type: ignore[method-assign]
                 checkout = _checkout(Path(tmp), role)
@@ -377,6 +376,7 @@ class ParallelFirstLaunchTest(unittest.TestCase):
                 errors.append(exc)
 
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             builder = _checkout(root, "builder")
@@ -393,7 +393,7 @@ class ParallelFirstLaunchTest(unittest.TestCase):
         creates = [call for call in herdr.calls if call[:2] == ("workspace", "create")]
         opens = [call for call in herdr.calls if call[:2] == ("worktree", "open")]
         tabs = [call for call in herdr.calls if call[:2] == ("tab", "create")]
-        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates, [])
         self.assertEqual(len(opens), 2)
         self.assertEqual(tabs, [])
         self.assertEqual(
@@ -413,6 +413,7 @@ class RetainResubmitTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             (tester / "secret.txt").write_text("private-tests", encoding="utf-8")
@@ -483,6 +484,7 @@ class RediscoveryTest(unittest.TestCase):
         first = _launcher(label)
         first._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester = _checkout(Path(tmp), "tester")
             spec = _spec(tester, lane=TESTS_LANE, role="tester")
             handle, _, _ = _place(first, herdr, spec)
@@ -505,6 +507,7 @@ class RediscoveryTest(unittest.TestCase):
         first = _launcher(label)
         first._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester = _checkout(Path(tmp), "tester")
             spec = _spec(tester, lane=TESTS_LANE, role="tester")
             old, _, _ = _place(first, herdr, spec)
@@ -542,6 +545,7 @@ class RediscoveryTest(unittest.TestCase):
         first = _launcher(label)
         first._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             builder = _checkout(root, "builder")
@@ -641,6 +645,7 @@ class RediscoveryTest(unittest.TestCase):
         launcher = _launcher(label)
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             other = _checkout(root, "other")
@@ -669,6 +674,7 @@ class RediscoveryTest(unittest.TestCase):
         launcher = _launcher(label)
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester = _checkout(Path(tmp), "tester")
             spec = _spec(tester, lane=TESTS_LANE, role="tester")
             handle, _, _ = _place(launcher, herdr, spec)
@@ -686,6 +692,7 @@ class FinalReviewPlacementTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             root = Path(tmp)
             tester = _checkout(root, "tester")
             builder = _checkout(root, "builder")
@@ -734,6 +741,7 @@ class RenameCloseTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester, reviewer, tester_handle, reviewer_handle = self._two_roles(
                 herdr, launcher, Path(tmp)
             )
@@ -792,6 +800,7 @@ class RenameCloseTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester, reviewer, tester_handle, reviewer_handle = self._two_roles(
                 herdr, launcher, Path(tmp)
             )
@@ -817,6 +826,7 @@ class RenameCloseTest(unittest.TestCase):
         launcher = _launcher(lch.workspace_label_for(PROJECT, RUN_HASH))
         launcher._herdr = herdr  # type: ignore[method-assign]
         with tempfile.TemporaryDirectory() as tmp:
+            herdr.add_workspace(PROJECT, Path(tmp))
             tester, reviewer, tester_handle, reviewer_handle = self._two_roles(
                 herdr, launcher, Path(tmp)
             )
@@ -1075,18 +1085,18 @@ START = ("agent", "start")
 class _RunFixture:
     """One run: a repository root with role checkouts, one fake, launchers.
 
-    By default the operator's own Space is open on the repository (Shape A);
-    `operator=False` models no Space open, where Maestro creates the parent.
+    The operator's own Space is open on the repository. That is the only
+    shape a run has: with the repository closed there is no parent to adopt
+    and the launch refuses (`NoSourceSpaceTest`).
     """
 
-    def __init__(self, tmp: str, *, operator: bool = True) -> None:
+    def __init__(self, tmp: str) -> None:
         self.root = Path(tmp)
         self.herdr = FakeHerdr()
         self.label = lch.workspace_label_for(PROJECT, RUN_HASH)
         self.foreign = _plant_foreign(self.herdr, self.root)
-        self.operator = _plant_operator_space(self.herdr, self.root) if operator else ""
-        if self.operator:
-            self.foreign |= _ids_of(self.herdr, self.operator)
+        self.operator = _plant_operator_space(self.herdr, self.root)
+        self.foreign |= _ids_of(self.herdr, self.operator)
         self.before = self.herdr.snapshot()
 
     def launcher(self) -> lch.HerdrLauncher:
@@ -1164,22 +1174,28 @@ class HerdrTopologySpecTest(unittest.TestCase):
             self.assertTrue(run.foreign_untouched())
             _assert_converged(self, run.herdr, run.launcher(), {TESTS_LANE: {"tester": spec}})
 
-    def test_02_no_space_open_creates_one_parent_at_the_primary(self) -> None:
+    def test_02_no_space_open_refuses_instead_of_creating_a_parent(self) -> None:
+        """With the repository closed there is no parent, so the launch stops.
+
+        Herdr fixes a lane's placement at `worktree open` and cannot move it
+        afterwards, so a parent Maestro created for itself would orphan every
+        lane under it the moment it went. Refusing here is what keeps the
+        operator's Space the only parent a lane ever has.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
-            spec = run.spec(TESTS_LANE, "tester")
-            handle = _launch(run.launcher(), run.herdr, spec)
-            creates = _calls_after(run.herdr, 0, CREATE)
-            self.assertEqual(len(creates), 1)
-            self.assertTrue(_same_path(_flag(creates[0], "--cwd"), run.root))
-            opens = _calls_after(run.herdr, 0, OPEN)
-            self.assertEqual(len(opens), 1)
-            self.assertEqual(_flag(opens[0], "--workspace"), handle.parent_workspace_id)
-            parent = run.herdr.workspaces[handle.parent_workspace_id]
-            self.assertFalse(_is_linked(parent))
-            self.assertEqual(parent["tokens"][lch.METADATA_TOKEN_KIND], lch.METADATA_KIND_RUN)
-            _assert_converged(self, run.herdr, run.launcher(), {TESTS_LANE: {"tester": spec}})
-            self.assertTrue(run.foreign_untouched())
+            run = _RunFixture(tmp)
+            run.herdr._close_workspace_state(run.operator)
+            before = run.herdr.snapshot()
+            with self.assertRaises(lch.LaunchRefused) as raised:
+                _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
+            self.assertEqual(
+                raised.exception.refusal, lch.LaunchRefusal.WORKSPACE_UNRESOLVED
+            )
+            self.assertIn("NO_SOURCE_SPACE", raised.exception.detail)
+            self.assertEqual(_calls_after(run.herdr, 0, CREATE, OPEN), [])
+            self.assertTrue(
+                run.herdr.records_unchanged(before, set(run.herdr.workspaces))
+            )
 
     def test_a_second_space_on_the_repo_is_ignored(self) -> None:
         """A second Space open on the repository does not divert the lanes.
@@ -1262,13 +1278,14 @@ class HerdrTopologySpecTest(unittest.TestCase):
             self.assertIn(run.operator, raised.exception.detail)
             self.assertFalse(raised.exception.pane_created)
             self.assertEqual(_calls_after(run.herdr, mark, CREATE, OPEN, SPLIT, START), [])
-            # The dead id is released; the next launch resolves the parent by
-            # the normal rule again (no Space open on the repo -> create one).
+            # The dead id is released, and with the repository closed there
+            # is nothing to resolve: the run waits for the operator rather
+            # than building a parent that would orphan its lanes again.
             mark = len(run.herdr.calls)
-            handle = _launch(launcher, run.herdr, builder)
-            self.assertNotEqual(handle.parent_workspace_id, run.operator)
-            self.assertEqual(len(_calls_after(run.herdr, mark, CREATE)), 1)
-            _assert_converged(self, run.herdr, launcher, {BUILD_LANE: {"builder": builder}})
+            with self.assertRaises(lch.LaunchRefused) as again:
+                _launch(launcher, run.herdr, builder)
+            self.assertIn("NO_SOURCE_SPACE", again.exception.detail)
+            self.assertEqual(_calls_after(run.herdr, mark, CREATE), [])
 
     def test_04_reconstructed_launcher_with_everything_creates_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1482,28 +1499,9 @@ class OwnershipMatrixTest(unittest.TestCase):
 
     # -- run parent ----------------------------------------------------------
 
-    def test_parent_created_then_stopped_before_tagging_converges(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
-            run.herdr.crash_after(CREATE)
-            spec = run.spec(TESTS_LANE, "tester")
-            with self.assertRaises((lch.LaunchRefused, FakeHerdrStopped)):
-                _launch(run.launcher(), run.herdr, spec)
-            untagged = [
-                wid for wid, rec in _live_workspaces(run.herdr).items()
-                if rec["label"] == run.label and "tokens" not in rec
-            ]
-            self.assertEqual(len(untagged), 1)
-            mark = len(run.herdr.calls)
-            handle = _launch(run.launcher(), run.herdr, spec)
-            self.assertEqual(handle.parent_workspace_id, untagged[0])
-            self.assertEqual(_calls_after(run.herdr, mark, CREATE), [])
-            _assert_converged(self, run.herdr, run.launcher(), {TESTS_LANE: {"tester": spec}})
-            self.assertTrue(run.foreign_untouched())
-
     def test_parent_tagged_then_stopped_before_child_opens_one_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
+            run = _RunFixture(tmp)
             run.herdr.crash_before(OPEN)
             spec = run.spec(TESTS_LANE, "tester")
             with self.assertRaises((lch.LaunchRefused, FakeHerdrStopped)):
@@ -1517,7 +1515,7 @@ class OwnershipMatrixTest(unittest.TestCase):
 
     def test_space_bound_to_another_repo_is_not_the_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
+            run = _RunFixture(tmp)
             elsewhere = run.root / "elsewhere"
             elsewhere.mkdir()
             other = run.herdr.add_workspace(run.label, elsewhere)
@@ -1525,48 +1523,36 @@ class OwnershipMatrixTest(unittest.TestCase):
             spec = run.spec(TESTS_LANE, "tester")
             handle = _launch(run.launcher(), run.herdr, spec)
             self.assertNotEqual(handle.parent_workspace_id, other)
-            self.assertEqual(len(_calls_after(run.herdr, 0, CREATE)), 1)
+            self.assertEqual(handle.parent_workspace_id, run.operator)
+            self.assertEqual(_calls_after(run.herdr, 0, CREATE), [])
             self.assertTrue(run.herdr.records_unchanged(before, _ids_of(run.herdr, other)))
             _assert_converged(self, run.herdr, run.launcher(), {TESTS_LANE: {"tester": spec}})
 
-    def test_another_runs_space_on_the_repo_is_the_shared_parent(self) -> None:
-        """A Maestro-created parent from an earlier run on the same
-        repository is the parent for this run too: identity is the repo
-        binding, and its tokens are left as they are."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
-            launcher = run.launcher()
-            earlier = launcher._parent_identity_tokens()
-            earlier[lch.METADATA_TOKEN_RUN] = "0" * 32
-            shared = run.herdr.add_workspace(run.label, run.root, tokens=dict(earlier))
-            spec = run.spec(TESTS_LANE, "tester")
-            handle = _launch(launcher, run.herdr, spec)
-            self.assertEqual(handle.parent_workspace_id, shared)
-            self.assertEqual(run.herdr.workspaces[shared]["tokens"], earlier)
-            self.assertEqual(_calls_after(run.herdr, 0, CREATE), [])
-            _assert_converged(self, run.herdr, launcher, {TESTS_LANE: {"tester": spec}})
-
-    def test_operators_space_not_a_valid_source_creates_maestros_own(self) -> None:
+    def test_operators_space_not_a_valid_source_refuses(self) -> None:
         """The operator's Space is open on a linked checkout, so Herdr names
-        no source for the repository. Maestro creates its own parent once
-        rather than hanging lanes off a Space Herdr does not group them
-        under."""
+        no source for the repository and there is no parent to adopt.
+
+        Hanging lanes off a Space Herdr does not group them under is what
+        produces the flat sidebar, and building a Space of Maestro's own
+        produces one that dies with the run. Neither is available, so the
+        launch refuses and the operator opens the repository."""
         with tempfile.TemporaryDirectory() as tmp:
             run = _RunFixture(tmp)
             launcher = run.launcher()
             run.herdr.workspaces[run.operator]["worktree"]["is_linked_worktree"] = True
-            spec = run.spec(TESTS_LANE, "tester")
-            handle = _launch(launcher, run.herdr, spec)
-            self.assertNotEqual(handle.parent_workspace_id, run.operator)
-            self.assertEqual(len(_calls_after(run.herdr, 0, CREATE)), 1)
-            _assert_converged(self, run.herdr, launcher, {TESTS_LANE: {"tester": spec}})
+            with self.assertRaises(lch.LaunchRefused) as raised:
+                _launch(launcher, run.herdr, run.spec(TESTS_LANE, "tester"))
+            self.assertIs(raised.exception.refusal, lch.LaunchRefusal.WORKSPACE_UNRESOLVED)
+            self.assertIn("NO_SOURCE_SPACE", raised.exception.detail)
+            self.assertEqual(_calls_after(run.herdr, 0, CREATE, OPEN), [])
 
-    def test_parent_disappearing_after_resolution_refuses_then_recovers(self) -> None:
+    def test_parent_disappearing_after_resolution_waits_for_the_operator(self) -> None:
         """The Space closes between being named the source and being used.
 
-        The launch refuses once naming the dead parent, releases every
-        placement under it, and the next launch resolves the parent afresh
-        instead of inheriting the dead id.
+        The launch refuses once naming the dead parent and releases every
+        placement under it. It does not inherit the dead id, and it does not
+        build a replacement either: until the operator has the repository
+        open again there is no parent, and the lane waits.
         """
         with tempfile.TemporaryDirectory() as tmp:
             run = _RunFixture(tmp)
@@ -1584,9 +1570,13 @@ class OwnershipMatrixTest(unittest.TestCase):
             self.assertIs(raised.exception.refusal, lch.LaunchRefusal.WORKSPACE_UNRESOLVED)
             self.assertIn("PARENT_WORKSPACE_GONE", raised.exception.detail)
             self.assertFalse(raised.exception.pane_created)
+            with self.assertRaises(lch.LaunchRefused) as again:
+                _launch(launcher, run.herdr, spec)
+            self.assertIn("NO_SOURCE_SPACE", again.exception.detail)
+            self.assertEqual(_calls_after(run.herdr, 0, CREATE), [])
+            reopened = run.herdr.add_workspace(PROJECT, run.root)
             handle = _launch(launcher, run.herdr, spec)
-            self.assertNotEqual(handle.parent_workspace_id, parent_id)
-            self.assertEqual(len(_calls_after(run.herdr, 0, CREATE)), 1)
+            self.assertEqual(handle.parent_workspace_id, reopened)
             _assert_converged(self, run.herdr, launcher, {TESTS_LANE: {"tester": spec}})
 
     def test_repository_herdr_calls_off_worktree_refuses_before_creating(self) -> None:
@@ -1596,7 +1586,7 @@ class OwnershipMatrixTest(unittest.TestCase):
         never built and there is nothing to close.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
+            run = _RunFixture(tmp)
             run.herdr.non_repo_cwds.add(str(run.root.resolve()))
             with self.assertRaises(lch.LaunchRefused) as raised:
                 _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
@@ -1609,7 +1599,7 @@ class OwnershipMatrixTest(unittest.TestCase):
     def test_repository_herdr_resolves_elsewhere_refuses_before_creating(self) -> None:
         """Herdr's source checkout disagreeing with the run's primary is fatal."""
         with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
+            run = _RunFixture(tmp)
             run.herdr.linked_checkouts[str(run.root.resolve())] = str((run.root / "..").resolve())
             with self.assertRaises(lch.LaunchRefused) as raised:
                 _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
@@ -2105,19 +2095,19 @@ class ConcurrencyMatrixTest(unittest.TestCase):
 
     def test_reconnect_racing_creation_converges_on_one_pane_and_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
+            run = _RunFixture(tmp)
             creator, reconnector = run.launcher(), run.launcher()
             spec = run.spec(TESTS_LANE, "tester")
             created = threading.Event()
             looked = threading.Event()
 
-            def after_create(args: tuple[str, ...]) -> None:
-                # The creator has the parent but has not tagged it; the
-                # reconnecting process lists workspaces exactly now.
+            def before_open(args: tuple[str, ...]) -> None:
+                # The creator has adopted the parent but has opened nothing
+                # under it; the reconnecting process lists exactly now.
                 created.set()
                 looked.wait(5.0)
 
-            run.herdr.hooks_after.setdefault(CREATE, []).append(after_create)
+            run.herdr.hooks_before.setdefault(OPEN, []).append(before_open)
             outcomes: dict[str, object] = {}
 
             def create() -> None:
@@ -2151,10 +2141,14 @@ class ConcurrencyMatrixTest(unittest.TestCase):
             assert isinstance(created_handle, lch.LaunchHandle)
             self.assertEqual(created_handle.pane_id, reconnected.pane_id)
             self.assertEqual(created_handle.agent_name, reconnected.agent_name)
-            self.assertEqual(len(_calls_after(run.herdr, 0, CREATE)), 1)
-            # The creator resumed onto the reconnector's tagged child and
-            # adopted it from the listing; nothing was opened twice.
-            self.assertEqual(len(_calls_after(run.herdr, 0, OPEN)), 1)
+            self.assertEqual(_calls_after(run.herdr, 0, CREATE), [])
+            # Both processes reach `worktree open` -- with no `workspace
+            # create` left, it is the first object a launch makes -- and
+            # Herdr answers the second with the child the first opened. One
+            # child, not two, is the property; the call count is not.
+            self.assertEqual(
+                created_handle.child_workspace_id, reconnected.child_workspace_id
+            )
             self.assertEqual(len(_calls_after(run.herdr, 0, SPLIT)), 1)
             self.assertEqual(len(_calls_after(run.herdr, 0, START)), 1)
             _assert_converged(self, run.herdr, run.launcher(), {TESTS_LANE: {"tester": spec}})
@@ -2662,39 +2656,6 @@ class UntestedExitsTest(unittest.TestCase):
             self.assertEqual(len(_calls_after(run.herdr, 0, SPLIT)), 1)
             self.assertEqual(_calls_after(run.herdr, 0, START), [])
             self.assertEqual(len(_calls_after(run.herdr, 0, ("pane", "close"))), 2)
-
-    def test_unbound_parent_close_refusal_is_reported(self) -> None:
-        """A created parent that lost the source race, and will not close.
-
-        With no Space open on the repository Maestro creates its own, then
-        proves the binding by asking Herdr again. A Space opened at the
-        primary checkout in between takes the source, so the parent Maestro
-        built is not it -- and when closing that parent is refused too, both
-        the reason and the refused close are reported.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            run = _RunFixture(tmp, operator=False)
-            run.herdr.source_space_rule = "last-open"
-            run.herdr.close_workspace_error = "workspace_busy"
-            planted: list[str] = []
-
-            def operator_opens_a_space(_args: tuple[str, ...]) -> None:
-                if not planted:
-                    planted.append(run.herdr.add_workspace("FDAdb (2)", run.root))
-
-            run.herdr.hooks_after.setdefault(CREATE, []).append(operator_opens_a_space)
-            with self.assertRaises(lch.LaunchRefused) as raised:
-                _launch(run.launcher(), run.herdr, run.spec(TESTS_LANE, "tester"))
-            self.assertIs(raised.exception.refusal, lch.LaunchRefusal.WORKSPACE_UNRESOLVED)
-            self.assertIn("RUN_WORKSPACE_UNBOUND", raised.exception.detail)
-            self.assertIn("NOT_SOURCE_SPACE:{}".format(planted[0]), raised.exception.detail)
-            self.assertIn("close refused", raised.exception.detail)
-            self.assertEqual(_calls_after(run.herdr, 0, OPEN), [])
-
-class ReopenedOperatorSpaceTest(unittest.TestCase):
-    """The operator closes and reopens their Space (S1). A lane child pinned
-    to the old Space id by its `parent` token must self-heal when Herdr left
-    it open, and be re-opened once when Herdr closed it with the Space."""
 
     def _reopen(self, run: _RunFixture) -> str:
         run.herdr("workspace", "close", run.operator)
