@@ -810,31 +810,27 @@ class ReconstructionTest(ReconstructionBase):
 
 
 class NoOperatorSpaceTest(ReconstructionBase):
-    """No Space is open on the repository: Maestro creates the one parent.
+    """No Space is open on the repository, so the run has no parent.
 
-    It is created at the primary checkout, it collects every lane child, and
-    completion leaves it open with no child under it -- a second invocation
-    on that repository adopts it rather than creating another.
+    Herdr fixes a lane's placement at `worktree open` and cannot move it
+    afterwards, so a parent Maestro built for itself would orphan every lane
+    under it the moment it went. There is no such parent to build: the run
+    refuses and waits for the operator to open the repository.
     """
 
     operator_space = False
 
-    def test_the_run_creates_one_parent_and_leaves_it_open(self) -> None:
-        self.run_cli()
+    def test_the_run_refuses_and_creates_no_space(self) -> None:
+        code, _ = self.run_cli(expect=None)
+        self.assertNotEqual(code, 0)
         run_ids = self.run_ids()
-        self.assertEqual(len(run_ids), 1)
-        self.assertEqual(self.run_status(run_ids[0]), st.RunStatus.COMPLETE)
-        parent = self.assert_shape_a()
-        self.assertNotIn(parent, self.herdr.closed_workspaces)
-        self.assertEqual(self.final_graph["parents"], [parent], self.final_graph)
+        for run_id in run_ids:
+            self.assertNotEqual(self.run_status(run_id), st.RunStatus.COMPLETE)
         self.assertEqual(
-            sorted(self.final_graph["children"][parent]), sorted(LANES)
+            [call for call in self.herdr.calls if call[:2] == ("workspace", "create")],
+            [],
         )
-        # Nothing linked survives the completion under the created parent.
-        self.assertEqual(herdr_graph(self.herdr)["child_ids"], {})
-
-    def test_termination_after_the_parent_space_is_created(self) -> None:
-        self._crash_then_resume(("workspace", "create"))
+        self.assertEqual(herdr_graph(self.herdr)["parents"], [])
 
 
 if __name__ == "__main__":

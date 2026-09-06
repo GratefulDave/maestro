@@ -174,6 +174,18 @@ def _as_composer_renders(message: str) -> str:
     return "\n".join(lines)
 
 
+def _claude_rename_confirmation(session_name: str) -> str:
+    """The confirmation a Claude composer prints, verbatim from pane w1EY:p2.
+
+    Written out here rather than derived from
+    `lch.session_rename_confirmation`, which is omp's wording. Deriving it made
+    this fake agree with whatever production expected, so no test in the suite
+    could fail while the comparison was wrong -- and none did, through the
+    whole time it was wrong for every Claude pane.
+    """
+    return "Session renamed to:\n{}".format(session_name)
+
+
 class FakeHerdr:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -520,8 +532,11 @@ class FakeHerdr:
             if key.lower() == "enter" and self.rename_confirms:
                 last = str(pane.get("last_text") or "")
                 if last.startswith("/rename "):
-                    pane["output"] = _as_composer_renders(
-                        lch.session_rename_confirmation(last[len("/rename ") :])
+                    pane["output"] = "\n".join(
+                        _as_composer_renders(line)
+                        for line in _claude_rename_confirmation(
+                            last[len("/rename ") :]
+                        ).split("\n")
                     )
             return {}
         # `pane wait-output` is deliberately not answered here. Nothing in the

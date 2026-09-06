@@ -53,7 +53,6 @@ def _bare_launcher(
     #: The primary checkout the hand-rolled `_parent_record` binds to.
     launcher._repository_root = Path("/repo/product")
     launcher._tabs = {}
-    launcher._seed_tab_id = ""
     launcher._role_handles = {}
     launcher._cleaned_absent = set()
     return launcher
@@ -1388,6 +1387,7 @@ class FivePaneTopologyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             launcher._repository_root = root
+            herdr.add_workspace(root.name, root)
             tester = root / "tester"
             reviewer = root / "integration-reviewer"
             tester.mkdir()
@@ -1416,7 +1416,7 @@ class FivePaneTopologyTest(unittest.TestCase):
             creates = [call for call in herdr.calls if call[:2] == ("workspace", "create")]
             opens = [call for call in herdr.calls if call[:2] == ("worktree", "open")]
             splits = [call for call in herdr.calls if call[:2] == ("pane", "split")]
-            self.assertEqual(len(creates), 1)
+            self.assertEqual(creates, [])
             self.assertEqual(len(opens), 1)
             self.assertEqual(len(splits), 1)
             first_env = _env_from_herdr_args(splits[0])
@@ -1430,8 +1430,9 @@ class FivePaneTopologyTest(unittest.TestCase):
             self.assertEqual(layout.parent_workspace_id, launcher._parent_workspace_id)
             parent = herdr.workspaces[layout.parent_workspace_id]
             child = herdr.workspaces[layout.child_workspace_id]
-            self.assertEqual(parent["tokens"][lch.METADATA_TOKEN_RUN], RUN_HASH)
-            self.assertEqual(parent["tokens"][lch.METADATA_TOKEN_REPO], REPO)
+            # The parent is the operator's own Space, so it carries no
+            # tokens of Maestro's; the lane child it hangs under does.
+            self.assertNotIn("tokens", parent)
             self.assertEqual(child["tokens"][lch.METADATA_TOKEN_LANE], LANE)
             self.assertEqual(
                 child["tokens"][lch.METADATA_TOKEN_PARENT], layout.parent_workspace_id
@@ -1476,6 +1477,7 @@ class FivePaneTopologyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             launcher._repository_root = root
+            herdr.add_workspace(root.name, root)
             builder = root / "builder" / "checkout"
             builder.mkdir(parents=True)
             builder_env = lch.role_pane_environment(builder, {})
@@ -1522,6 +1524,7 @@ class FivePaneTopologyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             launcher._repository_root = root
+            herdr.add_workspace(root.name, root)
             tester = root / "tester" / "checkout"
             builder = root / "builder" / "checkout"
             tester.mkdir(parents=True)

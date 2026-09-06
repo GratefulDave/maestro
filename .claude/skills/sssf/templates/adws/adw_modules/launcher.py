@@ -591,7 +591,44 @@ AGENT_QUIESCENT_STATUS = "idle"
 
 #: How long `AGENT_QUIESCENT_STATUS` must hold, with no transcript record
 #: appearing, before `poll` reads it as a turn that stopped without declaring.
-AGENT_QUIESCENCE_CONFIRM_S = 60.0
+#:
+#: The number is not a taste. It must STRICTLY EXCEED the longest interval the
+#: agent runtime can legitimately be silent, because an agent blocked inside a
+#: foreground tool call reports `idle` and writes nothing -- busy and silent is
+#: indistinguishable, from outside, from finished and silent. The bound that
+#: matters is the runtime's own foreground-tool ceiling: omp's bash tool runs a
+#: command for 60s and then backgrounds it, so every `npm install`, `uv sync`,
+#: or test run that reaches the ceiling produces a silence of exactly 60s.
+#:
+#: This was 60.0, numerically equal to that ceiling, which makes the collision
+#: guaranteed rather than unlucky. FDAdb run `a2ea7355699c4dff93bc82ac89415475`
+#: is the receipt: `lane-wp8r-route-tests` turn 8 has a transcript gap of
+#: 21:39:47.423 -> 21:40:47.432, exactly 60.0s, ended by a record reading
+#: `Backgrounded as job bg_3` -- the ceiling handing off. The window confirmed
+#: ~66s after dispatch and the run died on a tester that was working. Turn 7
+#: ran the same gauntlet with three gaps of >=60.0s and survived all three, so
+#: the old value was not detecting anything; it was losing a coin toss.
+#:
+#: The tool ceiling is not the bound that matters, though, and a value derived
+#: from it is still too small. Every role here runs on omp, omp delegates to
+#: subagents routinely, and a delegating agent writes NOTHING to its own
+#: transcript for the whole of the child's run -- which is bounded by the
+#: child's work, not by any tool call. It does not reliably report `working`
+#: while it waits, either, so the status signal does not cover the gap the
+#: transcript leaves. A silence spanning one subagent is ordinary, and no
+#: multiple of 60s is above it.
+#:
+#: So the value is set from the delegation case: 600.0, ten minutes, chosen to
+#: sit above a subagent run rather than above a backgrounded shell command. It
+#: is deliberately not derived from the ceiling above -- that derivation is
+#: what produced 180.0, and 180.0 would declare a delegating tester dead on
+#: the first child that takes four minutes.
+#:
+#: Raising it costs only how long a genuinely dead agent goes unnoticed, and
+#: that now parks one lane rather than ending a run -- so the cost of being
+#: too high is a slow lane, and the cost of being too low is a discarded run.
+#: Those are not symmetric, and the number belongs on the safe side of them.
+AGENT_QUIESCENCE_CONFIRM_S = 600.0
 
 #: Default bound on one provisioning run. Deployments override it through
 #: `maestro.config.yaml`'s `provision_timeout_s`, on the same route
@@ -1109,9 +1146,18 @@ def session_rename_confirmation(session_name: str) -> str:
     return 'Session renamed to "{}".'.format(session_name)
 
 
-def _squeezed(text: str) -> str:
-    """`text` with every run of whitespace removed."""
-    return "".join(str(text).split())
+def _unchromed(text: str) -> str:
+    """`text` with whitespace and the composers' own punctuation removed.
+
+    Quotes, a colon and a full stop are how a composer decorates the sentence,
+    not part of what it says. omp prints `Session renamed to "NAME".`; Claude
+    prints `Session renamed to:` and then the name, unquoted and unstopped.
+    Both of those renamed the session. Removing the decoration is what
+    compares the confirmation rather than one composer's typography.
+    """
+    return "".join(
+        ch for ch in str(text) if not ch.isspace() and ch not in "\"'.:"
+    )
 
 
 def session_rename_confirmed(text: str, session_name: str) -> bool:
@@ -1133,8 +1179,15 @@ def session_rename_confirmed(text: str, session_name: str) -> bool:
     whitespace removed matched in all three. Whitespace is the only thing the
     wrapping adds, so removing it is what compares the sentence rather than
     its layout.
+
+    Whitespace was not the only thing. Run a2ea7355 renamed every session and
+    then refused its own cleanup on pane w1EY:p2, a Claude builder, which had
+    already printed the confirmation as `Session renamed to:` followed by the
+    bare name -- a colon where omp writes a quote, and no full stop. The
+    rename had worked; the sentence was on screen for the whole 60s wait.
+    Punctuation is the composer's, so `_unchromed` drops it too.
     """
-    return _squeezed(session_rename_confirmation(session_name)) in _squeezed(text)
+    return _unchromed(session_rename_confirmation(session_name)) in _unchromed(text)
 
 
 def git_primary_workdir(repo: Path) -> Path:
@@ -2481,6 +2534,8 @@ class HerdrLauncher:
         self._handles: Dict[str, LaunchHandle] = {}
         self._tailers: Dict[str, TranscriptTailer] = {}
         self._quiescent_since: Dict[str, Tuple[float, int]] = {}
+        #: Records already in the transcript when each turn was submitted,
+        #: so `_transcript_turns` can answer about THIS turn.
         self._proven_absent: Dict[str, LaunchHandle] = {}
         self._split_parent_id: Optional[str] = None
         #: Parent run workspace id. Not the lane child.
@@ -2492,7 +2547,6 @@ class HerdrLauncher:
         self._repository_root: Path = Path()
         #: lane_key -> linked child layout.
         self._tabs: Dict[str, _TabLayout] = {}
-        self._seed_tab_id: str = ""
         self._role_handles: Dict[Tuple[str, str], LaunchHandle] = {}
         self._cleaned_absent: set[str] = set()
 
@@ -2874,8 +2928,18 @@ class HerdrLauncher:
         return ""
 
     def _run_workspace(self, environment: Mapping[str, str]) -> str:
-        """The parent Space lanes hang under: the operator's Space open on
-        the repository when there is one, else one Maestro creates once."""
+        """The parent Space lanes hang under: the operator's own Space, open
+        on the repository.
+
+        Herdr fixes a lane's placement when `worktree open` names its parent
+        and gives nothing to move it with afterwards, so the parent has to be
+        a Space that outlives the run. A Space Maestro created for itself is
+        not: when it goes, every lane it parented is orphaned at the top level
+        permanently, and `_repin_lane` can only rewrite the `parent` token,
+        never the placement. So the operator's Space is the only parent, and
+        a run started with the repository closed refuses here rather than
+        building a sidebar the operator cannot read.
+        """
         with self._handles_lock:
             if self._parent_workspace_id:
                 return self._parent_workspace_id
@@ -2886,88 +2950,15 @@ class HerdrLauncher:
                     pane_created=False,
                 )
             adopted = self._adopt_existing_workspace(environment)
-            if adopted:
-                self._parent_workspace_id = adopted
-                self._workspace_id = adopted
-                return adopted
-            repo_cwd = self._repository_root
-            if repo_cwd == Path():
+            if not adopted:
                 raise LaunchRefused(
                     LaunchRefusal.WORKSPACE_UNRESOLVED,
-                    "REPO_PARENT_CWD_REQUIRED",
+                    "NO_SOURCE_SPACE:{}".format(self._repository_root),
                     pane_created=False,
                 )
-            # Identity is proven writable before the object exists: a parent
-            # that cannot be tagged must not be created.
-            parent_tokens = self._parent_identity_tokens()
-            _metadata_token_flags(parent_tokens)
-            try:
-                payload = self._herdr(
-                    "workspace",
-                    "create",
-                    "--cwd",
-                    str(repo_cwd),
-                    "--label",
-                    self.workspace_label,
-                    "--no-focus",
-                    env=environment,
-                )
-            except BaseException as exc:
-                raise LaunchRefused(
-                    LaunchRefusal.WORKSPACE_UNRESOLVED,
-                    "{0}: {1}".format(type(exc).__name__, exc),
-                ) from exc
-            workspace = _extract(payload, "workspace")
-            workspace_id = (
-                workspace.get("workspace_id") if isinstance(workspace, dict) else None
-            )
-            if not workspace_id:
-                raise LaunchRefused(
-                    LaunchRefusal.WORKSPACE_UNRESOLVED, "NO_WORKSPACE_ID"
-                )
-            parent_id = str(workspace_id)
-            # Herdr groups a linked child under the workspace whose checkout
-            # is the repository's source. A parent Herdr did not bind to the
-            # primary worktree would collect its lanes under some other Space
-            # (the `run -> run -> lane` sidebar), so the binding is proven by
-            # asking Herdr again and an unbound parent is closed, not kept.
-            # The re-probe is the whole proof: a Space that became the
-            # repository's source is named by `worktree list` now, and one
-            # that lost the race to an operator Space opened since the adopt
-            # above answers `NOT_SOURCE_SPACE` and is closed here.
-            try:
-                unbound = self._parent_binding_defect(
-                    parent_id, repo_cwd, environment
-                )
-            except _WorkspaceGone:
-                unbound = "PARENT_GONE"
-            if unbound:
-                try:
-                    self._close_workspace_absent_ok(parent_id, environment)
-                except HerdrCallError as exc:
-                    unbound = "{}; close refused: {}".format(unbound, exc)
-                raise LaunchRefused(
-                    LaunchRefusal.WORKSPACE_UNRESOLVED,
-                    "RUN_WORKSPACE_UNBOUND:{}:{}".format(parent_id, unbound),
-                    pane_created=False,
-                )
-            self._tag_workspace(parent_id, parent_tokens, environment)
-            self._parent_workspace_id = parent_id
-            self._workspace_id = parent_id
-            seed = _extract(payload, "tab")
-            if isinstance(seed, dict) and seed.get("tab_id"):
-                self._seed_tab_id = str(seed["tab_id"])
-            return parent_id
-
-    def _close_seed_tab(self, environment: Mapping[str, str]) -> None:
-        """Drop the shell tab `workspace create` opens, once a child exists."""
-        tab_id, self._seed_tab_id = self._seed_tab_id, ""
-        if not tab_id:
-            return
-        try:
-            self._herdr("tab", "close", tab_id, env=environment)
-        except BaseException:
-            return
+            self._parent_workspace_id = adopted
+            self._workspace_id = adopted
+            return adopted
 
     def _adopt_existing_workspace(self, environment: Mapping[str, str]) -> str:
         """Adopt the Space Herdr names as the repository's source checkout.
@@ -3921,7 +3912,6 @@ class HerdrLauncher:
             if workspace_id == parent_id:
                 self._parent_workspace_id = ""
                 self._workspace_id = ""
-                self._seed_tab_id = ""
                 self._tabs.clear()
                 self._role_handles.clear()
                 return
@@ -4091,7 +4081,6 @@ class HerdrLauncher:
                 lane_label=label,
             )
             self._tabs[group] = layout
-            self._close_seed_tab(environment)
             return layout
 
     def _acquire_pane(
@@ -4736,6 +4725,9 @@ class HerdrLauncher:
             )
             if liveness_pid is not None:
                 object.__setattr__(handle, "liveness_pid", liveness_pid)
+            # The first turn of a session gets the same zero the correction
+            # turns get. An adopted pane can hand this launch a transcript
+            # that is already long.
             return handle
         except BaseException as exc:
             # Submission proof is only an observation of the launch path. The
@@ -4903,7 +4895,10 @@ class HerdrLauncher:
         )
         # A new prompt is a new turn. Any confirmation window still open from
         # the previous one measures a pane that has since been handed work,
-        # and would convict this turn on the last one's silence.
+        # and would convict this turn on the last one's silence -- and the
+        # record count it is judged against has to restart with it, or the
+        # previous turn's output arms the new turn's window before the new
+        # turn has written anything.
         self._clear_quiescence(handle.correlation_token)
         return handle
 
@@ -5046,12 +5041,7 @@ class HerdrLauncher:
         if not isinstance(agent, dict):
             return PollResult(PollState.GONE, detail="AGENT_GONE")
         status = _agent_status_of(agent) or "unknown"
-        with self._handles_lock:
-            tailer = self._tailers.get(handle.correlation_token)
-        turns = 0
-        if tailer:
-            tailer.read_new()
-            turns = len(tailer._records)
+        tailer, turns = self._transcript_turns(handle)
 
         # Reaching here means `_declared_result` found nothing: the turn has
         # not declared, so the pane's status is all there is to go on.
@@ -5116,6 +5106,16 @@ class HerdrLauncher:
             return PollResult(PollState.RUNNING)
         self._clear_quiescence(handle.correlation_token)
         return PollResult(PollState.RUNNING)
+
+    def _transcript_turns(self, handle: LaunchHandle) -> Tuple[object, int]:
+        """This turn's tailer and how many records it has produced so far."""
+        with self._handles_lock:
+            tailer = self._tailers.get(handle.correlation_token)
+        turns = 0
+        if tailer:
+            tailer.read_new()
+            turns = len(tailer._records)
+        return tailer, turns
 
     def _quiescence_confirmed(self, token: str, turns: int) -> bool:
         """Whether `idle` has held long enough to mean the turn stopped.
