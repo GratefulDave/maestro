@@ -9,10 +9,18 @@ cases makes a pass count incomparable to the one before it -- a suite that
 shrinks would read as a regression. The error count stays honest.
 """
 
+import json
+import pathlib
+import tempfile
 import unittest
 
 import adw_modules.scheduler_types as st
-from adw_modules.scheduler import _stalled
+from adw_modules.lifecycle import ArtifactStore
+from adw_modules.scheduler import (
+    _sealed_error_history,
+    _stalled,
+    _test_review_error_history,
+)
 
 
 class StalledPredicateTest(unittest.TestCase):
@@ -95,3 +103,133 @@ class WaitReasonTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoundWindowTest(unittest.TestCase):
+    """The window is the rounds of the argument the lane is having now.
+
+    `_stalled` is exercised above on bare lists. What builds those lists is
+    the SQL in `_sealed_error_history` and `_test_review_error_history`, and
+    it is the part that was wrong: it counted every round the lane had ever
+    had, so a lane an amendment sent back to BUILDING carried the finished
+    argument's rounds into the new one and parked on its first REVISE.
+
+    Real sqlite over the real ledger schema, because the SQL is the subject.
+    """
+
+    def setUp(self) -> None:
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.store = ArtifactStore(pathlib.Path(self.dir.name) / "ledger.sqlite3")
+        self.addCleanup(self.store.close)
+        self.run_id = "run-window"
+
+    def _seed_run(self, plan_revision: int) -> None:
+        for revision in range(1, plan_revision + 1):
+            self.store.conn.execute(
+                "INSERT INTO plan_revisions (run_id, plan_revision, plan_digest, "
+                "parent_revision, plan_artifact_ref, amendment_artifact_id, "
+                "created_at) VALUES (?,?,?,NULL,?,NULL,'t')",
+                (self.run_id, revision, "digest-{0}".format(revision),
+                 "plan:{0}".format(revision)),
+            )
+        columns = [
+            "run_id", "runtime_state_root", "runtime_state_fingerprint",
+            "plan_digest", "plan_revision", "integration_ref",
+            "integration_initial_sha", "target_repository_root",
+            "target_git_common_dir", "target_worktree_git_dir",
+            "target_object_format", "target_repository_fingerprint",
+            "target_sync_journal_fingerprint", "target_initial_main_sha",
+            "target_main_ref", "created_at", "updated_at",
+        ]
+        values = {name: "x" for name in columns}
+        values["run_id"] = self.run_id
+        values["plan_revision"] = plan_revision
+        self.store.conn.execute(
+            "INSERT INTO runs ({0}) VALUES ({1})".format(
+                ", ".join(columns), ", ".join("?" for _ in columns)
+            ),
+            [values[name] for name in columns],
+        )
+
+    def _round(
+        self,
+        sequence: int,
+        plan_revision: int,
+        kind: st.ArtifactKind,
+        payload: dict,
+    ) -> None:
+        self.store.conn.execute(
+            "INSERT INTO lane_artifacts (artifact_id, run_id, lane_id, sequence, "
+            "completed_stage, artifact_kind, plan_revision, spec_digest, "
+            "lane_projection_digest, input_digest, output_digest, artifact_ref, "
+            "payload_json, created_at) VALUES (?,?,?,?,'x',?,?,'x','x',?,'x','x',?,'t')",
+            (
+                "a{0}".format(sequence),
+                self.run_id,
+                "lane-build",
+                sequence,
+                kind.value,
+                plan_revision,
+                "in-{0}".format(sequence),
+                json.dumps(payload),
+            ),
+        )
+
+    def _review(self, sequence: int, plan_revision: int, errors: int) -> None:
+        self._round(
+            sequence,
+            plan_revision,
+            st.ArtifactKind.CODE_REVIEW,
+            {"public_result_summary": {"failed": errors, "errored": 0}},
+        )
+
+    def test_a_superseded_revisions_rounds_are_not_this_arguments_rounds(
+        self,
+    ) -> None:
+        # FDAdb run 2489c772, lane-wp4-clearances-build: three green rounds
+        # under revisions 1-3 (the last of which merged), then an amendment,
+        # then one REVISE under revision 4. Counting all four made
+        # `_stalled` true on the lane's first post-amendment round, and the
+        # run reported `waiting` with no window ever granted.
+        self._seed_run(4)
+        for sequence, revision in ((3, 1), (6, 2), (8, 3), (11, 4)):
+            self._review(sequence, revision, 0)
+        history = _sealed_error_history(self.store, self.run_id, "lane-build")
+        self.assertEqual(history, [0])
+        self.assertFalse(_stalled(history))
+
+    def test_rounds_of_the_current_revision_still_stop_the_lane(self) -> None:
+        self._seed_run(2)
+        self._review(1, 1, 0)
+        for sequence in (2, 3, 4):
+            self._review(sequence, 2, 5)
+        history = _sealed_error_history(self.store, self.run_id, "lane-build")
+        self.assertEqual(history, [5, 5, 5])
+        self.assertTrue(_stalled(history))
+
+    def test_user_wait_still_resets_inside_one_revision(self) -> None:
+        self._seed_run(1)
+        for sequence in (1, 2, 3):
+            self._review(sequence, 1, 5)
+        self._round(4, 1, st.ArtifactKind.USER_WAIT, {})
+        self._review(5, 1, 5)
+        history = _sealed_error_history(self.store, self.run_id, "lane-build")
+        self.assertEqual(history, [5])
+        self.assertFalse(_stalled(history))
+
+    def test_the_tests_lane_window_is_scoped_the_same_way(self) -> None:
+        self._seed_run(2)
+        for sequence, revision in ((1, 1), (2, 1), (3, 1)):
+            self._round(
+                sequence,
+                revision,
+                st.ArtifactKind.TEST_REVIEW,
+                {"findings": [{"id": "f"}]},
+            )
+        self._round(
+            4, 2, st.ArtifactKind.TEST_REVIEW, {"findings": [{"id": "f"}]}
+        )
+        history = _test_review_error_history(self.store, self.run_id, "lane-build")
+        self.assertEqual(history, [1])
+        self.assertFalse(_stalled(history))
