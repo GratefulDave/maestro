@@ -760,8 +760,10 @@ def _assert_declared_python(
         )
 
 
-def _suite_selectors(gate: SimpleNamespace, files: Sequence[str]) -> tuple[str, ...]:
-    argv, selectors = pr.substituted_gate_argv(gate.argv, files)
+def _suite_selectors(
+    gate: SimpleNamespace, files: Sequence[str], tree: Path
+) -> tuple[str, ...]:
+    argv, selectors = pr.substituted_gate_argv(gate.argv, files, tree)
     if gate.runner == "pytest":
         return (
             "--rootdir",
@@ -865,7 +867,13 @@ def run_private_suite(
         # `requires-python = ">=3.12"` project, so the sealed suite failed on
         # import forever. `rr.resolve` probes a project-local environment first
         # and refuses rather than guessing.
-        resolved = rr.resolve(bound.runner, resolution_root, bound.cwd)
+        # Only the path operands. `_suite_selectors` returns a whole
+        # invocation -- `--rootdir . -vv --tb=line …` -- and those flags are
+        # this suite's reporting shape, not the probe's question.
+        _argv, selectors = pr.substituted_gate_argv(bound.argv, files, Path(tree))
+        resolved = rr.resolve(
+            bound.runner, resolution_root, bound.cwd, paths=selectors
+        )
     except rr.RunnerUnusable as extra:
         raise pr.SealedEnvironmentError(
             "SEALED_SUITE_RUNNER_UNUSABLE:{0}".format(bound.runner)
@@ -873,7 +881,7 @@ def run_private_suite(
     _assert_declared_python(resolved, resolution_root, Path(tree), bound.cwd, files)
     exec_gate = SimpleNamespace(
         runner=bound.runner,
-        argv=_suite_selectors(bound, files),
+        argv=_suite_selectors(bound, files, Path(tree)),
         cwd=bound.cwd,
         min_cases=bound.min_cases,
     )

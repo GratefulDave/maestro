@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,12 +137,29 @@ class ADeclaredEnvelopeSurvivesASlowComposer(unittest.TestCase):
 
     def test_a_reviewer_verdict_is_still_required_before_the_wait(self) -> None:
         # Tolerating the render timeout must not tolerate a payload that has
-        # not declared. An unusable reviewer envelope reaches `poll`, which
-        # reports EXITED, and refuses -- the wait is never even reached.
+        # not declared. `MAYBE` is not a verdict, so `_payload_ok` is false and
+        # the composer wait is never reached -- `waits` stays 0.
+        #
+        # It used to refuse `STAGE_PAYLOAD_INVALID` here, via `poll` reporting
+        # EXITED. Nothing but the envelope ends this wait any more, so an
+        # undeclared payload leaves it running instead. See
+        # `test_absence_is_not_a_verdict`.
         launcher = _Waiter(None)
-        with self.assertRaises(Exception) as caught:
-            _await(launcher, {"verdict": "MAYBE"}, role="code-reviewer")
-        self.assertIn("STAGE_PAYLOAD_INVALID", str(caught.exception))
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["out"] = _await(
+                    launcher, {"verdict": "MAYBE"}, role="code-reviewer"
+                )
+            except BaseException as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=1.0)
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(box, {})
         self.assertEqual(launcher.waits, 0)
 
 

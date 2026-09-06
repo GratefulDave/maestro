@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
 import tempfile
 import sys
 import unittest
@@ -60,8 +61,12 @@ def _load_install():
 
 def _bind_tuple(layout: dict) -> tuple:
     runtime = mock.Mock()
-    runtime.ledger_path.return_value = Path("/runtime/lifecycle.sqlite3")
-    runtime.path = Path("/runtime")
+    # A real path, because `run start` and `run resume` now copy the plan
+    # revision under `runtime.path`. A double whose root does not exist stopped
+    # describing a runtime the moment anything wrote to one.
+    root = Path(tempfile.mkdtemp())
+    runtime.ledger_path.return_value = root / "lifecycle.sqlite3"
+    runtime.path = root
     store = mock.Mock()
     store.active_projection.return_value = ()
     row = {
@@ -285,8 +290,16 @@ class DashboardCallPlacementTest(unittest.TestCase):
                 return st.RunStatus.WAITING
 
         runtime = mock.Mock()
-        runtime.ledger_path.return_value = Path("/runtime/lifecycle.sqlite3")
-        runtime.path = Path("/runtime")
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        # A real path, because `run start` and `run resume` now copy the
+        # plan revision under `runtime.path`. A double whose root does not
+        # exist stopped describing a runtime the moment anything wrote to
+        # one.
+        runtime.ledger_path.return_value = root / "lifecycle.sqlite3"
+        runtime.path = root
+        plan_file = root / "plan.json"
+        plan_file.write_text("{}", encoding="utf-8")
         store = mock.Mock()
         target = SimpleNamespace(
             target_repository_root="/product",
@@ -294,7 +307,7 @@ class DashboardCallPlacementTest(unittest.TestCase):
         )
         compiled = SimpleNamespace(lanes=(SimpleNamespace(lane_id="lane-a"),))
         args = argparse.Namespace(
-            plan="plan.json",
+            plan=str(plan_file),
             repo="/product",
             main_ref="refs/heads/main",
             run_id="run-live",
@@ -331,6 +344,10 @@ class DashboardCallPlacementTest(unittest.TestCase):
 
         layout = {"dashboard": {"enabled": True}}
         bound = _bind_tuple(layout)
+        # `run amend` copies the revision it records under the runtime
+        # state root, so the plan it is handed has to be a real file.
+        plan_file = bound[1].path / "plan.json"
+        plan_file.write_text("{}", encoding="utf-8")
 
         class ImmediateScheduler:
             def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -362,7 +379,7 @@ class DashboardCallPlacementTest(unittest.TestCase):
             calls.clear()
             self.assertEqual(
                 maestro._run_amend(
-                    argparse.Namespace(run_id="run-1", plan="plan.json")
+                    argparse.Namespace(run_id="run-1", plan=str(plan_file))
                 ),
                 0,
             )

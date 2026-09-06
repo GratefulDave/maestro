@@ -14,7 +14,9 @@ reads one token as another's value.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from adw_modules import private_review as pr
@@ -38,6 +40,21 @@ COOKIE_FILES = {
 def _value_after(argv, flag):
     tokens = list(argv)
     return tokens[tokens.index(flag) + 1]
+
+
+class _Tree:
+    """A collection tree holding the repository files a gate may also name."""
+
+    def __init__(self, *present: str) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name)
+        for relative in present:
+            target = self.path / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("", encoding="utf-8")
+
+    def close(self) -> None:
+        self._tmp.cleanup()
 
 
 class GateArgvSubstitution(unittest.TestCase):
@@ -85,11 +102,15 @@ class GateArgvSubstitution(unittest.TestCase):
 
 
 class CollectGateArgv(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tree = _Tree()
+        self.addCleanup(self.tree.close)
+
     def test_collect_gate_pairs_config_with_the_config(self) -> None:
         gate = SimpleNamespace(
             runner="vitest", argv=COOKIE_ARGV, cwd=".", min_cases=6
         )
-        collect = _collect_gate(gate, COOKIE_FILES)
+        collect = _collect_gate(gate, COOKIE_FILES, self.tree.path)
         self.assertEqual(
             _value_after(collect.argv, "--config"),
             "tests/wp7-checkout/vitest.config.ts",
@@ -97,11 +118,15 @@ class CollectGateArgv(unittest.TestCase):
 
 
 class SuiteSelectorsArgv(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tree = _Tree()
+        self.addCleanup(self.tree.close)
+
     def test_sealed_suite_pairs_config_with_the_config(self) -> None:
         gate = SimpleNamespace(
             runner="vitest", argv=COOKIE_ARGV, cwd=".", min_cases=6
         )
-        argv = tc._suite_selectors(gate, tuple(COOKIE_FILES))
+        argv = tc._suite_selectors(gate, tuple(COOKIE_FILES), self.tree.path)
         self.assertEqual(
             _value_after(argv, "--config"), "tests/wp7-checkout/vitest.config.ts"
         )
@@ -109,9 +134,80 @@ class SuiteSelectorsArgv(unittest.TestCase):
     def test_pytest_keeps_its_own_flags_and_selectors(self) -> None:
         planned = ("services/api-gateway/tests/test_entitlement_issuance.py",)
         gate = SimpleNamespace(runner="pytest", argv=planned, cwd=".", min_cases=1)
-        argv = tc._suite_selectors(gate, planned)
+        argv = tc._suite_selectors(gate, planned, self.tree.path)
         self.assertEqual(argv[-1], planned[0])
         self.assertIn("--tb=line", argv)
+
+
+FIXTURE_ARGV = (
+    "src/lib/api/dpa.test.ts",
+    "src/lib/api/dpa-fixture-required.test.ts",
+)
+FIXTURE_WRITTEN = {"src/lib/api/dpa-fixture-required.test.ts": ""}
+
+
+class AGateOperandAlreadyInTheTree(unittest.TestCase):
+    """The shipped file a floor counts survives into the argv that measures it.
+
+    FDAdb `lane-wp8r-fixture-tests` declared min_cases 16: six private cases
+    plus the ten already in `src/lib/api/dpa.test.ts`, which the gate names as
+    its first operand and no lane writes. Dropping that operand left draft
+    collection measuring six against a floor of sixteen, so the run was
+    refused `DRAFT_MIN_CASES: collected 6, min_cases 16` one turn after the
+    test reviewer had correctly told the tester to stop padding the private
+    file with `it.each`. Nothing the tester could write was the thing that was
+    wrong (measured 2026-09-05, run a2ea7355).
+    """
+
+    def setUp(self) -> None:
+        self.tree = _Tree("src/lib/api/dpa.test.ts")
+        self.addCleanup(self.tree.close)
+
+    def test_an_unwritten_operand_present_in_the_tree_is_kept(self) -> None:
+        argv, selectors = pr.substituted_gate_argv(
+            FIXTURE_ARGV, FIXTURE_WRITTEN, self.tree.path
+        )
+        self.assertIn("src/lib/api/dpa.test.ts", argv)
+        self.assertIn("src/lib/api/dpa.test.ts", selectors)
+
+    def test_it_keeps_its_authored_position(self) -> None:
+        argv, _ = pr.substituted_gate_argv(
+            FIXTURE_ARGV, FIXTURE_WRITTEN, self.tree.path
+        )
+        self.assertEqual(argv, FIXTURE_ARGV)
+
+    def test_an_unwritten_operand_absent_from_the_tree_is_still_dropped(self) -> None:
+        argv, selectors = pr.substituted_gate_argv(
+            ("src/lib/api/never-written.test.ts",) + FIXTURE_ARGV[1:],
+            FIXTURE_WRITTEN,
+            self.tree.path,
+        )
+        self.assertNotIn("src/lib/api/never-written.test.ts", argv)
+        self.assertNotIn("src/lib/api/never-written.test.ts", selectors)
+
+    def test_a_directory_operand_is_dropped_even_when_it_exists(self) -> None:
+        argv, _ = pr.substituted_gate_argv(
+            ("src/lib/api",) + FIXTURE_ARGV[1:], FIXTURE_WRITTEN, self.tree.path
+        )
+        self.assertNotIn("src/lib/api", argv)
+
+    def test_a_caller_with_no_tree_cannot_test_existence_and_drops(self) -> None:
+        argv, _ = pr.substituted_gate_argv(FIXTURE_ARGV, FIXTURE_WRITTEN)
+        self.assertNotIn("src/lib/api/dpa.test.ts", argv)
+
+    def test_collect_gate_carries_the_shipped_operand(self) -> None:
+        gate = SimpleNamespace(
+            runner="vitest", argv=FIXTURE_ARGV, cwd=".", min_cases=16
+        )
+        collect = _collect_gate(gate, FIXTURE_WRITTEN, self.tree.path)
+        self.assertIn("src/lib/api/dpa.test.ts", collect.argv)
+
+    def test_the_sealed_suite_carries_the_shipped_operand(self) -> None:
+        gate = SimpleNamespace(
+            runner="vitest", argv=FIXTURE_ARGV, cwd=".", min_cases=16
+        )
+        argv = tc._suite_selectors(gate, tuple(FIXTURE_WRITTEN), self.tree.path)
+        self.assertIn("src/lib/api/dpa.test.ts", argv)
 
 
 if __name__ == "__main__":

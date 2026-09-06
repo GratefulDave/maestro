@@ -126,9 +126,25 @@ EXECUTE_ARGS: Dict[str, Tuple[str, ...]] = {
     "vitest": ("run",),
 }
 
-#: The capability probe: walk the whole tree, select nothing. Decoupled from
-#: the plan's selectors on purpose — see the module docstring for why the
-#: gate's own exit code cannot answer this question.
+#: The capability probe: select nothing, and — when the caller says which files
+#: it is about to run — look at nothing else. Decoupled from the plan's
+#: selectors on purpose; see the module docstring for why the gate's own exit
+#: code cannot answer this question.
+#:
+#: The scope is the correction. `-k` deselects every case but does not stop
+#: collection from IMPORTING every test module in the tree, so the probe's exit
+#: code reported facts about files the caller had not asked about. Two modules
+#: sharing a basename with no `__init__.py` between them is enough: pytest
+#: derives one module name twice and interrupts collection at exit 2, which
+#: `CAPABLE_EXIT` reads as "this runner cannot collect". On FDAdb run
+#: 2489c772d7c04ad5a2f2bcaa2f4de11c the sealed suite for
+#: `lane-wp4-release-build` was refused `SEALED_SUITE_RUNNER_UNUSABLE:pytest`
+#: because `services/device-substrates/tests/release/test_release_artifact.py`
+#: and `services/label-batch/tests/observations/test_release_artifact.py` — the
+#: second from a lane that merged weeks earlier — collide. Reproduced by hand
+#: in both review trees: exit 2, `import file mismatch`, `no tests collected
+#: (453 deselected), 1 error`. The interpreter was fine, and no agent could
+#: have acted on the refusal.
 PROBE_ARGS: Dict[str, Tuple[str, ...]] = {
     "pytest": (
         "-p",
@@ -195,6 +211,7 @@ class RunnerUnusable(RuntimeError):
         candidates: Sequence[str] = (),
         resolved: Optional[str] = None,
         probe_exit: Optional[int] = None,
+        probe_output: str = "",
         detail: str = "",
     ) -> None:
         self.runner = runner
@@ -203,6 +220,7 @@ class RunnerUnusable(RuntimeError):
         self.candidates: Tuple[str, ...] = tuple(candidates)
         self.resolved = resolved
         self.probe_exit = probe_exit
+        self.probe_output = probe_output
         self.detail = detail or self._detail()
         super().__init__(self.detail)
 
@@ -215,11 +233,16 @@ class RunnerUnusable(RuntimeError):
                 )
             )
         if self.reason is Reason.INCAPABLE:
+            said = (
+                "; the probe said: {0}".format(self.probe_output)
+                if self.probe_output
+                else ""
+            )
             return (
                 "{0} resolved to {1}, which started and could not collect "
                 "in {2} (probe exit {3}); it cannot import this "
-                "repository's test prerequisites".format(
-                    self.runner, self.resolved, self.cwd, self.probe_exit
+                "repository's test prerequisites{4}".format(
+                    self.runner, self.resolved, self.cwd, self.probe_exit, said
                 )
             )
         return "no usable {0} was found for {1}; candidates tried: {2}".format(
@@ -231,8 +254,8 @@ class RunnerUnusable(RuntimeError):
     def payload(self) -> Dict[str, Any]:
         """The refusal, as typed fields. Every one of them has a reader:
         `reason` is branched on by callers and asserted by the tests,
-        `candidates` and `probe_exit` are what an operator acts on, and
-        `resolved` names the binary that failed (§3.6 B15)."""
+        `candidates`, `probe_exit` and `probe_output` are what an operator acts
+        on, and `resolved` names the binary that failed (§3.6 B15)."""
         return {
             "outcome": RUNNER_UNUSABLE,
             "runner": self.runner,
@@ -241,6 +264,7 @@ class RunnerUnusable(RuntimeError):
             "candidates": list(self.candidates),
             "resolved": self.resolved,
             "probe_exit": self.probe_exit,
+            "probe_output": self.probe_output,
         }
 
 
@@ -332,13 +356,30 @@ def probe(
     runner: str,
     argv_prefix: Sequence[str],
     cwd: Path,
+    paths: Sequence[str],
     env: Optional[Mapping[str, str]] = None,
     timeout_s: float = PROBE_TIMEOUT_S,
-) -> int:
-    """The probe's exit code, or `-1` when it could not be started."""
-    args = PROBE_ARGS[runner]
-    code, _ = _run(tuple(argv_prefix) + args, cwd, env, timeout_s)
-    return code
+) -> Tuple[int, str]:
+    """The probe's exit code and its output, or `(-1, "")` when it never started.
+
+    The output used to be dropped here. `_run` captures it, `probe` discarded
+    it, and `resolve`'s discovery loop then had nothing to say about a
+    candidate that ran and failed -- so a pytest that was present, executable,
+    and could not import the repository's prerequisites was reported as
+    `no usable pytest was found`, which asserts the opposite of what happened.
+    Returning it is what lets the refusal name the measurement it made.
+    """
+    # Paths first, for both runners. vitest's optional-valued flags swallow a
+    # following path -- `vitest list --json <path>` once wrote 47KB of listing
+    # JSON over the tester's committed test file -- and pytest accepts path
+    # operands anywhere, so one order is safe for both and there is no
+    # per-runner branch to get wrong.
+    return _run(
+        tuple(argv_prefix) + tuple(paths) + PROBE_ARGS[runner],
+        cwd,
+        env,
+        timeout_s,
+    )
 
 
 def _version(
@@ -420,7 +461,8 @@ def _anchor_declared(value: str, repo: Path) -> Optional[Tuple[str, ...]]:
 def resolve(
     runner: str,
     repo: Path,
-    cwd: str = ".",
+    cwd: str,
+    paths: Sequence[str],
     *,
     declared: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -430,6 +472,13 @@ def resolve(
 
     `cwd` is relative to `repo` and is where the probe runs, so capability is
     established in the directory the gate will actually collect from.
+
+    `paths` are the files the caller is about to run, relative to `cwd`. Pass
+    them whenever they are known: the probe then imports only those, and the
+    verdict is about the runner and the code under test rather than about
+    whatever else the tree happens to contain. Omitting them keeps the
+    whole-tree reading, which is the right question only for a deployment
+    preflight that has no candidate yet.
     """
     repo = Path(repo)
     working = (repo / cwd).resolve()
@@ -463,7 +512,9 @@ def resolve(
                 detail="runners.{0} is declared as {1!r}, which is not an "
                 "executable file".format(runner, declared),
             )
-        exit_code = probe(runner, invocation, working, env, timeout_s)
+        exit_code, output = probe(
+            runner, invocation, working, paths, env, timeout_s
+        )
         if exit_code != CAPABLE_EXIT[runner]:
             # No fallback to discovery. A declaration that silently falls back
             # to a guess is not a declaration.
@@ -474,6 +525,7 @@ def resolve(
                 candidates=(declared,),
                 resolved=invocation[0],
                 probe_exit=exit_code,
+                probe_output=bounded_collect_output(output, "", hide=(str(repo),)),
             )
         return ResolvedRunner(
             runner=runner,
@@ -486,6 +538,12 @@ def resolve(
         )
 
     tried: List[str] = []
+    #: The highest-ranked candidate that started, with what it answered. A
+    #: candidate only reaches `tried` after `_is_executable` passed, so an
+    #: exhausted loop that has one of these did not fail to *find* a runner --
+    #: it found one that could not collect, which is `INCAPABLE`, the reason
+    #: the declared branch above has always raised for the same event.
+    started: Optional[Tuple[str, int, str]] = None
     for candidates in _rank_candidates(runner, repo):
         if not candidates:
             continue
@@ -498,7 +556,11 @@ def resolve(
             )
         invocation = candidates[0]
         tried.append(" ".join(invocation))
-        exit_code = probe(runner, invocation, working, env, timeout_s)
+        exit_code, output = probe(
+            runner, invocation, working, paths, env, timeout_s
+        )
+        if exit_code != CAPABLE_EXIT[runner] and exit_code != -1 and started is None:
+            started = (invocation[0], exit_code, output)
         if exit_code == CAPABLE_EXIT[runner]:
             return ResolvedRunner(
                 runner=runner,
@@ -509,6 +571,17 @@ def resolve(
                 version=_version(invocation, working, env),
                 cwd=cwd,
             )
+    if started is not None:
+        resolved, exit_code, output = started
+        raise RunnerUnusable(
+            runner,
+            Reason.INCAPABLE,
+            cwd,
+            candidates=tried,
+            resolved=resolved,
+            probe_exit=exit_code,
+            probe_output=bounded_collect_output(output, "", hide=(str(repo),)),
+        )
     raise RunnerUnusable(runner, Reason.UNRESOLVED, cwd, candidates=tried)
 
 
@@ -704,6 +777,62 @@ def bounded_collect_output(
     return out
 
 
+def _empty_listing_detail(
+    runner: str,
+    timeout_s: float,
+    stdout: str,
+    stderr: str,
+    *,
+    hide: Sequence[str] = (),
+) -> str:
+    """What to say when collection was stopped holding an empty listing.
+
+    The text this replaced was `"<runner> did not finish collecting in
+    120.0s"`. That is a stopwatch reading, and it is forwarded verbatim as the
+    draft author's one correction -- so the author is told the harness took two
+    minutes and asked to fix that. The repair it suggests is a bigger budget,
+    and time was never the scarce thing: measured 2026-09-05 against FDAdb
+    integration (vitest 3.2.7, node 24.16.0, Astro `getViteConfig`), a healthy
+    44-case listing lands in 7.6s of the 120s budget and vitest then never
+    exits, which is why this branch is reached with a *complete* answer often
+    enough to have its own early return above.
+
+    What the runner printed is the only discriminator available here, and it is
+    not always sufficient -- which this text has to say rather than guess past.
+    Measured the same day, same tree, same binary:
+
+        plain `defineConfig` + module whose top-level `await` never settles
+            -> 0 bytes on both streams, killed at the deadline
+        plain `defineConfig` + file that registers nothing
+            -> exits 0 in 2.29s with 0 bytes; never reaches this branch
+        Astro `getViteConfig` + either of those two files
+            -> the same 453 bytes of adapter banner, killed at the deadline
+
+    So silence is a sound signature of "no test module finished loading", while
+    output on its own is a signature of nothing: under the config FDAdb's own
+    gates use, a deadlocked import and an empty file are byte-identical here.
+    The runner's own text goes to the author, who has the file and can tell the
+    two apart by running the same command.
+    """
+    snippet = bounded_collect_output(stdout, stderr, hide=hide)
+    if not snippet:
+        return (
+            "{0} enumerated no case and printed nothing at all before it was "
+            "stopped at {1}s: no test module finished loading. That is what an "
+            "import that hangs or deadlocks looks like -- a top-level await "
+            "that never settles, a module-scope connection, a circular import. "
+            "Run the same collect command against the draft yourself and fix "
+            "what stops it loading; the case count is not the problem."
+        ).format(runner, timeout_s)
+    return (
+        "{0} enumerated no case before it was stopped at {1}s, but it did "
+        "print. Either a test module never finished loading, or one loaded and "
+        "registered no case -- this output cannot tell those apart, and only "
+        "running the same collect command against the draft can. What {0} "
+        "printed: {2}"
+    ).format(runner, timeout_s, snippet)
+
+
 def _collect_refuse_detail(
     runner: str,
     returncode: int,
@@ -778,22 +907,28 @@ def collect_cases(
             detail="{0} could not be run".format(resolved.runner),
         ) from extra
     output = (result.stdout or "") + "\n" + (result.stderr or "")
+    hide = (str(cwd), str(cwd.resolve()), str(Path(tree)), str(Path(tree).resolve()))
     if result.timed_out:
         # A runner that enumerated and then would not exit has answered the
         # only question collection asks. Refuse on an empty listing -- never
-        # on the exit that did not come.
+        # on the exit that did not come, and never by reporting the clock:
+        # forward what the runner itself printed, redacted through the same
+        # helper the non-zero-exit branch below uses.
         ids = collected_identifiers(output)
         if ids:
             return ids
         raise CollectFailed(
             resolved.runner,
-            detail="{0} did not finish collecting in {1}s".format(
-                resolved.runner, timeout_s
+            detail=_empty_listing_detail(
+                resolved.runner,
+                timeout_s,
+                result.stdout or "",
+                result.stderr or "",
+                hide=hide,
             ),
         )
     capable = CAPABLE_EXIT.get(resolved.runner)
     if result.returncode not in (0, capable):
-        hide = (str(cwd), str(cwd.resolve()), str(Path(tree)), str(Path(tree).resolve()))
         raise CollectFailed(
             resolved.runner,
             returncode=result.returncode,

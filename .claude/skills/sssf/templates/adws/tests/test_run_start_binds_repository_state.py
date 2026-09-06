@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import shutil
 import tempfile
 import threading
 import unittest
@@ -199,8 +200,16 @@ class RunStartBindsRepositoryStateTest(unittest.TestCase):
         result: list[int] = []
         failure: list[BaseException] = []
         runtime = mock.Mock()
-        runtime.path = Path("/runtime")
-        runtime.ledger_path.return_value = Path("/runtime/lifecycle.sqlite3")
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        # A real path, because `run start` and `run resume` now copy the
+        # plan revision under `runtime.path`. A double whose root does not
+        # exist stopped describing a runtime the moment anything wrote to
+        # one.
+        runtime.path = root
+        plan_file = root / "plan.json"
+        plan_file.write_text("{}", encoding="utf-8")
+        runtime.ledger_path.return_value = root / "lifecycle.sqlite3"
         store = mock.Mock()
         target = SimpleNamespace(
             target_repository_root="/product",
@@ -225,7 +234,7 @@ class RunStartBindsRepositoryStateTest(unittest.TestCase):
                 return maestro.st.RunStatus.WAITING
 
         args = argparse.Namespace(
-            plan="plan.json",
+            plan=str(plan_file),
             repo="/product",
             main_ref="refs/heads/main",
             run_id="run-live",

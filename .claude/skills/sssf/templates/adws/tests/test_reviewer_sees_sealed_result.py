@@ -92,6 +92,14 @@ class _EmptyStore:
     def __init__(self):
         self.conn = self._Conn()
 
+    def lane_stage(self, _run_id, _lane_id):
+        # Where a build lane sits once its code REVISE is recorded, which is
+        # where `_block_if_stalled` is called from. The guard reads the stage
+        # to decide which history it is judging -- sealed errors here, test
+        # review findings for a tests lane -- so a store that cannot answer
+        # it is not standing in for the production path.
+        return st.LaneStage.BUILDING
+
 
 def _scheduler(actor):
     scheduler = sch.FactoryScheduler.__new__(sch.FactoryScheduler)
