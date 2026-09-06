@@ -678,6 +678,67 @@ class HerdrStageActor:
             "affected_lanes": ["<lane-id>"],
         }
 
+    #: The one measurement a tester owes before it returns an envelope, and
+    #: the anti-measurement it keeps reaching for instead.
+    #:
+    #: Measured, FDAdb run `a2ea7355699c4dff93bc82ac89415475`,
+    #: `lane-wp8r-route-tests`, 2026-09-05. The tester submitted a draft whose
+    #: module deadlocks vitest at load; collection enumerated nothing for the
+    #: full 120s budget twice and ended the run. What the tester had actually
+    #: done before submitting, from its own transcript: a grep-based self-check
+    #: reporting `it count 8 / describe 1`, and one bash call that returned no
+    #: output in 0.12 seconds. It had run a real listing earlier in the lane and
+    #: stopped. Running the real listing by hand answers in 7.6s.
+    #:
+    #: A static scan is not a weaker version of that measurement, it is a
+    #: different question with a different answer: `it.each` expands to many
+    #: cases, a `describe` body never invoked registers none, and a module that
+    #: deadlocks at import greps identically to one that loads. Both tester
+    #: rules carry this because both drafts go through the same preflight
+    #: (`scheduler._collect_private_draft`), whatever the lane kind.
+    _PROHIBITION_RULE = (
+        "When an obligation forbids a behaviour -- 'never orders among', "
+        "'must not coalesce', 'is absent from' -- it names a FAMILY of wrong "
+        "implementations, not one. Cover the family: if the plan names one "
+        "member, enumerate the rest yourself and assert each is rejected. And "
+        "assert the boundary from the other side too, with a positive control "
+        "-- a legal near-miss the implementation is allowed to have, which "
+        "your case must keep passing. A case that rejects one member is "
+        "vacuous against its siblings; a case with no positive control "
+        "rejects correct implementations as readily as wrong ones, and you "
+        "will be sent back for the opposite defect. Measured on FDAdb "
+        "lane-wp4-recalls-tests: 'never orders among Class I, II and III' was "
+        "discharged by forbidding an ascending severity sort, and a "
+        "descending severity sort passed the whole case; the round before, "
+        "the same case had rejected a legitimate identifier ordering."
+    )
+
+    _PROHIBITION_REVIEW_RULE = (
+        "For every obligation that forbids a behaviour, probe the whole "
+        "family, not the member the plan happened to name: if the case "
+        "rejects one direction, orientation, or ordering of the prohibited "
+        "behaviour, try the others before passing it. Check the other side "
+        "too -- a case with no positive control rejects legal "
+        "implementations, and that is a REVISE of its own, not a strength."
+    )
+
+    _TESTER_COLLECT_RULE = (
+        "Before you return the envelope, enumerate your own draft with the "
+        "gate's own runner and see the listing. vitest: "
+        "`<vitest binary> list --run [--config <gate config>] <your files>`; "
+        "pytest: `<pytest binary> --collect-only -q -o addopts= <your files>`. "
+        "The harness runs exactly that and will not accept a draft it cannot "
+        "enumerate. A listing that appears and then does not exit is fine -- "
+        "some configs hold the runner open, and the harness reads what was "
+        "printed; kill it once you have seen your case ids. Nothing printed at "
+        "all means no module finished loading, which is your defect to fix, "
+        "not the harness's. Counting `it(`, `test(`, or `def test_` with grep, "
+        "or any other static scan of the file, is NOT this measurement and "
+        "does not discharge it: `it.each` expands, a `describe` body that is "
+        "never invoked registers nothing, and a module that deadlocks at "
+        "import greps exactly like one that loads."
+    )
+
     def _materialize_role_instructions(
         self, cwd: Path, role: str, route: str, lane_kind: str | None = None
     ) -> Path:
@@ -688,7 +749,10 @@ class HerdrStageActor:
                 "Author files exactly at declared_outputs. Returned private_files "
                 "paths must equal declared_outputs. On correction turns, apply "
                 "revise_findings to those declared files; do not claim a finding "
-                "is fixed by resubmitting byte-identical files."
+                "is fixed by resubmitting byte-identical files.\n"
+                + self._TESTER_COLLECT_RULE
+                + "\n"
+                + self._PROHIBITION_RULE
             )
         else:
             tester_rule = (
@@ -698,7 +762,10 @@ class HerdrStageActor:
                 "Write hidden validator/meta-test files that exercise builder "
                 "outputs; never replace those outputs. On correction turns, "
                 "apply revise_findings to hidden validators; do not claim a "
-                "finding is fixed by resubmitting byte-identical hidden files."
+                "finding is fixed by resubmitting byte-identical hidden files.\n"
+                + self._TESTER_COLLECT_RULE
+                + "\n"
+                + self._PROHIBITION_RULE
             )
         role_rules = {
             "tester": tester_rule,
@@ -714,7 +781,8 @@ class HerdrStageActor:
                 "listed in the per-turn JSON. Integration-seed and product "
                 "files are context and out of scope. A private validator "
                 "failing against the base is expected when falsifiability "
-                "requires red-at-base."
+                "requires red-at-base.\n"
+                + self._PROHIBITION_REVIEW_RULE
             ),
             "builder": (
                 "Modify only the declared product outputs. Never read private "
@@ -1399,17 +1467,14 @@ class HerdrStageActor:
         bound = Path(getattr(handle, "launched_cwd", "") or Path(envelope).parent)
         waited = 0.0
         while True:
-            envelope_exists = False
             try:
                 raw = _read_regular_text_under(bound, envelope)
-                envelope_exists = True
                 payload = json.loads(raw)
             except FileNotFoundError:
                 payload = None
             except FactoryRefused:
                 raise
             except (OSError, UnicodeError, ValueError):
-                envelope_exists = True
                 payload = None
 
             if isinstance(payload, dict) and self._payload_ok(role, payload):
@@ -1429,42 +1494,32 @@ class HerdrStageActor:
                             str(exc),
                         )
                 return payload
-            result = self.launcher.poll(handle)
-            if result.state in (lch.PollState.GONE, lch.PollState.EXITED):
-                # Belt to the `.part`-then-rename braces above. An envelope
-                # written in place can be read mid-write: json.loads throws,
-                # envelope_exists is already True, and poll reports EXITED
-                # because `_declared_result` read the same partial file.
-                #
-                # EXITED does NOT mean the process died -- role sessions are
-                # persistent across turns -- so this re-read is not authoritative
-                # and must never be described as such. It is a second look that
-                # usually lands after the write, and it exists only for an agent
-                # that ignored the rename protocol. The protocol is the fix; this
-                # is what keeps one unlucky read from ending a run while some
-                # route still writes in place.
-                payload = None
-                try:
-                    payload = json.loads(_read_regular_text_under(bound, envelope))
-                except FileNotFoundError:
-                    envelope_exists = False
-                except FactoryRefused:
-                    raise
-                except (OSError, UnicodeError, ValueError):
-                    envelope_exists = True
-                if isinstance(payload, dict) and self._payload_ok(role, payload):
-                    self._say(
-                        lane_id or "-",
-                        "{0} envelope settled after exit".format(role),
-                        "",
-                    )
-                    return payload
-                outcome = (
-                    "STAGE_PAYLOAD_INVALID"
-                    if envelope_exists
-                    else "STAGE_PAYLOAD_MISSING"
-                )
-                raise FactoryRefused(outcome)
+            # ── nothing but the envelope ends this wait ─────────────────────
+            #
+            # There used to be a `poll` here, and a GONE-or-EXITED branch that
+            # raised `STAGE_PAYLOAD_MISSING`. Every observation it read was a
+            # transport observation: whether herdr still lists a row under this
+            # agent's name, whether a pane has been quiet, whether a partial
+            # file parsed on one unlucky read. None of those answers the
+            # question this method asks, which is whether the turn declared.
+            #
+            # The branch was rewritten repeatedly and each rewrite fixed one
+            # arm. Reading the transcript for a terminal record ended attempts
+            # on the agent's first message. Reading the pane's absence before
+            # the envelope threw away completed work on run
+            # run-14b7b75944094c52ac9c0add41ae46a2. A single `idle` sample
+            # convicted a live builder on run-8d1a71f463e4430f92a125a8f8b3731d
+            # 75 seconds before it declared. A missing herdr row ended
+            # `lane-wp4-recalls-build` 245 seconds after dispatch on FDAdb run
+            # 2489c772d7c04ad5a2f2bcaa2f4de11c, with an empty `results/` and a
+            # prompt the builder never answered.
+            #
+            # Four incidents, one cause: a transport signal was allowed to
+            # terminate a lane. Deleting the branch is the fix. There is no
+            # confirmation window to tune and no state to add, because there is
+            # no longer a second thing that can end the wait -- the envelope
+            # ends it, and an agent that never declares leaves a lane visibly
+            # waiting for the operator who is watching the run.
             time.sleep(0.1)
             waited += 0.1
             # A silent minute is indistinguishable from a hung agent. Say the
@@ -1548,7 +1603,7 @@ class HerdrStageActor:
         key = self._role_key(ctx, role)
         # Every dispatch crosses here, which is why the release is here and
         # not in the five stage methods that each compute the same key.
-        superseded = self._release_superseded(key)
+        self._release_superseded(key)
         route = self.role_routes[role]
         stored = self._roles.get(key)
         if stored is not None:
@@ -1568,6 +1623,21 @@ class HerdrStageActor:
             stored.run_id = ctx.run_id
         session = attempt / "session"
         session.mkdir(exist_ok=True)
+        # The tree the role reads is materialized from the artifact this
+        # dispatch names, on every dispatch, here and nowhere else. This used
+        # to be three conditional calls -- one on the resubmit path, one
+        # behind `superseded`, and the tester's own refresh inside `_prepare`
+        # -- which left the ordinary first-launch path with no refresh at all.
+        # That path is not rare: it is taken whenever the in-memory role
+        # record is gone but the checkout and the agent's pane are not, which
+        # is every `run resume` and every `_retain_completed` that dropped the
+        # key. On run a2ea7355 the test reviewer read the round-1 draft for
+        # three consecutive rounds and reported round-1's defects each time,
+        # while the tester had fixed both in round 2. Nothing could notice: a
+        # private tree carries no sha, and the ledger records the input
+        # artifact id rather than the bytes the reader was given, so
+        # `input_digest` moved every round while the file did not.
+        prepare_cwd(cwd)
         envelope = lch.role_result_path(cwd, turn)
         envelope.parent.mkdir(parents=True, exist_ok=True)
         prompt = lch.role_prompt_path(cwd, turn)
@@ -1590,7 +1660,6 @@ class HerdrStageActor:
         lane_id = ctx.lane.lane_id
         token = lch.role_session_token(ctx.run_id, lane_id, role)
         if stored is not None and stored.handle is not None:
-            prepare_cwd(cwd)
             self._materialize_role_instructions(
                 cwd, role, route["route"], ctx.lane.lane_kind
             )
@@ -1618,13 +1687,6 @@ class HerdrStageActor:
             self._retain_completed(handle, key)
             return payload, handle, cwd_used
 
-        if superseded:
-            # This checkout is the released session's, adopted by path so its
-            # candidate commits survive. A first launch would have created it
-            # at the right sha and a resubmit would have prepared it; this is
-            # neither, so a reviewer would otherwise read the tree the previous
-            # revision left rather than the one it was dispatched against.
-            prepare_cwd(cwd)
         system_prompt = self._materialize_role_instructions(
             cwd, role, route["route"], ctx.lane.lane_kind
         )
@@ -1689,10 +1751,13 @@ class HerdrStageActor:
             and not precreated
             and ((cwd / ".git").exists() or any(cwd.iterdir()))
         ):
+            # Reuse of an existing checkout, whatever it holds. `_launch`
+            # refreshes every tree it dispatches into, so this returns the
+            # path and states nothing about its bytes. It used to refresh the
+            # tester's, and only the tester's, which read as a reuse guard and
+            # was really the one role that happened to be covered.
             if private_tree:
                 return attempt, None
-            if sha and role == "tester":
-                self._refresh_git_checkout(cwd, sha)
             return attempt, cwd
         if private_tree:
             draft = ctx.artifacts.get("TEST_DRAFT")
@@ -1872,13 +1937,12 @@ class HerdrStageActor:
         if checkout is None and stored is None:
             raise FactoryRefused("BUILDER_CHECKOUT_MISSING")
         cwd = checkout or stored.cwd
-        # `prepare_cwd` is not enough on its own. `_launch` calls it on the
-        # resubmit path, on an adopted pane, and on a superseded session --
-        # but a FIRST launch goes straight from `_prepare`, which materialized
-        # the worktree at `sha`, to `launcher.launch`. That is the turn an
-        # amended lane opens with, and `sha` is the integration head that
-        # carries its own suite, so the first turn is exactly the leak.
-        self._strip_paths(cwd, strip)
+        # The strip used to be repeated here because `_launch` skipped
+        # `prepare_cwd` on a first launch, and that is the turn an amended
+        # lane opens with, against an integration head carrying its own
+        # suite. `_launch` now prepares every tree it dispatches into, and
+        # `_refresh_builder_checkout` strips on both of its branches, so the
+        # guard holds for the same reason every other role's does.
         _payload, _handle, cwd_used = self._launch(
             ctx,
             "builder",
@@ -2355,6 +2419,9 @@ def _run_start(args: argparse.Namespace) -> int:
                 target=target,
             )
             target = target_from_binding(binding)
+            # Pin at creation, so the window between `run start` and the first
+            # bind is not one in which editing the plan invalidates the run.
+            _pin_plan_artifact(plan_path, _pinned_plan_artifact(runtime, run_id, 1))
             register_installation(
                 database=runtime.ledger_path(),
                 plans_dir=plan_path.resolve().parent,
@@ -2401,6 +2468,48 @@ def _run_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pinned_plan_artifact(runtime: Any, run_id: str, plan_revision: int) -> Path:
+    # `runtime` is read for its `path` alone, so the annotation is what a
+    # caller can actually satisfy rather than the whole state root.
+    """The run's own copy of one plan revision, under `runtime_state_root`.
+
+    A recorded revision is an immutable input, and until this existed it was
+    addressed as a path into the operator's working tree. `_bind_existing_run`
+    recompiles that path and refuses `PLAN_ARTIFACT_MISMATCH` when the digest
+    moved -- and it gates `resume`, `amend` and `status` alike. So the edit an
+    amendment requires was the edit that stopped all three verbs, and the only
+    way out was to restore the exact bytes, which meant the plan could not be
+    amended in place at all. Measured 2026-09-06 on FDAdb run 2489c772, whose
+    `plan_revisions.plan_artifact_ref` was
+    `<repo>/.maestro/plans/fdadb-wp4/maestro-plan.v1` while
+    `runtime_state_root/plans/` was empty.
+
+    `MAESTRO_architecture.md` already says copied plans live under the
+    deployment's `runtime_state_root`; the empty directory was the receipt that
+    the copy was never written. Nothing else changes: `plan_artifact_ref` keeps
+    the value it was recorded with, so no input digest moves, and the digest
+    check keeps its meaning -- it now checks the run's own copy rather than a
+    file anyone can edit.
+    """
+    return (
+        runtime.path
+        / "plans"
+        / run_id
+        / "r{0}".format(int(plan_revision))
+        / _PLAN_ARTIFACT_NAME
+    )
+
+
+def _pin_plan_artifact(source: Path, pinned: Path) -> None:
+    """Copy one revision's bytes under `runtime_state_root`, once."""
+    if pinned.exists():
+        return
+    pinned.parent.mkdir(parents=True, exist_ok=True)
+    scratch = pinned.with_name(pinned.name + ".tmp")
+    scratch.write_bytes(Path(source).read_bytes())
+    scratch.replace(pinned)
+
+
 def _bind_existing_run(
     run_id: str,
 ) -> tuple[
@@ -2422,14 +2531,21 @@ def _bind_existing_run(
         require_deployment(maestro_file, Path(row["target_repository_root"]))
         runtime.revalidate(row["runtime_state_fingerprint"])
         target = target_from_binding(binding_from_run(row))
-        plan_ref = Path(plan_artifact_ref_for(store, run_id, int(row["plan_revision"])))
+        revision = int(row["plan_revision"])
+        plan_ref = Path(plan_artifact_ref_for(store, run_id, revision))
+        pinned = _pinned_plan_artifact(runtime, run_id, revision)
+        # The pin is authoritative once it exists. A run created before it did
+        # has none, so the first bind reads the recorded path exactly as
+        # before, and pins it only after the digest check has proven those are
+        # still the revision's bytes.
         compiled = _compile_plan(
-            plan_ref,
-            revision=int(row["plan_revision"]),
+            pinned if pinned.is_file() else plan_ref,
+            revision=revision,
             ref=str(plan_ref),
         )
         if compiled.plan_digest != row["plan_digest"]:
             raise FactoryRefused("PLAN_ARTIFACT_MISMATCH")
+        _pin_plan_artifact(plan_ref, pinned)
         register_installation(
             database=runtime.ledger_path(),
             plans_dir=plan_ref.resolve().parent,
@@ -2505,6 +2621,10 @@ def _run_amend(args: argparse.Namespace) -> int:
                 compiled,
                 runtime=runtime,
                 target=target,
+            )
+            _pin_plan_artifact(
+                Path(args.plan),
+                _pinned_plan_artifact(runtime, run_id, row["plan_revision"] + 1),
             )
             console = step_log.RunReporter(run_id, runtime.path)
             console.opened(

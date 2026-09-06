@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -606,8 +607,26 @@ class PersistentRoleDispatchTest(unittest.TestCase):
                 agent_name=lch.agent_name_for("tok-malformed"),
                 launched_cwd=root,
             )
-            with self.assertRaisesRegex(FactoryRefused, "STAGE_PAYLOAD_INVALID"):
-                actor._await_envelope(handle, envelope, "tester")
+            # A malformed envelope is not a declaration, and is no longer a
+            # refusal either: `_await_envelope` consults nothing but the file,
+            # so the writer gets to finish. See
+            # `test_absence_is_not_a_verdict`. The wait must therefore still
+            # be running, which is what the timeout below asserts.
+            box: dict = {}
+
+            def wait() -> None:
+                try:
+                    box["payload"] = actor._await_envelope(
+                        handle, envelope, "tester"
+                    )
+                except BaseException as exc:
+                    box["error"] = exc
+
+            thread = threading.Thread(target=wait, daemon=True)
+            thread.start()
+            thread.join(timeout=1.0)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(box, {})
 
     def test_collect_uncommitted_refuses_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

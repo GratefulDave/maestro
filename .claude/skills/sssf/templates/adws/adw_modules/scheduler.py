@@ -13,7 +13,7 @@ import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
 from concurrent.futures import wait as _wait_futures
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,16 +66,22 @@ class RunnerPreflightRefused(FactoryRefused):
     code = "RUNNER_PREFLIGHT_REFUSED"
 
 
-class DraftMinCasesRefused(FactoryRefused):
-    code = "DRAFT_MIN_CASES"
-
-    def __init__(self, collected: int, min_cases: int) -> None:
-        self.collected = collected
-        self.min_cases = min_cases
-        super().__init__("collected {0}, min_cases {1}".format(collected, min_cases))
-
-
 class DraftCollectionRefused(FactoryRefused):
+    """The lane's gate cannot be measured. Never a verdict about a draft.
+
+    Raised by `_lane_gate` for a gate the plan declared wrong -- a missing
+    `min_cases`, an unsupported runner, `required_cases` longer than the floor.
+    Nothing a tester writes can answer that, so it refuses the run.
+
+    `_collect_private_draft` also raises it, and there it *is* about a draft:
+    that call site is inside `_measure_draft_gate`, which catches it and turns
+    it into a REVISE the tester is asked to answer. It reaches no further.
+    Before 2026-09-05 it did: on FDAdb run a2ea7355 one tests lane submitted a
+    module that deadlocked vitest at load, this exception left the scheduler,
+    and four sibling lanes -- two MERGED, two READY_TO_MERGE -- lost their run
+    with it.
+    """
+
     code = "DRAFT_COLLECTION_REFUSED"
 
 
@@ -196,6 +202,42 @@ def _sealed_error_history(
         errored = summary.get("errored")
         if isinstance(failed, int) and isinstance(errored, int):
             history.append(failed + errored)
+    return history
+
+
+def _test_review_error_history(
+    store: ArtifactStore, run_id: str, lane_id: str
+) -> list[int]:
+    """Finding counts for this lane's test-review rounds since the last block.
+
+    The tests-lane counterpart of `_sealed_error_history`, read by the same
+    `_stalled` and reset by the same USER_WAIT marker. A tests lane has no
+    sealed suite to count errors from -- its draft has not been accepted yet --
+    so the number that stands in for errors is how many findings the round
+    still had to raise. Lower is better, and a PASS scores zero, exactly as a
+    green sealed suite does.
+
+    Every TEST_REVIEW round counts, not only the ones the harness measured. A
+    reviewer that keeps saying REVISE without the finding count coming down is
+    the unbounded loop A9 names, and it is the same shape as a build lane
+    whose sealed errors stop falling. Three rounds of slack, then the operator.
+    """
+    marker = 0
+    for row in store.conn.execute(
+        "SELECT sequence FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+        "AND artifact_kind=? ORDER BY sequence DESC LIMIT 1",
+        (run_id, lane_id, st.ArtifactKind.USER_WAIT.value),
+    ):
+        marker = int(row["sequence"])
+    history: list[int] = []
+    for row in store.conn.execute(
+        "SELECT sequence, payload_json FROM lane_artifacts WHERE run_id=? "
+        "AND lane_id=? AND artifact_kind=? AND sequence>? ORDER BY sequence ASC",
+        (run_id, lane_id, st.ArtifactKind.TEST_REVIEW.value, marker),
+    ):
+        findings = _loads(row["payload_json"]).get("findings")
+        if isinstance(findings, list):
+            history.append(len(findings))
     return history
 
 
@@ -1037,8 +1079,10 @@ def _lane_gate(actor: object, lane_id: str) -> SimpleNamespace | None:
     )
 
 
-def _collect_gate(gate: SimpleNamespace, files: Mapping[str, str]) -> SimpleNamespace:
-    argv, _selectors = prv.substituted_gate_argv(gate.argv, files)
+def _collect_gate(
+    gate: SimpleNamespace, files: Mapping[str, str], tree: Path
+) -> SimpleNamespace:
+    argv, _selectors = prv.substituted_gate_argv(gate.argv, files, tree)
     return SimpleNamespace(
         runner=gate.runner,
         argv=argv,
@@ -1083,21 +1127,36 @@ def _collect_resolution_root(
 def _draft_collection_findings(detail: str) -> tuple[dict[str, str], ...]:
     """The collection refusal, as a finding its own author can act on.
 
-    A draft that lists too few cases gets one correction turn; a draft that
-    cannot be collected at all used to raise straight past it, so the tester
-    was never told what broke and wrote the same draft on every resume. The
-    detail is the text the refusal already carries, redacted at the raise, and
-    the tester authored the files it describes -- the seal keeps private tests
-    from the builder, not from the actor that wrote them.
+    The detail is whatever the refusal carries, redacted at the raise, and the
+    tester authored the files it describes -- the seal keeps private tests from
+    the builder, not from the actor that wrote them.
+
+    What it does *not* say is "fix what the refusal names", which is what it
+    used to say. A collect that never returns names a stopwatch --
+    `vitest did not finish collecting in 120.0s` -- and a tester handed that
+    sentence has been told the harness gave up, not what its module did. The
+    required behaviour below states the obligation the draft actually broke:
+    listing cases is an import, and an import that blocks, awaits, connects,
+    reads, or loops never reaches the listing. That is actionable against a
+    stopwatch, against a syntax error, and against a runner that printed a
+    stack trace, without the finding having to know which one it got.
     """
     return st.require_revise_findings(
         (
             {
                 "implementation_area": "private tests",
-                "observed_behavior": "native collect refused: {0}".format(detail),
+                "observed_behavior": (
+                    "the lane's gate could not list the draft's cases. The "
+                    "runner reported: {0}".format(detail)
+                ),
                 "required_behavior": (
-                    "the draft must collect under the lane's gate command; fix "
-                    "what the refusal names and resubmit"
+                    "every declared test file must import cleanly and register "
+                    "its cases at import time, so the gate's collect command "
+                    "lists them. Listing runs no case body: nothing at module "
+                    "scope may block, await, sleep, open a connection, read a "
+                    "fixture, or loop -- move it inside a case or a fixture. "
+                    "Correct what the runner reported above and resubmit the "
+                    "full draft"
                 ),
                 "violated_requirement": "gate collection",
             },
@@ -1944,7 +2003,15 @@ class FactoryScheduler:
         self._say(lane_id, "asking tester for private test draft")
         extra = dict(self.actor.write_tests(ctx))
         self._say(lane_id, "tester returned a draft")
-        files = self._require_draft_min_cases(ctx, _write_test_files(extra))
+        # The draft is recorded first and measured at REVIEWING_TESTS, where a
+        # verdict about it can be recorded beside it. Measuring here and
+        # refusing meant a refused draft was never written anywhere: the
+        # scratch worktree that held it was removed in the `finally` of
+        # `_collect_private_draft`, and the only reason FDAdb run a2ea7355
+        # could be diagnosed at all is that the agent happened to leave copies
+        # in its own scratch directory. An artifact a verdict is about has to
+        # outlive the verdict.
+        files = _write_test_files(extra)
         self._require_typed_test_outputs(lane, files)
         contract = prv.public_contract(
             acceptance_criteria=lane.public_acceptance,
@@ -1985,57 +2052,65 @@ class FactoryScheduler:
             raise TypedTestOutputsRefused(detail)
 
 
-    def _require_draft_min_cases(
-        self, ctx: LaneContext, files: Mapping[str, str]
-    ) -> dict[str, str]:
+    def _draft_private_files(self, draft: st.LaneArtifact) -> dict[str, str]:
+        """The draft's own private bytes, read back out of the vault.
+
+        `write_test_draft` pinned them under `refs/maestro/drafts/...` before
+        this stage was reached, so the measurement below reads the artifact
+        rather than a scratch tree that no longer exists.
+        """
+        vault = hv.ensure_vault(self.runtime.path, self.run_id)
+        commit = hv.rev_parse(vault, draft.artifact_ref)
+        files: dict[str, str] = {}
+        for path in tc.private_draft_overlay_paths(vault, draft):
+            blob = hv.blob_id_in(vault, commit, path)
+            if blob is None:
+                raise FactoryRefused("draft blob missing for {0}".format(path))
+            files[path] = hv.cat_blob(vault, blob).decode("utf-8")
+        if not files:
+            raise FactoryRefused("draft carries no private files")
+        return files
+
+    def _measure_draft_gate(
+        self, ctx: LaneContext, draft: st.LaneArtifact
+    ) -> tuple[Mapping[str, str], ...] | None:
+        """What the gate measures about this draft, as findings, or None.
+
+        None means the draft satisfies the gate and the test reviewer is the
+        next reader. Findings mean it does not, and they are recorded as this
+        round's REVISE without a reviewer being asked -- there is nothing for a
+        reviewer to judge in a suite whose cases cannot be listed, and a
+        reviewer that passed one anyway would seal it.
+
+        Every answer here is REVISE-shaped on purpose. "Your draft collected 6
+        cases against a floor of 16" and "your draft could not be collected"
+        are judgements about work the tester authored and can fix, which is the
+        same class of event as a test reviewer's REVISE, and a REVISE has never
+        been fatal. Raising them out of the scheduler instead cost FDAdb run
+        a2ea7355 four lanes that had nothing to do with the draft.
+
+        A gate the *plan* declared wrong is a different thing and still
+        refuses: `_lane_gate` raises outside the try below.
+        """
         gate = _lane_gate(self.actor, ctx.lane.lane_id)
         if gate is None:
-            return dict(files)
-        current = dict(files)
-        seen = st.digest_canonical(current)
-        try:
-            collected = self._collect_private_draft(ctx, gate, current)
-        except DraftCollectionRefused as refused:
-            # One correction turn, on the same channel a short draft gets. An
-            # identical resubmission re-raises, so this cannot loop.
-            correction = _draft_collection_findings(str(refused))
-            extra = dict(
-                self.actor.write_tests(replace(ctx, draft_correction=correction))
-            )
-            current = _write_test_files(extra)
-            if st.digest_canonical(current) == seen:
-                raise
-            seen = st.digest_canonical(current)
-            collected = self._collect_private_draft(ctx, gate, current)
-        required = tuple(getattr(gate, "required_cases", ()) or ())
-
-        def shortfall(ids: Sequence[str]) -> tuple[dict[str, str], ...] | None:
-            """The correction this draft needs, or None when it satisfies the gate.
-
-            Names before count: a suite missing a required case is wrong in a way
-            the tester can act on, and saying "write 4 more cases" instead of
-            naming them is what let run a33d5e9b re-emit the same eleven.
-            """
-            missing = _missing_required_cases(ids, required)
-            if missing:
-                return _draft_required_cases_findings(missing)
-            if len(ids) < gate.min_cases:
-                return _draft_min_cases_findings(len(ids), gate.min_cases)
             return None
-
-        correction = shortfall(collected)
-        if correction is None:
-            return current
-        extra = dict(
-            self.actor.write_tests(replace(ctx, draft_correction=correction))
+        files = self._draft_private_files(draft)
+        try:
+            collected = self._collect_private_draft(ctx, gate, files)
+        except DraftCollectionRefused as refused:
+            return _draft_collection_findings(str(refused))
+        # Names before count: a suite missing a required case is wrong in a way
+        # the tester can act on, and saying "write 4 more cases" instead of
+        # naming them is what let run a33d5e9b re-emit the same eleven.
+        missing = _missing_required_cases(
+            collected, tuple(getattr(gate, "required_cases", ()) or ())
         )
-        current = _write_test_files(extra)
-        if st.digest_canonical(current) == seen:
-            raise DraftMinCasesRefused(len(collected), gate.min_cases)
-        collected = self._collect_private_draft(ctx, gate, current)
-        if shortfall(collected) is None:
-            return current
-        raise DraftMinCasesRefused(len(collected), gate.min_cases)
+        if missing:
+            return _draft_required_cases_findings(missing)
+        if len(collected) < gate.min_cases:
+            return _draft_min_cases_findings(len(collected), gate.min_cases)
+        return None
 
     def _assert_runners_usable(self) -> None:
         """Every runner the plan names must run, before any agent is dispatched.
@@ -2072,6 +2147,7 @@ class FactoryScheduler:
                 self.runtime.path / "worktrees", "runner-preflight-{0}".format(runner)
             )
             hv.checkout_vault_worktree(vault, base, dest)
+            keep = False
             try:
                 self._say("", "checking {0} is usable in {1}".format(runner, cwd))
                 cr.provision_tree(
@@ -2086,16 +2162,44 @@ class FactoryScheduler:
                         provisioned=bool(self._provision_argv),
                     ),
                     cwd,
+                    # Empty on purpose, and now stated rather than defaulted:
+                    # this preflight runs before any candidate exists, so the
+                    # whole tree genuinely is its question.
+                    (),
                 )
-            except rr.RunnerUnusable as extra:
+            except (rr.RunnerUnusable, cr.ReviewProvisioningError) as extra:
+                # Provisioning belongs to this refusal, not above it. The
+                # preflight's own sentence is "the environment every lane will
+                # run in is usable", and a `provision_argv` that fails is that
+                # sentence coming out false -- one whose answer is the
+                # deployment's command, which no agent can act on either. It
+                # escaped here as an untyped crash, so the one run verb both
+                # paths cross reported a stack trace for the case it exists to
+                # name.
+                #
+                # The tree stays. A refusal about an environment is answered by
+                # opening that environment, and this one used to be deleted on
+                # the way out -- so the cheapest possible diagnosis, running the
+                # probe by hand where it failed, cost a full rebuild of the
+                # environment from the deployment's own `provision_argv` before
+                # it could start. `scratch_worktree_path` randomizes the name,
+                # so a kept tree can never be one a later call is refused for
+                # adopting.
+                # Named unredacted, unlike the draft-collect tree below: no
+                # private byte is ever written here -- `prv.write_files` is not
+                # on this path and the checkout is the integration ref, which
+                # sealed tests never reach -- so redacting the path hid the
+                # evidence and protected nothing.
+                keep = True
                 detail = getattr(extra, "detail", None) or str(extra)
                 unusable.append(
-                    "{0} in {1}: {2}".format(
-                        runner, cwd, prv.redact_text(str(detail), (str(dest),))
+                    "{0} in {1}: {2}; measured in {3}, which is kept".format(
+                        runner, cwd, detail, dest
                     )
                 )
             finally:
-                _remove_collect_tree(dest, vault)
+                if not keep:
+                    _remove_collect_tree(dest, vault)
         if unusable:
             raise RunnerPreflightRefused("; ".join(unusable))
 
@@ -2113,23 +2217,45 @@ class FactoryScheduler:
             "draft-collect-{0}".format(ctx.lane.lane_id),
         )
         hv.checkout_vault_worktree(vault, base, dest)
+        keep = False
         try:
             # Before any private byte is written, exactly as the review tree
             # provisions: nothing this runs, reads, or reports in an error can
             # carry draft test bytes. It is also what puts an interpreter in
             # the tree for `_collect_resolution_root` to find.
             cr.provision_tree(dest, self._provision_argv, self._provision_timeout_s)
-            prv.write_files(dest, files)
+            # Resolve BEFORE the draft is written, because `resolve`'s probe is
+            # a whole-tree `--collect-only` and would otherwise be measuring the
+            # draft it is supposed to be measuring the environment for. FDAdb
+            # run 2489c772 paid for that ordering: `lane-wp4-release-tests`
+            # drafted `services/device-substrates/tests/release/
+            # test_release_artifact.py`, the repository already carried
+            # `services/label-batch/tests/observations/test_release_artifact.py`
+            # from a merged lane, neither directory has an `__init__.py`, so
+            # pytest derived the same module name twice and interrupted
+            # collection with `import file mismatch` at exit 2. That is a name
+            # the tester chose and can change in one line -- and it was
+            # reported as `RUNNER_PREFLIGHT_REFUSED`, which ends the whole run,
+            # because a probe run after `write_files` cannot tell an unusable
+            # interpreter from a draft that will not collect.
             resolved = rr.resolve(
                 gate.runner,
                 _collect_resolution_root(
                     gate, dest, run_repo, provisioned=bool(self._provision_argv)
                 ),
                 gate.cwd,
+                # Empty on purpose. This probe deliberately runs BEFORE
+                # `write_files`, so the draft's paths do not exist yet and
+                # naming them makes pytest exit 4, `file or directory not
+                # found` -- an unusable-interpreter refusal for a draft that
+                # was never written. The question here is only whether the
+                # environment is usable.
+                (),
             )
+            prv.write_files(dest, files)
             ids = rr.collect_cases(
                 resolved,
-                _collect_gate(gate, files),
+                _collect_gate(gate, files, Path(dest)),
                 dest,
                 runtime_root=run_repo,
             )
@@ -2141,9 +2267,34 @@ class FactoryScheduler:
                 extra=(str(dest), str(Path(dest).resolve())),
                 vault_path=vault,
             )
-            raise DraftCollectionRefused(prv.redact_text(str(detail), tokens)) from extra
+            redacted = prv.redact_text(str(detail), tokens)
+            if isinstance(extra, rr.RunnerUnusable):
+                # The runner itself cannot run here. That is the harness's
+                # environment, never the draft, so it must not become a
+                # finding: a tester cannot install a runner, and sending it
+                # one spends three of its rounds and then parks its lane for
+                # an operator with a verdict about somebody else's work.
+                # `_assert_runners_usable` asks this question at run start for
+                # every (runner, cwd) the plan names; reaching it here means
+                # the answer changed mid-run, which is the same fault
+                # discovered later.
+                #
+                # And the same fault keeps the same evidence: this refusal ends
+                # the run and is read by an operator, so the tree it was
+                # measured in stays, named beside the redacted detail. Naming
+                # the directory is not naming its contents -- the detail is
+                # still redacted because a runner's error text can quote draft
+                # source, and the directory itself is under
+                # `runtime_state_root`, mode 0700, where the vault already
+                # holds these files.
+                keep = True
+                raise RunnerPreflightRefused(
+                    "{0}; measured in {1}, which is kept".format(redacted, dest)
+                ) from extra
+            raise DraftCollectionRefused(redacted) from extra
         finally:
-            _remove_collect_tree(dest, vault)
+            if not keep:
+                _remove_collect_tree(dest, vault)
 
 
 
@@ -2174,14 +2325,24 @@ class FactoryScheduler:
             artifacts={"LANE_PLAN": plan, "TEST_DRAFT": draft},
             public_contract=draft.payload.get("public_contract"),
         )
-        self._say(lane_id, "asking test reviewer")
-        verdict, findings = self.actor.review_tests(ctx)
-        self._say(
-            lane_id,
-            "test reviewer answered {0}".format(verdict.value),
-            "{0} finding(s)".format(len(findings)),
-        )
         draft_artifact = _record_as_lane_artifact(draft, lane)
+        measured = self._measure_draft_gate(ctx, draft_artifact)
+        if measured is not None:
+            verdict: st.ReviewerVerdict = st.ReviewerVerdict.REVISE
+            findings: Sequence[Mapping[str, str]] = measured
+            self._say(
+                lane_id,
+                "gate measurement answered REVISE",
+                "{0} finding(s); test reviewer not asked".format(len(findings)),
+            )
+        else:
+            self._say(lane_id, "asking test reviewer")
+            verdict, findings = self.actor.review_tests(ctx)
+            self._say(
+                lane_id,
+                "test reviewer answered {0}".format(verdict.value),
+                "{0} finding(s)".format(len(findings)),
+            )
         tokens = tc.draft_private_tokens(
             state_root=self.runtime.path,
             run_id=self.run_id,
@@ -2199,6 +2360,12 @@ class FactoryScheduler:
             ctx,
             _with_input_artifact_ids(artifact, [plan.artifact_id, draft.artifact_id]),
         )
+        # The lane is back at WRITING_TESTS and will redraft. A tests lane that
+        # keeps redrafting without the finding count coming down gets the same
+        # answer a build lane does: park for the operator, and let the run
+        # drain rather than opening another tester turn.
+        if verdict is st.ReviewerVerdict.REVISE:
+            self._block_if_stalled(lane_id)
 
     def _tests_sealed(self, lane_id: str) -> None:
         row, lane = self._common(lane_id)
@@ -2683,17 +2850,28 @@ class FactoryScheduler:
             self._block_if_stalled(lane_id)
 
     def _block_if_stalled(self, lane_id: str) -> None:
-        """Stop a build lane that has stopped climbing.
+        """Stop a lane that has stopped climbing.
 
         Called once the REVISE has been recorded, so the lane already sits at
-        BUILDING. Blocking here rather than at REVIEWING_CODE means a resume
-        rebuilds against the findings instead of re-running the sealed suite
-        over a candidate that was already judged.
+        the stage that will redo the work: BUILDING after a code review,
+        WRITING_TESTS after a test review. Blocking here rather than at the
+        reviewing stage means a resume redoes the work against the findings
+        instead of re-judging an artifact that was already judged.
+
+        Which history is read follows from that stage, because the two measure
+        different rounds of different work -- a tests lane has no sealed suite
+        to count errors from, and a build lane's test reviews belong to an
+        earlier, finished argument.
         """
-        history = _sealed_error_history(self.store, self.run_id, lane_id)
+        stage = self.store.lane_stage(self.run_id, lane_id)
+        if stage is st.LaneStage.WRITING_TESTS:
+            history = _test_review_error_history(self.store, self.run_id, lane_id)
+            label = "test review findings"
+        else:
+            history = _sealed_error_history(self.store, self.run_id, lane_id)
+            label = "sealed errors"
         if not _stalled(history):
             return
-        stage = self.store.lane_stage(self.run_id, lane_id)
         if stage not in st.PAUSEABLE_STAGES:
             return
         digest, observed = self._pause_input(lane_id, stage)
@@ -2708,7 +2886,8 @@ class FactoryScheduler:
         self._say(
             lane_id,
             "no progress, blocking for the operator",
-            "sealed errors {0} over {1} round(s); resume grants another {2}".format(
+            "{0} {1} over {2} round(s); resume grants another {3}".format(
+                label,
                 ", ".join(str(count) for count in history),
                 len(history),
                 st.NO_PROGRESS_GRACE_ROUNDS,

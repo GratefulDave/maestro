@@ -5,25 +5,31 @@ it, and `HerdrLauncher._declared_result` reads the same path to decide whether
 the turn declared. Both can catch a file mid-write, and the launcher turns one
 unlucky read into a permanent `EXITED/ENVELOPE_UNPARSED` verdict.
 
-There is no state in which a reader can know the write finished. `EXITED` does
-not mean the process died -- role sessions persist across turns -- and the pane
-signals lied three times before (see `launcher.poll`). Only the writer knows, so
-the writer declares by renaming a complete `.part` file into place. These cases
-pin that protocol:
+There is no state in which a reader can know the write finished. Only the
+writer knows, so the writer declares by renaming a complete `.part` file into
+place. These cases pin that protocol:
 
 * the turn instruction and the role contract both tell the agent to rename;
 * a `.part` file alone is not an envelope, so a reader never sees a partial one;
-* a genuinely corrupt envelope still refuses, so this widens nothing.
+* a corrupt or verdict-less envelope is not a declaration either, so the
+  protocol widens nothing.
 
-Observed on run a33d5e9b4a404f5889785cb1c9ca5f6f: the builder's envelope read
-`{"changed": false}` on disk, complete and valid, while the run had already
-refused `STAGE_PAYLOAD_INVALID` from reading it a fraction of a second earlier.
+What none of them do any more is refuse. `_await_envelope` used to answer the
+partial-write race by consulting `poll` and raising `STAGE_PAYLOAD_INVALID` or
+`STAGE_PAYLOAD_MISSING` when the pane looked dead -- which is how run
+`a33d5e9b4a404f5889785cb1c9ca5f6f` refused `STAGE_PAYLOAD_INVALID` while a
+complete, valid `{"changed": false}` sat on disk, written a fraction of a
+second after the read. That branch is gone: nothing but the envelope ends the
+wait, so an unfinished, unparsed, or unqualified file simply is not a
+declaration yet, and the writer gets to finish. See
+`test_absence_is_not_a_verdict`.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -43,15 +49,10 @@ class _Handle:
 
 
 class _Launcher:
-    """Polls GONE, optionally finishing the write first (the real race)."""
-
-    def __init__(self, on_poll=None) -> None:
-        self._on_poll = on_poll
+    """Polls GONE -- the reading `_await_envelope` no longer takes."""
 
     def poll(self, handle):
         del handle
-        if self._on_poll is not None:
-            self._on_poll()
         return types.SimpleNamespace(state=lch.PollState.GONE)
 
 
@@ -60,6 +61,22 @@ def _actor(launcher) -> M.HerdrStageActor:
     actor.launcher = launcher
     actor.step = None
     return actor
+
+
+def _await_in_thread(tmp: Path, envelope: Path, role: str):
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["payload"] = M.HerdrStageActor._await_envelope(
+                _actor(_Launcher()), _Handle(tmp), envelope, role, "lane-x"
+            )
+        except BaseException as exc:  # pragma: no cover - failure is the point
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return box, thread
 
 
 class EnvelopeRenameProtocolTests(unittest.TestCase):
@@ -78,58 +95,56 @@ class EnvelopeRenameProtocolTests(unittest.TestCase):
             tmp = Path(raw)
             envelope = tmp / "envelope-1.json"
             (tmp / "envelope-1.json.part").write_text('{"changed": true}')
-            with self.assertRaises(M.FactoryRefused) as caught:
-                M.HerdrStageActor._await_envelope(
-                    _actor(_Launcher()), _Handle(tmp), envelope, "builder", "lane-x"
-                )
-            # Missing, not invalid: nothing was ever declared at that path.
-            self.assertIn("STAGE_PAYLOAD_MISSING", str(caught.exception))
+            box, thread = _await_in_thread(tmp, envelope, "builder")
+            thread.join(timeout=1.0)
+            # Nothing was declared at that path, so nothing is returned and
+            # nothing is refused.
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(box, {})
 
-    def test_a_rename_that_lands_before_the_final_read_is_honoured(self):
+    def test_a_rename_that_lands_after_a_partial_read_is_honoured(self):
+        """The a33d5e9b race, with the refusal removed rather than timed.
+
+        An in-place partial write is on disk when the wait starts. The writer
+        then finishes properly, by rename. The wait must return that value --
+        previously it could refuse first and never see it.
+        """
         with TemporaryDirectory() as raw:
             tmp = Path(raw)
             envelope = tmp / "envelope-1.json"
             part = tmp / "envelope-1.json.part"
             envelope.write_text('{"changed": fal')  # an in-place partial write
 
-            def finish_the_write() -> None:
-                part.write_text('{"changed": false}')
-                part.replace(envelope)
+            box, thread = _await_in_thread(tmp, envelope, "builder")
+            thread.join(timeout=0.5)
+            self.assertTrue(thread.is_alive())
 
-            out = M.HerdrStageActor._await_envelope(
-                _actor(_Launcher(finish_the_write)),
-                _Handle(tmp),
-                envelope,
-                "builder",
-                "lane-x",
-            )
-            self.assertEqual(out, {"changed": False})
+            part.write_text('{"changed": false}')
+            part.replace(envelope)
 
-    def test_a_genuinely_corrupt_envelope_still_refuses(self):
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(box.get("payload"), {"changed": False})
+
+    def test_a_corrupt_envelope_is_not_a_declaration(self):
         with TemporaryDirectory() as raw:
             tmp = Path(raw)
             envelope = tmp / "envelope-1.json"
             envelope.write_text("not json at all")
-            with self.assertRaises(M.FactoryRefused) as caught:
-                M.HerdrStageActor._await_envelope(
-                    _actor(_Launcher()), _Handle(tmp), envelope, "builder", "lane-x"
-                )
-            self.assertIn("STAGE_PAYLOAD_INVALID", str(caught.exception))
+            box, thread = _await_in_thread(tmp, envelope, "builder")
+            thread.join(timeout=1.0)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(box, {})
 
-    def test_a_reviewer_envelope_without_a_verdict_still_refuses(self):
+    def test_a_reviewer_envelope_without_a_verdict_is_not_a_declaration(self):
         with TemporaryDirectory() as raw:
             tmp = Path(raw)
             envelope = tmp / "envelope-1.json"
             envelope.write_text(json.dumps({"findings": []}))
-            with self.assertRaises(M.FactoryRefused) as caught:
-                M.HerdrStageActor._await_envelope(
-                    _actor(_Launcher()),
-                    _Handle(tmp),
-                    envelope,
-                    "code-reviewer",
-                    "lane-x",
-                )
-            self.assertIn("STAGE_PAYLOAD_INVALID", str(caught.exception))
+            box, thread = _await_in_thread(tmp, envelope, "code-reviewer")
+            thread.join(timeout=1.0)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(box, {})
 
 
 if __name__ == "__main__":

@@ -1,4 +1,10 @@
-"""Private TEST_DRAFT is gated on native collect/list vs gate.min_cases."""
+"""The lane's gate measures the private TEST_DRAFT, and answers with a verdict.
+
+Native collect/list against `gate.min_cases` and `gate.required_cases`. What the
+measurement produces is a REVISE recorded on the tests lane -- never an
+exception out of the scheduler, which is what cost FDAdb run a2ea7355 four
+lanes that had nothing to do with the draft that broke.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +16,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ADWS))
 from adw_modules import git_publication as gitpub
+from adw_modules import hidden_vault as hv
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import runner_resolution as rr
@@ -140,23 +147,38 @@ def _install_fake_vitest(product: Path) -> Path:
 
 
 class DraftActor:
-    def __init__(self, bodies: list[str], *, selector: str = PRIVATE) -> None:
+    def __init__(
+        self,
+        bodies: list[str],
+        *,
+        selector: str = PRIVATE,
+        required_cases: Sequence[str] = (),
+        review_verdict: st.ReviewerVerdict = st.ReviewerVerdict.PASS,
+    ) -> None:
         self.selector = selector
         self.bodies = list(bodies)
         self.write_contexts: list[sch.LaneContext] = []
-        self.review_calls = 0
+        self.review_contexts: list[sch.LaneContext] = []
+        self.review_verdict = review_verdict
+        gate: dict[str, Any] = {
+            "runner": "pytest" if selector.endswith(".py") else "vitest",
+            "argv": [selector],
+            "cwd": ".",
+            "min_cases": 9,
+        }
+        if required_cases:
+            gate["required_cases"] = list(required_cases)
         self.lane_specs = {
             LANE_ID: {
                 "goal": "emit a.txt",
                 "integration": {"integration_branch": "refs/heads/main"},
-                "gate": {
-                    "runner": "pytest" if selector.endswith(".py") else "vitest",
-                    "argv": [selector],
-                    "cwd": ".",
-                    "min_cases": 9,
-                },
+                "gate": gate,
             }
         }
+
+    @property
+    def review_calls(self) -> int:
+        return len(self.review_contexts)
 
     def write_tests(self, ctx: sch.LaneContext) -> dict[str, Any]:
         self.write_contexts.append(ctx)
@@ -165,9 +187,17 @@ class DraftActor:
         return {"files": {self.selector: self.bodies.pop(0)}}
 
     def review_tests(self, ctx: sch.LaneContext) -> Any:
-        del ctx
-        self.review_calls += 1
-        raise AssertionError("test-reviewer must not run before TEST_DRAFT")
+        self.review_contexts.append(ctx)
+        if self.review_verdict is st.ReviewerVerdict.PASS:
+            return st.ReviewerVerdict.PASS, ()
+        return st.ReviewerVerdict.REVISE, (
+            {
+                "implementation_area": "private tests",
+                "observed_behavior": "the suite asserts nothing about refusal",
+                "required_behavior": "assert the refusal path too",
+                "violated_requirement": "acceptance",
+            },
+        )
 
     def build(self, ctx: sch.LaneContext) -> dict:
         del ctx
@@ -189,7 +219,17 @@ class DraftActor:
         del run_id
 
 
-class DraftMinCasesPreflightTests(unittest.TestCase):
+class DraftGateVerdictTests(unittest.TestCase):
+    """A gate measurement about a draft is a verdict, never a dead run.
+
+    Measured 2026-09-05, FDAdb run a2ea7355699c4dff93bc82ac89415475:
+    `lane-wp8r-route-tests` submitted a module that deadlocked vitest at load,
+    `DraftCollectionRefused` left the scheduler, and the run ended holding two
+    MERGED lanes and two READY_TO_MERGE lanes that had nothing to do with it.
+    It happened twice in a row because the tester's single in-turn correction
+    was the only channel a refusal had.
+    """
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -204,7 +244,9 @@ class DraftMinCasesPreflightTests(unittest.TestCase):
         self.addCleanup(self.runtime.close)
         self.addCleanup(self.tmp.cleanup)
 
-    def _start(self, actor: DraftActor, *, runner: str = "pytest") -> sch.FactoryScheduler:
+    def _start(
+        self, actor: DraftActor, *, runner: str = "pytest"
+    ) -> sch.FactoryScheduler:
         compiled = plan_compiler.compile_plan(
             _plan_bytes(runner=runner, selector=actor.selector),
             plan_revision=1,
@@ -224,106 +266,181 @@ class DraftMinCasesPreflightTests(unittest.TestCase):
         scheduler._planned(LANE_ID)
         return scheduler
 
-    def _drafts(self) -> list[tuple[str, dict]]:
+    def _round(self, scheduler: sch.FactoryScheduler) -> None:
+        """One WRITING_TESTS + REVIEWING_TESTS pass, the way the loop drives it."""
+        scheduler._writing_tests(LANE_ID)
+        scheduler._reviewing_tests(LANE_ID)
+
+    def _stage(self) -> st.LaneStage:
+        return self.store.lane_stage(RUN_ID, LANE_ID)
+
+    def _artifacts(self, kind: st.ArtifactKind) -> list[dict]:
         rows = []
-        for artifact_id, payload in self.store.conn.execute(
-            "SELECT artifact_id, payload_json FROM lane_artifacts "
+        for (payload,) in self.store.conn.execute(
+            "SELECT payload_json FROM lane_artifacts "
             "WHERE run_id=? AND lane_id=? AND artifact_kind=? ORDER BY sequence",
-            (RUN_ID, LANE_ID, st.ArtifactKind.TEST_DRAFT.value),
+            (RUN_ID, LANE_ID, kind.value),
         ):
-            rows.append((artifact_id, json.loads(payload)))
+            rows.append(json.loads(payload))
         return rows
 
-    def test_eight_collected_vs_min_cases_nine_refuses_without_draft_or_reviewer(
-        self,
-    ) -> None:
-        actor = DraftActor([_cases(8), _cases(8)])
+    def _drafts(self) -> list[dict]:
+        return self._artifacts(st.ArtifactKind.TEST_DRAFT)
+
+    def _reviews(self) -> list[dict]:
+        return self._artifacts(st.ArtifactKind.TEST_REVIEW)
+
+    def _only_finding(self) -> dict:
+        reviews = self._reviews()
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["verdict"], "REVISE")
+        self.assertEqual(len(reviews[0]["findings"]), 1)
+        return reviews[0]["findings"][0]
+
+    def _vault(self) -> Path:
+        return hv.vault_path(self.runtime.path, RUN_ID)
+
+    # -- a measured refusal is a REVISE, not the end of the run ------------
+
+    def test_short_draft_records_a_revise_and_sends_the_lane_back(self) -> None:
+        actor = DraftActor([_cases(8)])
         scheduler = self._start(actor)
-        with self.assertRaises(sch.DraftMinCasesRefused) as raised:
-            scheduler._writing_tests(LANE_ID)
-        self.assertEqual(raised.exception.collected, 8)
-        self.assertEqual(raised.exception.min_cases, 9)
-        self.assertEqual(self.store.lane_stage(RUN_ID, LANE_ID), st.LaneStage.WRITING_TESTS)
-        self.assertEqual(self._drafts(), [])
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
+        self.assertEqual(len(self._drafts()), 1)
         self.assertEqual(actor.review_calls, 0)
-        self.assertEqual(len(actor.write_contexts), 2)
-        first = actor.write_contexts[0]
-        second = actor.write_contexts[1]
-        self.assertIsNone(first.draft_correction)
-        correction = second.draft_correction
-        self.assertIsNotNone(correction)
-        assert correction is not None
-        finding = correction[0]
+        finding = self._only_finding()
+        self.assertEqual(finding["violated_requirement"], "gate.min_cases")
         self.assertIn("8", finding["observed_behavior"])
         self.assertIn("9", finding["required_behavior"])
-        self.assertNotIn("assert True", json.dumps(finding))
-        self.assertNotIn("test_case_0", json.dumps(finding))
+        blob = json.dumps(finding)
+        self.assertNotIn("assert True", blob)
+        self.assertNotIn("test_case_0", blob)
 
-    def test_identical_insufficient_output_does_not_loop(self) -> None:
-        actor = DraftActor([_cases(8), _cases(8), _cases(8)])
+    def test_uncollectable_draft_records_a_revise_and_sends_the_lane_back(
+        self,
+    ) -> None:
+        actor = DraftActor(["def broken(\n"])
         scheduler = self._start(actor)
-        with self.assertRaises(sch.DraftMinCasesRefused):
-            scheduler._writing_tests(LANE_ID)
-        self.assertEqual(len(actor.write_contexts), 2)
-        self.assertEqual(len(actor.bodies), 1)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
+        self.assertEqual(len(self._drafts()), 1)
         self.assertEqual(actor.review_calls, 0)
-        self.assertEqual(self._drafts(), [])
+        finding = self._only_finding()
+        self.assertEqual(finding["violated_requirement"], "gate collection")
+        self.assertIn("could not list", finding["observed_behavior"])
+        self.assertNotIn("def broken", json.dumps(finding))
 
-    def test_nine_collected_advances_to_review_without_reviewer_launch(self) -> None:
+    def test_the_refusal_reaches_the_tester_as_the_next_round_review(self) -> None:
         actor = DraftActor([_cases(8), _cases(9)])
         scheduler = self._start(actor)
+        self._round(scheduler)
         scheduler._writing_tests(LANE_ID)
-        self.assertEqual(
-            self.store.lane_stage(RUN_ID, LANE_ID), st.LaneStage.REVIEWING_TESTS
-        )
-        self.assertEqual(len(self._drafts()), 1)
-        self.assertEqual(actor.review_calls, 0)
         self.assertEqual(len(actor.write_contexts), 2)
-        self.assertIsNotNone(actor.write_contexts[1].draft_correction)
-
-    def test_adequate_first_draft_does_not_reprompt_tester(self) -> None:
-        actor = DraftActor([_cases(9), _cases(8)])
-        scheduler = self._start(actor)
-        scheduler._writing_tests(LANE_ID)
-        self.assertEqual(len(actor.write_contexts), 1)
-        self.assertIsNone(actor.write_contexts[0].draft_correction)
-        self.assertEqual(len(self._drafts()), 1)
-        self.assertEqual(actor.review_calls, 0)
-        self.assertEqual(len(actor.bodies), 1)
-
-    def test_collection_error_fails_closed_without_test_draft(self) -> None:
-        """One correction turn, then closed. An identical resubmit re-raises.
-
-        The tester authored the draft the refusal describes, so it is told what
-        broke -- the seal keeps private tests from the builder, not from their
-        author. Repeating the same bytes ends it, so this cannot loop.
-        """
-        actor = DraftActor(["def broken(\n", "def broken(\n"])
-        scheduler = self._start(actor)
-        with self.assertRaises(sch.DraftCollectionRefused) as raised:
-            scheduler._writing_tests(LANE_ID)
-        self.assertEqual(len(actor.write_contexts), 2)
-        self.assertIsNone(actor.write_contexts[0].draft_correction)
-        correction = actor.write_contexts[1].draft_correction
-        self.assertEqual(len(correction), 1)
-        self.assertIn("collect refused", correction[0]["observed_behavior"])
-        self.assertNotIn("def broken", correction[0]["observed_behavior"])
-        self.assertEqual(self._drafts(), [])
-        self.assertEqual(actor.review_calls, 0)
+        review = actor.write_contexts[1].artifacts.get("TEST_REVIEW")
+        self.assertIsNotNone(review)
+        assert review is not None
+        self.assertEqual(review.payload["verdict"], "REVISE")
         self.assertEqual(
-            self.store.lane_stage(RUN_ID, LANE_ID), st.LaneStage.WRITING_TESTS
+            review.payload["findings"][0]["violated_requirement"], "gate.min_cases"
         )
-        msg = str(raised.exception)
-        self.assertIn("collect refused", msg)
-        self.assertNotIn("def broken", msg)
 
-    def test_vitest_collect_refused_includes_stderr_not_private_source(self) -> None:
+    # -- the artifact a verdict is about outlives the verdict ---------------
+
+    def test_the_refused_draft_is_pinned_in_the_vault(self) -> None:
+        body = "def broken(\n"
+        actor = DraftActor([body])
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        draft = self._drafts()[0]
+        ref = draft["private_draft_ref"]
+        self.assertTrue(
+            ref.startswith("refs/maestro/drafts/{0}/{1}/".format(RUN_ID, LANE_ID))
+        )
+        vault = self._vault()
+        refs = _git(vault, "for-each-ref", "--format=%(refname)", "refs/maestro/drafts")
+        self.assertIn(ref, refs.splitlines())
+        self.assertEqual(
+            _git(vault, "show", "{0}:{1}".format(ref, PRIVATE)) + "\n", body
+        )
+
+    def test_the_collect_tree_is_still_discarded(self) -> None:
+        actor = DraftActor([_cases(8)])
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        leftover = list((self.runtime.path / "worktrees").glob("draft-collect-*"))
+        self.assertEqual(leftover, [])
+        self.assertFalse((self.repo / PRIVATE).exists())
+
+    # -- a lane that keeps failing measurement parks, it does not loop ------
+
+    def test_three_refused_rounds_park_the_lane_for_the_operator(self) -> None:
+        actor = DraftActor([_cases(8), _cases(7), _cases(6)])
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WAITING_FOR_USER)
+        waits = self._artifacts(st.ArtifactKind.USER_WAIT)
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]["wait_reason"], st.WaitReason.NO_PROGRESS.value)
+        self.assertEqual(waits[0]["resume_stage"], st.LaneStage.WRITING_TESTS.value)
+        self.assertEqual(len(self._reviews()), 3)
+        self.assertEqual(actor.review_calls, 0)
+
+    def test_a_reviewer_that_never_settles_parks_on_the_same_path(self) -> None:
+        actor = DraftActor(
+            [_cases(9), _cases(10), _cases(11)],
+            review_verdict=st.ReviewerVerdict.REVISE,
+        )
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.WAITING_FOR_USER)
+        self.assertEqual(actor.review_calls, 3)
+
+    # -- a draft that satisfies the gate is the reviewer's to judge ---------
+
+    def test_adequate_draft_reaches_the_test_reviewer_and_seals(self) -> None:
+        actor = DraftActor([_cases(9)])
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        self.assertEqual(actor.review_calls, 1)
+        self.assertEqual(self._reviews()[0]["verdict"], "PASS")
+        self.assertEqual(self._stage(), st.LaneStage.TESTS_SEALED)
+
+    def test_required_case_names_are_reported_before_the_count(self) -> None:
+        actor = DraftActor([_cases(9)], required_cases=["test_refuses_a_null_key"])
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        finding = self._only_finding()
+        self.assertEqual(finding["violated_requirement"], "gate.required_cases")
+        self.assertIn("test_refuses_a_null_key", finding["observed_behavior"])
+        self.assertEqual(actor.review_calls, 0)
+
+    def test_envelope_declared_count_is_not_authority(self) -> None:
+        class ClaimNine(DraftActor):
+            def write_tests(self, ctx: sch.LaneContext) -> dict:
+                payload = super().write_tests(ctx)
+                return {"files": payload["files"], "case_count": 9, "min_cases": 9}
+
+        actor = ClaimNine([_cases(8)])
+        scheduler = self._start(actor)
+        self._round(scheduler)
+        finding = self._only_finding()
+        self.assertEqual(finding["violated_requirement"], "gate.min_cases")
+        self.assertIn("8", finding["observed_behavior"])
+
+    # -- the finding still carries the runner, never the draft --------------
+
+    def test_vitest_collect_refused_forwards_stderr_not_private_source(self) -> None:
         _install_fake_vitest(self.repo)
         secret = "SECRET_ORACLE_LITERAL"
         body = _vitest_cases(1).replace("case 0", secret)
-        # Two identical bodies: the correction turn resubmits the same bytes,
-        # which is what ends the loop.
-        actor = DraftActor([body, body], selector=VITEST_PRIVATE)
+        actor = DraftActor([body], selector=VITEST_PRIVATE)
         scheduler = self._start(actor, runner="vitest")
         failed = rr.CollectFailed(
             "vitest",
@@ -335,42 +452,77 @@ class DraftMinCasesPreflightTests(unittest.TestCase):
             ),
         )
         with mock.patch.object(rr, "collect_cases", side_effect=failed):
-            with self.assertRaises(sch.DraftCollectionRefused) as raised:
-                scheduler._writing_tests(LANE_ID)
-        # The correction turn resubmitted the same bytes, so it re-raised.
-        msg = str(raised.exception)
-        self.assertIn("ERR_MODULE_NOT_FOUND", msg)
-        self.assertIn("Cannot find package 'vitest'", msg)
-        self.assertNotIn(secret, msg)
-        self.assertIn("[redacted]", msg)
-        self.assertEqual(self._drafts(), [])
+            self._round(scheduler)
+        finding = self._only_finding()
+        observed = finding["observed_behavior"]
+        self.assertIn("ERR_MODULE_NOT_FOUND", observed)
+        self.assertIn("Cannot find package 'vitest'", observed)
+        self.assertNotIn(secret, json.dumps(finding))
+        self.assertIn("[redacted]", observed)
+        self.assertEqual(self._stage(), st.LaneStage.WRITING_TESTS)
         self.assertEqual(actor.review_calls, 0)
 
     def test_vitest_draft_collects_via_product_node_modules_link(self) -> None:
         _install_fake_vitest(self.repo)
         actor = DraftActor([_vitest_cases(9)], selector=VITEST_PRIVATE)
         scheduler = self._start(actor, runner="vitest")
-        scheduler._writing_tests(LANE_ID)
-        self.assertEqual(
-            self.store.lane_stage(RUN_ID, LANE_ID), st.LaneStage.REVIEWING_TESTS
-        )
+        self._round(scheduler)
+        self.assertEqual(self._stage(), st.LaneStage.TESTS_SEALED)
         self.assertEqual(len(self._drafts()), 1)
-        self.assertEqual(actor.review_calls, 0)
+        self.assertEqual(actor.review_calls, 1)
         self.assertFalse((self.repo / VITEST_PRIVATE).exists())
         leftover = list((self.runtime.path / "worktrees").glob("draft-collect-*"))
         self.assertEqual(leftover, [])
 
-    def test_envelope_declared_count_is_not_authority(self) -> None:
-        class ClaimNine(DraftActor):
-            def write_tests(self, ctx: sch.LaneContext) -> dict:
-                payload = super().write_tests(ctx)
-                return {"files": payload["files"], "case_count": 9, "min_cases": 9}
 
-        actor = ClaimNine([_cases(8), _cases(8)])
-        scheduler = self._start(actor)
-        with self.assertRaises(sch.DraftMinCasesRefused) as raised:
-            scheduler._writing_tests(LANE_ID)
-        self.assertEqual(raised.exception.collected, 8)
+class CollectionFindingWording(unittest.TestCase):
+    """A refusal names a stopwatch; the finding must name an obligation.
+
+    `vitest did not finish collecting in 120.0s` told the tester the harness
+    gave up. It did not tell it that listing cases is an import, and that an
+    import which blocks never reaches the listing -- which is exactly what the
+    a2ea7355 draft did.
+    """
+
+    def test_the_runner_text_is_forwarded_verbatim(self) -> None:
+        detail = "vitest did not finish collecting in 120.0s"
+        finding = sch._draft_collection_findings(detail)[0]
+        self.assertIn(detail, finding["observed_behavior"])
+
+    def test_it_does_not_hand_the_stopwatch_back_as_the_instruction(self) -> None:
+        finding = sch._draft_collection_findings(
+            "vitest did not finish collecting in 120.0s"
+        )[0]
+        required = finding["required_behavior"]
+        self.assertNotIn("fix what the refusal names", required)
+        self.assertIn("import", required)
+        self.assertIn("module scope", required)
+
+    def test_it_is_a_valid_revise_finding(self) -> None:
+        findings = sch._draft_collection_findings("collect refused exit 2")
+        self.assertEqual(st.require_revise_findings(findings), findings)
+
+
+class DraftRefusalIsNotFatal(unittest.TestCase):
+    """The two draft judgements are no longer members of `FactoryRefused`.
+
+    `RunnerPreflightRefused` still is, and must stay: a missing runner is
+    nobody's draft and no finding can answer it.
+    """
+
+    def test_the_min_cases_refusal_no_longer_exists(self) -> None:
+        self.assertFalse(hasattr(sch, "DraftMinCasesRefused"))
+
+    def test_collection_refusal_never_escapes_the_measurement(self) -> None:
+        source = Path(sch.__file__).read_text(encoding="utf-8")
+        body = source.split("    def _measure_draft_gate(", 1)[1]
+        body = body.split("\n    def ", 1)[0]
+        self.assertIn("except DraftCollectionRefused as refused:", body)
+        self.assertIn("return _draft_collection_findings(str(refused))", body)
+
+    def test_runner_preflight_stays_a_factory_refusal(self) -> None:
+        self.assertTrue(issubclass(sch.RunnerPreflightRefused, sch.FactoryRefused))
+        self.assertEqual(sch.RunnerPreflightRefused.code, "RUNNER_PREFLIGHT_REFUSED")
 
 
 class CollectIdentifierTests(unittest.TestCase):
@@ -416,7 +568,7 @@ class CollectIdentifierTests(unittest.TestCase):
                 "    raise AssertionError('must not run')\n",
                 encoding="utf-8",
             )
-            resolved = rr.resolve("pytest", tree, ".")
+            resolved = rr.resolve("pytest", tree, ".", ())
             gate = SimpleNamespace(runner="pytest", argv=(PRIVATE,), cwd=".")
             ids = rr.collect_cases(resolved, gate, tree)
             self.assertEqual(len(ids), 2)

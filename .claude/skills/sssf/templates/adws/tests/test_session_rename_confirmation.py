@@ -38,7 +38,12 @@ sys.path.insert(0, str(ADWS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from adw_modules import launcher as lch  # noqa: E402
-from herdr_fake import COMPOSER_COLUMNS, FakeHerdr, _as_composer_renders  # noqa: E402
+from herdr_fake import (  # noqa: E402
+    COMPOSER_COLUMNS,
+    FakeHerdr,
+    _as_composer_renders,
+    _claude_rename_confirmation,
+)
 
 #: `herdr pane read w1EE:p3 --source recent`, verbatim, from the pane that
 #: refused run 98fa094e's cleanup.
@@ -54,6 +59,60 @@ OBSERVED_SESSION_NAME = (
     "FDAdb-d89af85d951e2aec923434e0c4449df21ee0d37b8b0237"
     "a8fad44cdfcc37d326-98fa-lane-wp8-store-build-code-reviewer"
 )
+
+
+#: `herdr pane read w1EY:p2 --source recent-unwrapped`, verbatim, from the
+#: Claude builder pane that refused run a2ea7355's cleanup. The rename had
+#: worked -- this text was on screen for the whole 60s wait. A Claude composer
+#: writes a colon where omp writes a quote, and no full stop.
+CLAUDE_PANE_TEXT = (
+    "  \u23bf  Session renamed to:\n"
+    "     FDAdb-d89af85d951e2aec923434e0c4449df21ee0d37b8b0237a8fa\n"
+    "     d44cdfcc37d326-a2ea-lane-wp8r-route-build-builder\n"
+)
+
+CLAUDE_SESSION_NAME = (
+    "FDAdb-d89af85d951e2aec923434e0c4449df21ee0d37b8b0237a8fa"
+    "d44cdfcc37d326-a2ea-lane-wp8r-route-build-builder"
+)
+
+
+class TheClaudeComposersWordingIsRecognised(unittest.TestCase):
+    """The second composer, whose punctuation is not omp's."""
+
+    def test_the_omp_sentence_is_not_in_the_claude_pane(self) -> None:
+        # Removing whitespace is not enough here: the quotes and the full stop
+        # this builds are absent from the pane, and the colon in the pane is
+        # absent from this.
+        self.assertNotIn(
+            "".join(
+                lch.session_rename_confirmation(CLAUDE_SESSION_NAME).split()
+            ),
+            "".join(CLAUDE_PANE_TEXT.split()),
+        )
+
+    def test_the_confirmation_is_recognised_anyway(self) -> None:
+        self.assertTrue(
+            lch.session_rename_confirmed(CLAUDE_PANE_TEXT, CLAUDE_SESSION_NAME)
+        )
+
+    def test_a_different_session_name_is_not_confirmed(self) -> None:
+        self.assertFalse(
+            lch.session_rename_confirmed(
+                CLAUDE_PANE_TEXT, CLAUDE_SESSION_NAME + "-reviewer"
+            )
+        )
+
+    def test_the_fake_does_not_derive_its_text_from_production(self) -> None:
+        # The whole reason this went unnoticed. A fake that renders whatever
+        # `session_rename_confirmation` returns agrees with the comparison by
+        # construction, and cannot fail while the comparison is wrong.
+        rendered = _claude_rename_confirmation(CLAUDE_SESSION_NAME)
+        self.assertEqual(rendered.split("\n")[0], "Session renamed to:")
+        self.assertNotIn('"', rendered)
+        self.assertTrue(
+            lch.session_rename_confirmed(rendered, CLAUDE_SESSION_NAME)
+        )
 
 
 class TheObservedPaneIsRecognised(unittest.TestCase):

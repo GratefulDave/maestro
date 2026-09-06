@@ -181,7 +181,7 @@ def _maybe_repo_path(token: str) -> str:
 
 
 def substituted_gate_argv(
-    argv: Sequence[str], files: Iterable[str]
+    argv: Sequence[str], files: Iterable[str], tree: Path | str | None = None
 ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     """A gate's argv with its selectors replaced by the files actually written.
 
@@ -206,10 +206,30 @@ def substituted_gate_argv(
     FDAdb `lane-wp7-cookie-tests`, four turns).
 
     A bare token immediately after a `-`-prefixed token carrying no `=` is
-    that option's value and is preserved verbatim. A planned selector the
-    draft did not write is dropped, and a written file the plan did not name
-    is appended -- which is what the old fallback to the written set was for.
+    that option's value and is preserved verbatim. A written file the plan did
+    not name is appended -- which is what the old fallback to the written set
+    was for.
+
+    `tree` is the checkout the argv will run in, and a planned selector the
+    draft did not write survives when it exists there. The rule this replaced
+    dropped every such selector on the premise that it "names nothing in the
+    tree". That premise holds only for a selector naming a file the tester was
+    supposed to write and did not; it is false for a gate operand naming a
+    file the repository already ships, because both the draft-collection tree
+    and the sealed review tree are seeded from the integration ref and carry
+    it. Where a plan's floor counts pre-existing cases -- FDAdb
+    `lane-wp8r-fixture-tests`, min_cases 16 = 6 private + the 10 already in
+    `src/lib/api/dpa.test.ts` -- dropping the shipped operand made the floor
+    unreachable by anything the tester could write. It refused the run
+    `DRAFT_MIN_CASES: collected 6, min_cases 16` one turn after the test
+    reviewer had correctly told the tester to stop padding the private file to
+    16 with `it.each`; its sibling `lane-wp8r-route-tests` reached its own
+    floor of 26 only by generating 18 cases asserting that the other files'
+    case titles appear as substrings (measured 2026-09-05, run a2ea7355).
+
+    A caller passing no `tree` cannot test existence and keeps the drop.
     """
+    root = Path(tree) if tree is not None else None
     written = tuple(sorted({normalize_repo_path(path) for path in files}))
     rebuilt: List[str] = []
     selectors: List[str] = []
@@ -232,9 +252,18 @@ def substituted_gate_argv(
             rebuilt.append(norm)
             selectors.append(norm)
             seen.add(norm)
-        # A planned selector the draft did not write names nothing in the
-        # tree; carrying it forward is what the written-set fallback existed
-        # to avoid.
+        elif norm and root is not None and (root / norm).is_file():
+            # An existing file the gate named. The floor counts it, and the
+            # runner can enumerate and execute it. `is_file`, not `exists`: a
+            # directory operand is a planned selector whose members the
+            # written set already names one by one, and a fresh draft creates
+            # its directory itself, so treating one as present would keep a
+            # token the wp7-cookie shape is pinned to drop.
+            rebuilt.append(norm)
+            selectors.append(norm)
+        # A planned selector that is neither written nor present names nothing
+        # in the tree; carrying it forward is what the written-set fallback
+        # existed to avoid.
     for path in written:
         if path in seen:
             continue

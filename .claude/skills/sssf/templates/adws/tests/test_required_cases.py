@@ -26,6 +26,7 @@ immediately, but only because a human knew the number was 15.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,6 +79,10 @@ class MissingRequiredCaseTests(unittest.TestCase):
 
 
 class GateParseTests(unittest.TestCase):
+    def setUp(self):
+        self.tree = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tree.cleanup)
+
     def test_required_cases_are_parsed_and_carried_to_the_collect_gate(self):
         gate = SimpleNamespace(
             runner="pytest",
@@ -86,7 +91,9 @@ class GateParseTests(unittest.TestCase):
             min_cases=15,
             required_cases=("test_without_raw_spl_is_refused",),
         )
-        collect = sch._collect_gate(gate, {"tests/observations/test_x.py": "x"})
+        collect = sch._collect_gate(
+            gate, {"tests/observations/test_x.py": "x"}, Path(self.tree.name)
+        )
         self.assertEqual(
             collect.required_cases, ("test_without_raw_spl_is_refused",)
         )
@@ -95,7 +102,9 @@ class GateParseTests(unittest.TestCase):
         gate = SimpleNamespace(
             runner="pytest", argv=("tests",), cwd=".", min_cases=1
         )
-        collect = sch._collect_gate(gate, {"tests/test_x.py": "x"})
+        collect = sch._collect_gate(
+            gate, {"tests/test_x.py": "x"}, Path(self.tree.name)
+        )
         self.assertEqual(collect.required_cases, ())
 
 

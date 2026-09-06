@@ -305,7 +305,9 @@ def scratch_worktree_path(worktrees_root: Path, prefix: str) -> Path:
     names, so a worktree left behind by a crashed call can never be the one a
     retry is refused for adopting. What the worktree produced lives in the
     vault object database; the directory is scaffolding and is removed by
-    `remove_vault_worktree` when the call ends.
+    `remove_vault_worktree` when the call ends -- unless the call is keeping it
+    as the evidence of a harness failure, which the randomized name is also
+    what makes safe.
     """
     return Path(worktrees_root) / "{0}-{1}".format(prefix, os.urandom(8).hex())
 

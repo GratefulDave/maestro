@@ -105,7 +105,12 @@ class CollectTimeout(unittest.TestCase):
                 rr.collect_cases(
                     self._resolved(script, marker), gate, tree, timeout_s=3.0
                 )
-            self.assertIn("did not finish collecting", str(caught.exception))
+            # The refusal used to read "did not finish collecting in 3.0s",
+            # which is a stopwatch reading forwarded to the draft author as
+            # its one correction. What is refused here is unchanged; what it
+            # says is pinned by `test_empty_listing_detail.py`.
+            self.assertIn("printed nothing at all", str(caught.exception))
+            self.assertIn("no test module finished loading", str(caught.exception))
 
 
 class RunBounded(unittest.TestCase):
