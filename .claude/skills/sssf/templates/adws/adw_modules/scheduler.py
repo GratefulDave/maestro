@@ -1346,8 +1346,6 @@ class FactoryScheduler:
                 if status is st.RunStatus.COMPLETE:
                     self._complete_run_spaces()
                     return status
-                if status is st.RunStatus.WAITING:
-                    return status
                 if status is st.RunStatus.PUBLISHABLE:
                     self._publish()
                     if self.status() is st.RunStatus.COMPLETE:
@@ -1407,19 +1405,6 @@ class FactoryScheduler:
             advancing.append(lane_id)
         return advancing
 
-    def _lane_parked(self) -> bool:
-        """True once any lane is WAITING_FOR_USER.
-
-        A parked lane ends the run at the next boundary, so refilling stops
-        and the pipeline drains rather than opening fresh agent turns the
-        operator is about to be asked about.
-        """
-        return any(
-            self.store.lane_stage(self.run_id, lane.lane_id)
-            is st.LaneStage.WAITING_FOR_USER
-            for lane in self.store.active_projection(self.run_id)
-        )
-
     def _advance_ready(self, lane_ids: Sequence[str]) -> None:
         """Advance every ready non-merge lane one stage.
 
@@ -1430,10 +1415,13 @@ class FactoryScheduler:
         batch returns. Waiting for the whole batch is what let three
         admissible lanes sit behind one builder turn with two workers free.
 
-        Nothing new is submitted once a lane fails or once any lane parks;
-        the first failure, in submission order, is re-raised after every lane
-        that was already running has finished its stage, so a failing lane
-        ends the run the way an inline failure does. Merges never come
+        Nothing new is submitted once a lane fails; the first failure, in
+        submission order, is re-raised after every lane that was already
+        running has finished its stage, so a failing lane ends the run the way
+        an inline failure does. A lane that parks is not a failure and stops
+        nothing but itself: `ready_lane_ids` skips a WAITING_FOR_USER lane and
+        anything downstream of it, so the refill simply stops offering that
+        lane while every independent lane keeps advancing. Merges never come
         through here, so this returns with the pool empty and the outer loop
         still sees the run between stages, as before.
         """
@@ -1464,8 +1452,7 @@ class FactoryScheduler:
                 running.pop(future, None)
                 if future.exception() is not None:
                     draining = True
-            if draining or self._lane_parked():
-                draining = True
+            if draining:
                 queued.clear()
                 continue
             busy = set(running.values()) | set(queued)
@@ -2373,8 +2360,9 @@ class FactoryScheduler:
         )
         # The lane is back at WRITING_TESTS and will redraft. A tests lane that
         # keeps redrafting without the finding count coming down gets the same
-        # answer a build lane does: park for the operator, and let the run
-        # drain rather than opening another tester turn.
+        # answer a build lane does: park for the operator rather than opening
+        # another tester turn. Only this lane stops; the run keeps advancing
+        # every lane that does not need it.
         if verdict is st.ReviewerVerdict.REVISE:
             self._block_if_stalled(lane_id)
 
