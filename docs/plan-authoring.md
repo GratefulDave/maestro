@@ -184,6 +184,19 @@ must not quote the private assertion.
   the fixture the tester wrote omitted two of those keys and asserted the object *valid*, so a
   correct implementation would have failed the suite. The test did not miss the defect, it
   mandated it, and a test review passed it.
+- **A derived identifier needs a distinctness case, not a presence case.** An obligation phrased
+  as "provenance carries `release_id`, `method_version` and `code_sha256`" is discharged by one
+  positive case, and no number of positive cases can tell a fingerprint from a constant. Where the
+  lane *computes* a value from its input — a digest, fingerprint, id or hash — say that the value
+  identifies that input, and enumerate the pair case: two inputs differing in exactly one retained
+  field must carry different values. WP4's recall lane passed twelve green cases over a serializer
+  that replaced any value whose `repr` contained `" at 0x"` with its type name, so two distinct
+  recall texts hashed to the same input digest; the code reviewer named it, and the suite could
+  not, because every case supplied one input and asked only whether the fields were there. The rule
+  is scoped to derivation: the clearance and release lanes of the same plan are handed
+  `code_sha256` as a keyword and pass it through, and have nothing to distinguish. Ask which lane
+  computes the identifier, and require the pair only there.
+
 - **The plan's case enumeration is a ceiling, not a floor.** A tester writes the cases the plan
   names and stops. Across five lanes of one audited run, every suite held exactly the enumerated
   cases and nothing else. Whatever the plan does not enumerate is not tested, so enumerate the
