@@ -180,9 +180,14 @@ def _sealed_error_history(
     whose suite shrinks would look like it was regressing. Errors are the
     number that stays honest, and lower is better.
 
-    The USER_WAIT record is the reset marker: only rounds recorded after the
-    most recent one count. That is what makes an operator resume grant a fresh
-    window without storing a counter anywhere.
+    The window is the rounds of the argument the lane is having now, so two
+    records reset it and neither is a counter stored anywhere. The USER_WAIT
+    record is the later boundary: only rounds recorded after the most recent
+    one count, which is what makes an operator resume grant a fresh window.
+    The run's plan revision is the other: an amendment replaces the contract,
+    the sealed suite, and the findings the builder is answering, so rounds
+    recorded under a superseded revision are rounds of a finished argument.
+    Counting them parks a lane on its first post-amendment REVISE.
     """
     marker = 0
     for row in store.conn.execute(
@@ -194,8 +199,10 @@ def _sealed_error_history(
     history: list[int] = []
     for row in store.conn.execute(
         "SELECT sequence, payload_json FROM lane_artifacts WHERE run_id=? "
-        "AND lane_id=? AND artifact_kind=? AND sequence>? ORDER BY sequence ASC",
-        (run_id, lane_id, st.ArtifactKind.CODE_REVIEW.value, marker),
+        "AND lane_id=? AND artifact_kind=? AND sequence>? "
+        "AND plan_revision=(SELECT plan_revision FROM runs WHERE run_id=?) "
+        "ORDER BY sequence ASC",
+        (run_id, lane_id, st.ArtifactKind.CODE_REVIEW.value, marker, run_id),
     ):
         summary = _loads(row["payload_json"]).get("public_result_summary") or {}
         failed = summary.get("failed")
@@ -217,10 +224,12 @@ def _test_review_error_history(
     still had to raise. Lower is better, and a PASS scores zero, exactly as a
     green sealed suite does.
 
-    Every TEST_REVIEW round counts, not only the ones the harness measured. A
-    reviewer that keeps saying REVISE without the finding count coming down is
-    the unbounded loop A9 names, and it is the same shape as a build lane
-    whose sealed errors stop falling. Three rounds of slack, then the operator.
+    Every TEST_REVIEW round of the current argument counts, not only the ones
+    the harness measured. A reviewer that keeps saying REVISE without the
+    finding count coming down is the unbounded loop A9 names, and it is the
+    same shape as a build lane whose sealed errors stop falling. Three rounds
+    of slack, then the operator. Rounds recorded under a superseded plan
+    revision are excluded for the reason given there.
     """
     marker = 0
     for row in store.conn.execute(
@@ -232,8 +241,10 @@ def _test_review_error_history(
     history: list[int] = []
     for row in store.conn.execute(
         "SELECT sequence, payload_json FROM lane_artifacts WHERE run_id=? "
-        "AND lane_id=? AND artifact_kind=? AND sequence>? ORDER BY sequence ASC",
-        (run_id, lane_id, st.ArtifactKind.TEST_REVIEW.value, marker),
+        "AND lane_id=? AND artifact_kind=? AND sequence>? "
+        "AND plan_revision=(SELECT plan_revision FROM runs WHERE run_id=?) "
+        "ORDER BY sequence ASC",
+        (run_id, lane_id, st.ArtifactKind.TEST_REVIEW.value, marker, run_id),
     ):
         findings = _loads(row["payload_json"]).get("findings")
         if isinstance(findings, list):
