@@ -518,6 +518,16 @@ class ArtifactStore:
         ).fetchone()
         return int(row[0]) + 1
 
+    def _lane_artifact_by_id(
+        self, run_id: str, lane_id: str, artifact_id: str
+    ) -> Optional[sqlite3.Row]:
+        """One lane artifact by the id another artifact names."""
+        return self.conn.execute(
+            "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=? "
+            "AND artifact_id=?",
+            (run_id, lane_id, artifact_id),
+        ).fetchone()
+
     def _latest_lane_artifact(
         self,
         run_id: str,
@@ -974,15 +984,20 @@ class ArtifactStore:
             invalidation = self._latest_lane_artifact(
                 run_id, lane_id, st.ArtifactKind.BASE_INVALIDATION
             )
-            prior = self._latest_lane_artifact(
-                run_id, lane_id, st.ArtifactKind.BUILDER_OUTPUT
-            )
-            review = self._latest_lane_artifact(
-                run_id,
-                lane_id,
-                st.ArtifactKind.CODE_REVIEW,
-                verdict=st.ReviewerVerdict.PASS,
-            )
+            # The ids the invalidation itself names, not the newest of each
+            # kind. This reader reconstructs the digest the scheduler wrote,
+            # so the two must resolve the same two artifacts; re-deriving them
+            # by recency is a second answer to a question the record already
+            # answered, and the answers diverge once a lane carries a
+            # candidate across an amendment.
+            stale = _loads(invalidation["payload_json"]) if invalidation else {}
+            prior = review = None
+            builder_id = stale.get("stale_builder_output_artifact_id")
+            review_id = stale.get("stale_code_review_artifact_id")
+            if isinstance(builder_id, str):
+                prior = self._lane_artifact_by_id(run_id, lane_id, builder_id)
+            if isinstance(review_id, str):
+                review = self._lane_artifact_by_id(run_id, lane_id, review_id)
             if invalidation is None or prior is None or review is None:
                 raise StaleStageInput("BASE_INVALIDATION variant missing artifacts")
             prior_builder = prior["artifact_id"]

@@ -5309,6 +5309,51 @@ class HerdrLauncher:
         self._cleaned_absent.add(workspace_id)
         self._invalidate_workspace_layout(workspace_id)
 
+    def close_run_panes(self, run_id: str) -> Tuple[str, ...]:
+        """Close every pane Herdr reports for `run_id`, by token, not by handle.
+
+        `complete_run` closes what *this process* launched: it reads
+        `self._roles`, which a fresh `maestro.py` invocation starts empty. The
+        panes of a run whose scheduler has exited are therefore unreachable
+        through it, and nothing else ever closed them -- a run that parked and
+        was amended left one pane per role alive, and the amended scheduler
+        opened a second set beside them.
+
+        The selector is `tools/cleanup.py`'s, deliberately and identically:
+        Maestro's own `kind=lane` token *and* a `run_id` token naming this run.
+        Two readers that close panes must not disagree about which panes are
+        closeable, and the operator's own Space on the repository carries
+        neither token. Panes that vanish between the listing and the close are
+        already the outcome being asked for.
+        """
+        run = str(run_id or "")
+        if not run:
+            return ()
+        try:
+            payload = self._herdr("pane", "list")
+        except (HerdrCallError, LaunchRefused):
+            return ()
+        closed: List[str] = []
+        for pane in _herdr_list(payload, "panes"):
+            tokens = _herdr_tokens(pane)
+            if tokens.get(METADATA_TOKEN_KIND) != METADATA_KIND_LANE:
+                continue
+            if tokens.get(METADATA_TOKEN_RUN) != run:
+                continue
+            pane_id = str(pane.get("pane_id") or "")
+            if not pane_id:
+                continue
+            try:
+                self._herdr("pane", "close", pane_id)
+            except HerdrCallError as exc:
+                if exc.code in (PANE_NOT_FOUND, WORKSPACE_NOT_FOUND):
+                    self._cleaned_absent.add(pane_id)
+                    continue
+                raise
+            self._cleaned_absent.add(pane_id)
+            closed.append(pane_id)
+        return tuple(closed)
+
     def complete_run(
         self,
         handles: Sequence[LaunchHandle],
@@ -5398,6 +5443,8 @@ class FakeLauncher:
         self._statuses: Dict[str, Optional[str]] = {}
         self.retained: List[str] = []
         self.completed: List[Tuple[str, ...]] = []
+        self.closed_runs: List[str] = []
+        self._runs: Dict[str, str] = {}
 
     def launch(self, spec: LaunchSpec) -> LaunchHandle:
         handle = LaunchHandle(
@@ -5414,6 +5461,7 @@ class FakeLauncher:
         )
         self._handles[spec.correlation_token] = handle
         self._states[spec.correlation_token] = PollResult(PollState.RUNNING)
+        self._runs[spec.correlation_token] = str(spec.run_id or "")
         return handle
 
     def resubmit(
@@ -5473,6 +5521,22 @@ class FakeLauncher:
                 LaunchRefusal.BINDING_MISMATCH, handle.correlation_token
             )
         self.retained.append(handle.correlation_token)
+
+    def close_run_panes(self, run_id: str) -> Tuple[str, ...]:
+        run = str(run_id or "")
+        if not run:
+            return ()
+        self.closed_runs.append(run)
+        closed: List[str] = []
+        for token, handle in list(self._handles.items()):
+            if self._runs.get(token) != run:
+                continue
+            self._states[token] = PollResult(
+                PollState.GONE, detail="RUN_PANES_CLOSED"
+            )
+            if handle.pane_id:
+                closed.append(handle.pane_id)
+        return tuple(closed)
 
     def complete_run(
         self,
