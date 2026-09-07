@@ -169,6 +169,68 @@ def _latest(
 
 
 
+def _lane_artifact_by_id(
+    store: ArtifactStore, run_id: str, lane_id: str, artifact_id: str
+) -> Optional[ArtifactRecord]:
+    """One lane artifact by the id another artifact names.
+
+    `_latest` answers "the newest of this kind under these filters", which is a
+    different question and the wrong one whenever a record already names the
+    artifact it was derived from. A BASE_INVALIDATION carries
+    `stale_builder_output_artifact_id` and `stale_code_review_artifact_id`;
+    re-deriving those by a newest-under-this-plan-revision query gave a
+    different answer across an amendment, because the candidate it invalidated
+    belongs to the revision before the one now current.
+    """
+    row = store.conn.execute(
+        "SELECT * FROM lane_artifacts WHERE run_id=? AND lane_id=? AND artifact_id=?",
+        (run_id, lane_id, artifact_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return ArtifactRecord(
+        artifact_id=row["artifact_id"],
+        run_id=run_id,
+        lane_id=lane_id,
+        sequence=row["sequence"],
+        kind=st.ArtifactKind(row["artifact_kind"]),
+        plan_revision=row["plan_revision"],
+        input_digest=row["input_digest"],
+        output_digest=row["output_digest"],
+        artifact_ref=row["artifact_ref"],
+        payload=_loads(row["payload_json"]),
+    )
+
+
+def _base_invalidation_priors(
+    store: ArtifactStore,
+    run_id: str,
+    lane_id: str,
+    invalidation: Optional[ArtifactRecord],
+) -> tuple[Optional[ArtifactRecord], Optional[ArtifactRecord]]:
+    """The builder output and passing review a BASE_INVALIDATION invalidated.
+
+    Read off the invalidation record itself, never re-queried. The candidate a
+    base invalidation is about was accepted before the invalidation existed,
+    and after an amendment it sits under the previous plan revision, so a
+    revision-scoped `_latest` finds nothing and the lane refuses
+    BASE_INVALIDATION missing artifacts. That refusal was unreachable while a
+    merged build lane re-entered BUILDING as INITIAL; it became reachable the
+    moment such a lane began re-entering through READY_TO_MERGE instead.
+    """
+    if invalidation is None:
+        return None, None
+    payload = invalidation.payload
+    builder_id = payload.get("stale_builder_output_artifact_id")
+    review_id = payload.get("stale_code_review_artifact_id")
+    if not isinstance(builder_id, str) or not isinstance(review_id, str):
+        return None, None
+    return (
+        _lane_artifact_by_id(store, run_id, lane_id, builder_id),
+        _lane_artifact_by_id(store, run_id, lane_id, review_id),
+    )
+
+
 def _sealed_error_history(
     store: ArtifactStore, run_id: str, lane_id: str
 ) -> list[int]:
@@ -1666,20 +1728,8 @@ class FactoryScheduler:
                 code_review = revise.artifact_id
                 ids.extend([prior_builder, code_review])
             elif entry is st.BuildingEntryKind.BASE_INVALIDATION:
-                prior = _latest(
-                    self.store,
-                    self.run_id,
-                    lane_id,
-                    st.ArtifactKind.BUILDER_OUTPUT,
-                    plan_revision=revision,
-                )
-                passing = _latest(
-                    self.store,
-                    self.run_id,
-                    lane_id,
-                    st.ArtifactKind.CODE_REVIEW,
-                    verdict=st.ReviewerVerdict.PASS,
-                    plan_revision=revision,
+                prior, passing = _base_invalidation_priors(
+                    self.store, self.run_id, lane_id, invalidation
                 )
                 if prior is None or passing is None or invalidation is None:
                     raise FactoryRefused("BASE_INVALIDATION missing artifacts")
@@ -2545,20 +2595,8 @@ class FactoryScheduler:
             code_review = revise.artifact_id
             ids.extend([prior_builder, code_review])
         elif entry is st.BuildingEntryKind.BASE_INVALIDATION:
-            prior = _latest(
-                self.store,
-                self.run_id,
-                lane_id,
-                st.ArtifactKind.BUILDER_OUTPUT,
-                plan_revision=revision,
-            )
-            passing = _latest(
-                self.store,
-                self.run_id,
-                lane_id,
-                st.ArtifactKind.CODE_REVIEW,
-                verdict=st.ReviewerVerdict.PASS,
-                plan_revision=revision,
+            prior, passing = _base_invalidation_priors(
+                self.store, self.run_id, lane_id, invalidation
             )
             if prior is None or passing is None or invalidation is None:
                 raise FactoryRefused("BASE_INVALIDATION missing artifacts")

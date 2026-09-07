@@ -2073,6 +2073,28 @@ class HerdrStageActor:
             return False
         return getattr(result, "state", None) is lch.PollState.GONE
 
+    def close_run_panes(self, run_id: str) -> Tuple[str, ...]:
+        """Close every pane Herdr still holds for `run_id`, handle or not.
+
+        `complete_run_spaces` can only reach what this process launched, and a
+        fresh invocation launched nothing. An amendment runs in exactly that
+        process, so without this the panes of the parked run stay open and the
+        amended scheduler opens a second set beside them.
+
+        Sessions this process *does* hold are dropped alongside their panes,
+        so a later `complete_run_spaces` does not try to rename a pane that is
+        already gone.
+        """
+        close = getattr(self.launcher, "close_run_panes", None)
+        if close is None:
+            return ()
+        closed = tuple(close(run_id))
+        for key, stored in list(self._roles.items()):
+            if self._session_run_id(stored) == run_id:
+                self._roles.pop(key, None)
+                self._safe_remove_attempt(stored.attempt, stored.checkout)
+        return closed
+
     def complete_run_spaces(self, run_id: str) -> None:
         sessions = [
             (key, stored)
@@ -2634,10 +2656,19 @@ def _run_amend(args: argparse.Namespace) -> int:
                 row["target_main_ref"],
                 (lane.lane_id for lane in store.active_projection(run_id)),
             )
+            actor = _actor_for(runtime, layout, target, run_id, compiled)
+            # Every pane of this run belongs to the revision the amendment
+            # just superseded, and this process holds no handle to any of
+            # them. Close them before the scheduler below launches its own,
+            # or the operator is left reading two sets of panes for one run
+            # and cannot tell which is live.
+            close_panes = getattr(actor, "close_run_panes", None)
+            if close_panes is not None:
+                close_panes(run_id)
             scheduler = FactoryScheduler(
                 store,
                 run_id,
-                _actor_for(runtime, layout, target, run_id, compiled),
+                actor,
                 runtime,
                 target,
                 stage_started=console.stage_started,

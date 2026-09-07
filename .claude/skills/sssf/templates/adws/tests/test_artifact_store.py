@@ -15,6 +15,7 @@ from pathlib import Path
 ADWS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ADWS))
 
+from adw_modules import git_publication as gitpub
 from adw_modules import scheduler_types as st  # noqa: E402
 from adw_modules import scheduler as sch  # noqa: E402
 from adw_modules.lifecycle import (  # noqa: E402
@@ -1339,13 +1340,26 @@ class ArtifactStoreTests(unittest.TestCase):
                 self.lane_a,
                 digest,
                 {
+                    # Built by the one helper production uses, so this record
+                    # cannot drift from the one a real run writes. It hand-rolled
+                    # a payload without stale_builder_output_artifact_id or
+                    # stale_code_review_artifact_id, which the reconstruction
+                    # reads to find the candidate the invalidation is about;
+                    # a fake that omits a field the writer always sets proves
+                    # only that the reader tolerated the fake.
+                    **gitpub.base_invalidation_payload(
+                        stale_builder_output_artifact_id=builder["artifact_id"],
+                        stale_code_review_artifact_id=review["artifact_id"],
+                        stale_builder_base_sha=loaded["builder_base_sha"],
+                        stale_candidate_sha=loaded["candidate_sha"],
+                        observed_integration_head=new_head,
+                        input_digest=digest,
+                    ),
                     "input_artifact_ids": [
                         builder["artifact_id"],
                         review["artifact_id"],
                     ],
                     "integration_head": new_head,
-                    "stale_builder_base_sha": loaded["builder_base_sha"],
-                    "stale_candidate_sha": loaded["candidate_sha"],
                 },
             ),
             st.LaneStage.BUILDING,

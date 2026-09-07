@@ -660,7 +660,27 @@ def amendment_reset_stage(
         return current
     kind = normalize_lane_kind(lane_kind)
     if kind == LANE_KIND_BUILD:
-        if current in STARTED_IMPLEMENTATION_STAGES or current is LaneStage.MERGED:
+        # An amendment replays the integration ref, so a merged lane has to
+        # merge again. It does not have to *build* again. Its candidate, its
+        # builder base and its PASS review are exactly the inputs
+        # READY_TO_MERGE consumes, and `decide_merge_action` is already the
+        # thing that asks whether the base moved: unchanged base merges or
+        # revalidates, moved base takes BASE_INVALIDATION back to BUILDING.
+        #
+        # Returning BUILDING here asked that question a second time and
+        # answered it "always yes". `changed` is read once at the top of this
+        # function and then ignored, so every amendment discarded every
+        # merged build lane's accepted work regardless of whether it touched
+        # that lane -- on run c9e5b420, `lane-wp4-clearances-build` was built
+        # and reviewed three times, once per revision, and no amendment ever
+        # named it. With three build lanes each amendment re-rolled all three,
+        # so fixing one lane re-ran the others and a rebuild could regress a
+        # lane that had already passed. That is what stopped runs converging,
+        # and it is the reason this returns the merge stage and not the build
+        # stage.
+        if current is LaneStage.MERGED:
+            return LaneStage.READY_TO_MERGE
+        if current in STARTED_IMPLEMENTATION_STAGES:
             return LaneStage.BUILDING
         raise IllegalStageEdge(f"no amendment reset for {current.value}")
     if current in STARTED_IMPLEMENTATION_STAGES or current is LaneStage.MERGED:
