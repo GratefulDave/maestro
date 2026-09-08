@@ -186,7 +186,7 @@
       <header>
         <div class="eyebrow">Technical documentation / current implementation</div>
         <h1>Code moves.<br><span>Control stays.</span></h1>
-        <p class="lede">Maestro executes an approved plan as a two-lane artifact factory. Durable authority is <code>lane_state.stage</code> plus immutable artifacts under an external <code>runtime_state_root</code>. Independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref. Herdr is transport. Resume restarts the incomplete stage from the last immutable artifact.</p>
+        <p class="lede">Maestro executes an approved plan as a two-lane artifact factory. Durable authority is <code>lane_state.stage</code> plus immutable artifacts under an external <code>runtime_state_root</code>. Independent ready lanes may overlap; each accepted lane merges exactly once into one run integration ref. Herdr is transport: the invoking Space owns UI; role cwd and publication stay on the target. Resume restores linked lane children, then restarts the incomplete stage from the last immutable artifact.</p>
         <div class="hero-meta">
           <span class="pill">Nine lane stages</span>
           <span class="pill">Immutable artifacts</span>
@@ -203,7 +203,8 @@
         </div>
         <div class="grid" style="margin-bottom:.85rem">
           <a class="card" href="architecture/00-artifact-factory.html"><span class="tag">00 · current</span><h3>Nine-stage artifact factory</h3><p>Operator CLI, <code>lane_state.stage</code>, sealed vault, exactly-once integration, and receipt-backed publication.</p></a>
-          <a class="card" href="architecture/00-lane-stage.html"><span class="tag">00 · current</span><h3>Lane stage machine</h3><p>The nine persisted stages, <code>REVISE</code> loops, <code>BASE_INVALIDATION</code>, and <code>WAITING_FOR_USER</code>.</p></a>
+          <a class="card" href="architecture/00-lane-stage.html"><span class="tag">00 · current</span><h3>Lane stage machine</h3><p>The nine persisted stages, <code>REVISE</code> loops, <code>NO_PROGRESS</code> pause, <code>BASE_INVALIDATION</code>, and <code>WAITING_FOR_USER</code>.</p></a>
+          <a class="card" href="architecture/00-role-topology.html"><span class="tag">00 · current</span><h3>Persistent role topology</h3><p>Invoking Space owns UI anchors; role panes execute on target cwd. Resume restores shells before native gates.</p></a>
         </div>
         <div class="grid-3">
           <a class="card" href="architecture/01-system.html"><span class="tag">01 · historical</span><h3>System architecture</h3><p>Control plane, derived build::review, isolated worktrees, and the SQLite trace. Superseded.</p></a>
@@ -238,7 +239,7 @@
         </div>
         <div class="grid">
           <article class="card"><span class="tag">Plan</span><h3>Approved before execution</h3><p>Planning skills emit one executable plan. The compiler checks schema, DAG, ownership, and acceptance. No <code>plan gate|review|ship</code> or <code>bootstrap</code> verb.</p></article>
-          <article class="card"><span class="tag">Isolation</span><h3>Parent Space, linked lanes</h3><p>One parent Herdr Space per repository identity and <code>run_id</code>, labelled <code>&lt;repo&gt;-&lt;4hash&gt;</code>. Linked children are labelled the exact authored <code>lane_id</code> and created only when that lane first dispatches. Role panes are lazy: <code>tester</code>, <code>tester-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, last-topo <code>integration-reviewer</code>. Dedicated host-authenticated profiles and checkout-local role instructions bind each agent to its assigned tree while native repository tools remain available.</p></article>
+          <article class="card"><span class="tag">Isolation</span><h3>Invoking Space, target cwd</h3><p>CLI captures <code>HERDR_WORKSPACE_ID</code> before run binding. Linked lane children are genuine worktree workspaces under that invoking Space, labelled the exact authored <code>lane_id</code>, with detached no-checkout UI anchors on the invoking repository. Role panes are lazy: <code>tester</code>, <code>tester-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, last-topo <code>integration-reviewer</code>. Execution checkouts and publication stay on the target repository even when it differs. Dedicated host-authenticated profiles and checkout-local role instructions bind each agent to its assigned tree while native repository tools remain available.</p></article>
           <article class="card"><span class="tag">Acceptance</span><h3>Sealed tests, then merge once</h3><p>Private tests seal before building. Each accepted lane merges exactly once into the run integration ref. Publication is receipt-backed.</p></article>
           <article class="card"><span class="tag">Trace</span><h3>Stage plus artifacts</h3><p>SQLite under <code>runtime_state_root</code> stores <code>lane_state.stage</code> and immutable artifacts. Attempts and operator escapes are not authority.</p></article>
         </div>
@@ -256,7 +257,7 @@
           <div class="flow-step"><code>04</code><b>Merge</b><small>Exactly-once integration merge from the immutable candidate SHA.</small></div>
           <div class="flow-step"><code>05</code><b>Publish</b><small>Final review, then receipt-backed publication to <code>main</code>.</small></div>
         </div>
-        <div class="callout"><strong>Resume.</strong> Process death restarts the current incomplete stage from its last immutable input. A still-running role pane may reconnect as transport by proved project/run/lane/role identity. <code>run amend</code> invalidates only the affected stage and transitive dependents. No retry/skip/abandon/cancel verb.</div>
+        <div class="callout"><strong>Resume.</strong> Process death restores owned role shells, then restarts the current incomplete stage from its last immutable input. A still-running role pane may reconnect as transport by proved project/run/lane/role identity. <code>run amend</code> invalidates only the affected stage and transitive dependents. No retry/skip/abandon/cancel verb. A stalled review loop records <code>NO_PROGRESS</code> on that lane only.</div>
       </section>
 
       <section id="components">
@@ -313,10 +314,11 @@
           <table>
             <thead><tr><th>Operation</th><th>Contract</th></tr></thead>
             <tbody>
-              <tr><td>launch(spec)</td><td>Place or reconnect one lazy role pane (<code>tester</code>, <code>tester-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, last-topo <code>integration-reviewer</code>) inside the parent Space labelled <code>&lt;repo&gt;-&lt;4hash&gt;</code> and the linked child labelled the exact <code>lane_id</code>. Keep the authenticated OMP or Claude process on the host, bind it to one stable role checkout or private tree, grant only Bash, and prove the container image and hook before launch. Every command enters a disposable no-network container; missing confinement refuses launch.</td></tr>
+              <tr><td>launch(spec)</td><td>Place or reconnect one lazy role pane (<code>tester</code>, <code>tester-reviewer</code>, <code>builder</code>, <code>code-reviewer</code>, last-topo <code>integration-reviewer</code>) inside the invoking Space captured from <code>HERDR_WORKSPACE_ID</code> and the linked child labelled the exact <code>lane_id</code>. Keep the authenticated OMP or Claude process on the host, bind it to one stable role checkout or private tree on the target, grant only Bash, and prove the container image and hook before launch. Every command enters a disposable no-network container; missing confinement refuses launch.</td></tr>
+              <tr><td>restore_layout(spec)</td><td>Before scheduler construction and native gates, restore already-materialized role shells into the invoking Space's linked lane children. Preserve proved PTYs and agent sessions; recreate absent shells without starting agents or replaying prompts. Fresh dispatch still reveals the verified role pane.</td></tr>
               <tr><td>poll(handle)</td><td>Report starting, running, idle, exited, or gone. Idle after output is normal and is not completion. Herdr state is advisory; the last complete structured transcript envelope synthesizes terminal exit truth.</td></tr>
               <tr><td>close(handle)</td><td>Transport only. Success leaves the role pane, process, working tree, and session available for later stages. Not a Maestro operator <code>cancel</code> verb and not a lane stage.</td></tr>
-              <tr><td>reclaim(token)</td><td>On scheduler restart, rediscover candidates from Herdr report-metadata first (full <code>run_id</code>, repository fingerprint, <code>lane_id</code>, role, parent Space ID), live-check them, and resubmit the current stage from its immutable input. Recreate only confirmed dead or typed <code>agent_not_found</code> roles. Never adopt or rename legacy stage/attempt panes, malformed observations, unreachable Herdr, or mismatched placement as current roles. After <code>MAIN_PUBLICATION</code> and derived COMPLETE, <code>/rename</code> then close linked children, then the parent Space.</td></tr>
+              <tr><td>reclaim(token)</td><td>On scheduler restart, rediscover candidates from Herdr report-metadata first (full <code>run_id</code>, repository fingerprint, <code>lane_id</code>, role, parent Space ID), live-check them, and resubmit the current stage from its immutable input. Recreate only confirmed dead or typed <code>agent_not_found</code> roles. Never adopt or rename legacy stage/attempt panes, malformed observations, unreachable Herdr, or mismatched placement as current roles. After <code>MAIN_PUBLICATION</code> and derived COMPLETE, close owned linked children and unregister UI anchors; retain the invoking Space.</td></tr>
               <tr><td>classify(error)</td><td>Map launch faults into fixed configuration, authentication, transient, protocol, or execution classes.</td></tr>
               <tr><td>provision(worktree)</td><td>Run ecosystem setup after worktree creation and before baseline or pre-gate measurement.</td></tr>
               <tr><td>wait_for_interactive_agent(name)</td><td>Block on <code>herdr agent wait &lt;name&gt; --until idle --timeout</code>, the documented readiness gate for coding agents. No undocumented status field is polled and no per-agent startup banner is scraped from the pane.</td></tr>
@@ -333,7 +335,7 @@
           <div><h2>Runtime and repository binding</h2><p class="section-copy">Every run binds one external <code>runtime_state_root</code> to one product Git common directory. Template trees and deployment worktrees are different roles; source/deployment confusion refuses before a run is created.</p></div>
         </div>
         <div class="flow" aria-label="Runtime binding flow">
-          <div class="flow-step"><code>01</code><b>Resolve</b><small>Canonicalize <code>--repo</code>, <code>--main-ref</code>, and the external runtime-state root.</small></div>
+          <div class="flow-step"><code>01</code><b>Resolve</b><small>Canonicalize <code>--repo</code> (inferred from the invoking working directory when omitted), <code>--main-ref</code> (inferred from symbolic <code>HEAD</code>), and the external runtime-state root.</small></div>
           <div class="flow-step"><code>02</code><b>Refuse</b><small>Reject template-source execution, unsafe permissions, symlinks, and runtime/product path overlap.</small></div>
           <div class="flow-step"><code>03</code><b>Bind</b><small>Persist repository identity, initial main SHA, plan revision, integration ref, and lane projection atomically.</small></div>
           <div class="flow-step"><code>04</code><b>Recheck</b><small><code>run resume|amend|status</code> revalidate the descriptor and repository fingerprint before reading or mutating run state.</small></div>
@@ -352,7 +354,7 @@
           <div><h2>Operator CLI</h2><p class="section-copy">Frozen surface. Invoke the deployment copy only. Template-source run creation refuses <code>RUN_REPOSITORY_MISMATCH</code>. No bootstrap, plan gate/review/ship/finalize, retry, skip, abandon, or cancel verb.</p></div>
         </div>
         <pre aria-label="Maestro command examples"><span class="comment"># frozen operator surface</span>
-<span class="prompt">$</span> uv run adws/maestro.py run start &lt;approved-plan&gt; --repo &lt;target-worktree-root&gt; --main-ref &lt;ref&gt;
+<span class="prompt">$</span> uv run adws/maestro.py run start &lt;approved-plan&gt; [--repo &lt;target-worktree-root&gt;] [--main-ref &lt;ref&gt;]
 <span class="prompt">$</span> uv run adws/maestro.py run resume &lt;run-id&gt;
 <span class="prompt">$</span> uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;
 <span class="prompt">$</span> uv run adws/maestro.py run status &lt;run-id&gt;</pre>

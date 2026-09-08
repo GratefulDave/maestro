@@ -75,7 +75,7 @@
       <p class="eyebrow">Contract / plan authoring</p>
       <h1>From a source document to an executable plan</h1>
       <p class="lede">Planning skills (<code>deep-interview</code>, <code>arch-brownfield</code>, <code>planf3</code>, <code>arch-review</code>) produce one approved executable plan. Maestro does not run <code>plan gate</code>, <code>plan review</code>, <code>plan ship</code>, <code>plan finalize</code>, or <code>bootstrap</code>. Execution is <code>uv run adws/maestro.py run start|resume|amend|status</code>. Durable authority after start is <code>lane_state.stage</code> plus immutable artifacts.</p>
-      <pre>source documents ──► approved executable plan ──► run start --repo … --main-ref …
+      <pre>source documents ──► approved executable plan ──► run start [--repo …] [--main-ref …]
    (audit, interview,     compiler: schema, DAG,         nine-stage factory
     arch)                 ownership, acceptance</pre>
       <p>Supporting a new kind of input means citing that document in the approved plan, not adding an adapter. Markdown source of this page: <a href="plan-authoring.md">plan-authoring.md</a> (historical notes may still mention planctl).</p>
@@ -101,14 +101,14 @@
       <h2>Single repository</h2>
       <ol>
         <li><code>deep-interview</code>, <code>arch-brownfield</code>, <code>planf3</code>, and <code>arch-review</code> — one approved executable plan.</li>
-        <li><code>uv run adws/maestro.py run start &lt;approved-plan&gt; --repo &lt;target-worktree-root&gt; --main-ref &lt;ref&gt;</code> — creates the run, <code>PLANNED</code> lanes, and integration ref.</li>
+        <li><code>uv run adws/maestro.py run start &lt;approved-plan&gt; [--repo &lt;target-worktree-root&gt;] [--main-ref &lt;ref&gt;]</code> — creates the run, <code>PLANNED</code> lanes, and integration ref. Omitted routing flags infer the invoking working directory and symbolic <code>HEAD</code>.</li>
         <li><code>uv run adws/maestro.py run resume &lt;run-id&gt;</code> — next incomplete stage from the last immutable artifact.</li>
         <li><code>uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;</code> — only verb that may apply a <code>PLAN_AMENDMENT</code>.</li>
         <li><code>uv run adws/maestro.py run status &lt;run-id&gt;</code> — derived from durable rows after fingerprint revalidation.</li>
       </ol>
       <div class="callout"><strong>Deployment copy only.</strong> Invoke <code>adws/maestro.py</code> from the stamped product repository. Template-source run creation refuses <code>RUN_REPOSITORY_MISMATCH</code>. There is no bootstrap or planctl operator path.</div>
       <pre># frozen operator surface
-uv run adws/maestro.py run start &lt;approved-plan&gt; --repo &lt;target-worktree-root&gt; --main-ref &lt;ref&gt;
+uv run adws/maestro.py run start &lt;approved-plan&gt; [--repo &lt;target-worktree-root&gt;] [--main-ref &lt;ref&gt;]
 uv run adws/maestro.py run resume &lt;run-id&gt;
 uv run adws/maestro.py run amend &lt;approved-plan&gt; --run &lt;run-id&gt;
 uv run adws/maestro.py run status &lt;run-id&gt;</pre>
@@ -126,6 +126,7 @@ uv run adws/maestro.py run status &lt;run-id&gt;</pre>
 
       <h2>Outputs are write permission</h2>
       <p>Exactly one lane may own a path. Ask: could an agent satisfy this instruction by changing only these files? If not, the lane will fail review. That judgment is a planning-skill / <code>run amend</code> problem, not <code>maestro plan review</code>.</p>
+      <p>Declare the public interface before private tests bind to it. Public acceptance or <code>spec.instruction</code> must name the module/import path, export or callable, argument and return shapes, and observable errors. A module filename is not a function. Test authors must not invent a private binding; test reviewers report undeclared bindings as <code>REVISE</code>. Builders must not recover missing signatures from sealed tests. Public signatures are not fixtures, selectors, expected literals, or assertion text.</p>
 
       <h2>Review rejection</h2>
       <p>A reviewer <code>REVISE</code> artifact returns the lane to <code>WRITING_TESTS</code> or <code>BUILDING</code> with actionable redacted findings. There is no repair chain, attempt identity, or <code>run convergence</code> verb. Resume is the next incomplete stage from the last immutable artifact.</p>
