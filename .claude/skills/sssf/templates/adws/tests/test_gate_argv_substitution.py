@@ -15,11 +15,15 @@ reads one token as another's value.
 from __future__ import annotations
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from adw_modules import private_review as pr
+from adw_modules import runner_resolution as rr
+from adw_modules import scheduler
 from adw_modules import tests_chain as tc
 from adw_modules.scheduler import _collect_gate
 
@@ -208,6 +212,68 @@ class AGateOperandAlreadyInTheTree(unittest.TestCase):
         )
         argv = tc._suite_selectors(gate, tuple(FIXTURE_WRITTEN), self.tree.path)
         self.assertIn("src/lib/api/dpa.test.ts", argv)
+
+
+class PrivateDraftCollection(unittest.TestCase):
+    def test_collects_shipped_and_private_cases_without_broadening_selectors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = root / "collection"
+            tree.mkdir()
+            (tree / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+            (tree / "test_shipped.py").write_text(
+                "def test_shipped():\n    raise AssertionError('collection only')\n",
+                encoding="utf-8",
+            )
+            (tree / "test_unselected.py").write_text(
+                "raise AssertionError('unselected file was imported')\n",
+                encoding="utf-8",
+            )
+            files = {
+                "private/test_draft.py":
+                    "def test_private():\n    raise AssertionError('collection only')\n"
+            }
+            gate = SimpleNamespace(
+                runner="pytest",
+                argv=("-c", "pytest.ini", "test_shipped.py", "private",
+                      "test_missing.py", "private/test_draft.py"),
+                cwd=".",
+                min_cases=2,
+            )
+            owner = SimpleNamespace(
+                target=SimpleNamespace(target_repository_root=root),
+                runtime=SimpleNamespace(path=root / "runtime"),
+                run_id="isolated-draft-collection",
+                _provision_argv=(),
+                _provision_timeout_s=30,
+            )
+            ctx = SimpleNamespace(
+                run_id=owner.run_id, lane=SimpleNamespace(lane_id="draft")
+            )
+            resolved = rr.ResolvedRunner(
+                runner="pytest", executable=sys.executable,
+                launcher_args=("-m", "pytest"),
+            )
+            # Only isolate checkout/provisioning and interpreter discovery.
+            # The production writer, argv helper and collector remain real.
+            with (
+                patch.object(scheduler.hv, "ensure_vault", return_value=root / "vault"),
+                patch.object(scheduler.hv, "seed", return_value="isolated-base"),
+                patch.object(scheduler.hv, "scratch_worktree_path", return_value=tree),
+                patch.object(scheduler.hv, "checkout_vault_worktree"),
+                patch.object(scheduler.cr, "provision_tree"),
+                patch.object(scheduler.rr, "prepare_collect_tree"),
+                patch.object(scheduler.rr, "resolve", return_value=resolved),
+                patch.object(scheduler, "_remove_collect_tree"),
+                patch.dict("os.environ", {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}),
+            ):
+                cases = scheduler.FactoryScheduler._collect_private_draft(
+                    owner, ctx, gate, files
+                )
+            self.assertEqual(
+                set(cases),
+                {"test_shipped.py::test_shipped", "private/test_draft.py::test_private"},
+            )
 
 
 if __name__ == "__main__":

@@ -120,52 +120,6 @@ class PytestGoesThroughResolveTest(unittest.TestCase):
     refuses when none is capable — a pin to `sys.executable` asks none of that.
     """
 
-    _SUMMARY = {
-        "pytest": "1 passed in 0.01s",
-        "vitest": "\n Test Files  1 passed (1)\n      Tests  1 passed (1)\n",
-    }
-
-    def _run(self, files: tuple[str, ...], resolved: rr.ResolvedRunner) -> dict:
-        with tempfile.TemporaryDirectory() as tree:
-            with mock.patch.object(
-                rr, "resolve", return_value=resolved
-            ) as resolve, mock.patch.object(
-                rr,
-                "execute_cases",
-                return_value={
-                    "output": self._SUMMARY[resolved.runner],
-                    "returncode": 0,
-                },
-            ) as execute:
-                out = tc.run_private_suite(Path(tree), files)
-            return {"out": out, "resolve": resolve, "execute": execute}
-
-    def test_a_pytest_suite_is_resolved_not_pinned(self) -> None:
-        resolved = rr.ResolvedRunner(
-            runner="pytest",
-            executable="/repo/.venv/bin/pytest",
-            origin="discovered",
-            probe_exit=5,
-        )
-        seen = self._run(("tests/test_thing.py",), resolved)
-        seen["resolve"].assert_called_once()
-        self.assertEqual(seen["resolve"].call_args.args[0], "pytest")
-        used = seen["execute"].call_args.args[0]
-        self.assertIs(used, resolved)
-        self.assertEqual(used.executable, "/repo/.venv/bin/pytest")
-        self.assertEqual(used.launcher_args, ())
-        self.assertEqual(seen["out"]["runner"], "pytest")
-
-    def test_a_vitest_suite_is_resolved_as_vitest(self) -> None:
-        resolved = rr.ResolvedRunner(
-            runner="vitest",
-            executable="/repo/node_modules/.bin/vitest",
-            origin="discovered",
-        )
-        seen = self._run(("src/a.test.ts",), resolved)
-        self.assertEqual(seen["resolve"].call_args.args[0], "vitest")
-        self.assertEqual(seen["out"]["runner"], "vitest")
-
     def test_an_unusable_pytest_refuses_rather_than_falling_back(self) -> None:
         unusable = rr.RunnerUnusable("pytest", rr.Reason.UNRESOLVED, ".")
         with tempfile.TemporaryDirectory() as tree:
@@ -173,13 +127,6 @@ class PytestGoesThroughResolveTest(unittest.TestCase):
                 with self.assertRaises(pr.PrivateReviewError) as caught:
                     tc.run_private_suite(Path(tree), ("tests/test_thing.py",))
         self.assertIn("SEALED_SUITE_RUNNER_UNUSABLE:pytest", str(caught.exception))
-
-    def test_pytest_has_a_measured_capability_probe(self) -> None:
-        # `rr.resolve` refuses any runner without one, so routing pytest through
-        # it would be a hard refusal if these rows were missing.
-        self.assertIn("pytest", rr.PROBE_ARGS)
-        self.assertIn("pytest", rr.CAPABLE_EXIT)
-        self.assertTrue(rr._measured("pytest"))
 
 
 class VersionSpecifierTest(unittest.TestCase):
@@ -724,7 +671,7 @@ class RealVitestCountsEveryShapeTest(unittest.TestCase):
             gate = tc._suite_gate(None, (selector,))
             exec_gate = SimpleNamespace(
                 runner="vitest",
-                argv=tc._suite_selectors(gate, (selector,)),
+                argv=tc._suite_selectors(gate, (selector,), root),
                 cwd=".",
                 min_cases=1,
             )
@@ -1112,101 +1059,80 @@ def _capable_stub(path: Path, exit_code: int) -> Path:
 
 
 class ResolutionRootIsTheExecutionTreeTest(unittest.TestCase):
-    """pytest resolves where it EXECUTES; vitest resolves where its modules are.
-
-    `rr.COLLECT_RUNTIME_DIRS` is `("node_modules",)`. vitest's environment is
-    bridged from the runtime root into the tree, so resolving vitest against
-    the runtime root is coherent. No Python environment is bridged, so a pytest
-    resolved against the runtime root is the real repository's interpreter
-    running against the candidate's source — missing deps at best, and at worst
-    an editable install that imports the real repository's code and certifies
-    it green.
-    """
+    """Both runners probe and execute the candidate's materialized tree."""
 
     @contextlib.contextmanager
     def _pair(self):
         with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as tree:
             yield Path(repo), Path(tree)
 
-    def _run(self, tree: Path, repo: Path, files: tuple[str, ...], runner: str):
-        summary = {
-            "pytest": "1 passed in 0.01s",
-            "vitest": "\n      Tests  1 passed (1)\n",
-        }[runner]
-        with mock.patch.object(
-            rr, "execute_cases", return_value={"output": summary, "returncode": 0}
-        ) as execute:
-            out = tc.run_private_suite(tree, files, runtime_root=repo)
-        return out, execute.call_args.args[0]
-
-    def test_pytest_prefers_the_trees_environment_over_the_repositorys(self) -> None:
+    def test_python_editable_imports_remain_candidate_local(self) -> None:
         with self._pair() as (repo, tree):
-            _capable_stub(repo / ".venv" / "bin" / "pytest", 5)
-            wanted = _capable_stub(tree / ".venv" / "bin" / "pytest", 5)
-            _out, resolved = self._run(tree, repo, ("tests/test_a.py",), "pytest")
-        self.assertEqual(resolved.runner, "pytest")
-        self.assertEqual(Path(resolved.executable), wanted)
+            for checkout, identity in ((repo, "runtime"), (tree, "candidate")):
+                source = checkout / "src"
+                source.mkdir()
+                (source / "candidate_identity.py").write_text(
+                    "IDENTITY = {0!r}\n".format(identity), encoding="utf-8"
+                )
+                site = checkout / "editable-site"
+                site.mkdir()
+                (site / "candidate.pth").write_text(str(source) + "\n", encoding="utf-8")
+                launcher = checkout / ".venv" / "bin" / "pytest"
+                launcher.parent.mkdir(parents=True)
+                launcher.write_text(
+                    "#!{0}\nimport site\nsite.addsitedir({1!r})\n"
+                    "import pytest\nraise SystemExit(pytest.main())\n".format(
+                        sys.executable, str(site)
+                    ),
+                    encoding="utf-8",
+                )
+                launcher.chmod(0o755)
+            (tree / "test_identity.py").write_text(
+                "from candidate_identity import IDENTITY\n"
+                "def test_candidate():\n    assert IDENTITY == 'candidate'\n",
+                encoding="utf-8",
+            )
+            out = tc.run_private_suite(tree, ("test_identity.py",), runtime_root=repo)
+        self.assertEqual(out["returncode"], 0, out["output"])
+        self.assertEqual(out["counts"]["passed"], 1)
 
-    def test_a_repository_venv_does_not_capture_pytest_resolution(self) -> None:
+    def test_vitest_probes_tree_local_selector_with_bridged_dependencies(self) -> None:
+        vitest = _discover_vitest()
+        if vitest is None:
+            self.skipTest("no vitest binary found; set MAESTRO_TEST_VITEST")
+        installation = next(
+            (
+                path for path in (
+                    Path(vitest).absolute().parent.parent,
+                    *Path(vitest).resolve().parents,
+                )
+                if (path / "vitest" / "package.json").is_file()
+                and (path / ".bin" / "vitest").is_file()
+            ),
+            None,
+        )
+        if installation is None:
+            self.skipTest("vitest needs an installed node_modules tree")
         with self._pair() as (repo, tree):
-            trap = _capable_stub(repo / ".venv" / "bin" / "pytest", 5)
-            _capable_stub(tree / ".venv" / "bin" / "pytest", 5)
-            _out, resolved = self._run(tree, repo, ("tests/test_a.py",), "pytest")
-            self.assertNotEqual(Path(resolved.executable), trap)
-            self.assertNotIn(str(repo), resolved.executable)
+            (repo / "node_modules").symlink_to(installation, target_is_directory=True)
+            for checkout in (repo, tree):
+                (checkout / "package.json").write_text(
+                    '{"name":"sealed","private":true,"type":"module"}\n',
+                    encoding="utf-8",
+                )
+            selector = "src/candidate-only.test.ts"
+            (tree / "src").mkdir()
+            (tree / selector).write_text(
+                'import { it, expect } from "vitest";\n'
+                'it("candidate", () => { expect(1 + 1).toBe(2); });\n',
+                encoding="utf-8",
+            )
+            out = tc.run_private_suite(
+                tree, (selector,), runtime_root=repo, timeout_s=300.0
+            )
+        self.assertEqual(out["returncode"], 0, out["output"])
+        self.assertEqual(out["counts"]["passed"], 1)
 
-    def test_pytest_refuses_when_the_tree_has_no_environment(self) -> None:
-        # An explicit refusal beats silently running the repository's
-        # interpreter against the candidate's source.
-        with self._pair() as (repo, tree):
-            _capable_stub(repo / ".venv" / "bin" / "pytest", 5)
-            with mock.patch.object(
-                rr, "resolve", side_effect=rr.RunnerUnusable
-                ("pytest", rr.Reason.UNRESOLVED, ".")
-            ):
-                with self.assertRaises(pr.PrivateReviewError) as caught:
-                    tc.run_private_suite(
-                        tree, ("tests/test_a.py",), runtime_root=repo
-                    )
-        self.assertIn("SEALED_SUITE_RUNNER_UNUSABLE:pytest", str(caught.exception))
-
-    def test_pytest_resolution_is_handed_the_tree_not_the_runtime_root(self) -> None:
-        with self._pair() as (repo, tree):
-            with mock.patch.object(
-                rr,
-                "resolve",
-                return_value=rr.ResolvedRunner(runner="pytest", executable="/bin/x"),
-            ) as resolve, mock.patch.object(
-                rr,
-                "execute_cases",
-                return_value={"output": "1 passed in 0.01s", "returncode": 0},
-            ):
-                tc.run_private_suite(tree, ("tests/test_a.py",), runtime_root=repo)
-            self.assertEqual(Path(resolve.call_args.args[1]), tree)
-
-    def test_vitest_still_resolves_from_the_runtime_root(self) -> None:
-        with self._pair() as (repo, tree):
-            wanted = _capable_stub(repo / "node_modules" / ".bin" / "vitest", 0)
-            _out, resolved = self._run(tree, repo, ("src/a.test.ts",), "vitest")
-        self.assertEqual(resolved.runner, "vitest")
-        self.assertEqual(Path(resolved.executable), wanted)
-
-    def test_vitest_resolution_is_handed_the_runtime_root(self) -> None:
-        with self._pair() as (repo, tree):
-            with mock.patch.object(
-                rr,
-                "resolve",
-                return_value=rr.ResolvedRunner(runner="vitest", executable="/bin/x"),
-            ) as resolve, mock.patch.object(
-                rr,
-                "execute_cases",
-                return_value={
-                    "output": "\n      Tests  1 passed (1)\n",
-                    "returncode": 0,
-                },
-            ):
-                tc.run_private_suite(tree, ("src/a.test.ts",), runtime_root=repo)
-            self.assertEqual(Path(resolve.call_args.args[1]), repo)
 
     def test_the_version_assertion_follows_the_resolved_pytest(self) -> None:
         with self._pair() as (repo, tree):

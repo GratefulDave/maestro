@@ -154,6 +154,14 @@ class _RoleLauncher:
         envelope.parent.mkdir(parents=True, exist_ok=True)
         envelope.write_text(json.dumps({}), encoding="utf-8")
 
+    def invoking_repository(self, environment) -> Path | None:
+        return None
+
+    def restore_layout(self, spec: lch.LaunchSpec) -> str:
+        key = (str(spec.lane_key or ""), str(spec.pane_role or ""))
+        live = self._live.get(key)
+        return live.pane_id if live is not None else ""
+
     def launch(self, spec: lch.LaunchSpec) -> SimpleNamespace:
         key = (str(spec.lane_key or ""), str(spec.pane_role or ""))
         live = self._live.get(key)

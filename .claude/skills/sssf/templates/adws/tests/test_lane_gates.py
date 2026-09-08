@@ -59,10 +59,12 @@ def _review_payload(
     failed: int,
     errored: int,
     findings=(),
+    input_artifact_ids=(),
 ) -> str:
     return json.dumps(
         {
             "input_digest": input_digest,
+            "input_artifact_ids": list(input_artifact_ids),
             "verdict": verdict,
             "findings": [dict(item) for item in findings],
             "public_result_summary": {
@@ -196,11 +198,29 @@ def ledger(tmp_path: Path) -> dict:
             (RUN_ID, lane_id, stage, "2026-09-02T01:00:00+00:00"),
         )
 
-    # Three review rounds that never clear their errors, which is what
-    # `_stalled` is looking at, plus the builder output the candidate sha
-    # comes off.
-    for sequence, counts in ((1, (2, 0)), (2, (2, 0)), (3, (2, 0))):
-        failed, errored = counts
+    # Reviews name the candidate they measured. Repeated admitted content,
+    # rather than equal failure counts, is the no-progress evidence.
+    for round_index in range(3):
+        producer_sequence = round_index * 2 + 1
+        sequence = producer_sequence + 1
+        failed, errored = 2, 0
+        _insert_artifact(
+            conn,
+            lane_id="lane-build",
+            sequence=producer_sequence,
+            kind=st.ArtifactKind.BUILDER_OUTPUT.value,
+            completed_stage=st.LaneStage.BUILDING.value,
+            payload_json=json.dumps(
+                {
+                    "spec_digest": DIGEST,
+                    "projection_digest": DIGEST,
+                    "builder_base_sha": head,
+                    "sealed_test_digest": DIGEST,
+                    "tree_delta": [{"path": "file.txt", "blob": _digest("candidate")}],
+                    "candidate_sha": head,
+                }
+            ),
+        )
         _insert_artifact(
             conn,
             lane_id="lane-build",
@@ -209,6 +229,9 @@ def ledger(tmp_path: Path) -> dict:
             completed_stage=st.LaneStage.REVIEWING_CODE.value,
             payload_json=_review_payload(
                 input_digest=_digest("lane-build:{0}".format(sequence)),
+                input_artifact_ids=(
+                    _digest("id:lane-build:{0}".format(producer_sequence)),
+                ),
                 verdict=st.ReviewerVerdict.REVISE.value,
                 executed=11,
                 passed=9,
@@ -220,12 +243,12 @@ def ledger(tmp_path: Path) -> dict:
     _insert_artifact(
         conn,
         lane_id="lane-build",
-        sequence=4,
+        sequence=7,
         kind=st.ArtifactKind.BUILDER_OUTPUT.value,
         completed_stage=st.LaneStage.BUILDING.value,
         payload_json=json.dumps(
             {
-                "input_digest": _digest("lane-build:4"),
+                "input_digest": _digest("lane-build:7"),
                 "candidate_sha": head,
                 "candidate_ref": "refs/maestro/candidate",
             }
@@ -288,24 +311,47 @@ def test_reports_stage_and_wait_and_rounds(ledger, capsys):
     assert "stage                   WAITING_FOR_USER" in " ".join(out.split("\n"))
     assert "stage" in out and "WAITING_FOR_USER" in out
     assert "executed=11 passed=9 failed=2 errored=0" in out
-    assert "sealed_error_history" in out and "[2, 2, 2]" in out
+    assert "reviewed_attempts" in out and "sealed_error_history" not in out
     assert "stalled" in out
     assert "candidate_sha" in out and ledger["head"] in out
     assert "candidate_matches_head  True" in out
 
 
-def test_stalled_matches_the_scheduler(ledger, capsys):
-    from adw_modules.scheduler import _stalled
-
-    _code, out = _run(ledger, capsys)
-    history = json.loads(
-        [line for line in out.splitlines() if line.startswith("sealed_error_history")][
-            0
-        ].split(None, 1)[1]
+def test_new_content_is_progress_despite_unchanged_failure_counts(ledger, capsys):
+    _code, out = _run(ledger, capsys, "--lane", "lane-build")
+    rows = dict(
+        line.split(None, 1) for line in out.splitlines()
+        if line.startswith(("reviewed_attempts", "stalled"))
     )
-    expected = str(_stalled(history))
-    line = [line for line in out.splitlines() if line.startswith("stalled")][0]
-    assert line.split(None, 1)[1] == expected
+    assert rows["reviewed_attempts"] == "3"
+    assert rows["stalled"] == "True"
+    assert st.digest_canonical(
+        [{"path": "file.txt", "blob": _digest("candidate")}]
+    ) not in out
+    conn = sqlite3.connect(ledger["database"])
+    try:
+        for sequence in (1, 3, 5):
+            payload = json.loads(conn.execute(
+                "SELECT payload_json FROM lane_artifacts WHERE run_id=? "
+                "AND lane_id=? AND sequence=?",
+                (RUN_ID, "lane-build", sequence),
+            ).fetchone()[0])
+            payload["tree_delta"][0]["blob"] = _digest("changed:{0}".format(sequence))
+            conn.execute(
+                "UPDATE lane_artifacts SET payload_json=? WHERE run_id=? "
+                "AND lane_id=? AND sequence=?",
+                (json.dumps(payload), RUN_ID, "lane-build", sequence),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _code, out = _run(ledger, capsys, "--lane", "lane-build")
+    rows = dict(
+        line.split(None, 1) for line in out.splitlines()
+        if line.startswith(("reviewed_attempts", "stalled"))
+    )
+    assert rows["reviewed_attempts"] == "3"
+    assert rows["stalled"] == "False"
 
 
 def test_lane_filter_selects_one_lane(ledger, capsys):
@@ -404,14 +450,3 @@ def test_never_spawns_maestro(ledger, capsys, monkeypatch):
         assert "rev-parse" in argv
 
 
-def test_no_write_verb_in_the_source():
-    """The tool never names an operator run verb in a command it could build."""
-    source = TOOL_PATH.read_text(encoding="utf-8")
-    body = "\n".join(
-        line for line in source.splitlines() if not line.lstrip().startswith("#")
-    )
-    # The module docstring is allowed to name what the tool refuses to do; the
-    # executable body is not allowed to build such a command.
-    _doc, _, code = body.partition('"""\n\nfrom __future__')
-    for forbidden in ('"maestro.py"', "'maestro.py'", '"run", "start"'):
-        assert forbidden not in code

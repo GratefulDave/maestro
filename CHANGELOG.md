@@ -35,17 +35,59 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   symbols and result-object keys from the sealed files as a whitelist of
   names; no literal, number, selector or fixture value crosses. Names are
   contract; values are secrets.
-- **A build lane that stops climbing blocks for the operator.** After
-  `NO_PROGRESS_GRACE_ROUNDS` review rounds, a round that fails to set a strict
-  new low in `failed + errored` pauses the lane with wait reason
-  `NO_PROGRESS`; `run resume` clears it and the `USER_WAIT` record is the reset
-  marker, so no counter is stored. `8, 8, 8` stops; `10, 8, 6, 4` never does.
+- **Stalled review loops pause only the affected lane.** Three equal actual
+  outcomes (`8,8,8` or `0,0,0`), a regression below the applicable prior best
+  (`4,6,8,6`), or substantive repetition after three reviews records resumable
+  `NO_PROGRESS`. Drafts use native collection counts; builders use sealed passed
+  counts. Python comments/docstrings and safe JS/TS cosmetics cannot manufacture
+  progress. Independent lanes continue; successful PASS still advances.
+  Existing applicability, amendment and user-resume boundaries reset history.
+- **Authored pytest quiet flags no longer hide native case identities.**
+  Collection overrides cumulative verbosity after authored options, clears
+  addopts and preserves selections and execution arguments. Unreadable exit-zero
+  output refuses with native diagnostics instead of reporting zero cases.
 - **A durable step log.** Every operator step line is appended to
   `<runtime_state_root>/steps.jsonl` as one JSON object, bounded by `run
   opened` and `run finished`. Reporting only: nothing in the runtime reads it
   back into a lifecycle decision, and a failed append cannot fail a lane.
 
 ### Fixed
+- **Resume restores genuine linked lane children before native gates.**
+  Lane UI anchors are deterministic detached, no-checkout worktrees of the
+  invoking repository; execution checkouts and publication stay target-bound.
+  Ordinary lane tabs no longer substitute for persistent sidebar children.
+  Resume discovers run-owned role panes before scheduler dispatch, preserves
+  existing PTYs and agent sessions through supported pane migration, and
+  recreates absent role shells without starting agents or replaying prompts.
+  Fresh dispatch and resubmission still reveal the verified role pane.
+  Whole-run cleanup closes owned children and unregisters their UI anchors
+  through the anchor repository, retaining the invoking parent.
+- **Repository-local run commands recover the run's own deployment.** Resume,
+  amend, and status prefer known local runs, then discover registered ledgers
+  read-only and select one target worktree config matching the persisted
+  runtime root. Ambiguous identities/configs refuse instead of silently using
+  another project's provisioning or role routes. `run start PLAN` now infers
+  the invoking repository and symbolic HEAD when routing flags are omitted.
+- **Run panes stay in the invoking Herdr workspace.** Managed invocations
+  create owned per-lane tabs with target-checkout role cwd, rather than
+  letting linked-worktree grouping relocate them to another repository's
+  Space. Identity-proved live role PTYs can move on resume without restart;
+  completion closes owned panes, never the operator's workspace.
+  Removed the contradictory final launch guard that rejected a pane for
+  landing in that invoking workspace with `WORKSPACE_DRIFT`; expected-layout,
+  cwd, and actor-ownership checks remain. Invocation regressions now exercise
+  real launch, reconnect, readiness, retention, and cleanup rather than only
+  pane acquisition.
+- **Distributed runner and review helpers match their current callers.**
+  Restored the Library template and source WP5 deployment to the canonical
+  resolver `paths` API and private-review `tree` API. Stale signatures crashed
+  runner preflight and draft collection with positional-argument `TypeError`s;
+  the same helpers also serve sealed-suite resolution and selection. Verified,
+  scoped synchronization preserves checkout-file selectors without widening
+  collection to unrelated tests. Regressions exercise production preflight
+  through the real resolver and probe, plus private-draft collection through
+  the real argv helper and collector, covering retained refusal evidence,
+  shipped and private cases, and option-value pairing.
 - **Three run-wide resources were not safe for two lanes at once.**
   `OrderedLocks` kept what it held on the instance and began every `acquire`
   by releasing it, so a second thread released the first's locks; held state

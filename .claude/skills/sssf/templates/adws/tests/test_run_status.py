@@ -172,16 +172,28 @@ class ResumeAmendStatusBindDeploymentTest(unittest.TestCase):
         self.addCleanup(self.runtime.close)
         self.addCleanup(self.tmp.cleanup)
 
-    def test_template_source_resume_amend_status_refuse(self) -> None:
-        for argv in (
-            ["run", "resume", self.run_id],
-            ["run", "amend", str(self.plan), "--run", self.run_id],
-            ["run", "status", self.run_id],
+    def test_unregistered_run_refuses_without_launch_or_durable_changes(self) -> None:
+        from unittest import mock
+
+        before = tuple(self.store.conn.iterdump())
+        missing_registry = self.root / "missing-registry.json"
+        with (
+            mock.patch.dict("os.environ", {"MAESTRO_REGISTRY": str(missing_registry)}),
+            mock.patch.object(
+                maestro, "_actor_for", side_effect=AssertionError("unknown run launched")
+            ),
         ):
-            with self.subTest(argv=argv):
-                code, payload = _outcome(list(argv))
-                self.assertEqual(code, 3)
-                self.assertEqual(payload["outcome"], "RUN_REPOSITORY_MISMATCH")
+            for argv in (
+                ["run", "resume", self.run_id],
+                ["run", "amend", str(self.plan), "--run", self.run_id],
+                ["run", "status", self.run_id],
+            ):
+                with self.subTest(argv=argv):
+                    code, _payload = _outcome(list(argv))
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(tuple(self.store.conn.iterdump()), before)
+                    self.assertFalse(missing_registry.exists())
+
 
     def test_wrong_common_dir_resume_amend_status_refuse(self) -> None:
         from unittest import mock

@@ -93,9 +93,8 @@ RESUMABLE_WAIT_REASONS: Tuple[WaitReason, ...] = (
     WaitReason.NO_PROGRESS,
 )
 
-# Rounds of slack a build lane gets before its sealed pass count has to climb.
-# Under it the lane may oscillate; past it, any round that fails to beat the
-# best count seen so far blocks the lane.
+# Reviewed attempts before a measured plateau or substantive repeat blocks.
+# A measured regression below the prior applicable best blocks immediately.
 NO_PROGRESS_GRACE_ROUNDS = 3
 
 

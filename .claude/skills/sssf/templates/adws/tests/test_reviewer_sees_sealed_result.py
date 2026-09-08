@@ -95,9 +95,8 @@ class _EmptyStore:
     def lane_stage(self, _run_id, _lane_id):
         # Where a build lane sits once its code REVISE is recorded, which is
         # where `_block_if_stalled` is called from. The guard reads the stage
-        # to decide which history it is judging -- sealed errors here, test
-        # review findings for a tests lane -- so a store that cannot answer
-        # it is not standing in for the production path.
+        # to select reviewed candidate content here, private draft content for
+        # a tests lane.
         return st.LaneStage.BUILDING
 
 
@@ -237,11 +236,8 @@ class ReviewerSeesTheSealedResult(unittest.TestCase):
         This asserted the opposite while a green suite outranked the reviewer:
         the settled verdict was PASS, so the guard was never reached and a
         lane could draw REVISE on every round and still merge on round one.
-        The guard is what makes the restored verdict recoverable rather than
-        infinite -- a green REVISE round scores zero errors, so three of them
-        satisfy `_stalled` and park the lane for the operator instead of
-        looping. Reaching the guard is not being blocked by it; `_stalled` is
-        false until the grace window fills.
+        Repeated work reaches the operator after grace, but distinct repairs
+        may continue. Neither path may merge a rejected candidate.
         """
         actor = _RecordingActor([(st.ReviewerVerdict.REVISE, ({"a": "b"},))])
         scheduler, artifact = _scheduler(actor)

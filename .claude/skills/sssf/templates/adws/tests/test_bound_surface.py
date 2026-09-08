@@ -19,6 +19,41 @@ import re
 import unittest
 
 from adw_modules.bound_surface import derive_bound_surface
+from adw_modules.bound_surface import _tokenize_javascript
+
+
+class JavaScriptComparisonTests(unittest.TestCase):
+    def test_comments_spacing_and_blank_lines_do_not_disguise_repeat(self):
+        first = "function f() {\nreturn /abc/.test(`value ${x}`);\n}"
+        second = "function /* note */ f( )  {\n\nreturn /abc/.test(`value ${x}`); // explanation\n\n}"
+        self.assertEqual(
+            _tokenize_javascript(first, comparison=True),
+            _tokenize_javascript(second, comparison=True),
+        )
+
+    def test_literal_and_asi_changes_remain_distinct(self):
+        for before, after in (
+            ("return /abc/;", "return /xyz/;"),
+            ("return `a ${x}`;", "return `a ${y}`;"),
+            ("return 'a';", "return 'b';"),
+            ("return value;", "return\nvalue;"),
+            ("return/* same line */value;", "return/*\n*/value;"),
+        ):
+            with self.subTest(before=before, after=after):
+                self.assertNotEqual(
+                    _tokenize_javascript(before, comparison=True),
+                    _tokenize_javascript(after, comparison=True),
+                )
+
+    def test_all_javascript_line_comment_terminators_preserve_following_code(self):
+        for terminator in ("\n", "\r", "\r\n", "\u2028", "\u2029"):
+            with self.subTest(terminator=repr(terminator)):
+                before = "// note" + terminator + "const x=1;"
+                after = "// note" + terminator + "const x=2;"
+                self.assertNotEqual(
+                    _tokenize_javascript(before, comparison=True),
+                    _tokenize_javascript(after, comparison=True),
+                )
 
 
 VITEST_SUITE = '''
