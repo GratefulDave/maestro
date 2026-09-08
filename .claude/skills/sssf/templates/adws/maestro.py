@@ -36,6 +36,7 @@ from adw_modules import code_review as cr
 from adw_modules import launcher as lch
 from adw_modules import plan_compiler
 from adw_modules import private_review as prv
+from adw_modules import review_standards as rvs
 from adw_modules import scheduler_types as st
 from adw_modules import step_log
 from adw_modules import tests_chain as tchain
@@ -747,7 +748,12 @@ class HerdrStageActor:
             return {"private_files": {"<path>": "<utf-8 contents>"}}
         if role == "builder":
             return {"candidate_sha": "<optional git sha>", "changed": "<optional bool>"}
-        if role in ("test-reviewer", "code-reviewer"):
+        if role == "code-reviewer":
+            return {
+                "verdict": "PASS|REVISE",
+                "findings": findings + list(st.FINDING_OPTIONAL_KEYS),
+            }
+        if role == "test-reviewer":
             return {"verdict": "PASS|REVISE", "findings": findings}
         return {
             "verdict": "PASS|REVISE",
@@ -910,7 +916,10 @@ class HerdrStageActor:
                 "against the call the lane's own tests make. A caller the "
                 "candidate breaks is a finding even though the caller is not a "
                 "declared output: the defect is in the declared output and so "
-                "is its repair, which is what keeps the finding actionable."
+                "is its repair, which is what keeps the finding actionable.\n\n"
+                + rvs.standards_section(
+                    rvs.discover_standards_files(self.target.target_repository_root)
+                )
             ),
             "integration-reviewer": (
                 "Review the exact integration checkout read-only. Return a "
