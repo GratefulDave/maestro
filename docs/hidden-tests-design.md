@@ -41,6 +41,53 @@ Test author and test reviewer may read the private draft. The implementation bui
 code reviewer has controlled vault access for the run and must not put private bytes in the public
 artifact.
 
+### Lane-local measured convergence and substantive repetition
+
+After a recorded `REVISE`, three consecutive equal measured outcomes pause the
+affected lane with `NO_PROGRESS` (`8,8,8` and `0,0,0`). An outcome below the
+previous best in the applicable window pauses immediately (`4,6,8,6`).
+Increasing outcomes continue. Test-authoring progress is the count of unique
+native collected case identities, stored as `TEST_REVIEW.public_result_summary.collected`;
+builder progress is the existing sealed `CODE_REVIEW.public_result_summary.passed`.
+Findings and reworded feedback are not successful outcomes. Collection failure
+has no numeric sample; it retains its refusal diagnostics, never invented zero
+success. A genuine empty native selection measures zero.
+
+Independently, after three reviewed attempts, repetition of substantive content
+(including A–B–A) pauses the lane. `PASS` advances without this guard: no builder
+implementation is required to pass while its tests are still being authored.
+
+Reviews identify their inputs through `input_artifact_ids`; the guard follows
+the named builder output or test draft, never the newest artifact of that kind.
+Builder identity is its admitted fixed-base tree delta, including paths and
+modes; commit metadata is not work. Private draft identity follows the named
+manifest, not its commit-bearing digest. Python AST fingerprints ignore comments,
+formatting and docstrings while retaining executable syntax. JavaScript/TypeScript
+reuse the existing scanner in conservative comparison mode: comments and
+non-linebreak spacing are ignored; complete literals, regexes, templates and
+line-terminator presence are retained. JSX/TSX, ambiguous slash syntax, unknown
+languages and invalid Python retain exact bytes rather than risk false equality.
+Cosmetics inside templates may therefore remain distinct, but measured plateau
+and regression apply regardless of language.
+Private content and identities are never printed or persisted by this guard.
+
+`USER_WAIT`, a new plan revision, or changed applicability starts a fresh window:
+spec/projection and base for both loops, plus the sealed suite for builders and
+public contract for drafts. `run resume` retains its existing pause semantics.
+Reviewer `REVISE` remains blocking, including over a green sealed suite; no
+verdict is promoted to `PASS` by this guard.
+
+Independent lanes continue; dependents remain blocked by the waiting prerequisite.
+The operator can resume the affected lane into its existing rework stage.
+This adds no database state, budget, configuration, stage, operator verb, or
+findings bucket. Optional measured artifact evidence is absent on old reviews;
+missing measurements never count as successful outcomes.
+
+Pytest collection fixes verbosity after authored options and before literal `--`,
+clears inherited addopts, and leaves execution arguments untouched. Summary counts
+are not case identities; successful but unreadable native output is a collection
+refusal with bounded diagnostics, not a misleading zero-case result.
+
 ## What authors must still do
 
 - Declare public acceptance criteria and exact file-path outputs. The compiler checks those

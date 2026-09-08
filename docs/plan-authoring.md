@@ -167,6 +167,15 @@ must not quote the private assertion.
 
 - **Write the public acceptance so it is falsifiable without leaking the encoding.** "Negative
   amounts are refused" is a contract. The private `assert` message is not.
+- **Declare the public interface before private tests bind to it.** In the existing public
+  acceptance criteria or `spec.instruction`, state the required module/import path, export or
+  callable name, argument and return shapes, and observable errors. The paired tests and build
+  lanes must consume that same public declaration. A module filename alone does not declare a
+  function. Test authors must not invent a private binding, and test reviewers must report
+  undeclared bindings or ambiguity as contract-adequacy findings through the existing `REVISE`
+  path. Builders must not recover missing signatures from sealed tests or guess a set of aliases.
+  Public signatures are not private fixtures, selectors, expected literals, or assertion text;
+  those remain sealed. This is an authoring obligation, not a new compiler gate or schema field.
 - **Keep private tests out of declared outputs.** A path the builder is allowed to write cannot also
   be the hidden suite.
 - **One owner per path.** Exactly one lane may own a path — a second lane declaring it is refused.
